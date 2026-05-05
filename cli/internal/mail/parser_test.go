@@ -366,6 +366,41 @@ func TestParserUnnamedAttachmentMagicDetection(t *testing.T) {
 	}
 }
 
+func TestParserSinglePartZipAttachment(t *testing.T) {
+	// Google sends DMARC aggregate reports as a single-part application/zip
+	// message (no multipart wrapper) per RFC 7489 §A.1. The parser must
+	// emit one AttachmentInfo and not stuff the decoded zip into BodyText.
+	msg := loadTestMail(t, "singlepart_zip_dmarc.eml")
+	parser := NewParser()
+
+	content := parser.Parse(msg)
+
+	if content.Body != "" {
+		t.Errorf("Body should be empty for binary single-part attachment, got %d bytes", len(content.Body))
+	}
+	if content.HTML != "" {
+		t.Errorf("HTML should be empty, got %d bytes", len(content.HTML))
+	}
+	if len(content.Attachments) != 1 {
+		t.Fatalf("Should have 1 attachment, got %d", len(content.Attachments))
+	}
+
+	att := content.Attachments[0]
+	wantName := "google.com!habric.com!1766001600!1766088000.zip"
+	if att.Filename != wantName {
+		t.Errorf("Filename = %q, want %q", att.Filename, wantName)
+	}
+	if att.ContentType != "application/zip" {
+		t.Errorf("ContentType = %q, want %q", att.ContentType, "application/zip")
+	}
+	if att.Disposition != "attachment" {
+		t.Errorf("Disposition = %q, want %q", att.Disposition, "attachment")
+	}
+	if att.Size == 0 {
+		t.Errorf("Size = 0, want non-zero")
+	}
+}
+
 func TestParserEmptyContentType(t *testing.T) {
 	msg := loadTestMail(t, "empty_content_type.eml")
 	parser := NewParser()

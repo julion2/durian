@@ -110,6 +110,49 @@ func (p *Parser) extractBody(msg *mail.Message) (string, string, []AttachmentInf
 		return p.extractMultipart(msg.Body, params["boundary"])
 	}
 
+	// Single-part non-text message (e.g. application/zip from Google DMARC reports,
+	// application/pdf, image/*, application/octet-stream with a filename). RFC 7489
+	// §A.1 explicitly allows DMARC aggregate reports as a single application/zip
+	// part with no multipart wrapper. Treat the whole body as one attachment
+	// instead of stuffing decoded binary bytes into BodyText.
+	contentDisp := msg.Header.Get("Content-Disposition")
+	dispMediaType, dispParams, _ := mime.ParseMediaType(contentDisp)
+	isAttachment := mediaType != "" && !strings.HasPrefix(mediaType, "text/") &&
+		(strings.HasPrefix(dispMediaType, "attachment") || strings.HasPrefix(dispMediaType, "inline") ||
+			params["name"] != "" || dispParams["filename"] != "")
+	if isAttachment {
+		body, _ := io.ReadAll(msg.Body)
+		name := encoding.DecodeHeader(dispParams["filename"])
+		if name == "" {
+			name = encoding.DecodeHeader(params["name"])
+		}
+		disposition := "attachment"
+		if strings.HasPrefix(dispMediaType, "inline") {
+			disposition = "inline"
+		}
+		if mediaType == "application/octet-stream" || name == "" {
+			if detected, ext := detectMagic(body, transferEncoding); detected != "" {
+				if mediaType == "application/octet-stream" {
+					mediaType = detected
+				}
+				if name == "" {
+					name = "attachment" + ext
+				}
+			}
+		}
+		if name == "" {
+			name = "unnamed"
+		}
+		attachments = append(attachments, AttachmentInfo{
+			Filename:    name,
+			ContentType: mediaType,
+			Size:        len(body),
+			Disposition: disposition,
+			ContentID:   msg.Header.Get("Content-Id"),
+		})
+		return "", "", attachments
+	}
+
 	body, _ := io.ReadAll(msg.Body)
 	return encoding.DecodeBody(body, transferEncoding, charset), "", attachments
 }
