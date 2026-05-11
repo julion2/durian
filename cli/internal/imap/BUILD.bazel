@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "imap",
     srcs = [
+        "attachment.go",
         "client.go",
         "exec.go",
         "flags.go",
@@ -32,6 +33,7 @@ go_test(
     name = "imap_test",
     size = "small",
     srcs = [
+        "attachment_test.go",
         "exec_test.go",
         "flags_test.go",
         "gmail_test.go",
