@@ -114,12 +114,17 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 	}
 	defer f.Close()
 
-	if err := client.FetchBodySection(msg.UID, []int{att.PartID}, f); err != nil {
+	if err := client.FetchDecodedAttachment(msg.UID, att.Filename, att.PartID, f); err != nil {
 		os.Remove(outPath)
 		return fmt.Errorf("download failed: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(att.Size))
+	fi, statErr := f.Stat()
+	var size int64
+	if statErr == nil {
+		size = fi.Size()
+	}
+	fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(int(size)))
 	return nil
 }
 
