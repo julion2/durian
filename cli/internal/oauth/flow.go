@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"html"
 	"net"
 	"net/http"
 	"os"
@@ -95,6 +96,9 @@ func startCallbackServer(expectedState string, resultChan chan *FlowResult, errC
 		// Check for error
 		if errMsg := query.Get("error"); errMsg != "" {
 			errDesc := query.Get("error_description")
+			// HTML-escape provider-supplied values before embedding them in the
+			// response page — a hostile OAuth provider could otherwise inject
+			// script tags that run in the browser session sharing localhost.
 			w.Header().Set("Content-Type", "text/html")
 			w.WriteHeader(http.StatusBadRequest)
 			fmt.Fprintf(w, `<!DOCTYPE html>
@@ -106,7 +110,7 @@ func startCallbackServer(expectedState string, resultChan chan *FlowResult, errC
 <p>%s</p>
 <p>You can close this window.</p>
 </body>
-</html>`, errMsg, errDesc)
+</html>`, html.EscapeString(errMsg), html.EscapeString(errDesc))
 			resultChan <- &FlowResult{Error: fmt.Sprintf("%s: %s", errMsg, errDesc)}
 			return
 		}
