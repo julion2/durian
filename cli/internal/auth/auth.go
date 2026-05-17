@@ -11,10 +11,9 @@ import (
 	"github.com/durian-dev/durian/cli/internal/smtp"
 )
 
-const (
-	// PasswordKeychainService is the service name for password-based auth.
-	PasswordKeychainService = "durian-password"
-)
+// PasswordKeychainService re-exports the canonical constant from the
+// keychain package so existing callers (and tests) keep compiling.
+const PasswordKeychainService = keychain.PasswordKeychainService
 
 // Replaceable function vars for testability.
 var (

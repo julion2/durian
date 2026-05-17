@@ -1,10 +1,12 @@
 package keychain
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -155,5 +157,139 @@ func TestExists_NotFound(t *testing.T) {
 
 	if Exists("svc", "acct") {
 		t.Error("Exists() = true, want false")
+	}
+}
+
+// --- GetOrCreateKey ---
+
+// scriptedResponse describes one mocked invocation of the `security` CLI.
+type scriptedResponse struct {
+	mode, stdout, stderr string
+}
+
+// scriptCommands replaces commandRunner with a sequence-aware mock. Each call
+// consumes one entry from responses, in order. Failing the test for over-runs
+// catches accidental extra keychain calls (an easy way to leak credentials).
+func scriptCommands(t *testing.T, responses []scriptedResponse) {
+	t.Helper()
+	var i int
+	commandRunner = func(name string, args ...string) *exec.Cmd {
+		if i >= len(responses) {
+			t.Fatalf("unexpected extra command #%d: %s %v", i+1, name, args)
+		}
+		r := responses[i]
+		i++
+		cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess")
+		cmd.Env = append(os.Environ(),
+			"GO_TEST_HELPER=1",
+			"GO_TEST_MODE="+r.mode,
+			"GO_TEST_STDOUT="+r.stdout,
+			"GO_TEST_STDERR="+r.stderr,
+		)
+		return cmd
+	}
+}
+
+func TestGetOrCreateKey_ReturnsExisting(t *testing.T) {
+	want := make([]byte, 32)
+	for i := range want {
+		want[i] = byte(i)
+	}
+	scriptCommands(t, []scriptedResponse{
+		{mode: "success", stdout: hex.EncodeToString(want) + "\n"},
+	})
+	defer restoreCommandRunner()
+
+	got, err := GetOrCreateKey(DBKeychainService, DBAccountMaster, 32)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hex.EncodeToString(got) != hex.EncodeToString(want) {
+		t.Errorf("key mismatch:\n got=%x\nwant=%x", got, want)
+	}
+}
+
+func TestGetOrCreateKey_GeneratesWhenMissing(t *testing.T) {
+	// SetPassword unconditionally calls DeletePassword first, then add. So a
+	// fresh-key path is: find (NotFound) → delete (NotFound, treated as ok)
+	// → add (ok). Three invocations.
+	scriptCommands(t, []scriptedResponse{
+		{mode: "exit44"}, // find-generic-password → not found
+		{mode: "exit44"}, // delete-generic-password → not found (ok)
+		{mode: "success"}, // add-generic-password → stored
+	})
+	defer restoreCommandRunner()
+
+	got, err := GetOrCreateKey(DBKeychainService, DBAccountMaster, 32)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 32 {
+		t.Errorf("generated key length = %d, want 32", len(got))
+	}
+	// A fresh crypto/rand key being all-zero would be astronomically unlikely.
+	var allZero [32]byte
+	if hex.EncodeToString(got) == hex.EncodeToString(allZero[:]) {
+		t.Error("generated key is all zero — rand.Read silently failed?")
+	}
+}
+
+func TestGetOrCreateKey_RejectsInvalidHex(t *testing.T) {
+	scriptCommands(t, []scriptedResponse{
+		{mode: "success", stdout: "not-hex-zzzz\n"},
+	})
+	defer restoreCommandRunner()
+
+	_, err := GetOrCreateKey(DBKeychainService, DBAccountMaster, 32)
+	if err == nil {
+		t.Fatal("expected error for non-hex stored value, got nil")
+	}
+	if !strings.Contains(err.Error(), "not valid hex") {
+		t.Errorf("error = %v, want it to mention 'not valid hex'", err)
+	}
+}
+
+func TestGetOrCreateKey_RejectsWrongLength(t *testing.T) {
+	// 16 bytes hex-encoded → 32 chars; ask for 32 bytes → mismatch.
+	short := strings.Repeat("ab", 16)
+	scriptCommands(t, []scriptedResponse{
+		{mode: "success", stdout: short + "\n"},
+	})
+	defer restoreCommandRunner()
+
+	_, err := GetOrCreateKey(DBKeychainService, DBAccountMaster, 32)
+	if err == nil {
+		t.Fatal("expected error for wrong-length stored key, got nil")
+	}
+	if !strings.Contains(err.Error(), "length 16, want 32") {
+		t.Errorf("error = %v, want length-mismatch message", err)
+	}
+}
+
+func TestGetOrCreateKey_RejectsBadNbytes(t *testing.T) {
+	// No commands should be issued: validation must happen before any keychain access.
+	scriptCommands(t, nil)
+	defer restoreCommandRunner()
+
+	if _, err := GetOrCreateKey(DBKeychainService, DBAccountMaster, 0); err == nil {
+		t.Error("nbytes=0: expected error, got nil")
+	}
+	if _, err := GetOrCreateKey(DBKeychainService, DBAccountMaster, -1); err == nil {
+		t.Error("nbytes=-1: expected error, got nil")
+	}
+}
+
+func TestGetOrCreateKey_PropagatesLookupError(t *testing.T) {
+	scriptCommands(t, []scriptedResponse{
+		{mode: "exit1", stderr: "security: SecKeychainSearchCopyNext: The user name or passphrase you entered is not correct."},
+	})
+	defer restoreCommandRunner()
+
+	_, err := GetOrCreateKey(DBKeychainService, DBAccountMaster, 32)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Error("lookup error must not be reported as ErrNotFound — would silently regenerate the master key")
 	}
 }
