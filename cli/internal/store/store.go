@@ -368,6 +368,81 @@ func (d *DB) migrate() error {
 				return fmt.Errorf("migrate v7→v8: %w", err)
 			}
 		}
+		version = 8
+	}
+
+	if version < 9 {
+		// ADR-0001 step 1: introduce mailbox/account lookup tables and
+		// activity booleans derived from `flags`. Old messages.mailbox /
+		// account / flags columns stay in place — this is the smallest
+		// diff that adds the new join keys without breaking any existing
+		// query path.
+		//
+		// TODO(ADR-0001): drop mailbox/account TEXT columns after step 5
+		// and convert flags TEXT to flags_other BLOB (encrypted) once the
+		// dbcrypto package lands.
+		migrations := []string{
+			`CREATE TABLE IF NOT EXISTS mailboxes (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				name TEXT NOT NULL UNIQUE
+			)`,
+			`CREATE TABLE IF NOT EXISTS accounts (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				name TEXT NOT NULL UNIQUE
+			)`,
+			"ALTER TABLE messages ADD COLUMN mailbox_id INTEGER REFERENCES mailboxes(id)",
+			"ALTER TABLE messages ADD COLUMN account_id INTEGER REFERENCES accounts(id)",
+			"ALTER TABLE messages ADD COLUMN is_seen INTEGER NOT NULL DEFAULT 0",
+			"ALTER TABLE messages ADD COLUMN is_flagged INTEGER NOT NULL DEFAULT 0",
+			"ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
+
+			// Populate mailboxes from distinct messages.mailbox. INBOX is
+			// case-normalized to "INBOX" (RFC 3501 reserves it case-
+			// insensitive); custom folders stay exact.
+			`INSERT OR IGNORE INTO mailboxes (name)
+			 SELECT DISTINCT
+			   CASE WHEN UPPER(mailbox) = 'INBOX' THEN 'INBOX' ELSE mailbox END
+			 FROM messages
+			 WHERE mailbox IS NOT NULL AND mailbox <> ''`,
+
+			// Populate accounts from distinct messages.account.
+			`INSERT OR IGNORE INTO accounts (name)
+			 SELECT DISTINCT account FROM messages
+			 WHERE account IS NOT NULL AND account <> ''`,
+
+			// Backfill FK columns. The CASE handles INBOX normalization
+			// symmetrically with the INSERT above so 'inbox' / 'Inbox' /
+			// 'INBOX' all resolve to the same mailbox_id.
+			`UPDATE messages
+			 SET mailbox_id = (
+			   SELECT id FROM mailboxes
+			   WHERE name = CASE WHEN UPPER(messages.mailbox) = 'INBOX'
+			                     THEN 'INBOX' ELSE messages.mailbox END
+			 )
+			 WHERE mailbox IS NOT NULL AND mailbox <> ''`,
+
+			`UPDATE messages
+			 SET account_id = (SELECT id FROM accounts WHERE name = messages.account)
+			 WHERE account IS NOT NULL AND account <> ''`,
+
+			// Derive activity booleans from existing flags TEXT. INSTR is
+			// used over LIKE to avoid SQLite's backslash-escaping ambiguity
+			// with the leading '\' in standard IMAP flags.
+			`UPDATE messages SET
+			   is_seen    = CASE WHEN INSTR(IFNULL(flags, ''), '\Seen')    > 0 THEN 1 ELSE 0 END,
+			   is_flagged = CASE WHEN INSTR(IFNULL(flags, ''), '\Flagged') > 0 THEN 1 ELSE 0 END,
+			   is_deleted = CASE WHEN INSTR(IFNULL(flags, ''), '\Deleted') > 0 THEN 1 ELSE 0 END`,
+
+			"CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id ON messages(mailbox_id)",
+			"CREATE INDEX IF NOT EXISTS idx_messages_account_id ON messages(account_id)",
+
+			"UPDATE schema_version SET version = 9 WHERE rowid = 1",
+		}
+		for _, stmt := range migrations {
+			if _, err := d.db.Exec(stmt); err != nil {
+				return fmt.Errorf("migrate v8→v9: %w", err)
+			}
+		}
 	}
 
 	return nil
