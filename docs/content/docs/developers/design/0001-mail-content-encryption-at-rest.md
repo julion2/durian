@@ -98,7 +98,8 @@ passwords (`durian-password / <email>`) and OAuth tokens (`durian / <email>`).
 ### 2. Key hierarchy
 
 Single 32-byte **master key** in the OS keychain, derived sub-keys via
-HKDF-SHA256 (`golang.org/x/crypto/hkdf`, the only x/crypto dep we add).
+HKDF-SHA256 (Go stdlib `crypto/hkdf`, promoted from x/crypto in Go 1.24 —
+no new direct dependency added).
 
 | Sub-key            | HKDF info string         | Purpose                                |
 | ------------------ | ------------------------ | -------------------------------------- |
@@ -115,7 +116,7 @@ Keychain layout (new):
 
 | Service       | Account   | Value                                |
 | ------------- | --------- | ------------------------------------ |
-| `durian-mail` | `master`  | 64-char hex of 32 random bytes       |
+| `durian-db`   | `master`  | 64-char hex of 32 random bytes       |
 
 Existing services (`durian`, `durian-password`) stay untouched.
 
@@ -270,7 +271,7 @@ the migration runs synchronously at first open after upgrade. Progress is
 logged. If interrupted, the transaction rolls back; on next open we detect
 the half-migrated state via `schema_version` and resume.
 
-Master key bootstrap: if `durian-mail / master` is missing on first run of an
+Master key bootstrap: if `durian-db / master` is missing on first run of an
 encrypted-build, generate via `crypto/rand`, store, derive sub-keys, proceed.
 If it's missing on a DB that's already migrated → hard error with explicit
 recovery instructions. Never silently delete or recreate.
