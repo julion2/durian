@@ -82,6 +82,13 @@ var quoteRegexPatterns = []*regexp.Regexp{
 	// matches "On 5 Apr 2026 ... wrote:<br/><blockquote>" (and similar variants).
 	// The opening <div> or <p> wrapping this attribution is the cut point.
 	regexp.MustCompile(`(?i)<(?:div|p)[^>]*>\s*On\s+\d[^<]*?wrote:\s*<br[^>]*>\s*<blockquote`),
+
+	// GMX / web.de Web: <div style="margin: ...; padding: ...; border-left: 2px solid rgb(...)">
+	// followed by a header block with <strong>Gesendet:</strong> / <strong>Von:</strong>.
+	// GMX does not use a stable class/id, but the border-left + Gesendet/Von combination
+	// is reliable. We anchor on the opening <div> with border-left so the quote box
+	// (including its surrounding margin/padding) is the cut point.
+	regexp.MustCompile(`(?is)<div[^>]*style="[^"]*border-left:[^"]*"[^>]*>\s*<div[^>]*>\s*<div[^>]*>\s*<strong>(?:Gesendet|Sent|Von|From):`),
 }
 
 // StripQuotedContent removes quoted reply content from HTML.
@@ -121,6 +128,70 @@ func StripQuotedContent(html string) string {
 		return html
 	}
 
+	return stripped
+}
+
+// textQuotePatterns are regex anchors for the start of a quoted/forwarded
+// block in plain-text mail bodies. The earliest match wins; everything
+// from the match position onward is treated as quoted content.
+//
+// We anchor on the BEGINNING OF A LINE so we don't trip over the same words
+// appearing inside legitimate prose (e.g. "Betreff dieses Treffens…").
+var textQuotePatterns = []*regexp.Regexp{
+	// GMX / web.de / many German webmailers: header block of a quoted reply.
+	// `Gesendet:` is the most distinctive marker; we accept it followed by
+	// optional `Von:`/`An:`/`Betreff:` lines but key on Gesendet alone.
+	regexp.MustCompile(`(?m)^[ \t]*Gesendet:\s`),
+	// Outlook English plain-text reply header.
+	regexp.MustCompile(`(?m)^[ \t]*Sent:\s.*\r?\n[ \t]*(?:From|To|Subject):`),
+	// German Outlook plain-text reply header.
+	regexp.MustCompile(`(?m)^[ \t]*Von:\s.*\r?\n[ \t]*(?:Gesendet|An|Betreff):`),
+	// Forwarded-message separators.
+	regexp.MustCompile(`(?im)^[ \t]*-{3,}\s*Urspr(?:ü|ue)ngliche Nachricht\s*-{3,}`),
+	regexp.MustCompile(`(?im)^[ \t]*-{3,}\s*Original Message\s*-{3,}`),
+	regexp.MustCompile(`(?im)^[ \t]*-{3,}\s*Forwarded message\s*-{3,}`),
+	// "On <date>, <name> wrote:" attribution line (Apple Mail, Spark, Gmail).
+	regexp.MustCompile(`(?m)^On\s+\w[^\n]{0,200}?\s+wrote:\s*$`),
+	// "Am <date> schrieb <name>:" attribution line (Thunderbird/Apple Mail DE).
+	regexp.MustCompile(`(?m)^Am\s+\w[^\n]{0,200}?\s+schrieb\s[^\n]{0,200}?:\s*$`),
+}
+
+// StripQuotedTextContent removes quoted reply / forwarded content from a
+// plain-text mail body. Mirrors StripQuotedContent for HTML.
+//
+// Like the HTML variant, if stripping leaves only whitespace or a mobile
+// signature the original is returned so the user still sees something.
+func StripQuotedTextContent(text string) string {
+	if text == "" {
+		return text
+	}
+
+	earliestIdx := -1
+	for _, re := range textQuotePatterns {
+		loc := re.FindStringIndex(text)
+		if loc != nil && (earliestIdx == -1 || loc[0] < earliestIdx) {
+			earliestIdx = loc[0]
+		}
+	}
+
+	if earliestIdx == -1 {
+		return text
+	}
+
+	stripped := strings.TrimRight(text[:earliestIdx], " \t\n\r")
+
+	textLower := strings.ToLower(strings.TrimSpace(stripped))
+	if textLower == "" {
+		return text
+	}
+	for _, sig := range mobileSignatures {
+		if strings.Contains(textLower, sig) {
+			remainder := strings.TrimSpace(strings.ReplaceAll(textLower, sig, ""))
+			if len(remainder) < 5 {
+				return text
+			}
+		}
+	}
 	return stripped
 }
 
