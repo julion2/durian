@@ -60,8 +60,8 @@ func (h *Handler) ShowMessageBody(messageID string) protocol.Response {
 	}
 
 	return protocol.SuccessWithMessageBody(&internmail.MessageBody{
-		Body: msg.BodyText,
-		HTML: msg.BodyHTML,
+		Body: sanitize.StripQuotedTextContent(msg.BodyText),
+		HTML: sanitize.StripQuotedContent(msg.BodyHTML),
 	})
 }
 
@@ -85,7 +85,7 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 			Date:      time.Unix(msg.Date, 0).Format(time.RFC1123Z),
 			Timestamp: msg.Date,
 			MessageID: msg.MessageID,
-			Body:      msg.BodyText,
+			Body:      sanitize.StripQuotedTextContent(msg.BodyText),
 		}
 		if !light {
 			info.InReplyTo = msg.InReplyTo

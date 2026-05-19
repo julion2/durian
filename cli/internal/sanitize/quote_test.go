@@ -129,6 +129,27 @@ func TestStripQuotedContent_OutlookHR_EnglishFrom(t *testing.T) {
 	assertStripped(t, "Outlook HR From", html, "Hi Bob", "Alice")
 }
 
+// --- GMX / web.de Web (border-left quote box) ---
+
+func TestStripQuotedContent_GMX_BorderLeftGesendet(t *testing.T) {
+	html := `<div>Hi Julian,</div>` +
+		`<div>der 20.7. passt.</div>` +
+		`<div>Viele Grüße, Georg</div>` +
+		`<div style="margin: 10px 5px 5px 10px; padding: 10px 0px 10px 10px; border-left: 2px solid rgb(195, 217, 229)">` +
+		`<div style="margin: 0px 0px 10px">` +
+		`<div><strong>Gesendet: </strong>Montag, 18. Mai 2026 um 21:08</div>` +
+		`<div><strong>Von: </strong>Julian Schenker</div>` +
+		`</div><div>Quoted reply text here.</div></div>`
+	assertStripped(t, "GMX border-left Gesendet", html, "der 20.7. passt", "Quoted reply text here")
+}
+
+func TestStripQuotedContent_GMX_BorderLeftVon(t *testing.T) {
+	html := `<div>Reply body.</div>` +
+		`<div style="border-left: 2px solid rgb(195, 217, 229); padding-left: 10px">` +
+		`<div><div><strong>Von: </strong>Alice</div></div>Original content.</div>`
+	assertStripped(t, "GMX border-left Von", html, "Reply body", "Original content")
+}
+
 // --- Forwarded message separators ---
 
 func TestStripQuotedContent_GermanForward(t *testing.T) {
@@ -381,6 +402,72 @@ func TestStripQuotedContent_Fixture_SparkForward(t *testing.T) {
 	mustContain(t, result, "Upgrade your account", "forwarded body heading")
 	mustContain(t, result, "Subscription ID", "forwarded body details")
 	mustContain(t, result, "noreply@example.com", "forwarded sender")
+}
+
+// --- StripQuotedTextContent (plain-text bodies) ---
+
+func assertTextStripped(t *testing.T, name, input, expectedKeep, expectedRemove string) {
+	t.Helper()
+	result := StripQuotedTextContent(input)
+	if expectedKeep != "" && !strings.Contains(result, expectedKeep) {
+		t.Errorf("[%s] result should contain %q, got: %q", name, expectedKeep, result)
+	}
+	if expectedRemove != "" && strings.Contains(result, expectedRemove) {
+		t.Errorf("[%s] result should NOT contain %q, got: %q", name, expectedRemove, result)
+	}
+}
+
+func TestStripQuotedTextContent_GMX_Gesendet(t *testing.T) {
+	text := "Hi Julian,\n\nder 20.7. nachmittags würde gut passen.\n\nViele Grüße\nGeorg\n\n" +
+		"Gesendet: Montag, 18. Mai 2026 um 21:08\n" +
+		"Von: \"Julian Schenker\" <julian@habric.com>\n" +
+		"An: dram-hn@gmx.de\n" +
+		"Betreff: Re: Treffen heute\n\n" +
+		"Hey Georg, danke dir für den Call.\n"
+	assertTextStripped(t, "GMX Gesendet", text, "der 20.7. nachmittags", "danke dir für den Call")
+}
+
+func TestStripQuotedTextContent_OutlookEnglish(t *testing.T) {
+	text := "My reply.\n\nSent: Monday, May 18, 2026 9:08 PM\nFrom: Julian\nTo: Georg\nSubject: Re: Hi\n\nOriginal body."
+	assertTextStripped(t, "Outlook English Sent/From", text, "My reply", "Original body")
+}
+
+func TestStripQuotedTextContent_OutlookGerman(t *testing.T) {
+	text := "Antwort.\n\nVon: Alice\nGesendet: Montag\nAn: Bob\nBetreff: Test\n\nOriginal."
+	assertTextStripped(t, "Outlook German Von/Gesendet", text, "Antwort", "Original.")
+}
+
+func TestStripQuotedTextContent_OnWrote(t *testing.T) {
+	text := "Thanks!\n\nOn 19 May 2026, Alice wrote:\n> Original message body here\n> more\n"
+	assertTextStripped(t, "On wrote attribution", text, "Thanks", "Original message body")
+}
+
+func TestStripQuotedTextContent_GermanForward(t *testing.T) {
+	text := "Schau mal:\n\n--- Ursprüngliche Nachricht ---\nVon: Alice\n\nOriginal text."
+	assertTextStripped(t, "German forward separator", text, "Schau mal", "Original text")
+}
+
+func TestStripQuotedTextContent_NoQuote(t *testing.T) {
+	text := "A short standalone email with no replies or forwards."
+	if got := StripQuotedTextContent(text); got != text {
+		t.Errorf("unmodified text changed: %q vs %q", got, text)
+	}
+}
+
+func TestStripQuotedTextContent_OnlyMobileSig(t *testing.T) {
+	// If stripping leaves only "Sent from my iPhone" we keep the original
+	// so the forwarded body is still visible.
+	text := "Sent from my iPhone\n\nOn 19 May 2026, Alice wrote:\nOriginal content."
+	got := StripQuotedTextContent(text)
+	if !strings.Contains(got, "Original content") {
+		t.Errorf("expected fallback to original, got: %q", got)
+	}
+}
+
+func TestStripQuotedTextContent_Empty(t *testing.T) {
+	if got := StripQuotedTextContent(""); got != "" {
+		t.Errorf("empty input should return empty, got %q", got)
+	}
 }
 
 // --- isEmptyHTML ---
