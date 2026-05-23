@@ -27,6 +27,11 @@ jobs:
         run: bazel test //cli/... --test_output=errors
 
       - name: Test API Contract
+        # The integration test starts `durian serve`, which normally
+        # bootstraps the ADR-0001 master key from the OS keychain.
+        # Headless CI has no Secret Service implementation, so we pass
+        # the key in via DURIAN_MASTER_KEY_HEX — see cmd/durian/master_key.go
+        # for the bypass behaviour. The value is throwaway test data.
         run: bazel test //integration:integration_test --test_output=all
 
       - name: Build CLI
