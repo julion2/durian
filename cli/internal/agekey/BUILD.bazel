@@ -1,0 +1,19 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "agekey",
+    srcs = ["agekey.go"],
+    importpath = "github.com/durian-dev/durian/cli/internal/agekey",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "@io_filippo_age//:age",
+        "@io_filippo_age//armor",
+    ],
+)
+
+go_test(
+    name = "agekey_test",
+    size = "small",
+    srcs = ["agekey_test.go"],
+    embed = [":agekey"],
+)

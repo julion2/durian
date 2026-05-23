@@ -167,6 +167,12 @@ func runPasswordLogin(account *config.AccountConfig) error {
 	return nil
 }
 
+// stdinPromptReader is a single bufio.Reader over os.Stdin shared across all
+// non-TTY promptPassword calls. A fresh per-call bufio.Reader would
+// over-read into its own buffer and the next prompt would see EOF — broken
+// for any flow that prompts twice (e.g. passphrase confirmation).
+var stdinPromptReader = bufio.NewReader(os.Stdin)
+
 // promptPassword securely prompts for a password (hides input)
 func promptPassword(prompt string) (string, error) {
 	fmt.Fprint(os.Stderr, prompt)
@@ -182,9 +188,9 @@ func promptPassword(prompt string) (string, error) {
 		return string(password), nil
 	}
 
-	// Fallback for non-terminal (e.g., piped input)
-	reader := bufio.NewReader(os.Stdin)
-	password, err := reader.ReadString('\n')
+	// Fallback for non-terminal (e.g., piped input). Use the shared reader
+	// so successive prompts in one invocation each get their own line.
+	password, err := stdinPromptReader.ReadString('\n')
 	if err != nil {
 		return "", err
 	}
