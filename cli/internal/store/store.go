@@ -7,17 +7,30 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/durian-dev/durian/cli/internal/dbcrypto"
+
 	_ "modernc.org/sqlite"
 )
 
-// DB wraps a SQLite database connection for the email store.
+// DB wraps a SQLite database connection for the email store. The Keyring
+// is held by reference so the store layer can transparently encrypt and
+// decrypt the ADR-0001 §3 sensitive columns. Nil is not allowed — every
+// caller must derive a keyring from the master key at startup.
 type DB struct {
-	db *sql.DB
+	db      *sql.DB
+	keyring *dbcrypto.Keyring
 }
 
 // Open opens or creates an email store database at the given path.
 // Use ":memory:" for in-memory databases (useful for testing).
-func Open(dbPath string) (*DB, error) {
+//
+// kr must be a non-nil Keyring derived from the OS-keychain master key.
+// Pilot encryption (ADR-0001 step 5) requires the keyring for the v9→v10
+// backfill and for every subsequent encrypted-column read/write.
+func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
+	if kr == nil {
+		return nil, fmt.Errorf("store: Open requires a non-nil keyring (see ADR-0001)")
+	}
 	if dbPath != ":memory:" {
 		if strings.HasPrefix(dbPath, "~/") {
 			home, err := os.UserHomeDir()
@@ -58,7 +71,7 @@ func Open(dbPath string) (*DB, error) {
 		}
 	}
 
-	return &DB{db: db}, nil
+	return &DB{db: db, keyring: kr}, nil
 }
 
 // Close closes the database connection.
@@ -443,7 +456,147 @@ func (d *DB) migrate() error {
 				return fmt.Errorf("migrate v8→v9: %w", err)
 			}
 		}
+		version = 9
+	}
+
+	if version < 10 {
+		// ADR-0001 step 5: pilot encryption of messages.subject. Add the
+		// subject_ct BLOB column and encrypt every existing plaintext
+		// subject into it. The plaintext `subject` column stays in place
+		// for now — FTS5 still indexes it, and the blind-token FTS5
+		// rebuild plus plaintext drop both land in step 7.
+		//
+		// ALTER TABLE cannot be wrapped in a transaction with the backfill
+		// (SQLite implicitly commits before DDL), so the column-add is
+		// idempotent: if a previous attempt added the column but failed in
+		// the backfill, we re-detect it via PRAGMA and skip straight to
+		// the backfill. The backfill is itself a transaction that rolls
+		// back cleanly on failure.
+		has, err := hasColumn(d.db, "messages", "subject_ct")
+		if err != nil {
+			return fmt.Errorf("migrate v9→v10 inspect: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN subject_ct BLOB"); err != nil {
+				return fmt.Errorf("migrate v9→v10 add column: %w", err)
+			}
+		}
+		if err := d.backfillSubjectCt(); err != nil {
+			return fmt.Errorf("migrate v9→v10 backfill: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 10 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v9→v10 bump: %w", err)
+		}
 	}
 
 	return nil
+}
+
+// hasColumn returns true if the named column already exists on table.
+// Used to make ALTER TABLE ADD COLUMN steps idempotent after a partial
+// migration (SQLite ALTER has no IF NOT EXISTS).
+func hasColumn(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// encryptSubject seals plain with the subject sub-key and returns the
+// envelope blob. An empty plaintext maps to a nil BLOB so the column
+// stays distinguishable from "encrypted empty string" — readers fall
+// back to the plaintext column when subject_ct IS NULL.
+func (d *DB) encryptSubject(plain string) ([]byte, error) {
+	if plain == "" {
+		return nil, nil
+	}
+	return dbcrypto.Encrypt(d.keyring.Subject, []byte(plain))
+}
+
+// decryptSubject returns the plaintext subject for a row. It prefers the
+// encrypted ciphertext when present and only falls back to the plaintext
+// column for legacy rows the v9→v10 backfill hasn't reached. A non-nil
+// subject_ct that fails to decrypt is a hard error — a silent fallback
+// would mask key/cipher mismatches that turn into corruption in step 7.
+func (d *DB) decryptSubject(plain string, ct []byte) (string, error) {
+	if len(ct) == 0 {
+		return plain, nil
+	}
+	out, err := dbcrypto.Decrypt(d.keyring.Subject, ct)
+	if err != nil {
+		return "", fmt.Errorf("decrypt subject: %w", err)
+	}
+	return string(out), nil
+}
+
+// backfillSubjectCt encrypts every existing messages.subject into the new
+// subject_ct BLOB column. Run inside a single transaction so a mid-loop
+// failure rolls back and leaves the schema_version unbumped — next Init()
+// retries the whole migration.
+//
+// Empty/NULL subjects are skipped to keep subject_ct = NULL distinguishable
+// from "encrypted empty string" — readers fall back to the plaintext column
+// when subject_ct IS NULL.
+func (d *DB) backfillSubjectCt() error {
+	if d.keyring == nil || d.keyring.Subject == nil {
+		return fmt.Errorf("no keyring available for subject backfill")
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rolled back if Commit not reached
+
+	rows, err := tx.Query(`SELECT id, subject FROM messages
+		WHERE subject IS NOT NULL AND subject <> '' AND subject_ct IS NULL`)
+	if err != nil {
+		return fmt.Errorf("select rows: %w", err)
+	}
+	type pending struct {
+		id      int64
+		subject string
+	}
+	var batch []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.subject); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan: %w", err)
+		}
+		batch = append(batch, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate rows: %w", err)
+	}
+
+	stmt, err := tx.Prepare("UPDATE messages SET subject_ct = ? WHERE id = ?")
+	if err != nil {
+		return fmt.Errorf("prepare update: %w", err)
+	}
+	defer stmt.Close()
+	for _, p := range batch {
+		ct, err := dbcrypto.Encrypt(d.keyring.Subject, []byte(p.subject))
+		if err != nil {
+			return fmt.Errorf("encrypt id=%d: %w", p.id, err)
+		}
+		if _, err := stmt.Exec(ct, p.id); err != nil {
+			return fmt.Errorf("update id=%d: %w", p.id, err)
+		}
+	}
+	return tx.Commit()
 }

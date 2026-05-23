@@ -1,12 +1,14 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/durian-dev/durian/cli/internal/dbcrypto"
 	"github.com/durian-dev/durian/cli/internal/protocol"
 	"github.com/durian-dev/durian/cli/internal/store"
 )
@@ -26,7 +28,11 @@ func (m *mockFetcher) FetchAttachment(_ context.Context, _, _ string,
 
 func newTestStore(t *testing.T) *store.DB {
 	t.Helper()
-	db, err := store.Open(":memory:")
+	kr, err := dbcrypto.NewKeyring(bytes.Repeat([]byte{0x42}, dbcrypto.MasterKeyLen))
+	if err != nil {
+		t.Fatalf("test keyring: %v", err)
+	}
+	db, err := store.Open(":memory:", kr)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

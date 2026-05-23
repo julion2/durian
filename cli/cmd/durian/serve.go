@@ -76,12 +76,17 @@ func runServe(cmd *cobra.Command, args []string) {
 		slog.Info("Opened contacts database", "module", "SERVE", "path", contactsDBPath)
 	}
 
+	// ADR-0001 steps 4+5: bootstrap the master key BEFORE opening the
+	// store. The keyring is required to encrypt new rows and to back-fill
+	// existing rows on the v9→v10 migration.
+	keyring := bootstrapKeyring()
+
 	// Open email store (required for reads)
 	dbPath := serveDB
 	if dbPath == "" {
 		dbPath = store.DefaultDBPath()
 	}
-	emailDB, err := store.Open(dbPath)
+	emailDB, err := store.Open(dbPath, keyring)
 	if err != nil {
 		slog.Error("Email store required but unavailable", "module", "SERVE", "err", err)
 		fmt.Fprintln(os.Stderr, "Error: email store unavailable:", err)
@@ -95,12 +100,6 @@ func runServe(cmd *cobra.Command, args []string) {
 	}
 	defer emailDB.Close()
 	slog.Info("Opened email store", "module", "SERVE", "path", dbPath) // encgrep:allow message text, no PII attr
-
-	// ADR-0001 step 4: bootstrap the at-rest master key. This is the
-	// canonical first-run path — generates a fresh key if missing, loads
-	// the existing one otherwise. The key is not retained in memory here;
-	// step 5 will wire it into a keyring once encrypted columns exist.
-	ensureMasterKey()
 
 	h := handler.New(emailDB, contactsDB)
 	eventHub := handler.NewEventHub()

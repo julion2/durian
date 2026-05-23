@@ -239,7 +239,7 @@ func deleteDraftFromLocalStore(account *config.AccountConfig, messageID string) 
 		return
 	}
 
-	db, err := store.Open(store.DefaultDBPath())
+	db, err := store.Open(store.DefaultDBPath(), bootstrapKeyring())
 	if err != nil {
 		slog.Debug("Could not open store for draft delete", "module", "DRAFT", "err", err)
 		return
@@ -259,7 +259,7 @@ func saveDraftToLocalStore(account *config.AccountConfig, messageID string, msg 
 		return
 	}
 
-	db, err := store.Open(store.DefaultDBPath())
+	db, err := store.Open(store.DefaultDBPath(), bootstrapKeyring())
 	if err != nil {
 		slog.Debug("Could not open store for draft insert", "module", "DRAFT", "err", err)
 		return

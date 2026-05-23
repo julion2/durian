@@ -16,7 +16,10 @@ go_library(
     ],
     importpath = "github.com/durian-dev/durian/cli/internal/store",
     visibility = ["//cli:__subpackages__"],
-    deps = ["@org_modernc_sqlite//:sqlite"],
+    deps = [
+        "//cli/internal/dbcrypto",
+        "@org_modernc_sqlite//:sqlite",
+    ],
 )
 
 go_test(
@@ -33,4 +36,5 @@ go_test(
         "threads_test.go",
     ],
     embed = [":store"],
+    deps = ["//cli/internal/dbcrypto"],
 )

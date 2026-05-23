@@ -47,6 +47,7 @@ go_test(
     embed = [":handler"],
     deps = [
         "//cli/internal/contacts",
+        "//cli/internal/dbcrypto",
         "//cli/internal/protocol",
         "//cli/internal/store",
         "@com_github_emersion_go_imap//:go-imap",

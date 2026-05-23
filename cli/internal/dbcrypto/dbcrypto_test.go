@@ -197,3 +197,45 @@ func TestDecrypt_RejectsBadKey(t *testing.T) {
 		t.Errorf("err = %v, want ErrInvalidKey", err)
 	}
 }
+
+// --- Keyring ---
+
+func TestNewKeyring_DerivesSubjectSubKey(t *testing.T) {
+	master := bytes.Repeat([]byte{0x77}, MasterKeyLen)
+	kr, err := NewKeyring(master)
+	if err != nil {
+		t.Fatalf("NewKeyring: %v", err)
+	}
+	if len(kr.Subject) != KeyLen {
+		t.Errorf("Subject sub-key length = %d, want %d", len(kr.Subject), KeyLen)
+	}
+	// Must match a direct DeriveSubKey call — they have to be bit-identical
+	// because both paths produce the same on-disk ciphertexts.
+	want, err := DeriveSubKey(master, LabelSubject)
+	if err != nil {
+		t.Fatalf("DeriveSubKey: %v", err)
+	}
+	if !bytes.Equal(kr.Subject, want) {
+		t.Errorf("Keyring.Subject diverged from DeriveSubKey(LabelSubject)")
+	}
+}
+
+func TestNewKeyring_RejectsBadMasterLen(t *testing.T) {
+	if _, err := NewKeyring(make([]byte, 16)); !errors.Is(err, ErrInvalidKey) {
+		t.Errorf("err = %v, want ErrInvalidKey wrapped", err)
+	}
+}
+
+func TestKeyring_Wipe(t *testing.T) {
+	kr, err := NewKeyring(bytes.Repeat([]byte{0x33}, MasterKeyLen))
+	if err != nil {
+		t.Fatalf("NewKeyring: %v", err)
+	}
+	kr.Wipe()
+	if kr.Subject != nil {
+		t.Errorf("Subject not nilled after Wipe: %x", kr.Subject)
+	}
+	// Wipe must be safe on nil receiver — defensive for shutdown paths.
+	var nilKr *Keyring
+	nilKr.Wipe()
+}

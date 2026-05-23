@@ -38,7 +38,7 @@ func runTagSyncPushAll(cmd *cobra.Command, args []string) error {
 	}
 
 	// Open store
-	db, err := store.Open(store.DefaultDBPath())
+	db, err := store.Open(store.DefaultDBPath(), bootstrapKeyring())
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
