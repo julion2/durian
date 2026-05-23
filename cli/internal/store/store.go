@@ -543,6 +543,29 @@ func (d *DB) migrate() error {
 		if _, err := d.db.Exec("UPDATE schema_version SET version = 12 WHERE rowid = 1"); err != nil {
 			return fmt.Errorf("migrate v11→v12 bump: %w", err)
 		}
+		version = 12
+	}
+
+	if version < 13 {
+		// ADR-0001 step 6: encrypt message_headers.value (headers_key).
+		// Header `name` stays plaintext — already a public registry
+		// (Return-Path, Authentication-Results, List-Unsubscribe, etc.)
+		// per ADR-0001 §3, and we need it for rule matching joins.
+		has, err := hasColumn(d.db, "message_headers", "value_ct")
+		if err != nil {
+			return fmt.Errorf("migrate v12→v13 inspect value_ct: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE message_headers ADD COLUMN value_ct BLOB"); err != nil {
+				return fmt.Errorf("migrate v12→v13 add value_ct: %w", err)
+			}
+		}
+		if err := d.backfillHeaderValueCt(); err != nil {
+			return fmt.Errorf("migrate v12→v13 backfill: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 13 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v12→v13 bump: %w", err)
+		}
 	}
 
 	return nil
@@ -742,6 +765,86 @@ func (d *DB) backfillBodyCt() error {
 		}
 		if _, err := stmt.Exec(textCT, htmlCT, p.id); err != nil {
 			return fmt.Errorf("update id=%d: %w", p.id, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// encryptHeaderValue seals plain with the headers sub-key. Empty plaintext
+// maps to nil so value_ct stays NULL — same convention as encryptSubject.
+func (d *DB) encryptHeaderValue(plain string) ([]byte, error) {
+	if plain == "" {
+		return nil, nil
+	}
+	return dbcrypto.Encrypt(d.keyring.Headers, []byte(plain))
+}
+
+// decryptHeaderValue returns the plaintext header value, preferring ct
+// when present. Decrypt failures on non-nil ct are hard errors.
+func (d *DB) decryptHeaderValue(plain string, ct []byte) (string, error) {
+	if len(ct) == 0 {
+		return plain, nil
+	}
+	out, err := dbcrypto.Decrypt(d.keyring.Headers, ct)
+	if err != nil {
+		return "", fmt.Errorf("decrypt header value: %w", err)
+	}
+	return string(out), nil
+}
+
+// backfillHeaderValueCt encrypts every existing message_headers.value into
+// the new value_ct BLOB column. Single transaction so a mid-loop failure
+// rolls back and leaves schema_version unbumped. message_headers can be
+// 5-10x the messages row count (each message has several persisted
+// headers); the prepared-statement loop keeps per-row overhead minimal.
+func (d *DB) backfillHeaderValueCt() error {
+	if d.keyring == nil || d.keyring.Headers == nil {
+		return fmt.Errorf("no keyring available for header backfill")
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// message_headers has a composite PK (message_id, name) — both are
+	// needed to address the row in the UPDATE.
+	rows, err := tx.Query(`SELECT message_id, name, value FROM message_headers
+		WHERE value IS NOT NULL AND value <> '' AND value_ct IS NULL`)
+	if err != nil {
+		return fmt.Errorf("select rows: %w", err)
+	}
+	type pending struct {
+		messageID int64
+		name      string
+		value     string
+	}
+	var batch []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.messageID, &p.name, &p.value); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan: %w", err)
+		}
+		batch = append(batch, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate rows: %w", err)
+	}
+
+	stmt, err := tx.Prepare("UPDATE message_headers SET value_ct = ? WHERE message_id = ? AND name = ?")
+	if err != nil {
+		return fmt.Errorf("prepare update: %w", err)
+	}
+	defer stmt.Close()
+	for _, p := range batch {
+		ct, err := d.encryptHeaderValue(p.value)
+		if err != nil {
+			return fmt.Errorf("encrypt header (%d/%s): %w", p.messageID, p.name, err)
+		}
+		if _, err := stmt.Exec(ct, p.messageID, p.name); err != nil {
+			return fmt.Errorf("update (%d/%s): %w", p.messageID, p.name, err)
 		}
 	}
 	return tx.Commit()

@@ -6,10 +6,16 @@ import (
 )
 
 // InsertHeader stores a message header. Overwrites if the header already exists.
+// Writes both plaintext value (so existing reads still work) and value_ct
+// (ADR-0001 step 6). The plaintext column dies in step 7.
 func (d *DB) InsertHeader(messageDBID int64, name, value string) error {
-	_, err := d.db.Exec(
-		"INSERT OR REPLACE INTO message_headers (message_id, name, value) VALUES (?, ?, ?)",
-		messageDBID, name, value)
+	valueCT, err := d.encryptHeaderValue(value)
+	if err != nil {
+		return fmt.Errorf("encrypt header value: %w", err)
+	}
+	_, err = d.db.Exec(
+		"INSERT OR REPLACE INTO message_headers (message_id, name, value, value_ct) VALUES (?, ?, ?, ?)",
+		messageDBID, name, value, valueCT)
 	if err != nil {
 		return fmt.Errorf("insert header: %w", err)
 	}
@@ -19,13 +25,18 @@ func (d *DB) InsertHeader(messageDBID int64, name, value string) error {
 // GetHeader returns a single header value for a message. Returns "" if not found.
 func (d *DB) GetHeader(messageDBID int64, name string) (string, error) {
 	var value string
+	var valueCT []byte
 	err := d.db.QueryRow(
-		"SELECT value FROM message_headers WHERE message_id = ? AND name = ?",
-		messageDBID, name).Scan(&value)
+		"SELECT value, value_ct FROM message_headers WHERE message_id = ? AND name = ?",
+		messageDBID, name).Scan(&value, &valueCT)
 	if err != nil {
 		return "", nil // not found
 	}
-	return value, nil
+	out, err := d.decryptHeaderValue(value, valueCT)
+	if err != nil {
+		return "", err
+	}
+	return out, nil
 }
 
 // HasHeaders returns true if the message has any stored headers.
@@ -95,7 +106,7 @@ func (d *DB) AllMessages() ([]*Message, error) {
 // AllHeadersByMessage loads all stored headers, keyed by message DB ID.
 // Header names are returned in canonical MIME form (e.g. "List-Unsubscribe").
 func (d *DB) AllHeadersByMessage() (map[int64]map[string][]string, error) {
-	rows, err := d.db.Query("SELECT message_id, name, value FROM message_headers")
+	rows, err := d.db.Query("SELECT message_id, name, value, value_ct FROM message_headers")
 	if err != nil {
 		return nil, fmt.Errorf("query headers: %w", err)
 	}
@@ -105,14 +116,19 @@ func (d *DB) AllHeadersByMessage() (map[int64]map[string][]string, error) {
 	for rows.Next() {
 		var msgID int64
 		var name, value string
-		if err := rows.Scan(&msgID, &name, &value); err != nil {
+		var valueCT []byte
+		if err := rows.Scan(&msgID, &name, &value, &valueCT); err != nil {
 			return nil, fmt.Errorf("scan header: %w", err)
+		}
+		plain, err := d.decryptHeaderValue(value, valueCT)
+		if err != nil {
+			return nil, err
 		}
 		if result[msgID] == nil {
 			result[msgID] = make(map[string][]string)
 		}
 		canonical := textproto.CanonicalMIMEHeaderKey(name)
-		result[msgID][canonical] = append(result[msgID][canonical], value)
+		result[msgID][canonical] = append(result[msgID][canonical], plain)
 	}
 	return result, rows.Err()
 }
