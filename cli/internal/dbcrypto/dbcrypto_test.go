@@ -200,23 +200,48 @@ func TestDecrypt_RejectsBadKey(t *testing.T) {
 
 // --- Keyring ---
 
-func TestNewKeyring_DerivesSubjectSubKey(t *testing.T) {
+func TestNewKeyring_DerivesAllSubKeys(t *testing.T) {
 	master := bytes.Repeat([]byte{0x77}, MasterKeyLen)
 	kr, err := NewKeyring(master)
 	if err != nil {
 		t.Fatalf("NewKeyring: %v", err)
 	}
-	if len(kr.Subject) != KeyLen {
-		t.Errorf("Subject sub-key length = %d, want %d", len(kr.Subject), KeyLen)
+	// Every sub-key must (a) be the right length and (b) match a direct
+	// DeriveSubKey call bit-for-bit — both paths produce the same on-disk
+	// ciphertexts, any drift here corrupts the entire DB.
+	cases := []struct {
+		name  string
+		got   []byte
+		label Label
+	}{
+		{"Subject", kr.Subject, LabelSubject},
+		{"Body", kr.Body, LabelBody},
+		{"Addrs", kr.Addrs, LabelAddrs},
 	}
-	// Must match a direct DeriveSubKey call — they have to be bit-identical
-	// because both paths produce the same on-disk ciphertexts.
-	want, err := DeriveSubKey(master, LabelSubject)
-	if err != nil {
-		t.Fatalf("DeriveSubKey: %v", err)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if len(c.got) != KeyLen {
+				t.Errorf("length = %d, want %d", len(c.got), KeyLen)
+			}
+			want, err := DeriveSubKey(master, c.label)
+			if err != nil {
+				t.Fatalf("DeriveSubKey: %v", err)
+			}
+			if !bytes.Equal(c.got, want) {
+				t.Errorf("diverged from DeriveSubKey(%s)", c.label)
+			}
+		})
 	}
-	if !bytes.Equal(kr.Subject, want) {
-		t.Errorf("Keyring.Subject diverged from DeriveSubKey(LabelSubject)")
+	// Pairwise distinctness — guards against future "oops, copy-paste".
+	pairs := [][2][]byte{
+		{kr.Subject, kr.Body},
+		{kr.Subject, kr.Addrs},
+		{kr.Body, kr.Addrs},
+	}
+	for i, p := range pairs {
+		if bytes.Equal(p[0], p[1]) {
+			t.Errorf("pair %d: sub-keys collided", i)
+		}
 	}
 }
 

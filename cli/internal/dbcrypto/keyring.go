@@ -10,14 +10,16 @@ import (
 // start, retained in memory for the lifetime of the daemon, and consumed
 // by the store layer for transparent encrypt-on-write / decrypt-on-read.
 //
-// Step 5 only derives Subject. Subsequent steps fill in Body, Headers,
-// Addrs, Draft, Contact, FTSToken, Meta — each as its own field so callers
-// never have to remember which label to pass.
+// Subsequent steps fill in Headers, Addrs, Draft, Contact, FTSToken, Meta
+// — each as its own field so callers never have to remember which label
+// to pass.
 type Keyring struct {
 	Subject []byte // encrypts messages.subject (LabelSubject)
+	Body    []byte // encrypts messages.body_text + body_html (LabelBody)
+	Addrs   []byte // encrypts messages.from_addr + to_addrs + cc_addrs (LabelAddrs)
 }
 
-// NewKeyring derives every step-5 sub-key from a 32-byte master key.
+// NewKeyring derives every currently-shipped sub-key from a 32-byte master.
 // The master is read once and never retained by the returned Keyring; the
 // caller is free to (and should) wipe its own copy once this returns.
 func NewKeyring(master []byte) (*Keyring, error) {
@@ -25,7 +27,15 @@ func NewKeyring(master []byte) (*Keyring, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dbcrypto: derive subject sub-key: %w", err)
 	}
-	return &Keyring{Subject: subject}, nil
+	body, err := DeriveSubKey(master, LabelBody)
+	if err != nil {
+		return nil, fmt.Errorf("dbcrypto: derive body sub-key: %w", err)
+	}
+	addrs, err := DeriveSubKey(master, LabelAddrs)
+	if err != nil {
+		return nil, fmt.Errorf("dbcrypto: derive addrs sub-key: %w", err)
+	}
+	return &Keyring{Subject: subject, Body: body, Addrs: addrs}, nil
 }
 
 // Wipe overwrites every sub-key in place with zeroes and nils the slice
@@ -37,7 +47,11 @@ func (k *Keyring) Wipe() {
 		return
 	}
 	zero(k.Subject)
+	zero(k.Body)
+	zero(k.Addrs)
 	k.Subject = nil
+	k.Body = nil
+	k.Addrs = nil
 }
 
 // zero overwrites b with zero bytes in constant time. Used by Wipe.

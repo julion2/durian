@@ -55,8 +55,9 @@ func (d *DB) GetMessageDBID(messageID, account string) (int64, error) {
 
 // AllMessages returns all messages with fields needed for rule matching.
 func (d *DB) AllMessages() ([]*Message, error) {
-	rows, err := d.db.Query(
-		"SELECT id, message_id, subject, subject_ct, from_addr, to_addrs, cc_addrs, body_text, account FROM messages")
+	rows, err := d.db.Query(`SELECT id, message_id, subject, subject_ct,
+		from_addr, from_addr_ct, to_addrs, to_addrs_ct, cc_addrs, cc_addrs_ct,
+		body_text, body_text_ct, account FROM messages`)
 	if err != nil {
 		return nil, fmt.Errorf("query messages: %w", err)
 	}
@@ -65,11 +66,25 @@ func (d *DB) AllMessages() ([]*Message, error) {
 	var msgs []*Message
 	for rows.Next() {
 		m := &Message{}
-		var subjectCT []byte
-		if err := rows.Scan(&m.ID, &m.MessageID, &m.Subject, &subjectCT, &m.FromAddr, &m.ToAddrs, &m.CCAddrs, &m.BodyText, &m.Account); err != nil {
+		var subjectCT, fromAddrCT, toAddrsCT, ccAddrsCT, bodyTextCT []byte
+		if err := rows.Scan(&m.ID, &m.MessageID, &m.Subject, &subjectCT,
+			&m.FromAddr, &fromAddrCT, &m.ToAddrs, &toAddrsCT, &m.CCAddrs, &ccAddrsCT,
+			&m.BodyText, &bodyTextCT, &m.Account); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
 		if m.Subject, err = d.decryptSubject(m.Subject, subjectCT); err != nil {
+			return nil, err
+		}
+		if m.FromAddr, err = d.decryptAddr(m.FromAddr, fromAddrCT); err != nil {
+			return nil, err
+		}
+		if m.ToAddrs, err = d.decryptAddr(m.ToAddrs, toAddrsCT); err != nil {
+			return nil, err
+		}
+		if m.CCAddrs, err = d.decryptAddr(m.CCAddrs, ccAddrsCT); err != nil {
+			return nil, err
+		}
+		if m.BodyText, err = d.decryptBody(m.BodyText, bodyTextCT); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, m)

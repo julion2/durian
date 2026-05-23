@@ -487,6 +487,62 @@ func (d *DB) migrate() error {
 		if _, err := d.db.Exec("UPDATE schema_version SET version = 10 WHERE rowid = 1"); err != nil {
 			return fmt.Errorf("migrate v9→v10 bump: %w", err)
 		}
+		version = 10
+	}
+
+	if version < 11 {
+		// ADR-0001 step 6: extend pilot encryption to messages.body_text
+		// and messages.body_html. Same pattern as v10 (subject) — two new
+		// BLOB columns, plaintext columns stay so FTS5 keeps indexing
+		// body_text until the step-7 rebuild.
+		for _, col := range []string{"body_text_ct", "body_html_ct"} {
+			has, err := hasColumn(d.db, "messages", col)
+			if err != nil {
+				return fmt.Errorf("migrate v10→v11 inspect %s: %w", col, err)
+			}
+			if !has {
+				if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN " + col + " BLOB"); err != nil {
+					return fmt.Errorf("migrate v10→v11 add %s: %w", col, err)
+				}
+			}
+		}
+		if err := d.backfillBodyCt(); err != nil {
+			return fmt.Errorf("migrate v10→v11 backfill: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 11 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v10→v11 bump: %w", err)
+		}
+		version = 11
+	}
+
+	if version < 12 {
+		// ADR-0001 step 6: extend encryption to messages.from_addr,
+		// to_addrs, cc_addrs (addrs_key). Same column-doubling pattern;
+		// plaintext columns stay so FTS5 keeps indexing from_addr/to_addrs
+		// and search.go's GROUP_CONCAT(from_addr) AS authors keeps working
+		// until step 7.
+		//
+		// idx_messages_from_addr is intentionally NOT dropped yet — the
+		// plaintext column it covers still exists and powers GetSenderCounts
+		// + search. ADR-0001 §3 schedules that index drop for step 7 when
+		// the plaintext column itself goes.
+		for _, col := range []string{"from_addr_ct", "to_addrs_ct", "cc_addrs_ct"} {
+			has, err := hasColumn(d.db, "messages", col)
+			if err != nil {
+				return fmt.Errorf("migrate v11→v12 inspect %s: %w", col, err)
+			}
+			if !has {
+				if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN " + col + " BLOB"); err != nil {
+					return fmt.Errorf("migrate v11→v12 add %s: %w", col, err)
+				}
+			}
+		}
+		if err := d.backfillAddrsCt(); err != nil {
+			return fmt.Errorf("migrate v11→v12 backfill: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 12 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v11→v12 bump: %w", err)
+		}
 	}
 
 	return nil
@@ -595,6 +651,183 @@ func (d *DB) backfillSubjectCt() error {
 			return fmt.Errorf("encrypt id=%d: %w", p.id, err)
 		}
 		if _, err := stmt.Exec(ct, p.id); err != nil {
+			return fmt.Errorf("update id=%d: %w", p.id, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// encryptBody seals plain with the body sub-key. Empty plaintext maps to
+// nil so the ct column stays NULL — same convention as encryptSubject.
+func (d *DB) encryptBody(plain string) ([]byte, error) {
+	if plain == "" {
+		return nil, nil
+	}
+	return dbcrypto.Encrypt(d.keyring.Body, []byte(plain))
+}
+
+// decryptBody returns the plaintext body for a row, preferring the
+// encrypted ciphertext when present and falling back to the plaintext
+// column only when ct IS NULL (legacy/unmigrated rows). Decrypt failures
+// on a non-nil ct are hard errors — silent fallback would mask a
+// key/cipher mismatch and become data loss in step 7.
+func (d *DB) decryptBody(plain string, ct []byte) (string, error) {
+	if len(ct) == 0 {
+		return plain, nil
+	}
+	out, err := dbcrypto.Decrypt(d.keyring.Body, ct)
+	if err != nil {
+		return "", fmt.Errorf("decrypt body: %w", err)
+	}
+	return string(out), nil
+}
+
+// backfillBodyCt encrypts every existing messages.body_text and
+// body_html into the new BLOB columns. Single transaction so a mid-loop
+// failure rolls back and leaves schema_version unbumped — next Init()
+// retries the migration from scratch.
+//
+// Bodies can be large (KB to MB); we still load the whole batch into RAM
+// before the UPDATE pass to keep the row + tx-prepared-statement lifetimes
+// simple. Memory cap on a typical mailbox (~50k rows × ~50 KB avg) is in
+// the hundreds-of-MB range, acceptable for a one-shot migration.
+func (d *DB) backfillBodyCt() error {
+	if d.keyring == nil || d.keyring.Body == nil {
+		return fmt.Errorf("no keyring available for body backfill")
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rolled back if Commit not reached
+
+	rows, err := tx.Query(`SELECT id, body_text, body_html FROM messages
+		WHERE (body_text IS NOT NULL AND body_text <> '' AND body_text_ct IS NULL)
+		   OR (body_html IS NOT NULL AND body_html <> '' AND body_html_ct IS NULL)`)
+	if err != nil {
+		return fmt.Errorf("select rows: %w", err)
+	}
+	type pending struct {
+		id       int64
+		bodyText string
+		bodyHTML string
+	}
+	var batch []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.bodyText, &p.bodyHTML); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan: %w", err)
+		}
+		batch = append(batch, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate rows: %w", err)
+	}
+
+	stmt, err := tx.Prepare("UPDATE messages SET body_text_ct = ?, body_html_ct = ? WHERE id = ?")
+	if err != nil {
+		return fmt.Errorf("prepare update: %w", err)
+	}
+	defer stmt.Close()
+	for _, p := range batch {
+		textCT, err := d.encryptBody(p.bodyText)
+		if err != nil {
+			return fmt.Errorf("encrypt body_text id=%d: %w", p.id, err)
+		}
+		htmlCT, err := d.encryptBody(p.bodyHTML)
+		if err != nil {
+			return fmt.Errorf("encrypt body_html id=%d: %w", p.id, err)
+		}
+		if _, err := stmt.Exec(textCT, htmlCT, p.id); err != nil {
+			return fmt.Errorf("update id=%d: %w", p.id, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// encryptAddr seals plain with the addrs sub-key. Empty plaintext maps to
+// nil so the ct column stays NULL — same convention as encryptSubject.
+func (d *DB) encryptAddr(plain string) ([]byte, error) {
+	if plain == "" {
+		return nil, nil
+	}
+	return dbcrypto.Encrypt(d.keyring.Addrs, []byte(plain))
+}
+
+// decryptAddr returns the plaintext address for a row, preferring the
+// encrypted ciphertext and falling back to the plaintext column only when
+// ct IS NULL. Decrypt failures on non-nil ct are hard errors.
+func (d *DB) decryptAddr(plain string, ct []byte) (string, error) {
+	if len(ct) == 0 {
+		return plain, nil
+	}
+	out, err := dbcrypto.Decrypt(d.keyring.Addrs, ct)
+	if err != nil {
+		return "", fmt.Errorf("decrypt addr: %w", err)
+	}
+	return string(out), nil
+}
+
+// backfillAddrsCt encrypts every existing from_addr / to_addrs / cc_addrs
+// into the new BLOB columns. Single transaction so a mid-loop failure
+// rolls back cleanly. Rows where all three are empty/NULL are skipped so
+// their *_ct columns stay NULL.
+func (d *DB) backfillAddrsCt() error {
+	if d.keyring == nil || d.keyring.Addrs == nil {
+		return fmt.Errorf("no keyring available for addrs backfill")
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // rolled back if Commit not reached
+
+	rows, err := tx.Query(`SELECT id, from_addr, to_addrs, cc_addrs FROM messages
+		WHERE (from_addr IS NOT NULL AND from_addr <> '' AND from_addr_ct IS NULL)
+		   OR (to_addrs  IS NOT NULL AND to_addrs  <> '' AND to_addrs_ct  IS NULL)
+		   OR (cc_addrs  IS NOT NULL AND cc_addrs  <> '' AND cc_addrs_ct  IS NULL)`)
+	if err != nil {
+		return fmt.Errorf("select rows: %w", err)
+	}
+	type pending struct {
+		id                       int64
+		fromAddr, toAddrs, ccAddrs string
+	}
+	var batch []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.fromAddr, &p.toAddrs, &p.ccAddrs); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan: %w", err)
+		}
+		batch = append(batch, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate rows: %w", err)
+	}
+
+	stmt, err := tx.Prepare("UPDATE messages SET from_addr_ct = ?, to_addrs_ct = ?, cc_addrs_ct = ? WHERE id = ?")
+	if err != nil {
+		return fmt.Errorf("prepare update: %w", err)
+	}
+	defer stmt.Close()
+	for _, p := range batch {
+		fromCT, err := d.encryptAddr(p.fromAddr)
+		if err != nil {
+			return fmt.Errorf("encrypt from_addr id=%d: %w", p.id, err)
+		}
+		toCT, err := d.encryptAddr(p.toAddrs)
+		if err != nil {
+			return fmt.Errorf("encrypt to_addrs id=%d: %w", p.id, err)
+		}
+		ccCT, err := d.encryptAddr(p.ccAddrs)
+		if err != nil {
+			return fmt.Errorf("encrypt cc_addrs id=%d: %w", p.id, err)
+		}
+		if _, err := stmt.Exec(fromCT, toCT, ccCT, p.id); err != nil {
 			return fmt.Errorf("update id=%d: %w", p.id, err)
 		}
 	}
