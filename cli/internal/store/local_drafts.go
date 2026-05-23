@@ -21,13 +21,18 @@ func (d *DB) SaveLocalDraft(draft *LocalDraft) error {
 	}
 	draft.ModifiedAt = now
 
-	_, err := d.db.Exec(`
-		INSERT INTO local_drafts (id, draft_json, created_at, modified_at)
-		VALUES (?, ?, ?, ?)
+	ct, err := d.encryptDraftJSON(draft.DraftJSON)
+	if err != nil {
+		return fmt.Errorf("encrypt draft_json: %w", err)
+	}
+	_, err = d.db.Exec(`
+		INSERT INTO local_drafts (id, draft_json, draft_json_ct, created_at, modified_at)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			draft_json = excluded.draft_json,
+			draft_json_ct = excluded.draft_json_ct,
 			modified_at = excluded.modified_at`,
-		draft.ID, draft.DraftJSON, draft.CreatedAt, draft.ModifiedAt)
+		draft.ID, draft.DraftJSON, ct, draft.CreatedAt, draft.ModifiedAt)
 	if err != nil {
 		return fmt.Errorf("save local draft: %w", err)
 	}
@@ -37,11 +42,15 @@ func (d *DB) SaveLocalDraft(draft *LocalDraft) error {
 // GetLocalDraft retrieves a local draft by ID.
 func (d *DB) GetLocalDraft(id string) (*LocalDraft, error) {
 	draft := &LocalDraft{}
+	var ct []byte
 	err := d.db.QueryRow(
-		"SELECT id, draft_json, created_at, modified_at FROM local_drafts WHERE id = ?", id,
-	).Scan(&draft.ID, &draft.DraftJSON, &draft.CreatedAt, &draft.ModifiedAt)
+		"SELECT id, draft_json, draft_json_ct, created_at, modified_at FROM local_drafts WHERE id = ?", id,
+	).Scan(&draft.ID, &draft.DraftJSON, &ct, &draft.CreatedAt, &draft.ModifiedAt)
 	if err != nil {
 		return nil, fmt.Errorf("get local draft: %w", err)
+	}
+	if draft.DraftJSON, err = d.decryptDraftJSON(draft.DraftJSON, ct); err != nil {
+		return nil, err
 	}
 	return draft, nil
 }
@@ -62,7 +71,7 @@ func (d *DB) DeleteLocalDraft(id string) error {
 // ListLocalDrafts returns all local drafts, newest first.
 func (d *DB) ListLocalDrafts() ([]*LocalDraft, error) {
 	rows, err := d.db.Query(
-		"SELECT id, draft_json, created_at, modified_at FROM local_drafts ORDER BY modified_at DESC")
+		"SELECT id, draft_json, draft_json_ct, created_at, modified_at FROM local_drafts ORDER BY modified_at DESC")
 	if err != nil {
 		return nil, fmt.Errorf("list local drafts: %w", err)
 	}
@@ -71,8 +80,12 @@ func (d *DB) ListLocalDrafts() ([]*LocalDraft, error) {
 	var drafts []*LocalDraft
 	for rows.Next() {
 		draft := &LocalDraft{}
-		if err := rows.Scan(&draft.ID, &draft.DraftJSON, &draft.CreatedAt, &draft.ModifiedAt); err != nil {
+		var ct []byte
+		if err := rows.Scan(&draft.ID, &draft.DraftJSON, &ct, &draft.CreatedAt, &draft.ModifiedAt); err != nil {
 			return nil, fmt.Errorf("scan local draft: %w", err)
+		}
+		if draft.DraftJSON, err = d.decryptDraftJSON(draft.DraftJSON, ct); err != nil {
+			return nil, err
 		}
 		drafts = append(drafts, draft)
 	}
