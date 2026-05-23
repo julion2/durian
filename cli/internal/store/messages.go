@@ -79,6 +79,13 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 	if err != nil {
 		return fmt.Errorf("encrypt cc_addrs: %w", err)
 	}
+	// ADR-0001 step 6: non-boolean flag parts go to flags_other under
+	// the meta sub-key. Booleans (is_seen/is_flagged/is_deleted) are
+	// derived elsewhere in this insert path's downstream tag flow.
+	flagsOtherCT, err := d.encryptMeta(flagsOtherForEncryption(msg.Flags))
+	if err != nil {
+		return fmt.Errorf("encrypt flags_other: %w", err)
+	}
 
 	err = tx.QueryRow(`
 		INSERT INTO messages (
@@ -86,8 +93,8 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 			from_addr, from_addr_ct, to_addrs, to_addrs_ct, cc_addrs, cc_addrs_ct,
 			date, created_at,
 			body_text, body_text_ct, body_html, body_html_ct,
-			mailbox, flags, uid, size, fetched_body, account
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			mailbox, flags, flags_other, uid, size, fetched_body, account
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id, account) DO UPDATE SET
 			subject = excluded.subject,
 			subject_ct = excluded.subject_ct,
@@ -107,6 +114,7 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 			                 THEN excluded.body_html_ct ELSE messages.body_html_ct END,
 			fetched_body = MAX(messages.fetched_body, excluded.fetched_body),
 			flags = excluded.flags,
+			flags_other = excluded.flags_other,
 			uid = CASE WHEN excluded.uid > 0 THEN excluded.uid ELSE messages.uid END,
 			mailbox = CASE WHEN excluded.mailbox != '' THEN excluded.mailbox ELSE messages.mailbox END
 		RETURNING id`,
@@ -114,7 +122,7 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 		msg.FromAddr, fromAddrCT, msg.ToAddrs, toAddrsCT, msg.CCAddrs, ccAddrsCT,
 		msg.Date, msg.CreatedAt,
 		msg.BodyText, bodyTextCT, msg.BodyHTML, bodyHTMLCT,
-		msg.Mailbox, msg.Flags, msg.UID, msg.Size, fetchedBody, msg.Account,
+		msg.Mailbox, msg.Flags, flagsOtherCT, msg.UID, msg.Size, fetchedBody, msg.Account,
 	).Scan(&msg.ID)
 	if err != nil {
 		return fmt.Errorf("upsert message: %w", err)

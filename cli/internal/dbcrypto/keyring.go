@@ -18,6 +18,8 @@ type Keyring struct {
 	Body    []byte // encrypts messages.body_text + body_html (LabelBody)
 	Addrs   []byte // encrypts messages.from_addr + to_addrs + cc_addrs (LabelAddrs)
 	Headers []byte // encrypts message_headers.value (LabelHeaders)
+	Draft   []byte // encrypts local_drafts.draft_json + outbox.draft_json (LabelDraft)
+	Meta    []byte // encrypts mailboxes.name + accounts.name + messages.flags_other (LabelMeta)
 }
 
 // NewKeyring derives every currently-shipped sub-key from a 32-byte master.
@@ -40,7 +42,15 @@ func NewKeyring(master []byte) (*Keyring, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dbcrypto: derive headers sub-key: %w", err)
 	}
-	return &Keyring{Subject: subject, Body: body, Addrs: addrs, Headers: headers}, nil
+	draft, err := DeriveSubKey(master, LabelDraft)
+	if err != nil {
+		return nil, fmt.Errorf("dbcrypto: derive draft sub-key: %w", err)
+	}
+	meta, err := DeriveSubKey(master, LabelMeta)
+	if err != nil {
+		return nil, fmt.Errorf("dbcrypto: derive meta sub-key: %w", err)
+	}
+	return &Keyring{Subject: subject, Body: body, Addrs: addrs, Headers: headers, Draft: draft, Meta: meta}, nil
 }
 
 // Wipe overwrites every sub-key in place with zeroes and nils the slice
@@ -55,10 +65,14 @@ func (k *Keyring) Wipe() {
 	zero(k.Body)
 	zero(k.Addrs)
 	zero(k.Headers)
+	zero(k.Draft)
+	zero(k.Meta)
 	k.Subject = nil
 	k.Body = nil
 	k.Addrs = nil
 	k.Headers = nil
+	k.Draft = nil
+	k.Meta = nil
 }
 
 // zero overwrites b with zero bytes in constant time. Used by Wipe.

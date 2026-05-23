@@ -181,6 +181,30 @@ func (d *DB) Init() error {
 			last_attempted_at INTEGER DEFAULT 0,
 			send_after INTEGER DEFAULT 0
 		)`,
+
+		// local_drafts was first added in the v6→v7 migration. Listing it
+		// here too keeps it created for any fresh DB regardless of which
+		// version Init() lands on, so later ALTER TABLE migrations don't
+		// trip on its absence in tests that seed schema_version > 7.
+		`CREATE TABLE IF NOT EXISTS local_drafts (
+			id TEXT PRIMARY KEY,
+			draft_json TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			modified_at INTEGER NOT NULL
+		)`,
+
+		// mailboxes and accounts were first added in the v8→v9 migration
+		// (ADR-0001 step 1). Same idempotency story as local_drafts —
+		// keep them present here so seeds at schema_version > 9 don't
+		// fail later ALTER TABLE migrations that target them.
+		`CREATE TABLE IF NOT EXISTS mailboxes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL UNIQUE
+		)`,
+		`CREATE TABLE IF NOT EXISTS accounts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL UNIQUE
+		)`,
 	}
 
 	for _, stmt := range stmts {
@@ -566,6 +590,67 @@ func (d *DB) migrate() error {
 		if _, err := d.db.Exec("UPDATE schema_version SET version = 13 WHERE rowid = 1"); err != nil {
 			return fmt.Errorf("migrate v12→v13 bump: %w", err)
 		}
+		version = 13
+	}
+
+	if version < 14 {
+		// ADR-0001 step 6: encrypt local_drafts.draft_json and
+		// outbox.draft_json (draft_key). Two separate tables, same
+		// sub-key — both hold pending outgoing mail, both deserve at-rest
+		// protection. Schema is parallel ALTER on each table.
+		for _, table := range []string{"local_drafts", "outbox"} {
+			has, err := hasColumn(d.db, table, "draft_json_ct")
+			if err != nil {
+				return fmt.Errorf("migrate v13→v14 inspect %s.draft_json_ct: %w", table, err)
+			}
+			if !has {
+				if _, err := d.db.Exec("ALTER TABLE " + table + " ADD COLUMN draft_json_ct BLOB"); err != nil {
+					return fmt.Errorf("migrate v13→v14 add %s.draft_json_ct: %w", table, err)
+				}
+			}
+		}
+		if err := d.backfillDraftJSONCt(); err != nil {
+			return fmt.Errorf("migrate v13→v14 backfill: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 14 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v13→v14 bump: %w", err)
+		}
+		version = 14
+	}
+
+	if version < 15 {
+		// ADR-0001 step 6: encrypt the meta_key columns — mailbox names
+		// (folder labels), account names, and the non-boolean parts of
+		// messages.flags. Plaintext columns stay alongside until step 7;
+		// reads keep using them. This commit just lays down the cipher-
+		// text columns plus encrypt-on-write for messages.flags_other.
+		//
+		// mailboxes.name and accounts.name have UNIQUE constraints that
+		// the encrypted (random-nonce) form cannot replicate, so the
+		// plaintext UNIQUE column stays as the lookup key until step 7
+		// introduces deterministic blind-tokens.
+		alters := []struct{ table, col string }{
+			{"mailboxes", "name_ct"},
+			{"accounts", "name_ct"},
+			{"messages", "flags_other"},
+		}
+		for _, a := range alters {
+			has, err := hasColumn(d.db, a.table, a.col)
+			if err != nil {
+				return fmt.Errorf("migrate v14→v15 inspect %s.%s: %w", a.table, a.col, err)
+			}
+			if !has {
+				if _, err := d.db.Exec("ALTER TABLE " + a.table + " ADD COLUMN " + a.col + " BLOB"); err != nil {
+					return fmt.Errorf("migrate v14→v15 add %s.%s: %w", a.table, a.col, err)
+				}
+			}
+		}
+		if err := d.backfillMetaCt(); err != nil {
+			return fmt.Errorf("migrate v14→v15 backfill: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 15 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v14→v15 bump: %w", err)
+		}
 	}
 
 	return nil
@@ -766,6 +851,256 @@ func (d *DB) backfillBodyCt() error {
 		if _, err := stmt.Exec(textCT, htmlCT, p.id); err != nil {
 			return fmt.Errorf("update id=%d: %w", p.id, err)
 		}
+	}
+	return tx.Commit()
+}
+
+// encryptMeta seals plain with the meta sub-key (mailbox/account names,
+// non-boolean flag parts). Empty plaintext maps to nil → NULL column.
+func (d *DB) encryptMeta(plain string) ([]byte, error) {
+	if plain == "" {
+		return nil, nil
+	}
+	return dbcrypto.Encrypt(d.keyring.Meta, []byte(plain))
+}
+
+// decryptMeta returns plaintext for a meta_key column, falling back to
+// the plaintext column when ct IS NULL. Decrypt failures on non-nil ct
+// are hard errors. Not yet called by production reads — step 7 will wire
+// the lookup paths to prefer ct over the plaintext columns that die then.
+func (d *DB) decryptMeta(plain string, ct []byte) (string, error) {
+	if len(ct) == 0 {
+		return plain, nil
+	}
+	out, err := dbcrypto.Decrypt(d.keyring.Meta, ct)
+	if err != nil {
+		return "", fmt.Errorf("decrypt meta: %w", err)
+	}
+	return string(out), nil
+}
+
+// flagsOtherForEncryption returns the subset of a space-separated IMAP
+// flags string that ADR-0001 §3 marks for meta_key encryption: everything
+// except the three boolean-tracked standard flags (\Seen, \Flagged,
+// \Deleted) that already live as O(1) integer columns. The remaining
+// flags include \Answered, \Draft, \Recent, $Sensitive and any
+// user-defined keywords — all preserved verbatim in their original order.
+func flagsOtherForEncryption(flags string) string {
+	if flags == "" {
+		return ""
+	}
+	parts := strings.Fields(flags)
+	out := parts[:0]
+	for _, p := range parts {
+		switch p {
+		case `\Seen`, `\Flagged`, `\Deleted`:
+			// covered by is_seen/is_flagged/is_deleted booleans
+		default:
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, " ")
+}
+
+// backfillMetaCt encrypts existing mailbox names, account names, and the
+// non-boolean flags subset of each message into the new BLOB columns.
+// Single transaction across all three so a mid-loop failure rolls back
+// cleanly.
+func (d *DB) backfillMetaCt() error {
+	if d.keyring == nil || d.keyring.Meta == nil {
+		return fmt.Errorf("no keyring available for meta backfill")
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// mailboxes + accounts share the same shape: id + name → name_ct.
+	for _, table := range []string{"mailboxes", "accounts"} {
+		rows, err := tx.Query(`SELECT id, name FROM ` + table + `
+			WHERE name IS NOT NULL AND name <> '' AND name_ct IS NULL`)
+		if err != nil {
+			return fmt.Errorf("select %s: %w", table, err)
+		}
+		type pending struct {
+			id   int64
+			name string
+		}
+		var batch []pending
+		for rows.Next() {
+			var p pending
+			if err := rows.Scan(&p.id, &p.name); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan %s: %w", table, err)
+			}
+			batch = append(batch, p)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate %s: %w", table, err)
+		}
+
+		stmt, err := tx.Prepare("UPDATE " + table + " SET name_ct = ? WHERE id = ?")
+		if err != nil {
+			return fmt.Errorf("prepare %s update: %w", table, err)
+		}
+		for _, p := range batch {
+			ct, err := d.encryptMeta(p.name)
+			if err != nil {
+				stmt.Close()
+				return fmt.Errorf("encrypt %s name id=%d: %w", table, p.id, err)
+			}
+			if _, err := stmt.Exec(ct, p.id); err != nil {
+				stmt.Close()
+				return fmt.Errorf("update %s id=%d: %w", table, p.id, err)
+			}
+		}
+		stmt.Close()
+	}
+
+	// messages.flags_other gets the non-boolean subset of the existing
+	// flags TEXT — booleans are already covered by is_{seen,flagged,deleted}.
+	rows, err := tx.Query(`SELECT id, flags FROM messages
+		WHERE flags IS NOT NULL AND flags <> '' AND flags_other IS NULL`)
+	if err != nil {
+		return fmt.Errorf("select messages: %w", err)
+	}
+	type pending struct {
+		id    int64
+		flags string
+	}
+	var batch []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.flags); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan messages: %w", err)
+		}
+		batch = append(batch, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate messages: %w", err)
+	}
+
+	stmt, err := tx.Prepare("UPDATE messages SET flags_other = ? WHERE id = ?")
+	if err != nil {
+		return fmt.Errorf("prepare messages update: %w", err)
+	}
+	defer stmt.Close()
+	for _, p := range batch {
+		other := flagsOtherForEncryption(p.flags)
+		ct, err := d.encryptMeta(other)
+		if err != nil {
+			return fmt.Errorf("encrypt flags id=%d: %w", p.id, err)
+		}
+		if _, err := stmt.Exec(ct, p.id); err != nil {
+			return fmt.Errorf("update messages id=%d: %w", p.id, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// encryptDraftJSON seals plain with the draft sub-key. Empty plaintext
+// maps to nil so draft_json_ct stays NULL — same convention as the other
+// encrypt* helpers.
+func (d *DB) encryptDraftJSON(plain string) ([]byte, error) {
+	if plain == "" {
+		return nil, nil
+	}
+	return dbcrypto.Encrypt(d.keyring.Draft, []byte(plain))
+}
+
+// decryptDraftJSON returns plaintext draft JSON, preferring ct when set.
+// Decrypt failures on non-nil ct are hard errors.
+func (d *DB) decryptDraftJSON(plain string, ct []byte) (string, error) {
+	if len(ct) == 0 {
+		return plain, nil
+	}
+	out, err := dbcrypto.Decrypt(d.keyring.Draft, ct)
+	if err != nil {
+		return "", fmt.Errorf("decrypt draft_json: %w", err)
+	}
+	return string(out), nil
+}
+
+// backfillDraftJSONCt encrypts every existing draft_json across both
+// local_drafts and outbox into their new draft_json_ct BLOB columns.
+// One transaction spans both tables so a mid-loop failure rolls back
+// cleanly. Volumes are small in practice (drafts plus pending sends)
+// so a single batch in RAM is fine.
+func (d *DB) backfillDraftJSONCt() error {
+	if d.keyring == nil || d.keyring.Draft == nil {
+		return fmt.Errorf("no keyring available for draft backfill")
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Two tables, same shape — fold them through one loop.
+	for _, table := range []struct {
+		name    string
+		pkCol   string // primary key column (TEXT for local_drafts, INTEGER for outbox)
+		pkScanT string // "string" or "int64"
+	}{
+		{"local_drafts", "id", "string"},
+		{"outbox", "id", "int64"},
+	} {
+		rows, err := tx.Query(`SELECT ` + table.pkCol + `, draft_json FROM ` + table.name + `
+			WHERE draft_json IS NOT NULL AND draft_json <> '' AND draft_json_ct IS NULL`)
+		if err != nil {
+			return fmt.Errorf("select %s: %w", table.name, err)
+		}
+		type pending struct {
+			idStr string
+			idInt int64
+			json  string
+		}
+		var batch []pending
+		for rows.Next() {
+			var p pending
+			if table.pkScanT == "string" {
+				if err := rows.Scan(&p.idStr, &p.json); err != nil {
+					rows.Close()
+					return fmt.Errorf("scan %s: %w", table.name, err)
+				}
+			} else {
+				if err := rows.Scan(&p.idInt, &p.json); err != nil {
+					rows.Close()
+					return fmt.Errorf("scan %s: %w", table.name, err)
+				}
+			}
+			batch = append(batch, p)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate %s rows: %w", table.name, err)
+		}
+
+		stmt, err := tx.Prepare("UPDATE " + table.name + " SET draft_json_ct = ? WHERE " + table.pkCol + " = ?")
+		if err != nil {
+			return fmt.Errorf("prepare update %s: %w", table.name, err)
+		}
+		for _, p := range batch {
+			ct, err := d.encryptDraftJSON(p.json)
+			if err != nil {
+				stmt.Close()
+				return fmt.Errorf("encrypt %s draft: %w", table.name, err)
+			}
+			if table.pkScanT == "string" {
+				_, err = stmt.Exec(ct, p.idStr)
+			} else {
+				_, err = stmt.Exec(ct, p.idInt)
+			}
+			if err != nil {
+				stmt.Close()
+				return fmt.Errorf("update %s: %w", table.name, err)
+			}
+		}
+		stmt.Close()
 	}
 	return tx.Commit()
 }
