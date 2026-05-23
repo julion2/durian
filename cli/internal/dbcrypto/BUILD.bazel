@@ -1,0 +1,15 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "dbcrypto",
+    srcs = ["dbcrypto.go"],
+    importpath = "github.com/durian-dev/durian/cli/internal/dbcrypto",
+    visibility = ["//cli:__subpackages__"],
+)
+
+go_test(
+    name = "dbcrypto_test",
+    size = "small",
+    srcs = ["dbcrypto_test.go"],
+    embed = [":dbcrypto"],
+)
