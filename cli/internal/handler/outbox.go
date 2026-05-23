@@ -84,7 +84,8 @@ func (h *Handler) EnqueueOutboxHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("Enqueued outbox item", "module", "OUTBOX", "id", id, "to", draft.To, "subject", draft.Subject, "is_html", draft.IsHTML, "body_len", len(draft.Body), "send_after", sendAfter)
+	// ADR-0001 §6 redaction: do not log recipient list, subject or body content.
+	slog.Info("Enqueued outbox item", "module", "OUTBOX", "id", id, "recipient_count", len(draft.To), "is_html", draft.IsHTML, "body_len", len(draft.Body), "send_after", sendAfter)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id, "send_after": sendAfter})
 }
@@ -348,11 +349,11 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *smtp
 	}
 
 	if err := w.store.InsertMessage(storeMsg); err != nil {
-		slog.Warn("Failed to save sent email to local store", "module", "OUTBOX", "err", err)
+		slog.Warn("Failed to save sent email to local store", "module", "OUTBOX", "err", err) // encgrep:allow message text, no PII attr
 		return
 	}
 	if err := w.store.AddTag(storeMsg.ID, "sent"); err != nil {
-		slog.Warn("Failed to tag sent email", "module", "OUTBOX", "err", err)
+		slog.Warn("Failed to tag sent email", "module", "OUTBOX", "err", err) // encgrep:allow message text, no PII attr
 	}
 }
 

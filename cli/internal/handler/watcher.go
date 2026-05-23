@@ -465,7 +465,8 @@ func (w *WatcherManager) syncAndNotify(account *config.AccountConfig, client *im
 			From:     from,
 			Snippet:  cleanSnippet(msg.BodyText, 150),
 		})
-		w.log.Info("New mail", "account", account.Email, "thread", msg.ThreadID, "from", from, "subject", msg.Subject)
+		// ADR-0001 §6 redaction: thread/id observability without leaking from/subject.
+		w.log.Info("New mail", "account", account.Email, "thread", msg.ThreadID) // encgrep:allow account.Email plaintext per ADR-0001 §3
 	}
 
 	w.log.Info("Broadcasting new messages", "account", account.Email, "count", len(messages))
@@ -523,11 +524,11 @@ func (w *WatcherManager) logRetry(lastErr *string, count *int, backoff *time.Dur
 			*backoff = min(*backoff*2, maxBackoff)
 			return // suppress log
 		}
-		w.log.Error("Retry", "account", email, "kind", kind, "err", err, "repeat", *count, "backoff", *backoff)
+		w.log.Error("Retry", "account", email, "kind", kind, "err", err, "repeat", *count, "backoff", *backoff) // encgrep:allow account email plaintext per ADR-0001 §3
 	} else {
 		*lastErr = errStr
 		*count = 1
-		w.log.Error("Retry", "account", email, "kind", kind, "err", err, "backoff", *backoff)
+		w.log.Error("Retry", "account", email, "kind", kind, "err", err, "backoff", *backoff) // encgrep:allow account email plaintext per ADR-0001 §3
 	}
 	*backoff = min(*backoff*2, maxBackoff)
 }

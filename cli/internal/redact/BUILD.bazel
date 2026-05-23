@@ -1,0 +1,15 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "redact",
+    srcs = ["redact.go"],
+    importpath = "github.com/durian-dev/durian/cli/internal/redact",
+    visibility = ["//cli:__subpackages__"],
+)
+
+go_test(
+    name = "redact_test",
+    size = "small",
+    srcs = ["redact_test.go"],
+    embed = [":redact"],
+)

@@ -140,7 +140,7 @@ func runContactsImport(cmd *cobra.Command, args []string) error {
 	}
 	defer emailDB.Close()
 
-	fmt.Println("Extracting addresses from email store...")
+	fmt.Println("Extracting addresses from email store...") // encgrep:allow user-facing TUI, no PII
 	contactList, err := contacts.ImportFromStore(emailDB)
 	if err != nil {
 		return fmt.Errorf("import from store: %w", err)
@@ -201,7 +201,7 @@ func runContactsList(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(contactList) == 0 {
-		fmt.Println("No contacts found. Run 'durian contacts import' to import from your email store.")
+		fmt.Println("No contacts found. Run 'durian contacts import' to import from your email store.") // encgrep:allow user-facing TUI, no PII
 		return nil
 	}
 
@@ -294,7 +294,7 @@ func runContactsAdd(cmd *cobra.Command, args []string) error {
 		return enc.Encode(output)
 	}
 
-	fmt.Printf("Added contact: %s", email)
+	fmt.Printf("Added contact: %s", email) // encgrep:allow user-facing TUI echoes user's own input
 	if name != "" {
 		fmt.Printf(" (%s)", name)
 	}
@@ -327,6 +327,6 @@ func runContactsDelete(cmd *cobra.Command, args []string) error {
 		return enc.Encode(output)
 	}
 
-	fmt.Printf("Deleted contact: %s\n", email)
+	fmt.Printf("Deleted contact: %s\n", email) // encgrep:allow user-facing TUI echoes user's own input
 	return nil
 }

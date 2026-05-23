@@ -308,7 +308,7 @@ func (sm *StateManager) acquireLock(email string) (*os.File, error) {
 	}
 
 	// Lock is held — retry with backoff (max 30s)
-	slog.Debug("Lock busy, waiting", "module", "SYNC", "account", email)
+	slog.Debug("Lock busy, waiting", "module", "SYNC", "account", email) // encgrep:allow account email plaintext per ADR-0001 §3
 	deadline := time.Now().Add(5 * time.Second)
 	delay := 250 * time.Millisecond
 	for time.Now().Before(deadline) {

@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/durian-dev/durian/cli/internal/config"
+	"github.com/durian-dev/durian/cli/internal/redact"
 	"github.com/durian-dev/durian/cli/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -107,7 +108,7 @@ func initLogger() {
 	if debugMode {
 		level = slog.LevelDebug
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	slog.SetDefault(slog.New(redact.Wrap(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))))
 }
 
 // openEmailDB opens and initializes the shared SQLite email store.

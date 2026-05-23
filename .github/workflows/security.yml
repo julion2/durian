@@ -16,6 +16,17 @@ permissions:
   actions: read
 
 jobs:
+  encryption-grep-gate:
+    # ADR-0001 §6: pre-merge tripwire that fails if log/print statements
+    # appear to leak values from columns the ADR marks as encrypted.
+    # Cheap (~1s), runs on every PR before the heavier SAST jobs.
+    name: encryption grep gate (ADR-0001 §6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run gate
+        run: .github/scripts/encryption-grep-gate.sh
+
   govulncheck:
     name: govulncheck (Go vuln DB)
     runs-on: ubuntu-latest

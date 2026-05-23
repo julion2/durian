@@ -106,9 +106,11 @@ func (h *Handler) IncrementContactUsageHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	for _, email := range req.Emails {
-		if err := h.contacts.IncrementUsage(email); err != nil {
-			slog.Warn("Failed to increment usage", "module", "CONTACTS", "email", email, "err", err)
+	for _, addr := range req.Emails {
+		if err := h.contacts.IncrementUsage(addr); err != nil {
+			// ADR-0001 §6 redaction: do not log contact addresses; addr_len gives
+			// enough signal for "is the input plausible".
+			slog.Warn("Failed to increment usage", "module", "CONTACTS", "addr_len", len(addr), "err", err)
 		}
 	}
 

@@ -36,6 +36,7 @@ go_library(
         "//cli/internal/mail",
         "//cli/internal/oauth",
         "//cli/internal/protocol",
+        "//cli/internal/redact",
         "//cli/internal/smtp",
         "//cli/internal/store",
         "//cli/internal/tagsync",
