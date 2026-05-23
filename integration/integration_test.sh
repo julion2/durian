@@ -63,6 +63,13 @@ assert_http_code() {
 
 # --- Setup ---
 
+# ADR-0001 step 4/5: seeder and serve must agree on the master encryption
+# key, otherwise serve cannot decrypt the subjects the seeder wrote.
+# DURIAN_MASTER_KEY_HEX is read by both binaries; the keychain is bypassed
+# in this test environment (headless CI has no Secret Service). The value
+# is throwaway test data — no production secret.
+export DURIAN_MASTER_KEY_HEX="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 echo "==> Seeding test databases"
 "$SEEDER" "$EMAIL_DB" "$CONTACTS_DB"
 

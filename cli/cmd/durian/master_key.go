@@ -84,29 +84,49 @@ func init() {
 	masterKeyImportCmd.MarkFlagRequired("from")
 }
 
-// ensureMasterKey bootstraps the ADR-0001 master key on serve startup.
-// If the keychain entry exists it is loaded; otherwise a fresh 32-byte key
-// is generated, hex-encoded and stored. The returned bytes are discarded
-// because no encryption path consumes the key yet — step 5 will retain it
-// in a keyring struct on the handler.
+// bootstrapKeyring loads (or, on first run, generates) the ADR-0001 master
+// key from the OS keychain and derives the sub-key keyring consumed by
+// store.Open. Fatal-exits on any error so the daemon never starts in a
+// state where encrypt-on-write would silently no-op.
 //
-// All errors here are fatal at the call site (logged then os.Exit by the
-// caller in serve.go's wider error handling). Loss of the keychain on an
-// already-migrated DB is detected later in this same function; for now
-// the DB is unencrypted so a fresh generate is harmless.
-func ensureMasterKey() {
+// If DURIAN_MASTER_KEY_HEX is set, the keychain path is skipped entirely
+// and the env var's 64-char hex is used verbatim. This exists for the
+// integration test and headless CI where there is no Secret Service
+// implementation. A Warn-level audit line accompanies every use so
+// accidental production deployments are visible in serve.log.
+func bootstrapKeyring() *dbcrypto.Keyring {
+	if raw := strings.TrimSpace(os.Getenv(envMasterKeyHex)); raw != "" {
+		master, err := hex.DecodeString(raw)
+		if err != nil || len(master) != dbcrypto.MasterKeyLen {
+			slog.Error("DURIAN_MASTER_KEY_HEX is set but not a valid 64-char hex of 32 bytes",
+				"module", "MASTER-KEY", "err", err, "len", len(master))
+			fmt.Fprintln(os.Stderr, "Error: DURIAN_MASTER_KEY_HEX must be a 64-character hex string (32 bytes)")
+			os.Exit(1)
+		}
+		kr, err := dbcrypto.NewKeyring(master)
+		if err != nil {
+			slog.Error("Keyring derivation failed", "module", "MASTER-KEY", "err", err)
+			fmt.Fprintln(os.Stderr, "Error: keyring derivation failed:", err)
+			os.Exit(1)
+		}
+		slog.Warn("Master key sourced from DURIAN_MASTER_KEY_HEX (test/CI mode — NOT for production)",
+			"module", "MASTER-KEY")
+		return kr
+	}
+
 	existed := keychain.Exists(keychain.DBKeychainService, keychain.DBAccountMaster)
-	key, err := keychain.GetOrCreateKey(keychain.DBKeychainService, keychain.DBAccountMaster, dbcrypto.MasterKeyLen)
+	master, err := keychain.GetOrCreateKey(keychain.DBKeychainService, keychain.DBAccountMaster, dbcrypto.MasterKeyLen)
 	if err != nil {
 		slog.Error("Master key bootstrap failed", "module", "MASTER-KEY", "err", err)
 		fmt.Fprintln(os.Stderr, "Error: master key bootstrap failed:", err)
 		os.Exit(1)
 	}
-	// Discard the key — no encryption code path uses it yet (ADR-0001 step 5).
-	// crypto/subtle wipe would be theatre when len(key) is going out of scope
-	// anyway; Go's GC will reclaim. Documented here so a future reader
-	// doesn't add a misleading "secure" wipe.
-	_ = key
+	kr, err := dbcrypto.NewKeyring(master)
+	if err != nil {
+		slog.Error("Keyring derivation failed", "module", "MASTER-KEY", "err", err)
+		fmt.Fprintln(os.Stderr, "Error: keyring derivation failed:", err)
+		os.Exit(1)
+	}
 	if existed {
 		slog.Info("Master key loaded from keychain", "module", "MASTER-KEY",
 			"service", keychain.DBKeychainService, "account", keychain.DBAccountMaster)
@@ -114,6 +134,7 @@ func ensureMasterKey() {
 		slog.Info("Master key generated and stored in keychain (first run)", "module", "MASTER-KEY",
 			"service", keychain.DBKeychainService, "account", keychain.DBAccountMaster)
 	}
+	return kr
 }
 
 func runMasterKeyExport(cmd *cobra.Command, args []string) error {

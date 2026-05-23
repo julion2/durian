@@ -111,9 +111,12 @@ func initLogger() {
 	slog.SetDefault(slog.New(redact.Wrap(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))))
 }
 
-// openEmailDB opens and initializes the shared SQLite email store.
+// openEmailDB opens and initializes the shared SQLite email store, with
+// the ADR-0001 keyring bootstrapped from the OS keychain. Used by the
+// one-shot CLI commands; serve has its own copy of this bootstrap.
 func openEmailDB() (*store.DB, error) {
-	db, err := store.Open(store.DefaultDBPath())
+	keyring := bootstrapKeyring()
+	db, err := store.Open(store.DefaultDBPath(), keyring)
 	if err != nil {
 		return nil, fmt.Errorf("open email store: %w", err)
 	}

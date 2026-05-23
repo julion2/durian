@@ -51,14 +51,22 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 		fetchedBody = 1
 	}
 
+	// ADR-0001 step 5: encrypted subject lives in subject_ct alongside the
+	// plaintext subject column (which FTS5 still indexes until step 7).
+	subjectCT, err := d.encryptSubject(msg.Subject)
+	if err != nil {
+		return fmt.Errorf("encrypt subject: %w", err)
+	}
+
 	err = tx.QueryRow(`
 		INSERT INTO messages (
-			message_id, thread_id, in_reply_to, refs, subject,
+			message_id, thread_id, in_reply_to, refs, subject, subject_ct,
 			from_addr, to_addrs, cc_addrs, date, created_at,
 			body_text, body_html, mailbox, flags, uid, size, fetched_body, account
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id, account) DO UPDATE SET
 			subject = excluded.subject,
+			subject_ct = excluded.subject_ct,
 			from_addr = excluded.from_addr,
 			to_addrs = excluded.to_addrs,
 			cc_addrs = excluded.cc_addrs,
@@ -71,7 +79,7 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 			uid = CASE WHEN excluded.uid > 0 THEN excluded.uid ELSE messages.uid END,
 			mailbox = CASE WHEN excluded.mailbox != '' THEN excluded.mailbox ELSE messages.mailbox END
 		RETURNING id`,
-		msg.MessageID, threadID, msg.InReplyTo, msg.Refs, msg.Subject,
+		msg.MessageID, threadID, msg.InReplyTo, msg.Refs, msg.Subject, subjectCT,
 		msg.FromAddr, msg.ToAddrs, msg.CCAddrs, msg.Date, msg.CreatedAt,
 		msg.BodyText, msg.BodyHTML, msg.Mailbox, msg.Flags, msg.UID, msg.Size, fetchedBody, msg.Account,
 	).Scan(&msg.ID)
@@ -126,13 +134,14 @@ func (d *DB) BackfillUID(messageID, account string, uid uint32, mailbox string) 
 func (d *DB) GetByMessageID(messageID string) (*Message, error) {
 	msg := &Message{}
 	var fetchedBody int
+	var subjectCT []byte
 	err := d.db.QueryRow(`
-		SELECT id, message_id, thread_id, in_reply_to, refs, subject,
+		SELECT id, message_id, thread_id, in_reply_to, refs, subject, subject_ct,
 		       from_addr, to_addrs, cc_addrs, date, created_at,
 		       body_text, body_html, mailbox, flags, uid, size, fetched_body, account
 		FROM messages WHERE message_id = ? LIMIT 1`, messageID,
 	).Scan(
-		&msg.ID, &msg.MessageID, &msg.ThreadID, &msg.InReplyTo, &msg.Refs, &msg.Subject,
+		&msg.ID, &msg.MessageID, &msg.ThreadID, &msg.InReplyTo, &msg.Refs, &msg.Subject, &subjectCT,
 		&msg.FromAddr, &msg.ToAddrs, &msg.CCAddrs, &msg.Date, &msg.CreatedAt,
 		&msg.BodyText, &msg.BodyHTML, &msg.Mailbox, &msg.Flags, &msg.UID, &msg.Size, &fetchedBody, &msg.Account,
 	)
@@ -143,6 +152,9 @@ func (d *DB) GetByMessageID(messageID string) (*Message, error) {
 		return nil, fmt.Errorf("get by message_id: %w", err)
 	}
 	msg.FetchedBody = fetchedBody == 1
+	if msg.Subject, err = d.decryptSubject(msg.Subject, subjectCT); err != nil {
+		return nil, err
+	}
 	return msg, nil
 }
 
@@ -150,7 +162,7 @@ func (d *DB) GetByMessageID(messageID string) (*Message, error) {
 // When a message exists in multiple accounts, only the first row is kept.
 func (d *DB) GetByThread(threadID string) ([]*Message, error) {
 	rows, err := d.db.Query(`
-		SELECT id, message_id, thread_id, in_reply_to, refs, subject,
+		SELECT id, message_id, thread_id, in_reply_to, refs, subject, subject_ct,
 		       from_addr, to_addrs, cc_addrs, date, created_at,
 		       body_text, body_html, mailbox, flags, uid, size, fetched_body, account
 		FROM messages WHERE thread_id = ?
@@ -160,7 +172,7 @@ func (d *DB) GetByThread(threadID string) ([]*Message, error) {
 	}
 	defer rows.Close()
 
-	all, err := scanMessages(rows)
+	all, err := d.scanMessages(rows)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +195,7 @@ func (d *DB) GetByThread(threadID string) ([]*Message, error) {
 // Returns all rows including multi-account duplicates. Used for tag sync.
 func (d *DB) GetAllByThread(threadID string) ([]*Message, error) {
 	rows, err := d.db.Query(`
-		SELECT id, message_id, thread_id, in_reply_to, refs, subject,
+		SELECT id, message_id, thread_id, in_reply_to, refs, subject, subject_ct,
 		       from_addr, to_addrs, cc_addrs, date, created_at,
 		       body_text, body_html, mailbox, flags, uid, size, fetched_body, account
 		FROM messages WHERE thread_id = ?
@@ -192,7 +204,7 @@ func (d *DB) GetAllByThread(threadID string) ([]*Message, error) {
 		return nil, fmt.Errorf("get all by thread: %w", err)
 	}
 	defer rows.Close()
-	return scanMessages(rows)
+	return d.scanMessages(rows)
 }
 
 // MessageExists checks if a message with the given Message-ID exists.
@@ -302,14 +314,16 @@ func (d *DB) GetRecipientAddresses() ([]string, error) {
 	return result, rows.Err()
 }
 
-// scanMessages scans rows into a slice of Message pointers.
-func scanMessages(rows *sql.Rows) ([]*Message, error) {
+// scanMessages scans rows into a slice of Message pointers. Caller's
+// SELECT must include subject_ct between subject and from_addr.
+func (d *DB) scanMessages(rows *sql.Rows) ([]*Message, error) {
 	var msgs []*Message
 	for rows.Next() {
 		msg := &Message{}
 		var fetchedBody int
+		var subjectCT []byte
 		err := rows.Scan(
-			&msg.ID, &msg.MessageID, &msg.ThreadID, &msg.InReplyTo, &msg.Refs, &msg.Subject,
+			&msg.ID, &msg.MessageID, &msg.ThreadID, &msg.InReplyTo, &msg.Refs, &msg.Subject, &subjectCT,
 			&msg.FromAddr, &msg.ToAddrs, &msg.CCAddrs, &msg.Date, &msg.CreatedAt,
 			&msg.BodyText, &msg.BodyHTML, &msg.Mailbox, &msg.Flags, &msg.UID, &msg.Size, &fetchedBody, &msg.Account,
 		)
@@ -317,6 +331,9 @@ func scanMessages(rows *sql.Rows) ([]*Message, error) {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
 		msg.FetchedBody = fetchedBody == 1
+		if msg.Subject, err = d.decryptSubject(msg.Subject, subjectCT); err != nil {
+			return nil, err
+		}
 		msgs = append(msgs, msg)
 	}
 	if err := rows.Err(); err != nil {

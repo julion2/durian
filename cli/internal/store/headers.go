@@ -56,7 +56,7 @@ func (d *DB) GetMessageDBID(messageID, account string) (int64, error) {
 // AllMessages returns all messages with fields needed for rule matching.
 func (d *DB) AllMessages() ([]*Message, error) {
 	rows, err := d.db.Query(
-		"SELECT id, message_id, subject, from_addr, to_addrs, cc_addrs, body_text, account FROM messages")
+		"SELECT id, message_id, subject, subject_ct, from_addr, to_addrs, cc_addrs, body_text, account FROM messages")
 	if err != nil {
 		return nil, fmt.Errorf("query messages: %w", err)
 	}
@@ -65,8 +65,12 @@ func (d *DB) AllMessages() ([]*Message, error) {
 	var msgs []*Message
 	for rows.Next() {
 		m := &Message{}
-		if err := rows.Scan(&m.ID, &m.MessageID, &m.Subject, &m.FromAddr, &m.ToAddrs, &m.CCAddrs, &m.BodyText, &m.Account); err != nil {
+		var subjectCT []byte
+		if err := rows.Scan(&m.ID, &m.MessageID, &m.Subject, &subjectCT, &m.FromAddr, &m.ToAddrs, &m.CCAddrs, &m.BodyText, &m.Account); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
+		}
+		if m.Subject, err = d.decryptSubject(m.Subject, subjectCT); err != nil {
+			return nil, err
 		}
 		msgs = append(msgs, m)
 	}
