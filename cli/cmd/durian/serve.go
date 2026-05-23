@@ -22,6 +22,7 @@ import (
 	"github.com/durian-dev/durian/cli/internal/config"
 	"github.com/durian-dev/durian/cli/internal/contacts"
 	"github.com/durian-dev/durian/cli/internal/handler"
+	"github.com/durian-dev/durian/cli/internal/redact"
 	"github.com/durian-dev/durian/cli/internal/store"
 	"github.com/durian-dev/durian/cli/internal/tagsync"
 )
@@ -58,7 +59,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	logPath := filepath.Join(stateDir, "serve.log")
 	if f, err := os.Create(logPath); err == nil {
 		defer f.Close()
-		slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: level})))
+		slog.SetDefault(slog.New(redact.Wrap(slog.NewTextHandler(f, &slog.HandlerOptions{Level: level}))))
 	}
 
 	// Open contacts database (non-fatal if missing)
@@ -93,7 +94,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 	defer emailDB.Close()
-	slog.Info("Opened email store", "module", "SERVE", "path", dbPath)
+	slog.Info("Opened email store", "module", "SERVE", "path", dbPath) // encgrep:allow message text, no PII attr
 
 	h := handler.New(emailDB, contactsDB)
 	eventHub := handler.NewEventHub()

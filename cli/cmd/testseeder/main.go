@@ -84,7 +84,7 @@ func seedEmailDB(path string) error {
 	db.AddTag(m3.ID, "inbox")
 	db.AddTag(m3.ID, "flagged")
 
-	fmt.Printf("  email.db: %d messages at %s\n", len(msgs), path)
+	fmt.Printf("  email.db: %d messages at %s\n", len(msgs), path) // encgrep:allow filename, not PII
 	return nil
 }
 

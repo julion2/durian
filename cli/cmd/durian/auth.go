@@ -231,7 +231,7 @@ func runAuthStatus(cmd *cobra.Command, args []string) error {
 		if account.Alias != "" {
 			emailDisplay = fmt.Sprintf("%s (%s)", account.Email, account.Alias)
 		}
-		fmt.Printf("  %-40s  %-12s  %s\n", emailDisplay, getAuthType(&account), status)
+		fmt.Printf("  %-40s  %-12s  %s\n", emailDisplay, getAuthType(&account), status) // encgrep:allow user-facing TUI lists user's own accounts
 	}
 
 	return nil
