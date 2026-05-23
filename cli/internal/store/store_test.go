@@ -42,8 +42,8 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 12 {
-		t.Errorf("version = %d, want 12", version)
+	if version != 13 {
+		t.Errorf("version = %d, want 13", version)
 	}
 }
 
@@ -168,8 +168,8 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 12 {
-		t.Fatalf("version = %d, want 12", version)
+	if version != 13 {
+		t.Fatalf("version = %d, want 13", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).
@@ -349,8 +349,8 @@ func TestMigrateV10_BackfillsSubjectCt(t *testing.T) {
 	if err := sd.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 12 {
-		t.Fatalf("version = %d, want 12", version)
+	if version != 13 {
+		t.Fatalf("version = %d, want 13", version)
 	}
 
 	// Raw check: subject_ct must be NULL for empty subject, non-NULL for the
@@ -483,8 +483,8 @@ func TestMigrateV11_BackfillsBodyCt(t *testing.T) {
 	if err := sd.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 12 {
-		t.Fatalf("version = %d, want 12", version)
+	if version != 13 {
+		t.Fatalf("version = %d, want 13", version)
 	}
 
 	// Raw check: body_text_ct populated only where body_text non-empty.
@@ -624,8 +624,8 @@ func TestMigrateV12_BackfillsAddrsCt(t *testing.T) {
 	if err := sd.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 12 {
-		t.Fatalf("version = %d, want 12", version)
+	if version != 13 {
+		t.Fatalf("version = %d, want 13", version)
 	}
 
 	rows, err := sd.db.Query(`SELECT message_id, from_addr, from_addr_ct,
