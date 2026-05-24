@@ -63,6 +63,15 @@ func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
 		"PRAGMA busy_timeout=5000",
 		"PRAGMA foreign_keys=ON",
 		"PRAGMA synchronous=NORMAL",
+		// ADR-0001 step 8: overwrite freed pages with zeros on DELETE /
+		// UPDATE so the ciphertext-and-still-plaintext columns we keep
+		// (from_addr, to_addrs, cc_addrs, message_id, dates, sizes,
+		// is_seen / is_flagged / is_deleted) don't leak old values via
+		// page-reuse delay to a forensic analyst with the raw .db file.
+		// Encrypted columns are safe under page reuse anyway, but
+		// secure_delete is the forward-looking guarantee for the
+		// plaintext set documented in ADR §3 "Stays plaintext".
+		"PRAGMA secure_delete = ON",
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {

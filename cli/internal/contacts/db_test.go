@@ -20,6 +20,21 @@ func newTestDB(t *testing.T) *DB {
 	return db
 }
 
+// TestOpen_SecureDeleteEnabled mirrors the store-side smoke test:
+// ADR-0001 step 8 requires PRAGMA secure_delete = ON on every fresh
+// contacts.db connection so deleted email / name bytes don't stay
+// recoverable in the .db file via page-reuse delay.
+func TestOpen_SecureDeleteEnabled(t *testing.T) {
+	db := newTestDB(t)
+	var v int
+	if err := db.db.QueryRow("PRAGMA secure_delete").Scan(&v); err != nil {
+		t.Fatalf("query pragma: %v", err)
+	}
+	if v != 1 {
+		t.Errorf("PRAGMA secure_delete = %d, want 1", v)
+	}
+}
+
 func TestAddAndSearch(t *testing.T) {
 	db := newTestDB(t)
 

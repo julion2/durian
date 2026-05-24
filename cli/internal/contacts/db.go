@@ -65,6 +65,15 @@ func Open(dbPath string) (*DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("set journal mode: %w", err)
 	}
+	// ADR-0001 step 8: overwrite freed pages with zeros on DELETE /
+	// UPDATE. contacts.email and contacts.name stay plaintext per the
+	// step 7g β-revision (ADR §3); a deleted contact row otherwise
+	// leaves its address bytes recoverable in the .db file until that
+	// page gets reused. secure_delete plugs the page-reuse window.
+	if _, err := db.Exec("PRAGMA secure_delete = ON"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set secure_delete pragma: %w", err)
+	}
 
 	return &DB{db: db}, nil
 }
