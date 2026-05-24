@@ -93,7 +93,7 @@ func runContactsInit(cmd *cobra.Command, args []string) error {
 	dbPath := getDBPath()
 	slog.Debug("Initializing contacts database", "path", dbPath)
 
-	db, err := contacts.Open(dbPath, bootstrapKeyring())
+	db, err := contacts.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -122,7 +122,7 @@ func runContactsImport(cmd *cobra.Command, args []string) error {
 	slog.Debug("Importing contacts", "path", dbPath)
 
 	// Open/create database
-	db, err := contacts.Open(dbPath, bootstrapKeyring())
+	db, err := contacts.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -183,7 +183,7 @@ func runContactsImport(cmd *cobra.Command, args []string) error {
 func runContactsList(cmd *cobra.Command, args []string) error {
 	dbPath := getDBPath()
 
-	db, err := contacts.Open(dbPath, bootstrapKeyring())
+	db, err := contacts.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -230,7 +230,7 @@ func runContactsSearch(cmd *cobra.Command, args []string) error {
 	query := args[0]
 	dbPath := getDBPath()
 
-	db, err := contacts.Open(dbPath, bootstrapKeyring())
+	db, err := contacts.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -268,7 +268,7 @@ func runContactsAdd(cmd *cobra.Command, args []string) error {
 
 	dbPath := getDBPath()
 
-	db, err := contacts.Open(dbPath, bootstrapKeyring())
+	db, err := contacts.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -307,7 +307,7 @@ func runContactsDelete(cmd *cobra.Command, args []string) error {
 	email := args[0]
 	dbPath := getDBPath()
 
-	db, err := contacts.Open(dbPath, bootstrapKeyring())
+	db, err := contacts.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}

@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,7 +13,6 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/durian-dev/durian/cli/internal/contacts"
-	"github.com/durian-dev/durian/cli/internal/dbcrypto"
 )
 
 // newTestRouter sets up a mux.Router with all routes, mirroring serve.go.
@@ -42,11 +40,7 @@ func newTestRouter(h *Handler, hub *EventHub) *mux.Router {
 func newTestContactsDB(t *testing.T) *contacts.DB {
 	t.Helper()
 	dir := t.TempDir()
-	kr, err := dbcrypto.NewKeyring(bytes.Repeat([]byte{0x42}, dbcrypto.MasterKeyLen))
-	if err != nil {
-		t.Fatalf("test keyring: %v", err)
-	}
-	db, err := contacts.Open(filepath.Join(dir, "contacts.db"), kr)
+	db, err := contacts.Open(filepath.Join(dir, "contacts.db"))
 	if err != nil {
 		t.Fatalf("open contacts: %v", err)
 	}
