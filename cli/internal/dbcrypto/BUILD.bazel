@@ -5,14 +5,19 @@ go_library(
     srcs = [
         "dbcrypto.go",
         "keyring.go",
+        "tokenize.go",
     ],
     importpath = "github.com/durian-dev/durian/cli/internal/dbcrypto",
     visibility = ["//cli:__subpackages__"],
+    deps = ["@com_github_rivo_uniseg//:uniseg"],
 )
 
 go_test(
     name = "dbcrypto_test",
     size = "small",
-    srcs = ["dbcrypto_test.go"],
+    srcs = [
+        "dbcrypto_test.go",
+        "tokenize_test.go",
+    ],
     embed = [":dbcrypto"],
 )

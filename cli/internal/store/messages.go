@@ -128,6 +128,20 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 		return fmt.Errorf("upsert message: %w", err)
 	}
 
+	// ADR-0001 step 7 (a+b): maintain the parallel blind FTS5 row. The
+	// old messages_fts trigger-pair still fires for the plaintext columns
+	// — step 7c flips reads to messages_blind_fts and step 7e drops the
+	// old triggers. DELETE+INSERT (vs UPDATE) because contentless FTS5
+	// columns can't be updated in place.
+	sTok, fTok, tTok, bTok := d.blindTokens(msg.Subject, msg.FromAddr, msg.ToAddrs, msg.BodyText)
+	if _, err := tx.Exec("DELETE FROM messages_blind_fts WHERE rowid = ?", msg.ID); err != nil {
+		return fmt.Errorf("blind fts delete: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO messages_blind_fts(rowid, subject_tok, from_tok, to_tok, body_tok)
+		VALUES (?, ?, ?, ?, ?)`, msg.ID, sTok, fTok, tTok, bTok); err != nil {
+		return fmt.Errorf("blind fts insert: %w", err)
+	}
+
 	return nil
 }
 

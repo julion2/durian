@@ -42,8 +42,8 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 15 {
-		t.Errorf("version = %d, want 15", version)
+	if version != 16 {
+		t.Errorf("version = %d, want 16", version)
 	}
 }
 
@@ -168,8 +168,8 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 15 {
-		t.Fatalf("version = %d, want 15", version)
+	if version != 16 {
+		t.Fatalf("version = %d, want 16", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).
@@ -349,8 +349,8 @@ func TestMigrateV10_BackfillsSubjectCt(t *testing.T) {
 	if err := sd.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 15 {
-		t.Fatalf("version = %d, want 15", version)
+	if version != 16 {
+		t.Fatalf("version = %d, want 16", version)
 	}
 
 	// Raw check: subject_ct must be NULL for empty subject, non-NULL for the
@@ -483,8 +483,8 @@ func TestMigrateV11_BackfillsBodyCt(t *testing.T) {
 	if err := sd.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 15 {
-		t.Fatalf("version = %d, want 15", version)
+	if version != 16 {
+		t.Fatalf("version = %d, want 16", version)
 	}
 
 	// Raw check: body_text_ct populated only where body_text non-empty.
@@ -624,8 +624,8 @@ func TestMigrateV12_BackfillsAddrsCt(t *testing.T) {
 	if err := sd.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 15 {
-		t.Fatalf("version = %d, want 15", version)
+	if version != 16 {
+		t.Fatalf("version = %d, want 16", version)
 	}
 
 	rows, err := sd.db.Query(`SELECT message_id, from_addr, from_addr_ct,
@@ -687,6 +687,54 @@ func TestMigrateV12_BackfillsAddrsCt(t *testing.T) {
 				want.id, msg.FromAddr, msg.ToAddrs, msg.CCAddrs,
 				want.from, want.to, want.cc)
 		}
+	}
+}
+
+// TestBlindFTS_InsertAndMatch verifies the step-7 (a+b) round-trip:
+// a message inserted via the store API populates messages_blind_fts,
+// and a token computed independently with the same FTSToken sub-key
+// matches the right rowid via SQLite's FTS5 MATCH operator.
+func TestBlindFTS_InsertAndMatch(t *testing.T) {
+	db := newTestDB(t)
+	kr := testKeyring(t)
+
+	msg := &Message{
+		MessageID: "blindtest@example",
+		Subject:   "Hello Blindtoken World",
+		FromAddr:  "alice@example.com",
+		ToAddrs:   "bob@example.com",
+		BodyText:  "the quick brown fox",
+		CreatedAt: 1,
+		Account:   "acct1",
+	}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	tok := dbcrypto.TokenizeFTS(kr.FTSToken, "blindtoken")
+	if tok == "" {
+		t.Fatal("tokenizer returned empty for non-empty input")
+	}
+	var rowid int64
+	err := db.db.QueryRow(
+		`SELECT rowid FROM messages_blind_fts WHERE subject_tok MATCH ? LIMIT 1`,
+		tok,
+	).Scan(&rowid)
+	if err != nil {
+		t.Fatalf("blind fts match: %v", err)
+	}
+	if rowid != msg.ID {
+		t.Errorf("rowid = %d, want %d", rowid, msg.ID)
+	}
+
+	notInSubject := dbcrypto.TokenizeFTS(kr.FTSToken, "kraftfahrzeughaftpflichtversicherung")
+	var dummy int64
+	err = db.db.QueryRow(
+		`SELECT rowid FROM messages_blind_fts WHERE subject_tok MATCH ? LIMIT 1`,
+		notInSubject,
+	).Scan(&dummy)
+	if err == nil {
+		t.Errorf("blind fts matched a word not in any subject (rowid=%d)", dummy)
 	}
 }
 

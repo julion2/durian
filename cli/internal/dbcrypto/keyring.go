@@ -14,13 +14,14 @@ import (
 // — each as its own field so callers never have to remember which label
 // to pass.
 type Keyring struct {
-	Subject []byte // encrypts messages.subject (LabelSubject)
-	Body    []byte // encrypts messages.body_text + body_html (LabelBody)
-	Addrs   []byte // encrypts messages.from_addr + to_addrs + cc_addrs (LabelAddrs)
-	Headers []byte // encrypts message_headers.value (LabelHeaders)
-	Draft   []byte // encrypts local_drafts.draft_json + outbox.draft_json (LabelDraft)
-	Meta    []byte // encrypts mailboxes.name + accounts.name + messages.flags_other (LabelMeta)
-	Contact []byte // encrypts contacts.email + contacts.name (LabelContact)
+	Subject  []byte // encrypts messages.subject (LabelSubject)
+	Body     []byte // encrypts messages.body_text + body_html (LabelBody)
+	Addrs    []byte // encrypts messages.from_addr + to_addrs + cc_addrs (LabelAddrs)
+	Headers  []byte // encrypts message_headers.value (LabelHeaders)
+	Draft    []byte // encrypts local_drafts.draft_json + outbox.draft_json (LabelDraft)
+	Meta     []byte // encrypts mailboxes.name + accounts.name + messages.flags_other (LabelMeta)
+	Contact  []byte // encrypts contacts.email + contacts.name (LabelContact)
+	FTSToken []byte // HMAC key for blind FTS5 search tokens (LabelFTSToken)
 }
 
 // NewKeyring derives every currently-shipped sub-key from a 32-byte master.
@@ -55,7 +56,14 @@ func NewKeyring(master []byte) (*Keyring, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dbcrypto: derive contact sub-key: %w", err)
 	}
-	return &Keyring{Subject: subject, Body: body, Addrs: addrs, Headers: headers, Draft: draft, Meta: meta, Contact: contact}, nil
+	ftsToken, err := DeriveSubKey(master, LabelFTSToken)
+	if err != nil {
+		return nil, fmt.Errorf("dbcrypto: derive fts-token sub-key: %w", err)
+	}
+	return &Keyring{
+		Subject: subject, Body: body, Addrs: addrs, Headers: headers,
+		Draft: draft, Meta: meta, Contact: contact, FTSToken: ftsToken,
+	}, nil
 }
 
 // Wipe overwrites every sub-key in place with zeroes and nils the slice
@@ -73,6 +81,7 @@ func (k *Keyring) Wipe() {
 	zero(k.Draft)
 	zero(k.Meta)
 	zero(k.Contact)
+	zero(k.FTSToken)
 	k.Subject = nil
 	k.Body = nil
 	k.Addrs = nil
@@ -80,6 +89,7 @@ func (k *Keyring) Wipe() {
 	k.Draft = nil
 	k.Meta = nil
 	k.Contact = nil
+	k.FTSToken = nil
 }
 
 // zero overwrites b with zero bytes in constant time. Used by Wipe.
