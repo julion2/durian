@@ -517,8 +517,12 @@ statement. Mitigations, all part of the implementation PR:
   `slog.String("subject", ...)` defeats the whole scheme. CI gate + redact
   wrapper documented in the *Logging audit* section above.
 - Three new tables (`mailboxes`, `accounts`) and a new BLOB columns layout
-  mean every query that previously joined on `messages.mailbox` /
-  `messages.account` gets a JOIN rewrite.
+  meant every query that previously joined on `messages.mailbox` /
+  `messages.account` got a JOIN rewrite (executed in step 7f when the
+  plaintext shadow columns were finally dropped). Same churn for the
+  `messages.flags` TEXT column, now reconstructed from
+  `is_seen` / `is_flagged` / `is_deleted` + the encrypted `flags_other`
+  BLOB on every read.
 
 **Neutral:**
 
