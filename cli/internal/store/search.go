@@ -451,7 +451,7 @@ func (d *DB) exprToSQL(node exprNode) (string, []interface{}, error) {
 		// user term is run through the same TokenizeFTS pipeline that
 		// populated the index in step 7a+b, so the hex tokens produced
 		// here line up with the tokens stored at write time.
-		toks := dbcrypto.TokenizeFTS(d.keyring.FTSToken, n.value)
+		toks := dbcrypto.TokenizeFTSQuery(d.keyring.FTSToken, n.value)
 		if toks == "" {
 			// All-stop-words / punctuation-only input — never matches anything.
 			return "1=0", nil, nil
@@ -498,7 +498,7 @@ func (d *DB) fieldToSQL(f *fieldExpr) (string, []interface{}, error) {
 		// ADR-0001 step 7c: subject: scoped FTS flips to messages_blind_fts.
 		// subject_tok:(tok1 tok2 ...) AND's each token against the
 		// subject_tok column only.
-		toks := dbcrypto.TokenizeFTS(d.keyring.FTSToken, f.value)
+		toks := dbcrypto.TokenizeFTSQuery(d.keyring.FTSToken, f.value)
 		if toks == "" {
 			return "1=0", nil, nil
 		}
