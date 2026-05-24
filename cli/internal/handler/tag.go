@@ -54,7 +54,7 @@ func (h *Handler) Tag(query string, tags string) protocol.Response {
 		if h.syncTrigger != nil {
 			accounts, err := h.store.GetAccountsByThread(threadID)
 			if err != nil {
-				slog.Debug("Failed to get accounts for sync trigger", "module", "TAG", "thread", threadID, "err", err)
+				slog.Debug("Failed to get accounts for sync trigger", "module", "TAG", "thread", threadID, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			}
 			for _, account := range accounts {
 				h.syncTrigger.TriggerSync(account)

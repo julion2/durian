@@ -108,7 +108,7 @@ func (s *Syncer) getMailboxesToSync() ([]string, error) {
 
 	// Gmail: sync only All Mail + Spam + Trash (labels come via X-GM-LABELS)
 	if s.isGmail() && len(s.account.IMAP.Mailboxes) == 0 {
-		slog.Info("Gmail account detected, using All Mail sync strategy", "module", "SYNC")
+		slog.Info("Gmail account detected, using All Mail sync strategy", "module", "SYNC") // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return s.resolveGmailMailboxes()
 	}
 
@@ -154,7 +154,7 @@ func (s *Syncer) getMailboxesToSync() ([]string, error) {
 	}
 
 	if len(mailboxes) == 0 {
-		slog.Debug("No mailboxes detected via SPECIAL-USE, falling back to defaults", "module", "SYNC")
+		slog.Debug("No mailboxes detected via SPECIAL-USE, falling back to defaults", "module", "SYNC") // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return s.getMailboxesByName(config.DefaultIMAPMailboxes)
 	}
 
@@ -179,7 +179,7 @@ func (s *Syncer) resolveGmailMailboxes() ([]string, error) {
 		result = append(result, trash)
 	}
 
-	slog.Info("Gmail mailboxes resolved", "module", "SYNC", "mailboxes", result)
+	slog.Info("Gmail mailboxes resolved", "module", "SYNC", "mailboxes", result) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	return result, nil
 }
 

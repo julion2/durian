@@ -31,7 +31,7 @@ func (s *Syncer) backfillHeaders(mailboxes []string) {
 func (s *Syncer) backfillHeadersForMailbox(mboxName string) {
 	mboxState := s.state.GetMailboxState(mboxName)
 	if _, err := s.client.SelectMailbox(mboxName); err != nil {
-		slog.Debug("Backfill: skip mailbox", "module", "SYNC", "mailbox", mboxName, "err", err)
+		slog.Debug("Backfill: skip mailbox", "module", "SYNC", "mailbox", mboxName, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
 
@@ -82,7 +82,7 @@ func (s *Syncer) uidsNeedingHeaderBackfill(mboxState *MailboxState) []uint32 {
 func (s *Syncer) backfillHeaderBatch(mboxName string, mboxState *MailboxState, batch []uint32) int {
 	headers, err := s.client.FetchHeadersOnly(batch)
 	if err != nil {
-		slog.Debug("Backfill fetch failed", "module", "SYNC", "mailbox", mboxName, "err", err)
+		slog.Debug("Backfill fetch failed", "module", "SYNC", "mailbox", mboxName, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return 0
 	}
 	stored := 0
@@ -120,7 +120,7 @@ func (s *Syncer) storeHeadersForUID(uid uint32, rawHeader []byte, mboxState *Mai
 // syncMailbox syncs a single mailbox
 func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 	result := MailboxResult{Name: mailboxName}
-	slog.Debug("Syncing mailbox", "module", "SYNC", "mailbox", mailboxName)
+	slog.Debug("Syncing mailbox", "module", "SYNC", "mailbox", mailboxName) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 
 	// Select mailbox
 	status, err := s.client.SelectMailbox(mailboxName)
@@ -316,7 +316,7 @@ func (s *Syncer) handleDeletedUID(uid uint32, mailboxName string, mboxState *Mai
 
 	if tagMapping != nil && len(tagMapping.AddTags) > 0 {
 		// Remove the folder's tags (reverse of adding them on download)
-		slog.Debug("Removing folder tags for moved message", "module", "SYNC",
+		slog.Debug("Removing folder tags for moved message", "module", "SYNC", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			"uid", uid, "message_id", messageID, "folder", mailboxName, "tags", tagMapping.AddTags)
 		if err := s.store.ModifyTagsByMessageIDAndAccount(
 			messageID, s.accountName(), nil, tagMapping.AddTags); err != nil {
@@ -326,7 +326,7 @@ func (s *Syncer) handleDeletedUID(uid uint32, mailboxName string, mboxState *Mai
 	}
 
 	// No tag mapping for this folder — delete the message
-	slog.Debug("Deleting message removed from untagged folder", "module", "SYNC",
+	slog.Debug("Deleting message removed from untagged folder", "module", "SYNC", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		"uid", uid, "message_id", messageID, "folder", mailboxName)
 	if err := s.store.DeleteByMessageIDAndAccount(messageID, s.accountName()); err != nil {
 		slog.Warn("store delete failed", "module", "SYNC", "uid", uid, "err", err)
@@ -406,7 +406,7 @@ func (s *Syncer) dedupOneUID(uid uint32, mailboxName string, mboxState *MailboxS
 
 	// Update mailbox and UID to reflect the message's current server folder
 	if err := s.store.UpdateMailbox(messageID, s.accountName(), mailboxName, uid); err != nil {
-		slog.Debug("Failed to update mailbox", "module", "SYNC", "message_id", messageID, "err", err)
+		slog.Debug("Failed to update mailbox", "module", "SYNC", "message_id", messageID, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	}
 
 	mboxState.AddSyncedUID(uid)

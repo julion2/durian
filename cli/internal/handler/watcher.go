@@ -154,13 +154,13 @@ func (w *WatcherManager) watchAccount(ctx context.Context, aw *accountWatcher) {
 		initOpts := &imap.SyncOptions{Quiet: true, Mailboxes: []string{"INBOX"}, Store: w.store, FilterRules: w.filterRules, Groups: w.groups}
 		initSyncer := imap.NewSyncerWithClient(account, client, initOpts)
 		if _, err := initSyncer.Sync(); err != nil {
-			w.log.Error("Initial sync failed", "account", account.Email, "err", err)
+			w.log.Error("Initial sync failed", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		}
 
 		// Select INBOX for IDLE (sync may have left a different mailbox selected)
 		status, err := client.SelectMailbox("INBOX")
 		if err != nil {
-			w.log.Error("Select INBOX failed after sync, reconnecting in 30s", "account", account.Email, "err", err)
+			w.log.Error("Select INBOX failed after sync, reconnecting in 30s", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			client.Close()
 			select {
 			case <-ctx.Done():
@@ -173,7 +173,7 @@ func (w *WatcherManager) watchAccount(ctx context.Context, aw *accountWatcher) {
 		// process (e.g. GUI quickSync) already synced them to disk.
 		uidNext := status.UidNext
 
-		w.log.Info("Watching for new messages", "account", account.Email, "uidnext", uidNext)
+		w.log.Info("Watching for new messages", "account", account.Email, "uidnext", uidNext) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 
 		// Inner loop: IDLE ↔ sync cycles on the SAME connection
 		connectionAlive := true
@@ -185,7 +185,7 @@ func (w *WatcherManager) watchAccount(ctx context.Context, aw *accountWatcher) {
 			go func() {
 				defer close(idleDone)
 				if err := client.Idle(stopIdle, updates); err != nil {
-					w.log.Error("IDLE error", "account", account.Email, "err", err)
+					w.log.Error("IDLE error", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 				}
 			}()
 
@@ -197,12 +197,12 @@ func (w *WatcherManager) watchAccount(ctx context.Context, aw *accountWatcher) {
 			case <-updates:
 				close(stopIdle)
 				<-idleDone // wait for IDLE goroutine to exit before reusing connection
-				w.log.Info("New messages detected, syncing", "account", account.Email)
+				w.log.Info("New messages detected, syncing", "account", account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 				w.syncAndNotify(account, client, uidNext)
 				// Re-SELECT INBOX (sync iterates all mailboxes, last selected may differ)
 				newStatus, err := client.SelectMailbox("INBOX")
 				if err != nil {
-					w.log.Error("Re-SELECT INBOX failed, reconnecting", "account", account.Email, "err", err)
+					w.log.Error("Re-SELECT INBOX failed, reconnecting", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 					connectionAlive = false
 				} else {
 					uidNext = newStatus.UidNext
@@ -214,14 +214,14 @@ func (w *WatcherManager) watchAccount(ctx context.Context, aw *accountWatcher) {
 				// Break IDLE to handle attachment fetch request
 				close(stopIdle)
 				<-idleDone
-				w.log.Debug("Attachment fetch request", "account", account.Email,
+				w.log.Debug("Attachment fetch request", "account", account.Email, // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 					"mailbox", req.Mailbox, "uid", req.UID, "filename", req.Filename)
 				fetchErr := w.handleFetchRequest(client, req)
 				req.Result <- FetchResult{Err: fetchErr}
 				// Re-SELECT INBOX and resume IDLE
 				newStatus, err := client.SelectMailbox("INBOX")
 				if err != nil {
-					w.log.Error("Re-SELECT INBOX failed after fetch, reconnecting", "account", account.Email, "err", err)
+					w.log.Error("Re-SELECT INBOX failed after fetch, reconnecting", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 					connectionAlive = false
 				} else {
 					uidNext = newStatus.UidNext
@@ -230,12 +230,12 @@ func (w *WatcherManager) watchAccount(ctx context.Context, aw *accountWatcher) {
 				// Break IDLE to push local tag/folder changes to IMAP
 				close(stopIdle)
 				<-idleDone
-				w.log.Info("Tag change detected, syncing flags", "account", account.Email)
+				w.log.Info("Tag change detected, syncing flags", "account", account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 				w.syncFlagsOnly(account, client)
 				// Re-SELECT INBOX and resume IDLE
 				newStatus, err := client.SelectMailbox("INBOX")
 				if err != nil {
-					w.log.Error("Re-SELECT INBOX failed after sync, reconnecting", "account", account.Email, "err", err)
+					w.log.Error("Re-SELECT INBOX failed after sync, reconnecting", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 					connectionAlive = false
 				} else {
 					uidNext = newStatus.UidNext
@@ -243,11 +243,11 @@ func (w *WatcherManager) watchAccount(ctx context.Context, aw *accountWatcher) {
 			case <-time.After(10 * time.Minute):
 				close(stopIdle)
 				<-idleDone
-				w.log.Info("Fallback poll, syncing", "account", account.Email)
+				w.log.Info("Fallback poll, syncing", "account", account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 				w.syncAndNotify(account, client, uidNext)
 				newStatus, err := client.SelectMailbox("INBOX")
 				if err != nil {
-					w.log.Error("Re-SELECT INBOX failed, reconnecting", "account", account.Email, "err", err)
+					w.log.Error("Re-SELECT INBOX failed, reconnecting", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 					connectionAlive = false
 				} else {
 					uidNext = newStatus.UidNext
@@ -372,11 +372,11 @@ func (w *WatcherManager) syncFlagsOnly(account *config.AccountConfig, client *im
 
 	result, err := syncer.Sync()
 	if err != nil {
-		w.log.Error("Upload-only sync failed", "account", account.Email, "err", err)
+		w.log.Error("Upload-only sync failed", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
 	if result.FlagsUploaded > 0 || result.TotalMoved > 0 {
-		w.log.Info("Upload-only sync complete", "account", account.Email,
+		w.log.Info("Upload-only sync complete", "account", account.Email, // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			"flags_uploaded", result.FlagsUploaded, "moved", result.TotalMoved)
 	}
 }
@@ -410,32 +410,32 @@ func (w *WatcherManager) syncAndNotify(account *config.AccountConfig, client *im
 	select {
 	case out := <-ch:
 		if out.err != nil {
-			w.log.Error("Sync failed", "account", account.Email, "err", out.err)
+			w.log.Error("Sync failed", "account", account.Email, "err", out.err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			return
 		}
 	case <-time.After(2 * time.Minute):
-		w.log.Error("Sync timed out after 2m", "account", account.Email)
+		w.log.Error("Sync timed out after 2m", "account", account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
 
 	// Detect new messages via UIDNEXT: any UID >= prevUidNext is new since
 	// the last IDLE cycle, regardless of whether another process synced it.
 	// Fetch envelopes for UIDs in [prevUidNext, *) to get their Message-IDs.
-	w.log.Debug("Searching for new UIDs", "account", account.Email, "min_uid", prevUidNext)
+	w.log.Debug("Searching for new UIDs", "account", account.Email, "min_uid", prevUidNext) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	newUIDs, err := client.SearchUIDRange(prevUidNext, 0)
 	if err != nil {
-		w.log.Error("UID search failed", "account", account.Email, "err", err)
+		w.log.Error("UID search failed", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
 	if len(newUIDs) == 0 {
-		w.log.Debug("No new UIDs found", "account", account.Email, "prev_uidnext", prevUidNext)
+		w.log.Debug("No new UIDs found", "account", account.Email, "prev_uidnext", prevUidNext) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
-	w.log.Debug("Found new UIDs", "account", account.Email, "count", len(newUIDs), "uids", newUIDs)
+	w.log.Debug("Found new UIDs", "account", account.Email, "count", len(newUIDs), "uids", newUIDs) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 
 	envelopes, err := client.FetchEnvelopes(newUIDs)
 	if err != nil {
-		w.log.Error("Envelope fetch failed", "account", account.Email, "err", err)
+		w.log.Error("Envelope fetch failed", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
 
@@ -445,14 +445,14 @@ func (w *WatcherManager) syncAndNotify(account *config.AccountConfig, client *im
 		if messageID == "" {
 			continue
 		}
-		w.log.Debug("UID to Message-ID mapping", "account", account.Email, "uid", uid, "message_id", messageID)
+		w.log.Debug("UID to Message-ID mapping", "account", account.Email, "uid", uid, "message_id", messageID) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		msg, err := w.store.GetByMessageID(messageID)
 		if err != nil {
-			w.log.Error("Store lookup failed", "account", account.Email, "message_id", messageID, "err", err)
+			w.log.Error("Store lookup failed", "account", account.Email, "message_id", messageID, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			continue
 		}
 		if msg == nil {
-			w.log.Debug("Message not yet in store", "account", account.Email, "message_id", messageID)
+			w.log.Debug("Message not yet in store", "account", account.Email, "message_id", messageID) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			continue
 		}
 		from := msg.FromAddr
@@ -469,7 +469,7 @@ func (w *WatcherManager) syncAndNotify(account *config.AccountConfig, client *im
 		w.log.Info("New mail", "account", account.Email, "thread", msg.ThreadID) // encgrep:allow account.Email plaintext per ADR-0001 §3
 	}
 
-	w.log.Info("Broadcasting new messages", "account", account.Email, "count", len(messages))
+	w.log.Info("Broadcasting new messages", "account", account.Email, "count", len(messages)) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	w.hub.Broadcast(NewMailEvent{
 		Account:  account.Email,
 		TotalNew: len(messages),

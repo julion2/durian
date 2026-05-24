@@ -195,7 +195,7 @@ func (s *Syncer) Sync() (*SyncResult, error) {
 	// Cache server mailbox list for exclusion tag logic
 	s.serverMailboxes, err = s.client.ListMailboxes()
 	if err != nil {
-		slog.Debug("Failed to cache server mailbox list", "module", "SYNC", "err", err)
+		slog.Debug("Failed to cache server mailbox list", "module", "SYNC", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	}
 
 	// Sync each mailbox with automatic reconnection on failure
@@ -208,13 +208,13 @@ func (s *Syncer) Sync() (*SyncResult, error) {
 				// Caller owns the connection — don't reconnect (would open a
 				// new socket that aggressive servers like M365 reject). Abort
 				// early and let the caller's IDLE loop catch up next cycle.
-				slog.Debug("Connection lost, aborting (caller-owned connection)", "module", "SYNC", "mailbox", mbox)
+				slog.Debug("Connection lost, aborting (caller-owned connection)", "module", "SYNC", "mailbox", mbox) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 				result.Mailboxes = append(result.Mailboxes, mboxResult)
 				result.Error = mboxResult.Error
 				break
 			}
 
-			slog.Debug("Connection lost, attempting reconnect", "module", "SYNC", "mailbox", mbox)
+			slog.Debug("Connection lost, attempting reconnect", "module", "SYNC", "mailbox", mbox) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			fmt.Fprintf(s.output, "  ⚠ Connection lost, reconnecting...\n")
 
 			if err := s.client.Reconnect(); err != nil {

@@ -21,47 +21,10 @@ import (
 	"log/slog"
 )
 
-// Placeholder replaces sensitive values in log output.
+// Placeholder replaces sensitive values in log output. The set of keys
+// triggering replacement is defined in keys.go (SensitiveSlogKeys) so the
+// runtime wrapper and the pre-merge grep gate share one source of truth.
 const Placeholder = "[REDACTED]"
-
-// sensitiveKeys is the registry generated from ADR-0001 §3 (Encrypted fields).
-// Adding a new encrypted column means adding its idiomatic slog key here.
-var sensitiveKeys = map[string]struct{}{
-	// messages
-	"subject":   {},
-	"body":      {},
-	"body_text": {},
-	"body_html": {},
-	"snippet":   {},
-	// addresses (encrypted in addrs_key)
-	"to":        {},
-	"from":      {},
-	"cc":        {},
-	"bcc":       {},
-	"reply_to":  {},
-	"recipient": {},
-	"sender":    {},
-	// headers
-	"header_value": {},
-	// drafts / outbox
-	"draft":      {},
-	"draft_json": {},
-	// contacts (note: "email" alone is intentionally NOT redacted — it is
-	// the account identifier elsewhere; use "contact_email" for contacts.)
-	"contact_email": {},
-	"contact_name":  {},
-	// meta_key columns
-	"mailbox_name": {},
-	"flags":        {},
-}
-
-// IsSensitive reports whether key would be redacted by Wrap-wrapped handlers.
-// Exported so tests and tooling (e.g. the grep-gate allow-list audit) can
-// query the registry without poking at internals.
-func IsSensitive(key string) bool {
-	_, ok := sensitiveKeys[key]
-	return ok
-}
 
 // Handler is a slog.Handler that scrubs sensitive attribute values before
 // delegating to the wrapped handler.
@@ -123,7 +86,7 @@ func redact(a slog.Attr) slog.Attr {
 		}
 		return slog.Group(a.Key, anyAttrs...)
 	}
-	if _, sensitive := sensitiveKeys[a.Key]; sensitive {
+	if _, sensitive := sensitiveSlogKeySet[a.Key]; sensitive {
 		return slog.String(a.Key, Placeholder)
 	}
 	return a

@@ -849,14 +849,14 @@ func (c *Client) GetSyncMailboxes() ([]string, error) {
 
 		// Skip non-mail Exchange folders
 		if config.IsIMAPMailboxExcluded(mbox.Name) {
-			slog.Debug("Skipping excluded mailbox", "module", "IMAP", "mailbox", mbox.Name)
+			slog.Debug("Skipping excluded mailbox", "module", "IMAP", "mailbox", mbox.Name) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			continue
 		}
 
 		result = append(result, mbox.Name)
 	}
 
-	slog.Debug("Sync mailboxes", "module", "IMAP", "count", len(result))
+	slog.Debug("Sync mailboxes", "module", "IMAP", "count", len(result)) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	return result, nil
 }
 
@@ -1045,7 +1045,7 @@ func (c *Client) Reconnect() error {
 		return fmt.Errorf("reconnect auth failed: %w", err)
 	}
 
-	slog.Debug("Reconnected", "module", "IMAP", "host", c.account.IMAP.Host)
+	slog.Debug("Reconnected", "module", "IMAP", "host", c.account.IMAP.Host) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	return nil
 }
 

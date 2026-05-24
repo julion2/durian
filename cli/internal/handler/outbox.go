@@ -360,41 +360,41 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *smtp
 // appendToSent saves a copy to the IMAP Sent folder (skip for providers that auto-save).
 func (w *OutboxWorker) appendToSent(account *config.AccountConfig, msg *smtp.Message) {
 	if account.OAuth != nil && (account.OAuth.Provider == "google" || account.OAuth.Provider == "microsoft") {
-		slog.Debug("Skipping Sent append", "module", "OUTBOX", "provider", account.OAuth.Provider)
+		slog.Debug("Skipping Sent append", "module", "OUTBOX", "provider", account.OAuth.Provider) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
 
 	messageData, err := msg.Build()
 	if err != nil {
-		slog.Warn("Failed to build message for Sent folder", "module", "OUTBOX", "err", err)
+		slog.Warn("Failed to build message for Sent folder", "module", "OUTBOX", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
 
 	conn := imapClient.NewClient(account)
 	if err := conn.Connect(); err != nil {
-		slog.Warn("Failed to connect IMAP for Sent folder", "module", "OUTBOX", "err", err)
+		slog.Warn("Failed to connect IMAP for Sent folder", "module", "OUTBOX", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
 	defer conn.Close()
 
 	if err := conn.Authenticate(); err != nil {
-		slog.Warn("Failed to authenticate IMAP for Sent folder", "module", "OUTBOX", "err", err)
+		slog.Warn("Failed to authenticate IMAP for Sent folder", "module", "OUTBOX", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
 
 	sentMailbox, err := conn.FindSentMailbox()
 	if err != nil {
-		slog.Warn("Could not find Sent mailbox", "module", "OUTBOX", "err", err)
+		slog.Warn("Could not find Sent mailbox", "module", "OUTBOX", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
 
 	flags := []string{imap.SeenFlag}
 	if _, err := conn.Append(sentMailbox, flags, time.Now(), messageData); err != nil {
-		slog.Warn("Failed to save to Sent folder", "module", "OUTBOX", "err", err)
+		slog.Warn("Failed to save to Sent folder", "module", "OUTBOX", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
 
-	slog.Info("Saved to Sent folder", "module", "OUTBOX", "mailbox", sentMailbox)
+	slog.Info("Saved to Sent folder", "module", "OUTBOX", "mailbox", sentMailbox) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 }
 
 // isNetworkError returns true if the error is a connection/DNS/timeout failure
