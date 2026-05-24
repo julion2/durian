@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"fmt"
 	"strconv"
 	"strings"
@@ -117,6 +118,26 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 	return results, nil
 }
 
+// resolveAccountIDs maps account names to their accounts.id values for
+// use in WHERE m.account_id IN (...) clauses. Unknown names drop out
+// silently — caller treats an empty result as "no matching rows". Used
+// throughout search.go after step 7f removed the plaintext messages.account.
+func (d *DB) resolveAccountIDs(names []string) ([]int64, error) {
+	out := make([]int64, 0, len(names))
+	for _, name := range names {
+		var id int64
+		err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", name).Scan(&id)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("lookup account id: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
 // getThreadTagsBatch returns distinct tags for multiple threads in a single query.
 // Returns map[threadID][]tags. When accounts are provided, only tags from those
 // accounts are included.
@@ -137,12 +158,19 @@ func (d *DB) getThreadTagsBatch(threadIDs []string, accounts ...string) (map[str
 		WHERE m.thread_id IN (` + strings.Join(placeholders, ",") + `)`
 
 	if len(accounts) > 0 {
-		acctPH := make([]string, len(accounts))
-		for i, a := range accounts {
-			acctPH[i] = "?"
-			params = append(params, a)
+		ids, err := d.resolveAccountIDs(accounts)
+		if err != nil {
+			return nil, err
 		}
-		q += " AND m.account IN (" + strings.Join(acctPH, ",") + ")"
+		if len(ids) == 0 {
+			return make(map[string][]string), nil
+		}
+		acctPH := make([]string, len(ids))
+		for i, id := range ids {
+			acctPH[i] = "?"
+			params = append(params, id)
+		}
+		q += " AND m.account_id IN (" + strings.Join(acctPH, ",") + ")"
 	}
 	q += " ORDER BY m.thread_id, t.tag"
 
@@ -171,12 +199,19 @@ func (d *DB) getThreadTags(threadID string, accounts ...string) ([]string, error
 		WHERE m.thread_id = ?`
 	params := []interface{}{threadID}
 	if len(accounts) > 0 {
-		placeholders := make([]string, len(accounts))
-		for i, a := range accounts {
-			placeholders[i] = "?"
-			params = append(params, a)
+		ids, err := d.resolveAccountIDs(accounts)
+		if err != nil {
+			return nil, err
 		}
-		q += " AND m.account IN (" + strings.Join(placeholders, ",") + ")"
+		if len(ids) == 0 {
+			return nil, nil
+		}
+		placeholders := make([]string, len(ids))
+		for i, id := range ids {
+			placeholders[i] = "?"
+			params = append(params, id)
+		}
+		q += " AND m.account_id IN (" + strings.Join(placeholders, ",") + ")"
 	}
 	q += " ORDER BY t.tag"
 	rows, err := d.db.Query(q, params...)
@@ -528,7 +563,14 @@ func (d *DB) fieldToSQL(f *fieldExpr) (string, []interface{}, error) {
 	case "path":
 		account := extractAccountFromPath(f.value)
 		if account != "" {
-			return "m.account = ?", []interface{}{account}, nil
+			ids, err := d.resolveAccountIDs([]string{account})
+			if err != nil {
+				return "", nil, err
+			}
+			if len(ids) == 0 {
+				return "1=0", nil, nil
+			}
+			return "m.account_id = ?", []interface{}{ids[0]}, nil
 		}
 		return "1=1", nil, nil
 

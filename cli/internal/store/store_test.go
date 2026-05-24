@@ -42,8 +42,8 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 18 {
-		t.Errorf("version = %d, want 18", version)
+	if version != 19 {
+		t.Errorf("version = %d, want 19", version)
 	}
 }
 
@@ -168,8 +168,8 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 18 {
-		t.Fatalf("version = %d, want 18", version)
+	if version != 19 {
+		t.Fatalf("version = %d, want 19", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).

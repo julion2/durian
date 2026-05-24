@@ -294,17 +294,16 @@ func TestModifyTagsByMessageIDAndAccount(t *testing.T) {
 		t.Fatalf("modify personal tags: %v", err)
 	}
 
-	// Verify work row has "sent" but not "inbox"
-	var workID int64
-	db.db.QueryRow("SELECT id FROM messages WHERE message_id = ? AND account = ?", "acct-tag@x", "work").Scan(&workID)
+	// Verify work row has "sent" but not "inbox". Step 7f removed
+	// messages.account; lookup is now via the accounts FK.
+	workID := messageDBIDForAccount(t, db, "acct-tag@x", "work")
 	workTags, _ := db.GetMessageTags(workID)
 	if len(workTags) != 1 || workTags[0] != "sent" {
 		t.Errorf("work tags = %v, want [sent]", workTags)
 	}
 
 	// Verify personal row has "inbox" but not "sent"
-	var persID int64
-	db.db.QueryRow("SELECT id FROM messages WHERE message_id = ? AND account = ?", "acct-tag@x", "personal").Scan(&persID)
+	persID := messageDBIDForAccount(t, db, "acct-tag@x", "personal")
 	persTags, _ := db.GetMessageTags(persID)
 	if len(persTags) != 1 || persTags[0] != "inbox" {
 		t.Errorf("personal tags = %v, want [inbox]", persTags)
@@ -319,6 +318,19 @@ func TestModifyTagsByMessageIDAndAccount_NotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no-op, got error: %v", err)
 	}
+}
+
+// messageDBIDForAccount looks up messages.id for a (message_id, account)
+// pair. Step 7f removed messages.account; lookups go via the accounts FK.
+func messageDBIDForAccount(t *testing.T, db *DB, msgID, account string) int64 {
+	t.Helper()
+	var id int64
+	if err := db.db.QueryRow(`SELECT m.id FROM messages m
+		JOIN accounts ac ON ac.id = m.account_id
+		WHERE m.message_id = ? AND ac.name = ?`, msgID, account).Scan(&id); err != nil {
+		t.Fatalf("lookup message id (%s, %s): %v", msgID, account, err)
+	}
+	return id
 }
 
 func insertTestMessageForAccount(t *testing.T, db *DB, msgID, account string) int64 {

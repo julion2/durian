@@ -51,12 +51,25 @@ func (d *DB) HasHeaders(messageDBID int64) (bool, error) {
 }
 
 // GetMessageDBID returns the internal DB ID for a message by its RFC822 Message-ID
-// and account. Returns 0 if not found.
+// and account. Returns 0 if not found. Step 7f: account is resolved to
+// its accounts.id; an empty account string matches rows where
+// account_id IS NULL (the empty-Account upsert path).
 func (d *DB) GetMessageDBID(messageID, account string) (int64, error) {
 	var id int64
-	err := d.db.QueryRow(
-		"SELECT id FROM messages WHERE message_id = ? AND account = ?",
-		messageID, account).Scan(&id)
+	var err error
+	if account == "" {
+		err = d.db.QueryRow(
+			"SELECT id FROM messages WHERE message_id = ? AND account_id IS NULL",
+			messageID).Scan(&id)
+	} else {
+		var accountID int64
+		if err = d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID); err != nil {
+			return 0, nil
+		}
+		err = d.db.QueryRow(
+			"SELECT id FROM messages WHERE message_id = ? AND account_id = ?",
+			messageID, accountID).Scan(&id)
+	}
 	if err != nil {
 		return 0, nil
 	}
@@ -65,11 +78,14 @@ func (d *DB) GetMessageDBID(messageID, account string) (int64, error) {
 
 // AllMessages returns all messages with fields needed for rule matching.
 // from_addr/to_addrs/cc_addrs are plaintext (ADR-0001 §3 revision);
-// subject/body_text are ct-only after step 7e.
+// subject/body_text are ct-only after step 7e. Step 7f: account name
+// comes from the accounts LEFT JOIN + meta_key decrypt.
 func (d *DB) AllMessages() ([]*Message, error) {
-	rows, err := d.db.Query(`SELECT id, message_id, subject_ct,
-		from_addr, to_addrs, cc_addrs,
-		body_text_ct, account FROM messages`)
+	rows, err := d.db.Query(`SELECT m.id, m.message_id, m.subject_ct,
+		m.from_addr, m.to_addrs, m.cc_addrs,
+		m.body_text_ct, ac.name_ct
+		FROM messages m
+		LEFT JOIN accounts ac ON ac.id = m.account_id`)
 	if err != nil {
 		return nil, fmt.Errorf("query messages: %w", err)
 	}
@@ -78,10 +94,10 @@ func (d *DB) AllMessages() ([]*Message, error) {
 	var msgs []*Message
 	for rows.Next() {
 		m := &Message{}
-		var subjectCT, bodyTextCT []byte
+		var subjectCT, bodyTextCT, accountCT []byte
 		if err := rows.Scan(&m.ID, &m.MessageID, &subjectCT,
 			&m.FromAddr, &m.ToAddrs, &m.CCAddrs,
-			&bodyTextCT, &m.Account); err != nil {
+			&bodyTextCT, &accountCT); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
 		if m.Subject, err = d.decryptSubject("", subjectCT); err != nil {
@@ -89,6 +105,9 @@ func (d *DB) AllMessages() ([]*Message, error) {
 		}
 		if m.BodyText, err = d.decryptBody("", bodyTextCT); err != nil {
 			return nil, err
+		}
+		if m.Account, err = d.decryptMeta("", accountCT); err != nil {
+			return nil, fmt.Errorf("decrypt account name: %w", err)
 		}
 		msgs = append(msgs, m)
 	}
