@@ -493,16 +493,32 @@ What secure_delete does **not** cover:
 A Durian build with encryption is only as private as its least careful log
 statement. Mitigations, all part of the implementation PR:
 
+- **Single source of truth for sensitive slog keys.** Both the runtime
+  redact wrapper and the pre-merge grep gate consume the same list,
+  defined in `cli/internal/redact/keys.go` as `SensitiveSlogKeys`. The
+  Go test `TestGrepGateTokensInSync` reads the bash grep-gate script
+  and fails CI if any entry of `SensitiveSlogKeys` is not covered by
+  the script's `TOKENS` regex, printing the corrected line to paste.
+  Drift between the two defenses was H1 of the post-step-8 audit: the
+  wrapper had `mailbox_name` while production code logged with the
+  bare key `mailbox`, so mailbox names encrypted at rest leaked
+  plaintext to `serve.log` for three months. The SSOT pattern makes
+  that class of drift loud at build time.
 - Pre-merge grep gate: CI runs
-  `grep -rnE 'slog\.|log\.|fmt\.Print' cli/ | grep -E 'subject|body_text|body_html|from_addr|to_addrs|cc_addrs|email|draft_json'`
-  and fails if matches appear outside an explicit allow-list. The allow-list
-  is reviewed in this ADR's follow-up issue.
+  `grep -rnE 'slog\.|log\.|fmt\.Print' cli/ | grep -E ':[0-9]+:.*(TOKENS_REGEX)'`
+  (anchored to line content, not path, so filenames like
+  `sync_mailbox.go` don't false-positive every line in the file) and
+  fails if matches appear outside an explicit `// encgrep:allow
+  <reason>` annotation. The TOKENS regex is generated from
+  `SensitiveSlogKeys` plus the ADR-§3 encrypted-column names.
 - A small `slog.Handler` wrapper in `cli/internal/redact` runs every attr
-  value through a redactor that replaces any string matched against the
-  encrypted-field registry with `[REDACTED]`. The registry is generated
-  from the encrypted-column list above. Defense in depth: even if a future
-  contributor adds `slog.String("subject", msg.Subject)`, the wrapper
-  scrubs it.
+  value through a redactor that replaces any string matched against
+  `SensitiveSlogKeys` with `[REDACTED]`. Defense in depth: even if a
+  future contributor adds `slog.String("subject", msg.Subject)`, the
+  wrapper scrubs it. Wrapper-protected slog calls in production code
+  that name a sensitive key explicitly carry an `// encgrep:allow
+  wrapper-protected slog key per redact.SensitiveSlogKeys` annotation
+  so reviewers can audit the set at a glance.
 - IMAP / SMTP error paths sanitized: server responses can echo back
   Subject lines. The IMAP layer's error wrapper truncates and base64s any
   string that's longer than 80 characters, with a comment pointing at this

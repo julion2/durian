@@ -21,15 +21,23 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-# Tokens drawn from ADR-0001 §3 encrypted-columns table (line-substring match).
-TOKENS='subject|body_text|body_html|from_addr|to_addrs|cc_addrs|email|draft_json'
+# Tokens drawn from ADR-0001 §3 encrypted-columns table + the slog-key SSOT
+# in cli/internal/redact/keys.go (line-substring match). The Go test
+# TestGrepGateTokensInSync asserts every entry of SensitiveSlogKeys appears
+# in this regex; adding a key in keys.go without updating this line fails
+# CI on the next run with the expected TOKENS string printed.
+TOKENS='subject|body_text|body_html|from_addr|to_addrs|cc_addrs|email|draft_json|mailbox|account|synthetic_id|dest|trash|archive|folder|header_value|contact_email|contact_name|snippet'
 
 # The redact package legitimately names every sensitive token in its
 # registry, its test fixtures and its package documentation.
 EXCLUDE_PATHS='cli/internal/redact/'
 
+# The second grep anchors the token match to the line CONTENT (after
+# the `:lineno:` prefix grep -rn prepends) so filenames like
+# sync_mailbox.go don't false-positive every slog call in the file
+# just because the path contains "mailbox".
 hits=$(grep -rnE 'slog\.|log\.|fmt\.Print' cli/ \
-  | grep -E "$TOKENS" \
+  | grep -E ":[0-9]+:.*($TOKENS)" \
   | grep -vE "$EXCLUDE_PATHS" \
   | grep -vF 'encgrep:allow' \
   || true)
