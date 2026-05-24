@@ -40,10 +40,18 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 		return nil, fmt.Errorf("parse query: %w", err)
 	}
 
+	// ADR-0001 step 7e: messages.subject (plaintext) is dropped; the
+	// per-thread display subject comes from the latest message's
+	// subject_ct, decrypted in Go after the query. Older `MAX(m.subject)`
+	// picked lexicographically max subject which approximated "the
+	// Re: variant"; the latest-by-date subquery here is a closer
+	// match to what mail clients show as the thread title.
 	q := `
 		SELECT
 			m.thread_id,
-			MAX(m.subject) AS subject,
+			(SELECT m3.subject_ct FROM messages m3
+			 WHERE m3.thread_id = m.thread_id
+			 ORDER BY m3.date DESC LIMIT 1) AS subject_ct,
 			GROUP_CONCAT(DISTINCT m.from_addr) AS authors,
 			MAX(m.date) AS max_date,
 			(SELECT m2.to_addrs FROM messages m2
@@ -71,10 +79,15 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 	var results []SearchResult
 	for rows.Next() {
 		var r SearchResult
-		err := rows.Scan(&r.Thread, &r.Subject, &r.Authors, &r.Timestamp, &r.Recipients)
+		var subjectCT []byte
+		err := rows.Scan(&r.Thread, &subjectCT, &r.Authors, &r.Timestamp, &r.Recipients)
 		if err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan search result: %w", err)
+		}
+		if r.Subject, err = d.decryptSubject("", subjectCT); err != nil {
+			rows.Close()
+			return nil, err
 		}
 		r.DateRelative = formatDateRelative(r.Timestamp)
 		results = append(results, r)

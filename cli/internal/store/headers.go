@@ -5,17 +5,17 @@ import (
 	"net/textproto"
 )
 
-// InsertHeader stores a message header. Overwrites if the header already exists.
-// Writes both plaintext value (so existing reads still work) and value_ct
-// (ADR-0001 step 6). The plaintext column dies in step 7.
+// InsertHeader stores a message header. Overwrites if it already exists.
+// ADR-0001 step 7e: only value_ct is written — the plaintext value
+// column is dropped in the v17→v18 migration.
 func (d *DB) InsertHeader(messageDBID int64, name, value string) error {
 	valueCT, err := d.encryptHeaderValue(value)
 	if err != nil {
 		return fmt.Errorf("encrypt header value: %w", err)
 	}
 	_, err = d.db.Exec(
-		"INSERT OR REPLACE INTO message_headers (message_id, name, value, value_ct) VALUES (?, ?, ?, ?)",
-		messageDBID, name, value, valueCT)
+		"INSERT OR REPLACE INTO message_headers (message_id, name, value_ct) VALUES (?, ?, ?)",
+		messageDBID, name, valueCT)
 	if err != nil {
 		return fmt.Errorf("insert header: %w", err)
 	}
@@ -24,15 +24,14 @@ func (d *DB) InsertHeader(messageDBID int64, name, value string) error {
 
 // GetHeader returns a single header value for a message. Returns "" if not found.
 func (d *DB) GetHeader(messageDBID int64, name string) (string, error) {
-	var value string
 	var valueCT []byte
 	err := d.db.QueryRow(
-		"SELECT value, value_ct FROM message_headers WHERE message_id = ? AND name = ?",
-		messageDBID, name).Scan(&value, &valueCT)
+		"SELECT value_ct FROM message_headers WHERE message_id = ? AND name = ?",
+		messageDBID, name).Scan(&valueCT)
 	if err != nil {
 		return "", nil // not found
 	}
-	out, err := d.decryptHeaderValue(value, valueCT)
+	out, err := d.decryptHeaderValue("", valueCT)
 	if err != nil {
 		return "", err
 	}
@@ -65,11 +64,12 @@ func (d *DB) GetMessageDBID(messageID, account string) (int64, error) {
 }
 
 // AllMessages returns all messages with fields needed for rule matching.
-// from_addr/to_addrs/cc_addrs are plaintext (ADR-0001 §3 revision).
+// from_addr/to_addrs/cc_addrs are plaintext (ADR-0001 §3 revision);
+// subject/body_text are ct-only after step 7e.
 func (d *DB) AllMessages() ([]*Message, error) {
-	rows, err := d.db.Query(`SELECT id, message_id, subject, subject_ct,
+	rows, err := d.db.Query(`SELECT id, message_id, subject_ct,
 		from_addr, to_addrs, cc_addrs,
-		body_text, body_text_ct, account FROM messages`)
+		body_text_ct, account FROM messages`)
 	if err != nil {
 		return nil, fmt.Errorf("query messages: %w", err)
 	}
@@ -79,15 +79,15 @@ func (d *DB) AllMessages() ([]*Message, error) {
 	for rows.Next() {
 		m := &Message{}
 		var subjectCT, bodyTextCT []byte
-		if err := rows.Scan(&m.ID, &m.MessageID, &m.Subject, &subjectCT,
+		if err := rows.Scan(&m.ID, &m.MessageID, &subjectCT,
 			&m.FromAddr, &m.ToAddrs, &m.CCAddrs,
-			&m.BodyText, &bodyTextCT, &m.Account); err != nil {
+			&bodyTextCT, &m.Account); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
-		if m.Subject, err = d.decryptSubject(m.Subject, subjectCT); err != nil {
+		if m.Subject, err = d.decryptSubject("", subjectCT); err != nil {
 			return nil, err
 		}
-		if m.BodyText, err = d.decryptBody(m.BodyText, bodyTextCT); err != nil {
+		if m.BodyText, err = d.decryptBody("", bodyTextCT); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, m)
@@ -98,7 +98,7 @@ func (d *DB) AllMessages() ([]*Message, error) {
 // AllHeadersByMessage loads all stored headers, keyed by message DB ID.
 // Header names are returned in canonical MIME form (e.g. "List-Unsubscribe").
 func (d *DB) AllHeadersByMessage() (map[int64]map[string][]string, error) {
-	rows, err := d.db.Query("SELECT message_id, name, value, value_ct FROM message_headers")
+	rows, err := d.db.Query("SELECT message_id, name, value_ct FROM message_headers")
 	if err != nil {
 		return nil, fmt.Errorf("query headers: %w", err)
 	}
@@ -107,12 +107,12 @@ func (d *DB) AllHeadersByMessage() (map[int64]map[string][]string, error) {
 	result := make(map[int64]map[string][]string)
 	for rows.Next() {
 		var msgID int64
-		var name, value string
+		var name string
 		var valueCT []byte
-		if err := rows.Scan(&msgID, &name, &value, &valueCT); err != nil {
+		if err := rows.Scan(&msgID, &name, &valueCT); err != nil {
 			return nil, fmt.Errorf("scan header: %w", err)
 		}
-		plain, err := d.decryptHeaderValue(value, valueCT)
+		plain, err := d.decryptHeaderValue("", valueCT)
 		if err != nil {
 			return nil, err
 		}
