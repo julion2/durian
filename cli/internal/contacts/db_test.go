@@ -1,22 +1,15 @@
 package contacts
 
 import (
-	"bytes"
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/durian-dev/durian/cli/internal/dbcrypto"
 )
 
 func newTestDB(t *testing.T) *DB {
 	t.Helper()
 	dir := t.TempDir()
-	kr, err := dbcrypto.NewKeyring(bytes.Repeat([]byte{0x42}, dbcrypto.MasterKeyLen))
-	if err != nil {
-		t.Fatalf("test keyring: %v", err)
-	}
-	db, err := Open(filepath.Join(dir, "contacts.db"), kr)
+	db, err := Open(filepath.Join(dir, "contacts.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

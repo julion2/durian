@@ -108,14 +108,19 @@ no new direct dependency added).
 | `headers_key`      | `"durian/v1/headers"`    | encrypts `message_headers.value`       |
 | `addrs_key`        | `"durian/v1/addrs"`      | **(retired, see §3)** previously encrypted `from_addr`, `to_addrs`, `cc_addrs` |
 | `draft_key`        | `"durian/v1/draft"`      | encrypts `local_drafts.draft_json`, `outbox.draft_json` |
-| `contact_key`      | `"durian/v1/contact"`    | encrypts `contacts.email`, `contacts.name` |
+| `contact_key`      | `"durian/v1/contact"`    | **(retired, see §3)** previously encrypted `contacts.email`, `contacts.name` |
 | `fts_token_key`    | `"durian/v1/fts-token"`  | HMAC key for blind FTS5 tokens (§4)    |
 | `meta_key`         | `"durian/v1/meta"`       | encrypts `mailbox` name, custom `flags`, `account` string |
 
-`addrs_key` is derived for backward-compatibility (the v11→v12 migration
-populated `from_addr_ct` / `to_addrs_ct` / `cc_addrs_ct` columns under
-this key) but no current read or write path consumes it — see §3 for
-why the addresses ended up staying plaintext.
+`addrs_key` and `contact_key` are still derived for forward-compatibility
+(the v11→v12 migration populated `from_addr_ct` / `to_addrs_ct` /
+`cc_addrs_ct` columns under `addrs_key`; the step-6 contacts migration
+populated `email_ct` / `name_ct` under `contact_key`) but no current
+read or write path consumes either — see §3 for why message addresses
+and contact rows both ended up staying plaintext. Removing the derivation
+is a no-op cleanup that would force a sub-key index renumber on every
+existing install; deferred until a future migration touches the keyring
+shape for unrelated reasons.
 
 Keychain layout (new):
 
@@ -208,8 +213,21 @@ Columns that **stay plaintext** with a documented information leak:
 `message_headers.value` → `BLOB`. Header `name` stays plaintext (already a
 small enumerable set per RFC 5322).
 
-`contacts.email` and `contacts.name` → `BLOB`. `id` stays plaintext (UUID),
-`source`, `last_used`, `usage_count`, `created_at` stay plaintext.
+`contacts.email` and `contacts.name` **stay plaintext TEXT** — moved
+from the encrypted set during implementation (step 7g). Same β-revision
+reasoning as `from_addr` / `to_addrs` / `cc_addrs` above: every contact
+row in the directory was either harvested from an incoming `From:` /
+`To:` / `Cc:` header or typed into a `compose` field that immediately
+becomes a wire address. Encrypting the local mirror while the same
+addresses shout on every wire hop is asymmetric protection. The cost
+side is concrete: `UNIQUE(email)` upsert and the `email LIKE 'ali%'` /
+`name LIKE 'ali%'` autocomplete that the compose-recipient picker
+relies on both need plaintext indexes — neither survives random-nonce
+AES-GCM, and a deterministic-token replacement (Naveed et al, CCS 2015)
+would leak a contact-frequency histogram that re-identifies the user's
+top correspondents from the ciphertext alone. `id` stays plaintext
+(UUID), `source`, `last_used`, `usage_count`, `created_at` stay
+plaintext as before.
 
 `outbox.draft_json`, `local_drafts.draft_json` → `BLOB`.
 
@@ -392,6 +410,14 @@ Does **not** defend against:
   ADR may add an opt-in encrypt-from-to flag for users whose threat
   model puts the local DB as the genuinely-only-place these addresses
   live (air-gapped archive, etc.).
+- Information leakage from `contacts.email` / `contacts.name` (see
+  §3): the directory is the projected union of every `From:` / `To:` /
+  `Cc:` the user has ever seen plus the addresses typed into compose.
+  An attacker with `contacts.db` recovers the user's full address book
+  and (via `usage_count` + `last_used`, also plaintext) a ranking of
+  who they correspond with most. Mitigation: none, deliberately. Same
+  on-the-wire-anyway argument as messages-side addresses; same
+  cost/benefit failure for the implementable encrypted alternatives.
 
 ### Threat-actor personas
 
@@ -679,6 +705,14 @@ Resolved (kept here for traceability):
   stay plaintext TEXT" + §6 threat-model bullet). Substring search
   served by `LIKE` on the plaintext column; no FTS5 address tokens
   exist in V1.
+- ~~Contact encryption.~~ → `contacts.email` and `contacts.name`
+  moved to plaintext in step 7g (see §3 + §6 threat-model bullet).
+  Same β-revision reasoning as the message-side addresses: contact
+  rows are projections of wire addresses, so encrypting only the
+  local mirror is asymmetric protection that costs `UNIQUE(email)`
+  upsert and prefix-LIKE autocomplete. The dead `email_ct` /
+  `name_ct` columns were dropped; `contact_key` is retired but
+  still derived (see §2 sub-key table).
 - ~~Mailbox / flags / account plaintext leak.~~ → encrypted, with integer
   surrogate columns for indexing (§3). Resolved in response to early-review
   feedback.

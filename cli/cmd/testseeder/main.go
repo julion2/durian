@@ -119,7 +119,7 @@ func seedEmailDB(path string) error {
 }
 
 func seedContactsDB(path string) error {
-	db, err := contacts.Open(path, testKeyring())
+	db, err := contacts.Open(path)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
