@@ -284,8 +284,8 @@ The implementation (`store/store.go` v15→v16 migration) currently uses
 the column names `subject_tok` / `body_tok` and an `unicode61` tokenizer
 (plus `from_tok` / `to_tok` columns that are kept for the v11→v12
 migration's column-set but unused by the read path — see §3 on address
-plaintext). The ADR-vs-reality drift is intentional during the
-roll-out; the final §6 step-7e cleanup squares them up.
+plaintext). Step 7e dropped the parallel plaintext `messages_fts` and
+its triggers; the blind-token table is now the only FTS.
 
 Search at runtime:
 
@@ -648,29 +648,49 @@ user-runnable.
    `mailbox_id` / `account_id` FK columns, and the new BLOB column shapes
    — all populated from existing plaintext via `INSERT ... SELECT`. No
    encryption yet; BLOBs hold raw UTF-8. Verifies that the new joins
-   compile and that the migration path is reversible.
+   compile and that the migration path is reversible. **Shipped.**
 2. **`cli/internal/dbcrypto` package.** Isolated crypto primitives: AES-GCM
    encrypt/decrypt with the `version || nonce || ct || tag` envelope, HKDF
    sub-key derivation, RFC-5869 test vectors, AES-GCM round-trip tests,
-   `crypto/subtle` wipe helper. Zero callers yet.
+   `crypto/subtle` wipe helper. Zero callers yet. **Shipped.**
 3. **`cli/internal/redact` slog wrapper + CI grep gate.** Lands before any
    encryption goes live so the gate is enforced from the first day real
-   plaintext flows through encryption code paths.
+   plaintext flows through encryption code paths. **Shipped.**
 4. **Master-key bootstrap + `master-key export/import` subcommands.**
    Keychain plumbing, recovery procedure UX, audit-log line. Tested without
-   any DB writes yet.
+   any DB writes yet. **Shipped.**
 5. **Pilot encryption: `subject` column only.** Smallest blast radius,
    exercises end-to-end (migration of one column, encrypt-on-write,
    decrypt-on-read, FTS5 plain-tokens still works because subject FTS5
-   rebuild is deferred to step 7). Bake on this for a release.
+   rebuild is deferred to step 7). **Shipped (#235, merged).**
 6. **Roll out encryption to remaining columns** (body, addrs, headers,
    drafts, contacts, meta). Each as its own PR if it carries a non-trivial
-   query rewrite.
+   query rewrite. **Shipped (PRs #236 / #237, draft).**
 7. **Blind-token FTS5.** Tokenizer pipeline (uniseg + normalize + HMAC),
    bigram derivation, FTS5 rebuild, search-path rewrite, post-decrypt
-   false-positive filter for long phrases.
+   false-positive filter for long phrases. **Shipped** in seven sub-steps:
+   - **7 a+b**: blind-token FTS5 infrastructure + parallel index.
+   - **7c**: flip search reads from plaintext `messages_fts` to
+     `messages_blind_fts`.
+   - **7d**: β-revision — `from_addr` / `to_addrs` / `cc_addrs` move
+     back to plaintext (substring-search UX vs. wire-plaintext
+     asymmetric protection); drop the dead `*_ct` columns.
+   - **7e**: drop plaintext `subject` / `body_text` / `body_html` /
+     `message_headers.value` / drafts and the old `messages_fts` table;
+     VACUUM.
+   - **7g**: extend β-revision to `contacts.email` / `contacts.name`
+     (same argument as message addresses); drop `email_ct` / `name_ct`.
+   - **7f**: drop `messages.mailbox` / `messages.account` /
+     `messages.flags` plaintext shadow columns now that the structured
+     FK / boolean / blob replacements are written by every path. SQLite
+     12-step table-rebuild for the in-place `UNIQUE` constraint swap.
+   - **Bigram phrase queries**: activate the unused-at-read-time
+     bigrams written by the step-7 a+b tokenizer; quoted phrases
+     (`"foo bar"`, `subject:"foo bar"`) now ride the bigram path to
+     anchor word order.
 8. **`PRAGMA secure_delete = ON`** flipped in `store.Open` and verified by
    a smoke test that asserts the pragma is set on every new connection.
+   **Pending** — separate PR after the step-7 stack lands.
 
 Steps 1–4 are pure infrastructure and can ship as alpha-grade without
 user-visible change. The first user-visible behaviour change is step 5.
@@ -727,6 +747,15 @@ Resolved (kept here for traceability):
 - ~~Account encryption + keychain lookup conflict.~~ → decrypt-on-startup,
   cache for process lifetime; keychain keyed-by-email kept (§3). Resolved
   by accepting one decrypt per account at sync start.
+- ~~Bigram phrase-query activation.~~ → `TokenizeFTSPhrase` emits the
+  same unigram + adjacent-pair-bigram set that `TokenizeFTS` writes at
+  index time; the lexer recognizes `"foo bar"` and `subject:"foo bar"`
+  as single phrase tokens with `phrase=true`; `exprToSQL` /
+  `fieldToSQL` dispatch to the phrase tokenizer. The bigrams that step
+  7 a+b put into the index now anchor word order at query time, and
+  word-AND searches keep the unigram-only `TokenizeFTSQuery` path so
+  they don't accidentally promote into phrase matches. Resolved with
+  no new ciphertext, no migration, and a single new dbcrypto function.
 
 ## References
 

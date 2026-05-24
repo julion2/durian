@@ -118,6 +118,21 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 	return results, nil
 }
 
+// queryTokens dispatches a bare/subject search term to the right
+// dbcrypto tokenizer: TokenizeFTSPhrase for double-quoted phrases
+// (unigrams + bigrams, so adjacent-pair tokens anchor word order
+// against the index written by TokenizeFTS) and TokenizeFTSQuery
+// for plain word-AND (unigrams only, so emitting query-time bigrams
+// wouldn't accidentally promote a word-AND query into a phrase
+// match). Returns the empty string when normalization drops the
+// input to nothing — callers map that to a 1=0 WHERE clause.
+func (d *DB) queryTokens(value string, phrase bool) string {
+	if phrase {
+		return dbcrypto.TokenizeFTSPhrase(d.keyring.FTSToken, value)
+	}
+	return dbcrypto.TokenizeFTSQuery(d.keyring.FTSToken, value)
+}
+
 // resolveAccountIDs maps account names to their accounts.id values for
 // use in WHERE m.account_id IN (...) clauses. Unknown names drop out
 // silently — caller treats an empty result as "no matching rows". Used
@@ -239,12 +254,14 @@ type exprNode interface {
 }
 
 type fieldExpr struct {
-	field string
-	value string
+	field  string
+	value  string
+	phrase bool // double-quoted value → use bigram phrase tokenization
 }
 
 type bareExpr struct {
-	value string
+	value  string
+	phrase bool // double-quoted value → use bigram phrase tokenization
 }
 
 type starExpr struct{}
@@ -283,49 +300,105 @@ const (
 const tokEOF lexTokenKind = -1
 
 type lexToken struct {
-	kind  lexTokenKind
-	field string // only for tokField
-	value string // for tokField and tokBare
+	kind   lexTokenKind
+	field  string // only for tokField
+	value  string // for tokField and tokBare
+	phrase bool   // true when the value came from a double-quoted segment
 }
 
-// lex breaks a query string into lexer tokens.
+// lex breaks a query string into lexer tokens. Scans character-by-
+// character so double-quoted phrases (`"foo bar"` or `subject:"foo bar"`)
+// land as a single bare/field token with phrase=true — that flag drives
+// the bigram phrase-token path in exprToSQL / fieldToSQL.
 func lex(query string) []lexToken {
 	query = strings.TrimSpace(query)
 	if query == "" || query == "*" {
 		return []lexToken{{kind: tokStar}}
 	}
 
-	query = strings.NewReplacer("(", " ( ", ")", " ) ").Replace(query)
-	parts := strings.Fields(query)
-
 	var tokens []lexToken
-	for _, p := range parts {
+	for i := 0; i < len(query); {
+		c := query[i]
 		switch {
-		case p == "(":
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			i++
+		case c == '(':
 			tokens = append(tokens, lexToken{kind: tokLParen})
-		case p == ")":
+			i++
+		case c == ')':
 			tokens = append(tokens, lexToken{kind: tokRParen})
-		case strings.EqualFold(p, "AND"):
-			tokens = append(tokens, lexToken{kind: tokAnd})
-		case strings.EqualFold(p, "OR"):
-			tokens = append(tokens, lexToken{kind: tokOr})
-		case strings.EqualFold(p, "NOT"):
-			tokens = append(tokens, lexToken{kind: tokNot})
-		case p == "*":
-			tokens = append(tokens, lexToken{kind: tokStar})
+			i++
 		default:
-			if idx := strings.Index(p, ":"); idx > 0 {
-				tokens = append(tokens, lexToken{
-					kind:  tokField,
-					field: strings.ToLower(p[:idx]),
-					value: p[idx+1:],
-				})
-			} else {
-				tokens = append(tokens, lexToken{kind: tokBare, value: p})
-			}
+			tok, next := scanToken(query, i)
+			tokens = append(tokens, tok)
+			i = next
 		}
 	}
 	return tokens
+}
+
+// scanToken reads one bare/field/keyword token starting at query[i] and
+// returns it plus the index after the consumed bytes. Stops at
+// unquoted whitespace or unquoted parens; everything inside a
+// "..." segment is taken verbatim and contributes to the token's
+// value with phrase=true. A field prefix is `[a-z]+:` before the
+// first quote/value byte. AND/OR/NOT/* are reserved only when the
+// raw run had no field prefix and no quotes.
+func scanToken(query string, i int) (lexToken, int) {
+	start := i
+	var field string
+	hasField := false
+	var phrase bool
+	var quotedSeen bool
+	var value strings.Builder
+	for i < len(query) {
+		c := query[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '(' || c == ')' {
+			break
+		}
+		if c == '"' {
+			quotedSeen = true
+			phrase = true
+			i++
+			for i < len(query) && query[i] != '"' {
+				value.WriteByte(query[i])
+				i++
+			}
+			if i < len(query) {
+				i++ // consume closing quote
+			}
+			continue
+		}
+		if c == ':' && !hasField {
+			field = strings.ToLower(value.String())
+			hasField = true
+			value.Reset()
+			i++
+			continue
+		}
+		value.WriteByte(c)
+		i++
+	}
+	raw := query[start:i]
+	valueStr := value.String()
+
+	if !hasField && !quotedSeen {
+		switch {
+		case strings.EqualFold(raw, "AND"):
+			return lexToken{kind: tokAnd}, i
+		case strings.EqualFold(raw, "OR"):
+			return lexToken{kind: tokOr}, i
+		case strings.EqualFold(raw, "NOT"):
+			return lexToken{kind: tokNot}, i
+		case raw == "*":
+			return lexToken{kind: tokStar}, i
+		}
+	}
+
+	if hasField {
+		return lexToken{kind: tokField, field: field, value: valueStr, phrase: phrase}, i
+	}
+	return lexToken{kind: tokBare, value: valueStr, phrase: phrase}, i
 }
 
 // --- Parser (recursive descent) ---
@@ -453,10 +526,10 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		return node, nil
 	case tokField:
 		p.next()
-		return &fieldExpr{field: tok.field, value: tok.value}, nil
+		return &fieldExpr{field: tok.field, value: tok.value, phrase: tok.phrase}, nil
 	case tokBare:
 		p.next()
-		return &bareExpr{value: tok.value}, nil
+		return &bareExpr{value: tok.value, phrase: tok.phrase}, nil
 	case tokStar:
 		p.next()
 		return &starExpr{}, nil
@@ -498,8 +571,10 @@ func (d *DB) exprToSQL(node exprNode) (string, []interface{}, error) {
 		// messages_fts to the blind-token messages_blind_fts. The
 		// user term is run through the same TokenizeFTS pipeline that
 		// populated the index in step 7a+b, so the hex tokens produced
-		// here line up with the tokens stored at write time.
-		toks := dbcrypto.TokenizeFTSQuery(d.keyring.FTSToken, n.value)
+		// here line up with the tokens stored at write time. A
+		// double-quoted bare value is a phrase query — uses the bigram
+		// path so adjacent-pair tokens anchor word order in the index.
+		toks := d.queryTokens(n.value, n.phrase)
 		if toks == "" {
 			// All-stop-words / punctuation-only input — never matches anything.
 			return "1=0", nil, nil
@@ -545,8 +620,9 @@ func (d *DB) fieldToSQL(f *fieldExpr) (string, []interface{}, error) {
 	case "subject":
 		// ADR-0001 step 7c: subject: scoped FTS flips to messages_blind_fts.
 		// subject_tok:(tok1 tok2 ...) AND's each token against the
-		// subject_tok column only.
-		toks := dbcrypto.TokenizeFTSQuery(d.keyring.FTSToken, f.value)
+		// subject_tok column only. Phrase form (subject:"foo bar")
+		// adds bigram tokens so word order is enforced.
+		toks := d.queryTokens(f.value, f.phrase)
 		if toks == "" {
 			return "1=0", nil, nil
 		}

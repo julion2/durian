@@ -110,6 +110,43 @@ func TestSearch_Subject(t *testing.T) {
 	}
 }
 
+// TestSearch_PhraseWordOrder asserts that a quoted phrase query
+// distinguishes word order via the bigram tokens: two messages share
+// the same word set but differ in adjacent-pair sequence — only the
+// one whose body matches the phrase order should come back.
+func TestSearch_PhraseWordOrder(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	db.InsertMessage(&Message{
+		MessageID: "ordered@x", Subject: "Ordered",
+		FromAddr: "a@x", Date: now, CreatedAt: now,
+		BodyText: "quick brown fox jumps", FetchedBody: true,
+	})
+	db.InsertMessage(&Message{
+		MessageID: "scrambled@x", Subject: "Scrambled",
+		FromAddr: "a@x", Date: now + 1, CreatedAt: now + 1,
+		BodyText: "fox brown quick jumps", FetchedBody: true,
+	})
+
+	// Unquoted: word-AND should hit both.
+	bare, err := db.Search("quick brown fox", 10)
+	if err != nil {
+		t.Fatalf("bare: %v", err)
+	}
+	if len(bare) != 2 {
+		t.Errorf("unquoted 'quick brown fox' got %d hits, want 2 (both share the words)", len(bare))
+	}
+
+	// Quoted: phrase match should hit ordered@x only.
+	phrase, err := db.Search(`"quick brown fox"`, 10)
+	if err != nil {
+		t.Fatalf("phrase: %v", err)
+	}
+	if len(phrase) != 1 {
+		t.Fatalf(`phrase "quick brown fox" got %d hits, want 1`, len(phrase))
+	}
+}
+
 func TestSearch_ThreadGrouping(t *testing.T) {
 	db := seedSearchDB(t)
 	// s2 and s3 are in the same thread — should appear as one result
@@ -181,6 +218,47 @@ func TestLex_Not(t *testing.T) {
 	}
 	if tokens[1].kind != tokField || tokens[1].field != "tag" || tokens[1].value != "spam" {
 		t.Errorf("token[1] = %+v, want field tag:spam", tokens[1])
+	}
+}
+
+func TestLex_QuotedPhrase(t *testing.T) {
+	cases := []struct {
+		query   string
+		wantKnd lexTokenKind
+		wantFld string
+		wantVal string
+	}{
+		{`"hello world"`, tokBare, "", "hello world"},
+		{`subject:"deal with this"`, tokField, "subject", "deal with this"},
+		// Quoted segment must not consume the keyword-promotion path —
+		// "AND" stays a literal phrase, not a binary-op token.
+		{`"AND"`, tokBare, "", "AND"},
+	}
+	for _, c := range cases {
+		toks := lex(c.query)
+		if len(toks) != 1 {
+			t.Errorf("lex(%q) yielded %d tokens, want 1", c.query, len(toks))
+			continue
+		}
+		got := toks[0]
+		if got.kind != c.wantKnd || got.field != c.wantFld || got.value != c.wantVal || !got.phrase {
+			t.Errorf("lex(%q) = %+v, want kind=%d field=%q value=%q phrase=true",
+				c.query, got, c.wantKnd, c.wantFld, c.wantVal)
+		}
+	}
+}
+
+func TestLex_QuotedPhraseMixedWithBareTerms(t *testing.T) {
+	// `from:alice "two words" tag:inbox` → 3 tokens, middle is phrase bare.
+	toks := lex(`from:alice "two words" tag:inbox`)
+	if len(toks) != 3 {
+		t.Fatalf("got %d tokens, want 3: %+v", len(toks), toks)
+	}
+	if toks[1].kind != tokBare || toks[1].value != "two words" || !toks[1].phrase {
+		t.Errorf("middle token = %+v, want phrase bare 'two words'", toks[1])
+	}
+	if toks[0].phrase || toks[2].phrase {
+		t.Errorf("non-quoted terms must not have phrase=true (got %v / %v)", toks[0].phrase, toks[2].phrase)
 	}
 }
 

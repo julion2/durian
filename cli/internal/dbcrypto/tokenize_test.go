@@ -103,3 +103,50 @@ func TestTokenizeFTS_PanicsOnBadKey(t *testing.T) {
 	}()
 	TokenizeFTS(make([]byte, 16), "hello")
 }
+
+// TestTokenizeFTSPhrase_MatchesWriteSide asserts that the query-time
+// phrase tokenizer produces exactly the set the write-time TokenizeFTS
+// produced for the same text. That equivalence is the entire reason
+// phrase queries can ride the existing index — every token the writer
+// stored must be reproducible at read time without re-encrypting.
+func TestTokenizeFTSPhrase_MatchesWriteSide(t *testing.T) {
+	key := bytes.Repeat([]byte{0x42}, KeyLen)
+	for _, s := range []string{"alpha beta gamma", "  weird  spacing  here  "} {
+		got := strings.Fields(TokenizeFTSPhrase(key, s))
+		want := strings.Fields(TokenizeFTS(key, s))
+		if len(got) != len(want) {
+			t.Fatalf("input %q: got %d tokens, want %d", s, len(got), len(want))
+		}
+		gotSet := map[string]bool{}
+		for _, tok := range got {
+			gotSet[tok] = true
+		}
+		for _, tok := range want {
+			if !gotSet[tok] {
+				t.Errorf("input %q: write-side token %q missing from phrase tokens", s, tok)
+			}
+		}
+	}
+}
+
+func TestTokenizeFTSPhrase_SingleWordDegrades(t *testing.T) {
+	key := bytes.Repeat([]byte{0x42}, KeyLen)
+	// 1 word → 1 unigram, no bigrams.
+	out := TokenizeFTSPhrase(key, "alpha")
+	tokens := strings.Fields(out)
+	if len(tokens) != 1 {
+		t.Errorf("got %d tokens, want 1 (single-word phrase)", len(tokens))
+	}
+	if tokens[0] != TokenizeFTSQuery(key, "alpha") {
+		t.Error("single-word phrase must produce the same unigram as TokenizeFTSQuery")
+	}
+}
+
+func TestTokenizeFTSPhrase_EmptyInput(t *testing.T) {
+	key := bytes.Repeat([]byte{0x42}, KeyLen)
+	for _, s := range []string{"", "   ", "..."} {
+		if got := TokenizeFTSPhrase(key, s); got != "" {
+			t.Errorf("TokenizeFTSPhrase(%q) = %q, want empty", s, got)
+		}
+	}
+}
