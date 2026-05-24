@@ -690,6 +690,32 @@ func (d *DB) migrate() error {
 		if _, err := d.db.Exec("UPDATE schema_version SET version = 16 WHERE rowid = 1"); err != nil {
 			return fmt.Errorf("migrate v15→v16 bump: %w", err)
 		}
+		version = 16
+	}
+
+	if version < 17 {
+		// ADR-0001 step 7d (prep for 7e): drop the dead from_addr_ct /
+		// to_addrs_ct / cc_addrs_ct columns the v11→v12 migration added.
+		// During that step the addresses were on the encrypt-at-rest
+		// roadmap; ADR-0001 §3 was updated to keep them plaintext
+		// (substring search UX outweighs the asymmetric protection vs.
+		// wire-plaintext leak). The BLOB columns are written but never
+		// read, so dropping them is pure cleanup. SQLite 3.35+ supports
+		// ALTER TABLE DROP COLUMN; idempotent via PRAGMA table_info.
+		for _, col := range []string{"from_addr_ct", "to_addrs_ct", "cc_addrs_ct"} {
+			has, err := hasColumn(d.db, "messages", col)
+			if err != nil {
+				return fmt.Errorf("migrate v16→v17 inspect %s: %w", col, err)
+			}
+			if has {
+				if _, err := d.db.Exec("ALTER TABLE messages DROP COLUMN " + col); err != nil {
+					return fmt.Errorf("migrate v16→v17 drop %s: %w", col, err)
+				}
+			}
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 17 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v16→v17 bump: %w", err)
+		}
 	}
 
 	return nil
@@ -930,39 +956,33 @@ func (d *DB) backfillBlindFTS() error {
 	// COALESCE the plaintext columns to '' — early-schema messages can
 	// have NULL subject/from/to/body where the new schema treats them as
 	// empty strings. NULL would error scanning into a *string.
+	// from_addr/to_addrs are plaintext per ADR-0001 §3 revision; no
+	// decrypt needed here.
 	rows, err := tx.Query(`SELECT m.id,
-		COALESCE(m.subject,    ''), m.subject_ct,
-		COALESCE(m.from_addr,  ''), m.from_addr_ct,
-		COALESCE(m.to_addrs,   ''), m.to_addrs_ct,
-		COALESCE(m.body_text,  ''), m.body_text_ct
+		COALESCE(m.subject,   ''), m.subject_ct,
+		COALESCE(m.from_addr, ''),
+		COALESCE(m.to_addrs,  ''),
+		COALESCE(m.body_text, ''), m.body_text_ct
 		FROM messages m
 		WHERE NOT EXISTS (SELECT 1 FROM messages_blind_fts WHERE rowid = m.id)`)
 	if err != nil {
 		return fmt.Errorf("select rows: %w", err)
 	}
 	type pending struct {
-		id                                                  int64
-		subject, fromAddr, toAddrs, bodyText                 string
+		id                                  int64
+		subject, fromAddr, toAddrs, bodyText string
 	}
 	var batch []pending
 	for rows.Next() {
 		var p pending
-		var sCT, fCT, tCT, bCT []byte
-		if err := rows.Scan(&p.id, &p.subject, &sCT, &p.fromAddr, &fCT, &p.toAddrs, &tCT, &p.bodyText, &bCT); err != nil {
+		var sCT, bCT []byte
+		if err := rows.Scan(&p.id, &p.subject, &sCT, &p.fromAddr, &p.toAddrs, &p.bodyText, &bCT); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan: %w", err)
 		}
 		if p.subject, err = d.decryptSubject(p.subject, sCT); err != nil {
 			rows.Close()
 			return fmt.Errorf("decrypt subject id=%d: %w", p.id, err)
-		}
-		if p.fromAddr, err = d.decryptAddr(p.fromAddr, fCT); err != nil {
-			rows.Close()
-			return fmt.Errorf("decrypt from_addr id=%d: %w", p.id, err)
-		}
-		if p.toAddrs, err = d.decryptAddr(p.toAddrs, tCT); err != nil {
-			rows.Close()
-			return fmt.Errorf("decrypt to_addrs id=%d: %w", p.id, err)
 		}
 		if p.bodyText, err = d.decryptBody(p.bodyText, bCT); err != nil {
 			rows.Close()
