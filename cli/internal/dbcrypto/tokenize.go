@@ -54,6 +54,26 @@ func TokenizeFTS(key []byte, plaintext string) string {
 	return strings.Join(out, " ")
 }
 
+// TokenizeFTSQuery returns the same per-word HMAC tokens TokenizeFTS
+// produces but WITHOUT the adjacent-pair bigrams. Use this on the
+// read side for plain word-AND queries — emitting the index-time
+// bigrams as additional query tokens would AND-require the searcher's
+// word pair to also appear consecutively in the source, turning a
+// word-AND query into a phrase-match by accident. Phrase-query
+// support reuses TokenizeFTS (with bigrams) once the parser learns
+// quote-for-phrase syntax.
+func TokenizeFTSQuery(key []byte, plaintext string) string {
+	words := wordsForFTS(plaintext)
+	if len(words) == 0 {
+		return ""
+	}
+	out := make([]string, len(words))
+	for i, w := range words {
+		out[i] = hmacHex(key, []byte(w))
+	}
+	return strings.Join(out, " ")
+}
+
 // wordsForFTS runs plaintext through the segment+normalize pipeline,
 // returning the lowercase word forms ready to HMAC. Exposed (lowercase)
 // for tests only — production callers always go through TokenizeFTS.

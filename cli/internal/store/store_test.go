@@ -42,8 +42,8 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 16 {
-		t.Errorf("version = %d, want 16", version)
+	if version != 17 {
+		t.Errorf("version = %d, want 17", version)
 	}
 }
 
@@ -168,8 +168,8 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 16 {
-		t.Fatalf("version = %d, want 16", version)
+	if version != 17 {
+		t.Fatalf("version = %d, want 17", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).
@@ -349,8 +349,8 @@ func TestMigrateV10_BackfillsSubjectCt(t *testing.T) {
 	if err := sd.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 16 {
-		t.Fatalf("version = %d, want 16", version)
+	if version != 17 {
+		t.Fatalf("version = %d, want 17", version)
 	}
 
 	// Raw check: subject_ct must be NULL for empty subject, non-NULL for the
@@ -483,8 +483,8 @@ func TestMigrateV11_BackfillsBodyCt(t *testing.T) {
 	if err := sd.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 16 {
-		t.Fatalf("version = %d, want 16", version)
+	if version != 17 {
+		t.Fatalf("version = %d, want 17", version)
 	}
 
 	// Raw check: body_text_ct populated only where body_text non-empty.
@@ -545,150 +545,6 @@ func TestMigrateV11_BackfillsBodyCt(t *testing.T) {
 	}
 }
 
-// TestMigrateV12_BackfillsAddrsCt seeds a v11-shaped DB with a mix of
-// from/to/cc populations and asserts the v11→v12 migration encrypts
-// only the non-empty addresses, leaves the rest NULL, and that
-// GetByMessageID round-trips through decryptAddr.
-func TestMigrateV12_BackfillsAddrsCt(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "step6-addrs.db")
-	seedDB, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("open seed: %v", err)
-	}
-	seed := []string{
-		`CREATE TABLE schema_version (version INTEGER NOT NULL)`,
-		`INSERT INTO schema_version (rowid, version) VALUES (1, 11)`,
-		`CREATE TABLE messages (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			message_id TEXT NOT NULL,
-			thread_id TEXT NOT NULL,
-			in_reply_to TEXT,
-			refs TEXT,
-			subject TEXT,
-			subject_ct BLOB,
-			from_addr TEXT,
-			to_addrs TEXT,
-			cc_addrs TEXT,
-			date INTEGER,
-			created_at INTEGER NOT NULL,
-			body_text TEXT,
-			body_text_ct BLOB,
-			body_html TEXT,
-			body_html_ct BLOB,
-			mailbox TEXT,
-			flags TEXT,
-			uid INTEGER DEFAULT 0,
-			size INTEGER DEFAULT 0,
-			fetched_body INTEGER DEFAULT 0,
-			account TEXT DEFAULT '',
-			mailbox_id INTEGER,
-			account_id INTEGER,
-			is_seen INTEGER NOT NULL DEFAULT 0,
-			is_flagged INTEGER NOT NULL DEFAULT 0,
-			is_deleted INTEGER NOT NULL DEFAULT 0,
-			UNIQUE(message_id, account)
-		)`,
-		`INSERT INTO messages (message_id, thread_id, in_reply_to, refs, subject,
-		    from_addr, to_addrs, cc_addrs, date, created_at,
-		    body_text, body_html, mailbox, flags) VALUES
-		   ('m1', 't1', '', '', '', 'a@x.com',  'b@x.com',  '',         0, 1, '', '', '', ''),
-		   ('m2', 't2', '', '', '', '',         '',         'c@x.com',  0, 2, '', '', '', ''),
-		   ('m3', 't3', '', '', '', 'a@x.com',  'b@x.com',  'c@x.com',  0, 3, '', '', '', ''),
-		   ('m4', 't4', '', '', '', '',         '',         '',         0, 4, '', '', '', '')`,
-		`CREATE VIRTUAL TABLE messages_fts USING fts5(
-			subject, from_addr, to_addrs, body_text,
-			content='messages',
-			content_rowid='id'
-		)`,
-		`INSERT INTO messages_fts(rowid, subject, from_addr, to_addrs, body_text)
-		 SELECT id, COALESCE(subject, ''), COALESCE(from_addr, ''), COALESCE(to_addrs, ''), COALESCE(body_text, '')
-		 FROM messages`,
-	}
-	for _, stmt := range seed {
-		if _, err := seedDB.Exec(stmt); err != nil {
-			t.Fatalf("seed: %v\nstmt: %s", err, stmt)
-		}
-	}
-	seedDB.Close()
-
-	sd, err := Open(dbPath, testKeyring(t))
-	if err != nil {
-		t.Fatalf("store open: %v", err)
-	}
-	t.Cleanup(func() { sd.Close() })
-	if err := sd.Init(); err != nil {
-		t.Fatalf("init/migrate: %v", err)
-	}
-
-	var version int
-	if err := sd.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
-		t.Fatalf("read version: %v", err)
-	}
-	if version != 16 {
-		t.Fatalf("version = %d, want 16", version)
-	}
-
-	rows, err := sd.db.Query(`SELECT message_id, from_addr, from_addr_ct,
-		to_addrs, to_addrs_ct, cc_addrs, cc_addrs_ct
-		FROM messages ORDER BY message_id`)
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	defer rows.Close()
-	type row struct {
-		id                                       string
-		from, to, cc                             string
-		fromCT, toCT, ccCT                       []byte
-	}
-	var got []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.id, &r.from, &r.fromCT, &r.to, &r.toCT, &r.cc, &r.ccCT); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		got = append(got, r)
-	}
-	if len(got) != 4 {
-		t.Fatalf("rows = %d, want 4", len(got))
-	}
-	checks := []struct {
-		idx                                 int
-		wantFromCT, wantToCT, wantCCCT bool
-	}{
-		{0, true, true, false},
-		{1, false, false, true},
-		{2, true, true, true},
-		{3, false, false, false},
-	}
-	for _, c := range checks {
-		r := got[c.idx]
-		if (len(r.fromCT) > 0) != c.wantFromCT {
-			t.Errorf("%s from_addr_ct populated=%v, want %v", r.id, len(r.fromCT) > 0, c.wantFromCT)
-		}
-		if (len(r.toCT) > 0) != c.wantToCT {
-			t.Errorf("%s to_addrs_ct populated=%v, want %v", r.id, len(r.toCT) > 0, c.wantToCT)
-		}
-		if (len(r.ccCT) > 0) != c.wantCCCT {
-			t.Errorf("%s cc_addrs_ct populated=%v, want %v", r.id, len(r.ccCT) > 0, c.wantCCCT)
-		}
-	}
-
-	// Round-trip via the production read path.
-	for _, want := range got {
-		msg, err := sd.GetByMessageID(want.id)
-		if err != nil {
-			t.Fatalf("get %s: %v", want.id, err)
-		}
-		if msg == nil {
-			t.Fatalf("get %s: nil", want.id)
-		}
-		if msg.FromAddr != want.from || msg.ToAddrs != want.to || msg.CCAddrs != want.cc {
-			t.Errorf("%s addrs mismatch: got (%q/%q/%q), want (%q/%q/%q)",
-				want.id, msg.FromAddr, msg.ToAddrs, msg.CCAddrs,
-				want.from, want.to, want.cc)
-		}
-	}
-}
 
 // TestBlindFTS_InsertAndMatch verifies the step-7 (a+b) round-trip:
 // a message inserted via the store API populates messages_blind_fts,

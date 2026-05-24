@@ -106,11 +106,16 @@ no new direct dependency added).
 | `body_key`         | `"durian/v1/body"`       | encrypts `messages.body_text/html`     |
 | `subject_key`      | `"durian/v1/subject"`    | encrypts `messages.subject`            |
 | `headers_key`      | `"durian/v1/headers"`    | encrypts `message_headers.value`       |
-| `addrs_key`        | `"durian/v1/addrs"`      | encrypts `from_addr`, `to_addrs`, `cc_addrs` |
+| `addrs_key`        | `"durian/v1/addrs"`      | **(retired, see §3)** previously encrypted `from_addr`, `to_addrs`, `cc_addrs` |
 | `draft_key`        | `"durian/v1/draft"`      | encrypts `local_drafts.draft_json`, `outbox.draft_json` |
 | `contact_key`      | `"durian/v1/contact"`    | encrypts `contacts.email`, `contacts.name` |
 | `fts_token_key`    | `"durian/v1/fts-token"`  | HMAC key for blind FTS5 tokens (§4)    |
 | `meta_key`         | `"durian/v1/meta"`       | encrypts `mailbox` name, custom `flags`, `account` string |
+
+`addrs_key` is derived for backward-compatibility (the v11→v12 migration
+populated `from_addr_ct` / `to_addrs_ct` / `cc_addrs_ct` columns under
+this key) but no current read or write path consumes it — see §3 for
+why the addresses ended up staying plaintext.
 
 Keychain layout (new):
 
@@ -134,11 +139,38 @@ migration. Migrations are additive, gated on a new `schema_version` step.
 | Old column      | New column       | Notes                            |
 | --------------- | ---------------- | -------------------------------- |
 | `subject TEXT`  | `subject BLOB`   | encrypted with `subject_key`     |
-| `from_addr TEXT`| `from_addr BLOB` | encrypted with `addrs_key`       |
-| `to_addrs TEXT` | `to_addrs BLOB`  | encrypted with `addrs_key`       |
-| `cc_addrs TEXT` | `cc_addrs BLOB`  | encrypted with `addrs_key`       |
 | `body_text TEXT`| `body_text BLOB` | encrypted with `body_key`        |
 | `body_html TEXT`| `body_html BLOB` | encrypted with `body_key`        |
+
+`from_addr`, `to_addrs`, `cc_addrs` **stay plaintext TEXT** — moved
+from the encrypted set during implementation. Rationale: these
+addresses are already plaintext on the wire (IMAP server logs,
+recipient-side `From:` headers, anti-spam routing, sending-server
+`Return-Path:`), at every Mail Transfer Agent they cross, and in the
+recipient's Sent folder. Encrypting them at rest while they shout on
+the wire is an asymmetric, low-value tradeoff. The two implementable
+alternatives both fail their cost/benefit test:
+
+- **Determinstic-HMAC search tokens** ([Naveed et al, "Inference
+  Attacks on Property-Preserving Encrypted Databases", CCS 2015])
+  enable substring search but leak token-frequency tables that are
+  trivially attackable for address-class data — `com`, `gma`, `info`,
+  `support` are unambiguous markers in any normal mailbox.
+- **Char-trigram FTS5** preserves substring-search UX but produces a
+  dense, skewed frequency distribution that yields *strictly more*
+  leakage than the plaintext-on-disk we'd be trying to avoid (the
+  attacker who can build a trigram histogram over your DB already has
+  the file; the plaintext just spares them the statistical step).
+
+The cost side: `from:partial` substring queries (e.g. `from:ali`
+matching `alice@example.com`) are a real UX habit that any
+blind-FTS-MATCH path breaks at word boundary. Acceptable plaintext
+leak, undebatable UX preservation.
+
+Out of scope for V1: an opt-in power-user encrypt-from-to flag for
+threat models where the local DB is genuinely the only place these
+addresses live (e.g. an air-gapped mail archive). Will get its own
+ADR if asked for.
 
 Folder names, IMAP keywords and account email addresses can themselves be
 sensitive (`Archive/Healthcare`, `Drafts/Resignation`, `$Confidential`,
@@ -205,12 +237,10 @@ trigger replacement code path):
    does not ship a UAX #29 word-segmenter. Drop tokens that contain only
    punctuation or whitespace. Stop-words are **not** dropped (see Threat
    Model §6).
-3. **Address-field special case** (subject/body skip this step). For each
-   `local@domain` match in `from_addr`/`to_addrs`/`cc_addrs`, emit three
-   tokens: `local`, `domain`, and `local@domain`. Rationale: users expect
-   both "all mail from alice" (local-part) and "all mail from example.com"
-   (domain) to work; keeping the full address as a third token avoids
-   losing a bigram across the `@` boundary.
+3. **(retired)** Earlier drafts had an address-field special case here that
+   emitted `local`, `domain`, `local@domain` tokens. With `from_addr`,
+   `to_addrs`, `cc_addrs` now kept plaintext (see §3), the special case
+   is gone — address search uses `LIKE` on the plaintext column directly.
 4. For each token `t`: `tok = base32(truncate(HMAC-SHA256(fts_token_key, t), 10))`.
    Output is a 16-char ASCII string, FTS5-tokenizer-safe. 80-bit truncation
    is chosen over 64 bit to raise the cost of long-term token-frequency
@@ -226,12 +256,18 @@ FTS5 schema:
 ```sql
 CREATE VIRTUAL TABLE messages_fts USING fts5(
     subject_tokens,        -- unigrams + bigrams for subject
-    addrs_tokens,          -- unigrams + bigrams for from/to/cc combined
     body_tokens,           -- unigrams + bigrams for body_text
     content='',            -- contentless: we never store plaintext here
     tokenize='ascii'       -- input is already opaque base32 ASCII
 );
 ```
+
+The implementation (`store/store.go` v15→v16 migration) currently uses
+the column names `subject_tok` / `body_tok` and an `unicode61` tokenizer
+(plus `from_tok` / `to_tok` columns that are kept for the v11→v12
+migration's column-set but unused by the read path — see §3 on address
+plaintext). The ADR-vs-reality drift is intentional during the
+roll-out; the final §6 step-7e cleanup squares them up.
 
 Search at runtime:
 
@@ -341,6 +377,21 @@ Does **not** defend against:
   `refs` (see §3): thread topology and sometimes provider domain remain
   observable. Mitigation: none in V1 — a future ADR may revisit if a
   realistic threat model demands it.
+- Information leakage from `from_addr` / `to_addrs` / `cc_addrs` (see
+  §3): an attacker with the DB file can read every sender/recipient
+  address verbatim plus the frequency of correspondence per address —
+  enough to reconstruct the user's communication graph. Mitigation:
+  none, deliberately. The same data is already exposed at the IMAP
+  server, all MTAs in transit, the recipient's Sent folder and
+  anti-spam routing logs; encrypting it at rest while it shouts on
+  the wire is asymmetric protection. The two implementable encrypted
+  alternatives both fail their cost/benefit test (deterministic-HMAC
+  search tokens leak token-frequency tables — Naveed et al CCS 2015;
+  char-trigram FTS5 leaks dense skewed trigram frequencies that yield
+  *more* information than the plaintext we would be hiding). Future
+  ADR may add an opt-in encrypt-from-to flag for users whose threat
+  model puts the local DB as the genuinely-only-place these addresses
+  live (air-gapped archive, etc.).
 
 ### Threat-actor personas
 
@@ -623,7 +674,11 @@ Resolved (kept here for traceability):
 - ~~Token truncation width.~~ → 80 bit (§4). Resolved in response to
   early-review feedback re: token-frequency correlation across snapshots.
 - ~~Address tokenization.~~ → emit three tokens per address (local,
-  domain, full). Resolved in §4 step 3.
+  domain, full). ~~Resolved in §4 step 3.~~ **Superseded:** addresses
+  themselves moved to plaintext (see §3 "from_addr/to_addrs/cc_addrs
+  stay plaintext TEXT" + §6 threat-model bullet). Substring search
+  served by `LIKE` on the plaintext column; no FTS5 address tokens
+  exist in V1.
 - ~~Mailbox / flags / account plaintext leak.~~ → encrypted, with integer
   surrogate columns for indexing (§3). Resolved in response to early-review
   feedback.

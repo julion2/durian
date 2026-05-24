@@ -66,19 +66,6 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 	if err != nil {
 		return fmt.Errorf("encrypt body_html: %w", err)
 	}
-	// ADR-0001 step 6: addrs columns.
-	fromAddrCT, err := d.encryptAddr(msg.FromAddr)
-	if err != nil {
-		return fmt.Errorf("encrypt from_addr: %w", err)
-	}
-	toAddrsCT, err := d.encryptAddr(msg.ToAddrs)
-	if err != nil {
-		return fmt.Errorf("encrypt to_addrs: %w", err)
-	}
-	ccAddrsCT, err := d.encryptAddr(msg.CCAddrs)
-	if err != nil {
-		return fmt.Errorf("encrypt cc_addrs: %w", err)
-	}
 	// ADR-0001 step 6: non-boolean flag parts go to flags_other under
 	// the meta sub-key. Booleans (is_seen/is_flagged/is_deleted) are
 	// derived elsewhere in this insert path's downstream tag flow.
@@ -87,23 +74,25 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 		return fmt.Errorf("encrypt flags_other: %w", err)
 	}
 
+	// ADR-0001 step 7d / §3 revision: from_addr/to_addrs/cc_addrs stay
+	// plaintext (substring-search UX, addresses already public on the
+	// wire). No *_ct columns written for the addrs columns — v17
+	// migration drops them.
+
 	err = tx.QueryRow(`
 		INSERT INTO messages (
 			message_id, thread_id, in_reply_to, refs, subject, subject_ct,
-			from_addr, from_addr_ct, to_addrs, to_addrs_ct, cc_addrs, cc_addrs_ct,
+			from_addr, to_addrs, cc_addrs,
 			date, created_at,
 			body_text, body_text_ct, body_html, body_html_ct,
 			mailbox, flags, flags_other, uid, size, fetched_body, account
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id, account) DO UPDATE SET
 			subject = excluded.subject,
 			subject_ct = excluded.subject_ct,
 			from_addr = excluded.from_addr,
-			from_addr_ct = excluded.from_addr_ct,
 			to_addrs = excluded.to_addrs,
-			to_addrs_ct = excluded.to_addrs_ct,
 			cc_addrs = excluded.cc_addrs,
-			cc_addrs_ct = excluded.cc_addrs_ct,
 			body_text = CASE WHEN excluded.fetched_body = 1 AND messages.fetched_body = 0
 			                 THEN excluded.body_text ELSE messages.body_text END,
 			body_text_ct = CASE WHEN excluded.fetched_body = 1 AND messages.fetched_body = 0
@@ -119,7 +108,7 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 			mailbox = CASE WHEN excluded.mailbox != '' THEN excluded.mailbox ELSE messages.mailbox END
 		RETURNING id`,
 		msg.MessageID, threadID, msg.InReplyTo, msg.Refs, msg.Subject, subjectCT,
-		msg.FromAddr, fromAddrCT, msg.ToAddrs, toAddrsCT, msg.CCAddrs, ccAddrsCT,
+		msg.FromAddr, msg.ToAddrs, msg.CCAddrs,
 		msg.Date, msg.CreatedAt,
 		msg.BodyText, bodyTextCT, msg.BodyHTML, bodyHTMLCT,
 		msg.Mailbox, msg.Flags, flagsOtherCT, msg.UID, msg.Size, fetchedBody, msg.Account,
@@ -157,7 +146,15 @@ func (d *DB) UpdateBody(messageID, bodyText, bodyHTML string) error {
 	if err != nil {
 		return fmt.Errorf("encrypt body_html: %w", err)
 	}
-	result, err := d.db.Exec(`
+	// Wrap in a tx so the messages UPDATE and the blind FTS refresh are
+	// atomic. Without this, a crash between them would leave body_tok
+	// stale (search wouldn't find body content of lazy-fetched mail).
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	result, err := tx.Exec(`
 		UPDATE messages SET body_text = ?, body_text_ct = ?,
 		                    body_html = ?, body_html_ct = ?,
 		                    fetched_body = 1
@@ -170,7 +167,26 @@ func (d *DB) UpdateBody(messageID, bodyText, bodyHTML string) error {
 	if rows == 0 {
 		return fmt.Errorf("message not found: %s", messageID)
 	}
-	return nil
+
+	// ADR-0001 step 7d: refresh the blind FTS row so body_tok matches
+	// the newly-fetched body. Need the other three fields too because
+	// contentless FTS5 can't UPDATE column-by-column — DELETE + INSERT
+	// the whole row is the only path.
+	var rowid int64
+	var subject, fromAddr, toAddrs string
+	if err := tx.QueryRow(`SELECT id, COALESCE(subject, ''), COALESCE(from_addr, ''), COALESCE(to_addrs, '')
+		FROM messages WHERE message_id = ? LIMIT 1`, messageID).Scan(&rowid, &subject, &fromAddr, &toAddrs); err != nil {
+		return fmt.Errorf("fetch row for blind FTS refresh: %w", err)
+	}
+	sTok, fTok, tTok, bTok := d.blindTokens(subject, fromAddr, toAddrs, bodyText)
+	if _, err := tx.Exec("DELETE FROM messages_blind_fts WHERE rowid = ?", rowid); err != nil {
+		return fmt.Errorf("blind fts delete: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO messages_blind_fts(rowid, subject_tok, from_tok, to_tok, body_tok)
+		VALUES (?, ?, ?, ?, ?)`, rowid, sTok, fTok, tTok, bTok); err != nil {
+		return fmt.Errorf("blind fts insert: %w", err)
+	}
+	return tx.Commit()
 }
 
 // UpdateMailbox sets the mailbox and UID for a message identified by message_id and account.
@@ -201,18 +217,16 @@ func (d *DB) BackfillUID(messageID, account string, uid uint32, mailbox string) 
 func (d *DB) GetByMessageID(messageID string) (*Message, error) {
 	msg := &Message{}
 	var fetchedBody int
-	var subjectCT, fromAddrCT, toAddrsCT, ccAddrsCT, bodyTextCT, bodyHTMLCT []byte
+	var subjectCT, bodyTextCT, bodyHTMLCT []byte
 	err := d.db.QueryRow(`
 		SELECT id, message_id, thread_id, in_reply_to, refs, subject, subject_ct,
-		       from_addr, from_addr_ct, to_addrs, to_addrs_ct, cc_addrs, cc_addrs_ct,
-		       date, created_at,
+		       from_addr, to_addrs, cc_addrs, date, created_at,
 		       body_text, body_text_ct, body_html, body_html_ct,
 		       mailbox, flags, uid, size, fetched_body, account
 		FROM messages WHERE message_id = ? LIMIT 1`, messageID,
 	).Scan(
 		&msg.ID, &msg.MessageID, &msg.ThreadID, &msg.InReplyTo, &msg.Refs, &msg.Subject, &subjectCT,
-		&msg.FromAddr, &fromAddrCT, &msg.ToAddrs, &toAddrsCT, &msg.CCAddrs, &ccAddrsCT,
-		&msg.Date, &msg.CreatedAt,
+		&msg.FromAddr, &msg.ToAddrs, &msg.CCAddrs, &msg.Date, &msg.CreatedAt,
 		&msg.BodyText, &bodyTextCT, &msg.BodyHTML, &bodyHTMLCT,
 		&msg.Mailbox, &msg.Flags, &msg.UID, &msg.Size, &fetchedBody, &msg.Account,
 	)
@@ -226,15 +240,7 @@ func (d *DB) GetByMessageID(messageID string) (*Message, error) {
 	if msg.Subject, err = d.decryptSubject(msg.Subject, subjectCT); err != nil {
 		return nil, err
 	}
-	if msg.FromAddr, err = d.decryptAddr(msg.FromAddr, fromAddrCT); err != nil {
-		return nil, err
-	}
-	if msg.ToAddrs, err = d.decryptAddr(msg.ToAddrs, toAddrsCT); err != nil {
-		return nil, err
-	}
-	if msg.CCAddrs, err = d.decryptAddr(msg.CCAddrs, ccAddrsCT); err != nil {
-		return nil, err
-	}
+	// from_addr/to_addrs/cc_addrs stay plaintext (ADR-0001 §3 revision).
 	if msg.BodyText, err = d.decryptBody(msg.BodyText, bodyTextCT); err != nil {
 		return nil, err
 	}
@@ -249,8 +255,7 @@ func (d *DB) GetByMessageID(messageID string) (*Message, error) {
 func (d *DB) GetByThread(threadID string) ([]*Message, error) {
 	rows, err := d.db.Query(`
 		SELECT id, message_id, thread_id, in_reply_to, refs, subject, subject_ct,
-		       from_addr, from_addr_ct, to_addrs, to_addrs_ct, cc_addrs, cc_addrs_ct,
-		       date, created_at,
+		       from_addr, to_addrs, cc_addrs, date, created_at,
 		       body_text, body_text_ct, body_html, body_html_ct,
 		       mailbox, flags, uid, size, fetched_body, account
 		FROM messages WHERE thread_id = ?
@@ -284,8 +289,7 @@ func (d *DB) GetByThread(threadID string) ([]*Message, error) {
 func (d *DB) GetAllByThread(threadID string) ([]*Message, error) {
 	rows, err := d.db.Query(`
 		SELECT id, message_id, thread_id, in_reply_to, refs, subject, subject_ct,
-		       from_addr, from_addr_ct, to_addrs, to_addrs_ct, cc_addrs, cc_addrs_ct,
-		       date, created_at,
+		       from_addr, to_addrs, cc_addrs, date, created_at,
 		       body_text, body_text_ct, body_html, body_html_ct,
 		       mailbox, flags, uid, size, fetched_body, account
 		FROM messages WHERE thread_id = ?
@@ -405,19 +409,19 @@ func (d *DB) GetRecipientAddresses() ([]string, error) {
 }
 
 // scanMessages scans rows into a slice of Message pointers. Caller's
-// SELECT must interleave each encrypted column's *_ct BLOB right after
-// its plaintext column, in this order: subject, from_addr, to_addrs,
-// cc_addrs, body_text, body_html.
+// SELECT must interleave subject_ct after subject and body_text_ct /
+// body_html_ct after their plaintext columns. from_addr/to_addrs/
+// cc_addrs stay plaintext (ADR-0001 §3 revision); their plaintext
+// values are scanned directly with no decrypt step.
 func (d *DB) scanMessages(rows *sql.Rows) ([]*Message, error) {
 	var msgs []*Message
 	for rows.Next() {
 		msg := &Message{}
 		var fetchedBody int
-		var subjectCT, fromAddrCT, toAddrsCT, ccAddrsCT, bodyTextCT, bodyHTMLCT []byte
+		var subjectCT, bodyTextCT, bodyHTMLCT []byte
 		err := rows.Scan(
 			&msg.ID, &msg.MessageID, &msg.ThreadID, &msg.InReplyTo, &msg.Refs, &msg.Subject, &subjectCT,
-			&msg.FromAddr, &fromAddrCT, &msg.ToAddrs, &toAddrsCT, &msg.CCAddrs, &ccAddrsCT,
-			&msg.Date, &msg.CreatedAt,
+			&msg.FromAddr, &msg.ToAddrs, &msg.CCAddrs, &msg.Date, &msg.CreatedAt,
 			&msg.BodyText, &bodyTextCT, &msg.BodyHTML, &bodyHTMLCT,
 			&msg.Mailbox, &msg.Flags, &msg.UID, &msg.Size, &fetchedBody, &msg.Account,
 		)
@@ -426,15 +430,6 @@ func (d *DB) scanMessages(rows *sql.Rows) ([]*Message, error) {
 		}
 		msg.FetchedBody = fetchedBody == 1
 		if msg.Subject, err = d.decryptSubject(msg.Subject, subjectCT); err != nil {
-			return nil, err
-		}
-		if msg.FromAddr, err = d.decryptAddr(msg.FromAddr, fromAddrCT); err != nil {
-			return nil, err
-		}
-		if msg.ToAddrs, err = d.decryptAddr(msg.ToAddrs, toAddrsCT); err != nil {
-			return nil, err
-		}
-		if msg.CCAddrs, err = d.decryptAddr(msg.CCAddrs, ccAddrsCT); err != nil {
 			return nil, err
 		}
 		if msg.BodyText, err = d.decryptBody(msg.BodyText, bodyTextCT); err != nil {
