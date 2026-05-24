@@ -73,14 +73,14 @@ func runServe(cmd *cobra.Command, args []string) {
 	if contactsDBPath == "" {
 		contactsDBPath = contacts.DefaultDBPath()
 	}
-	if cdb, err := contacts.Open(contactsDBPath, keyring); err != nil {
+	if cdb, err := contacts.Open(contactsDBPath); err != nil {
 		slog.Warn("Could not open contacts database", "module", "SERVE", "path", contactsDBPath, "err", err)
 	} else if err := cdb.Init(); err != nil {
 		// Init runs the CREATE TABLE IF NOT EXISTS and any pending
-		// migrations (ADR-0001 step 6 contact encryption). Previously
-		// serve skipped Init and relied on the import subcommand to
-		// have set up the schema; with encrypt-on-write live we must
-		// guarantee the migration runs on startup.
+		// migrations (currently: ADR-0001 step 7g drops the dead
+		// email_ct / name_ct columns). serve must run Init on startup
+		// rather than deferring to subcommands, otherwise pending
+		// schema migrations never apply on a server-only deployment.
 		slog.Warn("Could not init contacts database", "module", "SERVE", "path", contactsDBPath, "err", err)
 		cdb.Close()
 	} else {
