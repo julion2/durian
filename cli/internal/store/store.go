@@ -651,6 +651,45 @@ func (d *DB) migrate() error {
 		if _, err := d.db.Exec("UPDATE schema_version SET version = 15 WHERE rowid = 1"); err != nil {
 			return fmt.Errorf("migrate v14→v15 bump: %w", err)
 		}
+		version = 15
+	}
+
+	if version < 16 {
+		// ADR-0001 step 7 (a+b): blind-token FTS5 infrastructure.
+		// Stand up a parallel contentless FTS5 table that indexes
+		// HMAC-truncated tokens (no plaintext leaves the encrypted
+		// column world). The existing messages_fts table keeps serving
+		// search.go reads until step 7c flips the search path.
+		//
+		// contentless_delete=1 lets us DELETE FROM the FTS table by
+		// rowid (no FTS-specific 'delete' sentinel insert) — needed
+		// for the messages-DELETE trigger to stay simple.
+		stmts := []string{
+			`CREATE VIRTUAL TABLE IF NOT EXISTS messages_blind_fts USING fts5(
+				subject_tok, from_tok, to_tok, body_tok,
+				content='',
+				contentless_delete=1,
+				tokenize='unicode61 remove_diacritics 0'
+			)`,
+			// On messages DELETE, drop the parallel FTS row by rowid.
+			// INSERT/UPDATE maintenance happens Go-side (insertMessageTx /
+			// UpdateBody) since we need the Go tokenizer with the
+			// fts_token sub-key, which SQLite triggers can't reach.
+			`CREATE TRIGGER IF NOT EXISTS messages_blind_fts_ad AFTER DELETE ON messages BEGIN
+				DELETE FROM messages_blind_fts WHERE rowid = old.id;
+			END`,
+		}
+		for _, s := range stmts {
+			if _, err := d.db.Exec(s); err != nil {
+				return fmt.Errorf("migrate v15→v16 schema: %w", err)
+			}
+		}
+		if err := d.backfillBlindFTS(); err != nil {
+			return fmt.Errorf("migrate v15→v16 backfill: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 16 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v15→v16 bump: %w", err)
+		}
 	}
 
 	return nil
@@ -850,6 +889,102 @@ func (d *DB) backfillBodyCt() error {
 		}
 		if _, err := stmt.Exec(textCT, htmlCT, p.id); err != nil {
 			return fmt.Errorf("update id=%d: %w", p.id, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// blindTokens returns the four space-separated FTS5-ready token strings
+// for one message in the order (subject_tok, from_tok, to_tok, body_tok).
+// Each field is run through dbcrypto.TokenizeFTS under the FTSToken
+// sub-key. Empty plaintext maps to "" — FTS5 stores empty columns fine.
+func (d *DB) blindTokens(subject, fromAddr, toAddrs, bodyText string) (sTok, fTok, tTok, bTok string) {
+	k := d.keyring.FTSToken
+	return dbcrypto.TokenizeFTS(k, subject),
+		dbcrypto.TokenizeFTS(k, fromAddr),
+		dbcrypto.TokenizeFTS(k, toAddrs),
+		dbcrypto.TokenizeFTS(k, bodyText)
+}
+
+// backfillBlindFTS populates messages_blind_fts for every existing row.
+// Reads plaintext (still present until step 7e) via the encrypted-ct
+// columns where available so the tokenization is identical to what
+// step-7c reads will produce after the plaintext columns die.
+//
+// Streams via row iteration rather than batching into RAM because body
+// payloads can be MB-sized on real mail and the working set across 20k+
+// messages would otherwise top a gigabyte.
+func (d *DB) backfillBlindFTS() error {
+	if d.keyring == nil || d.keyring.FTSToken == nil {
+		return fmt.Errorf("no keyring available for blind FTS backfill")
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Skip rows that already have a blind FTS entry (idempotent retry).
+	// Joining against messages_blind_fts directly is awkward (contentless
+	// FTS5 doesn't expose a real table), so use NOT EXISTS on rowid.
+	// COALESCE the plaintext columns to '' — early-schema messages can
+	// have NULL subject/from/to/body where the new schema treats them as
+	// empty strings. NULL would error scanning into a *string.
+	rows, err := tx.Query(`SELECT m.id,
+		COALESCE(m.subject,    ''), m.subject_ct,
+		COALESCE(m.from_addr,  ''), m.from_addr_ct,
+		COALESCE(m.to_addrs,   ''), m.to_addrs_ct,
+		COALESCE(m.body_text,  ''), m.body_text_ct
+		FROM messages m
+		WHERE NOT EXISTS (SELECT 1 FROM messages_blind_fts WHERE rowid = m.id)`)
+	if err != nil {
+		return fmt.Errorf("select rows: %w", err)
+	}
+	type pending struct {
+		id                                                  int64
+		subject, fromAddr, toAddrs, bodyText                 string
+	}
+	var batch []pending
+	for rows.Next() {
+		var p pending
+		var sCT, fCT, tCT, bCT []byte
+		if err := rows.Scan(&p.id, &p.subject, &sCT, &p.fromAddr, &fCT, &p.toAddrs, &tCT, &p.bodyText, &bCT); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan: %w", err)
+		}
+		if p.subject, err = d.decryptSubject(p.subject, sCT); err != nil {
+			rows.Close()
+			return fmt.Errorf("decrypt subject id=%d: %w", p.id, err)
+		}
+		if p.fromAddr, err = d.decryptAddr(p.fromAddr, fCT); err != nil {
+			rows.Close()
+			return fmt.Errorf("decrypt from_addr id=%d: %w", p.id, err)
+		}
+		if p.toAddrs, err = d.decryptAddr(p.toAddrs, tCT); err != nil {
+			rows.Close()
+			return fmt.Errorf("decrypt to_addrs id=%d: %w", p.id, err)
+		}
+		if p.bodyText, err = d.decryptBody(p.bodyText, bCT); err != nil {
+			rows.Close()
+			return fmt.Errorf("decrypt body_text id=%d: %w", p.id, err)
+		}
+		batch = append(batch, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate rows: %w", err)
+	}
+
+	stmt, err := tx.Prepare(`INSERT INTO messages_blind_fts(rowid, subject_tok, from_tok, to_tok, body_tok)
+		VALUES (?, ?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("prepare insert: %w", err)
+	}
+	defer stmt.Close()
+	for _, p := range batch {
+		sTok, fTok, tTok, bTok := d.blindTokens(p.subject, p.fromAddr, p.toAddrs, p.bodyText)
+		if _, err := stmt.Exec(p.id, sTok, fTok, tTok, bTok); err != nil {
+			return fmt.Errorf("insert id=%d: %w", p.id, err)
 		}
 	}
 	return tx.Commit()
