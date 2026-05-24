@@ -116,31 +116,16 @@ func (d *DB) Init() error {
 
 		`CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date)`,
-		`CREATE INDEX IF NOT EXISTS idx_messages_mailbox ON messages(mailbox)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_from_addr ON messages(from_addr)`,
 
-		`CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-			subject, from_addr, to_addrs, body_text,
-			content='messages',
-			content_rowid='id'
-		)`,
-
-		`CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-			INSERT INTO messages_fts(rowid, subject, from_addr, to_addrs, body_text)
-			VALUES (new.id, new.subject, new.from_addr, new.to_addrs, new.body_text);
-		END`,
-
-		`CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-			INSERT INTO messages_fts(messages_fts, rowid, subject, from_addr, to_addrs, body_text)
-			VALUES ('delete', old.id, old.subject, old.from_addr, old.to_addrs, old.body_text);
-		END`,
-
-		`CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-			INSERT INTO messages_fts(messages_fts, rowid, subject, from_addr, to_addrs, body_text)
-			VALUES ('delete', old.id, old.subject, old.from_addr, old.to_addrs, old.body_text);
-			INSERT INTO messages_fts(rowid, subject, from_addr, to_addrs, body_text)
-			VALUES (new.id, new.subject, new.from_addr, new.to_addrs, new.body_text);
-		END`,
+		// idx_messages_mailbox / idx_messages_account, the old messages_fts
+		// table, and the messages_ai / messages_ad / messages_au triggers
+		// were removed from the fresh-install schema by ADR-0001 step 7f.
+		// On an old DB they still exist at this point and get cleaned up
+		// by the v17→v18 (FTS drop) and v18→v19 (column rebuild) migrations
+		// below. Listing them here would only re-create them under
+		// CREATE IF NOT EXISTS, then break the next Init() when their
+		// referenced columns are gone.
 
 		`CREATE TABLE IF NOT EXISTS tags (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,27 +202,15 @@ func (d *DB) Init() error {
 		return err
 	}
 
-	// Indexes and triggers that may have been dropped by migrations.
+	// Indexes that may have been dropped by migrations. Step 7f removed
+	// idx_messages_account + idx_messages_mailbox along with the columns
+	// they covered; the messages_ai / messages_ad / messages_au triggers
+	// died with the rebuilt table (step 7e had already patched them to
+	// SELECT-1 no-ops, and messages_fts itself is gone).
 	postMigration := []string{
-		`CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date)`,
-		`CREATE INDEX IF NOT EXISTS idx_messages_mailbox ON messages(mailbox)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_from_addr ON messages(from_addr)`,
-		`CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-			INSERT INTO messages_fts(rowid, subject, from_addr, to_addrs, body_text)
-			VALUES (new.id, new.subject, new.from_addr, new.to_addrs, new.body_text);
-		END`,
-		`CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-			INSERT INTO messages_fts(messages_fts, rowid, subject, from_addr, to_addrs, body_text)
-			VALUES ('delete', old.id, old.subject, old.from_addr, old.to_addrs, old.body_text);
-		END`,
-		`CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-			INSERT INTO messages_fts(messages_fts, rowid, subject, from_addr, to_addrs, body_text)
-			VALUES ('delete', old.id, old.subject, old.from_addr, old.to_addrs, old.body_text);
-			INSERT INTO messages_fts(rowid, subject, from_addr, to_addrs, body_text)
-			VALUES (new.id, new.subject, new.from_addr, new.to_addrs, new.body_text);
-		END`,
 	}
 	for _, stmt := range postMigration {
 		if _, err := d.db.Exec(stmt); err != nil {
@@ -796,6 +769,288 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 19 {
+		// ADR-0001 step 7f: drop the messages.mailbox / messages.account /
+		// messages.flags plaintext shadow columns. The structured
+		// replacements (mailbox_id FK, account_id FK, is_seen / is_flagged
+		// / is_deleted booleans, encrypted flags_other BLOB) have been
+		// alive since step 1 / step 6 but the INSERT path has been writing
+		// only the plaintext shadows — so before dropping anything we
+		// re-run the step-1 backfill for any row that the steady-state
+		// insert path left with NULL FK ids or zero booleans.
+		if err := d.backfillMessageMetaShadows(); err != nil {
+			return fmt.Errorf("migrate v18→v19 backfill: %w", err)
+		}
+
+		// DROP COLUMN cannot remove a column that participates in a UNIQUE
+		// constraint, and account is half of UNIQUE(message_id, account).
+		// SQLite's recommended escape hatch (https://www.sqlite.org/lang_altertable.html
+		// 12-step procedure) is a full table-rebuild: CREATE table with
+		// the desired schema, INSERT SELECT, DROP old, RENAME. FK refs
+		// from tags / attachments / message_headers / messages_blind_fts
+		// to messages.id survive the rebuild because we leave foreign_keys
+		// OFF for the duration and the FK lookups are by table name (which
+		// the final RENAME preserves).
+		if err := d.rebuildMessagesForStep7f(); err != nil {
+			return fmt.Errorf("migrate v18→v19 rebuild: %w", err)
+		}
+
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 19 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v18→v19 bump: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// backfillMessageMetaShadows populates mailbox_id / account_id / is_seen /
+// is_flagged / is_deleted / flags_other for any row that the post-step-1
+// INSERT path left with NULL FKs or zero booleans. Idempotent — rows
+// already populated are filtered out of every UPDATE's WHERE clause.
+// Runs inside the v18→v19 migration just before the table-rebuild that
+// drops the source columns.
+func (d *DB) backfillMessageMetaShadows() error {
+	// Populate mailboxes/accounts from any plaintext shadow value that's
+	// not yet represented. INBOX gets the same case normalization as the
+	// step-1 backfill so 'inbox' / 'Inbox' / 'INBOX' merge.
+	pre := []string{
+		`INSERT OR IGNORE INTO mailboxes (name)
+		 SELECT DISTINCT
+		   CASE WHEN UPPER(mailbox) = 'INBOX' THEN 'INBOX' ELSE mailbox END
+		 FROM messages
+		 WHERE mailbox IS NOT NULL AND mailbox <> '' AND mailbox_id IS NULL`,
+		`INSERT OR IGNORE INTO accounts (name)
+		 SELECT DISTINCT account FROM messages
+		 WHERE account IS NOT NULL AND account <> '' AND account_id IS NULL`,
+		`UPDATE messages
+		 SET mailbox_id = (
+		   SELECT id FROM mailboxes
+		   WHERE name = CASE WHEN UPPER(messages.mailbox) = 'INBOX'
+		                     THEN 'INBOX' ELSE messages.mailbox END
+		 )
+		 WHERE mailbox IS NOT NULL AND mailbox <> '' AND mailbox_id IS NULL`,
+		`UPDATE messages
+		 SET account_id = (SELECT id FROM accounts WHERE name = messages.account)
+		 WHERE account IS NOT NULL AND account <> '' AND account_id IS NULL`,
+		// Re-derive activity booleans for any row where they're still at
+		// the default 0 but flags TEXT actually carries one of the system
+		// flags (catches rows synced post-step-1 with the old insert path).
+		`UPDATE messages SET
+		   is_seen    = CASE WHEN INSTR(IFNULL(flags, ''), '\Seen')    > 0 THEN 1 ELSE is_seen END,
+		   is_flagged = CASE WHEN INSTR(IFNULL(flags, ''), '\Flagged') > 0 THEN 1 ELSE is_flagged END,
+		   is_deleted = CASE WHEN INSTR(IFNULL(flags, ''), '\Deleted') > 0 THEN 1 ELSE is_deleted END
+		 WHERE flags IS NOT NULL AND flags <> ''`,
+	}
+	for _, stmt := range pre {
+		if _, err := d.db.Exec(stmt); err != nil {
+			return fmt.Errorf("pre-rebuild backfill: %w", err)
+		}
+	}
+
+	// Mailboxes/accounts rows freshly created above need their name_ct
+	// populated too — the v14→v15 backfill ran before they existed.
+	// Encrypt-on-read isn't an option; the SELECT path JOINs name_ct.
+	if err := d.encryptMissingMetaNames(); err != nil {
+		return fmt.Errorf("encrypt new meta names: %w", err)
+	}
+
+	// flags_other_ct backfill for any row with non-empty plaintext flags
+	// but a NULL flags_other (rows synced after step 1 but before step 6
+	// landed encrypt-on-write).
+	if err := d.backfillFlagsOtherFromShadow(); err != nil {
+		return fmt.Errorf("flags_other backfill: %w", err)
+	}
+	return nil
+}
+
+// encryptMissingMetaNames writes name_ct for any mailboxes / accounts
+// row that has plaintext name but no encrypted name_ct yet. Covers the
+// freshly-created rows from backfillMessageMetaShadows. Idempotent.
+func (d *DB) encryptMissingMetaNames() error {
+	if d.keyring == nil || d.keyring.Meta == nil {
+		return fmt.Errorf("no keyring for meta name encrypt")
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	for _, table := range []string{"mailboxes", "accounts"} {
+		rows, err := tx.Query(`SELECT id, name FROM ` + table + `
+			WHERE name IS NOT NULL AND name <> '' AND name_ct IS NULL`)
+		if err != nil {
+			return fmt.Errorf("select %s: %w", table, err)
+		}
+		type pending struct {
+			id   int64
+			name string
+		}
+		var batch []pending
+		for rows.Next() {
+			var p pending
+			if err := rows.Scan(&p.id, &p.name); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan %s: %w", table, err)
+			}
+			batch = append(batch, p)
+		}
+		rows.Close()
+		stmt, err := tx.Prepare("UPDATE " + table + " SET name_ct = ? WHERE id = ?")
+		if err != nil {
+			return fmt.Errorf("prepare %s update: %w", table, err)
+		}
+		for _, p := range batch {
+			ct, err := d.encryptMeta(p.name)
+			if err != nil {
+				stmt.Close()
+				return fmt.Errorf("encrypt %s name id=%d: %w", table, p.id, err)
+			}
+			if _, err := stmt.Exec(ct, p.id); err != nil {
+				stmt.Close()
+				return fmt.Errorf("update %s id=%d: %w", table, p.id, err)
+			}
+		}
+		stmt.Close()
+	}
+	return tx.Commit()
+}
+
+// backfillFlagsOtherFromShadow encrypts any messages row's plaintext
+// flags TEXT (minus the boolean-covered system flags) into flags_other
+// when the latter is still NULL. Idempotent. Mirrors backfillMetaCt
+// but only targets rows still showing the pre-step-6 NULL.
+func (d *DB) backfillFlagsOtherFromShadow() error {
+	if d.keyring == nil || d.keyring.Meta == nil {
+		return fmt.Errorf("no keyring for flags_other backfill")
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	rows, err := tx.Query(`SELECT id, flags FROM messages
+		WHERE flags IS NOT NULL AND flags <> '' AND flags_other IS NULL`)
+	if err != nil {
+		return fmt.Errorf("select: %w", err)
+	}
+	type pending struct {
+		id    int64
+		flags string
+	}
+	var batch []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.flags); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan: %w", err)
+		}
+		batch = append(batch, p)
+	}
+	rows.Close()
+	stmt, err := tx.Prepare("UPDATE messages SET flags_other = ? WHERE id = ?")
+	if err != nil {
+		return fmt.Errorf("prepare: %w", err)
+	}
+	defer stmt.Close()
+	for _, p := range batch {
+		ct, err := d.encryptMeta(flagsOtherForEncryption(p.flags))
+		if err != nil {
+			return fmt.Errorf("encrypt id=%d: %w", p.id, err)
+		}
+		if _, err := stmt.Exec(ct, p.id); err != nil {
+			return fmt.Errorf("update id=%d: %w", p.id, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// rebuildMessagesForStep7f rebuilds the messages table to drop the
+// plaintext mailbox / account / flags columns and replace the
+// UNIQUE(message_id, account) constraint with UNIQUE(message_id,
+// account_id). SQLite's 12-step ALTER procedure.
+func (d *DB) rebuildMessagesForStep7f() error {
+	stmts := []string{
+		`PRAGMA foreign_keys = OFF`,
+		// The new table mirrors the current messages schema minus the
+		// three doomed columns. Column order chosen to keep CREATE TABLE
+		// readable rather than to match the in-place order — INSERT
+		// SELECT names columns explicitly so order is irrelevant.
+		`CREATE TABLE messages_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			message_id TEXT NOT NULL,
+			thread_id TEXT NOT NULL,
+			in_reply_to TEXT,
+			refs TEXT,
+			from_addr TEXT,
+			to_addrs TEXT,
+			cc_addrs TEXT,
+			date INTEGER,
+			created_at INTEGER NOT NULL,
+			uid INTEGER DEFAULT 0,
+			size INTEGER DEFAULT 0,
+			fetched_body INTEGER DEFAULT 0,
+			mailbox_id INTEGER REFERENCES mailboxes(id),
+			account_id INTEGER REFERENCES accounts(id),
+			is_seen INTEGER NOT NULL DEFAULT 0,
+			is_flagged INTEGER NOT NULL DEFAULT 0,
+			is_deleted INTEGER NOT NULL DEFAULT 0,
+			subject_ct BLOB,
+			body_text_ct BLOB,
+			body_html_ct BLOB,
+			flags_other BLOB
+		)`,
+		`INSERT INTO messages_new (
+			id, message_id, thread_id, in_reply_to, refs,
+			from_addr, to_addrs, cc_addrs,
+			date, created_at, uid, size, fetched_body,
+			mailbox_id, account_id, is_seen, is_flagged, is_deleted,
+			subject_ct, body_text_ct, body_html_ct, flags_other
+		) SELECT
+			id, message_id, thread_id, in_reply_to, refs,
+			from_addr, to_addrs, cc_addrs,
+			date, created_at, uid, size, fetched_body,
+			mailbox_id, account_id, is_seen, is_flagged, is_deleted,
+			subject_ct, body_text_ct, body_html_ct, flags_other
+		FROM messages`,
+		// modernc.org/sqlite step 7e quirk: DROP TRIGGER fired inside
+		// migrate() silently no-ops. The patched-to-no-op triggers
+		// (messages_ai / messages_ad / messages_au + messages_blind_fts_ad)
+		// disappear with the table drop, which works fine, but we have
+		// to re-create the blind-FTS trigger against the renamed table
+		// below since DROP TABLE takes its triggers with it.
+		`DROP TABLE messages`,
+		`ALTER TABLE messages_new RENAME TO messages`,
+		// Recreate the indexes that survived step 7e (idx_messages_mailbox
+		// + idx_messages_account died with the columns they covered).
+		`CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date)`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_from_addr ON messages(from_addr)`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id ON messages(mailbox_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_account_id ON messages(account_id)`,
+		// Replacement for the old UNIQUE(message_id, account) inline
+		// constraint. account_id can legitimately be NULL (empty Account
+		// on the Message struct → NULL FK), and SQLite treats NULLs as
+		// distinct under a plain UNIQUE — which would silently allow
+		// duplicate (message_id, NULL) rows and break the ON CONFLICT
+		// upsert path. Wrapping in IFNULL collapses NULL to the sentinel 0.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_msgid_acctid_uniq
+			ON messages(message_id, IFNULL(account_id, 0))`,
+		// Re-attach the blind-FTS delete trigger so messages_blind_fts
+		// stays in sync. INSERT/UPDATE maintenance still happens Go-side.
+		`CREATE TRIGGER IF NOT EXISTS messages_blind_fts_ad AFTER DELETE ON messages BEGIN
+			DELETE FROM messages_blind_fts WHERE rowid = old.id;
+		END`,
+		`PRAGMA foreign_keys = ON`,
+		`PRAGMA foreign_key_check`,
+	}
+	for _, s := range stmts {
+		if _, err := d.db.Exec(s); err != nil {
+			return fmt.Errorf("rebuild step %q: %w", s[:min(60, len(s))], err)
+		}
+	}
+	if _, err := d.db.Exec("VACUUM"); err != nil {
+		return fmt.Errorf("rebuild vacuum: %w", err)
+	}
 	return nil
 }
 
@@ -1133,6 +1388,94 @@ func flagsOtherForEncryption(flags string) string {
 		}
 	}
 	return strings.Join(out, " ")
+}
+
+// flagsFromParts reconstructs the space-separated IMAP flags string from
+// the three boolean columns plus the decrypted flags_other plaintext.
+// Inverse of flagsOtherForEncryption + the is_*-derivation in
+// insertMessageTx — together they must round-trip such that
+// flagsOtherForEncryption(flagsFromParts(s,f,d, other)) == other for
+// every other that contains no \Seen/\Flagged/\Deleted token (which is
+// guaranteed by flagsOtherForEncryption itself).
+//
+// Callers: scanMessages, GetByMessageID, GetByThread, GetAllByThread.
+// They feed the result into Message.Flags which IMAP/SMTP/tagsync code
+// re-tokenizes with strings.Fields — so the function only needs to
+// produce a *valid* space-separated flag list; the canonical IMAP order
+// is not enforceable here anyway (the original UID FETCH order is lost
+// the moment the booleans were extracted).
+func flagsFromParts(isSeen, isFlagged, isDeleted bool, other string) string {
+	if !isSeen && !isFlagged && !isDeleted {
+		return other
+	}
+	parts := make([]string, 0, 4)
+	if isSeen {
+		parts = append(parts, `\Seen`)
+	}
+	if isFlagged {
+		parts = append(parts, `\Flagged`)
+	}
+	if isDeleted {
+		parts = append(parts, `\Deleted`)
+	}
+	if other != "" {
+		parts = append(parts, other)
+	}
+	return strings.Join(parts, " ")
+}
+
+// getOrCreateMailbox returns the mailboxes.id for name, inserting the
+// row (with encrypted name_ct under meta_key) if it does not yet exist.
+// INBOX is case-normalized to "INBOX" to match the v8→v9 backfill so
+// 'inbox' / 'Inbox' / 'INBOX' continue to resolve to the same id.
+//
+// Runs inside the caller's transaction so failures roll back along with
+// the message insert that triggered the lookup. Returns 0 + nil for an
+// empty name — caller decides whether to store NULL.
+func (d *DB) getOrCreateMailbox(tx *sql.Tx, name string) (int64, error) {
+	if name == "" {
+		return 0, nil
+	}
+	if strings.EqualFold(name, "INBOX") {
+		name = "INBOX"
+	}
+	nameCT, err := d.encryptMeta(name)
+	if err != nil {
+		return 0, fmt.Errorf("encrypt mailbox name: %w", err)
+	}
+	if _, err := tx.Exec(
+		"INSERT OR IGNORE INTO mailboxes (name, name_ct) VALUES (?, ?)",
+		name, nameCT); err != nil {
+		return 0, fmt.Errorf("insert mailbox: %w", err)
+	}
+	var id int64
+	if err := tx.QueryRow("SELECT id FROM mailboxes WHERE name = ?", name).Scan(&id); err != nil {
+		return 0, fmt.Errorf("lookup mailbox id: %w", err)
+	}
+	return id, nil
+}
+
+// getOrCreateAccount mirrors getOrCreateMailbox for the accounts table.
+// Account names are not case-normalized — they are full email addresses
+// that callers already canonicalize at sync-config load.
+func (d *DB) getOrCreateAccount(tx *sql.Tx, name string) (int64, error) {
+	if name == "" {
+		return 0, nil
+	}
+	nameCT, err := d.encryptMeta(name)
+	if err != nil {
+		return 0, fmt.Errorf("encrypt account name: %w", err)
+	}
+	if _, err := tx.Exec(
+		"INSERT OR IGNORE INTO accounts (name, name_ct) VALUES (?, ?)",
+		name, nameCT); err != nil {
+		return 0, fmt.Errorf("insert account: %w", err)
+	}
+	var id int64
+	if err := tx.QueryRow("SELECT id FROM accounts WHERE name = ?", name).Scan(&id); err != nil {
+		return 0, fmt.Errorf("lookup account id: %w", err)
+	}
+	return id, nil
 }
 
 // backfillMetaCt encrypts existing mailbox names, account names, and the
