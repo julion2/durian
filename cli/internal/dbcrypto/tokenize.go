@@ -60,8 +60,7 @@ func TokenizeFTS(key []byte, plaintext string) string {
 // bigrams as additional query tokens would AND-require the searcher's
 // word pair to also appear consecutively in the source, turning a
 // word-AND query into a phrase-match by accident. Phrase-query
-// support reuses TokenizeFTS (with bigrams) once the parser learns
-// quote-for-phrase syntax.
+// support is in TokenizeFTSPhrase below.
 func TokenizeFTSQuery(key []byte, plaintext string) string {
 	words := wordsForFTS(plaintext)
 	if len(words) == 0 {
@@ -70,6 +69,40 @@ func TokenizeFTSQuery(key []byte, plaintext string) string {
 	out := make([]string, len(words))
 	for i, w := range words {
 		out[i] = hmacHex(key, []byte(w))
+	}
+	return strings.Join(out, " ")
+}
+
+// TokenizeFTSPhrase produces the query-side token set for a quoted
+// phrase: every unigram of the phrase AND every adjacent-pair bigram,
+// matching the token shapes TokenizeFTS wrote into the index. AND-ing
+// all of these against the index (FTS5 default conjunction) selects
+// only documents that contain the same word sequence — each bigram
+// pins the relative order of an adjacent pair, so a phrase of N words
+// is anchored by N-1 ordered pairs plus N word-presence checks.
+//
+// HMAC truncation collisions still need a post-decrypt false-positive
+// filter on the caller side (same as the unigram-only path) — the
+// index can confirm "consistent with the phrase" but not "exactly".
+//
+// Returns an empty string for empty/whitespace-only input. A
+// single-word phrase degrades to the unigram-only TokenizeFTSQuery
+// output (no bigrams exist).
+func TokenizeFTSPhrase(key []byte, plaintext string) string {
+	words := wordsForFTS(plaintext)
+	if len(words) == 0 {
+		return ""
+	}
+	out := make([]string, 0, len(words)*2-1)
+	for _, w := range words {
+		out = append(out, hmacHex(key, []byte(w)))
+	}
+	for i := 0; i < len(words)-1; i++ {
+		var buf strings.Builder
+		buf.WriteString(words[i])
+		buf.WriteByte(0x1f)
+		buf.WriteString(words[i+1])
+		out = append(out, hmacHex(key, []byte(buf.String())))
 	}
 	return strings.Join(out, " ")
 }
