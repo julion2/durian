@@ -53,6 +53,23 @@ func TestOpen_RejectsNilKeyring(t *testing.T) {
 	}
 }
 
+// TestOpen_SecureDeleteEnabled asserts ADR-0001 step 8: every fresh
+// connection has PRAGMA secure_delete = ON, so DELETE / UPDATE
+// overwrites freed pages with zeros before reuse. The plaintext
+// metadata Durian deliberately keeps (from_addr, to_addrs, cc_addrs,
+// message_id, dates) would otherwise stay recoverable in the .db file
+// until something else writes over the page.
+func TestOpen_SecureDeleteEnabled(t *testing.T) {
+	db := newTestDB(t)
+	var v int
+	if err := db.db.QueryRow("PRAGMA secure_delete").Scan(&v); err != nil {
+		t.Fatalf("query pragma: %v", err)
+	}
+	if v != 1 {
+		t.Errorf("PRAGMA secure_delete = %d, want 1", v)
+	}
+}
+
 func TestInitIdempotent(t *testing.T) {
 	db := newTestDB(t)
 

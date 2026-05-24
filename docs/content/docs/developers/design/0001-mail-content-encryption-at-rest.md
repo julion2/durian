@@ -454,6 +454,40 @@ still:
   need memory-dump resistance run an FDE-encrypted suspend / hibernate or
   exit `durian serve` when stepping away.
 
+### Disk hygiene
+
+SQLite by default treats DELETE / UPDATE as "mark the page free for
+later reuse" — the old row bytes stay in the `.db` file until some
+later write happens to land on that page. For the columns we
+deliberately keep plaintext per the β-revisions (`from_addr`,
+`to_addrs`, `cc_addrs`, RFC-5322 IDs, `is_seen` / `is_flagged` /
+`is_deleted`, dates, sizes, `contacts.email`, `contacts.name`), that
+delay is a Persona 1 leak: a forensic analyst with the raw file can
+recover the bytes of mails the user thought they deleted.
+
+Mitigation: **`PRAGMA secure_delete = ON`** is set on every fresh
+connection in both `store.Open` and `contacts.Open` (step 8). SQLite
+then zeroes freed pages before releasing them. Cost is one extra
+zero-write per delete — negligible for Durian's mailbox-scale delete
+rate.
+
+What secure_delete does **not** cover:
+
+- WAL-mode journal pages (`email.db-wal`) may briefly hold pre-delete
+  bytes before checkpoint. `journal_mode=DELETE` would close that
+  window but at the cost of write throughput; we accept the brief
+  WAL window because the WAL file gets checkpointed and rewritten
+  often. `contacts.db` is `journal_mode=DELETE` so it does not have
+  this gap.
+- Filesystem-level snapshots (Time Machine, APFS local snapshots,
+  iCloud backups) hold whole-file copies independent of SQLite's
+  page management. Persona 2's defense rests on the file being
+  ciphertext-mostly + locked-keychain, not on secure_delete.
+- SSD wear-leveling. The physical block the "zeroed" page sat in may
+  still hold old bits, accessible only to physical-media forensics
+  (chip-off attacks). Out of scope; mitigation is FileVault /
+  full-disk encryption, which Durian assumes the user enables.
+
 ### Logging audit
 
 A Durian build with encryption is only as private as its least careful log
@@ -688,9 +722,13 @@ user-runnable.
      bigrams written by the step-7 a+b tokenizer; quoted phrases
      (`"foo bar"`, `subject:"foo bar"`) now ride the bigram path to
      anchor word order.
-8. **`PRAGMA secure_delete = ON`** flipped in `store.Open` and verified by
-   a smoke test that asserts the pragma is set on every new connection.
-   **Pending** — separate PR after the step-7 stack lands.
+8. **`PRAGMA secure_delete = ON`** flipped in both `store.Open` and
+   `contacts.Open`, verified by smoke tests that assert the pragma is
+   set on every new connection. Overwrites freed pages with zeros so
+   the plaintext metadata the β-revisions deliberately kept (addresses,
+   IDs, dates, activity booleans, contact names) doesn't leak old
+   values via page-reuse delay to a forensic analyst with the raw
+   `.db` file. **Shipped.**
 
 Steps 1–4 are pure infrastructure and can ship as alpha-grade without
 user-visible change. The first user-visible behaviour change is step 5.
