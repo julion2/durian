@@ -62,24 +62,32 @@ func runServe(cmd *cobra.Command, args []string) {
 		slog.SetDefault(slog.New(redact.Wrap(slog.NewTextHandler(f, &slog.HandlerOptions{Level: level}))))
 	}
 
+	// ADR-0001 steps 4+5+6: bootstrap the master key BEFORE opening any
+	// store. The keyring is required to encrypt new rows and to back-fill
+	// existing rows in every per-step migration (messages, contacts).
+	keyring := bootstrapKeyring()
+
 	// Open contacts database (non-fatal if missing)
 	var contactsDB *contacts.DB
 	contactsDBPath := serveContactsDB
 	if contactsDBPath == "" {
 		contactsDBPath = contacts.DefaultDBPath()
 	}
-	if cdb, err := contacts.Open(contactsDBPath); err != nil {
+	if cdb, err := contacts.Open(contactsDBPath, keyring); err != nil {
 		slog.Warn("Could not open contacts database", "module", "SERVE", "path", contactsDBPath, "err", err)
+	} else if err := cdb.Init(); err != nil {
+		// Init runs the CREATE TABLE IF NOT EXISTS and any pending
+		// migrations (ADR-0001 step 6 contact encryption). Previously
+		// serve skipped Init and relied on the import subcommand to
+		// have set up the schema; with encrypt-on-write live we must
+		// guarantee the migration runs on startup.
+		slog.Warn("Could not init contacts database", "module", "SERVE", "path", contactsDBPath, "err", err)
+		cdb.Close()
 	} else {
 		contactsDB = cdb
 		defer contactsDB.Close()
 		slog.Info("Opened contacts database", "module", "SERVE", "path", contactsDBPath)
 	}
-
-	// ADR-0001 steps 4+5: bootstrap the master key BEFORE opening the
-	// store. The keyring is required to encrypt new rows and to back-fill
-	// existing rows on the v9→v10 migration.
-	keyring := bootstrapKeyring()
 
 	// Open email store (required for reads)
 	dbPath := serveDB
