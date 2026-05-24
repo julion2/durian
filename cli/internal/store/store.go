@@ -716,6 +716,84 @@ func (d *DB) migrate() error {
 		if _, err := d.db.Exec("UPDATE schema_version SET version = 17 WHERE rowid = 1"); err != nil {
 			return fmt.Errorf("migrate v16→v17 bump: %w", err)
 		}
+		version = 17
+	}
+
+	if version < 18 {
+		// ADR-0001 step 7e: drop the now-dead plaintext columns whose
+		// encrypted *_ct counterparts have been written and read by every
+		// path since steps 6 / 7c. messages.mailbox / account / flags
+		// stay alive — they still drive lookups; step 7f handles those.
+		//
+		// Also drops the old messages_fts external-content FTS5 table
+		// plus its insert/update/delete triggers. messages_blind_fts has
+		// served every search read since step 7c; the parallel index
+		// is dead weight.
+		// modernc.org/sqlite has a quirk where DROP TRIGGER fired from
+		// within Init's migrate() loop is silently no-op (verified by
+		// step-7e debug: same SQL works post-Init, fails mid-migration).
+		// Workaround: patch the trigger bodies in sqlite_master directly
+		// to a no-op SELECT before dropping the table, so the now-gone
+		// columns and table they reference can never be touched. Then
+		// drop the old FTS5 table.
+		patch := []string{
+			`PRAGMA writable_schema = ON`,
+			`UPDATE sqlite_master
+			 SET sql = 'CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN SELECT 1; END'
+			 WHERE type='trigger' AND name='messages_ai'`,
+			`UPDATE sqlite_master
+			 SET sql = 'CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN SELECT 1; END'
+			 WHERE type='trigger' AND name='messages_ad'`,
+			`UPDATE sqlite_master
+			 SET sql = 'CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN SELECT 1; END'
+			 WHERE type='trigger' AND name='messages_au'`,
+			`PRAGMA writable_schema = OFF`,
+			`DROP TABLE IF EXISTS messages_fts`,
+		}
+		for _, s := range patch {
+			if _, err := d.db.Exec(s); err != nil {
+				return fmt.Errorf("migrate v17→v18 trigger patch: %w", err)
+			}
+		}
+
+		// Idempotent column drops via PRAGMA table_info — partial
+		// migration on retry skips already-dropped columns.
+		drops := []struct{ table, col string }{
+			{"messages", "subject"},
+			{"messages", "body_text"},
+			{"messages", "body_html"},
+			{"message_headers", "value"},
+			{"local_drafts", "draft_json"},
+			{"outbox", "draft_json"},
+		}
+		for _, d2 := range drops {
+			has, err := hasColumn(d.db, d2.table, d2.col)
+			if err != nil {
+				return fmt.Errorf("migrate v17→v18 inspect %s.%s: %w", d2.table, d2.col, err)
+			}
+			if has {
+				if _, err := d.db.Exec("ALTER TABLE " + d2.table + " DROP COLUMN " + d2.col); err != nil {
+					return fmt.Errorf("migrate v17→v18 drop %s.%s: %w", d2.table, d2.col, err)
+				}
+			}
+		}
+
+
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 18 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v17→v18 bump: %w", err)
+		}
+
+		// VACUUM rebuilds the DB file to reclaim space from the dropped
+		// columns + FTS5 table. On a 20k-message mailbox this rewrites
+		// ~900 MB (the body plaintext duplication that's been sitting
+		// alongside body_text_ct since step 6). Slow — typically 30-90 s
+		// on a warm filesystem cache — but one-shot, after which the
+		// 1.8 GB DB should shrink back near the pre-encryption ~980 MB
+		// baseline (encrypted ct adds 29 bytes per blob; the plaintext
+		// duplication is gone).
+		if _, err := d.db.Exec("VACUUM"); err != nil {
+			return fmt.Errorf("migrate v17→v18 vacuum: %w", err)
+		}
 	}
 
 	return nil

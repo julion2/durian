@@ -164,11 +164,14 @@ func TestDeleteOutboxItemNotFound(t *testing.T) {
 func TestListOutboxOrder(t *testing.T) {
 	db := newTestDB(t)
 
-	// Insert with explicit created_at to ensure ordering
-	db.db.Exec("INSERT INTO outbox (draft_json, created_at, send_after) VALUES (?, ?, ?)",
-		`{"subject":"first"}`, 1000, 0)
-	db.db.Exec("INSERT INTO outbox (draft_json, created_at, send_after) VALUES (?, ?, ?)",
-		`{"subject":"second"}`, 2000, 0)
+	// Enqueue + override created_at so the ordering is deterministic.
+	// Step 7e dropped the plaintext draft_json column, so direct INSERTs
+	// that wrote it stopped working — go through Enqueue (which encrypts
+	// into draft_json_ct) then patch created_at after the fact.
+	id1, _ := db.Enqueue(`{"subject":"first"}`, 0)
+	id2, _ := db.Enqueue(`{"subject":"second"}`, 0)
+	db.db.Exec("UPDATE outbox SET created_at = ? WHERE id = ?", 1000, id1)
+	db.db.Exec("UPDATE outbox SET created_at = ? WHERE id = ?", 2000, id2)
 
 	items, err := db.ListOutbox()
 	if err != nil {
