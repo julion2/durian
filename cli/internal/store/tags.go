@@ -144,14 +144,31 @@ func (d *DB) ListTags(accounts ...string) ([]string, error) {
 	var rows *sql.Rows
 	var err error
 	if len(accounts) > 0 {
-		placeholders := make([]string, len(accounts))
-		params := make([]interface{}, len(accounts))
-		for i, a := range accounts {
+		// Resolve account names → ids. Unknown names contribute nothing
+		// to the IN-list; if all names are unknown we short-circuit empty.
+		ids := make([]int64, 0, len(accounts))
+		for _, name := range accounts {
+			var id int64
+			err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", name).Scan(&id)
+			if err == sql.ErrNoRows {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("lookup account id: %w", err)
+			}
+			ids = append(ids, id)
+		}
+		if len(ids) == 0 {
+			return nil, nil
+		}
+		placeholders := make([]string, len(ids))
+		params := make([]interface{}, len(ids))
+		for i, id := range ids {
 			placeholders[i] = "?"
-			params[i] = a
+			params[i] = id
 		}
 		rows, err = d.db.Query(
-			"SELECT DISTINCT t.tag FROM tags t JOIN messages m ON m.id = t.message_id WHERE m.account IN ("+
+			"SELECT DISTINCT t.tag FROM tags t JOIN messages m ON m.id = t.message_id WHERE m.account_id IN ("+
 				strings.Join(placeholders, ",")+") ORDER BY t.tag", params...)
 	} else {
 		rows, err = d.db.Query("SELECT DISTINCT tag FROM tags ORDER BY tag")
@@ -215,10 +232,15 @@ func (d *DB) ModifyTagsByMessageIDAndAccount(messageID, account string, addTags,
 	}
 	defer tx.Rollback()
 
+	var accountID int64
+	err = tx.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID)
+	if err != nil {
+		return nil // unknown account → no-op (mirrors pre-7f behavior)
+	}
 	var dbID int64
 	err = tx.QueryRow(
-		"SELECT id FROM messages WHERE message_id = ? AND account = ?",
-		messageID, account).Scan(&dbID)
+		"SELECT id FROM messages WHERE message_id = ? AND account_id = ?",
+		messageID, accountID).Scan(&dbID)
 	if err != nil {
 		return nil // message/account pair not in store — no-op
 	}
@@ -333,11 +355,15 @@ func (d *DB) SetMeta(key string, value int64) {
 }
 
 // ExportAllTags returns all (message_id, account, tag) tuples in the database.
-// Used for initial push to the tag sync server.
+// Used for initial push to the tag sync server. Account is resolved via
+// JOIN on accounts.id; the name comes from the encrypted name_ct BLOB
+// (decrypted under meta_key).
 func (d *DB) ExportAllTags() ([]struct{ MessageID, Account, Tag string }, error) {
 	rows, err := d.db.Query(`
-		SELECT m.message_id, m.account, t.tag
-		FROM tags t JOIN messages m ON m.id = t.message_id
+		SELECT m.message_id, ac.name_ct, t.tag
+		FROM tags t
+		JOIN messages m ON m.id = t.message_id
+		LEFT JOIN accounts ac ON ac.id = m.account_id
 		ORDER BY m.message_id`)
 	if err != nil {
 		return nil, fmt.Errorf("export tags: %w", err)
@@ -347,8 +373,12 @@ func (d *DB) ExportAllTags() ([]struct{ MessageID, Account, Tag string }, error)
 	var result []struct{ MessageID, Account, Tag string }
 	for rows.Next() {
 		var r struct{ MessageID, Account, Tag string }
-		if err := rows.Scan(&r.MessageID, &r.Account, &r.Tag); err != nil {
+		var accountCT []byte
+		if err := rows.Scan(&r.MessageID, &accountCT, &r.Tag); err != nil {
 			return nil, fmt.Errorf("scan: %w", err)
+		}
+		if r.Account, err = d.decryptMeta("", accountCT); err != nil {
+			return nil, fmt.Errorf("decrypt account name: %w", err)
 		}
 		result = append(result, r)
 	}
@@ -358,17 +388,37 @@ func (d *DB) ExportAllTags() ([]struct{ MessageID, Account, Tag string }, error)
 // GetAllMessagesWithTags returns a map of message_id → tags for all messages
 // in a given mailbox. When account is non-empty, results are scoped to that account.
 // Used for IMAP flag synchronization.
+//
+// Step 7f: mailbox + account are resolved to their FK ids; unknown names
+// return an empty map without an error (no rows can match).
 func (d *DB) GetAllMessagesWithTags(mailbox string, account ...string) (map[string][]string, error) {
+	if strings.EqualFold(mailbox, "INBOX") {
+		mailbox = "INBOX"
+	}
+	var mailboxID int64
+	if err := d.db.QueryRow("SELECT id FROM mailboxes WHERE name = ?", mailbox).Scan(&mailboxID); err != nil {
+		if err == sql.ErrNoRows {
+			return map[string][]string{}, nil
+		}
+		return nil, fmt.Errorf("lookup mailbox id: %w", err)
+	}
 	q := `
 		SELECT m.message_id, t.tag
 		FROM messages m
 		JOIN tags t ON t.message_id = m.id
-		WHERE m.mailbox = ?`
-	params := []interface{}{mailbox}
+		WHERE m.mailbox_id = ?`
+	params := []interface{}{mailboxID}
 
 	if len(account) > 0 && account[0] != "" {
-		q += " AND m.account = ?"
-		params = append(params, account[0])
+		var accountID int64
+		if err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account[0]).Scan(&accountID); err != nil {
+			if err == sql.ErrNoRows {
+				return map[string][]string{}, nil
+			}
+			return nil, fmt.Errorf("lookup account id: %w", err)
+		}
+		q += " AND m.account_id = ?"
+		params = append(params, accountID)
 	}
 	q += " ORDER BY m.message_id"
 
