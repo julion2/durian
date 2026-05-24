@@ -220,6 +220,7 @@ func TestNewKeyring_DerivesAllSubKeys(t *testing.T) {
 		{"Headers", kr.Headers, LabelHeaders},
 		{"Draft", kr.Draft, LabelDraft},
 		{"Meta", kr.Meta, LabelMeta},
+		{"Contact", kr.Contact, LabelContact},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -236,7 +237,7 @@ func TestNewKeyring_DerivesAllSubKeys(t *testing.T) {
 		})
 	}
 	// Pairwise distinctness — guards against future "oops, copy-paste".
-	all := [][]byte{kr.Subject, kr.Body, kr.Addrs, kr.Headers, kr.Draft, kr.Meta}
+	all := [][]byte{kr.Subject, kr.Body, kr.Addrs, kr.Headers, kr.Draft, kr.Meta, kr.Contact}
 	var pairs [][2][]byte
 	for i := range all {
 		for j := i + 1; j < len(all); j++ {
