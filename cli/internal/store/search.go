@@ -5,11 +5,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/durian-dev/durian/cli/internal/dbcrypto"
 )
 
 // SearchCount returns the number of threads matching a query.
 func (d *DB) SearchCount(query string) (int, error) {
-	where, params, err := parseQuery(query)
+	where, params, err := d.parseQuery(query)
 	if err != nil {
 		return 0, fmt.Errorf("parse query: %w", err)
 	}
@@ -33,7 +35,7 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 		limit = 50
 	}
 
-	where, params, err := parseQuery(query)
+	where, params, err := d.parseQuery(query)
 	if err != nil {
 		return nil, fmt.Errorf("parse query: %w", err)
 	}
@@ -418,32 +420,44 @@ func (p *parser) parsePrimary() (exprNode, error) {
 // --- SQL generation ---
 
 // exprToSQL walks the expression tree and produces a SQL WHERE clause with parameters.
-func exprToSQL(node exprNode) (string, []interface{}, error) {
+// Promoted to a method on *DB so the bareExpr and subject: cases can reach the
+// FTSToken sub-key for tokenizing user input against messages_blind_fts.
+func (d *DB) exprToSQL(node exprNode) (string, []interface{}, error) {
 	switch n := node.(type) {
 	case *binaryExpr:
-		leftSQL, leftParams, err := exprToSQL(n.left)
+		leftSQL, leftParams, err := d.exprToSQL(n.left)
 		if err != nil {
 			return "", nil, err
 		}
-		rightSQL, rightParams, err := exprToSQL(n.right)
+		rightSQL, rightParams, err := d.exprToSQL(n.right)
 		if err != nil {
 			return "", nil, err
 		}
 		return "(" + leftSQL + " " + n.op + " " + rightSQL + ")", append(leftParams, rightParams...), nil
 
 	case *notExpr:
-		childSQL, childParams, err := exprToSQL(n.child)
+		childSQL, childParams, err := d.exprToSQL(n.child)
 		if err != nil {
 			return "", nil, err
 		}
 		return "NOT (" + childSQL + ")", childParams, nil
 
 	case *fieldExpr:
-		return fieldToSQL(n)
+		return d.fieldToSQL(n)
 
 	case *bareExpr:
-		return "m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
-			[]interface{}{n.value}, nil
+		// ADR-0001 step 7c: bare FTS search flips from the plaintext
+		// messages_fts to the blind-token messages_blind_fts. The
+		// user term is run through the same TokenizeFTS pipeline that
+		// populated the index in step 7a+b, so the hex tokens produced
+		// here line up with the tokens stored at write time.
+		toks := dbcrypto.TokenizeFTS(d.keyring.FTSToken, n.value)
+		if toks == "" {
+			// All-stop-words / punctuation-only input — never matches anything.
+			return "1=0", nil, nil
+		}
+		return "m.id IN (SELECT rowid FROM messages_blind_fts WHERE messages_blind_fts MATCH ?)",
+			[]interface{}{toks}, nil
 
 	case *starExpr:
 		return "1=1", nil, nil
@@ -454,7 +468,7 @@ func exprToSQL(node exprNode) (string, []interface{}, error) {
 }
 
 // parseQuery translates a search query into a SQL WHERE clause and parameters.
-func parseQuery(query string) (where string, params []interface{}, err error) {
+func (d *DB) parseQuery(query string) (where string, params []interface{}, err error) {
 	tokens := lex(query)
 	node, err := parse(tokens)
 	if err != nil {
@@ -463,11 +477,13 @@ func parseQuery(query string) (where string, params []interface{}, err error) {
 	if _, ok := node.(*starExpr); ok {
 		return "", nil, nil
 	}
-	return exprToSQL(node)
+	return d.exprToSQL(node)
 }
 
-// fieldToSQL converts a field expression into a SQL clause.
-func fieldToSQL(f *fieldExpr) (string, []interface{}, error) {
+// fieldToSQL converts a field expression into a SQL clause. Method on
+// *DB so the subject: case can tokenize the user query against the
+// FTSToken sub-key for messages_blind_fts (ADR-0001 step 7c).
+func (d *DB) fieldToSQL(f *fieldExpr) (string, []interface{}, error) {
 	switch f.field {
 	case "from":
 		return "m.from_addr LIKE ?", []interface{}{"%" + f.value + "%"}, nil
@@ -479,8 +495,15 @@ func fieldToSQL(f *fieldExpr) (string, []interface{}, error) {
 		return "m.cc_addrs LIKE ?", []interface{}{"%" + f.value + "%"}, nil
 
 	case "subject":
-		return "m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
-			[]interface{}{"subject:" + f.value}, nil
+		// ADR-0001 step 7c: subject: scoped FTS flips to messages_blind_fts.
+		// subject_tok:(tok1 tok2 ...) AND's each token against the
+		// subject_tok column only.
+		toks := dbcrypto.TokenizeFTS(d.keyring.FTSToken, f.value)
+		if toks == "" {
+			return "1=0", nil, nil
+		}
+		return "m.id IN (SELECT rowid FROM messages_blind_fts WHERE messages_blind_fts MATCH ?)",
+			[]interface{}{"subject_tok:(" + toks + ")"}, nil
 
 	case "tag":
 		return "EXISTS (SELECT 1 FROM tags WHERE tags.message_id = m.id AND tags.tag = ?)",
