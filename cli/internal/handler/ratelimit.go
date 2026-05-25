@@ -46,14 +46,22 @@ func (b *tokenBucket) allow() bool {
 	return false
 }
 
-// searchCountLimiter throttles /api/v1/search/count. ADR-0001 audit H2:
-// the count endpoint is a chosen-plaintext oracle on the blind-FTS index
-// when an attacker can email crafted content into the user's mailbox
-// and observe whether their query term causes a count delta. The
-// post-decrypt filter (search_filter.go) eliminates HMAC-collision
-// false-positives, but the true-positive transition (0→1) still leaks
-// "the user received my chosen mail" via this endpoint. 10 req/s with
-// a burst of 30 is well above legitimate GUI use (search-as-you-type
-// is debounced client-side) and well below the rate needed to mount
-// statistical analysis over thousands of probes.
-var searchCountLimiter = newTokenBucket(10, 30)
+// searchOracleLimiter throttles both /api/v1/search AND /api/v1/search/count
+// under a single shared budget.
+//
+// ADR-0001 audit H2 originally throttled only /search/count. The audit-2
+// follow-up found that /search is the same oracle: an attacker who can
+// email crafted content into the user's mailbox can call
+// /search?query=X and count the response items themselves, bypassing
+// the count-endpoint limiter entirely. A single shared bucket
+// guarantees neither path can be raced past the limit by alternating
+// calls between the two endpoints.
+//
+// The post-decrypt filter (search_filter.go) eliminates
+// HMAC-collision false-positives, but the true-positive transition
+// (0→1) still leaks "the user received my chosen mail" via either
+// endpoint. 10 req/s with a burst of 30 is well above legitimate
+// GUI use (search-as-you-type is debounced client-side) and well
+// below the rate needed to mount statistical analysis over thousands
+// of probes.
+var searchOracleLimiter = newTokenBucket(10, 30)

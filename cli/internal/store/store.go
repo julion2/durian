@@ -1103,16 +1103,49 @@ func (d *DB) backfillFlagsOtherFromShadow() error {
 // failure (OOM / disk-full / power loss during the multi-GB INSERT
 // SELECT) left the half-built temp table behind, and the next Init()
 // crashed at CREATE TABLE with "table already exists" → migration
-// permanently wedged. We now DROP the temp table at entry and wrap
-// the whole rebuild in a transaction so partial states roll back
-// cleanly.
+// permanently wedged.
+//
+// ADR-0001 audit-2 follow-up: SQLite DDL is atomic per-statement, so a
+// crash CAN land between the `DROP TABLE messages` and `ALTER TABLE
+// messages_new RENAME TO messages` steps. In that state the only copy
+// of the data lives in messages_new; if we then blindly DROP TABLE IF
+// EXISTS messages_new at the entry of the next Init's rebuild, we
+// lose every message. Re-entry detection: if `messages` is missing
+// AND `messages_new` is present (and fully populated — i.e. its
+// schema matches the post-rebuild target), we fast-forward to the
+// post-INSERT path, skipping the pre-cleanup DROP and the CREATE +
+// INSERT SELECT.
 func (d *DB) rebuildMessagesForStep7f() error {
-	// DROP any half-built messages_new from a previous interrupted
-	// attempt. Outside the transaction — if it errors (it shouldn't,
-	// IF EXISTS is non-failing) we want to surface that before any
-	// destructive operation. Outside the BEGIN/COMMIT block because
-	// SQLite implicit-commits on DDL anyway, so wrapping it in the tx
-	// would only obscure the ordering.
+	messagesPresent, err := tableExists(d.db, "messages")
+	if err != nil {
+		return fmt.Errorf("rebuild pre-check messages: %w", err)
+	}
+	messagesNewPresent, err := tableExists(d.db, "messages_new")
+	if err != nil {
+		return fmt.Errorf("rebuild pre-check messages_new: %w", err)
+	}
+	if !messagesPresent && messagesNewPresent {
+		// Crashed between DROP TABLE messages and RENAME messages_new
+		// → messages. The temp table holds the only copy of the data.
+		// Skip pre-cleanup + the build path; jump straight to RENAME
+		// and the post-rename index/trigger recreation. No DROP IF
+		// EXISTS — that would delete the only data copy.
+		return d.rebuildMessagesPostRename()
+	}
+	if !messagesPresent && !messagesNewPresent {
+		// Neither table exists. Migration ran on a DB that has no
+		// messages at all (fresh-install never executed step 1?) —
+		// nothing to rebuild. The earlier migrations should have
+		// errored before reaching here; surface this as a hard fail
+		// rather than silently produce an empty messages table.
+		return fmt.Errorf("rebuild: neither messages nor messages_new exists — db is in an unexpected state")
+	}
+	// Normal path: messages is present. DROP any half-built
+	// messages_new from a previous interrupted attempt (this is now
+	// safe because messagesPresent==true guarantees the canonical data
+	// copy lives elsewhere). Outside the transaction — if it errors
+	// (it shouldn't, IF EXISTS is non-failing) we want to surface that
+	// before any destructive operation.
 	if _, err := d.db.Exec(`DROP TABLE IF EXISTS messages_new`); err != nil {
 		return fmt.Errorf("rebuild pre-cleanup: %w", err)
 	}
@@ -1166,6 +1199,29 @@ func (d *DB) rebuildMessagesForStep7f() error {
 		// to re-create the blind-FTS trigger against the renamed table
 		// below since DROP TABLE takes its triggers with it.
 		`DROP TABLE messages`,
+	}
+	for _, s := range stmts {
+		if _, err := d.db.Exec(s); err != nil {
+			return fmt.Errorf("rebuild step %q: %w", s[:min(60, len(s))], err)
+		}
+	}
+	// Crash window between DROP TABLE messages and the post-rename
+	// steps below was H4-in-other-form (audit-2). The post-rename
+	// path is now its own method that the re-entry detector at the
+	// top of this function can call directly.
+	return d.rebuildMessagesPostRename()
+}
+
+// rebuildMessagesPostRename runs the RENAME + index/trigger
+// recreation + foreign_keys re-enable + VACUUM steps of the
+// step-7f rebuild. Exposed as its own method so the
+// rebuildMessagesForStep7f re-entry detector can fast-forward to
+// it when a previous attempt crashed between DROP TABLE messages
+// and the RENAME (audit-2 follow-up — without this, the next
+// Init's pre-cleanup DROP IF EXISTS messages_new would silently
+// destroy the only remaining copy of the data).
+func (d *DB) rebuildMessagesPostRename() error {
+	stmts := []string{
 		`ALTER TABLE messages_new RENAME TO messages`,
 		// Recreate the indexes that survived step 7e (idx_messages_mailbox
 		// + idx_messages_account died with the columns they covered).
@@ -1192,13 +1248,31 @@ func (d *DB) rebuildMessagesForStep7f() error {
 	}
 	for _, s := range stmts {
 		if _, err := d.db.Exec(s); err != nil {
-			return fmt.Errorf("rebuild step %q: %w", s[:min(60, len(s))], err)
+			return fmt.Errorf("rebuild post-rename step %q: %w", s[:min(60, len(s))], err)
 		}
 	}
 	if _, err := d.db.Exec("VACUUM"); err != nil {
 		return fmt.Errorf("rebuild vacuum: %w", err)
 	}
 	return nil
+}
+
+// tableExists reports whether a table with the given name exists in
+// the main schema. Used by rebuildMessagesForStep7f's re-entry
+// detector to distinguish "first-time rebuild" from "recovering from
+// a crash between DROP TABLE messages and RENAME messages_new".
+func tableExists(db *sql.DB, name string) (bool, error) {
+	var dummy string
+	err := db.QueryRow(
+		"SELECT name FROM sqlite_master WHERE type='table' AND name = ?", name,
+	).Scan(&dummy)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // hasColumn returns true if the named column already exists on table.

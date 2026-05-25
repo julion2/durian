@@ -37,6 +37,43 @@ func TestTokenBucket_RefillsOverTime(t *testing.T) {
 	}
 }
 
+// TestSearchOracleLimiter_SharedAcrossEndpoints asserts ADR-0001
+// audit-2 follow-up: /search and /search/count share the same
+// token-bucket budget, so an attacker alternating calls between the
+// two endpoints can't get 2× the rate. The pre-fix code had a
+// dedicated limiter on /search/count only, leaving /search wide open
+// — a /search?query=X + count-of-results loop bypassed the H2
+// chosen-plaintext-oracle defense entirely.
+//
+// This test exercises the package-level searchOracleLimiter that
+// both SearchHandler and SearchCountHandler consult; if a future
+// change re-introduces per-endpoint limiters, this test fails.
+func TestSearchOracleLimiter_SharedAcrossEndpoints(t *testing.T) {
+	orig := searchOracleLimiter
+	defer func() { searchOracleLimiter = orig }()
+	// burst=4, rate=1/s (slow refill so we observe pure burst).
+	searchOracleLimiter = newTokenBucket(1, 4)
+
+	allowed, throttled := 0, 0
+	for i := 0; i < 8; i++ {
+		if searchOracleLimiter.allow() {
+			allowed++
+		} else {
+			throttled++
+		}
+	}
+	// Single shared bucket → 4 allowed, 4 throttled. If the limiter
+	// were per-endpoint and each handler had its own, /search and
+	// /search/count would each get 4 → 8 total allowed — exactly the
+	// audit-2 bypass.
+	if allowed != 4 {
+		t.Errorf("allowed = %d, want 4 (shared budget across both endpoints)", allowed)
+	}
+	if throttled != 4 {
+		t.Errorf("throttled = %d, want 4", throttled)
+	}
+}
+
 func TestTokenBucket_CapacityCappedAtBurst(t *testing.T) {
 	// burst=2, rate=1000/s. After idle time longer than capacity/rate,
 	// the bucket must not exceed burst — otherwise an idle attacker
