@@ -838,6 +838,97 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 21 {
+		// ADR-0001 audit medium follow-up: bigram-HMAC input encoding
+		// changed from `word_i || 0x1F || word_{i+1}` to length-prefixed
+		// `uvarint(len(w1)) || w1 || uvarint(len(w2)) || w2`. The old
+		// encoding was vulnerable to a forgery class where a literal
+		// 0x1F (U+001F unit separator) smuggled into a word — via HTML
+		// attribute / invisible body text / a future uniseg change in
+		// how it segments control characters — would HMAC-collide with
+		// a legitimate bigram and forge a phrase match. The new
+		// encoding is bijective: no two distinct (w1, w2) pairs share
+		// the same input bytes, regardless of what runes are in the
+		// words.
+		//
+		// Every existing messages_blind_fts row was tokenized with the
+		// old encoding; phrase queries would silently stop matching.
+		// Wipe and rebuild the FTS index from authoritative ct
+		// columns. Word-AND queries (unigrams only) survive across
+		// the change but we rebuild those too for consistency — the
+		// extra cost is one VACUUM-class re-tokenization, comparable
+		// to step-7a's original index build.
+		if err := d.rebuildBlindFTSForBigramEncoding(); err != nil {
+			return fmt.Errorf("migrate v20→v21 rebuild blind fts: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 21 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v20→v21 bump: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// rebuildBlindFTSForBigramEncoding wipes and repopulates
+// messages_blind_fts. Used by the v20→v21 migration after the bigram
+// HMAC input encoding changed. Reads exclusively from the ct columns
+// (step 7e dropped the plaintext subject / body_text shadows that
+// backfillBlindFTS still references for v15→v16 backfills on legacy
+// schemas), and uses the d.blindTokens helper that the steady-state
+// insert path also uses so the migration produces bit-identical output
+// to a fresh INSERT.
+func (d *DB) rebuildBlindFTSForBigramEncoding() error {
+	if d.keyring == nil || d.keyring.FTSToken == nil {
+		return fmt.Errorf("no keyring for blind fts rebuild")
+	}
+	if _, err := d.db.Exec("DELETE FROM messages_blind_fts"); err != nil {
+		return fmt.Errorf("wipe messages_blind_fts: %w", err)
+	}
+	// COALESCE the plaintext addrs columns — legacy rows can carry
+	// NULL there even though the steady-state insert path writes ''.
+	rows, err := d.db.Query(`SELECT m.id, m.subject_ct,
+		COALESCE(m.from_addr, ''), COALESCE(m.to_addrs, ''),
+		m.body_text_ct
+		FROM messages m`)
+	if err != nil {
+		return fmt.Errorf("select rows: %w", err)
+	}
+	defer rows.Close()
+	type pending struct {
+		id                            int64
+		subject, fromAddr, toAddrs, body string
+	}
+	var batch []pending
+	for rows.Next() {
+		var p pending
+		var sCT, bCT []byte
+		if err := rows.Scan(&p.id, &sCT, &p.fromAddr, &p.toAddrs, &bCT); err != nil {
+			return fmt.Errorf("scan row: %w", err)
+		}
+		if p.subject, err = d.decryptSubject("", sCT); err != nil {
+			return fmt.Errorf("decrypt subject id=%d: %w", p.id, err)
+		}
+		if p.body, err = d.decryptBody("", bCT); err != nil {
+			return fmt.Errorf("decrypt body id=%d: %w", p.id, err)
+		}
+		batch = append(batch, p)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate rows: %w", err)
+	}
+
+	stmt, err := d.db.Prepare(`INSERT INTO messages_blind_fts(rowid, subject_tok, from_tok, to_tok, body_tok)
+		VALUES (?, ?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("prepare insert: %w", err)
+	}
+	defer stmt.Close()
+	for _, p := range batch {
+		sTok, fTok, tTok, bTok := d.blindTokens(p.subject, p.fromAddr, p.toAddrs, p.body)
+		if _, err := stmt.Exec(p.id, sTok, fTok, tTok, bTok); err != nil {
+			return fmt.Errorf("insert tokens id=%d: %w", p.id, err)
+		}
+	}
 	return nil
 }
 

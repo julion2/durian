@@ -142,6 +142,37 @@ func TestTokenizeFTSPhrase_SingleWordDegrades(t *testing.T) {
 	}
 }
 
+// TestTokenizeFTS_BigramForgeryUnitSeparator asserts ADR-0001 audit
+// medium: a literal U+001F (unit separator) byte smuggled into a word
+// must NOT produce the same HMAC as the legitimate adjacent-pair
+// bigram of the two halves. The pre-fix encoding wrote bigrams as
+// `word_i || 0x1F || word_{i+1}`, so HMAC("foo" + 0x1F + "bar") was
+// byte-identical to HMAC of the single segment "foo\x1Fbar" treated
+// as one word. Length-prefixed encoding is bijective: distinct word
+// pairs cannot collide regardless of contents.
+func TestTokenizeFTS_BigramForgeryUnitSeparator(t *testing.T) {
+	key := bytes.Repeat([]byte{0x42}, KeyLen)
+	// Legitimate bigram from the two-word segmentation. Use unigram-
+	// only TokenizeFTSQuery on "foo bar" and full TokenizeFTS to
+	// compare the bigram token shape.
+	full := strings.Fields(TokenizeFTS(key, "foo bar"))
+	if len(full) != 3 {
+		t.Fatalf("expected 2 unigrams + 1 bigram = 3 tokens, got %d", len(full))
+	}
+	legitimateBigram := full[2]
+
+	// Attempt to forge: HMAC of the bigram-input bytes assembled by
+	// the pre-fix encoding, "foo" + 0x1F + "bar".
+	forgeryInput := []byte("foo")
+	forgeryInput = append(forgeryInput, 0x1F)
+	forgeryInput = append(forgeryInput, "bar"...)
+	forgery := hmacHex(key, forgeryInput)
+
+	if legitimateBigram == forgery {
+		t.Errorf("bigram forgery via 0x1F succeeded — encoding is not bijective")
+	}
+}
+
 func TestTokenizeFTSPhrase_EmptyInput(t *testing.T) {
 	key := bytes.Repeat([]byte{0x42}, KeyLen)
 	for _, s := range []string{"", "   ", "..."} {
