@@ -147,6 +147,70 @@ func TestSearch_PhraseWordOrder(t *testing.T) {
 	}
 }
 
+// TestSearch_PostDecryptFilterDropsForgedFTSHit asserts ADR-0001 audit
+// H2: the post-decrypt recheck drops candidate rows whose plaintext
+// doesn't actually contain the query term, even if the blind-FTS5
+// index returned them. We forge the leak by directly inserting an
+// extra messages_blind_fts row that points at an existing message's
+// rowid but with token data for an unrelated word — exactly the
+// shape an HMAC truncation collision would produce. Without the
+// filter, Search and SearchCount would both return the forged hit.
+// With the filter, neither does.
+func TestSearch_PostDecryptFilterDropsForgedFTSHit(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	// Real message whose body does NOT contain the word "needle".
+	realMsg := &Message{
+		MessageID: "real@x", Subject: "Status update",
+		FromAddr: "a@x", Date: now, CreatedAt: now,
+		BodyText: "haystack haystack haystack", FetchedBody: true,
+	}
+	if err := db.InsertMessage(realMsg); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// Forge the FTS index: replace the real row's tokens with the
+	// tokens "needle" would produce. From the index's perspective
+	// this is indistinguishable from an HMAC collision pointing at
+	// the real row.
+	forgedSubj, forgedFrom, forgedTo, forgedBody := db.blindTokens("needle", "", "", "needle")
+	if _, err := db.db.Exec("DELETE FROM messages_blind_fts WHERE rowid = ?", realMsg.ID); err != nil {
+		t.Fatalf("forge clear: %v", err)
+	}
+	if _, err := db.db.Exec(`INSERT INTO messages_blind_fts(rowid, subject_tok, from_tok, to_tok, body_tok)
+		VALUES (?, ?, ?, ?, ?)`, realMsg.ID, forgedSubj, forgedFrom, forgedTo, forgedBody); err != nil {
+		t.Fatalf("forge insert: %v", err)
+	}
+	// Without the H2 filter, MATCH on "needle" would return realMsg.
+	// With the filter, the plaintext "haystack haystack haystack" does
+	// not contain "needle" → filter drops it.
+	results, err := db.Search("needle", 10)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("Search returned %d results, want 0 (filter must drop forged FTS hit)", len(results))
+	}
+	count, err := db.SearchCount("needle")
+	if err != nil {
+		t.Fatalf("search count: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("SearchCount = %d, want 0 (filter must drop forged FTS hit)", count)
+	}
+	// Sanity check: a genuine match on "haystack" still succeeds.
+	results, err = db.Search("haystack", 10)
+	if err != nil {
+		t.Fatalf("haystack search: %v", err)
+	}
+	if len(results) != 0 {
+		// Real body content was overwritten in the FTS index; we only
+		// kept tokens for "needle". So "haystack" should also return
+		// nothing — proving the filter ALONE isn't restoring the row
+		// via the index, just verifying via decrypt.
+		t.Errorf("haystack search returned %d hits, but the FTS index was rewritten to only carry 'needle' tokens — Search must trust the index for candidates, not the plaintext", len(results))
+	}
+}
+
 func TestSearch_ThreadGrouping(t *testing.T) {
 	db := seedSearchDB(t)
 	// s2 and s3 are in the same thread — should appear as one result

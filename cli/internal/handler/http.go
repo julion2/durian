@@ -58,7 +58,24 @@ func (h *Handler) SearchHandler(w http.ResponseWriter, r *http.Request) {
 
 // SearchCountHandler handles GET /api/v1/search/count?query=...
 // Returns {"count": N} for the number of matching threads.
+//
+// ADR-0001 audit H2: rate-limited via searchCountLimiter to keep the
+// endpoint from becoming a high-bandwidth oracle for the chosen-plaintext
+// attack on the blind-FTS index. Even with the post-decrypt filter
+// (search_filter.go) in place — which makes the count return the true
+// number of matching threads instead of the inflated FTS-collision
+// count — a fast oracle still leaks "did my chosen plaintext make it
+// into the user's mailbox" via the 0-vs-nonzero transition. The
+// limiter throttles to a rate that makes statistical analysis over
+// many queries impractical without consuming the user's whole UI
+// responsiveness budget.
 func (h *Handler) SearchCountHandler(w http.ResponseWriter, r *http.Request) {
+	if !searchCountLimiter.allow() {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+
 	query := r.URL.Query().Get("query")
 	if query == "" {
 		http.Error(w, "Missing required 'query' parameter", http.StatusBadRequest)
@@ -67,14 +84,14 @@ func (h *Handler) SearchCountHandler(w http.ResponseWriter, r *http.Request) {
 
 	expanded, err := h.expandGroups(query)
 	if err != nil {
-		slog.Error("Group expansion failed", "module", "HANDLER", "query", query, "err", err)
+		slog.Error("Group expansion failed", "module", "HANDLER", "query", query, "err", err) // encgrep:allow query string is not encrypted plaintext, see audit
 		http.Error(w, "invalid group reference: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	count, err := h.store.SearchCount(expanded)
 	if err != nil {
-		slog.Error("Search count failed", "module", "HANDLER", "query", query, "err", err)
+		slog.Error("Search count failed", "module", "HANDLER", "query", query, "err", err) // encgrep:allow query string is not encrypted plaintext, see audit
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
