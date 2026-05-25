@@ -1,8 +1,88 @@
 package store
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 )
+
+// TestAttachmentMetadata_EncryptedAtRest asserts ADR-0001 attachments-
+// encryption: filename, content_type, and size never appear as their
+// distinctive plaintext bytes in the raw filename_ct / content_type_ct
+// / size_ct BLOB columns. A forensic analyst opening the .db file
+// must not be able to grep for "Tax_Return_2026.pdf" and find it.
+func TestAttachmentMetadata_EncryptedAtRest(t *testing.T) {
+	db := newTestDB(t)
+	msgID := insertTestMessage(t, db, "atrest@x")
+
+	const distinctiveFilename = "Tax_Return_2026.pdf"
+	const distinctiveContentType = "application/dicom"
+	const distinctiveSize = 314159
+
+	if err := db.InsertAttachment(&Attachment{
+		MessageDBID: msgID,
+		PartID:      1,
+		Filename:    distinctiveFilename,
+		ContentType: distinctiveContentType,
+		Size:        distinctiveSize,
+		Disposition: "attachment",
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// Read the raw ct bytes for the row and assert none of them
+	// contain the plaintext substrings.
+	var filenameCT, contentTypeCT, sizeCT []byte
+	if err := db.db.QueryRow(`SELECT filename_ct, content_type_ct, size_ct
+		FROM attachments WHERE message_db_id = ?`, msgID).Scan(&filenameCT, &contentTypeCT, &sizeCT); err != nil {
+		t.Fatalf("read raw ct: %v", err)
+	}
+	if bytes.Contains(filenameCT, []byte(distinctiveFilename)) {
+		t.Errorf("filename leaked into filename_ct ciphertext bytes")
+	}
+	if bytes.Contains(contentTypeCT, []byte(distinctiveContentType)) {
+		t.Errorf("content_type leaked into content_type_ct ciphertext bytes")
+	}
+	if bytes.Contains(sizeCT, []byte("314159")) {
+		t.Errorf("size leaked into size_ct ciphertext bytes")
+	}
+
+	// Read-through-API decrypts and returns the plaintext correctly.
+	atts, err := db.GetAttachmentsByMessage(msgID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(atts) != 1 || atts[0].Filename != distinctiveFilename || atts[0].ContentType != distinctiveContentType || atts[0].Size != distinctiveSize {
+		t.Errorf("round-trip failed: got %+v", atts)
+	}
+
+	// Plaintext columns must not exist after the v21→v22 migration.
+	for _, col := range []string{"filename", "content_type", "size"} {
+		has, err := hasColumn(db.db, "attachments", col)
+		if err != nil {
+			t.Fatalf("hasColumn: %v", err)
+		}
+		if has {
+			t.Errorf("plaintext column %q still exists post-migration", col)
+		}
+	}
+	// Sanity: the only attachment columns left are the structural /
+	// low-entropy ones documented as plaintext-by-design.
+	cols, err := db.db.Query(`SELECT name FROM pragma_table_info('attachments')`)
+	if err != nil {
+		t.Fatalf("pragma table_info: %v", err)
+	}
+	defer cols.Close()
+	var present []string
+	for cols.Next() {
+		var n string
+		cols.Scan(&n)
+		present = append(present, n)
+	}
+	if strings.Contains(strings.Join(present, ","), "filename,") || strings.Contains(strings.Join(present, ","), ",size,") {
+		t.Errorf("post-migration attachments table still carries plaintext columns: %v", present)
+	}
+}
 
 func TestInsertAndGetAttachments(t *testing.T) {
 	db := newTestDB(t)

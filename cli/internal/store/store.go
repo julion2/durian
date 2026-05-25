@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/durian-dev/durian/cli/internal/dbcrypto"
@@ -146,13 +147,18 @@ func (d *DB) Init() error {
 		`CREATE INDEX IF NOT EXISTS idx_tags_message_id ON tags(message_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag)`,
 
+		// ADR-0001 attachments-encryption (v21→v22): filename / content_type /
+		// size encrypted with meta_key. The plaintext columns the old schema
+		// carried are now ct BLOBs; the v21→v22 migration handles the
+		// ALTER+backfill+drop path for existing DBs. Fresh installs at
+		// schema_version >= 22 land directly in this shape.
 		`CREATE TABLE IF NOT EXISTS attachments (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			message_db_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
 			part_id INTEGER,
-			filename TEXT,
-			content_type TEXT,
-			size INTEGER DEFAULT 0,
+			filename_ct BLOB,
+			content_type_ct BLOB,
+			size_ct BLOB,
 			disposition TEXT,
 			content_id TEXT
 		)`,
@@ -866,7 +872,155 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 22 {
+		// ADR-0001 attachments-encryption: encrypt three columns of
+		// the attachments table with meta_key — filename,
+		// content_type, size. Filename like "Tax_Return_2026.pdf"
+		// carries subject-grade content-classification signal that
+		// the original ADR §3 missed (was scoped to body / subject /
+		// addrs / drafts but treated attachments as pure metadata).
+		// content_type "application/dicom" reveals as sharp a
+		// category as the filename; size combined with the already-
+		// plaintext from_addr + date is a sharp activity pattern
+		// ("Tuesday 9am 2.4MB PDF from accountant@x" = recurring
+		// report). The remaining columns (disposition, content_id,
+		// part_id) stay plaintext — disposition is 2 values,
+		// content_id is opaque MIME id, part_id is structural.
+		//
+		// ALTER TABLE cannot be wrapped in a transaction with the
+		// backfill (SQLite implicitly commits before DDL), so the
+		// column-add is idempotent via PRAGMA table_info: if a
+		// previous attempt added the columns but failed in the
+		// backfill, we re-detect and skip straight to the backfill.
+		alters := []string{"filename_ct", "content_type_ct", "size_ct"}
+		for _, col := range alters {
+			has, err := hasColumn(d.db, "attachments", col)
+			if err != nil {
+				return fmt.Errorf("migrate v21→v22 inspect %s: %w", col, err)
+			}
+			if !has {
+				if _, err := d.db.Exec("ALTER TABLE attachments ADD COLUMN " + col + " BLOB"); err != nil {
+					return fmt.Errorf("migrate v21→v22 add %s: %w", col, err)
+				}
+			}
+		}
+		if err := d.backfillAttachmentMetaCt(); err != nil {
+			return fmt.Errorf("migrate v21→v22 backfill: %w", err)
+		}
+		// Drop the plaintext columns. Idempotent via hasColumn so a
+		// crash mid-drop sequence retries cleanly on next Init.
+		drops := []string{"filename", "content_type", "size"}
+		for _, col := range drops {
+			has, err := hasColumn(d.db, "attachments", col)
+			if err != nil {
+				return fmt.Errorf("migrate v21→v22 inspect drop %s: %w", col, err)
+			}
+			if has {
+				if _, err := d.db.Exec("ALTER TABLE attachments DROP COLUMN " + col); err != nil {
+					return fmt.Errorf("migrate v21→v22 drop %s: %w", col, err)
+				}
+			}
+		}
+		// VACUUM before the schema_version bump (lesson from audit
+		// H3): a VACUUM crash must not lock us at v22 with the
+		// dropped plaintext bytes stranded in free pages.
+		if _, err := d.db.Exec("VACUUM"); err != nil {
+			return fmt.Errorf("migrate v21→v22 vacuum: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 22 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v21→v22 bump: %w", err)
+		}
+	}
+
 	return nil
+}
+
+// backfillAttachmentMetaCt encrypts every existing attachments row's
+// filename / content_type / size into the BLOB columns added by the
+// v21→v22 migration. Idempotent via WHERE *_ct IS NULL — rows already
+// backfilled by a prior partial attempt are filtered out.
+//
+// On a fresh install the base CREATE TABLE in Init() already lands at
+// the v22 shape (no plaintext columns), so there's nothing to read
+// from the legacy filename/content_type/size triple — the helper
+// short-circuits if any of those columns is missing.
+func (d *DB) backfillAttachmentMetaCt() error {
+	if d.keyring == nil || d.keyring.Meta == nil {
+		return fmt.Errorf("no keyring for attachment backfill")
+	}
+	for _, col := range []string{"filename", "content_type", "size"} {
+		has, err := hasColumn(d.db, "attachments", col)
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", col, err)
+		}
+		if !has {
+			// Fresh-install schema or already-dropped post-migration —
+			// either way, nothing to backfill.
+			return nil
+		}
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	rows, err := tx.Query(`SELECT id,
+		COALESCE(filename, ''), COALESCE(content_type, ''), COALESCE(size, 0)
+		FROM attachments
+		WHERE filename_ct IS NULL OR content_type_ct IS NULL OR size_ct IS NULL`)
+	if err != nil {
+		return fmt.Errorf("select rows: %w", err)
+	}
+	type pending struct {
+		id          int64
+		filename    string
+		contentType string
+		size        int64
+	}
+	var batch []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.filename, &p.contentType, &p.size); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan: %w", err)
+		}
+		batch = append(batch, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate: %w", err)
+	}
+
+	stmt, err := tx.Prepare(`UPDATE attachments
+		SET filename_ct = ?, content_type_ct = ?, size_ct = ?
+		WHERE id = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare update: %w", err)
+	}
+	defer stmt.Close()
+	for _, p := range batch {
+		filenameCT, err := d.encryptMeta(p.filename)
+		if err != nil {
+			return fmt.Errorf("encrypt filename id=%d: %w", p.id, err)
+		}
+		contentTypeCT, err := d.encryptMeta(p.contentType)
+		if err != nil {
+			return fmt.Errorf("encrypt content_type id=%d: %w", p.id, err)
+		}
+		var sizeStr string
+		if p.size != 0 {
+			sizeStr = strconv.FormatInt(p.size, 10)
+		}
+		sizeCT, err := d.encryptMeta(sizeStr)
+		if err != nil {
+			return fmt.Errorf("encrypt size id=%d: %w", p.id, err)
+		}
+		if _, err := stmt.Exec(filenameCT, contentTypeCT, sizeCT, p.id); err != nil {
+			return fmt.Errorf("update id=%d: %w", p.id, err)
+		}
+	}
+	return tx.Commit()
 }
 
 // rebuildBlindFTSForBigramEncoding wipes and repopulates
