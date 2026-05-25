@@ -326,15 +326,37 @@ whole corpus.
 
 V1 migration (`store.migrate()` adds a new version step):
 
-1. Bump `schema_version` to next free integer.
-2. Open transaction, for each `messages` row: read plaintext, encrypt each
+1. Open transaction, for each `messages` row: read plaintext, encrypt each
    sensitive field with the appropriate sub-key, write `BLOB` back via
    `UPDATE`. Same for `message_headers`, `local_drafts`, `outbox`, `contacts`.
-3. Drop and recreate `messages_fts` using the new schema, repopulate by
+2. Drop and recreate `messages_fts` using the new schema, repopulate by
    reading decrypted rows and running them through the tokenizer pipeline.
-4. `VACUUM` to reclaim plaintext pages.
-5. Run `PRAGMA secure_delete = ON` permanently from this point on (a
-   forward-only switch on the DB header).
+3. `VACUUM` to reclaim plaintext pages.
+4. Only then bump `schema_version` to the next free integer.
+5. `PRAGMA secure_delete = ON` is set on every connection in `store.Open` /
+   `contacts.Open` (step 8) so subsequent DELETEs / UPDATEs scrub freed
+   pages too.
+
+**Step ordering note (ADR-0001 audit H3).** VACUUM must precede the
+`schema_version` bump on any migration that drops plaintext columns or
+tables. The pre-fix v17→v18 reversed this; a VACUUM failure on a
+multi-GB DB left users stuck at v18 with the dropped step-7e plaintext
+bytes (`subject`, `body_text`, `body_html`, `message_headers.value`,
+`draft_json`) stranded in free pages forever, defeating the at-rest
+encryption story for any cold filesystem image taken thereafter. A
+follow-up v19→v20 migration is a one-shot re-VACUUM that catches
+users who already crossed v18 under the buggy ordering. Same lesson
+applies to any future migration that drops sensitive content.
+
+**Table rebuild idempotency (ADR-0001 audit H4).** Migrations that use
+SQLite's 12-step table-rebuild (e.g. `rebuildMessagesForStep7f` for the
+step 7f UNIQUE-constraint swap) must `DROP TABLE IF EXISTS` the
+temp-table name at entry. A mid-rebuild crash (OOM on a multi-GB INSERT
+SELECT, disk-full, power loss) otherwise leaves a half-built
+`messages_new` behind, and the next `Init()` wedges at "table already
+exists" with no recovery path. A regression test
+(`TestRebuildMessages_IdempotentAfterPartialFailure`) simulates the
+leftover state and asserts the rebuild re-enters cleanly.
 
 Since Durian is pre-1.0 and has no production users with multi-GB mailboxes,
 the migration runs synchronously at first open after upgrade. Progress is
