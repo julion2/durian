@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "contacts.go",
         "drafts.go",
+        "error_sanitize.go",
         "events.go",
         "handler.go",
         "http.go",
@@ -41,6 +42,7 @@ go_test(
     srcs = [
         "convert_thread_test.go",
         "drafts_test.go",
+        "error_sanitize_test.go",
         "handler_test.go",
         "http_test.go",
         "ratelimit_test.go",
@@ -51,6 +53,7 @@ go_test(
         "//cli/internal/contacts",
         "//cli/internal/dbcrypto",
         "//cli/internal/protocol",
+        "//cli/internal/smtp",
         "//cli/internal/store",
         "@com_github_emersion_go_imap//:go-imap",
         "@com_github_gorilla_mux//:mux",
