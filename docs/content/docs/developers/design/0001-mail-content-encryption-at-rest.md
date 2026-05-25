@@ -295,7 +295,14 @@ Search at runtime:
 - Two-word phrase `"alice bob"` → exact bigram MATCH (precise).
 - Longer phrase `"alice bob charlie"` → bigram intersection
   `(alice⌒bob) AND (bob⌒charlie)`. May have false positives where the words
-  appear in the same mail but not adjacent in that order.
+  appear in the same mail but not adjacent in that order. The bigram
+  HMAC input is **length-prefixed** (uvarint(len(w1)) || w1 ||
+  uvarint(len(w2)) || w2) rather than separator-delimited — ADR-0001
+  audit medium found that a literal U+001F unit-separator byte
+  smuggled into a word would HMAC-collide with the legitimate bigram
+  under the old encoding and forge a phrase match. The length-prefix
+  form is bijective: no two distinct (w1, w2) pairs share the same
+  byte sequence, regardless of what runes are in the words.
 - **Post-decrypt false-positive filter** (`cli/internal/store/search_filter.go`)
   runs on every blind-FTS query, not only long phrases. Even a single
   unigram MATCH has a non-zero 2⁻⁸⁰ collision probability per token-pair;

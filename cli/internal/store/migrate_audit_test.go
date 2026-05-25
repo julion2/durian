@@ -88,4 +88,9 @@ func TestMigrateV17V18_VacuumBeforeBump(t *testing.T) {
 	if version < 20 {
 		t.Errorf("schema_version = %d, want >= 20 (v19→v20 H3-followup re-VACUUM must be applied)", version)
 	}
+	// audit-medium follow-up: v20→v21 must also have applied (bigram
+	// HMAC encoding fix that rebuilds messages_blind_fts).
+	if version < 21 {
+		t.Errorf("schema_version = %d, want >= 21 (v20→v21 bigram-encoding rebuild must be applied)", version)
+	}
 }

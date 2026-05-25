@@ -3,6 +3,7 @@ package dbcrypto
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"strings"
 	"unicode"
@@ -45,13 +46,37 @@ func TokenizeFTS(key []byte, plaintext string) string {
 		out = append(out, hmacHex(key, []byte(w)))
 	}
 	for i := 0; i < len(words)-1; i++ {
-		var buf strings.Builder
-		buf.WriteString(words[i])
-		buf.WriteByte(0x1f)
-		buf.WriteString(words[i+1])
-		out = append(out, hmacHex(key, []byte(buf.String())))
+		out = append(out, hmacHex(key, bigramInput(words[i], words[i+1])))
 	}
 	return strings.Join(out, " ")
+}
+
+// bigramInput encodes an adjacent-pair as length-prefixed bytes so the
+// HMAC input is unambiguous regardless of what characters appear in
+// the words. ADR-0001 audit medium: the previous encoding used a
+// literal 0x1F unit-separator byte between words. uniseg's behavior on
+// stray control characters within a Unicode word is not specified by
+// its API, so a future uniseg update that started segmenting U+001F
+// differently (or any attacker who could smuggle a literal 0x1F into
+// a word via HTML attributes / invisible body text) could forge a
+// bigram HMAC for a phrase pair that doesn't actually appear
+// adjacently in the source: HMAC(key, "foo" + 0x1F + "bar") equals
+// HMAC(key, "foo\x1Fbar") byte-for-byte.
+//
+// Length-prefix encoding (uvarint len(w1) || w1 || uvarint len(w2) || w2)
+// is bijective — no two distinct (w1, w2) pairs share the same byte
+// sequence — so the construction is forgery-free independent of
+// what runes the tokenizer accepts.
+func bigramInput(a, b string) []byte {
+	buf := make([]byte, 0, len(a)+len(b)+binary.MaxVarintLen64*2)
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], uint64(len(a)))
+	buf = append(buf, tmp[:n]...)
+	buf = append(buf, a...)
+	n = binary.PutUvarint(tmp[:], uint64(len(b)))
+	buf = append(buf, tmp[:n]...)
+	buf = append(buf, b...)
+	return buf
 }
 
 // TokenizeFTSQuery returns the same per-word HMAC tokens TokenizeFTS
@@ -98,11 +123,7 @@ func TokenizeFTSPhrase(key []byte, plaintext string) string {
 		out = append(out, hmacHex(key, []byte(w)))
 	}
 	for i := 0; i < len(words)-1; i++ {
-		var buf strings.Builder
-		buf.WriteString(words[i])
-		buf.WriteByte(0x1f)
-		buf.WriteString(words[i+1])
-		out = append(out, hmacHex(key, []byte(buf.String())))
+		out = append(out, hmacHex(key, bigramInput(words[i], words[i+1])))
 	}
 	return strings.Join(out, " ")
 }
