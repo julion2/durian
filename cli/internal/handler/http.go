@@ -22,6 +22,17 @@ func writeJSON(w http.ResponseWriter, response any) {
 }
 
 func (h *Handler) SearchHandler(w http.ResponseWriter, r *http.Request) {
+	// ADR-0001 audit-2 follow-up: /search is the same chosen-plaintext
+	// oracle as /search/count — an attacker can call /search?query=X
+	// and count the result items themselves. The H2 limiter that only
+	// covered /search/count left this path wide open. Both endpoints
+	// share searchOracleLimiter so calls alternating between them are
+	// throttled under one budget.
+	if !searchOracleLimiter.allow() {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
 	query := r.URL.Query().Get("query")
 	if query == "" {
 		http.Error(w, "Missing required 'query' parameter", http.StatusBadRequest)
@@ -70,7 +81,7 @@ func (h *Handler) SearchHandler(w http.ResponseWriter, r *http.Request) {
 // many queries impractical without consuming the user's whole UI
 // responsiveness budget.
 func (h *Handler) SearchCountHandler(w http.ResponseWriter, r *http.Request) {
-	if !searchCountLimiter.allow() {
+	if !searchOracleLimiter.allow() {
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return

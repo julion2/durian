@@ -323,6 +323,22 @@ Search at runtime:
   statistical analysis over thousands of probes.
 - Prefix queries (`alice*`) are **not supported** — opaque tokens have no
   prefix relation to plaintext prefixes. Document this as a known limitation.
+- **Known limitation — unmigrated rows in the post-decrypt filter.**
+  `postDecryptFetch` passes the empty string as the plaintext fallback
+  when calling the decrypt helpers, on the assumption that every
+  message has its `subject_ct` / `body_text_ct` populated by step 7e.
+  A row mid-migration (or one that the steady-state insert somehow
+  left half-encrypted) would produce empty haystacks, so the filter
+  drops it even when the FTS index pointed at it for legitimate
+  reasons. Acceptable because (a) the steady-state insert path is
+  fully encrypted-on-write since step 6 — there is no production
+  scenario that produces ct=NULL + plaintext-present rows; (b) the
+  v17→v18 migration drops the plaintext shadow columns entirely so
+  the fallback would have nothing to read anyway. The asymmetry is
+  documented here so a future audit doesn't re-discover it as a
+  surprise. If a real workload turns out to need partial-encrypted
+  reads, the filter would need to consult both the ct and the
+  plaintext column under a `version`-style gate.
 
 Index size: ~2× the plaintext token count (unigrams + bigrams). For a 50k-mail
 mailbox averaging 500 body words this is ~50M FTS5 rows, comfortably handled
@@ -474,12 +490,17 @@ Does **not** defend against:
   (1) the post-decrypt false-positive filter (§4) eliminates the
   HMAC-collision signal by verifying decrypted plaintext actually
   contains the term, so the count reflects true matches only;
-  (2) rate-limit on `/api/v1/search/count` at 10 req/s / burst 30
-  caps the residual 0→1 transition signal to a rate where
-  statistical analysis over the token space (~2⁸⁰) becomes
-  computationally infeasible. The bearer-token + loopback-only
-  enforcement on the HTTP server (Persona 3 boundary) covers the
-  observation channel for non-local attackers.
+  (2) rate-limit shared across BOTH `/api/v1/search` and
+  `/api/v1/search/count` at 10 req/s / burst 30 caps the residual
+  0→1 transition signal — a single token bucket so an attacker
+  alternating between the two endpoints cannot double their
+  effective rate. (Audit-2 follow-up: the original H2 fix
+  rate-limited only `/search/count`; `/search` was the equivalent
+  oracle because the response item count is observable from the
+  caller. Both endpoints now share `searchOracleLimiter`.) The
+  bearer-token + loopback-only enforcement on the HTTP server
+  (Persona 3 boundary) covers the observation channel for non-local
+  attackers.
 
 ### Threat-actor personas
 
@@ -500,16 +521,30 @@ process — all bigger investments than this ADR.
 
 ### Memory hygiene
 
-Go's GC can make heap copies, so wipe is best-effort, not guaranteed. We
-still:
+Go's GC can make heap copies, so wipe is best-effort, not guaranteed.
+The honest state of the implementation (audit-2 follow-up — earlier
+revisions of this section overpromised):
 
 - Derive sub-keys once at process start, store them in a `keyring` struct,
   keep them for the process lifetime (rederivation per row is wasteful, and
   the master-key exposure window doesn't shrink either way).
-- Allocate plaintext buffers with `make([]byte, n)` so they live on the heap
-  exactly once; wipe via `crypto/subtle.ConstantTimeCopy` of a zero buffer
-  before returning from the decrypt helper. `runtime.KeepAlive` anchors the
-  buffer through the wipe.
+- **Plaintext decrypt buffers are NOT explicitly wiped** before returning
+  from the decrypt helpers. `decryptSubject` / `decryptBody` /
+  `decryptMeta` allocate a fresh `[]byte` via `gcm.Open`, convert to
+  `string` (which copies in Go) and return — the original byte buffer
+  becomes GC-reachable for one cycle and then unreachable. A `crypto/
+  subtle.ConstantTimeCopy` over the buffer before returning would be
+  defeated by Go's string-from-bytes copy anyway, so the historical
+  design that named that pattern was misleading; calling it out
+  honestly here saves a future reader from chasing a phantom guarantee.
+- `Keyring.Wipe()` zeroes the sub-key byte slices at shutdown. Best-effort
+  only: Go's GC may already have copied the slice during heap growth, the
+  function has no `runtime.KeepAlive(k)` after the zeroing (a sufficiently
+  aggressive compiler could in theory reorder past the wipe), and the
+  sub-keys are held for process lifetime anyway so the wipe runs at the
+  moment everything is about to be freed. Tracked as a follow-up
+  (issue #253) — either harden the contract with `runtime.KeepAlive` +
+  tests, or remove the misleading API entirely.
 - Do **not** rely on `[]byte` slice reuse from a sync.Pool for plaintext.
   Pool reuse can leave plaintext stranded in unrelated allocations.
 - Document explicitly that the running process is a soft target. Users who
