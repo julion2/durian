@@ -295,9 +295,25 @@ Search at runtime:
 - Two-word phrase `"alice bob"` → exact bigram MATCH (precise).
 - Longer phrase `"alice bob charlie"` → bigram intersection
   `(alice⌒bob) AND (bob⌒charlie)`. May have false positives where the words
-  appear in the same mail but not adjacent in that order. False positives are
-  filtered post-hoc by decrypting the matching rows and running a
-  `strings.Contains` on the original phrase.
+  appear in the same mail but not adjacent in that order.
+- **Post-decrypt false-positive filter** (`cli/internal/store/search_filter.go`)
+  runs on every blind-FTS query, not only long phrases. Even a single
+  unigram MATCH has a non-zero 2⁻⁸⁰ collision probability per token-pair;
+  without a recheck, an attacker who can email crafted content to the
+  user and observe `/api/v1/search/count` deltas can confirm collisions
+  one by one and bit-by-bit recover the `fts_token` sub-key. The filter
+  decrypts each candidate row's `subject` + `body_text` + `body_html`,
+  lower-cases both sides, and verifies the user term actually appears
+  via `strings.Contains` (phrase queries) or per-word presence
+  (word-AND queries). Rows that don't verify are dropped before they
+  affect the result set or the count.
+- **Rate limit** on `/api/v1/search/count` (10 req/s, burst 30) plugs
+  the residual true-positive 0→1 transition that the filter cannot
+  eliminate — even with collisions gone, the count endpoint still
+  reveals whether the user *actually* received an attacker-chosen
+  mail. The limit is well above legitimate GUI use (search-as-you-type
+  is debounced client-side) and well below the rate needed to mount
+  statistical analysis over thousands of probes.
 - Prefix queries (`alice*`) are **not supported** — opaque tokens have no
   prefix relation to plaintext prefixes. Document this as a known limitation.
 
@@ -418,6 +434,23 @@ Does **not** defend against:
   who they correspond with most. Mitigation: none, deliberately. Same
   on-the-wire-anyway argument as messages-side addresses; same
   cost/benefit failure for the implementable encrypted alternatives.
+- **Chosen-plaintext attack on the blind-FTS index via search-count
+  oracle.** An attacker who can deliver crafted mail to the user
+  (i.e. anyone with the user's email address) AND observe
+  `/api/v1/search/count` deltas (e.g. via browser devtools while the
+  user is authenticated, or any local process with the bearer token)
+  can iteratively confirm whether their chosen plaintext tokenizes
+  to specific HMAC values, recovering the `fts_token` sub-key one
+  bit at a time. **Defended** via two complementary mechanisms:
+  (1) the post-decrypt false-positive filter (§4) eliminates the
+  HMAC-collision signal by verifying decrypted plaintext actually
+  contains the term, so the count reflects true matches only;
+  (2) rate-limit on `/api/v1/search/count` at 10 req/s / burst 30
+  caps the residual 0→1 transition signal to a rate where
+  statistical analysis over the token space (~2⁸⁰) becomes
+  computationally infeasible. The bearer-token + loopback-only
+  enforcement on the HTTP server (Persona 3 boundary) covers the
+  observation channel for non-local attackers.
 
 ### Threat-actor personas
 

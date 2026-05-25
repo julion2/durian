@@ -10,23 +10,91 @@ import (
 	"github.com/durian-dev/durian/cli/internal/dbcrypto"
 )
 
-// SearchCount returns the number of threads matching a query.
+// SearchCount returns the number of threads matching a query. ADR-0001
+// audit H2: when the query has any blind-FTS terms, the count is taken
+// over the post-decrypt-filtered candidate set so HMAC collisions in
+// the index don't inflate the count and feed a chosen-plaintext oracle.
 func (d *DB) SearchCount(query string) (int, error) {
-	where, params, err := d.parseQuery(query)
+	where, params, terms, err := d.parseQueryWithTerms(query)
 	if err != nil {
 		return 0, fmt.Errorf("parse query: %w", err)
 	}
 
-	q := "SELECT COUNT(DISTINCT m.thread_id) FROM messages m"
+	if len(terms) == 0 {
+		// Fast path: pure SQL filter, no FTS involved → no collision risk
+		// → no need to materialize per-row decrypts just to count threads.
+		q := "SELECT COUNT(DISTINCT m.thread_id) FROM messages m"
+		if where != "" {
+			q += " WHERE " + where
+		}
+		var count int
+		if err := d.db.QueryRow(q, params...).Scan(&count); err != nil {
+			return 0, fmt.Errorf("search count: %w", err)
+		}
+		return count, nil
+	}
+
+	threadIDs, err := d.filteredThreadIDs(where, params, terms)
+	if err != nil {
+		return 0, err
+	}
+	return len(threadIDs), nil
+}
+
+// filteredThreadIDs returns the distinct thread_ids that survive the
+// post-decrypt filter for the given SQL WHERE + FTS terms. Used by
+// both Search and SearchCount so the two endpoints can't diverge on
+// what "matches" means.
+func (d *DB) filteredThreadIDs(where string, params []any, terms []ftsTerm) ([]string, error) {
+	q := "SELECT m.id, m.thread_id FROM messages m"
 	if where != "" {
 		q += " WHERE " + where
 	}
-
-	var count int
-	if err := d.db.QueryRow(q, params...).Scan(&count); err != nil {
-		return 0, fmt.Errorf("search count: %w", err)
+	rows, err := d.db.Query(q, params...)
+	if err != nil {
+		return nil, fmt.Errorf("filter candidates: %w", err)
 	}
-	return count, nil
+	type idPair struct {
+		id     int64
+		thread string
+	}
+	var candidates []idPair
+	for rows.Next() {
+		var p idPair
+		if err := rows.Scan(&p.id, &p.thread); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan candidate: %w", err)
+		}
+		candidates = append(candidates, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate candidates: %w", err)
+	}
+
+	ids := make([]int64, len(candidates))
+	for i, p := range candidates {
+		ids[i] = p.id
+	}
+	surviving, err := d.postDecryptFilter(ids, terms)
+	if err != nil {
+		return nil, err
+	}
+	survivingSet := make(map[int64]struct{}, len(surviving))
+	for _, id := range surviving {
+		survivingSet[id] = struct{}{}
+	}
+	threadSet := make(map[string]struct{}, len(surviving))
+	for _, p := range candidates {
+		if _, ok := survivingSet[p.id]; ok {
+			threadSet[p.thread] = struct{}{}
+		}
+	}
+	threadIDs := make([]string, 0, len(threadSet))
+	for t := range threadSet {
+		threadIDs = append(threadIDs, t)
+	}
+	return threadIDs, nil
 }
 
 // Search finds threads matching a search query string.
@@ -36,9 +104,40 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 		limit = 50
 	}
 
-	where, params, err := d.parseQuery(query)
+	where, params, terms, err := d.parseQueryWithTerms(query)
 	if err != nil {
 		return nil, fmt.Errorf("parse query: %w", err)
+	}
+
+	// ADR-0001 audit H2: when blind-FTS terms are present, first
+	// materialize the post-decrypt-filtered thread set, then restrict
+	// the aggregation query to those threads. Without this step, HMAC
+	// collisions in messages_blind_fts can return spurious threads
+	// whose count is observable via /api/v1/search/count — a
+	// chosen-plaintext attacker who can email the user and watch the
+	// count delta can confirm token-collision pairs and recover the
+	// fts_token sub-key one bit at a time.
+	var threadFilter string
+	if len(terms) > 0 {
+		threadIDs, err := d.filteredThreadIDs(where, params, terms)
+		if err != nil {
+			return nil, err
+		}
+		if len(threadIDs) == 0 {
+			return nil, nil
+		}
+		// Replace the original WHERE entirely — the thread-id list is
+		// strictly tighter than `where` (it's the intersection of
+		// `where` and the post-decrypt recheck) and dropping the
+		// FTS subquery saves a second index lookup.
+		placeholders := make([]string, len(threadIDs))
+		params = params[:0]
+		for i, tid := range threadIDs {
+			placeholders[i] = "?"
+			params = append(params, tid)
+		}
+		threadFilter = "m.thread_id IN (" + strings.Join(placeholders, ",") + ")"
+		where = threadFilter
 	}
 
 	// ADR-0001 step 7e: messages.subject (plaintext) is dropped; the
@@ -601,6 +700,29 @@ func (d *DB) parseQuery(query string) (where string, params []interface{}, err e
 		return "", nil, nil
 	}
 	return d.exprToSQL(node)
+}
+
+// parseQueryWithTerms parses the query like parseQuery and also returns
+// the flat list of FTS-bound terms extracted from the AST. ADR-0001
+// audit H2 callers feed the terms into postDecryptFilter to verify the
+// FTS5 MATCH wasn't satisfied by an HMAC truncation collision. If the
+// query has no blind-FTS terms, terms is nil and callers can take the
+// pure-SQL fast path.
+func (d *DB) parseQueryWithTerms(query string) (where string, params []interface{}, terms []ftsTerm, err error) {
+	tokens := lex(query)
+	node, err := parse(tokens)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if _, ok := node.(*starExpr); ok {
+		return "", nil, nil, nil
+	}
+	where, params, err = d.exprToSQL(node)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	terms = extractFTSTerms(node)
+	return where, params, terms, nil
 }
 
 // fieldToSQL converts a field expression into a SQL clause. Method on
