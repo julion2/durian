@@ -19,16 +19,21 @@ import (
 // code never touches this path — the seeder builds throwaway fixtures
 // for integration tests against an HTTP server it controls.
 //
-// Honours DURIAN_MASTER_KEY_HEX (same env var that durian serve reads)
-// so the integration test can seed and serve with the same key — without
-// it, ciphertexts written by the seeder would be unreadable by serve.
-// Falls back to a fixed 0xee*32 master when the env var is unset.
+// Honours DURIAN_MASTER_KEY_HEX_SECRET (the env var that durian serve
+// reads — ADR-0001 audit medium renamed it from DURIAN_MASTER_KEY_HEX
+// so secret-detection tooling catches it). Legacy name still
+// recognized for grace period. Falls back to a fixed 0xee*32 master
+// when neither env var is set.
 func testKeyring() *dbcrypto.Keyring {
 	var master []byte
-	if raw := strings.TrimSpace(os.Getenv("DURIAN_MASTER_KEY_HEX")); raw != "" {
+	raw := strings.TrimSpace(os.Getenv("DURIAN_MASTER_KEY_HEX_SECRET"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("DURIAN_MASTER_KEY_HEX"))
+	}
+	if raw != "" {
 		m, err := hex.DecodeString(raw)
 		if err != nil || len(m) != dbcrypto.MasterKeyLen {
-			panic(fmt.Sprintf("testseeder: DURIAN_MASTER_KEY_HEX must be 64-char hex of 32 bytes (got len=%d, err=%v)", len(m), err))
+			panic(fmt.Sprintf("testseeder: DURIAN_MASTER_KEY_HEX_SECRET must be 64-char hex of 32 bytes (got len=%d, err=%v)", len(m), err))
 		}
 		master = m
 	} else {

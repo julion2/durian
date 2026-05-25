@@ -17,10 +17,24 @@ import (
 
 // envMasterKeyHex is an override env var read by bootstrapKeyring before
 // touching the OS keychain. Intended exclusively for integration tests
-// and CI environments that have no Secret Service implementation. Setting
-// this in production is logged at Warn level on every startup so the
-// misuse is visible in serve.log.
-const envMasterKeyHex = "DURIAN_MASTER_KEY_HEX"
+// and CI environments that have no Secret Service implementation.
+//
+// ADR-0001 audit medium-priority: the variable name includes "SECRET"
+// so log scrubbers, GitHub push-protection, and generic
+// secret-detection patterns flag it automatically. The legacy name
+// DURIAN_MASTER_KEY_HEX (without _SECRET) is still recognized for
+// one release as a deprecation grace period; setting it emits a Warn
+// telling the operator to rename.
+//
+// On any successful read, bootstrapKeyring immediately os.Unsetenv's
+// the variable so it doesn't propagate to child processes (sync
+// helpers, exec'd hooks) and doesn't appear in coredumps captured
+// after the read. Visibility into legitimate test/CI use is preserved
+// via the Warn log line.
+const (
+	envMasterKeyHex          = "DURIAN_MASTER_KEY_HEX_SECRET"
+	envMasterKeyHexLegacy    = "DURIAN_MASTER_KEY_HEX"
+)
 
 // Flags
 var (
@@ -89,18 +103,41 @@ func init() {
 // store.Open. Fatal-exits on any error so the daemon never starts in a
 // state where encrypt-on-write would silently no-op.
 //
-// If DURIAN_MASTER_KEY_HEX is set, the keychain path is skipped entirely
-// and the env var's 64-char hex is used verbatim. This exists for the
-// integration test and headless CI where there is no Secret Service
-// implementation. A Warn-level audit line accompanies every use so
-// accidental production deployments are visible in serve.log.
+// If DURIAN_MASTER_KEY_HEX_SECRET (or the legacy DURIAN_MASTER_KEY_HEX)
+// is set, the keychain path is skipped entirely and the env var's
+// 64-char hex is used verbatim. This exists for the integration test
+// and headless CI where there is no Secret Service implementation.
+// A Warn-level audit line accompanies every use so accidental
+// production deployments are visible in serve.log.
+//
+// ADR-0001 audit medium: the env var is os.Unsetenv'd immediately on
+// read so it doesn't propagate to child processes or land in coredumps
+// captured after the read. The legacy name emits an additional Warn
+// asking the operator to rename — one-release deprecation grace period.
 func bootstrapKeyring() *dbcrypto.Keyring {
-	if raw := strings.TrimSpace(os.Getenv(envMasterKeyHex)); raw != "" {
+	rawCanonical := strings.TrimSpace(os.Getenv(envMasterKeyHex))
+	rawLegacy := strings.TrimSpace(os.Getenv(envMasterKeyHexLegacy))
+	raw := rawCanonical
+	source := envMasterKeyHex
+	if raw == "" && rawLegacy != "" {
+		raw = rawLegacy
+		source = envMasterKeyHexLegacy
+		slog.Warn("DURIAN_MASTER_KEY_HEX is deprecated — rename to DURIAN_MASTER_KEY_HEX_SECRET so secret-detection tooling catches it",
+			"module", "MASTER-KEY")
+	}
+	// Clear BOTH names from the process environment regardless of which
+	// (if either) was set — defense in depth against later code
+	// re-reading. Errors from Unsetenv are not actionable here; in the
+	// worst case the original value stays in /proc/self/environ but we
+	// have not made things worse than the pre-fix state.
+	_ = os.Unsetenv(envMasterKeyHex)
+	_ = os.Unsetenv(envMasterKeyHexLegacy)
+	if raw != "" {
 		master, err := hex.DecodeString(raw)
 		if err != nil || len(master) != dbcrypto.MasterKeyLen {
-			slog.Error("DURIAN_MASTER_KEY_HEX is set but not a valid 64-char hex of 32 bytes",
+			slog.Error(source+" is set but not a valid 64-char hex of 32 bytes",
 				"module", "MASTER-KEY", "err", err, "len", len(master))
-			fmt.Fprintln(os.Stderr, "Error: DURIAN_MASTER_KEY_HEX must be a 64-character hex string (32 bytes)")
+			fmt.Fprintln(os.Stderr, "Error: "+source+" must be a 64-character hex string (32 bytes)")
 			os.Exit(1)
 		}
 		kr, err := dbcrypto.NewKeyring(master)
@@ -109,7 +146,7 @@ func bootstrapKeyring() *dbcrypto.Keyring {
 			fmt.Fprintln(os.Stderr, "Error: keyring derivation failed:", err)
 			os.Exit(1)
 		}
-		slog.Warn("Master key sourced from DURIAN_MASTER_KEY_HEX (test/CI mode — NOT for production)",
+		slog.Warn("Master key sourced from "+source+" (test/CI mode — NOT for production)",
 			"module", "MASTER-KEY")
 		return kr
 	}

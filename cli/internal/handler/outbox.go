@@ -197,7 +197,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 	var draft OutboxDraft
 	if err := json.Unmarshal([]byte(item.DraftJSON), &draft); err != nil {
 		slog.Error("Failed to unmarshal draft", "module", "OUTBOX", "id", item.ID, "err", err)
-		w.store.MarkAttempted(item.ID, "invalid draft JSON: "+err.Error())
+		w.store.MarkAttempted(item.ID, sanitizeOutboxError(err))
 		return
 	}
 
@@ -215,8 +215,9 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 	smtpAuth, err := auth.GetSMTPAuth(account)
 	if err != nil {
 		slog.Error("Auth failed for outbox item", "module", "OUTBOX", "id", item.ID, "err", err)
-		w.store.MarkAttempted(item.ID, "auth: "+err.Error())
-		w.broadcastStatus(item.ID, "failed", err.Error(), draft.Subject, strings.Join(draft.To, ", "))
+		safeMsg := "auth: " + sanitizeOutboxError(err)
+		w.store.MarkAttempted(item.ID, safeMsg)
+		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
 		return
 	}
 
@@ -243,8 +244,11 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 		data, err := base64.StdEncoding.DecodeString(att.DataBase64)
 		if err != nil {
 			slog.Error("Failed to decode attachment", "module", "OUTBOX", "id", item.ID, "filename", att.Filename, "err", err)
-			w.store.MarkAttempted(item.ID, "attachment decode: "+err.Error())
-			w.broadcastStatus(item.ID, "failed", "Bad attachment: "+att.Filename, draft.Subject, strings.Join(draft.To, ", "))
+			safeMsg := "attachment decode: " + sanitizeOutboxError(err)
+			w.store.MarkAttempted(item.ID, safeMsg)
+			// Drop the filename from the SSE broadcast too — it's
+			// user-supplied content that may carry sensitive metadata.
+			w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
 			return
 		}
 		msg.Attachments = append(msg.Attachments, smtp.Attachment{
@@ -268,13 +272,17 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 		smtpErr := smtp.ParseSMTPError(err)
 		slog.Error("SMTP send failed", "module", "OUTBOX", "id", item.ID, "err", err)
 
+		// ADR-0001 audit medium: sanitize before DB-persist + SSE so
+		// the server-supplied response body (Gmail/O365 echo To: /
+		// Subject: fragments in 5xx) never reaches the GUI.
+		safeMsg := sanitizeOutboxError(err)
 		if smtpErr != nil && smtpErr.IsPermanent() {
 			// 5xx permanent error — poison immediately
-			w.store.PoisonOutboxItem(item.ID, "permanent: "+err.Error())
+			w.store.PoisonOutboxItem(item.ID, safeMsg)
 		} else {
-			w.store.MarkAttempted(item.ID, err.Error())
+			w.store.MarkAttempted(item.ID, safeMsg)
 		}
-		w.broadcastStatus(item.ID, "failed", err.Error(), draft.Subject, strings.Join(draft.To, ", "))
+		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
 		return
 	}
 
