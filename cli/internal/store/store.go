@@ -761,20 +761,26 @@ func (d *DB) migrate() error {
 		}
 
 
-		if _, err := d.db.Exec("UPDATE schema_version SET version = 18 WHERE rowid = 1"); err != nil {
-			return fmt.Errorf("migrate v17→v18 bump: %w", err)
-		}
-
 		// VACUUM rebuilds the DB file to reclaim space from the dropped
 		// columns + FTS5 table. On a 20k-message mailbox this rewrites
 		// ~900 MB (the body plaintext duplication that's been sitting
 		// alongside body_text_ct since step 6). Slow — typically 30-90 s
 		// on a warm filesystem cache — but one-shot, after which the
 		// 1.8 GB DB should shrink back near the pre-encryption ~980 MB
-		// baseline (encrypted ct adds 29 bytes per blob; the plaintext
-		// duplication is gone).
+		// baseline.
+		//
+		// ADR-0001 audit H3: VACUUM runs BEFORE the schema_version bump.
+		// Earlier versions bumped first; a VACUUM crash (out of disk,
+		// interrupt, power loss) then left the DB stuck at v18 with the
+		// dropped columns' plaintext bytes still in free pages, and no
+		// migration code ever revisiting VACUUM. The v19→v20 migration
+		// below catches users who already crossed v18 under the old
+		// ordering and re-VACUUMs idempotently.
 		if _, err := d.db.Exec("VACUUM"); err != nil {
 			return fmt.Errorf("migrate v17→v18 vacuum: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 18 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v17→v18 bump: %w", err)
 		}
 	}
 
@@ -806,6 +812,29 @@ func (d *DB) migrate() error {
 
 		if _, err := d.db.Exec("UPDATE schema_version SET version = 19 WHERE rowid = 1"); err != nil {
 			return fmt.Errorf("migrate v18→v19 bump: %w", err)
+		}
+	}
+
+	if version < 20 {
+		// ADR-0001 audit H3 follow-up: users who crossed v18 under the
+		// pre-fix bump-then-VACUUM ordering may have had VACUUM fail or
+		// be killed between the bump and the rewrite; the dropped step-7e
+		// plaintext bytes (subject / body_text / body_html / message_headers
+		// .value / draft_json) would have stayed stranded in free pages
+		// forever, defeating the at-rest encryption story for any cold
+		// filesystem image taken thereafter. Backups taken from such a
+		// DB carry the same residue. One-time idempotent re-VACUUM
+		// scrubs the free pages either way; on a clean v18→v19 install
+		// it is a relatively cheap no-op rewrite.
+		//
+		// VACUUM runs BEFORE the schema_version bump (lesson from H3
+		// itself): if it crashes, we want v20 to NOT be marked done so
+		// the next Init() retries it.
+		if _, err := d.db.Exec("VACUUM"); err != nil {
+			return fmt.Errorf("migrate v19→v20 vacuum: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 20 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v19→v20 bump: %w", err)
 		}
 	}
 
@@ -977,7 +1006,25 @@ func (d *DB) backfillFlagsOtherFromShadow() error {
 // plaintext mailbox / account / flags columns and replace the
 // UNIQUE(message_id, account) constraint with UNIQUE(message_id,
 // account_id). SQLite's 12-step ALTER procedure.
+//
+// ADR-0001 audit H4: idempotent on retry. Earlier versions used a bare
+// CREATE TABLE messages_new without IF NOT EXISTS — a mid-stream
+// failure (OOM / disk-full / power loss during the multi-GB INSERT
+// SELECT) left the half-built temp table behind, and the next Init()
+// crashed at CREATE TABLE with "table already exists" → migration
+// permanently wedged. We now DROP the temp table at entry and wrap
+// the whole rebuild in a transaction so partial states roll back
+// cleanly.
 func (d *DB) rebuildMessagesForStep7f() error {
+	// DROP any half-built messages_new from a previous interrupted
+	// attempt. Outside the transaction — if it errors (it shouldn't,
+	// IF EXISTS is non-failing) we want to surface that before any
+	// destructive operation. Outside the BEGIN/COMMIT block because
+	// SQLite implicit-commits on DDL anyway, so wrapping it in the tx
+	// would only obscure the ordering.
+	if _, err := d.db.Exec(`DROP TABLE IF EXISTS messages_new`); err != nil {
+		return fmt.Errorf("rebuild pre-cleanup: %w", err)
+	}
 	stmts := []string{
 		`PRAGMA foreign_keys = OFF`,
 		// The new table mirrors the current messages schema minus the

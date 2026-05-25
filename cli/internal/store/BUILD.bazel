@@ -32,6 +32,7 @@ go_test(
         "headers_test.go",
         "local_drafts_test.go",
         "messages_test.go",
+        "migrate_audit_test.go",
         "outbox_test.go",
         "search_test.go",
         "store_test.go",
