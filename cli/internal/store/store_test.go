@@ -3,6 +3,8 @@ package store
 import (
 	"bytes"
 	"database/sql"
+	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -68,6 +70,101 @@ func TestOpen_SecureDeleteEnabled(t *testing.T) {
 	if v != 1 {
 		t.Errorf("PRAGMA secure_delete = %d, want 1", v)
 	}
+}
+
+// TestSecureDelete_ScrubsRawBytes is the ADR-0001 audit #252 follow-up
+// to TestOpen_SecureDeleteEnabled: pragma-set-to-1 only proves SQLite
+// accepted the directive, not that the freed bytes are actually being
+// overwritten on disk. This test asserts the real property — INSERT a
+// plaintext marker into a plaintext column (from_addr stays plaintext
+// post-β-revision), DELETE the row, checkpoint WAL into the main file,
+// close, then grep the raw bytes of every on-disk file (the .db, its
+// -wal, its -shm). The marker must be absent from all three.
+//
+// A pre-deletion sanity grep proves the marker really was on disk in the
+// first place — without it, "absent after delete" could just mean the
+// insert never reached the bytes we read.
+func TestSecureDelete_ScrubsRawBytes(t *testing.T) {
+	const marker = "DURIAN_SECURE_DELETE_MARKER_3F8B7A1E"
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "email.db")
+
+	db, err := Open(dbPath, testKeyring(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	msg := &Message{
+		MessageID: "marker@example.com",
+		Subject:   "test",
+		FromAddr:  marker + "@example.com",
+		ToAddrs:   "bob@example.com",
+		Date:      1700000000,
+		CreatedAt: 1700000000,
+		Mailbox:   "INBOX",
+	}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// Force the row into the main DB so the pre-delete sanity grep is
+	// looking at the right file — without this, the WAL holds the bytes
+	// and the main .db is still empty.
+	if _, err := db.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatalf("pre-delete checkpoint: %v", err)
+	}
+	if !rawDBContains(t, dbPath, marker) {
+		t.Fatalf("test setup broken: marker %q not present in raw bytes pre-delete", marker)
+	}
+
+	if err := db.DeleteByMessageID("marker@example.com"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	// Merge the secure-delete-zeroed page from WAL into the main DB file.
+	if _, err := db.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatalf("post-delete checkpoint: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		path := dbPath + suffix
+		b, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if bytes.Contains(b, []byte(marker)) {
+			t.Errorf("marker %q still present in %s after secure_delete (%d bytes)", marker, path, len(b))
+		}
+	}
+}
+
+// rawDBContains returns whether the raw bytes of dbPath (or its WAL
+// sidecar, if the marker hasn't been checkpointed yet) contain the
+// marker. Used by the secure_delete sanity check.
+func rawDBContains(t *testing.T, dbPath, marker string) bool {
+	t.Helper()
+	for _, suffix := range []string{"", "-wal"} {
+		path := dbPath + suffix
+		b, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if bytes.Contains(b, []byte(marker)) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestInitIdempotent(t *testing.T) {
