@@ -355,6 +355,11 @@ Durian goes the other way: render mail, search mail, reply, file. Tags instead o
     title="Configured like infrastructure"
     subtitle="Accounts, sync intervals, filter rules, key bindings, sidebar profiles — everything is in typed Pkl files. Validated at startup, versionable, reproducible across machines. There is no settings UI on purpose." >}}
 
+{{< hextra/feature-card
+    link="docs/cli/encryption-at-rest"
+    title="Encrypted at rest, searchable anyway"
+    subtitle="Mail bodies, subjects, headers, contacts, drafts — all encrypted in the SQLite store with per-column sub-keys derived from a master in the OS keychain. Full-text search still works against a blind-token index, no plaintext leaves the encryption layer." >}}
+
 {{< /hextra/feature-grid >}}
 
 <br>

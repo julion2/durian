@@ -143,6 +143,7 @@ See `durian --help` for the full command list, or `man durian-<cmd>` for detaile
 
 ## 6. Common next steps
 
+- **Back up your encryption key** — `durian master-key export --out ~/durian-master.age` writes a passphrase-protected backup. Without it, a lost OS keychain entry means lost local-only data (drafts, manual contacts). See [Encryption at rest](../cli/encryption-at-rest/).
 - **Sidebar folders and profiles** — copy [profiles-example.pkl](https://github.com/julion2/durian/blob/main/docs/profiles-example.pkl) to `~/.config/durian/profiles.pkl`
 - **Custom keymaps** — copy [keymaps-example.pkl](https://github.com/julion2/durian/blob/main/docs/keymaps-example.pkl) to `~/.config/durian/keymaps.pkl`
 - **Filter rules** (auto-tag on sync) — copy [rules-example.pkl](https://github.com/julion2/durian/blob/main/docs/rules-example.pkl) to `~/.config/durian/rules.pkl`

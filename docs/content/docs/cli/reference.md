@@ -119,6 +119,17 @@ durian auth logout personal           # remove from keychain
 
 Credentials live in the macOS Keychain — see [OAuth setup](../auth/oauth/) and [Password setup](../auth/password/).
 
+## master-key — back up the at-rest encryption key
+
+```bash
+durian master-key export --out ~/durian-master.age   # passphrase-encrypted age file
+durian master-key export --out -                     # to stdout
+durian master-key import --from ~/durian-master.age  # restore into a fresh keychain
+durian master-key import --from FILE --force         # overwrite an existing entry
+```
+
+The master encrypts every sensitive column in `email.db` + `contacts.db`. Lose it and the local DB is unrecoverable. See the [Encryption at rest](encryption-at-rest/) walkthrough.
+
 ## contacts — local address book
 
 ```bash

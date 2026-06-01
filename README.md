@@ -26,7 +26,7 @@
 </p>
 </details>
 
-Tags instead of folders. Full-text search. Multi-account with OAuth (Gmail, Microsoft 365) and password auth. IMAP sync to a local SQLite store — fast offline search, no Maildir. Configurable keybindings, filter rules, and HTML signatures. All in a native GUI backed by a Go CLI.
+Tags instead of folders. Full-text search. Multi-account with OAuth (Gmail, Microsoft 365) and password auth. IMAP sync to a local SQLite store, encrypted at rest by default with searchable full-text index. Configurable keybindings, filter rules, and HTML signatures. All in a native GUI backed by a Go CLI.
 
 > **Early Alpha** — Expect bugs and breaking changes. No external security audit.
 > This is a side project — features, improvements, and bug fixes happen as time allows.

@@ -11,12 +11,16 @@ No analytics, no usage stats, no error reporting, no auto-updater. The CLI and G
 
 ## Where your data lives
 
-| Data | Location |
-|---|---|
-| Mail, threads, tags, attachments | `~/.local/share/durian/email.db` |
-| Contacts | `~/.local/share/durian/contacts.db` |
-| Configuration | `~/.config/durian/*.pkl` |
-| OAuth tokens, IMAP/SMTP passwords | OS keychain |
+| Data | Location | Encrypted at rest |
+|---|---|---|
+| Mail bodies, subjects, headers, addresses, drafts, attachment metadata | `~/.local/share/durian/email.db` | yes (AES-256-GCM, per-column) |
+| Contacts (name + email) | `~/.local/share/durian/contacts.db` | yes (AES-256-GCM) |
+| Full-text search index | `email.db` (`messages_blind_fts`) | yes (blind-token via HMAC) |
+| Configuration | `~/.config/durian/*.pkl` | no (plain text, version-controllable) |
+| OAuth tokens, IMAP/SMTP passwords | OS keychain | yes (Keychain ACL / libsecret) |
+| Master encryption key | OS keychain (`durian-db` / `master`) | yes (Keychain ACL / libsecret) |
+
+The master key never leaves the keychain except when you explicitly run `durian master-key export` for backup. See [Encryption at rest](docs/cli/encryption-at-rest/) for the user-facing story.
 
 ## Network connections
 

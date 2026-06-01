@@ -98,7 +98,17 @@ One SQLite file at `~/.local/share/durian/email.db` (or `$XDG_DATA_HOME/durian/e
 - `attachments` — per-part metadata (filename, content_type, size, partId, disposition)
 - `local_drafts` — crash-recovery drafts (kept locally until saved to IMAP)
 - `outbox` — queued outgoing messages (with `send_after` timestamp for undo-send)
-- `messages_fts` — FTS5 virtual table for full-text search
+- `messages_blind_fts` — blind-token FTS5 virtual table for full-text search over encrypted columns
+
+### Encryption layer
+
+Sensitive columns are AES-256-GCM encrypted at the application layer via `cli/internal/dbcrypto/` (see [ADR-0001](design/0001-mail-content-encryption-at-rest/)). A 32-byte master in the OS keychain (`durian-db` / `master`) is bootstrapped at `durian serve` start and derives one HKDF-SHA256 sub-key per purpose (subject, body, addrs, headers, draft, meta, contact, fts-token). Sub-keys live in process RAM with a cached `cipher.AEAD` so the hot encrypt/decrypt path stays at ~290 ns/op.
+
+What stays plaintext on purpose: `message_id`, `thread_id`, `date`, `account`, `mailbox`, UID, flags, sizes. These are needed for IMAP sync correlation and for SQLite query planning. ADR-0001 §3 has the exact column-by-column table.
+
+Search runs against `messages_blind_fts`, an FTS5 index built from HMAC-bigram tokens (`cli/internal/dbcrypto/tokenize.go`). The FTS index contains no plaintext — the same token in two different mails produces the same HMAC, and the post-decrypt filter (`cli/internal/store/search_filter.go`) re-checks any FTS hit against the decrypted body to defeat HMAC truncation collisions. Bigram phrase queries work via consecutive-token AND'ing.
+
+Disk hygiene: `PRAGMA secure_delete = ON` is set on every connection (zeroes freed pages on DELETE / UPDATE). On `store.Open`, the freelist is inspected and auto-VACUUM runs if the file is unusually fragmented — covers the Time-Machine-restore-of-an-old-backup case. See ADR-0001 §6 "Disk hygiene".
 
 Search uses notmuch-style query syntax (`tag:inbox AND from:boss@example.com`) parsed in `cli/internal/store/search.go` into SQL + FTS5 MATCH.
 

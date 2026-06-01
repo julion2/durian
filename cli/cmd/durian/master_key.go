@@ -32,20 +32,20 @@ import (
 // after the read. Visibility into legitimate test/CI use is preserved
 // via the Warn log line.
 const (
-	envMasterKeyHex          = "DURIAN_MASTER_KEY_HEX_SECRET"
-	envMasterKeyHexLegacy    = "DURIAN_MASTER_KEY_HEX"
+	envMasterKeyHex       = "DURIAN_MASTER_KEY_HEX_SECRET"
+	envMasterKeyHexLegacy = "DURIAN_MASTER_KEY_HEX"
 )
 
 // Flags
 var (
-	masterKeyExportOut    string
-	masterKeyImportFrom   string
-	masterKeyImportForce  bool
+	masterKeyExportOut   string
+	masterKeyImportFrom  string
+	masterKeyImportForce bool
 )
 
 var masterKeyCmd = &cobra.Command{
 	Use:   "master-key",
-	Short: "Manage the at-rest encryption master key (ADR-0001)",
+	Short: "Manage the at-rest encryption master key",
 	Long: `Manage the master key that protects Durian's encrypted database
 columns (mail bodies, subjects, contacts, drafts).
 
