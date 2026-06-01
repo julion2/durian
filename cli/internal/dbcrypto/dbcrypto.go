@@ -35,6 +35,14 @@ const (
 	// envelopeOverhead is the minimum bytes any V1 ciphertext occupies,
 	// even for empty plaintext: version + nonce + tag.
 	envelopeOverhead = 1 + NonceLen + TagLen
+
+	// MaxPlaintextLen caps the bytes any single Encrypt / EncryptX call
+	// will accept. SQLite's default SQLITE_MAX_LENGTH is 1 GiB, so any
+	// value the store could possibly hand us already fits; this guard
+	// exists so the `envelopeOverhead + len(plaintext)` expression in
+	// sealAEAD provably can't overflow `int` on 32-bit platforms or trip
+	// CodeQL's go/allocation-size-overflow check.
+	MaxPlaintextLen = 1 << 30 // 1 GiB
 )
 
 // Label is the HKDF "info" string for one sub-key purpose. The exact byte
@@ -54,9 +62,10 @@ const (
 )
 
 var (
-	ErrInvalidKey      = errors.New("dbcrypto: key must be 32 bytes")
-	ErrShortCiphertext = errors.New("dbcrypto: ciphertext shorter than envelope overhead")
-	ErrUnknownVersion  = errors.New("dbcrypto: unknown envelope version")
+	ErrInvalidKey       = errors.New("dbcrypto: key must be 32 bytes")
+	ErrShortCiphertext  = errors.New("dbcrypto: ciphertext shorter than envelope overhead")
+	ErrUnknownVersion   = errors.New("dbcrypto: unknown envelope version")
+	ErrPlaintextTooLong = fmt.Errorf("dbcrypto: plaintext exceeds %d bytes", MaxPlaintextLen)
 )
 
 // DeriveSubKey extracts a 32-byte purpose-specific sub-key from a 32-byte
@@ -124,7 +133,14 @@ func Decrypt(key, ciphertext []byte) ([]byte, error) {
 // out so both Encrypt (fresh AEAD per call) and the Keyring per-sub-key
 // methods (cached AEAD) share one identical wire-format producer — no risk
 // of envelope-shape drift between the two paths.
+//
+// The MaxPlaintextLen guard bounds the make() capacity argument below so
+// `envelopeOverhead + len(plaintext)` provably stays within int range
+// (CodeQL go/allocation-size-overflow).
 func sealAEAD(aead cipher.AEAD, plaintext []byte) ([]byte, error) {
+	if len(plaintext) > MaxPlaintextLen {
+		return nil, ErrPlaintextTooLong
+	}
 	// Pre-allocate the full envelope so Seal appends in place.
 	out := make([]byte, 1+NonceLen, envelopeOverhead+len(plaintext))
 	out[0] = EnvelopeV1

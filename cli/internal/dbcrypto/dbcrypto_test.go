@@ -108,6 +108,24 @@ func TestEncrypt_RejectsBadKey(t *testing.T) {
 	}
 }
 
+// TestEncrypt_RejectsOversizedPlaintext pins the MaxPlaintextLen guard
+// that sealAEAD relies on so `envelopeOverhead + len(plaintext)` can't
+// overflow `int` (CodeQL go/allocation-size-overflow).
+//
+// Skipped on memory-constrained runners — allocating 1 GiB just to read
+// its length is wasteful, but there is no cheaper way in pure Go to
+// produce a slice whose `len()` lies about its backing.
+func TestEncrypt_RejectsOversizedPlaintext(t *testing.T) {
+	if testing.Short() {
+		t.Skip("allocates 1 GiB; skipped under -short")
+	}
+	key := bytes.Repeat([]byte{0x88}, KeyLen)
+	oversized := make([]byte, MaxPlaintextLen+1)
+	if _, err := Encrypt(key, oversized); !errors.Is(err, ErrPlaintextTooLong) {
+		t.Errorf("err = %v, want ErrPlaintextTooLong", err)
+	}
+}
+
 // --- Round-trip (requires Decrypt to be implemented) ---
 
 func TestRoundTrip_AllLabels(t *testing.T) {
