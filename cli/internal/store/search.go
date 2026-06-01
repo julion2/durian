@@ -689,8 +689,25 @@ func (d *DB) exprToSQL(node exprNode) (string, []interface{}, error) {
 	}
 }
 
+// MaxQueryLen caps the bytes a single search query may contain. ADR-0001
+// audit #254.2: the per-char lexer in scanToken has no internal length
+// budget, so an unbounded query allocates O(N) tokens. The HTTP handler
+// already enforces this cap, but the CLI (`durian search`) and any
+// future unix-socket caller need it too — pushing the check into
+// parseQuery ensures every entry path gets it without coordination.
+const MaxQueryLen = 1024
+
+// ErrQueryTooLong is returned by parseQuery / parseQueryWithTerms when
+// the input exceeds MaxQueryLen bytes. Callers that want a precise 400
+// at an HTTP boundary can errors.Is-match this; the CLI surface is
+// content with the wrapped message.
+var ErrQueryTooLong = fmt.Errorf("query too long (max %d bytes)", MaxQueryLen)
+
 // parseQuery translates a search query into a SQL WHERE clause and parameters.
 func (d *DB) parseQuery(query string) (where string, params []interface{}, err error) {
+	if len(query) > MaxQueryLen {
+		return "", nil, ErrQueryTooLong
+	}
 	tokens := lex(query)
 	node, err := parse(tokens)
 	if err != nil {
@@ -709,6 +726,9 @@ func (d *DB) parseQuery(query string) (where string, params []interface{}, err e
 // query has no blind-FTS terms, terms is nil and callers can take the
 // pure-SQL fast path.
 func (d *DB) parseQueryWithTerms(query string) (where string, params []interface{}, terms []ftsTerm, err error) {
+	if len(query) > MaxQueryLen {
+		return "", nil, nil, ErrQueryTooLong
+	}
 	tokens := lex(query)
 	node, err := parse(tokens)
 	if err != nil {
