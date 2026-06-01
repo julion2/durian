@@ -231,6 +231,25 @@ plaintext as before.
 
 `outbox.draft_json`, `local_drafts.draft_json` → `BLOB`.
 
+`attachments.filename`, `attachments.content_type`, `attachments.size` →
+`BLOB` (encrypted with `meta_key`, v21→v22). Filenames like
+`Tax_Return_2026.pdf` or `MRI_results.dcm` carry subject-grade
+content-classification signal — the original ADR scope treated
+attachments as pure metadata and missed this; post-audit-2 deep
+review corrected the gap. `content_type` ("application/dicom" reveals
+medical context as sharply as the filename) and `size` (combined with
+the already-plaintext `from_addr` + `date`, sharpens an
+activity-pattern signal like "Tuesday 9am 2.4MB PDF from
+accountant@x") get the same treatment. The remaining columns —
+`disposition` (2 values, encrypt-buys-nothing), `content_id` (opaque
+random MIME Content-ID, no content signal), `part_id` (structural
+MIME-part enumeration) — stay plaintext. β-revision argument is
+**partial** here: inbound attachment metadata was on the wire over
+all MTAs (β applies on the read side), but `local_drafts` / `outbox`
+filenames are pre-wire if the user cancels send (β does NOT apply, same
+shape as `draft_json` which the ADR already encrypts). Encrypting the
+combined set is the conservative choice that closes both halves.
+
 Indexes that referenced encrypted columns (e.g. `idx_messages_from_addr`) are
 **dropped**. They are unusable on ciphertext. Replacement: the blind-token
 FTS5 index covers the common search cases; for exact lookups on `from_addr`
@@ -627,9 +646,11 @@ statement. Mitigations, all part of the implementation PR:
 ### 7. Out of scope (separate future ADRs)
 
 - Master-key rotation procedure.
-- Encrypted attachments-on-disk (`attachments` table only stores metadata
-  today; raw attachment bytes live in the IMAP server cache or are fetched
-  on demand).
+- Encrypted attachment **payload bytes**-on-disk (raw bytes live in the
+  IMAP server cache or are fetched on demand; the local attachments
+  table only stores metadata). Attachment metadata that carries
+  content-classification signal (`filename`, `content_type`, `size`) IS
+  encrypted post-v22 — see §3.
 - Sync server (`sync/main.go`): different data domain (tag changes only, no
   user content). Stays unencrypted.
 - Linux-Wayland-clipboard plaintext leakage of decrypted bodies — UI concern.
