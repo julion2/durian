@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/durian-dev/durian/cli/internal/dbcrypto"
@@ -84,6 +86,110 @@ func TestOpen_SecureDeleteEnabled(t *testing.T) {
 // A pre-deletion sanity grep proves the marker really was on disk in the
 // first place — without it, "absent after delete" could just mean the
 // insert never reached the bytes we read.
+// TestFreelistTriggersVacuum pins the ADR-0001 audit #251 calibration.
+// Concrete page counts come from realistic scenarios:
+//   - healthy 50k-page DB after a sync (~10 free pages)
+//   - same DB after months of churn without VACUUM (~800 free pages)
+//   - post-Time-Machine-restore residue (10 %+ stranded plaintext)
+//   - tiny test DB where the ratio threshold catches what the floor misses
+//
+// If the calibration drifts, this test catches the user-visible
+// regression (false fires on every Open, or missed restore residue).
+func TestFreelistTriggersVacuum(t *testing.T) {
+	cases := []struct {
+		name      string
+		pages     int64
+		freelist  int64
+		wantFires bool
+	}{
+		{"healthy post-sync (50k pages, 10 free)", 50_000, 10, false},
+		{"long-running but small churn (50k, 800)", 50_000, 800, false},
+		{"large absolute residue (50k, 6000 ~= 12 %)", 50_000, 6000, true},
+		{"restore residue ratio (10k pages, 30 % free)", 10_000, 3_000, true},
+		{"tiny DB at ratio (1000 pages, 100 free = 10 %)", 1_000, 100, true},
+		{"tiny DB below ratio (1000 pages, 50 free = 5 %)", 1_000, 50, false},
+		{"empty DB", 0, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := freelistTriggersVacuum(c.pages, c.freelist); got != c.wantFires {
+				t.Errorf("freelistTriggersVacuum(%d, %d) = %v, want %v",
+					c.pages, c.freelist, got, c.wantFires)
+			}
+		})
+	}
+}
+
+// TestVacuumIfFreelistHigh_FiresWhenForced exercises the end-to-end
+// path: artificially set the floor so any non-empty freelist triggers,
+// allocate + delete enough rows to inflate the freelist, run the helper
+// directly, then assert PRAGMA freelist_count dropped. Real-Open
+// integration is implicit: every other store test goes through Open and
+// gets the production thresholds (which never fire on small test DBs).
+func TestVacuumIfFreelistHigh_FiresWhenForced(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "freelist.db")
+
+	db, err := Open(dbPath, testKeyring(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	// Inflate the freelist: insert many rows, then delete them all.
+	// secure_delete=ON zeros the pages but they stay on the freelist
+	// until VACUUM compacts them away.
+	for i := range 200 {
+		msg := &Message{
+			MessageID: fmt.Sprintf("inflate-%d@example.com", i),
+			Subject:   strings.Repeat("padding ", 50),
+			FromAddr:  fmt.Sprintf("sender-%d@example.com", i),
+			ToAddrs:   "bob@example.com",
+			Date:      1700000000,
+			CreatedAt: 1700000000,
+			Mailbox:   "INBOX",
+			BodyText:  strings.Repeat("body ", 200),
+		}
+		if err := db.InsertMessage(msg); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	if _, err := db.db.Exec("DELETE FROM messages"); err != nil {
+		t.Fatalf("bulk delete: %v", err)
+	}
+
+	var beforeFree int64
+	if err := db.db.QueryRow("PRAGMA freelist_count").Scan(&beforeFree); err != nil {
+		t.Fatalf("read freelist pre-VACUUM: %v", err)
+	}
+	if beforeFree == 0 {
+		t.Skip("could not inflate freelist on this SQLite build — test inert")
+	}
+
+	// Lower both thresholds for this test so the helper actually fires.
+	origRatio, origFloor := freelistVacuumRatio, freelistVacuumFloor
+	t.Cleanup(func() {
+		freelistVacuumRatio = origRatio
+		freelistVacuumFloor = origFloor
+	})
+	freelistVacuumRatio = 0
+	freelistVacuumFloor = 1
+
+	if err := vacuumIfFreelistHigh(db.db); err != nil {
+		t.Fatalf("vacuumIfFreelistHigh: %v", err)
+	}
+
+	var afterFree int64
+	if err := db.db.QueryRow("PRAGMA freelist_count").Scan(&afterFree); err != nil {
+		t.Fatalf("read freelist post-VACUUM: %v", err)
+	}
+	if afterFree >= beforeFree {
+		t.Errorf("freelist did not shrink: before=%d after=%d", beforeFree, afterFree)
+	}
+}
+
 func TestSecureDelete_ScrubsRawBytes(t *testing.T) {
 	const marker = "DURIAN_SECURE_DELETE_MARKER_3F8B7A1E"
 

@@ -604,6 +604,33 @@ What secure_delete does **not** cover:
   (chip-off attacks). Out of scope; mitigation is FileVault /
   full-disk encryption, which Durian assumes the user enables.
 
+#### Restored-backup hygiene (auto-VACUUM at Open)
+
+The retroactive VACUUM that step-7e and audit-H3 wired into the v19→v20
+schema migration only fires once per install. A user who runs Durian
+post-v20, **then** restores an old `email.db` from Time Machine / iCloud
+/ an external backup over the top, lands in a state where
+`schema_version` already reads 21 but the restored file is full of
+pre-fix free-page residue — the migration scrubber does not re-fire.
+
+Mitigation: on every `store.Open`, the freelist is inspected via
+`PRAGMA freelist_count` + `PRAGMA page_count` and `VACUUM` runs once if
+**either** of the following holds (see
+`freelistTriggersVacuum` in `cli/internal/store/store.go`):
+
+- `freelist_count / page_count ≥ 0.10` (the file is ≥ 10 % free pages —
+  signal of a major drop that was never compacted), or
+- `freelist_count ≥ 1024` (≥ 4 MB stranded plaintext in absolute terms,
+  even on a small DB).
+
+Trade-off: bounded recurring cost (one VACUUM per N restores; on a
+2 GB mailbox this is a multi-second Open) instead of the previous
+unbounded behaviour (no scrub at all after the first migration).
+A healthy DB after routine sync has freelist counts in the dozens, well
+below both triggers, so steady-state startups pay only the two PRAGMA
+reads. The `:memory:` test path is exempt — there is no on-disk
+residue to scrub.
+
 ### Logging audit
 
 A Durian build with encryption is only as private as its least careful log
