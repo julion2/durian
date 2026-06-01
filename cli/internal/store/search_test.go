@@ -1,6 +1,8 @@
 package store
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -611,6 +613,28 @@ func TestSearch_UnknownField(t *testing.T) {
 	_, err := db.Search("unknown:value", 10)
 	if err == nil {
 		t.Error("expected error for unknown field")
+	}
+}
+
+// TestSearch_RejectsOversizedQuery pins ADR-0001 audit #254.2: any query
+// over MaxQueryLen bytes must be rejected before the per-char lexer runs,
+// regardless of which caller fed it in (HTTP, CLI, unix socket). Test sits
+// at parseQuery's level so all upstream paths inherit the guarantee.
+func TestSearch_RejectsOversizedQuery(t *testing.T) {
+	db := newTestDB(t)
+	huge := strings.Repeat("a", MaxQueryLen+1)
+	_, err := db.Search(huge, 10)
+	if err == nil {
+		t.Fatalf("expected ErrQueryTooLong for %d-byte query", len(huge))
+	}
+	if !errors.Is(err, ErrQueryTooLong) {
+		t.Errorf("err = %v, want wraps ErrQueryTooLong", err)
+	}
+	// Boundary: exactly MaxQueryLen must still be accepted by the lexer
+	// (parser may reject for other reasons, but not for length).
+	atCap := strings.Repeat("a", MaxQueryLen)
+	if _, err := db.Search(atCap, 10); errors.Is(err, ErrQueryTooLong) {
+		t.Errorf("query at exact cap was rejected as too long")
 	}
 }
 

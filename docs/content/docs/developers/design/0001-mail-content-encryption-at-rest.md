@@ -556,14 +556,19 @@ revisions of this section overpromised):
   defeated by Go's string-from-bytes copy anyway, so the historical
   design that named that pattern was misleading; calling it out
   honestly here saves a future reader from chasing a phantom guarantee.
-- `Keyring.Wipe()` zeroes the sub-key byte slices at shutdown. Best-effort
-  only: Go's GC may already have copied the slice during heap growth, the
-  function has no `runtime.KeepAlive(k)` after the zeroing (a sufficiently
-  aggressive compiler could in theory reorder past the wipe), and the
-  sub-keys are held for process lifetime anyway so the wipe runs at the
-  moment everything is about to be freed. Tracked as a follow-up
-  (issue #253) — either harden the contract with `runtime.KeepAlive` +
-  tests, or remove the misleading API entirely.
+- **Sub-keys are not wiped — at shutdown or otherwise.** An earlier
+  revision of this ADR documented a `Keyring.Wipe()` that overwrote
+  each sub-key with zeros via `crypto/subtle.ConstantTimeCopy`. Issue
+  #253 (audit-2 follow-up) removed it: the guarantee was unenforceable
+  in Go (no `runtime.KeepAlive`, GC may already have copied the
+  backing array during slice growth, sub-keys are held for process
+  lifetime so the wipe fired only at shutdown when the process was
+  about to free everything anyway), and shipping a best-effort scrub
+  under a name that implies stronger semantics is worse than not
+  shipping one. Honest contract: sub-keys live in process memory for
+  the lifetime of `durian serve` and are released to the GC at exit,
+  same as any other allocation. Users who need memory-dump resistance
+  rely on the two mitigations in the next bullet, not on `Wipe`.
 - Do **not** rely on `[]byte` slice reuse from a sync.Pool for plaintext.
   Pool reuse can leave plaintext stranded in unrelated allocations.
 - Document explicitly that the running process is a soft target. Users who
@@ -603,6 +608,33 @@ What secure_delete does **not** cover:
   still hold old bits, accessible only to physical-media forensics
   (chip-off attacks). Out of scope; mitigation is FileVault /
   full-disk encryption, which Durian assumes the user enables.
+
+#### Restored-backup hygiene (auto-VACUUM at Open)
+
+The retroactive VACUUM that step-7e and audit-H3 wired into the v19→v20
+schema migration only fires once per install. A user who runs Durian
+post-v20, **then** restores an old `email.db` from Time Machine / iCloud
+/ an external backup over the top, lands in a state where
+`schema_version` already reads 21 but the restored file is full of
+pre-fix free-page residue — the migration scrubber does not re-fire.
+
+Mitigation: on every `store.Open`, the freelist is inspected via
+`PRAGMA freelist_count` + `PRAGMA page_count` and `VACUUM` runs once if
+**either** of the following holds (see
+`freelistTriggersVacuum` in `cli/internal/store/store.go`):
+
+- `freelist_count / page_count ≥ 0.10` (the file is ≥ 10 % free pages —
+  signal of a major drop that was never compacted), or
+- `freelist_count ≥ 1024` (≥ 4 MB stranded plaintext in absolute terms,
+  even on a small DB).
+
+Trade-off: bounded recurring cost (one VACUUM per N restores; on a
+2 GB mailbox this is a multi-second Open) instead of the previous
+unbounded behaviour (no scrub at all after the first migration).
+A healthy DB after routine sync has freelist counts in the dozens, well
+below both triggers, so steady-state startups pay only the two PRAGMA
+reads. The `:memory:` test path is exempt — there is no on-disk
+residue to scrub.
 
 ### Logging audit
 

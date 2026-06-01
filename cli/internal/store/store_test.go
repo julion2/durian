@@ -3,7 +3,11 @@ package store
 import (
 	"bytes"
 	"database/sql"
+	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/durian-dev/durian/cli/internal/dbcrypto"
@@ -68,6 +72,205 @@ func TestOpen_SecureDeleteEnabled(t *testing.T) {
 	if v != 1 {
 		t.Errorf("PRAGMA secure_delete = %d, want 1", v)
 	}
+}
+
+// TestSecureDelete_ScrubsRawBytes is the ADR-0001 audit #252 follow-up
+// to TestOpen_SecureDeleteEnabled: pragma-set-to-1 only proves SQLite
+// accepted the directive, not that the freed bytes are actually being
+// overwritten on disk. This test asserts the real property — INSERT a
+// plaintext marker into a plaintext column (from_addr stays plaintext
+// post-β-revision), DELETE the row, checkpoint WAL into the main file,
+// close, then grep the raw bytes of every on-disk file (the .db, its
+// -wal, its -shm). The marker must be absent from all three.
+//
+// A pre-deletion sanity grep proves the marker really was on disk in the
+// first place — without it, "absent after delete" could just mean the
+// insert never reached the bytes we read.
+// TestFreelistTriggersVacuum pins the ADR-0001 audit #251 calibration.
+// Concrete page counts come from realistic scenarios:
+//   - healthy 50k-page DB after a sync (~10 free pages)
+//   - same DB after months of churn without VACUUM (~800 free pages)
+//   - post-Time-Machine-restore residue (10 %+ stranded plaintext)
+//   - tiny test DB where the ratio threshold catches what the floor misses
+//
+// If the calibration drifts, this test catches the user-visible
+// regression (false fires on every Open, or missed restore residue).
+func TestFreelistTriggersVacuum(t *testing.T) {
+	cases := []struct {
+		name      string
+		pages     int64
+		freelist  int64
+		wantFires bool
+	}{
+		{"healthy post-sync (50k pages, 10 free)", 50_000, 10, false},
+		{"long-running but small churn (50k, 800)", 50_000, 800, false},
+		{"large absolute residue (50k, 6000 ~= 12 %)", 50_000, 6000, true},
+		{"restore residue ratio (10k pages, 30 % free)", 10_000, 3_000, true},
+		{"tiny DB at ratio (1000 pages, 100 free = 10 %)", 1_000, 100, true},
+		{"tiny DB below ratio (1000 pages, 50 free = 5 %)", 1_000, 50, false},
+		{"empty DB", 0, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := freelistTriggersVacuum(c.pages, c.freelist); got != c.wantFires {
+				t.Errorf("freelistTriggersVacuum(%d, %d) = %v, want %v",
+					c.pages, c.freelist, got, c.wantFires)
+			}
+		})
+	}
+}
+
+// TestVacuumIfFreelistHigh_FiresWhenForced exercises the end-to-end
+// path: artificially set the floor so any non-empty freelist triggers,
+// allocate + delete enough rows to inflate the freelist, run the helper
+// directly, then assert PRAGMA freelist_count dropped. Real-Open
+// integration is implicit: every other store test goes through Open and
+// gets the production thresholds (which never fire on small test DBs).
+func TestVacuumIfFreelistHigh_FiresWhenForced(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "freelist.db")
+
+	db, err := Open(dbPath, testKeyring(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	// Inflate the freelist: insert many rows, then delete them all.
+	// secure_delete=ON zeros the pages but they stay on the freelist
+	// until VACUUM compacts them away.
+	for i := range 200 {
+		msg := &Message{
+			MessageID: fmt.Sprintf("inflate-%d@example.com", i),
+			Subject:   strings.Repeat("padding ", 50),
+			FromAddr:  fmt.Sprintf("sender-%d@example.com", i),
+			ToAddrs:   "bob@example.com",
+			Date:      1700000000,
+			CreatedAt: 1700000000,
+			Mailbox:   "INBOX",
+			BodyText:  strings.Repeat("body ", 200),
+		}
+		if err := db.InsertMessage(msg); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	if _, err := db.db.Exec("DELETE FROM messages"); err != nil {
+		t.Fatalf("bulk delete: %v", err)
+	}
+
+	var beforeFree int64
+	if err := db.db.QueryRow("PRAGMA freelist_count").Scan(&beforeFree); err != nil {
+		t.Fatalf("read freelist pre-VACUUM: %v", err)
+	}
+	if beforeFree == 0 {
+		t.Skip("could not inflate freelist on this SQLite build — test inert")
+	}
+
+	// Lower both thresholds for this test so the helper actually fires.
+	origRatio, origFloor := freelistVacuumRatio, freelistVacuumFloor
+	t.Cleanup(func() {
+		freelistVacuumRatio = origRatio
+		freelistVacuumFloor = origFloor
+	})
+	freelistVacuumRatio = 0
+	freelistVacuumFloor = 1
+
+	if err := vacuumIfFreelistHigh(db.db); err != nil {
+		t.Fatalf("vacuumIfFreelistHigh: %v", err)
+	}
+
+	var afterFree int64
+	if err := db.db.QueryRow("PRAGMA freelist_count").Scan(&afterFree); err != nil {
+		t.Fatalf("read freelist post-VACUUM: %v", err)
+	}
+	if afterFree >= beforeFree {
+		t.Errorf("freelist did not shrink: before=%d after=%d", beforeFree, afterFree)
+	}
+}
+
+func TestSecureDelete_ScrubsRawBytes(t *testing.T) {
+	const marker = "DURIAN_SECURE_DELETE_MARKER_3F8B7A1E"
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "email.db")
+
+	db, err := Open(dbPath, testKeyring(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	msg := &Message{
+		MessageID: "marker@example.com",
+		Subject:   "test",
+		FromAddr:  marker + "@example.com",
+		ToAddrs:   "bob@example.com",
+		Date:      1700000000,
+		CreatedAt: 1700000000,
+		Mailbox:   "INBOX",
+	}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// Force the row into the main DB so the pre-delete sanity grep is
+	// looking at the right file — without this, the WAL holds the bytes
+	// and the main .db is still empty.
+	if _, err := db.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatalf("pre-delete checkpoint: %v", err)
+	}
+	if !rawDBContains(t, dbPath, marker) {
+		t.Fatalf("test setup broken: marker %q not present in raw bytes pre-delete", marker)
+	}
+
+	if err := db.DeleteByMessageID("marker@example.com"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	// Merge the secure-delete-zeroed page from WAL into the main DB file.
+	if _, err := db.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatalf("post-delete checkpoint: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		path := dbPath + suffix
+		b, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if bytes.Contains(b, []byte(marker)) {
+			t.Errorf("marker %q still present in %s after secure_delete (%d bytes)", marker, path, len(b))
+		}
+	}
+}
+
+// rawDBContains returns whether the raw bytes of dbPath (or its WAL
+// sidecar, if the marker hasn't been checkpointed yet) contain the
+// marker. Used by the secure_delete sanity check.
+func rawDBContains(t *testing.T, dbPath, marker string) bool {
+	t.Helper()
+	for _, suffix := range []string{"", "-wal"} {
+		path := dbPath + suffix
+		b, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if bytes.Contains(b, []byte(marker)) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestInitIdempotent(t *testing.T) {

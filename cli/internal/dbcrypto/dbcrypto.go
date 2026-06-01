@@ -35,6 +35,14 @@ const (
 	// envelopeOverhead is the minimum bytes any V1 ciphertext occupies,
 	// even for empty plaintext: version + nonce + tag.
 	envelopeOverhead = 1 + NonceLen + TagLen
+
+	// MaxPlaintextLen caps the bytes any single Encrypt / EncryptX call
+	// will accept. SQLite's default SQLITE_MAX_LENGTH is 1 GiB, so any
+	// value the store could possibly hand us already fits; this guard
+	// exists so the `envelopeOverhead + len(plaintext)` expression in
+	// sealAEAD provably can't overflow `int` on 32-bit platforms or trip
+	// CodeQL's go/allocation-size-overflow check.
+	MaxPlaintextLen = 1 << 30 // 1 GiB
 )
 
 // Label is the HKDF "info" string for one sub-key purpose. The exact byte
@@ -54,9 +62,10 @@ const (
 )
 
 var (
-	ErrInvalidKey      = errors.New("dbcrypto: key must be 32 bytes")
-	ErrShortCiphertext = errors.New("dbcrypto: ciphertext shorter than envelope overhead")
-	ErrUnknownVersion  = errors.New("dbcrypto: unknown envelope version")
+	ErrInvalidKey       = errors.New("dbcrypto: key must be 32 bytes")
+	ErrShortCiphertext  = errors.New("dbcrypto: ciphertext shorter than envelope overhead")
+	ErrUnknownVersion   = errors.New("dbcrypto: unknown envelope version")
+	ErrPlaintextTooLong = fmt.Errorf("dbcrypto: plaintext exceeds %d bytes", MaxPlaintextLen)
 )
 
 // DeriveSubKey extracts a 32-byte purpose-specific sub-key from a 32-byte
@@ -74,6 +83,10 @@ func DeriveSubKey(master []byte, label Label) ([]byte, error) {
 //
 // The returned slice is newly allocated and safe for the caller to retain.
 // Plaintext is not modified.
+//
+// Hot paths that already hold a Keyring should prefer the per-sub-key
+// methods (e.g. (*Keyring).EncryptSubject), which reuse a cached AEAD
+// instead of re-running aes.NewCipher + cipher.NewGCM per call.
 func Encrypt(key, plaintext []byte) ([]byte, error) {
 	if len(key) != KeyLen {
 		return nil, ErrInvalidKey
@@ -82,18 +95,15 @@ func Encrypt(key, plaintext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Pre-allocate the full envelope so Seal appends in place.
-	out := make([]byte, 1+NonceLen, envelopeOverhead+len(plaintext))
-	out[0] = EnvelopeV1
-	nonce := out[1 : 1+NonceLen]
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("dbcrypto: nonce: %w", err)
-	}
-	return gcm.Seal(out, nonce, plaintext, nil), nil
+	return sealAEAD(gcm, plaintext)
 }
 
 // Decrypt opens a V1 envelope produced by Encrypt. It returns the plaintext
 // or an error — never both, and never a partial result.
+//
+// Hot paths that already hold a Keyring should prefer the per-sub-key
+// methods (e.g. (*Keyring).DecryptSubject), which reuse a cached AEAD
+// instead of re-running aes.NewCipher + cipher.NewGCM per call.
 //
 // Check order matters: key length first (AES constructor would panic on a
 // bad-length key), then envelope length (no slice access without a bound
@@ -111,13 +121,43 @@ func Decrypt(key, ciphertext []byte) ([]byte, error) {
 	if ciphertext[0] != EnvelopeV1 {
 		return nil, ErrUnknownVersion
 	}
-	nonce := ciphertext[1 : 1+NonceLen]
-	body := ciphertext[1+NonceLen:]
 	gcm, err := newGCM(key)
 	if err != nil {
 		return nil, err
 	}
-	return gcm.Open(nil, nonce, body, nil)
+	return openAEAD(gcm, ciphertext)
+}
+
+// sealAEAD writes the V1 envelope around aead.Seal. The aead must have a
+// NonceSize of NonceLen (true for AES-GCM constructed via newGCM). Pulled
+// out so both Encrypt (fresh AEAD per call) and the Keyring per-sub-key
+// methods (cached AEAD) share one identical wire-format producer — no risk
+// of envelope-shape drift between the two paths.
+//
+// The MaxPlaintextLen guard bounds the make() capacity argument below so
+// `envelopeOverhead + len(plaintext)` provably stays within int range
+// (CodeQL go/allocation-size-overflow).
+func sealAEAD(aead cipher.AEAD, plaintext []byte) ([]byte, error) {
+	if len(plaintext) > MaxPlaintextLen {
+		return nil, ErrPlaintextTooLong
+	}
+	// Pre-allocate the full envelope so Seal appends in place.
+	out := make([]byte, 1+NonceLen, envelopeOverhead+len(plaintext))
+	out[0] = EnvelopeV1
+	nonce := out[1 : 1+NonceLen]
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("dbcrypto: nonce: %w", err)
+	}
+	return aead.Seal(out, nonce, plaintext, nil), nil
+}
+
+// openAEAD parses the V1 envelope and calls aead.Open. Callers are
+// expected to have already validated len(ciphertext) >= envelopeOverhead
+// and ciphertext[0] == EnvelopeV1.
+func openAEAD(aead cipher.AEAD, ciphertext []byte) ([]byte, error) {
+	nonce := ciphertext[1 : 1+NonceLen]
+	body := ciphertext[1+NonceLen:]
+	return aead.Open(nil, nonce, body, nil)
 }
 
 // newGCM is the shared AES-GCM construction step. Pulled out so Encrypt and

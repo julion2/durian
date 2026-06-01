@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -81,7 +82,82 @@ func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
 		}
 	}
 
+	if dbPath != ":memory:" {
+		if err := vacuumIfFreelistHigh(db); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("freelist hygiene: %w", err)
+		}
+	}
+
 	return &DB{db: db, keyring: kr}, nil
+}
+
+// freelistVacuumRatio and freelistVacuumFloor together decide when
+// vacuumIfFreelistHigh fires. ADR-0001 audit #251: a Time-Machine /
+// iCloud / external backup taken before the v19→v20 audit-H3 fix is
+// still full of dropped-step-7e plaintext bytes stranded in unused
+// pages. The retroactive VACUUM only fires once per migration step,
+// so a user who restores the old backup over a current install never
+// gets cleaned up. This guard is the recurring counter-measure —
+// "if the freelist is unusually large for this DB, scrub it once."
+//
+// Trade-off: bounded recurring cost (one VACUUM per N restores) vs.
+// the current unbounded behaviour (none). Threshold values are tuned
+// to avoid firing on a healthy DB (typical freelist after sync ≈ a
+// few dozen pages on 50k-message mailbox = ~10–50 MB) and to fire
+// after a backup restore (page_count comparable, but freelist
+// proportionally huge).
+//
+// Calibration: ratio=0.10 fires when 10 % of the file is freelist —
+// well above the post-sync baseline (single-digit pages on a healthy
+// 200 MB DB ≈ 0.001 %) but well below the post-restore signal
+// (step-7e drop alone stranded ~30 % of pages on early test DBs).
+// floor=1024 (≈4 MB at 4 KB pages) is the absolute scrub trigger so
+// even tiny DBs with proportionally huge freelists get cleaned —
+// without it, a 10k-page test DB with 800 free pages (8 %) would
+// slip past the ratio guard.
+var (
+	freelistVacuumRatio = 0.10
+	freelistVacuumFloor = int64(1024)
+)
+
+// vacuumIfFreelistHigh inspects PRAGMA page_count and PRAGMA
+// freelist_count and runs VACUUM when the freelist exceeds either
+// freelistVacuumFloor or freelistVacuumRatio * page_count. It is a
+// best-effort hygiene pass: failures here do not block Open in
+// production (the function is wrapped in a fmt.Errorf for surfacing,
+// but callers can choose to log-and-continue if VACUUM ever becomes
+// expensive on huge databases).
+func vacuumIfFreelistHigh(db *sql.DB) error {
+	var pageCount, freelist int64
+	if err := db.QueryRow("PRAGMA page_count").Scan(&pageCount); err != nil {
+		return fmt.Errorf("read page_count: %w", err)
+	}
+	if err := db.QueryRow("PRAGMA freelist_count").Scan(&freelist); err != nil {
+		return fmt.Errorf("read freelist_count: %w", err)
+	}
+	if !freelistTriggersVacuum(pageCount, freelist) {
+		return nil
+	}
+	slog.Info("auto-VACUUM triggered by high freelist", "module", "STORE",
+		"page_count", pageCount, "freelist_count", freelist,
+		"ratio", freelistVacuumRatio, "floor", freelistVacuumFloor)
+	if _, err := db.Exec("VACUUM"); err != nil {
+		return fmt.Errorf("vacuum: %w", err)
+	}
+	return nil
+}
+
+// freelistTriggersVacuum is the pure decision so unit tests can drive
+// it without spinning up a real DB.
+func freelistTriggersVacuum(pageCount, freelist int64) bool {
+	if freelist >= freelistVacuumFloor && freelistVacuumFloor > 0 {
+		return true
+	}
+	if pageCount > 0 && float64(freelist)/float64(pageCount) >= freelistVacuumRatio && freelistVacuumRatio > 0 {
+		return true
+	}
+	return false
 }
 
 // Close closes the database connection.
@@ -1461,7 +1537,7 @@ func (d *DB) encryptSubject(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
-	return dbcrypto.Encrypt(d.keyring.Subject, []byte(plain))
+	return d.keyring.EncryptSubject([]byte(plain))
 }
 
 // decryptSubject returns the plaintext subject for a row. It prefers the
@@ -1473,7 +1549,7 @@ func (d *DB) decryptSubject(plain string, ct []byte) (string, error) {
 	if len(ct) == 0 {
 		return plain, nil
 	}
-	out, err := dbcrypto.Decrypt(d.keyring.Subject, ct)
+	out, err := d.keyring.DecryptSubject(ct)
 	if err != nil {
 		return "", fmt.Errorf("decrypt subject: %w", err)
 	}
@@ -1527,7 +1603,7 @@ func (d *DB) backfillSubjectCt() error {
 	}
 	defer stmt.Close()
 	for _, p := range batch {
-		ct, err := dbcrypto.Encrypt(d.keyring.Subject, []byte(p.subject))
+		ct, err := d.keyring.EncryptSubject([]byte(p.subject))
 		if err != nil {
 			return fmt.Errorf("encrypt id=%d: %w", p.id, err)
 		}
@@ -1544,7 +1620,7 @@ func (d *DB) encryptBody(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
-	return dbcrypto.Encrypt(d.keyring.Body, []byte(plain))
+	return d.keyring.EncryptBody([]byte(plain))
 }
 
 // decryptBody returns the plaintext body for a row, preferring the
@@ -1556,7 +1632,7 @@ func (d *DB) decryptBody(plain string, ct []byte) (string, error) {
 	if len(ct) == 0 {
 		return plain, nil
 	}
-	out, err := dbcrypto.Decrypt(d.keyring.Body, ct)
+	out, err := d.keyring.DecryptBody(ct)
 	if err != nil {
 		return "", fmt.Errorf("decrypt body: %w", err)
 	}
@@ -1724,7 +1800,7 @@ func (d *DB) encryptMeta(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
-	return dbcrypto.Encrypt(d.keyring.Meta, []byte(plain))
+	return d.keyring.EncryptMeta([]byte(plain))
 }
 
 // decryptMeta returns plaintext for a meta_key column, falling back to
@@ -1735,7 +1811,7 @@ func (d *DB) decryptMeta(plain string, ct []byte) (string, error) {
 	if len(ct) == 0 {
 		return plain, nil
 	}
-	out, err := dbcrypto.Decrypt(d.keyring.Meta, ct)
+	out, err := d.keyring.DecryptMeta(ct)
 	if err != nil {
 		return "", fmt.Errorf("decrypt meta: %w", err)
 	}
@@ -1960,7 +2036,7 @@ func (d *DB) encryptDraftJSON(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
-	return dbcrypto.Encrypt(d.keyring.Draft, []byte(plain))
+	return d.keyring.EncryptDraft([]byte(plain))
 }
 
 // decryptDraftJSON returns plaintext draft JSON, preferring ct when set.
@@ -1969,7 +2045,7 @@ func (d *DB) decryptDraftJSON(plain string, ct []byte) (string, error) {
 	if len(ct) == 0 {
 		return plain, nil
 	}
-	out, err := dbcrypto.Decrypt(d.keyring.Draft, ct)
+	out, err := d.keyring.DecryptDraft(ct)
 	if err != nil {
 		return "", fmt.Errorf("decrypt draft_json: %w", err)
 	}
@@ -2062,7 +2138,7 @@ func (d *DB) encryptHeaderValue(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
-	return dbcrypto.Encrypt(d.keyring.Headers, []byte(plain))
+	return d.keyring.EncryptHeaders([]byte(plain))
 }
 
 // decryptHeaderValue returns the plaintext header value, preferring ct
@@ -2071,7 +2147,7 @@ func (d *DB) decryptHeaderValue(plain string, ct []byte) (string, error) {
 	if len(ct) == 0 {
 		return plain, nil
 	}
-	out, err := dbcrypto.Decrypt(d.keyring.Headers, ct)
+	out, err := d.keyring.DecryptHeaders(ct)
 	if err != nil {
 		return "", fmt.Errorf("decrypt header value: %w", err)
 	}
@@ -2142,7 +2218,7 @@ func (d *DB) encryptAddr(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
-	return dbcrypto.Encrypt(d.keyring.Addrs, []byte(plain))
+	return d.keyring.EncryptAddrs([]byte(plain))
 }
 
 // decryptAddr returns the plaintext address for a row, preferring the
@@ -2152,7 +2228,7 @@ func (d *DB) decryptAddr(plain string, ct []byte) (string, error) {
 	if len(ct) == 0 {
 		return plain, nil
 	}
-	out, err := dbcrypto.Decrypt(d.keyring.Addrs, ct)
+	out, err := d.keyring.DecryptAddrs(ct)
 	if err != nil {
 		return "", fmt.Errorf("decrypt addr: %w", err)
 	}

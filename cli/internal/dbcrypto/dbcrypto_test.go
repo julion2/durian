@@ -108,6 +108,24 @@ func TestEncrypt_RejectsBadKey(t *testing.T) {
 	}
 }
 
+// TestEncrypt_RejectsOversizedPlaintext pins the MaxPlaintextLen guard
+// that sealAEAD relies on so `envelopeOverhead + len(plaintext)` can't
+// overflow `int` (CodeQL go/allocation-size-overflow).
+//
+// Skipped on memory-constrained runners — allocating 1 GiB just to read
+// its length is wasteful, but there is no cheaper way in pure Go to
+// produce a slice whose `len()` lies about its backing.
+func TestEncrypt_RejectsOversizedPlaintext(t *testing.T) {
+	if testing.Short() {
+		t.Skip("allocates 1 GiB; skipped under -short")
+	}
+	key := bytes.Repeat([]byte{0x88}, KeyLen)
+	oversized := make([]byte, MaxPlaintextLen+1)
+	if _, err := Encrypt(key, oversized); !errors.Is(err, ErrPlaintextTooLong) {
+		t.Errorf("err = %v, want ErrPlaintextTooLong", err)
+	}
+}
+
 // --- Round-trip (requires Decrypt to be implemented) ---
 
 func TestRoundTrip_AllLabels(t *testing.T) {
@@ -252,22 +270,122 @@ func TestNewKeyring_DerivesAllSubKeys(t *testing.T) {
 	}
 }
 
+// TestKeyring_CachedAEADMatchesFreshPath proves that ciphertext produced
+// by the cached-AEAD per-sub-key methods round-trips through the
+// package-level Decrypt(key, ct) path and vice versa. If the two paths
+// ever diverge on envelope shape, every ciphertext written by one path
+// becomes unreadable by the other — same risk class as the HKDF tripwire
+// above.
+func TestKeyring_CachedAEADMatchesFreshPath(t *testing.T) {
+	master := bytes.Repeat([]byte{0xa5}, MasterKeyLen)
+	kr, err := NewKeyring(master)
+	if err != nil {
+		t.Fatalf("NewKeyring: %v", err)
+	}
+	plain := []byte("paths must agree on the wire format")
+
+	cases := []struct {
+		name    string
+		key     []byte
+		seal    func([]byte) ([]byte, error)
+		open    func([]byte) ([]byte, error)
+	}{
+		{"Subject", kr.Subject, kr.EncryptSubject, kr.DecryptSubject},
+		{"Body", kr.Body, kr.EncryptBody, kr.DecryptBody},
+		{"Addrs", kr.Addrs, kr.EncryptAddrs, kr.DecryptAddrs},
+		{"Headers", kr.Headers, kr.EncryptHeaders, kr.DecryptHeaders},
+		{"Draft", kr.Draft, kr.EncryptDraft, kr.DecryptDraft},
+		{"Meta", kr.Meta, kr.EncryptMeta, kr.DecryptMeta},
+		{"Contact", kr.Contact, kr.EncryptContact, kr.DecryptContact},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// cached seal → fresh open
+			ct, err := c.seal(plain)
+			if err != nil {
+				t.Fatalf("cached seal: %v", err)
+			}
+			got, err := Decrypt(c.key, ct)
+			if err != nil {
+				t.Fatalf("fresh open of cached ct: %v", err)
+			}
+			if !bytes.Equal(got, plain) {
+				t.Errorf("fresh-open mismatch: got=%q want=%q", got, plain)
+			}
+			// fresh seal → cached open
+			ct2, err := Encrypt(c.key, plain)
+			if err != nil {
+				t.Fatalf("fresh seal: %v", err)
+			}
+			got2, err := c.open(ct2)
+			if err != nil {
+				t.Fatalf("cached open of fresh ct: %v", err)
+			}
+			if !bytes.Equal(got2, plain) {
+				t.Errorf("cached-open mismatch: got=%q want=%q", got2, plain)
+			}
+		})
+	}
+}
+
+// TestKeyring_DecryptCached_RejectsStructuralErrors mirrors the
+// package-level guards (short / unknown-version) for the cached path so
+// callers see the same error shape regardless of which entry they took.
+func TestKeyring_DecryptCached_RejectsStructuralErrors(t *testing.T) {
+	kr, err := NewKeyring(bytes.Repeat([]byte{0x66}, MasterKeyLen))
+	if err != nil {
+		t.Fatalf("NewKeyring: %v", err)
+	}
+	for _, n := range []int{0, 1, NonceLen, envelopeOverhead - 1} {
+		if _, err := kr.DecryptSubject(make([]byte, n)); !errors.Is(err, ErrShortCiphertext) {
+			t.Errorf("len %d: err = %v, want ErrShortCiphertext", n, err)
+		}
+	}
+	bad := make([]byte, envelopeOverhead)
+	bad[0] = 0xff
+	if _, err := kr.DecryptSubject(bad); !errors.Is(err, ErrUnknownVersion) {
+		t.Errorf("bad version: err = %v, want ErrUnknownVersion", err)
+	}
+}
+
+// BenchmarkDecrypt_FreshVsCached compares the package-level Decrypt path
+// (which re-runs aes.NewCipher + cipher.NewGCM per call) against the
+// Keyring-cached path. ADR-0001 audit #254.1 acceptance: ≥2× speedup.
+//
+// Run via:  go test -run=^$ -bench=Decrypt_FreshVsCached -benchmem ./...
+func BenchmarkDecrypt_FreshVsCached(b *testing.B) {
+	master := bytes.Repeat([]byte{0xc3}, MasterKeyLen)
+	kr, err := NewKeyring(master)
+	if err != nil {
+		b.Fatalf("NewKeyring: %v", err)
+	}
+	plain := bytes.Repeat([]byte("durian-body "), 80) // ~1 KB
+	ct, err := kr.EncryptBody(plain)
+	if err != nil {
+		b.Fatalf("seal: %v", err)
+	}
+
+	b.Run("fresh", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := Decrypt(kr.Body, ct); err != nil {
+				b.Fatalf("decrypt: %v", err)
+			}
+		}
+	})
+	b.Run("cached", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := kr.DecryptBody(ct); err != nil {
+				b.Fatalf("decrypt: %v", err)
+			}
+		}
+	})
+}
+
 func TestNewKeyring_RejectsBadMasterLen(t *testing.T) {
 	if _, err := NewKeyring(make([]byte, 16)); !errors.Is(err, ErrInvalidKey) {
 		t.Errorf("err = %v, want ErrInvalidKey wrapped", err)
 	}
 }
 
-func TestKeyring_Wipe(t *testing.T) {
-	kr, err := NewKeyring(bytes.Repeat([]byte{0x33}, MasterKeyLen))
-	if err != nil {
-		t.Fatalf("NewKeyring: %v", err)
-	}
-	kr.Wipe()
-	if kr.Subject != nil {
-		t.Errorf("Subject not nilled after Wipe: %x", kr.Subject)
-	}
-	// Wipe must be safe on nil receiver — defensive for shutdown paths.
-	var nilKr *Keyring
-	nilKr.Wipe()
-}

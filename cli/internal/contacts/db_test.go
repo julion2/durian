@@ -1,6 +1,9 @@
 package contacts
 
 import (
+	"bytes"
+	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -33,6 +36,78 @@ func TestOpen_SecureDeleteEnabled(t *testing.T) {
 	if v != 1 {
 		t.Errorf("PRAGMA secure_delete = %d, want 1", v)
 	}
+}
+
+// TestSecureDelete_ScrubsRawBytes (ADR-0001 audit #252): same property
+// proof as the store-side test, applied to contacts.db. The contact
+// name column stays plaintext in contacts.db (ADR-0001 step 7g moved
+// the encrypted variant out of scope until β-revision lands here), so
+// we insert a marker name, delete the row, checkpoint, and grep raw
+// bytes — must not survive.
+func TestSecureDelete_ScrubsRawBytes(t *testing.T) {
+	const marker = "DurianSecureDeleteMarker3F8B7A1E"
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "contacts.db")
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	if err := db.Add("scrub@example.com", marker, SourceImported); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := db.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatalf("pre-delete checkpoint: %v", err)
+	}
+	if !rawContactsDBContains(t, dbPath, marker) {
+		t.Fatalf("test setup broken: marker %q not present pre-delete", marker)
+	}
+
+	if err := db.Delete("scrub@example.com"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := db.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatalf("post-delete checkpoint: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		path := dbPath + suffix
+		b, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if bytes.Contains(b, []byte(marker)) {
+			t.Errorf("marker %q still present in %s after secure_delete (%d bytes)", marker, path, len(b))
+		}
+	}
+}
+
+func rawContactsDBContains(t *testing.T, dbPath, marker string) bool {
+	t.Helper()
+	for _, suffix := range []string{"", "-wal"} {
+		path := dbPath + suffix
+		b, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if bytes.Contains(b, []byte(marker)) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestAddAndSearch(t *testing.T) {

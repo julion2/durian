@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -276,10 +277,28 @@ func prompt(message string) (string, error) {
 	return strings.TrimSpace(line), nil
 }
 
-// openEditor opens $EDITOR for the user to write the email body
+// openEditor opens $EDITOR for the user to write the email body.
+//
+// ADR-0001 audit #254.3: the editor file holds the plaintext body, so it
+// must not land in /tmp where any local user can read it and where editor
+// artefacts (vim .swp, crashed sessions) linger across reboots. The file
+// is placed under $XDG_CACHE_HOME/durian (or ~/.cache/durian) with the
+// containing directory restricted to 0700 — matching the imap state-manager
+// convention in the same cache root.
 func openEditor(to, subject string) (string, error) {
-	// Create temp file with template
-	tmpfile, err := os.CreateTemp("", "durian-*.txt")
+	cacheRoot := os.Getenv("XDG_CACHE_HOME")
+	if cacheRoot == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home dir for editor tempfile: %w", err)
+		}
+		cacheRoot = filepath.Join(home, ".cache")
+	}
+	cacheDir := filepath.Join(cacheRoot, "durian")
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		return "", fmt.Errorf("create editor cache dir: %w", err)
+	}
+	tmpfile, err := os.CreateTemp(cacheDir, "compose-*.txt")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp file: %w", err)
 	}
