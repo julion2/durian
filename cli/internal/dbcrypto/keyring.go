@@ -2,7 +2,6 @@ package dbcrypto
 
 import (
 	"crypto/cipher"
-	"crypto/subtle"
 	"fmt"
 )
 
@@ -193,36 +192,14 @@ func decryptCached(aead cipher.AEAD, ciphertext []byte) ([]byte, error) {
 	return openAEAD(aead, ciphertext)
 }
 
-// Wipe overwrites every sub-key in place with zeroes and nils the slice
-// headers, making post-Wipe use of the Keyring panic instead of silently
-// returning all-zero ciphertexts. Intended for shutdown paths; Go's GC
-// otherwise reclaims the underlying memory eventually.
-func (k *Keyring) Wipe() {
-	if k == nil {
-		return
-	}
-	zero(k.Subject)
-	zero(k.Body)
-	zero(k.Addrs)
-	zero(k.Headers)
-	zero(k.Draft)
-	zero(k.Meta)
-	zero(k.Contact)
-	zero(k.FTSToken)
-	k.Subject = nil
-	k.Body = nil
-	k.Addrs = nil
-	k.Headers = nil
-	k.Draft = nil
-	k.Meta = nil
-	k.Contact = nil
-	k.FTSToken = nil
-}
-
-// zero overwrites b with zero bytes in constant time. Used by Wipe.
-func zero(b []byte) {
-	if len(b) == 0 {
-		return
-	}
-	subtle.ConstantTimeCopy(1, b, make([]byte, len(b)))
-}
+// (ADR-0001 audit #253) An earlier revision of this file shipped a
+// Keyring.Wipe method that overwrote each sub-key with zeros via
+// crypto/subtle.ConstantTimeCopy. It has been removed: the guarantee
+// was unenforceable in Go (no runtime.KeepAlive, GC may already have
+// copied the backing array during slice growth, sub-keys are held for
+// process lifetime so Wipe fires only at shutdown when the process is
+// about to free everything anyway). Shipping a best-effort scrub under
+// the name "Wipe" is worse than not shipping one — readers assumed
+// stronger semantics than the code delivered. See ADR-0001 § Memory
+// hygiene for the honest contract: sub-keys stay in process memory
+// for the lifetime of `durian serve`, no scrubbing attempted.

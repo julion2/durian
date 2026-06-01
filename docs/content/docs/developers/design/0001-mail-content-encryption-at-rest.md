@@ -556,14 +556,19 @@ revisions of this section overpromised):
   defeated by Go's string-from-bytes copy anyway, so the historical
   design that named that pattern was misleading; calling it out
   honestly here saves a future reader from chasing a phantom guarantee.
-- `Keyring.Wipe()` zeroes the sub-key byte slices at shutdown. Best-effort
-  only: Go's GC may already have copied the slice during heap growth, the
-  function has no `runtime.KeepAlive(k)` after the zeroing (a sufficiently
-  aggressive compiler could in theory reorder past the wipe), and the
-  sub-keys are held for process lifetime anyway so the wipe runs at the
-  moment everything is about to be freed. Tracked as a follow-up
-  (issue #253) — either harden the contract with `runtime.KeepAlive` +
-  tests, or remove the misleading API entirely.
+- **Sub-keys are not wiped — at shutdown or otherwise.** An earlier
+  revision of this ADR documented a `Keyring.Wipe()` that overwrote
+  each sub-key with zeros via `crypto/subtle.ConstantTimeCopy`. Issue
+  #253 (audit-2 follow-up) removed it: the guarantee was unenforceable
+  in Go (no `runtime.KeepAlive`, GC may already have copied the
+  backing array during slice growth, sub-keys are held for process
+  lifetime so the wipe fired only at shutdown when the process was
+  about to free everything anyway), and shipping a best-effort scrub
+  under a name that implies stronger semantics is worse than not
+  shipping one. Honest contract: sub-keys live in process memory for
+  the lifetime of `durian serve` and are released to the GC at exit,
+  same as any other allocation. Users who need memory-dump resistance
+  rely on the two mitigations in the next bullet, not on `Wipe`.
 - Do **not** rely on `[]byte` slice reuse from a sync.Pool for plaintext.
   Pool reuse can leave plaintext stranded in unrelated allocations.
 - Document explicitly that the running process is a soft target. Users who

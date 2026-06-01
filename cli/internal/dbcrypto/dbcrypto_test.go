@@ -371,16 +371,3 @@ func TestNewKeyring_RejectsBadMasterLen(t *testing.T) {
 	}
 }
 
-func TestKeyring_Wipe(t *testing.T) {
-	kr, err := NewKeyring(bytes.Repeat([]byte{0x33}, MasterKeyLen))
-	if err != nil {
-		t.Fatalf("NewKeyring: %v", err)
-	}
-	kr.Wipe()
-	if kr.Subject != nil {
-		t.Errorf("Subject not nilled after Wipe: %x", kr.Subject)
-	}
-	// Wipe must be safe on nil receiver — defensive for shutdown paths.
-	var nilKr *Keyring
-	nilKr.Wipe()
-}
