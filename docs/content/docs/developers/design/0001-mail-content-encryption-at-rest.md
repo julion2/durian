@@ -3,10 +3,10 @@ title: "ADR-0001: Mail content encryption at rest with searchable blind-token FT
 weight: 1
 ---
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented 2026-05-17 — 2026-06-01, all 8 steps + audit-2 follow-ups shipped via PRs #239–#256, #258)
 - **Date:** 2026-05-17
 - **Author:** @julion2 (solo project; external crypto review tracked in §Open Questions)
-- **Issue:** [#217](https://github.com/julion2/durian/issues/217)
+- **Issue:** [#217](https://github.com/julion2/durian/issues/217) (closed 2026-06-01)
 - **Supersedes:** —
 - **Superseded by:** —
 
