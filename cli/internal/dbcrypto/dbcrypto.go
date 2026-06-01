@@ -74,6 +74,10 @@ func DeriveSubKey(master []byte, label Label) ([]byte, error) {
 //
 // The returned slice is newly allocated and safe for the caller to retain.
 // Plaintext is not modified.
+//
+// Hot paths that already hold a Keyring should prefer the per-sub-key
+// methods (e.g. (*Keyring).EncryptSubject), which reuse a cached AEAD
+// instead of re-running aes.NewCipher + cipher.NewGCM per call.
 func Encrypt(key, plaintext []byte) ([]byte, error) {
 	if len(key) != KeyLen {
 		return nil, ErrInvalidKey
@@ -82,18 +86,15 @@ func Encrypt(key, plaintext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Pre-allocate the full envelope so Seal appends in place.
-	out := make([]byte, 1+NonceLen, envelopeOverhead+len(plaintext))
-	out[0] = EnvelopeV1
-	nonce := out[1 : 1+NonceLen]
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("dbcrypto: nonce: %w", err)
-	}
-	return gcm.Seal(out, nonce, plaintext, nil), nil
+	return sealAEAD(gcm, plaintext)
 }
 
 // Decrypt opens a V1 envelope produced by Encrypt. It returns the plaintext
 // or an error — never both, and never a partial result.
+//
+// Hot paths that already hold a Keyring should prefer the per-sub-key
+// methods (e.g. (*Keyring).DecryptSubject), which reuse a cached AEAD
+// instead of re-running aes.NewCipher + cipher.NewGCM per call.
 //
 // Check order matters: key length first (AES constructor would panic on a
 // bad-length key), then envelope length (no slice access without a bound
@@ -111,13 +112,36 @@ func Decrypt(key, ciphertext []byte) ([]byte, error) {
 	if ciphertext[0] != EnvelopeV1 {
 		return nil, ErrUnknownVersion
 	}
-	nonce := ciphertext[1 : 1+NonceLen]
-	body := ciphertext[1+NonceLen:]
 	gcm, err := newGCM(key)
 	if err != nil {
 		return nil, err
 	}
-	return gcm.Open(nil, nonce, body, nil)
+	return openAEAD(gcm, ciphertext)
+}
+
+// sealAEAD writes the V1 envelope around aead.Seal. The aead must have a
+// NonceSize of NonceLen (true for AES-GCM constructed via newGCM). Pulled
+// out so both Encrypt (fresh AEAD per call) and the Keyring per-sub-key
+// methods (cached AEAD) share one identical wire-format producer — no risk
+// of envelope-shape drift between the two paths.
+func sealAEAD(aead cipher.AEAD, plaintext []byte) ([]byte, error) {
+	// Pre-allocate the full envelope so Seal appends in place.
+	out := make([]byte, 1+NonceLen, envelopeOverhead+len(plaintext))
+	out[0] = EnvelopeV1
+	nonce := out[1 : 1+NonceLen]
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("dbcrypto: nonce: %w", err)
+	}
+	return aead.Seal(out, nonce, plaintext, nil), nil
+}
+
+// openAEAD parses the V1 envelope and calls aead.Open. Callers are
+// expected to have already validated len(ciphertext) >= envelopeOverhead
+// and ciphertext[0] == EnvelopeV1.
+func openAEAD(aead cipher.AEAD, ciphertext []byte) ([]byte, error) {
+	nonce := ciphertext[1 : 1+NonceLen]
+	body := ciphertext[1+NonceLen:]
+	return aead.Open(nil, nonce, body, nil)
 }
 
 // newGCM is the shared AES-GCM construction step. Pulled out so Encrypt and

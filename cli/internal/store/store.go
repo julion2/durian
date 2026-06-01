@@ -1461,7 +1461,7 @@ func (d *DB) encryptSubject(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
-	return dbcrypto.Encrypt(d.keyring.Subject, []byte(plain))
+	return d.keyring.EncryptSubject([]byte(plain))
 }
 
 // decryptSubject returns the plaintext subject for a row. It prefers the
@@ -1473,7 +1473,7 @@ func (d *DB) decryptSubject(plain string, ct []byte) (string, error) {
 	if len(ct) == 0 {
 		return plain, nil
 	}
-	out, err := dbcrypto.Decrypt(d.keyring.Subject, ct)
+	out, err := d.keyring.DecryptSubject(ct)
 	if err != nil {
 		return "", fmt.Errorf("decrypt subject: %w", err)
 	}
@@ -1527,7 +1527,7 @@ func (d *DB) backfillSubjectCt() error {
 	}
 	defer stmt.Close()
 	for _, p := range batch {
-		ct, err := dbcrypto.Encrypt(d.keyring.Subject, []byte(p.subject))
+		ct, err := d.keyring.EncryptSubject([]byte(p.subject))
 		if err != nil {
 			return fmt.Errorf("encrypt id=%d: %w", p.id, err)
 		}
@@ -1544,7 +1544,7 @@ func (d *DB) encryptBody(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
-	return dbcrypto.Encrypt(d.keyring.Body, []byte(plain))
+	return d.keyring.EncryptBody([]byte(plain))
 }
 
 // decryptBody returns the plaintext body for a row, preferring the
@@ -1556,7 +1556,7 @@ func (d *DB) decryptBody(plain string, ct []byte) (string, error) {
 	if len(ct) == 0 {
 		return plain, nil
 	}
-	out, err := dbcrypto.Decrypt(d.keyring.Body, ct)
+	out, err := d.keyring.DecryptBody(ct)
 	if err != nil {
 		return "", fmt.Errorf("decrypt body: %w", err)
 	}
@@ -1724,7 +1724,7 @@ func (d *DB) encryptMeta(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
-	return dbcrypto.Encrypt(d.keyring.Meta, []byte(plain))
+	return d.keyring.EncryptMeta([]byte(plain))
 }
 
 // decryptMeta returns plaintext for a meta_key column, falling back to
@@ -1735,7 +1735,7 @@ func (d *DB) decryptMeta(plain string, ct []byte) (string, error) {
 	if len(ct) == 0 {
 		return plain, nil
 	}
-	out, err := dbcrypto.Decrypt(d.keyring.Meta, ct)
+	out, err := d.keyring.DecryptMeta(ct)
 	if err != nil {
 		return "", fmt.Errorf("decrypt meta: %w", err)
 	}
@@ -1960,7 +1960,7 @@ func (d *DB) encryptDraftJSON(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
-	return dbcrypto.Encrypt(d.keyring.Draft, []byte(plain))
+	return d.keyring.EncryptDraft([]byte(plain))
 }
 
 // decryptDraftJSON returns plaintext draft JSON, preferring ct when set.
@@ -1969,7 +1969,7 @@ func (d *DB) decryptDraftJSON(plain string, ct []byte) (string, error) {
 	if len(ct) == 0 {
 		return plain, nil
 	}
-	out, err := dbcrypto.Decrypt(d.keyring.Draft, ct)
+	out, err := d.keyring.DecryptDraft(ct)
 	if err != nil {
 		return "", fmt.Errorf("decrypt draft_json: %w", err)
 	}
@@ -2062,7 +2062,7 @@ func (d *DB) encryptHeaderValue(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
-	return dbcrypto.Encrypt(d.keyring.Headers, []byte(plain))
+	return d.keyring.EncryptHeaders([]byte(plain))
 }
 
 // decryptHeaderValue returns the plaintext header value, preferring ct
@@ -2071,7 +2071,7 @@ func (d *DB) decryptHeaderValue(plain string, ct []byte) (string, error) {
 	if len(ct) == 0 {
 		return plain, nil
 	}
-	out, err := dbcrypto.Decrypt(d.keyring.Headers, ct)
+	out, err := d.keyring.DecryptHeaders(ct)
 	if err != nil {
 		return "", fmt.Errorf("decrypt header value: %w", err)
 	}
@@ -2142,7 +2142,7 @@ func (d *DB) encryptAddr(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
 	}
-	return dbcrypto.Encrypt(d.keyring.Addrs, []byte(plain))
+	return d.keyring.EncryptAddrs([]byte(plain))
 }
 
 // decryptAddr returns the plaintext address for a row, preferring the
@@ -2152,7 +2152,7 @@ func (d *DB) decryptAddr(plain string, ct []byte) (string, error) {
 	if len(ct) == 0 {
 		return plain, nil
 	}
-	out, err := dbcrypto.Decrypt(d.keyring.Addrs, ct)
+	out, err := d.keyring.DecryptAddrs(ct)
 	if err != nil {
 		return "", fmt.Errorf("decrypt addr: %w", err)
 	}
