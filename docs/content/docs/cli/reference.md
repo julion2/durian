@@ -128,7 +128,7 @@ durian master-key import --from ~/durian-master.age  # restore into a fresh keyc
 durian master-key import --from FILE --force         # overwrite an existing entry
 ```
 
-The master encrypts every sensitive column in `email.db` + `contacts.db`. Lose it and the local DB is unrecoverable. See the [Encryption at rest](../cli/encryption-at-rest/) walkthrough.
+The master encrypts every sensitive column in `email.db` + `contacts.db`. Lose it and the local DB is unrecoverable. See the [Encryption at rest](../encryption-at-rest/) walkthrough.
 
 ## contacts — local address book
 
