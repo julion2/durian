@@ -241,13 +241,13 @@ func deleteDraftFromLocalStore(account *config.AccountConfig, messageID string) 
 
 	db, err := store.Open(store.DefaultDBPath(), bootstrapKeyring())
 	if err != nil {
-		slog.Debug("Could not open store for draft delete", "module", "DRAFT", "err", err)
+		slog.Debug("Could not open store for draft delete", "module", "DRAFT", "err", err) // encgrep:allow word "draft" in message text, no draft value logged
 		return
 	}
 	defer db.Close()
 
 	if err := db.DeleteByMessageIDAndAccount(messageID, account.AccountIdentifier()); err != nil {
-		slog.Debug("Local draft row not deleted", "module", "DRAFT", "message_id", messageID, "err", err)
+		slog.Debug("Local draft row not deleted", "module", "DRAFT", "message_id", messageID, "err", err) // encgrep:allow word "draft" in message text, no draft value logged
 	}
 }
 
@@ -261,7 +261,7 @@ func saveDraftToLocalStore(account *config.AccountConfig, messageID string, msg 
 
 	db, err := store.Open(store.DefaultDBPath(), bootstrapKeyring())
 	if err != nil {
-		slog.Debug("Could not open store for draft insert", "module", "DRAFT", "err", err)
+		slog.Debug("Could not open store for draft insert", "module", "DRAFT", "err", err) // encgrep:allow word "draft" in message text, no draft value logged
 		return
 	}
 	defer db.Close()
@@ -293,7 +293,7 @@ func saveDraftToLocalStore(account *config.AccountConfig, messageID string, msg 
 	}
 
 	if err := db.InsertMessage(storeMsg); err != nil {
-		slog.Debug("Failed to save draft to local store", "module", "DRAFT", "err", err)
+		slog.Debug("Failed to save draft to local store", "module", "DRAFT", "err", err) // encgrep:allow word "draft" in message text, no draft value logged
 		return
 	}
 	_ = db.AddTag(storeMsg.ID, "draft")

@@ -32,7 +32,7 @@ func (h *Handler) SaveLocalDraftHandler(w http.ResponseWriter, r *http.Request) 
 		DraftJSON: string(body.DraftJSON),
 	}
 	if err := h.store.SaveLocalDraft(draft); err != nil {
-		slog.Error("Failed to save local draft", "module", "DRAFTS", "id", id, "err", err)
+		slog.Error("Failed to save local draft", "module", "DRAFTS", "id", id, "err", err) // encgrep:allow word "draft" in message text, no draft value logged
 		http.Error(w, "Failed to save draft", http.StatusInternalServerError)
 		return
 	}
@@ -72,7 +72,7 @@ func (h *Handler) DeleteLocalDraftHandler(w http.ResponseWriter, r *http.Request
 func (h *Handler) ListLocalDraftsHandler(w http.ResponseWriter, r *http.Request) {
 	drafts, err := h.store.ListLocalDrafts()
 	if err != nil {
-		slog.Error("Failed to list local drafts", "module", "DRAFTS", "err", err)
+		slog.Error("Failed to list local drafts", "module", "DRAFTS", "err", err) // encgrep:allow word "drafts" in message text, no draft value logged
 		http.Error(w, "Failed to list drafts", http.StatusInternalServerError)
 		return
 	}

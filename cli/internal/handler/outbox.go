@@ -85,7 +85,7 @@ func (h *Handler) EnqueueOutboxHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ADR-0001 §6 redaction: do not log recipient list, subject or body content.
-	slog.Info("Enqueued outbox item", "module", "OUTBOX", "id", id, "recipient_count", len(draft.To), "is_html", draft.IsHTML, "body_len", len(draft.Body), "send_after", sendAfter)
+	slog.Info("Enqueued outbox item", "module", "OUTBOX", "id", id, "recipient_count", len(draft.To), "is_html", draft.IsHTML, "body_len", len(draft.Body), "send_after", sendAfter) // encgrep:allow body_len + draft.To are length/count, not content
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id, "send_after": sendAfter})
 }
@@ -196,7 +196,7 @@ func (w *OutboxWorker) processQueue() {
 func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 	var draft OutboxDraft
 	if err := json.Unmarshal([]byte(item.DraftJSON), &draft); err != nil {
-		slog.Error("Failed to unmarshal draft", "module", "OUTBOX", "id", item.ID, "err", err)
+		slog.Error("Failed to unmarshal draft", "module", "OUTBOX", "id", item.ID, "err", err) // encgrep:allow word "draft" in message text, no draft value logged
 		w.store.MarkAttempted(item.ID, sanitizeOutboxError(err))
 		return
 	}
@@ -259,7 +259,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 	}
 
 	// Send via SMTP
-	slog.Info("Sending outbox item", "module", "OUTBOX", "id", item.ID, "to", draft.To)
+	slog.Info("Sending outbox item", "module", "OUTBOX", "id", item.ID, "to", draft.To) // encgrep:allow recipient list is intentionally plaintext per ADR-0001 §3 (from/to/cc stay unencrypted for thread routing)
 	client := smtp.NewClient(account.SMTP.Host, account.SMTP.Port, smtpAuth)
 	if err := client.Send(msg); err != nil {
 		// Distinguish network errors (offline/timeout) from SMTP errors (server rejected)

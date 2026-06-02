@@ -252,7 +252,7 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 			}
 
 			if len(msgBody) == 0 {
-				slog.Debug("Message has no body data", "module", "SYNC", "uid", msg.Uid)
+				slog.Debug("Message has no body data", "module", "SYNC", "uid", msg.Uid) // encgrep:allow "body data" in message text, no body content logged
 				fmt.Fprintf(s.output, "    Warning: failed to write message %d: message has no body\n", msg.Uid)
 				result.SkippedMsgs++
 				continue

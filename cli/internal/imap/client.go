@@ -315,7 +315,7 @@ func (c *Client) FetchMessages(uids []uint32) ([]*imap.Message, error) {
 
 	var result []*imap.Message
 	for msg := range messages {
-		slog.Debug("Received message", "module", "IMAP", "uid", msg.Uid, "body_parts", len(msg.Body))
+		slog.Debug("Received message", "module", "IMAP", "uid", msg.Uid, "body_parts", len(msg.Body)) // encgrep:allow body_parts is part count, not content
 		result = append(result, msg)
 	}
 

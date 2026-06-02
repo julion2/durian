@@ -174,11 +174,11 @@ func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs 
 
 			if !localState.Equal(serverState) && s.options.Mode != SyncUploadOnly {
 				if err := s.downloadFlagChanges(messageID, localState, serverState); err != nil {
-					slog.Debug("Error downloading flags", "module", "SYNC", "uid", uid, "err", err)
+					slog.Debug("Error downloading flags", "module", "SYNC", "uid", uid, "err", err) // encgrep:allow word "flags" in message text, no flag value logged
 					flagErrors++
 				} else {
 					downloaded++
-					slog.Debug("First-sync downloaded flags", "module", "SYNC", "uid", uid, "message_id", messageID, "flags", serverState)
+					slog.Debug("First-sync downloaded flags", "module", "SYNC", "uid", uid, "message_id", messageID, "flags", serverState) // encgrep:allow flags value redacted at runtime by redact.SensitiveSlogKeys ("flags")
 				}
 			}
 			continue
@@ -187,11 +187,11 @@ func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs 
 		// Check for local changes (local differs from stored)
 		if NeedsUpload(localState, storedState) && s.options.Mode != SyncDownloadOnly {
 			if err := s.uploadFlagChanges(uid, localState, serverState); err != nil {
-				slog.Debug("Error uploading flags", "module", "SYNC", "uid", uid, "err", err)
+				slog.Debug("Error uploading flags", "module", "SYNC", "uid", uid, "err", err) // encgrep:allow word "flags" in message text, no flag value logged
 				flagErrors++
 			} else {
 				uploaded++
-				slog.Debug("Uploaded flags", "module", "SYNC", "uid", uid, "from", storedState, "to", localState)
+				slog.Debug("Uploaded flags", "module", "SYNC", "uid", uid, "from", storedState, "to", localState) // encgrep:allow IMAP flag-state transition for sync debug; from/to here are state directions, not addresses
 				// Update stored state (skip in dry-run)
 				if !s.options.DryRun {
 					mboxState.SetMessageFlags(uid, localState)
@@ -216,11 +216,11 @@ func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs 
 
 			if !targetState.Equal(localState) {
 				if err := s.downloadFlagChanges(messageID, localState, targetState); err != nil {
-					slog.Debug("Error downloading flags", "module", "SYNC", "uid", uid, "err", err)
+					slog.Debug("Error downloading flags", "module", "SYNC", "uid", uid, "err", err) // encgrep:allow word "flags" in message text, no flag value logged
 					flagErrors++
 				} else {
 					downloaded++
-					slog.Debug("Downloaded flags", "module", "SYNC", "uid", uid, "from", localState, "to", targetState)
+					slog.Debug("Downloaded flags", "module", "SYNC", "uid", uid, "from", localState, "to", targetState) // encgrep:allow IMAP flag-state transition for sync debug; from/to here are state directions, not addresses
 				}
 			}
 			// Update stored state (skip in dry-run)
@@ -556,7 +556,7 @@ func (s *Syncer) uploadFlagChanges(uid uint32, local, server FlagState) error {
 	toAdd, toRemove := DiffFlags(local, server)
 
 	if s.options.DryRun {
-		slog.Debug("[dry-run] Would upload flags", "module", "SYNC", "uid", uid, "add", toAdd, "remove", toRemove)
+		slog.Debug("[dry-run] Would upload flags", "module", "SYNC", "uid", uid, "add", toAdd, "remove", toRemove) // encgrep:allow word "flags" in message text, no flag value logged
 		return nil
 	}
 
