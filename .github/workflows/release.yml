@@ -76,6 +76,15 @@ jobs:
           # of the cli/ module and emits a CycloneDX 1.5 JSON document.
           # sync/ shares the same module so one SBOM covers both binaries.
           # Format choice: JSON over XML for grep/jq friendliness.
+          #
+          # Stage the Pkl schema files where //go:embed schema/*.pkl in
+          # cli/internal/config/pkl.go expects them. Bazel does this via
+          # a genrule in cli/internal/config/BUILD.bazel; cyclonedx-gomod
+          # runs outside Bazel so we have to mirror the copy here, else
+          # `go list` fails with "schema/*.pkl: no matching files found".
+          mkdir -p cli/internal/config/schema
+          cp schema/*.pkl cli/internal/config/schema/
+
           go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
           cd cli
           cyclonedx-gomod app -main ./cmd/durian -output ../dist/durian-${{ steps.version.outputs.version }}.cdx.json -json -licenses
