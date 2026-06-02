@@ -17,11 +17,11 @@ const (
 
 // Response represents a JSON response sent to the client
 type Response struct {
-	OK        bool                `json:"ok"`
-	ErrorCode ErrorCode           `json:"error_code,omitempty"`
-	Error     string              `json:"error,omitempty"`
-	Results   []mail.Mail         `json:"results"`
-	Mail      *mail.MailContent   `json:"mail,omitempty"`
+	OK          bool                           `json:"ok"`
+	ErrorCode   ErrorCode                      `json:"error_code,omitempty"`
+	Error       string                         `json:"error,omitempty"`
+	Results     []mail.Mail                    `json:"results"`
+	Mail        *mail.MailContent              `json:"mail,omitempty"`
 	Thread      *mail.ThreadContent            `json:"thread,omitempty"`
 	Threads     map[string]*mail.ThreadContent `json:"threads,omitempty"`
 	MessageBody *mail.MessageBody              `json:"message_body,omitempty"`

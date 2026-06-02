@@ -16,7 +16,7 @@ var showHTML bool
 var showCmd = &cobra.Command{
 	Use:   "show <thread-id>",
 	Short: "Display email thread content",
-	Long: "Display the content of an email thread by its thread ID.",
+	Long:  "Display the content of an email thread by its thread ID.",
 	Example: `  durian show 00000000000022ca
   durian show 00000000000022ca --html
   durian show 00000000000022ca --json`,

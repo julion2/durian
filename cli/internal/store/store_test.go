@@ -487,8 +487,6 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	}
 }
 
-
-
 // TestBlindFTS_InsertAndMatch verifies the step-7 (a+b) round-trip:
 // a message inserted via the store API populates messages_blind_fts,
 // and a token computed independently with the same FTSToken sub-key

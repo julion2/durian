@@ -61,7 +61,7 @@ func Google() *Provider {
 		Scopes: []string{
 			"https://mail.google.com/",
 		},
-		SASlMethod:          "OAUTHBEARER",
+		SASlMethod: "OAUTHBEARER",
 		// No default credentials — users must configure their own Google OAuth app.
 		// See https://julion2.github.io/durian/docs/auth/oauth/ for instructions.
 	}

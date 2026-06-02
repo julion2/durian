@@ -103,12 +103,12 @@ func TestConvertThread_AllFieldsMapped(t *testing.T) {
 
 	seedThreadMessage(t, db, &store.Message{
 		MessageID: "fields@test", Subject: "Field Test",
-		FromAddr: "alice@example.com",
-		ToAddrs:  "bob@example.com",
-		CCAddrs:  "carol@example.com, dave@example.com",
+		FromAddr:  "alice@example.com",
+		ToAddrs:   "bob@example.com",
+		CCAddrs:   "carol@example.com, dave@example.com",
 		InReplyTo: "<previous@test>",
-		Refs:     "<previous@test> <other@test>",
-		Date:     now, CreatedAt: now,
+		Refs:      "<previous@test> <other@test>",
+		Date:      now, CreatedAt: now,
 		BodyText: "plain body",
 		BodyHTML: "<p>html body</p>",
 		Mailbox:  "INBOX",

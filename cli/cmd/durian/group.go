@@ -15,7 +15,7 @@ import (
 var groupCmd = &cobra.Command{
 	Use:   "group",
 	Short: "Manage contact groups",
-	Long: "Manage contact groups defined in groups.pkl. Edit the file directly to modify.",
+	Long:  "Manage contact groups defined in groups.pkl. Edit the file directly to modify.",
 }
 
 var groupListCmd = &cobra.Command{

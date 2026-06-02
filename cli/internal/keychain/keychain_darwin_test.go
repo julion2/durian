@@ -214,8 +214,8 @@ func TestGetOrCreateKey_GeneratesWhenMissing(t *testing.T) {
 	// fresh-key path is: find (NotFound) → delete (NotFound, treated as ok)
 	// → add (ok). Three invocations.
 	scriptCommands(t, []scriptedResponse{
-		{mode: "exit44"}, // find-generic-password → not found
-		{mode: "exit44"}, // delete-generic-password → not found (ok)
+		{mode: "exit44"},  // find-generic-password → not found
+		{mode: "exit44"},  // delete-generic-password → not found (ok)
 		{mode: "success"}, // add-generic-password → stored
 	})
 	defer restoreCommandRunner()

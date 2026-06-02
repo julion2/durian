@@ -315,16 +315,28 @@ func (d *DB) JournalTagChange(messageID, account, tag, action string, timestamp 
 }
 
 // ReadTagJournal returns all pending journal entries without deleting them.
-func (d *DB) ReadTagJournal() ([]struct{ ID int64; MessageID, Account, Tag, Action string; Timestamp int64 }, error) {
+func (d *DB) ReadTagJournal() ([]struct {
+	ID                              int64
+	MessageID, Account, Tag, Action string
+	Timestamp                       int64
+}, error) {
 	rows, err := d.db.Query("SELECT id, message_id, account, tag, action, timestamp FROM tag_journal ORDER BY id")
 	if err != nil {
 		return nil, fmt.Errorf("read journal: %w", err)
 	}
 	defer rows.Close()
 
-	var result []struct{ ID int64; MessageID, Account, Tag, Action string; Timestamp int64 }
+	var result []struct {
+		ID                              int64
+		MessageID, Account, Tag, Action string
+		Timestamp                       int64
+	}
 	for rows.Next() {
-		var r struct{ ID int64; MessageID, Account, Tag, Action string; Timestamp int64 }
+		var r struct {
+			ID                              int64
+			MessageID, Account, Tag, Action string
+			Timestamp                       int64
+		}
 		if err := rows.Scan(&r.ID, &r.MessageID, &r.Account, &r.Tag, &r.Action, &r.Timestamp); err != nil {
 			return nil, fmt.Errorf("scan: %w", err)
 		}

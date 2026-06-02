@@ -285,10 +285,10 @@ func TestKeyring_CachedAEADMatchesFreshPath(t *testing.T) {
 	plain := []byte("paths must agree on the wire format")
 
 	cases := []struct {
-		name    string
-		key     []byte
-		seal    func([]byte) ([]byte, error)
-		open    func([]byte) ([]byte, error)
+		name string
+		key  []byte
+		seal func([]byte) ([]byte, error)
+		open func([]byte) ([]byte, error)
 	}{
 		{"Subject", kr.Subject, kr.EncryptSubject, kr.DecryptSubject},
 		{"Body", kr.Body, kr.EncryptBody, kr.DecryptBody},
@@ -388,4 +388,3 @@ func TestNewKeyring_RejectsBadMasterLen(t *testing.T) {
 		t.Errorf("err = %v, want ErrInvalidKey wrapped", err)
 	}
 }
-

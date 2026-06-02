@@ -17,7 +17,7 @@ func newMockStore() *mockStore {
 	return &mockStore{data: make(map[string]int64)}
 }
 
-func (m *mockStore) GetMeta(key string) int64 { return m.data[key] }
+func (m *mockStore) GetMeta(key string) int64    { return m.data[key] }
 func (m *mockStore) SetMeta(key string, v int64) { m.data[key] = v }
 
 func newTestClient(url string) *Client {

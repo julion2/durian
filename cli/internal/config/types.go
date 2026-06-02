@@ -34,7 +34,7 @@ type AttachmentCacheConfig struct {
 
 // TagSyncConfig configures the optional remote tag sync server.
 type TagSyncConfig struct {
-	URL    string `pkl:"url" json:"url"`     // e.g. "http://nas:8724"
+	URL    string `pkl:"url" json:"url"`         // e.g. "http://nas:8724"
 	APIKey string `pkl:"api_key" json:"api_key"` // Shared secret
 }
 
@@ -46,16 +46,16 @@ type ContactsConfig struct {
 
 // AccountConfig represents a single email account
 type AccountConfig struct {
-	Name             string      `pkl:"name" json:"name"`
-	DisplayName      string      `pkl:"display_name" json:"display_name"` // Full name for From header (e.g., "Julian Schenker")
-	Email            string      `pkl:"email" json:"email"`
-	AuthEmail        string      `pkl:"auth_email" json:"auth_email"` // Delegating user for shared mailbox OAuth (token owner)
-	Alias            string      `pkl:"alias" json:"alias"`      // Short alias for CLI (e.g., "work", "personal")
-	Default          bool        `pkl:"default" json:"default"`
-	DefaultSignature string      `pkl:"default_signature" json:"default_signature"`
-	Notifications    *bool       `pkl:"notifications" json:"notifications"` // Per-account notification override (nil = use global setting)
-	SMTP             SMTPConfig  `pkl:"smtp" json:"smtp"`
-	IMAP             IMAPConfig  `pkl:"imap" json:"imap"`
+	Name             string       `pkl:"name" json:"name"`
+	DisplayName      string       `pkl:"display_name" json:"display_name"` // Full name for From header (e.g., "Julian Schenker")
+	Email            string       `pkl:"email" json:"email"`
+	AuthEmail        string       `pkl:"auth_email" json:"auth_email"` // Delegating user for shared mailbox OAuth (token owner)
+	Alias            string       `pkl:"alias" json:"alias"`           // Short alias for CLI (e.g., "work", "personal")
+	Default          bool         `pkl:"default" json:"default"`
+	DefaultSignature string       `pkl:"default_signature" json:"default_signature"`
+	Notifications    *bool        `pkl:"notifications" json:"notifications"` // Per-account notification override (nil = use global setting)
+	SMTP             SMTPConfig   `pkl:"smtp" json:"smtp"`
+	IMAP             IMAPConfig   `pkl:"imap" json:"imap"`
 	Auth             *AuthConfig  `pkl:"auth" json:"auth"`
 	OAuth            *OAuthConfig `pkl:"oauth" json:"oauth"`
 }
@@ -74,7 +74,7 @@ type SMTPConfig struct {
 	Host              string `pkl:"host" json:"host"`
 	Port              int    `pkl:"port" json:"port"`
 	SSL               bool   `pkl:"ssl" json:"ssl"`
-	Auth              string `pkl:"auth" json:"auth"`                // "password" or "oauth2"
+	Auth              string `pkl:"auth" json:"auth"`                               // "password" or "oauth2"
 	MaxAttachmentSize string `pkl:"max_attachment_size" json:"max_attachment_size"` // e.g. "25MB", default 25MB
 }
 
@@ -97,8 +97,8 @@ type AuthConfig struct {
 
 // OAuthConfig contains OAuth2 authentication settings
 type OAuthConfig struct {
-	Provider     string `pkl:"provider" json:"provider"`      // "google", "microsoft"
-	ClientID     string `pkl:"client_id" json:"client_id"`     // Azure App Client ID or Google Client ID
+	Provider     string `pkl:"provider" json:"provider"`           // "google", "microsoft"
+	ClientID     string `pkl:"client_id" json:"client_id"`         // Azure App Client ID or Google Client ID
 	ClientSecret string `pkl:"client_secret" json:"client_secret"` // Required for Google, optional for Microsoft
-	Tenant       string `pkl:"tenant" json:"tenant"`        // Microsoft tenant (default: "common")
+	Tenant       string `pkl:"tenant" json:"tenant"`               // Microsoft tenant (default: "common")
 }

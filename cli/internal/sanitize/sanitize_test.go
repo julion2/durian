@@ -298,9 +298,9 @@ func TestStyleTagPreservation(t *testing.T) {
 
 func TestTableCellAttributes(t *testing.T) {
 	tests := []struct {
-		name string
+		name  string
 		input string
-		want string
+		want  string
 	}{
 		{"td width", `<table><tr><td width="50%">x</td></tr></table>`, `width="50%"`},
 		{"th height", `<table><tr><th height="30">x</th></tr></table>`, `height="30"`},

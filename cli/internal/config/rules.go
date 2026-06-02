@@ -17,10 +17,10 @@ type RuleConfig struct {
 	Match       string   `pkl:"match" json:"match"`
 	AddTags     []string `pkl:"add_tags" json:"add_tags"`
 	RemoveTags  []string `pkl:"remove_tags" json:"remove_tags"`
-	Accounts    []string `pkl:"accounts" json:"accounts"`     // If set, only apply to these accounts (by alias)
-	Exec        string   `pkl:"exec" json:"exec"`          // Optional: external command to run (stdin=email JSON, stdout=tag ops JSON)
-	ExecTimeout int      `pkl:"exec_timeout" json:"exec_timeout"`  // Timeout in seconds (default: 10)
-	AllowedTags []string `pkl:"allowed_tags" json:"allowed_tags"`  // Optional: restrict exec output to these tags
+	Accounts    []string `pkl:"accounts" json:"accounts"`         // If set, only apply to these accounts (by alias)
+	Exec        string   `pkl:"exec" json:"exec"`                 // Optional: external command to run (stdin=email JSON, stdout=tag ops JSON)
+	ExecTimeout int      `pkl:"exec_timeout" json:"exec_timeout"` // Timeout in seconds (default: 10)
+	AllowedTags []string `pkl:"allowed_tags" json:"allowed_tags"` // Optional: restrict exec output to these tags
 }
 
 // LoadRules loads filter rules from the given path.

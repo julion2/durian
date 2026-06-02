@@ -71,7 +71,6 @@ func TestCleanSnippet_EmptyInput(t *testing.T) {
 	}
 }
 
-
 func TestNewWatcherManager(t *testing.T) {
 	db := newTestStore(t)
 	w := NewWatcherManager(nil, db, nil, nil)

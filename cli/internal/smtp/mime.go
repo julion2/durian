@@ -25,8 +25,8 @@ type Message struct {
 	Subject     string
 	Body        string
 	IsHTML      bool
-	InReplyTo  string // Message-ID of the message being replied to
-	References string // Space-separated list of Message-IDs in the thread
+	InReplyTo   string // Message-ID of the message being replied to
+	References  string // Space-separated list of Message-IDs in the thread
 	Attachments []Attachment
 	// GeneratedMessageID is populated by Build() on first call and reused on
 	// subsequent calls so that SMTP send and IMAP append share the same ID.

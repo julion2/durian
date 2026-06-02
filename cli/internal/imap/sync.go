@@ -48,15 +48,15 @@ var specialUseFolderTags = map[string]FolderTagMapping{
 
 // SyncOptions configures the sync behavior
 type SyncOptions struct {
-	DryRun           bool
-	Quiet            bool
-	NoFlags          bool                // Skip flag synchronization
-	Mode             SyncMode            // Sync direction
-	Mailboxes        []string            // Specific mailboxes to sync (empty = all)
-	Store            *store.DB           // SQLite store (required)
-	FilterRules      []config.RuleConfig          // User-defined filter rules applied at insert time
-	Groups           map[string]config.GroupEntry // Contact groups for group: expansion in rules
-	BackfillHeaders  bool                         // Fetch and store headers for existing messages
+	DryRun          bool
+	Quiet           bool
+	NoFlags         bool                         // Skip flag synchronization
+	Mode            SyncMode                     // Sync direction
+	Mailboxes       []string                     // Specific mailboxes to sync (empty = all)
+	Store           *store.DB                    // SQLite store (required)
+	FilterRules     []config.RuleConfig          // User-defined filter rules applied at insert time
+	Groups          map[string]config.GroupEntry // Contact groups for group: expansion in rules
+	BackfillHeaders bool                         // Fetch and store headers for existing messages
 }
 
 // SyncResult contains the results of a sync operation
@@ -66,11 +66,11 @@ type SyncResult struct {
 	Duration          time.Duration
 	TotalNew          int
 	TotalSkipped      int
-	TotalDeleted      int // Messages deleted locally (removed from server)
-	TotalDeduplicated int // Messages that already existed locally (tags updated)
-	FlagsUploaded     int // Flags uploaded to server
-	FlagsDownload     int // Flags downloaded from server
-	TotalMoved        int // Messages moved between IMAP folders
+	TotalDeleted      int      // Messages deleted locally (removed from server)
+	TotalDeduplicated int      // Messages that already existed locally (tags updated)
+	FlagsUploaded     int      // Flags uploaded to server
+	FlagsDownload     int      // Flags downloaded from server
+	TotalMoved        int      // Messages moved between IMAP folders
 	NewMessageIDs     []string // Message-IDs of newly downloaded messages
 	Error             error
 }
@@ -85,7 +85,7 @@ type MailboxResult struct {
 	DeduplicatedMsgs int // Messages that already existed locally (tags updated)
 	FlagsUploaded    int
 	FlagsDownload    int
-	MovedMsgs        int // Messages moved between IMAP folders
+	MovedMsgs        int      // Messages moved between IMAP folders
 	NewMessageIDs    []string // Message-IDs of newly downloaded messages
 	Error            error
 }
@@ -95,7 +95,7 @@ type Syncer struct {
 	client          *Client
 	state           *State
 	stateMgr        *StateManager
-	stateLock       *os.File             // File lock held during sync
+	stateLock       *os.File // File lock held during sync
 	account         *config.AccountConfig
 	options         *SyncOptions
 	output          io.Writer
@@ -103,8 +103,8 @@ type Syncer struct {
 	archiveMailbox  string                // Cached archive mailbox name for archive operations
 	serverMailboxes []*goimap.MailboxInfo // Cached mailbox list for exclusion tags
 	ownsClient      bool                  // true = syncer manages connection lifecycle
-	store           *store.DB            // SQLite store for messages and tags
-	parser          *durianmail.Parser   // Email parser for store writes
+	store           *store.DB             // SQLite store for messages and tags
+	parser          *durianmail.Parser    // Email parser for store writes
 }
 
 // NewSyncer creates a new syncer for an account

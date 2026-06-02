@@ -52,4 +52,3 @@ func DeleteToken(email string) error {
 	}
 	return nil
 }
-

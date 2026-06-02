@@ -28,14 +28,14 @@ type Message struct {
 
 // Attachment represents file metadata attached to a message.
 type Attachment struct {
-	ID           int64
-	MessageDBID  int64
-	PartID       int
-	Filename     string
-	ContentType  string
-	Size         int
-	Disposition  string
-	ContentID    string
+	ID          int64
+	MessageDBID int64
+	PartID      int
+	Filename    string
+	ContentType string
+	Size        int
+	Disposition string
+	ContentID   string
 }
 
 // SearchResult represents a thread-level search result.

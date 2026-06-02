@@ -3,9 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/spf13/cobra"
 	"os"
 	"path/filepath"
-	"github.com/spf13/cobra"
 
 	"github.com/julion2/durian/cli/internal/imap"
 	"github.com/julion2/durian/cli/internal/store"
@@ -14,7 +14,7 @@ import (
 var attachmentCmd = &cobra.Command{
 	Use:   "attachment <message-id>",
 	Short: "List or download attachments",
-	Long: "List attachments for a message, or download a specific part with --save.",
+	Long:  "List attachments for a message, or download a specific part with --save.",
 	Example: `  durian attachment msg-id@example.com
   durian attachment msg-id@example.com --save 1
   durian attachment msg-id@example.com --save 1 --output ~/Downloads/`,
@@ -138,4 +138,3 @@ func formatSize(bytes int) string {
 		return fmt.Sprintf("%d B", bytes)
 	}
 }
-

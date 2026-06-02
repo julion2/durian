@@ -48,16 +48,16 @@ var SensitiveSlogKeys = []string{
 	"contact_name",
 	// meta_key columns (mailbox/account names encrypted in step 6+, the
 	// non-boolean flags subset encrypted in flags_other)
-	"mailbox",        // mailboxes.name — encrypted post-step-6 (audit H1)
-	"mailbox_name",   // legacy spelling, kept for back-compat
-	"account",        // accounts.name — encrypted post-step-6 (audit H1)
-	"account_name",   // explicit form
-	"dest",           // IMAP move-destination mailbox (audit H1)
-	"trash",          // resolved trash mailbox name (audit H1)
-	"archive",        // resolved archive mailbox name (audit H1)
-	"folder",         // generic mailbox/folder alias
-	"synthetic_id",   // embeds mailbox + account in the synthetic
-	"flags",          // full IMAP flags string includes encrypted flags_other
+	"mailbox",      // mailboxes.name — encrypted post-step-6 (audit H1)
+	"mailbox_name", // legacy spelling, kept for back-compat
+	"account",      // accounts.name — encrypted post-step-6 (audit H1)
+	"account_name", // explicit form
+	"dest",         // IMAP move-destination mailbox (audit H1)
+	"trash",        // resolved trash mailbox name (audit H1)
+	"archive",      // resolved archive mailbox name (audit H1)
+	"folder",       // generic mailbox/folder alias
+	"synthetic_id", // embeds mailbox + account in the synthetic
+	"flags",        // full IMAP flags string includes encrypted flags_other
 }
 
 // sensitiveSlogKeySet is the set form built once at init from

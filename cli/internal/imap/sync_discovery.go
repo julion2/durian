@@ -97,8 +97,6 @@ func gmailLabelsToTags(msg *goimap.Message) []string {
 	return tags
 }
 
-
-
 // getMailboxesToSync returns the list of mailboxes to sync
 func (s *Syncer) getMailboxesToSync() ([]string, error) {
 	// If specific mailboxes are requested via CLI, use those

@@ -28,15 +28,15 @@ type SyncTrigger interface {
 
 // Handler processes commands and returns responses
 type Handler struct {
-	store       *store.DB // SQLite store (primary read backend)
-	parser      *mail.Parser
-	contacts    *contacts.DB
-	cfg         *config.Config                // application config (for outbox worker)
-	groups      map[string]config.GroupEntry   // contact groups for query expansion
-	fetcher        AttachmentFetcher // optional IMAP attachment fetcher
-	syncTrigger    SyncTrigger       // optional sync trigger for tag changes
-	tagSync        *tagsync.Client   // optional remote tag sync client
-	tagSyncEnabled bool              // true when tag sync is configured (enables journal)
+	store          *store.DB // SQLite store (primary read backend)
+	parser         *mail.Parser
+	contacts       *contacts.DB
+	cfg            *config.Config               // application config (for outbox worker)
+	groups         map[string]config.GroupEntry // contact groups for query expansion
+	fetcher        AttachmentFetcher            // optional IMAP attachment fetcher
+	syncTrigger    SyncTrigger                  // optional sync trigger for tag changes
+	tagSync        *tagsync.Client              // optional remote tag sync client
+	tagSyncEnabled bool                         // true when tag sync is configured (enables journal)
 }
 
 // New creates a Handler that reads from the SQLite store.

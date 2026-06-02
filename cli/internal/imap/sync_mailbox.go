@@ -116,7 +116,6 @@ func (s *Syncer) storeHeadersForUID(uid uint32, rawHeader []byte, mboxState *Mai
 	return true
 }
 
-
 // syncMailbox syncs a single mailbox
 func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 	result := MailboxResult{Name: mailboxName}

@@ -74,12 +74,12 @@ func TestSuccessWithResultsEmpty(t *testing.T) {
 
 func TestSuccessWithMail(t *testing.T) {
 	content := &mail.MailContent{
-		From:        "sender@example.com",
-		To:          "recipient@example.com",
-		Subject:     "Test Subject",
-		Date:        "Thu, 18 Dec 2025 10:00:00 +0100",
-		Body:        "Hello, this is the body.",
-		HTML:        "<p>Hello, this is the body.</p>",
+		From:    "sender@example.com",
+		To:      "recipient@example.com",
+		Subject: "Test Subject",
+		Date:    "Thu, 18 Dec 2025 10:00:00 +0100",
+		Body:    "Hello, this is the body.",
+		HTML:    "<p>Hello, this is the body.</p>",
 		Attachments: []mail.AttachmentInfo{
 			{Filename: "file.pdf", ContentType: "application/pdf", Disposition: "attachment"},
 			{Filename: "image.png", ContentType: "image/png", Disposition: "attachment"},

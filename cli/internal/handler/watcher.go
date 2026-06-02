@@ -45,11 +45,11 @@ type WatcherManager struct {
 	hub         *EventHub
 	store       *store.DB
 	log         *slog.Logger
-	locks       map[string]*sync.Mutex // per-account sync locks keyed by email
-	locksMu     sync.Mutex             // protects the locks map
-	watchers    map[string]*accountWatcher           // keyed by account identifier (e.g. "work")
-	filterRules []config.RuleConfig                  // user-defined filter rules applied at sync time
-	groups      map[string]config.GroupEntry          // contact groups for group: expansion in rules
+	locks       map[string]*sync.Mutex       // per-account sync locks keyed by email
+	locksMu     sync.Mutex                   // protects the locks map
+	watchers    map[string]*accountWatcher   // keyed by account identifier (e.g. "work")
+	filterRules []config.RuleConfig          // user-defined filter rules applied at sync time
+	groups      map[string]config.GroupEntry // contact groups for group: expansion in rules
 }
 
 // NewWatcherManager creates a WatcherManager wired to the given EventHub
@@ -196,7 +196,7 @@ func (w *WatcherManager) watchAccount(ctx context.Context, aw *accountWatcher) {
 				return
 			case <-updates:
 				close(stopIdle)
-				<-idleDone // wait for IDLE goroutine to exit before reusing connection
+				<-idleDone                                                             // wait for IDLE goroutine to exit before reusing connection
 				w.log.Info("New messages detected, syncing", "account", account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 				w.syncAndNotify(account, client, uidNext)
 				// Re-SELECT INBOX (sync iterates all mailboxes, last selected may differ)

@@ -30,13 +30,13 @@ var authCmd = &cobra.Command{
 var authLoginCmd = &cobra.Command{
 	Use:   "login <account>",
 	Short: "Authenticate with an email account",
-	Long: "Authenticate with an email account using OAuth or password.",
+	Long:  "Authenticate with an email account using OAuth or password.",
 	Example: `  durian auth login gmail       # Use alias
   durian auth login work         # Use alias
   durian auth login you@company.com  # Use full email`,
-	Args: cobra.ExactArgs(1),
+	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: completeAccounts,
-	RunE: runAuthLogin,
+	RunE:              runAuthLogin,
 }
 
 var authStatusCmd = &cobra.Command{
@@ -47,21 +47,21 @@ var authStatusCmd = &cobra.Command{
 }
 
 var authLogoutCmd = &cobra.Command{
-	Use:   "logout <account>",
-	Short: "Remove credentials for an account",
-	Long: "Remove stored OAuth tokens or passwords from the keychain.",
-	Args: cobra.ExactArgs(1),
+	Use:               "logout <account>",
+	Short:             "Remove credentials for an account",
+	Long:              "Remove stored OAuth tokens or passwords from the keychain.",
+	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: completeAccounts,
-	RunE: runAuthLogout,
+	RunE:              runAuthLogout,
 }
 
 var authRefreshCmd = &cobra.Command{
-	Use:   "refresh <account>",
-	Short: "Manually refresh OAuth token for an account",
-	Long: "Force a token refresh (normally done automatically).",
-	Args: cobra.ExactArgs(1),
+	Use:               "refresh <account>",
+	Short:             "Manually refresh OAuth token for an account",
+	Long:              "Force a token refresh (normally done automatically).",
+	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: completeAccounts,
-	RunE: runAuthRefresh,
+	RunE:              runAuthRefresh,
 }
 
 func init() {
@@ -273,7 +273,7 @@ func runAuthLogout(cmd *cobra.Command, args []string) error {
 		// Shared mailbox: token belongs to the delegating user
 		if account.AuthEmail != "" {
 			fmt.Printf("Shared mailbox %s uses token from %s\n", account.Email, account.AuthEmail) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-			fmt.Printf("Run: durian auth logout %s\n", account.AuthEmail) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+			fmt.Printf("Run: durian auth logout %s\n", account.AuthEmail)                          // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			return nil
 		}
 

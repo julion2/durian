@@ -13,7 +13,7 @@ import (
 type NewMailEvent struct {
 	Account  string        `json:"account"`
 	TotalNew int           `json:"total_new"`
-	Messages []NewMailInfo  `json:"messages"`
+	Messages []NewMailInfo `json:"messages"`
 }
 
 // NewMailInfo describes a single new message within a NewMailEvent.

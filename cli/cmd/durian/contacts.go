@@ -27,8 +27,8 @@ var contactsInitCmd = &cobra.Command{
 var contactsImportCmd = &cobra.Command{
 	Use:   "import",
 	Short: "Import contacts from email store",
-	Long: "Import email addresses from the local email store (From, To, Cc headers).",
-	RunE: runContactsImport,
+	Long:  "Import email addresses from the local email store (From, To, Cc headers).",
+	RunE:  runContactsImport,
 }
 
 var contactsListCmd = &cobra.Command{

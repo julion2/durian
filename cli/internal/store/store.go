@@ -842,7 +842,6 @@ func (d *DB) migrate() error {
 			}
 		}
 
-
 		// VACUUM rebuilds the DB file to reclaim space from the dropped
 		// columns + FTS5 table. On a 20k-message mailbox this rewrites
 		// ~900 MB (the body plaintext duplication that's been sitting
@@ -1125,7 +1124,7 @@ func (d *DB) rebuildBlindFTSForBigramEncoding() error {
 	}
 	defer rows.Close()
 	type pending struct {
-		id                            int64
+		id                               int64
 		subject, fromAddr, toAddrs, body string
 	}
 	var batch []pending
@@ -1753,7 +1752,7 @@ func (d *DB) backfillBlindFTS() error {
 		return fmt.Errorf("select rows: %w", err)
 	}
 	type pending struct {
-		id                                  int64
+		id                                   int64
 		subject, fromAddr, toAddrs, bodyText string
 	}
 	var batch []pending
@@ -2257,7 +2256,7 @@ func (d *DB) backfillAddrsCt() error {
 		return fmt.Errorf("select rows: %w", err)
 	}
 	type pending struct {
-		id                       int64
+		id                         int64
 		fromAddr, toAddrs, ccAddrs string
 	}
 	var batch []pending

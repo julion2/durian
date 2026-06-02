@@ -35,8 +35,8 @@ var serveNoAuth bool
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start OpenAPI HTTP server (for GUI integration)",
-	Long: "Start the HTTP server that provides a RESTful API for the GUI.",
-	Run: runServe,
+	Long:  "Start the HTTP server that provides a RESTful API for the GUI.",
+	Run:   runServe,
 }
 
 func init() {

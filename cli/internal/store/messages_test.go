@@ -10,17 +10,17 @@ func TestInsertAndGetMessage(t *testing.T) {
 	now := time.Now().Unix()
 
 	err := db.InsertMessage(&Message{
-		MessageID: "test@example.com",
-		Subject:   "Hello World",
-		FromAddr:  "alice@example.com",
-		ToAddrs:   "bob@example.com",
-		Date:      now,
-		CreatedAt: now,
-		BodyText:  "This is a test",
-		BodyHTML:  "<p>This is a test</p>",
-		Mailbox:   "INBOX",
+		MessageID:   "test@example.com",
+		Subject:     "Hello World",
+		FromAddr:    "alice@example.com",
+		ToAddrs:     "bob@example.com",
+		Date:        now,
+		CreatedAt:   now,
+		BodyText:    "This is a test",
+		BodyHTML:    "<p>This is a test</p>",
+		Mailbox:     "INBOX",
 		FetchedBody: true,
-		Account:  "work",
+		Account:     "work",
 	})
 	if err != nil {
 		t.Fatalf("insert: %v", err)
@@ -56,13 +56,13 @@ func TestUpsert_HeadersOnlyThenBody(t *testing.T) {
 
 	// First insert: headers only (no body)
 	err := db.InsertMessage(&Message{
-		MessageID: "upsert@example.com",
-		Subject:   "Upsert Test",
-		FromAddr:  "alice@example.com",
-		Date:      now,
-		CreatedAt: now,
-		Mailbox:   "INBOX",
-		Flags:     "\\Seen",
+		MessageID:   "upsert@example.com",
+		Subject:     "Upsert Test",
+		FromAddr:    "alice@example.com",
+		Date:        now,
+		CreatedAt:   now,
+		Mailbox:     "INBOX",
+		Flags:       "\\Seen",
 		FetchedBody: false,
 	})
 	if err != nil {
@@ -76,15 +76,15 @@ func TestUpsert_HeadersOnlyThenBody(t *testing.T) {
 
 	// Second insert: now with body
 	err = db.InsertMessage(&Message{
-		MessageID: "upsert@example.com",
-		Subject:   "Upsert Test",
-		FromAddr:  "alice@example.com",
-		Date:      now,
-		CreatedAt: now,
-		BodyText:  "Now with body",
-		BodyHTML:  "<p>Now with body</p>",
-		Mailbox:   "INBOX",
-		Flags:     "\\Seen \\Answered",
+		MessageID:   "upsert@example.com",
+		Subject:     "Upsert Test",
+		FromAddr:    "alice@example.com",
+		Date:        now,
+		CreatedAt:   now,
+		BodyText:    "Now with body",
+		BodyHTML:    "<p>Now with body</p>",
+		Mailbox:     "INBOX",
+		Flags:       "\\Seen \\Answered",
 		FetchedBody: true,
 	})
 	if err != nil {

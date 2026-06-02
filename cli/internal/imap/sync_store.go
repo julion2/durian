@@ -13,7 +13,6 @@ import (
 	"github.com/julion2/durian/cli/internal/store"
 )
 
-
 // accountName returns the account identifier (e.g. "work") used as the
 // account column in the SQLite store.
 func (s *Syncer) accountName() string {

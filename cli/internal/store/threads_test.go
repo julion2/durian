@@ -96,7 +96,7 @@ func TestResolveThreadID_LinearChain(t *testing.T) {
 	// Insert B replying to A
 	err = db.InsertMessage(&Message{
 		MessageID: "b@x", InReplyTo: "<a@x>", Refs: "<a@x>",
-		Subject: "Re: Thread start",
+		Subject:  "Re: Thread start",
 		FromAddr: "bob@x", Date: now + 1, CreatedAt: now + 1, FetchedBody: true,
 	})
 	if err != nil {
@@ -106,7 +106,7 @@ func TestResolveThreadID_LinearChain(t *testing.T) {
 	// Insert C replying to B, with full references chain
 	err = db.InsertMessage(&Message{
 		MessageID: "c@x", InReplyTo: "<b@x>", Refs: "<a@x> <b@x>",
-		Subject: "Re: Re: Thread start",
+		Subject:  "Re: Re: Thread start",
 		FromAddr: "charlie@x", Date: now + 2, CreatedAt: now + 2, FetchedBody: true,
 	})
 	if err != nil {
@@ -251,8 +251,8 @@ func TestResolveThreadID_CrossBatchSplit_DifferentRoot(t *testing.T) {
 	// Batch 1: child references a chain [grandparent, parent]
 	db.InsertMessage(&Message{
 		MessageID: "child2@x", InReplyTo: "<parent2@x>",
-		Refs:      "<grandparent2@x> <parent2@x>",
-		Subject:   "Child", FromAddr: "bob@x", Date: now + 2, CreatedAt: now + 2, FetchedBody: true,
+		Refs:    "<grandparent2@x> <parent2@x>",
+		Subject: "Child", FromAddr: "bob@x", Date: now + 2, CreatedAt: now + 2, FetchedBody: true,
 	})
 
 	// Batch 2: parent arrives (standalone — no refs to grandparent)

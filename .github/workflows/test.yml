@@ -23,6 +23,18 @@ jobs:
           key: bazel-cli-${{ hashFiles('MODULE.bazel', 'cli/go.mod', 'cli/go.sum') }}
           restore-keys: bazel-cli-
 
+      - name: Check gofmt
+        run: |
+          # gofmt has a habit of silently drifting after struct-field renames
+          # because Bazel doesn't enforce it. This step is the gate.
+          unformatted=$(gofmt -l ./cli/ ./sync/ ./docs/)
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-clean:"
+            echo "$unformatted"
+            echo "Run: gofmt -w \$(gofmt -l ./cli/ ./sync/ ./docs/)"
+            exit 1
+          fi
+
       - name: Test CLI
         run: bazel test //cli/... --test_output=errors
 

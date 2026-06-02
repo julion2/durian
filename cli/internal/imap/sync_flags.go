@@ -9,7 +9,6 @@ import (
 	goimap "github.com/emersion/go-imap"
 )
 
-
 // getFolderTagMapping returns the tag mapping for a mailbox based on SPECIAL-USE attributes
 // Returns tags to add and remove when a mail is found in this folder
 // Used for both new downloads and deduplication (updating tags for existing mails)

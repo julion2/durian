@@ -129,9 +129,9 @@ var (
 )
 
 type tableAttrs struct {
-	th, cellpadding, cellspacing, border          bool
-	width, height, bgcolor, align, valign         bool
-	colspan                                       bool
+	th, cellpadding, cellspacing, border  bool
+	width, height, bgcolor, align, valign bool
+	colspan                               bool
 }
 
 // assertTableLayout checks table structure and layout attributes.
@@ -468,7 +468,7 @@ func TestAllFixturesPresent(t *testing.T) {
 		"apple_mail_newsletter":      true,
 		"ci_build_notification":      true,
 		"darkmode_digest":            true,
-		"example_newsletter":          true,
+		"example_newsletter":         true,
 		"gmail_forwarded_chain":      true,
 		"gmail_mobile_forward":       true, // quote_test.go: Fixture_GmailMobileForward
 		"icloud_mail_reply":          true, // quote_test.go: Fixture_iCloudMail
