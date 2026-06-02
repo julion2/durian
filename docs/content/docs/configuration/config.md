@@ -40,7 +40,7 @@ accounts {
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `theme` | `"light" \| "dark" \| "system"` | `"system"` | GUI theme |
+| `theme` | `"light" \| "dark" \| "system"` | `"system"` | GUI theme. `"light"` / `"dark"` force the app chrome regardless of the macOS appearance; `"system"` follows it. Email body rendering picks up the same value. |
 | `notifications_enabled` | `Boolean` | `true` | Global notification toggle (override per account) |
 | `load_remote_images` | `Boolean` | `false` | Block tracking pixels by default |
 | `accent_color` | `String?` | `null` | Hex color, e.g. `"#3B82F6"` |

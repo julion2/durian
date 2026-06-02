@@ -44,7 +44,20 @@ struct DurianApp: App {
     @Environment(\.openWindow) private var openWindow
     @StateObject private var profileManager = ProfileManager.shared
     @StateObject private var accountManager = AccountManager.shared
+    @StateObject private var settingsManager = SettingsManager.shared
     @State private var cliVersion: String = ""
+
+    /// Override the macOS global appearance with the per-app
+    /// `settings.theme` from config.pkl: "light" / "dark" force the
+    /// app chrome regardless of system setting; "system" (the default)
+    /// or any unknown value returns nil, letting macOS decide.
+    private var appColorScheme: ColorScheme? {
+        switch settingsManager.settings.theme {
+        case "light": return .light
+        case "dark":  return .dark
+        default:      return nil
+        }
+    }
 
     private static let notificationDelegate = NotificationDelegate()
 
@@ -74,6 +87,7 @@ struct DurianApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .preferredColorScheme(appColorScheme)
         }
         .commands {
             CommandGroup(replacing: .appInfo) {
