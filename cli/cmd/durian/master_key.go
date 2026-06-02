@@ -38,9 +38,9 @@ const (
 
 // Flags
 var (
-	masterKeyExportOut   string
-	masterKeyImportFrom  string
-	masterKeyImportForce bool
+	masterKeyExportOut    string
+	masterKeyImportSource string
+	masterKeyImportForce  bool
 )
 
 var masterKeyCmd = &cobra.Command{
@@ -59,7 +59,7 @@ mail can be re-synced from the server.`,
 }
 
 var masterKeyExportCmd = &cobra.Command{
-	Use:   "export --out FILE",
+	Use:   "export --output FILE",
 	Short: "Export the master key to a passphrase-encrypted age file",
 	Long: `Read the master key from the OS keychain, encrypt it with an
 age scrypt passphrase, and write the armored ciphertext to FILE.
@@ -68,12 +68,12 @@ The on-disk format is the same 64-character hex representation that the
 keychain stores, so the file round-trips cleanly with 'master-key import'
 and can also be decrypted manually with the 'age' CLI.
 
-Use --out - to write to stdout.`,
+Use --output - to write to stdout.`,
 	RunE: runMasterKeyExport,
 }
 
 var masterKeyImportCmd = &cobra.Command{
-	Use:   "import --from FILE",
+	Use:   "import --source FILE",
 	Short: "Import a master key from an age file into the OS keychain",
 	Long: `Decrypt an age file produced by 'master-key export' (or any age
 file containing a 64-char hex master key) and store the result in the OS
@@ -90,12 +90,21 @@ func init() {
 	masterKeyCmd.AddCommand(masterKeyExportCmd)
 	masterKeyCmd.AddCommand(masterKeyImportCmd)
 
-	masterKeyExportCmd.Flags().StringVar(&masterKeyExportOut, "out", "", "destination file (or '-' for stdout)")
-	masterKeyExportCmd.MarkFlagRequired("out")
+	masterKeyExportCmd.Flags().StringVarP(&masterKeyExportOut, "output", "o", "", "destination file (or '-' for stdout)")
+	// --out kept as a deprecated alias for one release. Same backing var, so
+	// the import branch in runMasterKeyExport doesn't change.
+	masterKeyExportCmd.Flags().StringVar(&masterKeyExportOut, "out", "", "destination file (deprecated alias for --output)")
+	_ = masterKeyExportCmd.Flags().MarkDeprecated("out", "use --output (or -o) instead")
+	masterKeyExportCmd.MarkFlagsOneRequired("output", "out")
 
-	masterKeyImportCmd.Flags().StringVar(&masterKeyImportFrom, "from", "", "source age file")
+	masterKeyImportCmd.Flags().StringVar(&masterKeyImportSource, "source", "", "source age file")
+	// --from kept as a deprecated alias for one release. The flag name "from"
+	// is reserved for sender semantics (send/draft); using it for a file path
+	// was inconsistent.
+	masterKeyImportCmd.Flags().StringVar(&masterKeyImportSource, "from", "", "source age file (deprecated alias for --source)")
+	_ = masterKeyImportCmd.Flags().MarkDeprecated("from", "use --source instead")
 	masterKeyImportCmd.Flags().BoolVar(&masterKeyImportForce, "force", false, "overwrite an existing keychain entry")
-	masterKeyImportCmd.MarkFlagRequired("from")
+	masterKeyImportCmd.MarkFlagsOneRequired("source", "from")
 }
 
 // bootstrapKeyring loads (or, on first run, generates) the ADR-0001 master
@@ -226,9 +235,9 @@ func runMasterKeyExport(cmd *cobra.Command, args []string) error {
 }
 
 func runMasterKeyImport(cmd *cobra.Command, args []string) error {
-	ct, err := os.ReadFile(masterKeyImportFrom)
+	ct, err := os.ReadFile(masterKeyImportSource)
 	if err != nil {
-		return fmt.Errorf("read %s: %w", masterKeyImportFrom, err)
+		return fmt.Errorf("read %s: %w", masterKeyImportSource, err)
 	}
 
 	pass, err := promptPassword("Passphrase to decrypt the master key: ")
@@ -257,7 +266,7 @@ func runMasterKeyImport(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "Master key imported from %s into keychain (%s/%s)\n",
-		masterKeyImportFrom, keychain.DBKeychainService, keychain.DBAccountMaster)
-	slog.Info("Master key imported", "module", "MASTER-KEY", "from", masterKeyImportFrom, "forced", masterKeyImportForce)
+		masterKeyImportSource, keychain.DBKeychainService, keychain.DBAccountMaster)
+	slog.Info("Master key imported", "module", "MASTER-KEY", "from", masterKeyImportSource, "forced", masterKeyImportForce)
 	return nil
 }

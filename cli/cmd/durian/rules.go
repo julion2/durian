@@ -16,6 +16,16 @@ var rulesApplyDryRun bool
 var rulesCmd = &cobra.Command{
 	Use:   "rules",
 	Short: "Manage filter rules",
+	Long: `Work with the declarative filter rules defined in rules.pkl
+(~/.config/durian/rules.pkl). Each rule matches incoming messages by
+header / body / address / group and adds or removes tags.
+
+Rules are evaluated automatically during 'durian sync' and while
+'durian serve' is running. This subcommand is for backfilling: 'rules
+apply' re-runs the current ruleset against every message in the local
+store, useful after editing rules.pkl.
+
+Validate the file with 'durian validate rules' before applying.`,
 }
 
 var rulesApplyCmd = &cobra.Command{

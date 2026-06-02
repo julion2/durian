@@ -42,7 +42,7 @@ The first run of any `durian` command that needs the keyring auto-generates the 
 If you ever lose the keychain entry — Mac wipe, Migration Assistant going sideways, fresh OS install — the encrypted DB is unreadable without the master. **Export it once, store the file in your password manager or on a hardware token.**
 
 ```bash
-durian master-key export --out ~/durian-master.age
+durian master-key export --output ~/durian-master.age
 ```
 
 You'll be prompted for a passphrase. The output is an ASCII-armored age file (scrypt recipient), so any standard `age` install can also decrypt it:
@@ -56,7 +56,7 @@ The file content is the 64-character hex of the master. Treat it like a root pas
 Write to stdout if you want to pipe straight into a password manager:
 
 ```bash
-durian master-key export --out - | pbcopy   # macOS clipboard
+durian master-key export --output - | pbcopy   # macOS clipboard
 ```
 
 ## Restore: import an age file into a fresh keychain
@@ -64,7 +64,7 @@ durian master-key export --out - | pbcopy   # macOS clipboard
 On a new machine (or after `security delete-generic-password -s durian-db`), bring the master back before `durian sync`:
 
 ```bash
-durian master-key import --from ~/durian-master.age
+durian master-key import --source ~/durian-master.age
 ```
 
 Passphrase prompt, decrypt, write to the keychain. Refuses to overwrite an existing entry unless you pass `--force` (using `--force` on a populated DB with a different master makes that DB unreadable — the warning is real).

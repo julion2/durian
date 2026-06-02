@@ -36,7 +36,11 @@ var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start OpenAPI HTTP server (for GUI integration)",
 	Long:  "Start the HTTP server that provides a RESTful API for the GUI.",
-	Run:   runServe,
+	Example: `  durian serve                     # default port 9723, bearer-token auth
+  durian serve --port 8080         # listen on a non-default port
+  durian serve --debug             # debug-level logging to serve.log
+  durian serve --no-auth           # skip bearer-token check (experimental clients)`,
+	Run: runServe,
 }
 
 func init() {

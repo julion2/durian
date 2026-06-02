@@ -21,6 +21,11 @@ durian sync                          # all accounts, all mailboxes
 durian sync personal                 # one account by alias
 durian sync personal INBOX           # one mailbox
 durian sync --debug                  # verbose logging to stderr
+durian sync --upload-only            # only push local tag/flag changes
+durian sync --download-only          # only fetch from server
+durian sync --no-flags               # skip flag sync (bodies only)
+durian sync --backfill-headers       # refetch headers for existing rows
+durian sync --dry-run                # report what would happen, write nothing
 ```
 
 Bidirectional by default — local tag changes are uploaded as IMAP flags / folder moves, and server-side flag changes are pulled down. The first sync of a large mailbox can take a few minutes; subsequent syncs are incremental.
@@ -33,7 +38,7 @@ The GUI runs `durian serve`, which keeps a long-lived IDLE connection open per a
 durian search "tag:inbox" -l 10
 durian search "from:boss@company.com AND has:attachment:pdf"
 durian search "group:vip AND date:1w.." --json
-durian search count "tag:unread"
+durian count "tag:unread"
 ```
 
 Uses [notmuch-style syntax](../gui/search/) — terms are ANDed by default; `OR`/`NOT` are explicit. `--json` emits machine-readable output for piping into other tools.
@@ -60,27 +65,37 @@ Renders the thread to stdout — useful for piping into `less` or grepping a spe
 ## attachment — list or download
 
 ```bash
-durian attachment <message-id>                          # list parts
-durian attachment <message-id> --part 2 --save ./out/   # download part 2
+durian attachment <message-id>                              # list parts
+durian attachment <message-id> --save 2 --output ./out/     # download part 2 into ./out/
+durian attachment <message-id> --save 2                     # download part 2 into the current dir
 ```
 
-Part IDs come from the `list` output. `--save` writes the original filename into the target directory.
+Part IDs come from the `list` output. `--save <part>` selects the part, `-o, --output <dir>` picks the target directory (defaults to `.`). The original filename is preserved.
 
 ## send — send an email
 
 ```bash
 durian send --to bob@x.com --subject Hi --body "Hello"
 durian send --to bob@x.com --subject Draft       # opens $EDITOR
-durian send --to bob@x.com --subject "PR" --attachment patch.diff
+durian send --to bob@x.com --subject "PR" --attach patch.diff
+durian send --to bob@x.com --subject "Newsletter" --body-file newsletter.html --html
+durian send --to bob@x.com --subject "Re: PR" \
+            --in-reply-to "<orig@host>" --references "<root@host> <orig@host>" \
+            --body "ack"
+durian send --to bob@x.com --subject "huge" --attach video.mov --force
 ```
 
-If `--body` is omitted, your `$EDITOR` opens with a temp file.
+If `--body` is omitted, your `$EDITOR` opens with a temp file. `--body-file`
+reads the body from disk (use with `--html` for HTML mail). `--in-reply-to`
+and `--references` set the threading headers when scripting replies.
+`--force` overrides the per-account attachment-size limit (see
+`max_attachment_size_mb` in `config.pkl`).
 
 ## draft — manage IMAP drafts
 
 ```bash
 durian draft save --to alice@x.com --subject WIP --body "..."
-durian draft save --replace --message-id "<original-id>" ...
+durian draft save --replace "<original-id>" ...
 durian draft delete "<message-id>"
 ```
 
@@ -122,11 +137,14 @@ Credentials live in the macOS Keychain — see [OAuth setup](../auth/oauth/) and
 ## master-key — back up the at-rest encryption key
 
 ```bash
-durian master-key export --out ~/durian-master.age   # passphrase-encrypted age file
-durian master-key export --out -                     # to stdout
-durian master-key import --from ~/durian-master.age  # restore into a fresh keychain
-durian master-key import --from FILE --force         # overwrite an existing entry
+durian master-key export -o ~/durian-master.age        # passphrase-encrypted age file
+durian master-key export --output -                    # to stdout
+durian master-key import --source ~/durian-master.age  # restore into a fresh keychain
+durian master-key import --source FILE --force         # overwrite an existing entry
 ```
+
+The previous `--out` / `--from` flag names are kept as deprecated aliases for one
+release — they still work but print a deprecation warning.
 
 The master encrypts every sensitive column in `email.db` + `contacts.db`. Lose it and the local DB is unrecoverable. See the [Encryption at rest](../encryption-at-rest/) walkthrough.
 
@@ -155,10 +173,13 @@ Groups are defined in `groups.pkl` — edit the file to add or remove members. T
 ## tag-sync — multi-machine tag replication
 
 ```bash
-durian tag-sync push                  # push local tag changes to server
-durian tag-sync pull                  # pull remote changes
-durian tag-sync push-all              # initial sync (all tags)
+durian tag-sync init                  # one-shot bulk push of all local tags
 ```
+
+Incremental `push` / `pull` subcommands are not yet implemented — for now tag changes
+are pushed/pulled automatically as part of every `durian sync` (and continuously while
+`durian serve` is running). `tag-sync init` is the one-time bootstrap to seed a fresh
+sync server from an existing local DB.
 
 Optional. Requires a self-hosted [tag sync server](https://github.com/julion2/durian/tree/main/sync) configured in `config.pkl`:
 

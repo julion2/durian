@@ -18,24 +18,29 @@ var contactsCmd = &cobra.Command{
 }
 
 var contactsInitCmd = &cobra.Command{
-	Use:   "init",
-	Short: "Initialize the contacts database",
-	Long:  `Create the contacts database file and schema.`,
-	RunE:  runContactsInit,
+	Use:     "init",
+	Short:   "Initialize the contacts database",
+	Long:    `Create the contacts database file and schema.`,
+	Example: `  durian contacts init`,
+	RunE:    runContactsInit,
 }
 
 var contactsImportCmd = &cobra.Command{
-	Use:   "import",
-	Short: "Import contacts from email store",
-	Long:  "Import email addresses from the local email store (From, To, Cc headers).",
-	RunE:  runContactsImport,
+	Use:     "import",
+	Short:   "Import contacts from email store",
+	Long:    "Import email addresses from the local email store (From, To, Cc headers).",
+	Example: `  durian contacts import`,
+	RunE:    runContactsImport,
 }
 
 var contactsListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all contacts",
 	Long:  `List all contacts in the database, ordered by usage.`,
-	RunE:  runContactsList,
+	Example: `  durian contacts list
+  durian contacts list -l 500
+  durian contacts list --json`,
+	RunE: runContactsList,
 }
 
 var contactsSearchCmd = &cobra.Command{
@@ -77,8 +82,8 @@ func init() {
 	contactsCmd.AddCommand(contactsDeleteCmd)
 
 	// Add flags
-	contactsListCmd.Flags().IntVarP(&contactsLimit, "limit", "n", 100, "maximum number of contacts to show")
-	contactsSearchCmd.Flags().IntVarP(&contactsLimit, "limit", "n", 20, "maximum number of results")
+	contactsListCmd.Flags().IntVarP(&contactsLimit, "limit", "l", 100, "maximum number of contacts to show")
+	contactsSearchCmd.Flags().IntVarP(&contactsLimit, "limit", "l", 20, "maximum number of results")
 }
 
 // getDBPath returns the database path from config or default
@@ -220,7 +225,7 @@ func runContactsList(cmd *cobra.Command, args []string) error {
 
 	total, _ := db.Count()
 	if total > contactsLimit {
-		fmt.Printf("\n(showing %d of %d contacts, use -n to show more)\n", contactsLimit, total)
+		fmt.Printf("\n(showing %d of %d contacts, use -l to show more)\n", contactsLimit, total)
 	}
 
 	return nil
