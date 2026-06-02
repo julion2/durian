@@ -84,6 +84,28 @@ jobs:
           shasum -a 256 *.tar.gz *.zip *.cdx.json > checksums.txt
           cat checksums.txt
 
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          # Pull out the [vX.Y.Z] section that matches GITHUB_REF_NAME.
+          # CHANGELOG.md is the single source of truth — mirrored into the
+          # release body byte-identically. Falls back to a one-line stub
+          # pointing at CHANGELOG.md if no matching section is found.
+          TAG="${GITHUB_REF_NAME}"
+          if awk -v tag="$TAG" '
+            BEGIN { found = 0 }
+            /^## \[/ {
+              if (found) exit
+              if ($0 ~ "^## \\[" tag "\\]") { found = 1; print; next }
+            }
+            found { print }
+          ' CHANGELOG.md > dist/release-notes.md && [ -s dist/release-notes.md ]; then
+            echo "Extracted $(wc -l < dist/release-notes.md) lines from CHANGELOG.md for $TAG"
+          else
+            echo "No CHANGELOG.md entry found for $TAG — falling back to stub" >&2
+            printf '## %s\n\nSee [CHANGELOG.md](https://github.com/julion2/durian/blob/main/CHANGELOG.md) for notes.\n' "$TAG" > dist/release-notes.md
+          fi
+
       - name: Create Release
         run: |
           gh release create "${{ github.ref_name }}" \
@@ -97,7 +119,7 @@ jobs:
             dist/durian-${{ steps.version.outputs.version }}.cdx.json \
             dist/checksums.txt \
             --title "Durian ${{ github.ref_name }}" \
-            --generate-notes
+            --notes-file dist/release-notes.md
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
