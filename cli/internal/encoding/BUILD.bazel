@@ -8,7 +8,7 @@ go_library(
         "html.go",
         "transfer.go",
     ],
-    importpath = "github.com/durian-dev/durian/cli/internal/encoding",
+    importpath = "github.com/julion2/durian/cli/internal/encoding",
     visibility = ["//cli:__subpackages__"],
     deps = [
         "@org_golang_x_net//html",

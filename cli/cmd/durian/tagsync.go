@@ -7,8 +7,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/durian-dev/durian/cli/internal/store"
-	"github.com/durian-dev/durian/cli/internal/tagsync"
+	"github.com/julion2/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/tagsync"
 )
 
 var tagSyncCmd = &cobra.Command{

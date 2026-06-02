@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/durian-dev/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 // --- Helpers ---

@@ -7,7 +7,7 @@ go_library(
         "import.go",
         "types.go",
     ],
-    importpath = "github.com/durian-dev/durian/cli/internal/contacts",
+    importpath = "github.com/julion2/durian/cli/internal/contacts",
     visibility = ["//cli:__subpackages__"],
     deps = [
         "//cli/internal/dbcrypto",

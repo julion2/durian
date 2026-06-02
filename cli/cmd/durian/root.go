@@ -5,9 +5,9 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/durian-dev/durian/cli/internal/config"
-	"github.com/durian-dev/durian/cli/internal/redact"
-	"github.com/durian-dev/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/redact"
+	"github.com/julion2/durian/cli/internal/store"
 	"github.com/spf13/cobra"
 )
 

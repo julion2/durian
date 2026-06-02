@@ -16,12 +16,12 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/gorilla/mux"
 
-	"github.com/durian-dev/durian/cli/internal/auth"
-	"github.com/durian-dev/durian/cli/internal/config"
-	"github.com/durian-dev/durian/cli/internal/encoding"
-	imapClient "github.com/durian-dev/durian/cli/internal/imap"
-	"github.com/durian-dev/durian/cli/internal/smtp"
-	"github.com/durian-dev/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/auth"
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/encoding"
+	imapClient "github.com/julion2/durian/cli/internal/imap"
+	"github.com/julion2/durian/cli/internal/smtp"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 // OutboxDraft is the JSON payload for enqueuing an email to the outbox.

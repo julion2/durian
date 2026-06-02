@@ -19,12 +19,12 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/spf13/cobra"
 
-	"github.com/durian-dev/durian/cli/internal/config"
-	"github.com/durian-dev/durian/cli/internal/contacts"
-	"github.com/durian-dev/durian/cli/internal/handler"
-	"github.com/durian-dev/durian/cli/internal/redact"
-	"github.com/durian-dev/durian/cli/internal/store"
-	"github.com/durian-dev/durian/cli/internal/tagsync"
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/contacts"
+	"github.com/julion2/durian/cli/internal/handler"
+	"github.com/julion2/durian/cli/internal/redact"
+	"github.com/julion2/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/tagsync"
 )
 
 var servePort int

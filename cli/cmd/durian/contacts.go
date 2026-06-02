@@ -7,7 +7,7 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/durian-dev/durian/cli/internal/contacts"
+	"github.com/julion2/durian/cli/internal/contacts"
 	"github.com/spf13/cobra"
 )
 

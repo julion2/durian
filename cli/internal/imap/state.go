@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/durian-dev/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/config"
 )
 
 // State tracks sync state for an account

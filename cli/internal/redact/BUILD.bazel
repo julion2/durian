@@ -6,7 +6,7 @@ go_library(
         "keys.go",
         "redact.go",
     ],
-    importpath = "github.com/durian-dev/durian/cli/internal/redact",
+    importpath = "github.com/julion2/durian/cli/internal/redact",
     visibility = ["//cli:__subpackages__"],
 )
 

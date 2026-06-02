@@ -1,4 +1,4 @@
-module github.com/durian-dev/durian/cli
+module github.com/julion2/durian/cli
 
 go 1.25.10
 

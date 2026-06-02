@@ -4,8 +4,8 @@ import (
 	"net/mail"
 	"testing"
 
-	"github.com/durian-dev/durian/cli/internal/config"
-	"github.com/durian-dev/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 func TestEvalExpr_FieldFrom(t *testing.T) {

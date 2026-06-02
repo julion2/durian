@@ -7,9 +7,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/durian-dev/durian/cli/internal/config"
-	"github.com/durian-dev/durian/cli/internal/imap"
-	"github.com/durian-dev/durian/cli/internal/tagsync"
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/imap"
+	"github.com/julion2/durian/cli/internal/tagsync"
 )
 
 var (

@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/durian-dev/durian/cli/internal/dbcrypto"
-	"github.com/durian-dev/durian/cli/internal/protocol"
-	"github.com/durian-dev/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/dbcrypto"
+	"github.com/julion2/durian/cli/internal/protocol"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 // mockFetcher implements AttachmentFetcher for testing.

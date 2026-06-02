@@ -17,7 +17,7 @@ go_library(
         "tags.go",
         "watcher.go",
     ],
-    importpath = "github.com/durian-dev/durian/cli/internal/handler",
+    importpath = "github.com/julion2/durian/cli/internal/handler",
     visibility = ["//cli:__subpackages__"],
     deps = [
         "//cli/internal/auth",

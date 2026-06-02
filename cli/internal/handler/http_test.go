@@ -12,7 +12,7 @@ import (
 
 	"github.com/gorilla/mux"
 
-	"github.com/durian-dev/durian/cli/internal/contacts"
+	"github.com/julion2/durian/cli/internal/contacts"
 )
 
 // newTestRouter sets up a mux.Router with all routes, mirroring serve.go.

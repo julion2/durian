@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/durian-dev/durian/cli/internal/dbcrypto"
+	"github.com/julion2/durian/cli/internal/dbcrypto"
 )
 
 // testKeyring returns a deterministic keyring used across every store test.

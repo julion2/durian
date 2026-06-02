@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/durian-dev/durian/cli/internal/contacts"
-	"github.com/durian-dev/durian/cli/internal/dbcrypto"
-	"github.com/durian-dev/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/contacts"
+	"github.com/julion2/durian/cli/internal/dbcrypto"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 // testKeyring is a deterministic keyring for seeded test DBs. Production

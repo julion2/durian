@@ -33,7 +33,7 @@ go_library(
         "schema/Profiles.pkl",
         "schema/Rules.pkl",
     ],
-    importpath = "github.com/durian-dev/durian/cli/internal/config",
+    importpath = "github.com/julion2/durian/cli/internal/config",
     visibility = ["//cli:__subpackages__"],
     deps = ["@com_github_apple_pkl_go//pkl"],
 )

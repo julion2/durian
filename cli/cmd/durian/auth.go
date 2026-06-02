@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/durian-dev/durian/cli/internal/config"
-	"github.com/durian-dev/durian/cli/internal/keychain"
-	"github.com/durian-dev/durian/cli/internal/oauth"
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/keychain"
+	"github.com/julion2/durian/cli/internal/oauth"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )

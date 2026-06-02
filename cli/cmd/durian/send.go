@@ -12,10 +12,10 @@ import (
 
 	"github.com/emersion/go-imap"
 
-	"github.com/durian-dev/durian/cli/internal/auth"
-	"github.com/durian-dev/durian/cli/internal/config"
-	imapClient "github.com/durian-dev/durian/cli/internal/imap"
-	"github.com/durian-dev/durian/cli/internal/smtp"
+	"github.com/julion2/durian/cli/internal/auth"
+	"github.com/julion2/durian/cli/internal/config"
+	imapClient "github.com/julion2/durian/cli/internal/imap"
+	"github.com/julion2/durian/cli/internal/smtp"
 	"github.com/spf13/cobra"
 )
 

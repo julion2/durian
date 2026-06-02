@@ -7,7 +7,7 @@ go_library(
         "keyring.go",
         "tokenize.go",
     ],
-    importpath = "github.com/durian-dev/durian/cli/internal/dbcrypto",
+    importpath = "github.com/julion2/durian/cli/internal/dbcrypto",
     visibility = ["//cli:__subpackages__"],
     deps = ["@com_github_rivo_uniseg//:uniseg"],
 )

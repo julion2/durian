@@ -1,6 +1,6 @@
 package protocol
 
-import "github.com/durian-dev/durian/cli/internal/mail"
+import "github.com/julion2/durian/cli/internal/mail"
 
 // ErrorCode represents standardized error codes for client handling
 type ErrorCode string

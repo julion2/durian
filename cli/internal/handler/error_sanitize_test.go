@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/durian-dev/durian/cli/internal/smtp"
+	"github.com/julion2/durian/cli/internal/smtp"
 )
 
 // TestSanitizeOutboxError_StripsSMTPServerResponse asserts ADR-0001

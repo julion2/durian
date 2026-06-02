@@ -4,12 +4,12 @@ import (
 	"context"
 	"io"
 
-	"github.com/durian-dev/durian/cli/internal/config"
-	"github.com/durian-dev/durian/cli/internal/contacts"
-	"github.com/durian-dev/durian/cli/internal/mail"
-	"github.com/durian-dev/durian/cli/internal/protocol"
-	"github.com/durian-dev/durian/cli/internal/store"
-	"github.com/durian-dev/durian/cli/internal/tagsync"
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/contacts"
+	"github.com/julion2/durian/cli/internal/mail"
+	"github.com/julion2/durian/cli/internal/protocol"
+	"github.com/julion2/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/tagsync"
 )
 
 // AttachmentFetcher fetches attachment bytes directly from the IMAP server.

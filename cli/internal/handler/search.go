@@ -3,9 +3,9 @@ package handler
 import (
 	"strings"
 
-	"github.com/durian-dev/durian/cli/internal/mail"
-	"github.com/durian-dev/durian/cli/internal/protocol"
-	"github.com/durian-dev/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/mail"
+	"github.com/julion2/durian/cli/internal/protocol"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 // Search handles the "search" command.

@@ -9,8 +9,8 @@ import (
 	"net/mail"
 	"strings"
 
-	"github.com/durian-dev/durian/cli/internal/encoding"
-	"github.com/durian-dev/durian/cli/internal/sanitize"
+	"github.com/julion2/durian/cli/internal/encoding"
+	"github.com/julion2/durian/cli/internal/sanitize"
 )
 
 // detectMagic returns MIME type and extension from file magic bytes.

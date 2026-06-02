@@ -6,8 +6,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/durian-dev/durian/cli/internal/handler"
-	"github.com/durian-dev/durian/cli/internal/protocol"
+	"github.com/julion2/durian/cli/internal/handler"
+	"github.com/julion2/durian/cli/internal/protocol"
 	"github.com/spf13/cobra"
 )
 

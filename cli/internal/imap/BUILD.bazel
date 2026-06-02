@@ -15,7 +15,7 @@ go_library(
         "sync_mailbox.go",
         "sync_store.go",
     ],
-    importpath = "github.com/durian-dev/durian/cli/internal/imap",
+    importpath = "github.com/julion2/durian/cli/internal/imap",
     visibility = ["//cli:__subpackages__"],
     deps = [
         "//cli/internal/config",

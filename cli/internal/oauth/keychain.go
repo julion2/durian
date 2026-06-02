@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/durian-dev/durian/cli/internal/keychain"
+	"github.com/julion2/durian/cli/internal/keychain"
 )
 
 const (

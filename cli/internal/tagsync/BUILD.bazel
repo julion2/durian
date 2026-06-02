@@ -3,7 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "tagsync",
     srcs = ["client.go"],
-    importpath = "github.com/durian-dev/durian/cli/internal/tagsync",
+    importpath = "github.com/julion2/durian/cli/internal/tagsync",
     visibility = ["//cli:__subpackages__"],
 )
 

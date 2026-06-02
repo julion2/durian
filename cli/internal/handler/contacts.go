@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/durian-dev/durian/cli/internal/contacts"
+	"github.com/julion2/durian/cli/internal/contacts"
 )
 
 // SearchContactsHandler handles GET /api/v1/contacts/search

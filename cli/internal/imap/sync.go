@@ -10,9 +10,9 @@ import (
 
 	goimap "github.com/emersion/go-imap"
 
-	"github.com/durian-dev/durian/cli/internal/config"
-	durianmail "github.com/durian-dev/durian/cli/internal/mail"
-	"github.com/durian-dev/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/config"
+	durianmail "github.com/julion2/durian/cli/internal/mail"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 // SyncMode defines the sync direction

@@ -3,7 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "agekey",
     srcs = ["agekey.go"],
-    importpath = "github.com/durian-dev/durian/cli/internal/agekey",
+    importpath = "github.com/julion2/durian/cli/internal/agekey",
     visibility = ["//cli:__subpackages__"],
     deps = [
         "@io_filippo_age//:age",

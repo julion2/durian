@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/durian-dev/durian/cli/internal/mail"
+	"github.com/julion2/durian/cli/internal/mail"
 )
 
 // mockHandler implements CommandHandler for testing

@@ -6,7 +6,7 @@ go_library(
         "parser.go",
         "types.go",
     ],
-    importpath = "github.com/durian-dev/durian/cli/internal/mail",
+    importpath = "github.com/julion2/durian/cli/internal/mail",
     visibility = ["//cli:__subpackages__"],
     deps = [
         "//cli/internal/encoding",

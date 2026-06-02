@@ -7,7 +7,7 @@ go_library(
         "keychain_darwin.go",
         "keychain_linux.go",
     ],
-    importpath = "github.com/durian-dev/durian/cli/internal/keychain",
+    importpath = "github.com/julion2/durian/cli/internal/keychain",
     visibility = ["//cli:__subpackages__"],
 )
 

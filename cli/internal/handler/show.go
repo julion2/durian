@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	internmail "github.com/durian-dev/durian/cli/internal/mail"
-	"github.com/durian-dev/durian/cli/internal/protocol"
-	"github.com/durian-dev/durian/cli/internal/sanitize"
-	"github.com/durian-dev/durian/cli/internal/store"
+	internmail "github.com/julion2/durian/cli/internal/mail"
+	"github.com/julion2/durian/cli/internal/protocol"
+	"github.com/julion2/durian/cli/internal/sanitize"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 // Show handles the "show" command for a file path

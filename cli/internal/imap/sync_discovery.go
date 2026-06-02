@@ -7,7 +7,7 @@ import (
 
 	goimap "github.com/emersion/go-imap"
 
-	"github.com/durian-dev/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/config"
 )
 
 // isGmail returns true if the account is a Gmail/Google Workspace account.

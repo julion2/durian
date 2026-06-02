@@ -7,7 +7,7 @@ go_library(
         "response.go",
         "server.go",
     ],
-    importpath = "github.com/durian-dev/durian/cli/internal/protocol",
+    importpath = "github.com/julion2/durian/cli/internal/protocol",
     visibility = ["//cli:__subpackages__"],
     deps = ["//cli/internal/mail"],
 )

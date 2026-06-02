@@ -10,7 +10,7 @@ import (
 
 	goimap "github.com/emersion/go-imap"
 
-	"github.com/durian-dev/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 

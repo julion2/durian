@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/durian-dev/durian/cli/internal/config"
-	"github.com/durian-dev/durian/cli/internal/imap"
-	"github.com/durian-dev/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/imap"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 // FetchRequest is sent to an account watcher to break IDLE and fetch an

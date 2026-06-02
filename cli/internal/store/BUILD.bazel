@@ -15,7 +15,7 @@ go_library(
         "threads.go",
         "types.go",
     ],
-    importpath = "github.com/durian-dev/durian/cli/internal/store",
+    importpath = "github.com/julion2/durian/cli/internal/store",
     visibility = ["//cli:__subpackages__"],
     deps = [
         "//cli/internal/dbcrypto",

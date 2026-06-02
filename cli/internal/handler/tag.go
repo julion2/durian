@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/durian-dev/durian/cli/internal/protocol"
-	"github.com/durian-dev/durian/cli/internal/tagsync"
+	"github.com/julion2/durian/cli/internal/protocol"
+	"github.com/julion2/durian/cli/internal/tagsync"
 )
 
 // Tag handles the "tag" command.

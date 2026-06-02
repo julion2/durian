@@ -1,6 +1,6 @@
 package handler
 
-import "github.com/durian-dev/durian/cli/internal/protocol"
+import "github.com/julion2/durian/cli/internal/protocol"
 
 // ListTags returns all known tags.
 func (h *Handler) ListTags() protocol.Response {

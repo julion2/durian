@@ -9,8 +9,8 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/durian-dev/durian/cli/internal/config"
-	"github.com/durian-dev/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 // ExecInput is the JSON sent to an exec rule's stdin.

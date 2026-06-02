@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/durian-dev/durian/cli/internal/dbcrypto"
+	"github.com/julion2/durian/cli/internal/dbcrypto"
 
 	_ "modernc.org/sqlite"
 )

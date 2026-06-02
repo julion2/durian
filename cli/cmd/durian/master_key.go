@@ -10,9 +10,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/durian-dev/durian/cli/internal/agekey"
-	"github.com/durian-dev/durian/cli/internal/dbcrypto"
-	"github.com/durian-dev/durian/cli/internal/keychain"
+	"github.com/julion2/durian/cli/internal/agekey"
+	"github.com/julion2/durian/cli/internal/dbcrypto"
+	"github.com/julion2/durian/cli/internal/keychain"
 )
 
 // envMasterKeyHex is an override env var read by bootstrapKeyring before

@@ -3,7 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "auth",
     srcs = ["auth.go"],
-    importpath = "github.com/durian-dev/durian/cli/internal/auth",
+    importpath = "github.com/julion2/durian/cli/internal/auth",
     visibility = ["//cli:__subpackages__"],
     deps = [
         "//cli/internal/config",

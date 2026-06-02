@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/durian-dev/durian/cli/internal/smtp"
+	"github.com/julion2/durian/cli/internal/smtp"
 )
 
 // sanitizeOutboxError returns a string safe to persist in outbox.last_error

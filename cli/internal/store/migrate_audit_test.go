@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/durian-dev/durian/cli/internal/dbcrypto"
+	"github.com/julion2/durian/cli/internal/dbcrypto"
 )
 
 // TestRebuildMessages_IdempotentAfterPartialFailure asserts ADR-0001

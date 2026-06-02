@@ -8,7 +8,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/durian-dev/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/config"
 	"github.com/spf13/cobra"
 )
 

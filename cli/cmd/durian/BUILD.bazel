@@ -24,7 +24,7 @@ go_library(
         "tagsync.go",
         "validate.go",
     ],
-    importpath = "github.com/durian-dev/durian/cli/cmd/durian",
+    importpath = "github.com/julion2/durian/cli/cmd/durian",
     visibility = ["//visibility:private"],
     deps = [
         "//cli/internal/agekey",

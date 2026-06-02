@@ -9,7 +9,7 @@ go_library(
         "provider.go",
         "token.go",
     ],
-    importpath = "github.com/durian-dev/durian/cli/internal/oauth",
+    importpath = "github.com/julion2/durian/cli/internal/oauth",
     visibility = ["//cli:__subpackages__"],
     deps = ["//cli/internal/keychain"],
 )

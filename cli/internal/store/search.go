@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/durian-dev/durian/cli/internal/dbcrypto"
+	"github.com/julion2/durian/cli/internal/dbcrypto"
 )
 
 // SearchCount returns the number of threads matching a query. ADR-0001
