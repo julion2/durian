@@ -8,20 +8,27 @@ The release body on GitHub Releases mirrors the corresponding section of this fi
 
 The headline of this release is **at-rest encryption** of the local SQLite store. Mail bodies, subjects, headers, addresses, drafts, attachment metadata, and contact entries are now AES-256-GCM encrypted in `email.db` and `contacts.db`, with the master key in your OS keychain. Full-text search continues to work against a blind-token FTS5 index — no plaintext leaves the encryption layer. See the new [Encryption at rest](https://julion2.github.io/durian/docs/cli/encryption-at-rest/) walkthrough and [ADR-0001](https://julion2.github.io/durian/docs/developers/design/0001-mail-content-encryption-at-rest/).
 
-### Before you upgrade — read this
+### Migration — read this carefully
 
 This release ships an automatic, one-shot schema migration from v9 to v22 that encrypts every existing row in your local DB in place. The migration runs on the first `durian serve` start after upgrade and is **not reversible** — downgrading back to v0.3.x cannot read the migrated DB.
 
-Strongly recommended before upgrading:
+**Before upgrading** — snapshot your data directory so you can roll back to v0.3.x if anything goes sideways:
 
 ```bash
-durian master-key export --out ~/durian-master.age
 cp -a ~/.local/share/durian ~/durian-backup-v0.3.x
 ```
 
-The first command writes a passphrase-encrypted backup of your master key — keep it somewhere outside `~/.local/share/durian` (password manager, hardware token, external drive). Losing it after a future keychain wipe makes the encrypted DB unrecoverable. The second snapshots your pre-migration DB so a rollback to v0.3.x is possible by restoring the snapshot.
+(Linux / non-default XDG: replace `~/.local/share/durian` with `$XDG_DATA_HOME/durian`.)
 
-The migration takes seconds on small mailboxes, up to a minute on 50k-message mailboxes.
+**After the first `durian serve` on v0.4.0** — back up the master key that was just auto-generated and stored in your OS keychain:
+
+```bash
+durian master-key export --out ~/durian-master.age
+```
+
+You'll be prompted for a passphrase. Move the resulting age file somewhere outside `~/.local/share/durian` (password manager, hardware token, external drive). Without this backup, a future keychain wipe makes the encrypted DB unrecoverable.
+
+The migration itself takes seconds on small mailboxes, up to a minute on 50k-message mailboxes. Initial `durian serve` log line confirms when it completes.
 
 ### Security
 
