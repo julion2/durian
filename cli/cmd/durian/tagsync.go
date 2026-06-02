@@ -14,20 +14,45 @@ import (
 var tagSyncCmd = &cobra.Command{
 	Use:   "tag-sync",
 	Short: "Manage remote tag synchronization",
+	Long: `Replicate Durian's local tags to a self-hosted tag-sync server so they
+follow you across machines. Configuration lives in config.pkl under
+sync { tag_sync { url; api_key } }.
+
+Incremental push/pull happen automatically during 'durian sync' and while
+'durian serve' is running — this command group is only for the one-shot
+'init' bootstrap that seeds a fresh server from an existing local DB.`,
 }
 
+var tagSyncInitCmd = &cobra.Command{
+	Use:   "init",
+	Short: "Bulk-push all local tags to the sync server (one-shot bootstrap)",
+	Long: `Push every local tag in one batch to the configured tag-sync server.
+
+Run this once after pointing a new machine at the server, or after standing
+up a fresh server, to seed it from an existing local DB. Routine
+incremental sync is handled by 'durian sync' and 'durian serve' — you do
+not need to call 'init' again on the same server.`,
+	Example: `  durian tag-sync init`,
+	RunE:    runTagSyncInit,
+}
+
+// tagSyncPushAllCmd is the previous name for 'init' — kept as a hidden,
+// deprecated alias for one release so existing scripts keep working.
 var tagSyncPushAllCmd = &cobra.Command{
-	Use:   "push-all",
-	Short: "Push all local tags to the sync server (initial sync)",
-	RunE:  runTagSyncPushAll,
+	Use:        "push-all",
+	Short:      "Deprecated alias for 'tag-sync init'",
+	Hidden:     true,
+	Deprecated: "use 'durian tag-sync init' instead",
+	RunE:       runTagSyncInit,
 }
 
 func init() {
+	tagSyncCmd.AddCommand(tagSyncInitCmd)
 	tagSyncCmd.AddCommand(tagSyncPushAllCmd)
 	rootCmd.AddCommand(tagSyncCmd)
 }
 
-func runTagSyncPushAll(cmd *cobra.Command, args []string) error {
+func runTagSyncInit(cmd *cobra.Command, args []string) error {
 	cfg := GetConfig()
 	if cfg == nil {
 		return fmt.Errorf("no configuration loaded")

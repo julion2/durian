@@ -15,20 +15,30 @@ import (
 var groupCmd = &cobra.Command{
 	Use:   "group",
 	Short: "Manage contact groups",
-	Long:  "Manage contact groups defined in groups.pkl. Edit the file directly to modify.",
+	Long: `Inspect the contact groups defined in groups.pkl
+(~/.config/durian/groups.pkl). Groups bundle email addresses under a
+shared name (e.g. "vip", "investor") so that rules and search queries
+can refer to "group:vip" instead of enumerating every address.
+
+The CLI is read-only — edit groups.pkl to add, remove, or rename groups,
+then run 'durian validate groups' to check the file.`,
 }
 
 var groupListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all contact groups",
-	RunE:  runGroupList,
+	Example: `  durian group list
+  durian group list --json`,
+	RunE: runGroupList,
 }
 
 var groupMembersCmd = &cobra.Command{
 	Use:   "members <name>",
 	Short: "List members of a group",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runGroupMembers,
+	Example: `  durian group members vip
+  durian group members investor --json`,
+	Args: cobra.ExactArgs(1),
+	RunE: runGroupMembers,
 }
 
 func init() {
