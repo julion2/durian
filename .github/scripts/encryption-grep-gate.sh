@@ -26,7 +26,7 @@ cd "$ROOT"
 # TestGrepGateTokensInSync asserts every entry of SensitiveSlogKeys appears
 # in this regex; adding a key in keys.go without updating this line fails
 # CI on the next run with the expected TOKENS string printed.
-TOKENS='subject|body_text|body_html|from_addr|to_addrs|cc_addrs|email|draft_json|mailbox|account|synthetic_id|dest|trash|archive|folder|header_value|contact_email|contact_name|snippet'
+TOKENS='subject|body|body_text|body_html|from_addr|to_addrs|cc_addrs|email|draft|draft_json|mailbox|account|synthetic_id|dest|trash|archive|folder|header_value|contact_email|contact_name|snippet|flags'
 
 # The redact package legitimately names every sensitive token in its
 # registry, its test fixtures and its package documentation.

@@ -103,13 +103,32 @@ func suggestedTokensLine(have map[string]struct{}, missing []string) string {
 	return strings.Join(deduped, "|")
 }
 
-// findGrepGateScript locates the bash grep-gate relative to the test
-// binary. bazel runs tests from a sandbox; we walk up looking for a
-// .github directory. The repo layout is fixed so a short walk suffices.
+// findGrepGateScript locates the bash grep-gate from the running test.
+//
+// Under `bazel test` the script is staged into the runfiles tree via
+// the BUILD.bazel `data` attribute, addressable at
+// $TEST_SRCDIR/_main/.github/scripts/encryption-grep-gate.sh. The env
+// var is set by rules_go's test runner and never present otherwise, so
+// it doubles as the Bazel-detection signal. A missing file under that
+// path is a hard test failure (NOT a Skip) — the whole reason this test
+// exists is to break CI when the script drifts, and a silent Skip
+// defeats the purpose.
+//
+// Under plain `go test` the env var is empty; fall back to a short
+// parent-walk from the test source file to locate the repo root.
 func findGrepGateScript(t *testing.T) string {
 	t.Helper()
-	// Start from the test source file location — under bazel this resolves
-	// to the runfiles tree; outside bazel it's the repo path.
+	if srcdir := os.Getenv("TEST_SRCDIR"); srcdir != "" {
+		// rules_go bzlmod default workspace name is "_main" (no explicit
+		// module(name=...) in MODULE.bazel). Path is stable across rules_go
+		// versions in the 0.5x-0.6x range.
+		path := filepath.Join(srcdir, "_main", ".github", "scripts", "encryption-grep-gate.sh")
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("grep-gate script missing under TEST_SRCDIR (%s): %v — the BUILD.bazel data attribute likely lost the dep", path, err)
+		}
+		return path
+	}
+	// Fallback for plain `go test`: walk up from the test source file.
 	_, here, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed")
@@ -126,6 +145,6 @@ func findGrepGateScript(t *testing.T) string {
 		}
 		dir = parent
 	}
-	t.Skipf("grep-gate script not reachable from %s — likely running under sandboxed test runner without repo access", here)
+	t.Fatalf("grep-gate script not reachable from %s — running outside Bazel sandbox and parent-walk exhausted", here)
 	return ""
 }

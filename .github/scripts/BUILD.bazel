@@ -1,0 +1,4 @@
+exports_files(
+    ["encryption-grep-gate.sh"],
+    visibility = ["//cli/internal/redact:__pkg__"],
+)

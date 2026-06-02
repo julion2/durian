@@ -17,5 +17,6 @@ go_test(
         "redact_test.go",
         "sync_test.go",
     ],
+    data = ["//.github/scripts:encryption-grep-gate.sh"],
     embed = [":redact"],
 )
