@@ -17,6 +17,7 @@ swift_deps.from_package(
 use_repo(swift_deps, "swift_package", "swiftpkg_pkl_swift")
 
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+
 # Pin Go to a patched stdlib (govulncheck flags net/mail DoS bugs fixed in
 # 1.25.10). Without an explicit version, rules_go falls back to its bundled
 # default which lags behind. from_file uses the `go` directive in cli/go.mod

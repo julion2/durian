@@ -12,14 +12,15 @@ def _qt_local_repository_impl(ctx):
     for candidate in [
         qt_root + "/lib",
         qt_root + "/lib64",
-        qt_root + "/lib/x86_64-linux-gnu",   # Ubuntu/Debian x86_64
-        qt_root + "/lib/aarch64-linux-gnu",   # Ubuntu/Debian arm64
+        qt_root + "/lib/x86_64-linux-gnu",  # Ubuntu/Debian x86_64
+        qt_root + "/lib/aarch64-linux-gnu",  # Ubuntu/Debian arm64
         qt_root + "/../",  # QTDIR=/usr/lib64/qt6 → libs in /usr/lib64
     ]:
         p = ctx.path(candidate)
         if p.exists and ctx.path(candidate + "/libQt6Core.so").exists:
             lib_dir = candidate
             break
+
         # macOS frameworks
         if p.exists and ctx.path(candidate + "/QtCore.framework").exists:
             lib_dir = candidate
@@ -60,8 +61,8 @@ def _qt_local_repository_impl(ctx):
     include_dir = None
     for candidate in [
         qt_root + "/include/qt6",
-        qt_root + "/include/x86_64-linux-gnu/qt6",   # Ubuntu/Debian x86_64
-        qt_root + "/include/aarch64-linux-gnu/qt6",   # Ubuntu/Debian arm64
+        qt_root + "/include/x86_64-linux-gnu/qt6",  # Ubuntu/Debian x86_64
+        qt_root + "/include/aarch64-linux-gnu/qt6",  # Ubuntu/Debian arm64
         qt_root + "/include",
     ]:
         if ctx.path(candidate).exists and ctx.path(candidate + "/QtCore").exists:
@@ -133,16 +134,26 @@ def _qt_local_repository_impl(ctx):
         linkopts = [
             "-F" + lib_dir,
             "-Wl,-rpath," + lib_dir,
-            "-framework", "QtWidgets",
-            "-framework", "QtGui",
-            "-framework", "QtCore",
-            "-framework", "QtNetwork",
-            "-framework", "QtQuick",
-            "-framework", "QtQml",
-            "-framework", "QtQuickControls2",
-            "-framework", "QtWebEngineCore",
-            "-framework", "QtWebEngineQuick",
-            "-framework", "QtTest",
+            "-framework",
+            "QtWidgets",
+            "-framework",
+            "QtGui",
+            "-framework",
+            "QtCore",
+            "-framework",
+            "QtNetwork",
+            "-framework",
+            "QtQuick",
+            "-framework",
+            "QtQml",
+            "-framework",
+            "QtQuickControls2",
+            "-framework",
+            "QtWebEngineCore",
+            "-framework",
+            "QtWebEngineQuick",
+            "-framework",
+            "QtTest",
         ]
     else:
         includes = [

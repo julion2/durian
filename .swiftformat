@@ -1,0 +1,29 @@
+# SwiftFormat config — keeps the macos/ codebase in step with the
+# observed style (4-space indent, no hard line length, `// MARK:`
+# sections, Foundation/SwiftUI-first imports per CLAUDE.md).
+#
+# Conservative rule set: catches the trailing-whitespace and stale
+# import-order drift that the reviewer flagged, without forcing churn
+# on the existing 200+ Swift files.
+
+--swiftversion 5.10
+--indent 4
+--maxwidth none
+--trimwhitespace always
+--linebreaks lf
+--commas inline
+--self remove
+--header ignore
+
+# Enabled rules — conservative, all observably present in the codebase
+--enable trailingSpace
+--enable redundantSelf
+--enable sortImports
+--enable redundantParens
+--enable redundantReturn
+--enable wrapMultilineStatementBraces
+
+# Disabled — opinionated, would churn existing files for no gain
+--disable redundantType
+--disable blankLinesAtStartOfScope
+--disable redundantInternal

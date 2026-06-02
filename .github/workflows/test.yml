@@ -35,6 +35,17 @@ jobs:
             exit 1
           fi
 
+      - name: Check Buildifier
+        run: |
+          # Format-checks the BUILD/MODULE/.bzl files actually tracked in
+          # git. -r would also walk .bazelbsp/ (tool-generated, gitignored).
+          go install github.com/bazelbuild/buildtools/buildifier@latest
+          tracked=$(git ls-files '*.bzl' '*.bazel' 'BUILD' 'WORKSPACE' 'MODULE.bazel')
+          if [ -z "$tracked" ]; then
+            echo "no Bazel files to check"; exit 0
+          fi
+          "$(go env GOPATH)/bin/buildifier" --mode=check $tracked
+
       - name: Test CLI
         run: bazel test //cli/... --test_output=errors
 
