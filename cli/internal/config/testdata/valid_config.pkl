@@ -22,7 +22,7 @@ accounts: Listing<C.AccountConfig> = new {
     default_signature = "work"
     smtp { host = "smtp.work.com"; port = 587; auth = "password" }
     imap { host = "imap.work.com"; port = 993; auth = "password" }
-    auth { username = "test@work.com"; password_keychain = "work-account" }
+    auth { username = "test@work.com" }
   }
   new {
     name = "Personal"

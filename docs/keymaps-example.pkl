@@ -18,7 +18,6 @@
 
 global_settings {
   keymaps_enabled = true
-  show_keymap_hints = true
   sequence_timeout = 1.0              // seconds to wait for next key in sequence
 }
 

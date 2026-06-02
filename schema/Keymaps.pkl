@@ -4,7 +4,6 @@ module schema.Keymaps
 
 class KeymapGlobalSettings {
   keymaps_enabled: Boolean = true
-  show_keymap_hints: Boolean = true
   sequence_timeout: Float = 1.0
 }
 

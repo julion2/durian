@@ -40,8 +40,7 @@ type TagSyncConfig struct {
 
 // ContactsConfig contains contacts database settings
 type ContactsConfig struct {
-	Enabled bool   `pkl:"enabled" json:"enabled"` // Enable contacts feature (default: true)
-	DBPath  string `pkl:"db_path" json:"db_path"` // Path to SQLite DB (default: ~/.local/share/durian/contacts.db)
+	DBPath string `pkl:"db_path" json:"db_path"` // Path to SQLite DB (default: ~/.local/share/durian/contacts.db)
 }
 
 // AccountConfig represents a single email account
@@ -69,30 +68,33 @@ func (a *AccountConfig) GetAuthEmail() string {
 	return a.Email
 }
 
-// SMTPConfig contains SMTP server settings
+// SMTPConfig contains SMTP server settings.
+// Note: TLS is decided by port (465 = implicit TLS, 587 = STARTTLS) in
+// cli/internal/smtp/client.go — there is intentionally no ssl flag.
 type SMTPConfig struct {
 	Host              string `pkl:"host" json:"host"`
 	Port              int    `pkl:"port" json:"port"`
-	SSL               bool   `pkl:"ssl" json:"ssl"`
 	Auth              string `pkl:"auth" json:"auth"`                               // "password" or "oauth2"
 	MaxAttachmentSize string `pkl:"max_attachment_size" json:"max_attachment_size"` // e.g. "25MB", default 25MB
 }
 
-// IMAPConfig contains IMAP server settings
+// IMAPConfig contains IMAP server settings.
+// Note: TLS is always implicit (port 993, wrapped unconditionally in
+// cli/internal/imap/client.go) — there is intentionally no ssl flag.
 type IMAPConfig struct {
 	Host        string   `pkl:"host" json:"host"`
 	Port        int      `pkl:"port" json:"port"`
-	SSL         bool     `pkl:"ssl" json:"ssl"`
 	Auth        string   `pkl:"auth" json:"auth"`
 	MaxMessages int      `pkl:"max_messages" json:"max_messages"`
 	BatchSize   int      `pkl:"batch_size" json:"batch_size"`
 	Mailboxes   []string `pkl:"mailboxes" json:"mailboxes"`
 }
 
-// AuthConfig contains password-based authentication settings
+// AuthConfig contains password-based authentication settings.
+// The keychain service name is the hardcoded constant
+// keychain.PasswordKeychainService; there is no override field.
 type AuthConfig struct {
-	Username         string `pkl:"username" json:"username"`
-	PasswordKeychain string `pkl:"password_keychain" json:"password_keychain"`
+	Username string `pkl:"username" json:"username"`
 }
 
 // OAuthConfig contains OAuth2 authentication settings

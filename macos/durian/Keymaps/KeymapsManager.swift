@@ -256,28 +256,24 @@ struct KeymapEntry: Codable {
 
 struct KeymapGlobalSettings: Codable {
     var keymapsEnabled: Bool = true
-    var showKeymapHints: Bool = true
     var sequenceTimeout: Double = 1.0
-    
+
     enum CodingKeys: String, CodingKey {
         case keymapsEnabled = "keymaps_enabled"
-        case showKeymapHints = "show_keymap_hints"
         case sequenceTimeout = "sequence_timeout"
     }
-    
+
     init() {}
-    
-    init(keymapsEnabled: Bool = true, showKeymapHints: Bool = true, sequenceTimeout: Double = 1.0) {
+
+    init(keymapsEnabled: Bool = true, sequenceTimeout: Double = 1.0) {
         self.keymapsEnabled = keymapsEnabled
-        self.showKeymapHints = showKeymapHints
         self.sequenceTimeout = sequenceTimeout
     }
-    
+
     // Custom init for backwards compatibility
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         keymapsEnabled = try container.decodeIfPresent(Bool.self, forKey: .keymapsEnabled) ?? true
-        showKeymapHints = try container.decodeIfPresent(Bool.self, forKey: .showKeymapHints) ?? true
         sequenceTimeout = try container.decodeIfPresent(Double.self, forKey: .sequenceTimeout) ?? 1.0
     }
 }

@@ -112,12 +112,12 @@ func TestLoadValidConfig(t *testing.T) {
 	if work.SMTP.Auth != "password" {
 		t.Errorf("Accounts[0].SMTP.Auth = %q, want %q", work.SMTP.Auth, "password")
 	}
-	if work.Auth == nil || work.Auth.PasswordKeychain != "work-account" {
-		keychain := ""
+	if work.Auth == nil || work.Auth.Username != "test@work.com" {
+		username := ""
 		if work.Auth != nil {
-			keychain = work.Auth.PasswordKeychain
+			username = work.Auth.Username
 		}
-		t.Errorf("Accounts[0].Auth.PasswordKeychain = %q, want %q", keychain, "work-account")
+		t.Errorf("Accounts[0].Auth.Username = %q, want %q", username, "test@work.com")
 	}
 
 	// Second account (Personal with OAuth)

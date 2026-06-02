@@ -12,7 +12,6 @@ For the built-in default set and how chords/contexts work conceptually, see [GUI
 ```pkl
 global_settings {
   keymaps_enabled = true
-  show_keymap_hints = true
   sequence_timeout = 1.0      // seconds to wait for next key in a sequence
 }
 

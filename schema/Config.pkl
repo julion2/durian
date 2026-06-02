@@ -30,7 +30,6 @@ class TagSyncConfig {
 }
 
 class ContactsConfig {
-  enabled: Boolean = true
   db_path: String?
 }
 
@@ -39,7 +38,6 @@ class ContactsConfig {
 class SMTPConfig {
   host: String
   port: Int(this == 465 || this == 587) = 587
-  ssl: Boolean = false
   auth: "password"|"oauth2"
   max_attachment_size: String = "25MB"
 }
@@ -47,7 +45,6 @@ class SMTPConfig {
 class IMAPConfig {
   host: String
   port: Int = 993
-  ssl: Boolean = false
   auth: "password"|"oauth2"
   max_messages: Int = 5000
   batch_size: Int(this > 0) = 100
@@ -56,7 +53,6 @@ class IMAPConfig {
 
 class AuthConfig {
   username: String
-  password_keychain: String?
 }
 
 class OAuthConfig {
