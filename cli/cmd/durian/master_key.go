@@ -38,9 +38,9 @@ const (
 
 // Flags
 var (
-	masterKeyExportOut     string
-	masterKeyImportSource  string
-	masterKeyImportForce   bool
+	masterKeyExportOut    string
+	masterKeyImportSource string
+	masterKeyImportForce  bool
 )
 
 var masterKeyCmd = &cobra.Command{
