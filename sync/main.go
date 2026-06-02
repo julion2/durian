@@ -16,7 +16,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -58,27 +58,38 @@ func main() {
 	flag.StringVar(&apiKey, "api-key", os.Getenv("DURIAN_SYNC_API_KEY"), "API key for auth (or DURIAN_SYNC_API_KEY env)")
 	flag.Parse()
 
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
 	if apiKey == "" {
-		log.Fatal("API key required: --api-key or DURIAN_SYNC_API_KEY env")
+		slog.Error("API key required", "module", "SYNC",
+			"hint", "use --api-key flag or DURIAN_SYNC_API_KEY env")
+		os.Exit(1)
 	}
 
 	var err error
 	db, err = openDB(*dbPath)
 	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
+		slog.Error("Failed to open database", "module", "SYNC", "path", *dbPath, "err", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
 	if err := initDB(); err != nil {
-		log.Fatalf("Failed to init database: %v", err)
+		slog.Error("Failed to init database", "module", "SYNC", "err", err)
+		os.Exit(1)
 	}
 
 	http.HandleFunc("/v1/sync", authMiddleware(handleSync))
 	http.HandleFunc("/health", handleHealth)
 
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("Durian Sync Server listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	slog.Info("Sync server listening", "module", "SYNC", "addr", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		slog.Error("Server exited", "module", "SYNC", "err", err)
+		os.Exit(1)
+	}
 }
 
 func openDB(path string) (*sql.DB, error) {
