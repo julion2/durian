@@ -90,15 +90,16 @@ Integration tests in `integration/integration_test.sh` exercise the contract end
 
 ## Storage model
 
-One SQLite file at `~/.local/share/durian/email.db` (or `$XDG_DATA_HOME/durian/email.db`):
+One SQLite file at `~/.local/share/durian/email.db` (or `$XDG_DATA_HOME/durian/email.db`). Schema version is bumped on every ADR-0001 migration step; current floor is v22.
 
-- `messages` — core email rows (message_id, thread_id, account, mailbox, UID, flags, body, html, timestamps)
-- `message_tags` — tag join table (one row per (message_id, tag))
-- `message_headers` — raw headers used by filter rules (List-Id, Authentication-Results, …)
-- `attachments` — per-part metadata (filename, content_type, size, partId, disposition)
-- `local_drafts` — crash-recovery drafts (kept locally until saved to IMAP)
-- `outbox` — queued outgoing messages (with `send_after` timestamp for undo-send)
-- `messages_blind_fts` — blind-token FTS5 virtual table for full-text search over encrypted columns
+- `messages` — one row per email. Plaintext columns: `message_id`, `thread_id`, `in_reply_to`, `refs`, `from_addr`, `to_addrs`, `cc_addrs`, `date`, `created_at`, `size`, `uid`, `account_id` + `mailbox_id` (FKs), `is_seen` / `is_flagged` / `is_deleted` booleans. Encrypted BLOBs: `subject_ct`, `body_text_ct`, `body_html_ct`, `flags_other_ct` (non-canonical IMAP flags).
+- `tags` — tag join table, one row per (message_id, tag).
+- `message_headers` — raw headers used by filter rules (List-Id, Authentication-Results, …). The `value` column is encrypted (`value_ct` BLOB); `name` stays plaintext for SQL filtering.
+- `attachments` — per-part metadata. `filename_ct`, `content_type_ct`, `size_ct` are encrypted; `part_id`, `disposition`, `content_id` stay plaintext (needed for fetch correlation with the IMAP server).
+- `local_drafts` — crash-recovery drafts kept locally until saved to IMAP. The `draft_json` payload is encrypted (`draft_json_ct` BLOB).
+- `outbox` — queued outgoing messages with `send_after` timestamp for undo-send. `draft_json_ct` BLOB; `attempts`, `last_error`, `created_at`, `last_attempted_at`, `send_after` plaintext.
+- `mailboxes`, `accounts` — operational lookup tables. `name_ct` encrypted (mailbox / account display names are sensitive); integer IDs are the FK targets for `messages.mailbox_id` / `messages.account_id`.
+- `messages_blind_fts` — FTS5 virtual table indexing HMAC-blind tokens of subject + body + addresses. No plaintext lives here; see [§Encryption layer](#encryption-layer) below.
 
 ### Encryption layer
 
