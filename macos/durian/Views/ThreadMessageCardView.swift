@@ -7,10 +7,10 @@
 //  thread-level layout and header/footer composition.
 //
 
-import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
 import Quartz
+import SwiftUI
+import UniformTypeIdentifiers
 
 struct ThreadMessageCardView: View {
     let message: ThreadMessage
@@ -122,16 +122,16 @@ struct ThreadMessageCardView: View {
         .padding(.top, isFirst ? 24 : 0)
         .padding(.bottom, isLast ? 32 : 16)
     }
-    
+
     // MARK: - Own Message Detection
-    
+
     /// Check if message is from one of the configured accounts
     private func isOwnMessage() -> Bool {
         let fromEmail = extractEmail(from: message.from).lowercased()
         let ownEmails = ConfigManager.shared.getAccounts().map { $0.email.lowercased() }
         return ownEmails.contains(fromEmail)
     }
-    
+
     /// Extract email address from "Name <email>" format
     private func extractEmail(from: String) -> String {
         if let start = from.range(of: "<"), let end = from.range(of: ">") {
@@ -139,34 +139,34 @@ struct ThreadMessageCardView: View {
         }
         return from
     }
-    
+
     // MARK: - Sender Row
-    
+
     @ViewBuilder
     private var senderRow: some View {
         HStack(alignment: .top, spacing: 12) {
             AvatarView(name: message.from, email: message.from, size: 40)
-            
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(extractName(from: message.from))
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundColor(Color.Detail.textPrimary)
-                
+
                 // To/Cc line with expand chevron
                 recipientsRow
             }
-            
+
             Spacer()
-            
+
             Text(formatDate(message.date))
                 .font(.system(size: 14))
                 .foregroundColor(Color.Detail.textTertiary)
                 .lineLimit(1)
         }
     }
-    
+
     // MARK: - Recipients Row (To/Cc)
-    
+
     @ViewBuilder
     private var recipientsRow: some View {
         HStack(spacing: 4) {
@@ -187,7 +187,7 @@ struct ThreadMessageCardView: View {
                     .foregroundColor(Color.Detail.textSecondary)
                     .lineLimit(1)
             }
-            
+
             // Expand chevron
             Image(systemName: "chevron.right")
                 .font(.system(size: 12, weight: .medium))
@@ -203,28 +203,28 @@ struct ThreadMessageCardView: View {
             }
         }
     }
-    
+
     /// Extract clean names from recipient list
     /// "\"Lisa Neumayer | kmpro\" <l@x.de>, \"Max Müller\" <m@x.de>" → ["Lisa Neumayer", "Max Müller"]
     private func extractRecipientNames(_ recipients: String) -> [String] {
         // Split by comma, but be careful with commas inside quotes
         let parts = recipients.components(separatedBy: ">,")
-        
+
         return parts.compactMap { part in
             let trimmed = part.trimmingCharacters(in: .whitespaces)
             guard !trimmed.isEmpty else { return nil }
-            
+
             // Add back the ">" if it was removed by split (except for last part)
             let fullPart = trimmed.hasSuffix(">") ? trimmed : trimmed + ">"
-            
+
             // Use extractName to get clean name
             let name = extractName(from: fullPart)
-            
+
             // Remove "| domain" suffix if present
             if let pipeRange = name.range(of: " |") {
                 return String(name[..<pipeRange.lowerBound]).trimmingCharacters(in: .whitespaces)
             }
-            
+
             if !name.isEmpty { return name }
             // Fallback: show local part of email
             let email = AddressUtils.extractEmail(from: fullPart)
@@ -234,7 +234,7 @@ struct ThreadMessageCardView: View {
             return nil
         }
     }
-    
+
     // MARK: - Attachment Bar
 
     @ViewBuilder
@@ -505,7 +505,7 @@ struct ThreadMessageCardView: View {
                 guard html.contains("cid:\(cleanId)") else { continue }
 
                 group.addTask {
-                    guard let data = await self.fetchAttachmentData(attachment) else {
+                    guard let data = await fetchAttachmentData(attachment) else {
                         return (cleanId, nil)
                     }
                     let base64 = data.base64EncodedString()
@@ -552,26 +552,26 @@ struct ThreadMessageCardView: View {
             if message.from.contains("<") || message.from.contains("@") {
                 detailRow(label: "From", value: message.from)
             }
-            
+
             // To (from message if available, else from parent email)
             if let to = message.to, !to.isEmpty {
                 detailRow(label: "To", value: to)
             } else if let to = email.to, !to.isEmpty {
                 detailRow(label: "To", value: to)
             }
-            
+
             // Cc (from message if available, else from parent email)
             if let cc = message.cc, !cc.isEmpty {
                 detailRow(label: "Cc", value: cc)
             } else if let cc = email.cc, !cc.isEmpty {
                 detailRow(label: "Cc", value: cc)
             }
-            
+
             // Tags (from message)
             if let tags = message.tags, !tags.isEmpty {
                 detailRow(label: "Tags", value: tags.joined(separator: ", "))
             }
-            
+
             // Message-ID (from message)
             detailRow(label: "Message-ID", value: message.id)
         }
@@ -579,21 +579,21 @@ struct ThreadMessageCardView: View {
         .padding(.top, 8)
         .transition(.opacity.combined(with: .move(edge: .top)))
     }
-    
+
     @ViewBuilder
     private func detailRow(label: String, value: String) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Text("\(label):")
                 .font(.system(size: 13))
                 .foregroundColor(Color.Detail.textTertiary)
-            
+
             Text(value)
                 .font(.system(size: 13))
                 .foregroundColor(Color.Detail.textSecondary)
                 .textSelection(.enabled)
         }
     }
-    
+
     // MARK: - Action Footer
 
     @ViewBuilder
@@ -643,7 +643,7 @@ struct ThreadMessageCardView: View {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
-        
+
         guard let date = formatter.date(from: dateString) else {
             // Fallback: try without day name
             formatter.dateFormat = "dd MMM yyyy HH:mm:ss Z"
@@ -652,15 +652,15 @@ struct ThreadMessageCardView: View {
             }
             return formatRelativeDate(date)
         }
-        
+
         return formatRelativeDate(date)
     }
-    
+
     /// Format date as relative or absolute depending on age
     private func formatRelativeDate(_ date: Date) -> String {
         let calendar = Calendar.current
         let now = Date()
-        
+
         if calendar.isDateInToday(date) {
             // Today: show time only
             let formatter = DateFormatter()

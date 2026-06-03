@@ -5,8 +5,8 @@
 //  Created by Julian Schenker on 15.09.25.
 //
 
-import SwiftUI
 import Combine
+import SwiftUI
 
 // MARK: - Popup Navigation Notifications
 
@@ -56,7 +56,7 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             emailView
-            
+
             if showSearchPopup {
                 searchPopupOverlay
             }
@@ -98,7 +98,7 @@ struct ContentView: View {
     }
 
     // MARK: - Search Popup Overlay
-    
+
     @ViewBuilder
     private var searchPopupOverlay: some View {
         ZStack {
@@ -138,7 +138,7 @@ struct ContentView: View {
         }
         .ignoresSafeArea()
     }
-    
+
     // MARK: - Tag Picker Overlay
 
     @ViewBuilder
@@ -247,7 +247,7 @@ struct ContentView: View {
     }
 
     // MARK: - Email View
-    
+
     @ViewBuilder
     private var emailView: some View {
         NavigationSplitView {
@@ -270,7 +270,7 @@ struct ContentView: View {
                     }
                     .padding(.vertical, 4)
                 }
-                
+
                 if !displayEmails.isEmpty {
                     emailListView
                 } else if !isSearchMode && accountManager.isLoadingEmails {
@@ -296,44 +296,44 @@ struct ContentView: View {
                     }
                     .help("New Message (Cmd+N)")
                     .keyboardShortcut("n", modifiers: .command)
-                    
+
                     Button(action: { replyToSelected() }) {
                         Image(systemName: "arrowshape.turn.up.left")
                     }
                     .help("Reply (R)")
                     .disabled(markedEmails.isEmpty || !selectedEmailHasBody)
-                    
+
                     Button(action: { replyAllToSelected() }) {
                         Image(systemName: "arrowshape.turn.up.left.2")
                     }
                     .help("Reply All (Shift+R)")
                     .disabled(markedEmails.isEmpty || !selectedEmailHasBody)
-                    
+
                     Button(action: { forwardSelected() }) {
                         Image(systemName: "arrowshape.turn.up.right")
                     }
                     .help("Forward (F)")
                     .disabled(markedEmails.isEmpty || !selectedEmailHasBody)
-                    
+
                     Button(action: deleteSelectedEmails) {
                         Image(systemName: "trash")
                     }
                     .help("Delete")
                     .disabled(markedEmails.isEmpty)
-                    
+
                     Button(action: togglePin) {
                         Image(systemName: selectedEmailIsPinned ? "pin.fill" : "pin")
                     }
                     .help(selectedEmailIsPinned ? "Unpin (S)" : "Pin (S)")
                     .disabled(markedEmails.isEmpty)
-                    
+
                     Button(action: toggleRead) {
                         Image(systemName: selectedEmailIsRead ? "envelope.open" : "envelope.badge")
                     }
                     .help(selectedEmailIsRead ? "Mark Unread (U)" : "Mark Read (U)")
                     .disabled(markedEmails.isEmpty)
                 }
-                
+
                 // Right: Search & Sync
                 ToolbarItemGroup(placement: .automatic) {
                     Button(action: { showSearchPopup = true }) {
@@ -341,7 +341,7 @@ struct ContentView: View {
                     }
                     .keyboardShortcut("/", modifiers: .command)
                     .help("Search (Cmd+/)")
-                    
+
                     Button(action: {
                         Task {
                             await syncManager.quickSync()
@@ -367,7 +367,8 @@ struct ContentView: View {
             // Detail View - always show cursor email, with badge if multi-selected
             if let emailId = cursorEmailId,
                let email = accountManager.mailMessages.first(where: { $0.id == emailId })
-                            ?? searchResults.first(where: { $0.id == emailId }) {
+                            ?? searchResults.first(where: { $0.id == emailId })
+            {
                 ZStack(alignment: .bottomTrailing) {
                     EmailDetailView(
                         email: email,
@@ -393,7 +394,7 @@ struct ContentView: View {
                         isThreadFocused: isThreadFocused
                     )
                     .id(email.id)  // Force new View instance on email change to reset @State
-                    
+
                     // Selection badge when multiple emails marked
                     if markedEmails.count > 1 {
                         HStack(spacing: 4) {
@@ -494,7 +495,7 @@ struct ContentView: View {
             return .ignored
         }
     }
-    
+
     /// Number of thread messages for the currently focused email
     var currentThreadMessageCount: Int {
         guard let emailId = cursorEmailId,
@@ -634,7 +635,7 @@ struct ContentView: View {
     }
 
     // MARK: - Helper Methods
-    
+
     private func handleEmailSelection(_ emailId: String) {
         detailMode = .emailDetail(emailId: emailId)
 
@@ -678,12 +679,13 @@ struct ContentView: View {
             }
         }
     }
-    
+
     // MARK: - Toolbar Helpers
-    
+
     private var selectedEmailIsPinned: Bool {
         guard let emailId = markedEmails.first,
-              let email = displayEmails.first(where: { $0.id == emailId }) else {
+              let email = displayEmails.first(where: { $0.id == emailId }) else
+        {
             return false
         }
         return email.isPinned
@@ -691,7 +693,8 @@ struct ContentView: View {
 
     private var selectedEmailIsRead: Bool {
         guard let emailId = markedEmails.first,
-              let email = displayEmails.first(where: { $0.id == emailId }) else {
+              let email = displayEmails.first(where: { $0.id == emailId }) else
+        {
             return true
         }
         return email.isRead
@@ -699,7 +702,8 @@ struct ContentView: View {
 
     private var selectedEmailHasBody: Bool {
         guard let emailId = markedEmails.first,
-              let email = displayEmails.first(where: { $0.id == emailId }) else {
+              let email = displayEmails.first(where: { $0.id == emailId }) else
+        {
             return false
         }
         if case .loaded = email.bodyState {
@@ -712,7 +716,7 @@ struct ContentView: View {
         guard let emailId = markedEmails.first else { return nil }
         return displayEmails.first(where: { $0.id == emailId })
     }
-    
+
     private func deleteSelectedEmails() {
         guard !markedEmails.isEmpty else { return }
         let ids = markedEmails
@@ -751,9 +755,9 @@ struct ContentView: View {
             }
         }
     }
-    
+
     // MARK: - Compose
-    
+
     func openNewCompose() {
         guard defaultFromAccount != nil else {
             BannerManager.shared.showWarning(title: "No Account", message: "Configure an email account to use this action.")
@@ -762,15 +766,16 @@ struct ContentView: View {
         let draftId = DraftService.shared.createDraft(from: defaultFromAccount)
         openWindow(value: draftId)
     }
-    
+
     // MARK: - Reply/Forward Actions
-    
+
     /// Get default from-account based on current profile
     private var defaultFromAccount: String? {
         // Get first account from current profile
         if let profile = profileManager.currentProfile,
            let accountName = profile.accounts.first,
-           accountName != "*" {
+           accountName != "*"
+        {
             // Find matching account by name
             return ConfigManager.shared.getAccounts()
                 .first(where: { $0.name.caseInsensitiveCompare(accountName) == .orderedSame })?.email
@@ -778,11 +783,12 @@ struct ContentView: View {
         // Fallback to first configured account
         return ConfigManager.shared.getAccounts().first?.email
     }
-    
+
     func replyToSelected() {
         guard let email = selectedEmail,
               case .loaded = email.bodyState,
-              let fromAccount = defaultFromAccount else {
+              let fromAccount = defaultFromAccount else
+        {
             Log.warning("COMPOSE", "replyToSelected guard failed — selected=\(selectedEmail != nil), bodyState=\(String(describing: selectedEmail?.bodyState)), fromAccount=\(defaultFromAccount ?? "nil")")
             if defaultFromAccount == nil {
                 BannerManager.shared.showWarning(title: "No Account", message: "Configure an email account to use this action.")
@@ -801,7 +807,8 @@ struct ContentView: View {
     func replyAllToSelected() {
         guard let email = selectedEmail,
               case .loaded = email.bodyState,
-              let fromAccount = defaultFromAccount else {
+              let fromAccount = defaultFromAccount else
+        {
             Log.warning("COMPOSE", "replyAllToSelected guard failed — selected=\(selectedEmail != nil), bodyState=\(String(describing: selectedEmail?.bodyState)), fromAccount=\(defaultFromAccount ?? "nil")")
             if defaultFromAccount == nil {
                 BannerManager.shared.showWarning(title: "No Account", message: "Configure an email account to use this action.")
@@ -824,11 +831,12 @@ struct ContentView: View {
         guard let response = await backend.fetchOriginalBody(messageId: targetId) else { return nil }
         return (body: response.body, html: response.html)
     }
-    
+
     func forwardSelected() {
         guard let email = selectedEmail,
               case .loaded = email.bodyState,
-              let fromAccount = defaultFromAccount else {
+              let fromAccount = defaultFromAccount else
+        {
             Log.warning("COMPOSE", "forwardSelected guard failed — selected=\(selectedEmail != nil), bodyState=\(String(describing: selectedEmail?.bodyState)), fromAccount=\(defaultFromAccount ?? "nil")")
             if defaultFromAccount == nil {
                 BannerManager.shared.showWarning(title: "No Account", message: "Configure an email account to use this action.")
@@ -863,9 +871,9 @@ struct ContentView: View {
         let draftId = DraftService.shared.createDraft(with: draft)
         openWindow(value: draftId)
     }
-    
+
     // MARK: - Navigation Helpers
-    
+
     /// Advance cursor and selection to the given email, or clear if nil.
     func advanceCursor(to emailId: String?) {
         if let emailId = emailId {
@@ -901,13 +909,13 @@ struct ContentView: View {
         let unpinned = displayEmails.filter { !$0.isPinned }.sorted { $0.timestamp > $1.timestamp }
         return (pinned + unpinned).map { $0.id }
     }
-    
+
     /// Get current email index in sorted list (based on cursor position)
     func currentEmailIndex() -> Int? {
         guard let currentId = cursorEmailId else { return nil }
         return sortedEmailIds.firstIndex(of: currentId)
     }
-    
+
     /// Navigate to email at specific index (clamped to valid range)
     /// Updates cursor position and handles visual mode selection
     func navigateToEmail(at index: Int) {
@@ -917,16 +925,17 @@ struct ContentView: View {
 
         // Always update cursor position
         cursorEmailId = targetId
-        
+
         switch keymapHandler.engine.visualModeType {
         case .none:
             // Normal navigation: selection follows cursor
             markedEmails = [targetId]
-            
+
         case .line:
             // Line mode: selection = all emails from anchor to cursor
             if let anchor = visualModeAnchor,
-               let anchorIndex = sortedEmailIds.firstIndex(of: anchor) {
+               let anchorIndex = sortedEmailIds.firstIndex(of: anchor)
+            {
                 let start = min(anchorIndex, clampedIndex)
                 let end = max(anchorIndex, clampedIndex)
                 markedEmails = Set(sortedEmailIds[start...end])
@@ -934,13 +943,13 @@ struct ContentView: View {
                 // No anchor yet, just add cursor to selection
                 markedEmails.insert(targetId)
             }
-            
+
         case .toggle:
             // Toggle mode: selection stays unchanged, only cursor moves
             break
         }
     }
-    
+
     /// Get range of email IDs between two indices
     private func emailsInRange(from: Int, to: Int) -> Set<String> {
         let start = min(from, to)

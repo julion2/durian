@@ -11,7 +11,7 @@ import Network
 @MainActor
 class NetworkMonitor: ObservableObject {
     static let shared = NetworkMonitor()
-    
+
     @Published private(set) var isConnected: Bool = true
     @Published private(set) var showReconnectedBanner: Bool = false
 
@@ -27,13 +27,13 @@ class NetworkMonitor: ObservableObject {
                 let nowConnected = (path.status == .satisfied)
 
                 // Skip if state hasn't changed
-                guard nowConnected != self.isConnected else { return }
+                guard nowConnected != isConnected else { return }
 
                 // Debounce: NWPathMonitor fires rapidly during WiFi transitions.
                 // Wait 2s before committing the state change — if it flaps back,
                 // the previous task is cancelled and no update is published.
-                self.debounceTask?.cancel()
-                self.debounceTask = Task { @MainActor in
+                debounceTask?.cancel()
+                debounceTask = Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                     guard !Task.isCancelled else { return }
 

@@ -83,7 +83,7 @@ struct DurianApp: App {
             }
         }
     }
-    
+
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -102,21 +102,21 @@ struct DurianApp: App {
                 }
                 .keyboardShortcut(",", modifiers: .command)
             }
-            
+
             CommandGroup(after: .newItem) {
                 Button("Reload Keymaps") {
                     KeymapsManager.shared.reloadKeymaps()
                 }
                 .keyboardShortcut("k", modifiers: [.command, .shift])
-                
+
                 Button("Reload Config") {
                     SettingsManager.shared.reloadSettings()
                     ProfileManager.shared.loadProfiles()
                 }
                 .keyboardShortcut("c", modifiers: [.command, .shift])
-                
+
                 Divider()
-                
+
                 Button("Full Sync") {
                     Task {
                         await SyncManager.shared.fullSync()
@@ -124,7 +124,7 @@ struct DurianApp: App {
                 }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             }
-            
+
             // Profile Menu
             CommandMenu("Profiles") {
                 ForEach(Array(profileManager.profiles.enumerated()), id: \.element.id) { index, profile in
@@ -144,7 +144,7 @@ struct DurianApp: App {
                 }
             }
         }
-        
+
         // Compose Window - supports multiple windows via UUID
         WindowGroup("New Message", for: UUID.self) { $draftId in
             if let draftId = draftId {
@@ -153,11 +153,12 @@ struct DurianApp: App {
         }
         .defaultSize(width: 650, height: 550)
     }
-    
+
     private func showAbout() {
         Task {
             if let backend = accountManager.emailBackend,
-               let info = await backend.fetchVersion() {
+               let info = await backend.fetchVersion()
+            {
                 cliVersion = "\(info.version) (\(info.commit))"
             }
             await MainActor.run {

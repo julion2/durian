@@ -97,18 +97,18 @@ struct AppConfig: Codable {
     let settings: AppSettings
     let sync: SyncSettings
     let signatures: [String: String]
-    
+
     init(accounts: [MailAccount], settings: AppSettings = AppSettings(), sync: SyncSettings = SyncSettings(), signatures: [String: String] = [:]) {
         self.accounts = accounts
         self.settings = settings
         self.sync = sync
         self.signatures = signatures
     }
-    
+
     enum CodingKeys: String, CodingKey {
         case accounts, settings, sync, signatures
     }
-    
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         accounts = try container.decodeIfPresent([MailAccount].self, forKey: .accounts) ?? []
@@ -149,7 +149,7 @@ class ConfigManager {
 
     /// Test-only initializer: inject config directly, skip file loading
     init(config: AppConfig) {
-        self._config = config
+        _config = config
     }
 
     /// Synchronous load via pkl CLI subprocess.
@@ -174,36 +174,36 @@ class ConfigManager {
     private func getConfigURL() -> URL {
         FileManager.default.durianConfigURL().appendingPathComponent("config.pkl")
     }
-    
+
     // MARK: - Public API
-    
+
     func getAccounts() -> [MailAccount] {
-        return config?.accounts ?? []
+        config?.accounts ?? []
     }
-    
+
     func getSettings() -> AppSettings {
-        return config?.settings ?? AppSettings()
+        config?.settings ?? AppSettings()
     }
-    
+
     func getSignatures() -> [String: String] {
-        return config?.signatures ?? [:]
+        config?.signatures ?? [:]
     }
-    
+
     func getSyncSettings() -> SyncSettings {
-        return config?.sync ?? SyncSettings()
+        config?.sync ?? SyncSettings()
     }
-    
+
     /// Reload config from disk (call after editing config.pkl)
     func reloadConfig() {
         Log.info("CONFIG", "Reloading config...")
         loadConfigBlocking()
     }
-    
+
     func updateSettings(_ newSettings: AppSettings) {
-        guard let currentConfig = self.config else { return }
+        guard let currentConfig = config else { return }
 
         let updatedConfig = AppConfig(accounts: currentConfig.accounts, settings: newSettings, sync: currentConfig.sync, signatures: currentConfig.signatures)
-        self.config = updatedConfig
+        config = updatedConfig
         // Settings are now managed in config.pkl — edit the file directly
     }
 }

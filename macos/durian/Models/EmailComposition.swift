@@ -77,8 +77,8 @@ struct EmailDraft: Identifiable, Codable, Equatable {
         self.quotedIsHTML = quotedIsHTML
         self.htmlSignature = htmlSignature
         self.htmlBody = htmlBody
-        self.createdAt = Date()
-        self.modifiedAt = Date()
+        createdAt = Date()
+        modifiedAt = Date()
     }
 
     mutating func updateModifiedDate() {
@@ -86,11 +86,11 @@ struct EmailDraft: Identifiable, Codable, Equatable {
     }
 
     var hasRecipients: Bool {
-        return !to.isEmpty || !cc.isEmpty || !bcc.isEmpty
+        !to.isEmpty || !cc.isEmpty || !bcc.isEmpty
     }
 
     var isValid: Bool {
-        return hasRecipients && !subject.isEmpty
+        hasRecipients && !subject.isEmpty
     }
 
     /// Whether the user has typed any actual content (excludes signature, quoted content).
@@ -109,7 +109,7 @@ struct EmailDraft: Identifiable, Codable, Equatable {
     }
 
     var hasAttachments: Bool {
-        return !attachments.isEmpty
+        !attachments.isEmpty
     }
 
     var totalAttachmentSize: Int64 {
@@ -191,7 +191,8 @@ enum EmailHelper {
         // Standard format: "Name <email>"
         if let start = trimmed.firstIndex(of: "<"),
            let end = trimmed.firstIndex(of: ">"),
-           start < end {
+           start < end
+        {
             let email = String(trimmed[trimmed.index(after: start)..<end])
             if email.contains("@") {
                 return email.trimmingCharacters(in: .whitespaces)
@@ -209,6 +210,6 @@ enum EmailHelper {
 
     /// Validate all recipients and return list of invalid emails
     static func validateRecipients(_ recipients: [String]) -> [String] {
-        return recipients.filter { !isValidEmail($0) }
+        recipients.filter { !isValidEmail($0) }
     }
 }

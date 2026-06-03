@@ -1,21 +1,21 @@
-import Foundation
 import Combine
+import Foundation
 
 class SettingsManager: ObservableObject {
     static let shared = SettingsManager()
-    
+
     @Published var settings: AppSettings = AppSettings()
     private var cancellables = Set<AnyCancellable>()
-    
+
     private init() {
         loadSettings()
         setupAutoSave()
     }
-    
+
     private func loadSettings() {
         settings = ConfigManager.shared.getSettings()
     }
-    
+
     private func setupAutoSave() {
         // Auto-save when settings change
         $settings
@@ -26,28 +26,28 @@ class SettingsManager: ObservableObject {
             }
             .store(in: &cancellables)
     }
-    
+
     private func saveSettings() {
         ConfigManager.shared.updateSettings(settings)
     }
-    
+
     // MARK: - Sync Settings (read from [sync] section)
-    
+
     /// Sync settings are read-only from config.pkl [sync] section
     var syncSettings: SyncSettings {
         ConfigManager.shared.getSyncSettings()
     }
-    
+
     /// Whether GUI auto-sync is enabled
     var guiAutoSync: Bool {
         syncSettings.guiAutoSync
     }
-    
+
     /// Quick sync interval in seconds
     var autoFetchInterval: TimeInterval {
         syncSettings.autoFetchInterval
     }
-    
+
     /// Full sync interval in seconds
     var fullSyncInterval: TimeInterval {
         syncSettings.fullSyncInterval
@@ -57,21 +57,21 @@ class SettingsManager: ObservableObject {
     var attachmentCacheSettings: AttachmentCacheSettings {
         syncSettings.attachmentCache
     }
-    
+
     // MARK: - Public API
-    
+
     func resetToDefaults() {
         settings = AppSettings()
         Log.info("SETTINGS", "Reset to defaults")
     }
-    
+
     @MainActor
     func reloadSettings() {
         ConfigManager.shared.reloadConfig()
         settings = ConfigManager.shared.getSettings()
         Log.info("SETTINGS", "Reloaded from config file")
         Log.info("SETTINGS", "Sync - guiAutoSync=\(guiAutoSync), autoFetchInterval=\(autoFetchInterval)s, fullSyncInterval=\(fullSyncInterval)s")
-        
+
         // Restart sync timers with new settings
         SyncManager.shared.restartTimers()
     }

@@ -5,8 +5,8 @@
 //  Manages email synchronization via durian CLI
 //
 
-import Foundation
 import Combine
+import Foundation
 import SwiftUI
 import UserNotifications
 
@@ -17,7 +17,7 @@ enum SyncState: Equatable {
     case syncing           // Rotating icon - sync in progress
     case success           // Green - sync completed
     case failed(String)    // Red - sync failed
-    
+
     var color: Color {
         switch self {
         case .idle: return .secondary
@@ -26,14 +26,14 @@ enum SyncState: Equatable {
         case .failed: return .red
         }
     }
-    
+
     var shouldNotify: Bool {
         switch self {
         case .failed: return true
         default: return false
         }
     }
-    
+
     var statusText: String {
         switch self {
         case .idle: return ""
@@ -49,11 +49,11 @@ enum SyncState: Equatable {
 @MainActor
 class SyncManager: ObservableObject {
     static let shared = SyncManager()
-    
+
     // MARK: - Published State
     @Published var syncState: SyncState = .idle
     @Published var lastSyncTime: Date?
-    
+
     // MARK: - Sync Lock (prevents multiple concurrent syncs)
     private var syncLock = false
 
@@ -68,26 +68,26 @@ class SyncManager: ObservableObject {
 
     /// True if a sync is currently in progress
     var isSyncing: Bool { syncLock }
-    
+
     // MARK: - Paths
     private let durianPath: String
-    
+
     // MARK: - Timers
     private var quickSyncTimer: Timer?
     private var fullSyncTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
-    
+
     private init() {
         // Initial path resolution, will be refreshed in runDurianSync if needed
         durianPath = FileManager.default.resolveDurianPath() ?? ""
     }
-    
+
     // MARK: - Setup (call on app start)
-    
+
     func setup() {
         Log.debug("SYNC", "Setting up SyncManager...")
         Log.debug("SYNC", "Config - guiAutoSync=\(SettingsManager.shared.guiAutoSync), autoFetchInterval=\(SettingsManager.shared.autoFetchInterval)s, fullSyncInterval=\(SettingsManager.shared.fullSyncInterval)s")
-        
+
         // Start timers based on config (if online)
         if NetworkMonitor.shared.isConnected {
             startQuickSyncTimer()
@@ -95,7 +95,7 @@ class SyncManager: ObservableObject {
         } else {
             Log.debug("SYNC", "Offline at startup, timers not started")
         }
-        
+
         // Start SSE event stream for real-time new-mail notifications
         let stream = EventStreamClient()
         stream.onNewMail = { [weak self] event in
@@ -144,12 +144,12 @@ class SyncManager: ObservableObject {
                 }
             }
             .store(in: &cancellables)
-        
+
         Log.info("SYNC", "Setup complete")
     }
-    
+
     // MARK: - Timer Management
-    
+
     func startQuickSyncTimer() {
         guard SettingsManager.shared.guiAutoSync else {
             Log.debug("SYNC", "GUI auto-sync disabled, not starting quick sync timer")
@@ -159,10 +159,10 @@ class SyncManager: ObservableObject {
             Log.debug("SYNC", "Offline, not starting quick sync timer")
             return
         }
-        
+
         let interval = SettingsManager.shared.autoFetchInterval
         Log.debug("SYNC", "Starting quick sync timer with interval \(interval)s")
-        
+
         quickSyncTimer?.invalidate()
         quickSyncTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -179,7 +179,7 @@ class SyncManager: ObservableObject {
             }
         }
     }
-    
+
     func startFullSyncTimer() {
         guard SettingsManager.shared.guiAutoSync else {
             Log.debug("SYNC", "GUI auto-sync disabled, not starting full sync timer")
@@ -189,10 +189,10 @@ class SyncManager: ObservableObject {
             Log.debug("SYNC", "Offline, not starting full sync timer")
             return
         }
-        
+
         let interval = SettingsManager.shared.fullSyncInterval
         Log.debug("SYNC", "Starting full sync timer with interval \(interval)s (\(interval/3600)h)")
-        
+
         fullSyncTimer?.invalidate()
         fullSyncTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -209,7 +209,7 @@ class SyncManager: ObservableObject {
             }
         }
     }
-    
+
     func stopTimers() {
         Log.debug("SYNC", "Stopping all sync timers")
         quickSyncTimer?.invalidate()
@@ -217,7 +217,7 @@ class SyncManager: ObservableObject {
         fullSyncTimer?.invalidate()
         fullSyncTimer = nil
     }
-    
+
     func restartTimers() {
         Log.debug("SYNC", "Restarting timers with new settings")
         stopTimers()
@@ -226,7 +226,7 @@ class SyncManager: ObservableObject {
             startFullSyncTimer()
         }
     }
-    
+
     // MARK: - Failure Suppression
 
     /// Show banner only after 3+ consecutive failures
@@ -246,7 +246,7 @@ class SyncManager: ObservableObject {
     }
 
     // MARK: - Quick Sync (Cmd+R)
-    
+
     /// Quick sync - syncs current profile's INBOX only
     @discardableResult
     func quickSync() async -> Bool {
@@ -254,10 +254,10 @@ class SyncManager: ObservableObject {
             Log.debug("SYNC", "Quick sync - already syncing, skipping")
             return false
         }
-        
+
         syncLock = true
         defer { syncLock = false }
-        
+
         // Get current profile for targeted sync
         guard let currentProfile = ProfileManager.shared.currentProfile else {
             Log.debug("SYNC", "Quick sync - no current profile, skipping")
@@ -271,7 +271,8 @@ class SyncManager: ObservableObject {
         let accountName: String?
         if !currentProfile.isAll && currentProfile.accounts.count == 1,
            let profileAccount = currentProfile.accounts.first,
-           knownAccountNames.contains(profileAccount.lowercased()) {
+           knownAccountNames.contains(profileAccount.lowercased())
+        {
             accountName = profileAccount
         } else {
             accountName = nil
@@ -280,7 +281,7 @@ class SyncManager: ObservableObject {
         syncState = .syncing
 
         let success = await runDurianSync(account: accountName, mailbox: "INBOX", timeout: 60)
-        
+
         if success {
             Log.info("SYNC", "Quick sync completed successfully")
             recordSyncSuccess()
@@ -311,9 +312,9 @@ class SyncManager: ObservableObject {
 
         return success
     }
-    
+
     // MARK: - Full Sync (Cmd+Shift+R or timer)
-    
+
     /// Full sync - syncs all accounts with longer timeout
     @discardableResult
     func fullSync() async -> Bool {
@@ -321,15 +322,15 @@ class SyncManager: ObservableObject {
             Log.debug("SYNC", "Full sync - already syncing, skipping")
             return false
         }
-        
+
         syncLock = true
         defer { syncLock = false }
-        
+
         Log.debug("SYNC", "Full sync starting (all accounts)")
         // No UI feedback for full sync (runs in background)
-        
+
         let success = await runDurianSync(account: nil, mailbox: nil, timeout: 300)
-        
+
         if success {
             Log.info("SYNC", "Full sync completed successfully")
             recordSyncSuccess()
@@ -346,12 +347,12 @@ class SyncManager: ObservableObject {
                 showFailureBannerIfThresholdMet(title: "Full Sync Failed", message: "Background sync encountered an error.")
             }
         }
-        
+
         return success
     }
-    
+
     // MARK: - Core Sync Logic
-    
+
     /// Run durian sync with optional account and mailbox targeting
     /// - Parameters:
     ///   - account: Specific account name to sync (nil = all accounts)
@@ -363,7 +364,7 @@ class SyncManager: ObservableObject {
             BannerManager.shared.showCritical(title: "Durian CLI Not Found", message: "Install durian to sync emails.")
             return false
         }
-        
+
         // Build command args: sync [account] [mailbox]
         var args = ["sync"]
         if let account = account {
@@ -372,10 +373,10 @@ class SyncManager: ObservableObject {
                 args.append(mailbox)
             }
         }
-        
+
         Log.debug("SYNC", "Running \(resolvedPath) \(args.joined(separator: " ")) (timeout: \(Int(timeout))s)")
         let result = await runCommand(resolvedPath, args: args, timeout: timeout)
-        
+
         if result.success {
             Log.debug("SYNC", "durian sync completed successfully")
             if let output = result.output, !output.isEmpty {
@@ -387,10 +388,10 @@ class SyncManager: ObservableObject {
                 Log.error("SYNC", "Error: \(error)")
             }
         }
-        
+
         return result.success
     }
-    
+
     /// Reload the email list after sync to show new messages
     private func reloadEmailList() async {
         guard let backend = AccountManager.shared.emailBackend else { return }
@@ -427,7 +428,8 @@ class SyncManager: ObservableObject {
         }
         // Per-account notification filter
         if let account = ConfigManager.shared.getAccounts().first(where: { $0.email == event.account }),
-           let notify = account.notifications, !notify {
+           let notify = account.notifications, !notify
+        {
             Log.debug("NOTIFY", "Notifications disabled for account \(event.account), skipping")
             return
         }
@@ -474,7 +476,7 @@ class SyncManager: ObservableObject {
             center.add(request)
         }
     }
-    
+
     // MARK: - Outbox Update Handler
 
     /// Handle an outbox_update SSE event — show banners for sent/failed status.
@@ -509,13 +511,13 @@ class SyncManager: ObservableObject {
     }
 
     // MARK: - Command Execution
-    
+
     private struct CommandResult {
         let success: Bool
         let output: String?
         let error: String?
     }
-    
+
     /// Run a command directly with timeout
     private func runCommand(_ path: String, args: [String], timeout: TimeInterval) async -> CommandResult {
         await withCheckedContinuation { continuation in
@@ -523,7 +525,7 @@ class SyncManager: ObservableObject {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: path)
                 process.arguments = args
-                
+
                 // Set up environment with Homebrew paths
                 var env = ProcessInfo.processInfo.environment
                 let homebrewPaths = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin"
@@ -533,12 +535,12 @@ class SyncManager: ObservableObject {
                     env["PATH"] = "\(homebrewPaths):/usr/bin:/bin:/usr/sbin:/sbin"
                 }
                 process.environment = env
-                
+
                 let outputPipe = Pipe()
                 let errorPipe = Pipe()
                 process.standardOutput = outputPipe
                 process.standardError = errorPipe
-                
+
                 // Set up timeout
                 var didTimeout = false
                 let timeoutWorkItem = DispatchWorkItem {
@@ -549,14 +551,14 @@ class SyncManager: ObservableObject {
                     }
                 }
                 DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutWorkItem)
-                
+
                 do {
                     try process.run()
                     process.waitUntilExit()
-                    
+
                     // Cancel timeout timer if process completed
                     timeoutWorkItem.cancel()
-                    
+
                     if didTimeout {
                         continuation.resume(returning: CommandResult(
                             success: false,
@@ -565,13 +567,13 @@ class SyncManager: ObservableObject {
                         ))
                         return
                     }
-                    
+
                     let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
                     let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-                    
+
                     let output = String(data: outputData, encoding: .utf8)
                     let error = String(data: errorData, encoding: .utf8)
-                    
+
                     let success = process.terminationStatus == 0
                     continuation.resume(returning: CommandResult(success: success, output: output, error: error))
                 } catch {

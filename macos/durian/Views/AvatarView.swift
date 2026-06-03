@@ -11,14 +11,14 @@ struct AvatarView: View {
     let name: String
     var email: String? = nil  // Optional email for avatar lookup
     var size: CGFloat = 36
-    
+
     @State private var loadedImage: NSImage? = nil
-    
+
     private static let avatarColors: [Color] = [
         .red, .orange, .yellow, .green, .mint, .teal,
         .cyan, .blue, .indigo, .purple, .pink, .brown
     ]
-    
+
     var body: some View {
         ZStack {
             if let image = loadedImage {
@@ -31,7 +31,7 @@ struct AvatarView: View {
                 // Fallback: Initials with hash-based color
                 Circle()
                     .fill(colorForName)
-                
+
                 Text(initials)
                     .font(.system(size: size * 0.4, weight: .semibold))
                     .foregroundColor(.white)
@@ -44,19 +44,19 @@ struct AvatarView: View {
             await loadAvatarImage()
         }
     }
-    
+
     // MARK: - Avatar Loading
-    
+
     private func loadAvatarImage() async {
         guard let email = email, !email.isEmpty else { return }
-        
+
         // Request 2x size for retina displays
         let requestSize = Int(size * 2)
         loadedImage = await AvatarManager.shared.loadAvatar(for: email, size: requestSize)
     }
-    
+
     // MARK: - Initials (Fallback)
-    
+
     /// Extract initials from name (max 2 characters)
     /// "Julian Schenker" → "JS"
     /// "Atlassian Home" → "AH"
@@ -64,7 +64,7 @@ struct AvatarView: View {
     private var initials: String {
         let cleanName = extractDisplayName(from: name)
         let words = cleanName.split(separator: " ")
-        
+
         if words.count >= 2 {
             // First letter of first two words
             let first = words[0].prefix(1).uppercased()
@@ -77,7 +77,7 @@ struct AvatarView: View {
             return "?"
         }
     }
-    
+
     /// Get consistent color based on name hash
     private var colorForName: Color {
         let cleanName = extractDisplayName(from: name).lowercased()
@@ -88,7 +88,7 @@ struct AvatarView: View {
         let index = abs(hash) % Self.avatarColors.count
         return Self.avatarColors[index]
     }
-    
+
     private func extractDisplayName(from: String) -> String {
         AddressUtils.extractName(from: from)
     }

@@ -21,7 +21,8 @@ class AttachmentCacheManager: ObservableObject {
     private var failedKeys: Set<String> = []
 
     init(cacheDir: URL? = nil,
-         settingsProvider: @escaping () -> AttachmentCacheSettings = { SettingsManager.shared.attachmentCacheSettings }) {
+         settingsProvider: @escaping () -> AttachmentCacheSettings = { SettingsManager.shared.attachmentCacheSettings })
+    {
         let resolvedDir: URL
         if let cacheDir {
             resolvedDir = cacheDir
@@ -30,7 +31,7 @@ class AttachmentCacheManager: ObservableObject {
             resolvedDir = caches.appendingPathComponent("org.js-lab.durian/attachments", isDirectory: true)
         }
         self.cacheDir = resolvedDir
-        self.indexFile = resolvedDir.appendingPathComponent(".cache-index.json")
+        indexFile = resolvedDir.appendingPathComponent(".cache-index.json")
         self.settingsProvider = settingsProvider
         try? fileManager.createDirectory(at: resolvedDir, withIntermediateDirectories: true)
         loadIndex()

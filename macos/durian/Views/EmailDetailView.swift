@@ -6,10 +6,10 @@
 //  Uses ThreadMessage data from CLI instead of HTML parsing
 //
 
-import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
 import Quartz
+import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - Email Detail View
 
@@ -89,9 +89,9 @@ struct EmailDetailView: View {
             focusedMessageIndex = 0
         }
     }
-    
+
     // MARK: - Message Cards (Chat-Style Thread View)
-    
+
     @ViewBuilder
     private var messageCards: some View {
         switch email.bodyState {
@@ -99,10 +99,10 @@ struct EmailDetailView: View {
             loadingCard(text: "Click to load") {
                 onLoadBody()
             }
-            
+
         case .loading:
             loadingCard(text: nil, action: nil)
-            
+
         case .loaded:
             // Use thread messages from CLI if available
             if let messages = email.threadMessages, !messages.isEmpty {
@@ -132,41 +132,41 @@ struct EmailDetailView: View {
                 // Fallback: single message with body/html directly from email
                 singleMessageFallback
             }
-            
+
         case .failed(let errorMessage):
             errorCard(message: errorMessage)
         }
     }
-    
+
     @ViewBuilder
     private var singleMessageFallback: some View {
         // Use htmlBody if available, otherwise body
         let htmlContent = email.htmlBody ?? ""
         let textContent = email.body ?? ""
-        
+
         VStack(alignment: .leading, spacing: 16) {
             // Sender row
             HStack(alignment: .top, spacing: 12) {
                 AvatarView(name: email.from, email: email.from, size: 40)
-                
+
                 VStack(alignment: .leading, spacing: 2) {
                     Text(extractName(from: email.from))
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundColor(Color.Detail.textPrimary)
-                    
+
                     Text("Details")
                         .font(.system(size: 14))
                         .foregroundColor(Color.Detail.textSecondary)
                 }
-                
+
                 Spacer()
-                
+
                 Text(formatDate(email.date))
                     .font(.system(size: 14))
                     .foregroundColor(Color.Detail.textTertiary)
                     .lineLimit(1)
             }
-            
+
             // Content
             if !htmlContent.isEmpty {
                 NonScrollingWebView(
@@ -183,7 +183,7 @@ struct EmailDetailView: View {
                     .foregroundColor(Color.Detail.textPrimary)
                     .textSelection(.enabled)
             }
-            
+
             // Action footer
             actionFooter
         }
@@ -197,7 +197,7 @@ struct EmailDetailView: View {
         .padding(.top, 24)
         .padding(.bottom, 32)
     }
-    
+
     private func scrollBy(_ delta: CGFloat) {
         guard let sv = detailScrollView,
               let docView = sv.documentView else { return }
@@ -214,7 +214,7 @@ struct EmailDetailView: View {
             set: { messageHeights[id] = $0 }
         )
     }
-    
+
     @ViewBuilder
     private func loadingCard(text: String?, action: (() -> Void)?) -> some View {
         VStack {
@@ -245,7 +245,7 @@ struct EmailDetailView: View {
         .padding(.top, 24)
         .padding(.bottom, 32)
     }
-    
+
     @ViewBuilder
     private func errorCard(message: String) -> some View {
         Text("Failed: \(message)")
@@ -259,9 +259,9 @@ struct EmailDetailView: View {
             .padding(.top, 24)
             .padding(.bottom, 32)
     }
-    
+
     // MARK: - Header Section
-    
+
     private var parsedTags: [String] {
         (email.tags?.split(separator: ",").map(String.init) ?? [])
             .filter { $0 != currentFolder }
@@ -289,7 +289,7 @@ struct EmailDetailView: View {
             }
         }
     }
-    
+
     // MARK: - Action Footer
 
     @ViewBuilder
@@ -339,7 +339,7 @@ struct EmailDetailView: View {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
-        
+
         guard let date = formatter.date(from: dateString) else {
             // Fallback: try without day name
             formatter.dateFormat = "dd MMM yyyy HH:mm:ss Z"
@@ -348,15 +348,15 @@ struct EmailDetailView: View {
             }
             return formatRelativeDate(date)
         }
-        
+
         return formatRelativeDate(date)
     }
-    
+
     /// Format date as relative or absolute depending on age
     private func formatRelativeDate(_ date: Date) -> String {
         let calendar = Calendar.current
         let now = Date()
-        
+
         if calendar.isDateInToday(date) {
             // Today: show time only
             let formatter = DateFormatter()

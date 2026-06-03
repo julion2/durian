@@ -10,7 +10,7 @@ import SwiftUI
 /// Wrapper view for the compose window
 struct ComposeWindow: View {
     let draftId: UUID
-    
+
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openWindow) private var openWindow
     @StateObject private var draftService = DraftService.shared
@@ -44,9 +44,9 @@ struct ComposeWindow: View {
         }
         .tint(profileManager.resolvedAccentColor)
     }
-    
+
     // MARK: - Subviews
-    
+
     private var noAccountsView: some View {
         VStack(spacing: 16) {
             Image(systemName: "exclamationmark.triangle")
@@ -63,7 +63,7 @@ struct ComposeWindow: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
     }
-    
+
     private func composeView(draft: EmailDraft, accounts: [MailAccount]) -> some View {
         ZStack {
         ComposeForm(
@@ -89,7 +89,7 @@ struct ComposeWindow: View {
                         .scaleEffect(0.7)
                 }
             }
-            
+
             // Action icons (right)
             ToolbarItemGroup(placement: .primaryAction) {
                 // Placeholder: AI Assist (not yet implemented)
@@ -111,7 +111,7 @@ struct ComposeWindow: View {
                 //     Image(systemName: "doc.on.doc")
                 // }
                 // .help("Templates")
-                
+
                 // More options
                 Menu {
                     Button(action: {}) {
@@ -122,7 +122,7 @@ struct ComposeWindow: View {
                     Image(systemName: "ellipsis")
                 }
                 .help("More Options")
-                
+
                 // Send
                 Button(action: {
                     triggerSend = true
@@ -210,7 +210,7 @@ struct ComposeWindow: View {
         .onAppear { KeymapHandler.shared.composeActive = true }
         .onDisappear { KeymapHandler.shared.composeActive = false }
     }
-    
+
     // MARK: - Actions
 
     /// Activate the next visible Durian window so the app doesn't appear

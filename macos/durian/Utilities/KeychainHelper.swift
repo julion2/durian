@@ -17,13 +17,14 @@ struct KeychainHelper {
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
-        
+
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        
+
         if status == errSecSuccess,
            let data = result as? Data,
-           let password = String(data: data, encoding: .utf8) {
+           let password = String(data: data, encoding: .utf8)
+        {
             return password
         } else {
             Log.error("KEYCHAIN", "Failed to retrieve password from keychain for \(account): \(status)")

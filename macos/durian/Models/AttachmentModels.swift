@@ -15,7 +15,7 @@ struct IncomingAttachmentMetadata: Identifiable, Codable, Hashable {
     let sizeBytes: Int64
     let disposition: AttachmentDisposition
     let contentId: String?
-    
+
     init(id: UUID = UUID(), section: String, filename: String, mimeType: String, sizeBytes: Int64, disposition: AttachmentDisposition = .attachment, contentId: String? = nil) {
         self.id = id
         self.section = section
@@ -25,11 +25,11 @@ struct IncomingAttachmentMetadata: Identifiable, Codable, Hashable {
         self.disposition = disposition
         self.contentId = contentId
     }
-    
+
     var sizeFormatted: String {
         ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
     }
-    
+
     var icon: String {
         if mimeType.hasPrefix("image/") {
             return "photo"
@@ -51,9 +51,9 @@ struct IncomingAttachmentMetadata: Identifiable, Codable, Hashable {
             return "doc"
         }
     }
-    
+
     var isInlineImage: Bool {
-        return disposition == .inline && mimeType.hasPrefix("image/")
+        disposition == .inline && mimeType.hasPrefix("image/")
     }
 }
 
@@ -90,7 +90,7 @@ enum AttachmentError: Error, LocalizedError {
     case circuitBreakerOpen
     case downloadTimeout
     case corruptedData
-    
+
     var errorDescription: String? {
         switch self {
         case .failedToExtract:

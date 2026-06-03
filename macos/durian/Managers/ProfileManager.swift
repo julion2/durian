@@ -26,19 +26,19 @@ struct Profile: Identifiable, Equatable, Hashable {
     let isDefault: Bool
     let color: String?  // Hex color string, e.g. "#3B82F6"
     let folders: [FolderConfig]  // Folders with custom queries
-    
+
     var isAll: Bool { accounts.contains("*") }
-    
+
     /// Convert hex color string to SwiftUI Color
     var swiftUIColor: Color {
         guard let hex = color else { return .brown }  // Fallback: Brown
         return Color(hex: hex)
     }
-    
+
     static func == (lhs: Profile, rhs: Profile) -> Bool {
         lhs.name == rhs.name && lhs.accounts == rhs.accounts
     }
-    
+
     func hash(into hasher: inout Hasher) {
         hasher.combine(name)
         hasher.combine(accounts)
@@ -49,7 +49,7 @@ struct Profile: Identifiable, Equatable, Hashable {
 
 struct ProfilesConfig: Decodable {
     let profiles: [ProfileEntry]
-    
+
     struct ProfileEntry: Decodable {
         let name: String
         let accounts: [String]
@@ -57,7 +57,7 @@ struct ProfilesConfig: Decodable {
         var color: String?
         var folders: [FolderEntry]?
     }
-    
+
     struct FolderEntry: Decodable {
         let name: String
         var icon: String?
@@ -70,15 +70,15 @@ struct ProfilesConfig: Decodable {
 @MainActor
 class ProfileManager: ObservableObject {
     static let shared = ProfileManager()
-    
+
     @Published var profiles: [Profile] = []
     @Published var currentProfile: Profile?
-    
+
     /// Default folders when none are defined in config
     static let defaultFolders: [FolderConfig] = [
         FolderConfig(name: "Inbox", icon: "tray", query: "tag:inbox", isSection: false)
     ]
-    
+
     init() {
         loadProfiles()
     }
@@ -135,7 +135,7 @@ class ProfileManager: ObservableObject {
             Log.debug("PROFILE", "Current profile has \(profile.folders.count) folders")
         }
     }
-    
+
     /// Resolved app-wide accent color following the precedence:
     ///   1. currentProfile.color (per-profile override)
     ///   2. settings.accent_color (app-wide default in [settings])
@@ -157,7 +157,7 @@ class ProfileManager: ObservableObject {
         guard let profile = currentProfile else {
             return "tag:inbox"
         }
-        
+
         // Find folder query from config
         let baseQuery: String
         if let folder = profile.folders.first(where: { $0.name.lowercased() == folderName.lowercased() }) {
@@ -166,14 +166,14 @@ class ProfileManager: ObservableObject {
             // Fallback: simple tag query
             baseQuery = "tag:\(folderName.lowercased())"
         }
-        
+
         // Add profile path filter (except for "All" profile)
         return buildQueryWithProfileFilter(baseQuery: baseQuery)
     }
-    
+
     /// Add profile path filter to an arbitrary query (e.g. from the search popup)
     func applyProfileFilter(to query: String) -> String {
-        return buildQueryWithProfileFilter(baseQuery: query)
+        buildQueryWithProfileFilter(baseQuery: query)
     }
 
     /// Add profile path filter to a base query
@@ -181,11 +181,11 @@ class ProfileManager: ObservableObject {
         guard let profile = currentProfile, !profile.isAll else {
             return baseQuery
         }
-        
+
         // Build path filter: (path:work/** OR path:personal/**)
         let pathFilters = profile.accounts.map { "path:\($0)/**" }
         let pathQuery = pathFilters.joined(separator: " OR ")
-        
+
         let query = "(\(baseQuery)) AND (\(pathQuery))"
         Log.debug("PROFILE", "Built query: \(query)")
         return query
