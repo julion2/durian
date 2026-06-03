@@ -18,11 +18,12 @@ use_repo(swift_deps, "swift_package", "swiftpkg_pkl_swift")
 
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
 
-# Pin Go to a patched stdlib (govulncheck flags net/mail DoS bugs fixed in
-# 1.25.10). Without an explicit version, rules_go falls back to its bundled
+# Pin Go to a patched stdlib. 1.25.11 fixes GO-2026-5039 (net/textproto
+# error-message unescaped input), follow-on to the 1.25.10 net/mail DoS
+# bump. Without an explicit version, rules_go falls back to its bundled
 # default which lags behind. from_file uses the `go` directive in cli/go.mod
 # as the floor.
-go_sdk.download(version = "1.25.10")
+go_sdk.download(version = "1.25.11")
 
 go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
 go_deps.from_file(go_mod = "//cli:go.mod")
