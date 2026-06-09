@@ -171,8 +171,14 @@ type AttachmentMeta struct {
 }
 
 // AttachmentsByMessage returns attachment metadata grouped by message DB ID.
+//
+// After ADR-0001 attachments-encryption (v21→v22) the content_type and
+// filename columns are encrypted BLOBs (content_type_ct, filename_ct)
+// sealed under the meta sub-key. Each row gets two decryptMeta calls;
+// the rules engine calls this once per `rules apply` so the cost is
+// bounded by total attachment count, not message count.
 func (d *DB) AttachmentsByMessage() (map[int64][]AttachmentMeta, error) {
-	rows, err := d.db.Query("SELECT message_db_id, content_type, filename FROM attachments")
+	rows, err := d.db.Query("SELECT message_db_id, content_type_ct, filename_ct FROM attachments")
 	if err != nil {
 		return nil, fmt.Errorf("query attachments: %w", err)
 	}
@@ -181,9 +187,17 @@ func (d *DB) AttachmentsByMessage() (map[int64][]AttachmentMeta, error) {
 	result := make(map[int64][]AttachmentMeta)
 	for rows.Next() {
 		var msgID int64
-		var ct, fn string
-		if err := rows.Scan(&msgID, &ct, &fn); err != nil {
+		var contentTypeCT, filenameCT []byte
+		if err := rows.Scan(&msgID, &contentTypeCT, &filenameCT); err != nil {
 			return nil, fmt.Errorf("scan attachment: %w", err)
+		}
+		ct, err := d.decryptMeta("", contentTypeCT)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt content_type msg=%d: %w", msgID, err)
+		}
+		fn, err := d.decryptMeta("", filenameCT)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt filename msg=%d: %w", msgID, err)
 		}
 		result[msgID] = append(result[msgID], AttachmentMeta{ContentType: ct, Filename: fn})
 	}
