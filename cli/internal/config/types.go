@@ -24,6 +24,11 @@ type SyncConfig struct {
 	FullSyncInterval  int                    `pkl:"full_sync_interval" json:"full_sync_interval"`
 	TagSync           *TagSyncConfig         `pkl:"tag_sync" json:"tag_sync"`
 	AttachmentCache   *AttachmentCacheConfig `pkl:"attachment_cache" json:"attachment_cache"`
+	// IndexedHeaders supplements the built-in set of MIME headers that
+	// sync fetches into message_headers for rule matching. See
+	// cli/internal/imap/sync_mailbox.go builtinSelectedHeaders for the
+	// built-ins. Case-insensitive merge, user entries are additive only.
+	IndexedHeaders []string `pkl:"indexed_headers" json:"indexed_headers"`
 }
 
 // AttachmentCacheConfig configures the GUI attachment cache.

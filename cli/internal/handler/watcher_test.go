@@ -73,7 +73,7 @@ func TestCleanSnippet_EmptyInput(t *testing.T) {
 
 func TestNewWatcherManager(t *testing.T) {
 	db := newTestStore(t)
-	w := NewWatcherManager(nil, db, nil, nil)
+	w := NewWatcherManager(nil, db, nil, nil, nil)
 	if w == nil {
 		t.Fatal("nil watcher manager")
 	}
@@ -90,7 +90,7 @@ func TestNewWatcherManager(t *testing.T) {
 
 func TestWatcherManager_AccountLock_SameEmailSameLock(t *testing.T) {
 	db := newTestStore(t)
-	w := NewWatcherManager(nil, db, nil, nil)
+	w := NewWatcherManager(nil, db, nil, nil, nil)
 
 	a := w.accountLock("alice@example.com")
 	b := w.accountLock("alice@example.com")
@@ -101,7 +101,7 @@ func TestWatcherManager_AccountLock_SameEmailSameLock(t *testing.T) {
 
 func TestWatcherManager_AccountLock_DifferentEmailsDifferentLocks(t *testing.T) {
 	db := newTestStore(t)
-	w := NewWatcherManager(nil, db, nil, nil)
+	w := NewWatcherManager(nil, db, nil, nil, nil)
 
 	a := w.accountLock("alice@example.com")
 	b := w.accountLock("bob@example.com")
@@ -112,7 +112,7 @@ func TestWatcherManager_AccountLock_DifferentEmailsDifferentLocks(t *testing.T) 
 
 func TestWatcherManager_AccountLock_ConcurrentSafe(t *testing.T) {
 	db := newTestStore(t)
-	w := NewWatcherManager(nil, db, nil, nil)
+	w := NewWatcherManager(nil, db, nil, nil, nil)
 
 	// Hammer accountLock from multiple goroutines — should not race
 	// when run under `bazel test --test_arg=-race` (go_test has race
@@ -136,7 +136,7 @@ func TestWatcherManager_AccountLock_ConcurrentSafe(t *testing.T) {
 
 func TestWatcherManager_TriggerSync_UnknownAccount(t *testing.T) {
 	db := newTestStore(t)
-	w := NewWatcherManager(nil, db, nil, nil)
+	w := NewWatcherManager(nil, db, nil, nil, nil)
 
 	// Must not panic when the account has no registered watcher
 	w.TriggerSync("unknown-account")

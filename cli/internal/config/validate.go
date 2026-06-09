@@ -43,6 +43,24 @@ func ValidateConfig(cfg *Config) []ValidationError {
 		}
 	}
 
+	// indexed_headers: RFC 822 header names = ASCII letters + digits +
+	// hyphen, starting with a letter. The runtime merge in imap.headerSet
+	// drops empty strings and dedups case-insensitively, but a typo like
+	// "X Gitlab Reason " (spaces) would silently be a no-op — surface it
+	// at validate time instead.
+	headerName := regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]*$`)
+	for i, name := range cfg.Sync.IndexedHeaders {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			add(fmt.Sprintf("sync.indexed_headers[%d]", i), "empty header name")
+			continue
+		}
+		if !headerName.MatchString(trimmed) {
+			add(fmt.Sprintf("sync.indexed_headers[%d]", i),
+				fmt.Sprintf("invalid MIME header name: %q (must match [A-Za-z][A-Za-z0-9-]*)", name))
+		}
+	}
+
 	if len(cfg.Accounts) == 0 {
 		warn("accounts", "no accounts configured")
 		return errs

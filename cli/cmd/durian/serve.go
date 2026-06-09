@@ -226,7 +226,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		if len(accounts) == 0 {
 			slog.Info("No IMAP accounts configured, skipping watchers", "module", "SERVE") // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		} else {
-			watcher := handler.NewWatcherManager(eventHub, emailDB, rules, groups)
+			watcher := handler.NewWatcherManager(eventHub, emailDB, rules, groups, cfg.Sync.IndexedHeaders)
 			h.SetFetcher(watcher)
 			h.SetSyncTrigger(watcher)
 			go watcher.Start(watcherCtx, accounts)

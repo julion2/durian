@@ -17,6 +17,14 @@ class SyncConfig {
   full_sync_interval: Int(this > 0) = 7200
   tag_sync: TagSyncConfig?
   attachment_cache: AttachmentCacheConfig?
+  /// Extra MIME header names to fetch and index on top of the built-in
+  /// set (List-Id, List-Unsubscribe, Precedence, X-Mailer, Return-Path,
+  /// X-GitHub-Reason, Authentication-Results). Use this when you want
+  /// rules.pkl to match against provider-specific headers like
+  /// X-GitLab-NotificationReason or X-Spam-Status. After changing the
+  /// list, run `durian sync --backfill-headers` once to populate
+  /// existing messages.
+  indexed_headers: Listing<String>?
 }
 
 class AttachmentCacheConfig {
