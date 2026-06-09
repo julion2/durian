@@ -48,16 +48,17 @@ var specialUseFolderTags = map[string]FolderTagMapping{
 
 // SyncOptions configures the sync behavior
 type SyncOptions struct {
-	DryRun          bool
-	Quiet           bool
-	NoFlags         bool                         // Skip flag synchronization
-	Mode            SyncMode                     // Sync direction
-	Mailboxes       []string                     // Specific mailboxes to sync (empty = all)
-	Store           *store.DB                    // SQLite store (required)
-	FilterRules     []config.RuleConfig          // User-defined filter rules applied at insert time
-	Groups          map[string]config.GroupEntry // Contact groups for group: expansion in rules
-	BackfillHeaders bool                         // Fetch and store headers for existing messages
-	IndexedHeaders  []string                     // User-added MIME header names to index on top of builtinSelectedHeaders (see sync_mailbox.go)
+	DryRun               bool
+	Quiet                bool
+	NoFlags              bool                         // Skip flag synchronization
+	Mode                 SyncMode                     // Sync direction
+	Mailboxes            []string                     // Specific mailboxes to sync (empty = all)
+	Store                *store.DB                    // SQLite store (required)
+	FilterRules          []config.RuleConfig          // User-defined filter rules applied at insert time
+	Groups               map[string]config.GroupEntry // Contact groups for group: expansion in rules
+	BackfillHeaders      bool                         // Fetch and store headers for existing messages
+	BackfillHeadersForce bool                         // With BackfillHeaders, re-fetch every message even if it already has rows in message_headers — needed after sync.indexed_headers changes
+	IndexedHeaders       []string                     // User-added MIME header names to index on top of builtinSelectedHeaders (see sync_mailbox.go)
 }
 
 // SyncResult contains the results of a sync operation
