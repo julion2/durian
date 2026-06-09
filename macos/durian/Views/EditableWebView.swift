@@ -27,7 +27,14 @@ struct EditableWebView: NSViewRepresentable {
     var vimInsertExitKeys: [String] = []
 
     func makeNSView(context: Context) -> WKWebView {
+        // Per-instance config (userContentController + message handlers must
+        // belong to this single editor), but share the SharedWebKit.composePool
+        // so successive open-and-close compose windows reuse one WebContent
+        // process instead of spawning fresh. Distinct from the read-only pool
+        // — editor message handlers shouldn't share a process with rendered
+        // mail content.
         let config = WKWebViewConfiguration()
+        config.processPool = SharedWebKit.composePool
         config.defaultWebpagePreferences.allowsContentJavaScript = true
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
 
@@ -43,6 +50,7 @@ struct EditableWebView: NSViewRepresentable {
         config.userContentController.add(handler, name: "vimSearch")
 
         let webView = ScrollPassthroughWebView(frame: .zero, configuration: config)
+        SharedWebKit.applyEnergyDefaults(to: webView)
         #if DEBUG
         webView.isInspectable = true
         #endif
@@ -235,6 +243,12 @@ struct EditableWebView: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
+    }
+
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) {
+        // Stop in-flight loads on compose-window close so the editor's
+        // WebContent process doesn't keep doing work after dismissal.
+        nsView.stopLoading()
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
