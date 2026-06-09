@@ -90,6 +90,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 		Store:           emailDB,
 		FilterRules:     rules,
 		BackfillHeaders: syncBackfillHeaders,
+		IndexedHeaders:  GetConfig().Sync.IndexedHeaders,
 		Groups:          func() map[string]config.GroupEntry { g, _ := config.LoadGroups(""); return g }(),
 	}
 

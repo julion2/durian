@@ -57,6 +57,7 @@ type SyncOptions struct {
 	FilterRules     []config.RuleConfig          // User-defined filter rules applied at insert time
 	Groups          map[string]config.GroupEntry // Contact groups for group: expansion in rules
 	BackfillHeaders bool                         // Fetch and store headers for existing messages
+	IndexedHeaders  []string                     // User-added MIME header names to index on top of builtinSelectedHeaders (see sync_mailbox.go)
 }
 
 // SyncResult contains the results of a sync operation

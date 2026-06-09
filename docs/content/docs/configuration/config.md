@@ -54,6 +54,29 @@ accounts {
 | `full_sync_interval` | `Int` (seconds) | `7200` | Full sync interval |
 | `tag_sync` | object? | `null` | Optional remote tag sync — see [tag sync server](https://github.com/julion2/durian/tree/main/sync) |
 | `attachment_cache` | object? | `null` | `{ max_size_mb, ttl_days }` |
+| `indexed_headers` | `Listing<String>?` | `null` | Extra MIME headers to fetch + index on top of the built-in seven (`List-Id`, `List-Unsubscribe`, `Precedence`, `X-Mailer`, `Return-Path`, `X-GitHub-Reason`, `Authentication-Results`). Use for provider-specific rules. After editing, run `durian sync --backfill-headers` once to populate existing messages. |
+
+### Extra `indexed_headers` example
+
+```pkl
+sync {
+  indexed_headers {
+    "X-GitLab-NotificationReason"   // own_activity / assigned / mentioned
+    "X-GitLab-Project-Path"
+    "X-Spam-Status"
+    "Auto-Submitted"
+  }
+}
+```
+
+Then in `rules.pkl`:
+
+```pkl
+new { name = "GitLab mentions"; match = "header:x-gitlab-notificationreason:mentioned"; add_tags { "gitlab/mention" } }
+new { name = "Spam";           match = "header:x-spam-status:Yes";                        add_tags { "spam" } }
+```
+
+The built-in seven cover ~90% of inbox-zero patterns; user additions handle the long tail without code changes. After editing the config, `durian sync --backfill-headers` re-fetches headers for existing messages so old mails match the new rules. New mails pick up the change automatically on the next sync.
 
 ## accounts
 
