@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"net/textproto"
+	"strings"
 )
 
 // InsertHeader stores a message header. Overwrites if it already exists.
@@ -118,6 +119,49 @@ func (d *DB) AllMessages() ([]*Message, error) {
 // Header names are returned in canonical MIME form (e.g. "List-Unsubscribe").
 func (d *DB) AllHeadersByMessage() (map[int64]map[string][]string, error) {
 	rows, err := d.db.Query("SELECT message_id, name, value_ct FROM message_headers")
+	if err != nil {
+		return nil, fmt.Errorf("query headers: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[int64]map[string][]string)
+	for rows.Next() {
+		var msgID int64
+		var name string
+		var valueCT []byte
+		if err := rows.Scan(&msgID, &name, &valueCT); err != nil {
+			return nil, fmt.Errorf("scan header: %w", err)
+		}
+		plain, err := d.decryptHeaderValue("", valueCT)
+		if err != nil {
+			return nil, err
+		}
+		if result[msgID] == nil {
+			result[msgID] = make(map[string][]string)
+		}
+		canonical := textproto.CanonicalMIMEHeaderKey(name)
+		result[msgID][canonical] = append(result[msgID][canonical], plain)
+	}
+	return result, rows.Err()
+}
+
+// HeadersByMessageDBIDs loads headers scoped to the given message DB IDs.
+// Same decrypt path as AllHeadersByMessage but parameterised — useful for
+// `durian show --headers` where we already know the thread's message set
+// and don't want to scan the entire message_headers table.
+func (d *DB) HeadersByMessageDBIDs(ids []int64) (map[int64]map[string][]string, error) {
+	if len(ids) == 0 {
+		return map[int64]map[string][]string{}, nil
+	}
+	placeholders := make([]string, len(ids))
+	params := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		params[i] = id
+	}
+	q := "SELECT message_id, name, value_ct FROM message_headers WHERE message_id IN (" +
+		strings.Join(placeholders, ",") + ")"
+	rows, err := d.db.Query(q, params...)
 	if err != nil {
 		return nil, fmt.Errorf("query headers: %w", err)
 	}
