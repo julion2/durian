@@ -18,7 +18,8 @@ var (
 	syncNoFlags         bool
 	syncDownloadOnly    bool
 	syncUploadOnly      bool
-	syncBackfillHeaders bool
+	syncBackfillHeaders      bool
+	syncBackfillHeadersForce bool
 )
 
 var syncCmd = &cobra.Command{
@@ -48,7 +49,8 @@ func init() {
 	syncCmd.Flags().BoolVar(&syncNoFlags, "no-flags", false, "skip flag synchronization")
 	syncCmd.Flags().BoolVar(&syncDownloadOnly, "download-only", false, "only download from server (no flag upload)")
 	syncCmd.Flags().BoolVar(&syncUploadOnly, "upload-only", false, "only upload local changes to server")
-	syncCmd.Flags().BoolVar(&syncBackfillHeaders, "backfill-headers", false, "fetch and store headers for existing messages")
+	syncCmd.Flags().BoolVar(&syncBackfillHeaders, "backfill-headers", false, "fetch and store headers for messages that don't have any yet")
+	syncCmd.Flags().BoolVar(&syncBackfillHeadersForce, "force", false, "with --backfill-headers, re-fetch headers for ALL messages even if they already have some (needed after changing sync.indexed_headers in config.pkl)")
 
 	rootCmd.AddCommand(syncCmd)
 }
@@ -89,8 +91,9 @@ func runSync(cmd *cobra.Command, args []string) error {
 		Mode:            mode,
 		Store:           emailDB,
 		FilterRules:     rules,
-		BackfillHeaders: syncBackfillHeaders,
-		IndexedHeaders:  GetConfig().Sync.IndexedHeaders,
+		BackfillHeaders:      syncBackfillHeaders,
+		BackfillHeadersForce: syncBackfillHeadersForce,
+		IndexedHeaders:       GetConfig().Sync.IndexedHeaders,
 		Groups:          func() map[string]config.GroupEntry { g, _ := config.LoadGroups(""); return g }(),
 	}
 
