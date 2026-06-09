@@ -24,7 +24,8 @@ durian sync --debug                  # verbose logging to stderr
 durian sync --upload-only            # only push local tag/flag changes
 durian sync --download-only          # only fetch from server
 durian sync --no-flags               # skip flag sync (bodies only)
-durian sync --backfill-headers       # refetch headers for existing rows
+durian sync --backfill-headers       # fetch headers for messages that don't have any yet
+durian sync --backfill-headers --force  # re-fetch headers for ALL messages (after editing sync.indexed_headers)
 durian sync --dry-run                # report what would happen, write nothing
 ```
 
@@ -56,11 +57,17 @@ Tags must be prefixed with `+` (add) or `-` (remove). Both can be mixed in one c
 ## show — display a thread
 
 ```bash
-durian show <thread-id>
-durian show <thread-id> --html
+durian show <thread-id>                                   # plain-text body
+durian show <thread-id> --html                            # HTML body
+durian show <thread-id> --headers                         # indexed MIME headers per message (local, fast)
+durian show <thread-id> --header list-id                  # single header by name (implies --headers)
+durian show <thread-id> --raw-headers                     # full header block from IMAP (network, slow)
+durian show <thread-id> --raw-headers --header x-spam-status
 ```
 
 Renders the thread to stdout — useful for piping into `less` or grepping a specific thread.
+
+`--headers` shows what Durian indexed at sync time (`sync.indexed_headers` plus the built-in seven). `--raw-headers` does an on-demand IMAP `BODY.PEEK[HEADER]` fetch — useful for discovering what a provider actually sends before deciding what to add to `indexed_headers`. See [Encryption at rest](encryption-at-rest/#inspecting-headers) and the [Writing rules](../configuration/rules/#finding-the-header-value-for-a-rule) walkthrough.
 
 ## attachment — list or download
 

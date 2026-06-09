@@ -16,8 +16,8 @@ Durian uses notmuch-style queries — terms are ANDed by default; `OR` and `NOT`
 | `from:alice@example.com` | Sender contains substring |
 | `to:me@you.com` | Recipient contains substring |
 | `subject:invoice` | Subject contains substring |
-| `header:list-id:` | Header present (any value) |
-| `header:x-spam-score:5` | Header value contains substring |
+| `header:list-id:` | Header present (any value). **Note:** only available in `rules.pkl` match clauses, not in search queries yet — tracked in [#265](https://github.com/julion2/durian/issues/265). |
+| `header:x-spam-score:5` | Header value contains substring. Same restriction as above. |
 | `has:attachment` | Has any attachment |
 | `has:attachment:pdf` | Has a PDF attachment |
 | `path:Work/Projects` | IMAP folder path |
