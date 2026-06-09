@@ -5,8 +5,8 @@
 //  Tracks outbox state (pending count) for badge display.
 //
 
-import Foundation
 import Combine
+import Foundation
 
 @MainActor
 class OutboxManager: ObservableObject {
@@ -17,12 +17,12 @@ class OutboxManager: ObservableObject {
     private let backendProvider: () -> (any OutboxBackend)?
 
     private init() {
-        self.backendProvider = { AccountManager.shared.emailBackend }
+        backendProvider = { AccountManager.shared.emailBackend }
     }
 
     /// Test-only initializer for dependency injection
     init(backend: @escaping () -> (any OutboxBackend)?) {
-        self.backendProvider = backend
+        backendProvider = backend
     }
 
     /// Refresh the pending count from the server.

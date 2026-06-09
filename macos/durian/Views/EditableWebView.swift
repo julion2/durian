@@ -102,7 +102,7 @@ struct EditableWebView: NSViewRepresentable {
         // Execute formatting command if requested
         if let cmd = formatCommand {
             DispatchQueue.main.async {
-                self.formatCommand = nil
+                formatCommand = nil
             }
             let js: String
             if cmd == "insertUnorderedList" || cmd == "insertOrderedList" {
@@ -159,7 +159,7 @@ struct EditableWebView: NSViewRepresentable {
         // Execute font size command if requested
         if let size = fontSizeCommand {
             DispatchQueue.main.async {
-                self.fontSizeCommand = nil
+                fontSizeCommand = nil
             }
             let js = """
             (function() {
@@ -193,7 +193,7 @@ struct EditableWebView: NSViewRepresentable {
         // Execute font family command if requested
         if let family = fontFamilyCommand {
             DispatchQueue.main.async {
-                self.fontFamilyCommand = nil
+                fontFamilyCommand = nil
             }
             let stacks: [String: String] = [
                 "Helvetica": "'Helvetica Neue', Helvetica, Arial, sans-serif",
@@ -345,7 +345,8 @@ struct EditableWebView: NSViewRepresentable {
         // Open links in browser
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             if navigationAction.navigationType == .linkActivated,
-               let url = navigationAction.request.url {
+               let url = navigationAction.request.url
+            {
                 NSWorkspace.shared.open(url)
                 decisionHandler(.cancel)
             } else {

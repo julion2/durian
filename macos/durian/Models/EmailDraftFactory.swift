@@ -34,7 +34,7 @@ extension EmailDraft {
     /// Returns the message ID of the message that should be quoted in a reply.
     /// Used to lazy-load the original (unstripped) body before creating the draft.
     static func replyTargetMessageId(for message: MailMessage, fromAccount: String) -> String? {
-        return findReplyTarget(message: message, fromAccount: fromAccount).bodySourceId
+        findReplyTarget(message: message, fromAccount: fromAccount).bodySourceId
     }
 
     /// Create a reply draft from a mail message
@@ -45,7 +45,8 @@ extension EmailDraft {
     ///     When provided, used for quoting instead of the stripped thread body.
     /// - Returns: A new EmailDraft configured as a reply
     static func createReply(from message: MailMessage, fromAccount: String,
-                            originalBody: (body: String, html: String?)? = nil) -> EmailDraft {
+                            originalBody: (body: String, html: String?)? = nil) -> EmailDraft
+    {
         let target = findReplyTarget(message: message, fromAccount: fromAccount)
 
         // Fallback if target.from has no email (e.g. cache restored without headers)
@@ -100,7 +101,8 @@ extension EmailDraft {
     ///   - fromAccount: The email address to send from
     /// - Returns: A new EmailDraft configured as a reply-all
     static func createReplyAll(from message: MailMessage, fromAccount: String,
-                               originalBody: (body: String, html: String?)? = nil) -> EmailDraft {
+                               originalBody: (body: String, html: String?)? = nil) -> EmailDraft
+    {
         var draft = createReply(from: message, fromAccount: fromAccount, originalBody: originalBody)
         let target = findReplyTarget(message: message, fromAccount: fromAccount)
 
@@ -324,7 +326,8 @@ extension EmailDraft {
         // Standard format: "Name <email>"
         if let start = trimmed.firstIndex(of: "<"),
            let end = trimmed.firstIndex(of: ">"),
-           start < end {
+           start < end
+        {
             let email = String(trimmed[trimmed.index(after: start)..<end])
             // Validate it looks like an email
             if email.contains("@") {
@@ -404,7 +407,7 @@ extension EmailDraft {
 
     /// Quote body HTML for reply (preserves formatting)
     private static func quoteBodyHTML(_ html: String, from: String, date: String) -> String {
-        return """
+        """
         <div style="color: #555;">
         <p style="font-size: 12px; color: #888; margin-bottom: 8px;">On \(escapeHTML(date)), \(escapeHTML(from)) wrote:</p>
         <div style="border-left: 2px solid #ccc; padding-left: 10px; margin-left: 5px;">
@@ -420,7 +423,7 @@ extension EmailDraft {
     private static func buildForwardThread(_ messages: [ThreadMessage]) -> String {
         // Thread messages arrive newest-first from API; keep that order
         // in forwards so the most recent reply is at the top.
-        return messages.map { msg in
+        messages.map { msg in
             var part = "---------- Forwarded message ----------\n"
             part += "From: \(msg.from)\n"
             if let to = msg.to { part += "To: \(to)\n" }
@@ -495,7 +498,7 @@ extension EmailDraft {
 
     /// Escape HTML special characters
     private static func escapeHTML(_ string: String) -> String {
-        return string
+        string
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")

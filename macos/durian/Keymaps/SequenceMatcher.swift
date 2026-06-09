@@ -9,11 +9,11 @@ import Foundation
 
 /// Matches key buffer contents against defined sequences
 class SequenceMatcher {
-    
+
     // MARK: - Singleton
-    
+
     static let shared = SequenceMatcher()
-    
+
     // MARK: - Dynamic Sequence Storage
 
     /// All defined key sequences (loaded from config), grouped by context
@@ -30,12 +30,12 @@ class SequenceMatcher {
 
     /// Per-context tag_op tags lookup: sequence → tags string (e.g. "+todo -inbox")
     private var contextTagOps: [KeymapContext: [String: String]] = [:]
-    
+
     // MARK: - Init
-    
+
     private init() {
         reloadFromConfig()
-        
+
         // Observe config changes
         NotificationCenter.default.addObserver(
             self,
@@ -44,17 +44,17 @@ class SequenceMatcher {
             object: nil
         )
     }
-    
+
     deinit {
         NotificationCenter.default.removeObserver(self)
     }
-    
+
     // MARK: - Config Loading
-    
+
     @objc private func configDidChange() {
         reloadFromConfig()
     }
-    
+
     /// Reload sequences from KeymapsManager config
     func reloadFromConfig() {
         let keymapEntries = KeymapsManager.shared.keymaps.keymaps
@@ -125,7 +125,7 @@ class SequenceMatcher {
         let totalSeqs = contextSequenceLookup.values.reduce(0) { $0 + $1.count }
         Log.debug("SEQMATCH", "Loaded \(totalSeqs) sequences across \(contextSequenceLookup.count) contexts")
     }
-    
+
     // MARK: - Public API
 
     /// Match buffer contents against known sequences in the given context
@@ -168,7 +168,7 @@ class SequenceMatcher {
 
         return .noMatch
     }
-    
+
     /// Get tags for a tag_op sequence in a given context
     func tagOpTags(for sequence: String, context: KeymapContext) -> String? {
         contextTagOps[context]?[sequence]
@@ -178,26 +178,26 @@ class SequenceMatcher {
     func sequences(for action: KeymapAction) -> [String] {
         sequences.filter { $0.action == action }.map { $0.sequence }
     }
-    
+
     /// Get all defined sequences (for help display)
     var allSequences: [SequenceDefinition] {
         sequences
     }
-    
+
     /// Check if an action supports count prefix in a given context
     func supportsCount(_ action: KeymapAction, context: KeymapContext = .list) -> Bool {
         contextCountSupported[context]?.contains(action) ?? false
     }
-    
+
     // MARK: - Private
-    
+
     /// Parse count prefix from buffer
     /// e.g., "5j" → (5, "j"), "12gg" → (12, "gg"), "gg" → (nil, "gg")
     func parseCountAndSequence(_ buffer: String) -> (count: Int?, sequence: String) {
         var digits = ""
         var rest = ""
         var foundNonDigit = false
-        
+
         for char in buffer {
             if char.isNumber && !foundNonDigit {
                 digits.append(char)
@@ -206,7 +206,7 @@ class SequenceMatcher {
                 rest.append(char)
             }
         }
-        
+
         let count = digits.isEmpty ? nil : Int(digits)
         return (count, rest)
     }

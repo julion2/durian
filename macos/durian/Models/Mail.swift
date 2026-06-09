@@ -51,7 +51,7 @@ enum EmailBodyState: Equatable, Hashable {
     case loading
     case loaded(body: String, attributedBody: NSAttributedString?)
     case failed(message: String)
-    
+
     var displayBody: String {
         switch self {
         case .notLoaded:
@@ -64,7 +64,7 @@ enum EmailBodyState: Equatable, Hashable {
             return "Failed to load: \(message)"
         }
     }
-    
+
     var attributedBody: NSAttributedString? {
         switch self {
         case .loaded(_, let attributed):
@@ -73,7 +73,7 @@ enum EmailBodyState: Equatable, Hashable {
             return nil
         }
     }
-    
+
     func hash(into hasher: inout Hasher) {
         switch self {
         case .notLoaded:
@@ -88,7 +88,7 @@ enum EmailBodyState: Equatable, Hashable {
             hasher.combine(message)
         }
     }
-    
+
     static func == (lhs: EmailBodyState, rhs: EmailBodyState) -> Bool {
         switch (lhs, rhs) {
         case (.notLoaded, .notLoaded), (.loading, .loading):
@@ -115,82 +115,82 @@ struct MailFolder: Identifiable, Hashable {
     let isSpecial: Bool  // true for inbox, sent, drafts, trash
     let specialType: SpecialFolderType?
     let isSection: Bool  // true for section headers (no query, not clickable)
-    
+
     enum SpecialFolderType: String {
         case inbox, sent, drafts, trash, archive, junk
     }
-    
+
     /// Create a section header (non-clickable divider in sidebar)
     init(section title: String) {
-        self.id = "section:\(title)"
-        self.name = title
-        self.displayName = title
-        self.icon = nil
-        self.accountId = "default"
-        self.isSpecial = false
-        self.specialType = nil
-        self.isSection = true
+        id = "section:\(title)"
+        name = title
+        displayName = title
+        icon = nil
+        accountId = "default"
+        isSpecial = false
+        specialType = nil
+        isSection = true
     }
 
     /// Create for tag-based folder
     init(tag: String, icon: String) {
-        self.id = "tag:\(tag)"
-        self.name = tag
-        self.displayName = tag.capitalized
+        id = "tag:\(tag)"
+        name = tag
+        displayName = tag.capitalized
         self.icon = icon
-        self.accountId = "default"
-        self.isSection = false
+        accountId = "default"
+        isSection = false
 
         switch tag {
         case "inbox":
-            self.isSpecial = true
-            self.specialType = .inbox
+            isSpecial = true
+            specialType = .inbox
         case "sent":
-            self.isSpecial = true
-            self.specialType = .sent
+            isSpecial = true
+            specialType = .sent
         case "draft", "drafts":
-            self.isSpecial = true
-            self.specialType = .drafts
+            isSpecial = true
+            specialType = .drafts
         case "deleted", "trash":
-            self.isSpecial = true
-            self.specialType = .trash
+            isSpecial = true
+            specialType = .trash
         case "archive":
-            self.isSpecial = true
-            self.specialType = .archive
+            isSpecial = true
+            specialType = .archive
         default:
-            self.isSpecial = false
-            self.specialType = nil
+            isSpecial = false
+            specialType = nil
         }
     }
-    
+
     /// Create from profile folder config (name, displayName, icon)
     init(name: String, displayName: String, icon: String?) {
-        self.id = "folder:\(name)"
+        id = "folder:\(name)"
         self.name = name
         self.displayName = displayName
         self.icon = icon
-        self.accountId = "default"
-        self.isSection = false
+        accountId = "default"
+        isSection = false
 
         switch name.lowercased() {
         case "inbox":
-            self.isSpecial = true
-            self.specialType = .inbox
+            isSpecial = true
+            specialType = .inbox
         case "sent":
-            self.isSpecial = true
-            self.specialType = .sent
+            isSpecial = true
+            specialType = .sent
         case "draft", "drafts":
-            self.isSpecial = true
-            self.specialType = .drafts
+            isSpecial = true
+            specialType = .drafts
         case "deleted", "trash":
-            self.isSpecial = true
-            self.specialType = .trash
+            isSpecial = true
+            specialType = .trash
         case "archive":
-            self.isSpecial = true
-            self.specialType = .archive
+            isSpecial = true
+            specialType = .archive
         default:
-            self.isSpecial = false
-            self.specialType = nil
+            isSpecial = false
+            specialType = nil
         }
     }
 }
@@ -213,10 +213,10 @@ struct MailMessage: Identifiable, Hashable {
     var hasAttachment: Bool
     var bodyState: EmailBodyState
     var incomingAttachments: [IncomingAttachmentMetadata]
-    
+
     // Thread messages (loaded from CLI show command)
     var threadMessages: [ThreadMessage]?
-    
+
     // Preview text from search enrichment (separate from bodyState cache)
     var previewText: String?
 
@@ -225,32 +225,32 @@ struct MailMessage: Identifiable, Hashable {
     var messageId: String?
     var inReplyTo: String?
     var references: String?
-    
+
     /// Create from search result
     init(threadId: String, subject: String, from: String, to: String? = nil, date: String, timestamp: Int, tags: String) {
-        self.id = threadId
+        id = threadId
         self.subject = subject
         self.from = from
         self.to = to
-        self.cc = nil
+        cc = nil
         self.date = date
         self.timestamp = timestamp
         self.tags = tags
-        self.body = nil
-        self.htmlBody = nil
-        self.attributedBody = nil
+        body = nil
+        htmlBody = nil
+        attributedBody = nil
         let tagSet = Set(tags.split(separator: ","))
-        self.isRead = !tagSet.contains("unread")
-        self.isPinned = tagSet.contains("flagged")
-        self.hasAttachment = tagSet.contains("attachment")
-        self.bodyState = .notLoaded
-        self.incomingAttachments = []
-        self.threadMessages = nil
-        self.messageId = nil
-        self.inReplyTo = nil
-        self.references = nil
+        isRead = !tagSet.contains("unread")
+        isPinned = tagSet.contains("flagged")
+        hasAttachment = tagSet.contains("attachment")
+        bodyState = .notLoaded
+        incomingAttachments = []
+        threadMessages = nil
+        messageId = nil
+        inReplyTo = nil
+        references = nil
     }
-    
+
     var isDraft: Bool {
         guard let tags = tags else { return false }
         return tags.split(separator: ",").contains("draft")
@@ -278,7 +278,7 @@ struct MailMessage: Identifiable, Hashable {
             return nil
         }
     }
-    
+
     // Hashable
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)

@@ -5,8 +5,8 @@
 //  Manages email sending via the outbox HTTP API
 //
 
-import Foundation
 import Combine
+import Foundation
 
 @MainActor
 class EmailSendingManager: ObservableObject {
@@ -322,7 +322,8 @@ class EmailSendingManager: ObservableObject {
 
         if let startIdx = trimmed.lastIndex(of: "<"),
            let endIdx = trimmed.lastIndex(of: ">"),
-           startIdx < endIdx {
+           startIdx < endIdx
+        {
             let start = trimmed.index(after: startIdx)
             return String(trimmed[start..<endIdx]).trimmingCharacters(in: .whitespaces)
         }

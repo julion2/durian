@@ -1,5 +1,5 @@
-import XCTest
 @testable import durian_lib
+import XCTest
 
 final class EmailSendingManagerTests: XCTestCase {
 

@@ -13,7 +13,7 @@ struct ScrollViewFinder: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         DispatchQueue.main.async {
-            self.scrollView = view.enclosingScrollView
+            scrollView = view.enclosingScrollView
         }
         return view
     }
@@ -21,7 +21,7 @@ struct ScrollViewFinder: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {
         if scrollView == nil {
             DispatchQueue.main.async {
-                self.scrollView = nsView.enclosingScrollView
+                scrollView = nsView.enclosingScrollView
             }
         }
     }

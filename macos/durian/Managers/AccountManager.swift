@@ -5,14 +5,14 @@
 //  Manages email backend for email access
 //
 
-import Foundation
-import Combine
 import AppKit
+import Combine
+import Foundation
 
 @MainActor
 class AccountManager: ObservableObject {
     static let shared = AccountManager()
-    
+
     // MARK: - Email Backend Properties
     @Published var emailBackend: EmailBackend?
     @Published var mailMessages: [MailMessage] = []    // Messages
@@ -27,9 +27,9 @@ class AccountManager: ObservableObject {
 
     /// Unread thread counts per folder name (for sidebar badges)
     @Published var folderUnreadCounts: [String: Int] = [:]
-    
+
     private var cancellables = Set<AnyCancellable>()
-    
+
     /// Folders from current profile config
     var mailFolders: [MailFolder] {
         let profile = ProfileManager.shared.currentProfile
@@ -42,17 +42,17 @@ class AccountManager: ObservableObject {
             return MailFolder(name: folder.name.lowercased(), displayName: folder.name, icon: folder.icon)
         }
     }
-    
+
     private init() {
         setupEmailBackend()
     }
-    
+
     // MARK: - Backend Setup
-    
+
     private func setupEmailBackend() {
         Log.debug("BACKEND", "AccountManager: Setting up email backend")
         emailBackend = EmailBackend()
-        
+
         // Subscribe to backend changes — debounced to avoid cascade storms
         emailBackend?.objectWillChange
             .debounce(for: .milliseconds(50), scheduler: DispatchQueue.main)
@@ -75,7 +75,7 @@ class AccountManager: ObservableObject {
             loadingProgress = backend.loadingProgress
         }
     }
-    
+
     // MARK: - Folder Unread Counts & Dock Badge
 
     /// Refresh unread counts for all sidebar folders and update dock badge.
@@ -101,7 +101,7 @@ class AccountManager: ObservableObject {
     }
 
     // MARK: - Connection
-    
+
     func connectToAllAccounts() async {
         Log.debug("BACKEND", "AccountManager: Connecting to email backend...")
         guard let backend = emailBackend else {
@@ -112,7 +112,7 @@ class AccountManager: ObservableObject {
         syncFromBackend()
         await selectTag(resolvedFolder())
     }
-    
+
     // MARK: - Folder/Tag Selection
 
     /// Returns `selectedFolder` if it exists in the current profile,
@@ -135,20 +135,20 @@ class AccountManager: ObservableObject {
         syncFromBackend()
         await refreshFolderCounts()
     }
-    
+
     // MARK: - Profile Switching
-    
+
     /// Switch to a different profile and reload the current tag/folder
     func switchProfile(_ profile: Profile) async {
         // Update ProfileManager
         ProfileManager.shared.currentProfile = profile
         Log.info("BACKEND", "Switched to profile '\(profile.name)'")
-        
+
         await selectTag(resolvedFolder())
     }
-    
+
     // MARK: - Email Operations
-    
+
     @discardableResult func fetchEmailBody(id: String) async -> MailMessage? {
         guard let backend = emailBackend else { return nil }
         let standalone = await backend.fetchEmailBody(id: id)
@@ -159,7 +159,7 @@ class AccountManager: ObservableObject {
     func prefetchAroundCursor(cursorId: String) {
         emailBackend?.prefetchAroundCursor(cursorId: cursorId)
     }
-    
+
     func markAsRead(id: String) async {
         guard let backend = emailBackend else { return }
         do {
@@ -335,7 +335,7 @@ class AccountManager: ObservableObject {
         }
         syncFromBackend()
     }
-    
+
     // MARK: - Notification Navigation
 
     /// Select an email by thread ID (called when user clicks a notification)
@@ -349,21 +349,21 @@ class AccountManager: ObservableObject {
     }
 
     // MARK: - Full Reload
-    
+
     func reloadEmail() async {
         guard let backend = emailBackend else { return }
-        
+
         isLoadingEmails = true
-        
+
         // Quick sync via SyncManager
         let success = await SyncManager.shared.quickSync()
-        
+
         if !success {
             loadingProgress = SyncManager.shared.syncState.statusText
             isLoadingEmails = false
             return
         }
-        
+
         // Reload from backend
         loadingProgress = "Loading..."
         Log.debug("BACKEND", "Reloading from backend")

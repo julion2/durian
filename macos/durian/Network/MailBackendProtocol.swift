@@ -5,8 +5,8 @@
 //  Abstract protocol for mail backends
 //
 
-import Foundation
 import Combine
+import Foundation
 
 // MARK: - Mail Backend Protocol
 

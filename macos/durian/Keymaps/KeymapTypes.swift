@@ -88,24 +88,24 @@ struct KeyEvent: Equatable {
     let key: String
     let modifiers: Set<KeyModifier>
     let timestamp: Date
-    
+
     init(key: String, modifiers: Set<KeyModifier> = [], timestamp: Date = Date()) {
         self.key = key
         self.modifiers = modifiers
         self.timestamp = timestamp
     }
-    
+
     /// String representation for matching (e.g., "shift+g" or "j")
     var normalized: String {
         if modifiers.isEmpty {
             return key.lowercased()
         }
-        
+
         // Special case: Shift+letter becomes uppercase
         if modifiers == [.shift] && key.count == 1 && key.first?.isLetter == true {
             return key.uppercased()
         }
-        
+
         let modStr = modifiers.sorted(by: { $0.rawValue < $1.rawValue })
             .map { $0.rawValue }
             .joined(separator: "+")
@@ -121,7 +121,7 @@ enum KeyModifier: String, Comparable {
     case ctrl = "ctrl"
     case option = "option"
     case shift = "shift"
-    
+
     static func < (lhs: KeyModifier, rhs: KeyModifier) -> Bool {
         lhs.rawValue < rhs.rawValue
     }
@@ -133,13 +133,13 @@ enum KeyModifier: String, Comparable {
 enum SequenceMatchResult: Equatable {
     /// No match found - clear buffer
     case noMatch
-    
+
     /// Partial match - waiting for more keys (e.g., "g" waiting for "g")
     case partial
-    
+
     /// Full match found
     case match(action: KeymapAction, count: Int)
-    
+
     static func == (lhs: SequenceMatchResult, rhs: SequenceMatchResult) -> Bool {
         switch (lhs, rhs) {
         case (.noMatch, .noMatch):

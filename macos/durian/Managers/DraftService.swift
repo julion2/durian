@@ -5,8 +5,8 @@
 //  Manages email drafts with IMAP synchronization
 //
 
-import SwiftUI
 import Combine
+import SwiftUI
 
 /// Response from durian draft save command
 struct DraftSaveResponse: Decodable {
@@ -29,7 +29,7 @@ enum DraftError: Error, LocalizedError {
     case deleteFailed(String)
     case loadFailed(String)
     case cliError(String)
-    
+
     var errorDescription: String? {
         switch self {
         case .noAccountConfigured:
@@ -50,21 +50,21 @@ enum DraftError: Error, LocalizedError {
 @MainActor
 class DraftService: ObservableObject {
     static let shared = DraftService()
-    
+
     /// Active drafts indexed by window UUID
     @Published var activeDrafts: [UUID: EmailDraft] = [:]
-    
+
     /// Drafts currently being saved (to show progress)
     @Published var savingDrafts: Set<UUID> = []
-    
+
     private let durianPath: String
-    
+
     private init() {
         durianPath = FileManager.default.resolveDurianPath() ?? "\(NSHomeDirectory())/.local/bin/durian"
     }
-    
+
     // MARK: - Draft Lifecycle
-    
+
     /// Create a new draft and return its UUID
     func createDraft(from account: String? = nil) -> UUID {
         let id = UUID()
@@ -74,7 +74,7 @@ class DraftService: ObservableObject {
         Log.debug("DRAFT", "Created new draft \(id)")
         return id
     }
-    
+
     /// Create a draft from an existing EmailDraft (for reply/forward)
     func createDraft(with draft: EmailDraft) -> UUID {
         let id = draft.id
@@ -82,17 +82,17 @@ class DraftService: ObservableObject {
         Log.debug("DRAFT", "Created draft from template \(id)")
         return id
     }
-    
+
     /// Get a draft by its UUID
     func getDraft(id: UUID) -> EmailDraft? {
-        return activeDrafts[id]
+        activeDrafts[id]
     }
-    
+
     /// Update a draft (called on every change in the compose view)
     func updateDraft(id: UUID, draft: EmailDraft) {
         activeDrafts[id] = draft
     }
-    
+
     /// Discard a draft without saving to IMAP
     func discard(id: UUID) {
         activeDrafts.removeValue(forKey: id)
@@ -108,16 +108,16 @@ class DraftService: ObservableObject {
         Log.debug("DRAFT", "Cloned draft \(id) → \(newId)")
         return newId
     }
-    
+
     // MARK: - IMAP Operations
-    
+
     /// Save a draft to IMAP (called on window close)
     /// Returns the new Message-ID if successful
     func saveToServer(id: UUID) async throws -> String {
         guard let draft = activeDrafts[id] else {
             throw DraftError.saveFailed("Draft not found")
         }
-        
+
         // Discard drafts where the user hasn't typed any content
         // (signatures and quoted content don't count)
         if !draft.hasUserContent {
@@ -126,16 +126,17 @@ class DraftService: ObservableObject {
             Log.debug("DRAFT", "Discarded draft with no user content \(id)")
             return ""
         }
-        
+
         // Get account
-        guard let account = ConfigManager.shared.getAccounts().first(where: { $0.email == draft.from }) 
-              ?? ConfigManager.shared.getAccounts().first else {
+        guard let account = ConfigManager.shared.getAccounts().first(where: { $0.email == draft.from })
+              ?? ConfigManager.shared.getAccounts().first else
+        {
             throw DraftError.noAccountConfigured
         }
-        
+
         savingDrafts.insert(id)
         defer { savingDrafts.remove(id) }
-        
+
         // Build command arguments
         var args = [
             "draft", "save",
@@ -144,7 +145,7 @@ class DraftService: ObservableObject {
             "--subject", draft.subject,
             "--body", draft.body
         ]
-        
+
         // Add recipients
         if !draft.to.isEmpty {
             args += ["--to", draft.to.joined(separator: ",")]
@@ -155,7 +156,7 @@ class DraftService: ObservableObject {
         if !draft.bcc.isEmpty {
             args += ["--bcc", draft.bcc.joined(separator: ",")]
         }
-        
+
         // Reply threading headers
         if let inReplyTo = draft.inReplyTo, !inReplyTo.isEmpty {
             args += ["--in-reply-to", inReplyTo]
@@ -168,77 +169,80 @@ class DraftService: ObservableObject {
         if let messageId = draft.messageId, !messageId.isEmpty {
             args += ["--replace", messageId]
         }
-        
+
         // HTML flag
         if draft.isHTML {
             args.append("--html")
         }
-        
+
         // Note: Attachments would need to be saved to temp files first
         // For now, we skip attachments in IMAP drafts (they're stored locally)
-        
+
         // Execute CLI command
         let result = try await executeCLI(args: args)
-        
+
         // Parse response
         guard let data = result.data(using: .utf8) else {
             throw DraftError.cliError("Invalid response")
         }
-        
+
         let response = try JSONDecoder().decode(DraftSaveResponse.self, from: data)
-        
+
         if !response.ok {
             throw DraftError.saveFailed(response.error ?? "Unknown error")
         }
-        
+
         // Update draft with new message ID
         var updatedDraft = draft
         updatedDraft.messageId = response.message_id
         activeDrafts[id] = updatedDraft
-        
+
         Log.info("DRAFT", "Saved to IMAP - Message-ID: \(response.message_id ?? "unknown")")
-        
+
         return response.message_id ?? ""
     }
-    
+
     /// Delete a draft from IMAP after sending
     func deleteAfterSend(id: UUID) async {
         guard let draft = activeDrafts[id],
               let messageId = draft.messageId,
-              !messageId.isEmpty else {
+              !messageId.isEmpty else
+        {
             // No server-side draft to delete
             activeDrafts.removeValue(forKey: id)
             return
         }
-        
+
         // Get account
         guard let account = ConfigManager.shared.getAccounts().first(where: { $0.email == draft.from })
-              ?? ConfigManager.shared.getAccounts().first else {
+              ?? ConfigManager.shared.getAccounts().first else
+        {
             activeDrafts.removeValue(forKey: id)
             return
         }
-        
+
         do {
             let args = [
                 "draft", "delete",
                 "--account", account.email,
                 messageId
             ]
-            
+
             let result = try await executeCLI(args: args)
-            
+
             if let data = result.data(using: .utf8),
                let response = try? JSONDecoder().decode(DraftDeleteResponse.self, from: data),
-               response.ok {
+               response.ok
+            {
                 Log.info("DRAFT", "Deleted from IMAP - \(messageId)")
             }
         } catch {
             Log.error("DRAFT", "Failed to delete from IMAP - \(error)")
         }
-        
+
         activeDrafts.removeValue(forKey: id)
     }
-    
+
     /// Load a draft from backend for editing
     /// Returns the UUID of the new draft window
     func loadFromBackend(messageId: String) async throws -> UUID {
@@ -249,34 +253,34 @@ class DraftService: ObservableObject {
         activeDrafts[id] = draft
         return id
     }
-    
+
     // MARK: - CLI Execution
-    
+
     private func executeCLI(args: [String]) async throws -> String {
-        return try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: self.durianPath)
                 process.arguments = args
-                
+
                 // Set PATH for durian CLI
                 var environment = ProcessInfo.processInfo.environment
                 let homebrewPaths = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin"
                 environment["PATH"] = homebrewPaths + ":" + (environment["PATH"] ?? "")
                 process.environment = environment
-                
+
                 let stdout = Pipe()
                 let stderr = Pipe()
                 process.standardOutput = stdout
                 process.standardError = stderr
-                
+
                 do {
                     try process.run()
                     process.waitUntilExit()
-                    
+
                     let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
                     let output = String(data: outputData, encoding: .utf8) ?? ""
-                    
+
                     if process.terminationStatus != 0 {
                         let errorData = stderr.fileHandleForReading.readDataToEndOfFile()
                         let errorOutput = String(data: errorData, encoding: .utf8) ?? "Unknown error"

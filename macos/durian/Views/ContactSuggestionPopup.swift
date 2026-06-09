@@ -13,7 +13,7 @@ import SwiftUI
 struct ContactSuggestionRow: View {
     let contact: Contact
     let isSelected: Bool
-    
+
     var body: some View {
         HStack(spacing: 8) {
             // Avatar with initials
@@ -49,7 +49,7 @@ struct ContactSuggestionPopup: View {
     let selectedIndex: Int
     let onSelect: (Contact) -> Void
     let onDismiss: () -> Void
-    
+
     private let maxHeight: CGFloat = 200  // ~5 rows visible
     private let popupWidth: CGFloat = 200
 

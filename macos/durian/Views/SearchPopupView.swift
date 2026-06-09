@@ -95,21 +95,21 @@ struct SearchPopupView: View {
             return .handled
         }
     }
-    
+
     // MARK: - Subviews
-    
+
     private var searchInputView: some View {
         HStack(spacing: 14) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
                 .font(.title2)
                 .fontWeight(.medium)
-            
+
             TextField("Search emails...", text: $query)
                 .textFieldStyle(.plain)
                 .font(.title2)
                 .focused($isTextFieldFocused)
-            
+
             if !query.isEmpty {
                 Button {
                     query = ""
@@ -121,7 +121,7 @@ struct SearchPopupView: View {
                 }
                 .buttonStyle(.plain)
             }
-            
+
             if searchManager.isSearching {
                 ProgressView()
                     .scaleEffect(0.8)
@@ -130,7 +130,7 @@ struct SearchPopupView: View {
         .padding(.horizontal, 20)
         .padding(.vertical, 18)
     }
-    
+
     private var loadingView: some View {
         HStack(spacing: 10) {
             ProgressView()
@@ -142,7 +142,7 @@ struct SearchPopupView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 24)
     }
-    
+
     private var noResultsView: some View {
         VStack(spacing: 6) {
             Image(systemName: "magnifyingglass")
@@ -155,7 +155,7 @@ struct SearchPopupView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 24)
     }
-    
+
     private var resultsListView: some View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
@@ -206,19 +206,19 @@ struct SearchPopupView: View {
             .padding(.vertical, 8)
         }
     }
-    
+
     // MARK: - Actions
-    
+
     private func selectCurrentResult() {
         guard !searchManager.results.isEmpty,
               selectedIndex < searchManager.results.count else { return }
-        
+
         let email = searchManager.results[selectedIndex]
         selectedEmailId = email.id
         onResultsActivated(query, searchManager.results, email.id)
         close()
     }
-    
+
     private func close() {
         searchManager.clear()
         query = ""

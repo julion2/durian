@@ -66,7 +66,8 @@ enum AddressUtils {
     private static func stripOuterQuotes(_ s: String) -> String {
         var r = s
         if (r.hasPrefix("\"") && r.hasSuffix("\"")) ||
-           (r.hasPrefix("'") && r.hasSuffix("'")) {
+           (r.hasPrefix("'") && r.hasSuffix("'"))
+        {
             r = String(r.dropFirst().dropLast())
         }
         return r.trimmingCharacters(in: .whitespaces)

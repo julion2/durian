@@ -60,25 +60,25 @@ struct ComposeToolbar: View {
 
             // Font Picker
             fontPicker
-            
+
             // Size Picker
             sizePicker
-            
+
             Divider()
                 .frame(height: 20)
-            
+
             // Bold, Italic, Underline
             textStyleButtons
-            
+
             Divider()
                 .frame(height: 20)
-            
+
             // Alignment
             alignmentButtons
-            
+
             Divider()
                 .frame(height: 20)
-            
+
             // Lists
             listButtons
 
@@ -94,9 +94,9 @@ struct ComposeToolbar: View {
         .padding(.vertical, 12)
         .background(Color(NSColor.windowBackgroundColor))
     }
-    
+
     // MARK: - Font Picker
-    
+
     private var fontPicker: some View {
         Menu {
             ForEach(availableFonts, id: \.self) { font in
@@ -127,9 +127,9 @@ struct ComposeToolbar: View {
         }
         .buttonStyle(.plain)
     }
-    
+
     // MARK: - Size Picker
-    
+
     private var sizePicker: some View {
         Menu {
             ForEach(availableSizes, id: \.self) { size in
@@ -160,9 +160,9 @@ struct ComposeToolbar: View {
         }
         .buttonStyle(.plain)
     }
-    
+
     // MARK: - Text Style Buttons (B, I, U)
-    
+
     private var textStyleButtons: some View {
         HStack(spacing: 4) {
             ToolbarIconButton(icon: "bold", action: { onFormat?("bold") }, isActive: boldActive)
@@ -171,9 +171,9 @@ struct ComposeToolbar: View {
             ToolbarIconButton(icon: "strikethrough", action: { onFormat?("strikeThrough") }, isActive: strikethroughActive)
         }
     }
-    
+
     // MARK: - Alignment Buttons
-    
+
     private var alignmentButtons: some View {
         HStack(spacing: 4) {
             ToolbarIconButton(icon: "text.alignleft", action: { onFormat?("justifyLeft") }, isActive: currentAlignment == "left")
@@ -182,7 +182,7 @@ struct ComposeToolbar: View {
             ToolbarIconButton(icon: "text.justify", action: { onFormat?("justifyFull") }, isActive: currentAlignment == "justify")
         }
     }
-    
+
     // MARK: - List Buttons
 
     private var listButtons: some View {
@@ -235,9 +235,9 @@ struct ToolbarIconButton: View {
     let icon: String
     let action: () -> Void
     var isActive: Bool = false
-    
+
     @State private var isHovered: Bool = false
-    
+
     var body: some View {
         Button(action: action) {
             Image(systemName: icon)

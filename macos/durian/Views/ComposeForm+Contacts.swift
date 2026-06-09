@@ -6,8 +6,8 @@
 //  Split out of ComposeForm.swift to keep the main form file under 800 lines.
 //
 
-import SwiftUI
 import AppKit
+import SwiftUI
 
 extension ComposeForm {
     // MARK: - Contact Suggestion Handling

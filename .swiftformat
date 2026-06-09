@@ -2,28 +2,23 @@
 # observed style (4-space indent, no hard line length, `// MARK:`
 # sections, Foundation/SwiftUI-first imports per CLAUDE.md).
 #
-# Conservative rule set: catches the trailing-whitespace and stale
-# import-order drift that the reviewer flagged, without forcing churn
-# on the existing 200+ Swift files.
+# `--rules` is an allowlist: ONLY the rules below run. SwiftFormat's
+# default rule set is otherwise large (~50 rules) and includes
+# semantic style migrations (andOperator, hoistPatternLet,
+# unusedArguments) that would churn existing files without
+# discriminating real improvements from cosmetic.
 
 --swiftversion 5.10
 --indent 4
 --maxwidth none
---trimwhitespace always
 --linebreaks lf
 --commas inline
---self remove
---header ignore
 
-# Enabled rules — conservative, all observably present in the codebase
---enable trailingSpace
---enable redundantSelf
---enable sortImports
---enable redundantParens
---enable redundantReturn
---enable wrapMultilineStatementBraces
-
-# Disabled — opinionated, would churn existing files for no gain
---disable redundantType
---disable blankLinesAtStartOfScope
---disable redundantInternal
+# Allowlist — narrowly chosen for "obvious safe cleanup":
+#   trailingSpace  — drop end-of-line whitespace (the reviewer's main flag)
+#   sortImports    — alphabetize import blocks per CLAUDE.md style
+#   redundantSelf  — remove `self.` where unambiguous
+#   redundantParens — drop unneeded parens in conditions / returns
+#   redundantReturn — drop `return` from single-expression closures
+#   wrapMultilineStatementBraces — opening brace on its own line for long ifs
+--rules trailingSpace,sortImports,redundantSelf,redundantParens,redundantReturn,wrapMultilineStatementBraces

@@ -7,8 +7,8 @@
 //  itself.
 //
 
-import SwiftUI
 import AppKit
+import SwiftUI
 
 // MARK: - Attachment Chip
 
@@ -18,13 +18,13 @@ struct AttachmentChip: View {
     let isSelected: Bool
     let onClick: () -> Void
     let onRemove: () -> Void
-    
+
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "doc.fill")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(filename)
                     .font(.caption)
@@ -33,7 +33,7 @@ struct AttachmentChip: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
-            
+
             Button(action: onRemove) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.caption)

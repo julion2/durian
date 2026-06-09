@@ -95,6 +95,11 @@ jobs:
           key: bazel-gui-${{ hashFiles('MODULE.bazel', 'gui/BUILD.bazel') }}
           restore-keys: bazel-gui-
 
+      - name: Check SwiftFormat
+        run: |
+          brew install swiftformat
+          swiftformat --lint macos/
+
       - name: Test
         run: bazel test //macos:all --build_tests_only --test_output=errors
 

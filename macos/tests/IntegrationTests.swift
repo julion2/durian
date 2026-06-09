@@ -1,5 +1,5 @@
-import XCTest
 @testable import durian_lib
+import XCTest
 
 /// Integration tests that hit a real durian server.
 /// The server URL is passed via DURIAN_TEST_URL environment variable.

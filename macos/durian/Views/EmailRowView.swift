@@ -47,13 +47,13 @@ struct EmailRowView: View, Equatable {
                             .fill(Color.blue)
                             .frame(width: 8, height: 8)
                     }
-                    
+
                     if email.isPinned {
                         Image(systemName: "pin.fill")
                             .font(.caption)
                             .foregroundColor(.yellow)
                     }
-                    
+
                     Text(parties.map(\.name).isEmpty ? Self.extractName(from: email.from) : parties.map(\.name).joined(separator: ", "))
                         .font(.headline)
                         .fontWeight(email.isRead ? .regular : .bold)
@@ -112,14 +112,14 @@ struct EmailRowView: View, Equatable {
             Button(action: { onTogglePin?() }) {
                 Label(email.isPinned ? "Unpin" : "Pin", systemImage: email.isPinned ? "pin.slash" : "pin")
             }
-            
+
             Button(action: { onToggleRead?() }) {
-                Label(email.isRead ? "Mark as Unread" : "Mark as Read", 
+                Label(email.isRead ? "Mark as Unread" : "Mark as Read",
                       systemImage: email.isRead ? "envelope.badge" : "envelope.open")
             }
-            
+
             Divider()
-            
+
             Button(action: { onReply?() }) {
                 Label("Reply", systemImage: "arrowshape.turn.up.left")
             }
@@ -133,9 +133,9 @@ struct EmailRowView: View, Equatable {
             Button(action: { onShowTagPicker?() }) {
                 Label("Tags...", systemImage: "tag")
             }
-            
+
             Divider()
-            
+
             Button(role: .destructive, action: { onDelete?() }) {
                 Label("Delete", systemImage: "trash")
             }
@@ -288,7 +288,8 @@ struct EmailRowView: View, Equatable {
                 if trimmed.isEmpty { continue }
                 if let pipeRange = trimmed.range(of: "|"),
                    pipeRange.lowerBound > trimmed.startIndex,
-                   trimmed[trimmed.index(before: pipeRange.lowerBound)] != " " {
+                   trimmed[trimmed.index(before: pipeRange.lowerBound)] != " "
+                {
                     let before = String(trimmed[..<pipeRange.lowerBound]).trimmingCharacters(in: .whitespaces)
                     let after = String(trimmed[trimmed.index(after: pipeRange.lowerBound)...]).trimmingCharacters(in: .whitespaces)
                     if !before.isEmpty { authors.append(before) }
@@ -366,7 +367,7 @@ private struct TruncatedTagsView: View {
                     .padding(.horizontal, hPadding)
                     .padding(.vertical, 2)
                     .background(
-                        (isSelected ? Color.white.opacity(0.15) : Color.gray.opacity(0.15)),
+                        isSelected ? Color.white.opacity(0.15) : Color.gray.opacity(0.15),
                         in: Capsule()
                     )
             }

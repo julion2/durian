@@ -1,12 +1,12 @@
-import XCTest
 @testable import durian_lib
+import XCTest
 
 @MainActor
 private class MockOutboxBackend: OutboxBackend {
     var outboxItems: [OutboxEntry] = []
 
     func listOutbox() async -> [OutboxEntry] {
-        return outboxItems
+        outboxItems
     }
 }
 
