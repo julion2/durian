@@ -181,8 +181,18 @@ func (c *Client) Send(msg *Message) error {
 		return fmt.Errorf("invalid From address: %w", err)
 	}
 
-	// Set sender
-	if err := client.Mail(from); err != nil {
+	// Set sender. Bypass smtp.Client.Mail() because Go's stdlib unconditionally
+	// appends "BODY=8BITMIME" and "SMTPUTF8" to MAIL FROM when the server
+	// advertises those extensions in EHLO. Microsoft 365's SMTP service has
+	// shipped (mid-2026) tenant-scoped routing where some submission backends
+	// advertise both extensions in EHLO but then reject MAIL FROM with the
+	// parameters present, returning '502 5.3.3 Command not implemented'. The
+	// same session, same auth, sending a bare 'MAIL FROM:<email>' is accepted.
+	// Apple Mail and other clients that don't auto-append these extension
+	// parameters are unaffected. Our message bodies are quoted-printable or
+	// base64 (always 7-bit clean) and our addresses are ASCII, so dropping
+	// both extension declarations is a no-op for content semantics.
+	if err := mailFromPlain(client, from); err != nil {
 		return fmt.Errorf("MAIL FROM failed: %w", err)
 	}
 
@@ -236,6 +246,25 @@ func buildXOAuth2String(email, accessToken string) string {
 	return base64.StdEncoding.EncodeToString(
 		[]byte(fmt.Sprintf("user=%s\x01auth=Bearer %s\x01\x01", email, accessToken)),
 	)
+}
+
+// mailFromPlain sends 'MAIL FROM:<email>' without 8BITMIME or SMTPUTF8 extension
+// parameters via the client's exported textproto.Conn. See the call site for
+// the M365 motivation; this helper does the minimal SMTP roundtrip and asserts
+// a 250 response, mirroring what smtp.Client.Mail does without the extension
+// auto-append.
+func mailFromPlain(c *smtp.Client, from string) error {
+	if strings.ContainsAny(from, "\r\n") {
+		return fmt.Errorf("MAIL FROM address contains CR or LF")
+	}
+	id, err := c.Text.Cmd("MAIL FROM:<%s>", from)
+	if err != nil {
+		return err
+	}
+	c.Text.StartResponse(id)
+	defer c.Text.EndResponse(id)
+	_, _, err = c.Text.ReadResponse(250)
+	return err
 }
 
 // SMTPError represents an SMTP error with code
