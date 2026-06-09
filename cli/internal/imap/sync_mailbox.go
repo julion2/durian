@@ -109,8 +109,14 @@ func (s *Syncer) uidsNeedingHeaderBackfill(mboxState *MailboxState) []uint32 {
 		if err != nil || dbID == 0 {
 			continue
 		}
-		if has, _ := s.store.HasHeaders(dbID); has {
-			continue
+		// Without --force, skip messages that already have at least one
+		// header row — incremental backfill. With --force, refetch
+		// everything; needed after the user changes sync.indexed_headers
+		// because the existing rows reflect the old configured set.
+		if !s.options.BackfillHeadersForce {
+			if has, _ := s.store.HasHeaders(dbID); has {
+				continue
+			}
 		}
 		uids = append(uids, uid)
 	}
