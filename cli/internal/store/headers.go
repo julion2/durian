@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"net/textproto"
+	"strings"
 )
 
 // InsertHeader stores a message header. Overwrites if it already exists.
@@ -144,6 +145,49 @@ func (d *DB) AllHeadersByMessage() (map[int64]map[string][]string, error) {
 	return result, rows.Err()
 }
 
+// HeadersByMessageDBIDs loads headers scoped to the given message DB IDs.
+// Same decrypt path as AllHeadersByMessage but parameterised — useful for
+// `durian show --headers` where we already know the thread's message set
+// and don't want to scan the entire message_headers table.
+func (d *DB) HeadersByMessageDBIDs(ids []int64) (map[int64]map[string][]string, error) {
+	if len(ids) == 0 {
+		return map[int64]map[string][]string{}, nil
+	}
+	placeholders := make([]string, len(ids))
+	params := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		params[i] = id
+	}
+	q := "SELECT message_id, name, value_ct FROM message_headers WHERE message_id IN (" +
+		strings.Join(placeholders, ",") + ")"
+	rows, err := d.db.Query(q, params...)
+	if err != nil {
+		return nil, fmt.Errorf("query headers: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[int64]map[string][]string)
+	for rows.Next() {
+		var msgID int64
+		var name string
+		var valueCT []byte
+		if err := rows.Scan(&msgID, &name, &valueCT); err != nil {
+			return nil, fmt.Errorf("scan header: %w", err)
+		}
+		plain, err := d.decryptHeaderValue("", valueCT)
+		if err != nil {
+			return nil, err
+		}
+		if result[msgID] == nil {
+			result[msgID] = make(map[string][]string)
+		}
+		canonical := textproto.CanonicalMIMEHeaderKey(name)
+		result[msgID][canonical] = append(result[msgID][canonical], plain)
+	}
+	return result, rows.Err()
+}
+
 // AttachmentCounts returns the number of attachments per message DB ID.
 func (d *DB) AttachmentCounts() (map[int64]int, error) {
 	rows, err := d.db.Query("SELECT message_db_id, COUNT(*) FROM attachments GROUP BY message_db_id")
@@ -171,8 +215,14 @@ type AttachmentMeta struct {
 }
 
 // AttachmentsByMessage returns attachment metadata grouped by message DB ID.
+//
+// After ADR-0001 attachments-encryption (v21→v22) the content_type and
+// filename columns are encrypted BLOBs (content_type_ct, filename_ct)
+// sealed under the meta sub-key. Each row gets two decryptMeta calls;
+// the rules engine calls this once per `rules apply` so the cost is
+// bounded by total attachment count, not message count.
 func (d *DB) AttachmentsByMessage() (map[int64][]AttachmentMeta, error) {
-	rows, err := d.db.Query("SELECT message_db_id, content_type, filename FROM attachments")
+	rows, err := d.db.Query("SELECT message_db_id, content_type_ct, filename_ct FROM attachments")
 	if err != nil {
 		return nil, fmt.Errorf("query attachments: %w", err)
 	}
@@ -181,9 +231,17 @@ func (d *DB) AttachmentsByMessage() (map[int64][]AttachmentMeta, error) {
 	result := make(map[int64][]AttachmentMeta)
 	for rows.Next() {
 		var msgID int64
-		var ct, fn string
-		if err := rows.Scan(&msgID, &ct, &fn); err != nil {
+		var contentTypeCT, filenameCT []byte
+		if err := rows.Scan(&msgID, &contentTypeCT, &filenameCT); err != nil {
 			return nil, fmt.Errorf("scan attachment: %w", err)
+		}
+		ct, err := d.decryptMeta("", contentTypeCT)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt content_type msg=%d: %w", msgID, err)
+		}
+		fn, err := d.decryptMeta("", filenameCT)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt filename msg=%d: %w", msgID, err)
 		}
 		result[msgID] = append(result[msgID], AttachmentMeta{ContentType: ct, Filename: fn})
 	}

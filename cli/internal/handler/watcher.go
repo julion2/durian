@@ -42,27 +42,29 @@ type accountWatcher struct {
 // WatcherManager runs per-account IMAP IDLE watchers that trigger syncs
 // and broadcast new-mail events via the EventHub.
 type WatcherManager struct {
-	hub         *EventHub
-	store       *store.DB
-	log         *slog.Logger
-	locks       map[string]*sync.Mutex       // per-account sync locks keyed by email
-	locksMu     sync.Mutex                   // protects the locks map
-	watchers    map[string]*accountWatcher   // keyed by account identifier (e.g. "work")
-	filterRules []config.RuleConfig          // user-defined filter rules applied at sync time
-	groups      map[string]config.GroupEntry // contact groups for group: expansion in rules
+	hub            *EventHub
+	store          *store.DB
+	log            *slog.Logger
+	locks          map[string]*sync.Mutex       // per-account sync locks keyed by email
+	locksMu        sync.Mutex                   // protects the locks map
+	watchers       map[string]*accountWatcher   // keyed by account identifier (e.g. "work")
+	filterRules    []config.RuleConfig          // user-defined filter rules applied at sync time
+	groups         map[string]config.GroupEntry // contact groups for group: expansion in rules
+	indexedHeaders []string                     // user-added MIME headers to index (see imap.SyncOptions)
 }
 
 // NewWatcherManager creates a WatcherManager wired to the given EventHub
 // and SQLite store.
-func NewWatcherManager(hub *EventHub, db *store.DB, rules []config.RuleConfig, groups map[string]config.GroupEntry) *WatcherManager {
+func NewWatcherManager(hub *EventHub, db *store.DB, rules []config.RuleConfig, groups map[string]config.GroupEntry, indexedHeaders []string) *WatcherManager {
 	return &WatcherManager{
-		hub:         hub,
-		store:       db,
-		log:         slog.Default().With("module", "WATCHER"),
-		locks:       make(map[string]*sync.Mutex),
-		watchers:    make(map[string]*accountWatcher),
-		filterRules: rules,
-		groups:      groups,
+		hub:            hub,
+		store:          db,
+		log:            slog.Default().With("module", "WATCHER"),
+		locks:          make(map[string]*sync.Mutex),
+		watchers:       make(map[string]*accountWatcher),
+		filterRules:    rules,
+		groups:         groups,
+		indexedHeaders: indexedHeaders,
 	}
 }
 
@@ -151,7 +153,7 @@ func (w *WatcherManager) watchAccount(ctx context.Context, aw *accountWatcher) {
 		// Initial sync on the watcher's connection (catch-up, no SSE notification).
 		// If this kills the connection, SELECT below will fail and the
 		// outer loop reconnects with 30s backoff.
-		initOpts := &imap.SyncOptions{Quiet: true, Mailboxes: []string{"INBOX"}, Store: w.store, FilterRules: w.filterRules, Groups: w.groups}
+		initOpts := &imap.SyncOptions{Quiet: true, Mailboxes: []string{"INBOX"}, Store: w.store, FilterRules: w.filterRules, Groups: w.groups, IndexedHeaders: w.indexedHeaders}
 		initSyncer := imap.NewSyncerWithClient(account, client, initOpts)
 		if _, err := initSyncer.Sync(); err != nil {
 			w.log.Error("Initial sync failed", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
@@ -392,7 +394,7 @@ func (w *WatcherManager) syncAndNotify(account *config.AccountConfig, client *im
 
 	// Build syncer: reuse caller's IDLE connection, only sync INBOX.
 	// Iterating other mailboxes triggers rate-limiting on M365.
-	opts := &imap.SyncOptions{Quiet: true, Mailboxes: []string{"INBOX"}, Store: w.store, FilterRules: w.filterRules, Groups: w.groups}
+	opts := &imap.SyncOptions{Quiet: true, Mailboxes: []string{"INBOX"}, Store: w.store, FilterRules: w.filterRules, Groups: w.groups, IndexedHeaders: w.indexedHeaders}
 	syncer := imap.NewSyncerWithClient(account, client, opts)
 
 	// Run sync with timeout so a flaky server can't block the watcher forever.

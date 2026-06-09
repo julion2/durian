@@ -10,11 +10,52 @@ import (
 	"strings"
 )
 
-// selectedHeaders are the headers stored in message_headers for rule matching.
-var selectedHeaders = []string{
+// builtinSelectedHeaders is the universal-default set of MIME headers
+// fetched into message_headers for rule matching. Users can extend this
+// per-account or per-install via config.pkl's sync.indexed_headers
+// listing; the runtime set is the case-insensitive union of these
+// built-ins and the user additions (see (*Syncer).headerSet).
+//
+// These seven cover ~90% of inbox-zero rule patterns: mailing-list
+// identification (List-Id, List-Unsubscribe, Precedence), automation
+// markers (X-Mailer, Return-Path), GitHub notification routing
+// (X-GitHub-Reason), and sender verification (Authentication-Results).
+// Provider-specific additions like X-GitLab-NotificationReason,
+// X-Spam-Status, etc. belong in the user's indexed_headers config.
+var builtinSelectedHeaders = []string{
 	"List-Id", "List-Unsubscribe", "Precedence",
 	"X-Mailer", "Return-Path", "X-GitHub-Reason",
 	"Authentication-Results",
+}
+
+// headerSet returns the deduped, case-insensitive union of the built-in
+// header allowlist and the user's sync.indexed_headers entries. Output
+// preserves built-ins-first order; user entries follow in declaration
+// order. Used by both the live-sync header insert (sync_store.go) and
+// the backfill-headers path (sync_mailbox.go).
+func (s *Syncer) headerSet() []string {
+	seen := make(map[string]struct{}, len(builtinSelectedHeaders)+len(s.options.IndexedHeaders))
+	out := make([]string, 0, len(builtinSelectedHeaders)+len(s.options.IndexedHeaders))
+	for _, h := range builtinSelectedHeaders {
+		k := strings.ToLower(h)
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, h)
+	}
+	for _, h := range s.options.IndexedHeaders {
+		k := strings.ToLower(strings.TrimSpace(h))
+		if k == "" {
+			continue
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, h)
+	}
+	return out
 }
 
 // backfillHeaders fetches headers from the IMAP server for messages that
@@ -68,8 +109,14 @@ func (s *Syncer) uidsNeedingHeaderBackfill(mboxState *MailboxState) []uint32 {
 		if err != nil || dbID == 0 {
 			continue
 		}
-		if has, _ := s.store.HasHeaders(dbID); has {
-			continue
+		// Without --force, skip messages that already have at least one
+		// header row — incremental backfill. With --force, refetch
+		// everything; needed after the user changes sync.indexed_headers
+		// because the existing rows reflect the old configured set.
+		if !s.options.BackfillHeadersForce {
+			if has, _ := s.store.HasHeaders(dbID); has {
+				continue
+			}
 		}
 		uids = append(uids, uid)
 	}
@@ -106,10 +153,10 @@ func (s *Syncer) storeHeadersForUID(uid uint32, rawHeader []byte, mboxState *Mai
 	if err != nil {
 		return false
 	}
-	for _, hdrName := range selectedHeaders {
+	for _, hdrName := range s.headerSet() {
 		if v := parsed.Header.Get(hdrName); v != "" {
 			if err := s.store.InsertHeader(dbID, strings.ToLower(hdrName), v); err != nil {
-				slog.Debug("InsertHeader failed", "module", "SYNC", "uid", uid, "header", hdrName, "err", err)
+				slog.Debug("InsertHeader failed", "module", "SYNC", "uid", uid, "header", hdrName, "err", err) // encgrep:allow word "header" in message text, no header value logged
 			}
 		}
 	}

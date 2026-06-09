@@ -355,3 +355,62 @@ func TestMailboxResult(t *testing.T) {
 		t.Error("expected Error to be nil")
 	}
 }
+
+func TestHeaderSet_MergesBuiltinAndUser(t *testing.T) {
+	cases := []struct {
+		name string
+		user []string
+		want []string
+	}{
+		{
+			name: "no user additions returns builtins",
+			user: nil,
+			want: []string{"List-Id", "List-Unsubscribe", "Precedence",
+				"X-Mailer", "Return-Path", "X-GitHub-Reason",
+				"Authentication-Results"},
+		},
+		{
+			name: "user additions are appended",
+			user: []string{"X-GitLab-NotificationReason", "X-Spam-Status"},
+			want: []string{"List-Id", "List-Unsubscribe", "Precedence",
+				"X-Mailer", "Return-Path", "X-GitHub-Reason",
+				"Authentication-Results",
+				"X-GitLab-NotificationReason", "X-Spam-Status"},
+		},
+		{
+			name: "case-insensitive dedup against builtins",
+			user: []string{"list-id", "LIST-UNSUBSCRIBE", "X-Spam-Status"},
+			want: []string{"List-Id", "List-Unsubscribe", "Precedence",
+				"X-Mailer", "Return-Path", "X-GitHub-Reason",
+				"Authentication-Results", "X-Spam-Status"},
+		},
+		{
+			name: "case-insensitive dedup within user list",
+			user: []string{"X-Spam-Status", "x-spam-status", "X-SPAM-STATUS"},
+			want: []string{"List-Id", "List-Unsubscribe", "Precedence",
+				"X-Mailer", "Return-Path", "X-GitHub-Reason",
+				"Authentication-Results", "X-Spam-Status"},
+		},
+		{
+			name: "empty + whitespace-only entries dropped",
+			user: []string{"", "   ", "X-Spam-Status"},
+			want: []string{"List-Id", "List-Unsubscribe", "Precedence",
+				"X-Mailer", "Return-Path", "X-GitHub-Reason",
+				"Authentication-Results", "X-Spam-Status"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := &Syncer{options: &SyncOptions{IndexedHeaders: c.user}}
+			got := s.headerSet()
+			if len(got) != len(c.want) {
+				t.Fatalf("len = %d, want %d (got=%v)", len(got), len(c.want), got)
+			}
+			for i, h := range c.want {
+				if got[i] != h {
+					t.Errorf("[%d] = %q, want %q", i, got[i], h)
+				}
+			}
+		})
+	}
+}

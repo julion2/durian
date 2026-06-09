@@ -79,6 +79,19 @@ IMAP-sourced mail is recoverable — re-sync from the server with a fresh keyrin
 
 So: export the master at least once, soon. The `durian master-key export` command is the entire disaster-recovery story.
 
+## Inspecting headers
+
+Because `message_headers.value` is encrypted at rest, raw `sqlite3` access doesn't work for inspecting individual mail headers anymore. Two CLI flags are the canonical replacement:
+
+```bash
+durian show <thread-id> --headers                    # what's in the local DB right now
+durian show <thread-id> --header list-id             # filter to one header (case-insensitive)
+durian show <thread-id> --raw-headers                # bypass the indexed allowlist, fetch from IMAP
+durian show <thread-id> --raw-headers --header x-spam-status
+```
+
+`--headers` reads from `message_headers` and decrypts via the meta sub-key. `--raw-headers` does a `BODY.PEEK[HEADER]` IMAP fetch — useful when you want to see headers that aren't on the indexed allowlist (the built-in seven plus your `sync.indexed_headers`). See the [rules-writing walkthrough](../../configuration/rules/#finding-the-header-value-for-a-rule).
+
 ## Performance
 
 On Apple M2: ~290 ns per AES-GCM decrypt on the hot path with the cached AEAD (PR #258, [#254.1](https://github.com/julion2/durian/pull/258)). A full-mailbox scan of 50,000 messages costs ~15 ms of crypto work — dwarfed by SQLite row I/O and IMAP latency.
