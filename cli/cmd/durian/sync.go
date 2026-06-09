@@ -13,11 +13,11 @@ import (
 )
 
 var (
-	syncDryRun          bool
-	syncQuiet           bool
-	syncNoFlags         bool
-	syncDownloadOnly    bool
-	syncUploadOnly      bool
+	syncDryRun               bool
+	syncQuiet                bool
+	syncNoFlags              bool
+	syncDownloadOnly         bool
+	syncUploadOnly           bool
 	syncBackfillHeaders      bool
 	syncBackfillHeadersForce bool
 )
@@ -85,16 +85,16 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Build sync options
 	options := &imap.SyncOptions{
-		DryRun:          syncDryRun,
-		Quiet:           syncQuiet,
-		NoFlags:         syncNoFlags,
-		Mode:            mode,
-		Store:           emailDB,
-		FilterRules:     rules,
+		DryRun:               syncDryRun,
+		Quiet:                syncQuiet,
+		NoFlags:              syncNoFlags,
+		Mode:                 mode,
+		Store:                emailDB,
+		FilterRules:          rules,
 		BackfillHeaders:      syncBackfillHeaders,
 		BackfillHeadersForce: syncBackfillHeadersForce,
 		IndexedHeaders:       GetConfig().Sync.IndexedHeaders,
-		Groups:          func() map[string]config.GroupEntry { g, _ := config.LoadGroups(""); return g }(),
+		Groups:               func() map[string]config.GroupEntry { g, _ := config.LoadGroups(""); return g }(),
 	}
 
 	// Determine which accounts to sync
