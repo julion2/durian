@@ -1,8 +1,12 @@
 package smtp
 
 import (
+	"net"
+	"net/smtp"
+	"net/textproto"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMessageBuild(t *testing.T) {
@@ -450,4 +454,83 @@ func extractHeader(content, name string) string {
 		}
 	}
 	return ""
+}
+
+// TestMailFromPlain_NoExtensionParams pins the contract that mailFromPlain
+// sends a bare 'MAIL FROM:<email>' even when the server advertises 8BITMIME
+// and SMTPUTF8. If someone replaces mailFromPlain with smtp.Client.Mail()
+// in the future, this test will catch it — and the failure message will
+// remind them why we bypass: M365 backends reject MAIL FROM with the
+// auto-appended parameters returning '502 5.3.3 Command not implemented'.
+func TestMailFromPlain_NoExtensionParams(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	var capturedMailFrom string
+	serverDone := make(chan struct{})
+
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+		text := textproto.NewConn(conn)
+		_ = text.PrintfLine("220 fake.example.com ESMTP test")
+		for {
+			line, err := text.ReadLine()
+			if err != nil {
+				return
+			}
+			upper := strings.ToUpper(line)
+			switch {
+			case strings.HasPrefix(upper, "EHLO"):
+				// Advertise both extensions so stdlib Mail() WOULD append
+				// BODY=8BITMIME and SMTPUTF8. mailFromPlain must NOT.
+				_ = text.PrintfLine("250-fake.example.com")
+				_ = text.PrintfLine("250-8BITMIME")
+				_ = text.PrintfLine("250 SMTPUTF8")
+			case strings.HasPrefix(upper, "MAIL FROM:"):
+				capturedMailFrom = line
+				_ = text.PrintfLine("250 2.1.0 OK")
+			case strings.HasPrefix(upper, "QUIT"):
+				_ = text.PrintfLine("221 2.0.0 bye")
+				return
+			default:
+				_ = text.PrintfLine("502 5.5.1 unimplemented in test")
+			}
+		}
+	}()
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	client, err := smtp.NewClient(conn, "fake.example.com")
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := client.Hello("client.example.com"); err != nil {
+		t.Fatalf("EHLO: %v", err)
+	}
+
+	if err := mailFromPlain(client, "sender@example.com"); err != nil {
+		t.Fatalf("mailFromPlain: %v", err)
+	}
+	_ = client.Quit()
+	<-serverDone
+
+	wantPrefix := "MAIL FROM:<sender@example.com>"
+	if capturedMailFrom != wantPrefix {
+		t.Fatalf("MAIL FROM line mismatch — got %q, want exactly %q "+
+			"(this guards against re-introducing BODY=8BITMIME / SMTPUTF8 "+
+			"auto-append which Microsoft 365 rejects with 502 5.3.3)",
+			capturedMailFrom, wantPrefix)
+	}
 }
