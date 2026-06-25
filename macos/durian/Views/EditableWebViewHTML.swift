@@ -10,7 +10,8 @@
 import AppKit
 
 enum EditableWebViewHTML {
-        static func resolveHex(_ color: NSColor, dark: Bool) -> String {
+        static func resolveHex(_ color: NSColor, dark: Bool) -> String
+    {
         let name: NSAppearance.Name = dark ? .darkAqua : .aqua
         guard let appearance = NSAppearance(named: name) else {
             let resolved = color.usingColorSpace(.sRGB) ?? color

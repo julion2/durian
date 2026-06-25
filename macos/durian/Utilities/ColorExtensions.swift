@@ -5,8 +5,8 @@
 //  Design system colors from Figma + hex initializer
 //
 
-import SwiftUI
 import AppKit
+import SwiftUI
 
 // MARK: - Hex Initializer
 

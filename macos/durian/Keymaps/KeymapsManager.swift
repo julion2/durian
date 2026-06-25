@@ -1,6 +1,6 @@
+import Combine
 import Foundation
 import SwiftUI
-import Combine
 
 // MARK: - Notifications
 
@@ -10,10 +10,10 @@ extension Notification.Name {
 
 class KeymapsManager: ObservableObject {
     static let shared = KeymapsManager()
-    
+
     @Published var keymaps: KeymapConfig = KeymapConfig()
     private var cancellables = Set<AnyCancellable>()
-    
+
     private init() {
         loadKeymapsBlocking()
     }
@@ -41,10 +41,10 @@ class KeymapsManager: ObservableObject {
 
         NotificationCenter.default.post(name: .keymapsDidChange, object: nil)
     }
-    
+
     /// Returns the default keymaps array
     private func getDefaultKeymaps() -> [KeymapEntry] {
-        return [
+        [
             // Navigation
             KeymapEntry(action: "next_email", key: "j", supportsCount: true),
             KeymapEntry(action: "prev_email", key: "k", supportsCount: true),
@@ -147,9 +147,9 @@ class KeymapsManager: ObservableObject {
         FileManager.default.durianConfigURL().appendingPathComponent("keymaps.pkl")
     }
 
-    
+
     // MARK: - Public API
-    
+
     func setKeymap(for action: String, key: String, modifiers: [String] = []) {
         if let index = keymaps.keymaps.firstIndex(where: { $0.action == action }) {
             keymaps.keymaps[index].key = key
@@ -157,13 +157,13 @@ class KeymapsManager: ObservableObject {
             Log.debug("KEYMAPS", "Set \(action) = \(formatKeymap(key: key, modifiers: modifiers))")
         }
     }
-    
+
     func getKeymap(for action: String) -> KeymapEntry? {
-        return keymaps.keymaps.first(where: { $0.action == action })
+        keymaps.keymaps.first(where: { $0.action == action })
     }
 
     func getKeymapsForAction(_ action: String) -> [KeymapEntry] {
-        return keymaps.keymaps.filter { $0.action == action }
+        keymaps.keymaps.filter { $0.action == action }
     }
 
     func isKeymapPressed(key: String, modifiers: [String], for action: String) -> Bool {
@@ -174,18 +174,18 @@ class KeymapsManager: ObservableObject {
         let matchingKeymaps = keymaps.keymaps.filter {
             $0.action == action
         }
-        
+
         return matchingKeymaps.contains { keymap in
-            keymap.key.lowercased() == key.lowercased() && 
+            keymap.key.lowercased() == key.lowercased() &&
             Set(keymap.modifiers) == Set(modifiers)
         }
     }
-    
+
     private func formatKeymap(key: String, modifiers: [String]) -> String {
         let modString = modifiers.isEmpty ? "" : modifiers.joined(separator: "+") + "+"
         return modString + key
     }
-    
+
     // Public method to manually reload keymaps
     func reloadKeymaps() {
         Log.info("KEYMAPS", "Manual keymaps reload requested")
@@ -196,12 +196,12 @@ class KeymapsManager: ObservableObject {
 struct KeymapConfig: Codable {
     var keymaps: [KeymapEntry]
     var globalSettings: KeymapGlobalSettings
-    
+
     init() {
-        self.keymaps = []
-        self.globalSettings = KeymapGlobalSettings()
+        keymaps = []
+        globalSettings = KeymapGlobalSettings()
     }
-    
+
     enum CodingKeys: String, CodingKey {
         case keymaps
         case globalSettings = "global_settings"

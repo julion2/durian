@@ -6,9 +6,9 @@
 //  Email backend using durian CLI HTTP server
 //
 
-import Foundation
-import Combine
 import AppKit
+import Combine
+import Foundation
 
 // MARK: - JSON Models (unchanged, but DurianRequest is no longer needed)
 
@@ -132,7 +132,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     // Internal state
     private var currentFolder = "inbox"
     private var currentQuery = "tag:inbox"
-    
+
     // Cancellation support for prefetch and active search
     private var prefetchTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
@@ -275,7 +275,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     }
 
     // MARK: - Folder/Tag Selection (unchanged)
-    
+
     func selectFolder(_ name: String) async {
         shouldCancelPrefetch = true
         prefetchTask?.cancel()
@@ -295,7 +295,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     // MARK: - Generic HTTP Request Function
 
     private func request<T: Decodable>(endpoint: String, method: String = "GET") async -> T? {
-        return await performRequest(endpoint: endpoint, method: method, bodyData: nil)
+        await performRequest(endpoint: endpoint, method: method, bodyData: nil)
     }
 
     private func request<T: Decodable>(endpoint: String, method: String = "GET", body: some Encodable) async -> T? {
@@ -382,7 +382,8 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
 
         guard let thread = response?.thread else {
             if let index = emails.firstIndex(where: { $0.id == id }) {
-                 if isPrefetch && (shouldCancelPrefetch || Task.isCancelled) {
+                 if isPrefetch && (shouldCancelPrefetch || Task.isCancelled)
+                {
                     emails[index].bodyState = .notLoaded
                     Log.debug("BACKEND", "Prefetch cancelled for \(id)")
                 } else {
@@ -416,7 +417,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         Log.info("BACKEND", "Loaded thread \(id) with \(thread.messages.count) messages (standalone)")
         return mail
     }
-    
+
     /// Shared search pipeline: build URL, request, parse results, apply enrichment.
     /// Returns nil on request failure, empty array on no results.
     private func performSearch(query: String, limit: Int, enrich: Int = 50) async -> [MailMessage]? {
@@ -595,7 +596,8 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         let filename: String
         if let disposition = httpResponse.value(forHTTPHeaderField: "Content-Disposition"),
            let range = disposition.range(of: "filename=\""),
-           let endRange = disposition[range.upperBound...].range(of: "\"") {
+           let endRange = disposition[range.upperBound...].range(of: "\"")
+        {
             filename = String(disposition[range.upperBound..<endRange.lowerBound])
         } else {
             filename = "attachment"
@@ -687,7 +689,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
 
     // MARK: - Unchanged methods (markAsRead, togglePin, etc.)
     // These methods use `tag` internally and don't need to be changed.
-    
+
     func markAsRead(id: String) async throws {
         try await tag(query: "thread:\(id)", tags: "-unread")
         if let index = emails.firstIndex(where: { $0.id == id }) {
@@ -735,7 +737,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
 
     func modifyTags(id: String, add: [String], remove: [String]) async throws {
         let ops = add.map { "+\($0)" } + remove.map { "-\($0)" }
-        try await self.tag(query: "thread:\(id)", tags: ops.joined(separator: " "))
+        try await tag(query: "thread:\(id)", tags: ops.joined(separator: " "))
         await reload()
     }
 
@@ -744,7 +746,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         emails.removeAll { $0.id == id }
         await reload()
     }
-    
+
     func reload() async {
         currentQuery = ProfileManager.shared.buildQuery(folderName: currentFolder)
         await search(currentQuery)
@@ -796,7 +798,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     }
 
     // MARK: - Unchanged Caching and Prefetching Logic
-    
+
     private func cacheThread(id: String, messages: [ThreadMessage]) {
         threadCache[id] = CachedThread(messages: messages, timestamp: Date())
         if threadCache.count > maxCacheSize {
@@ -810,7 +812,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
             Log.debug("BACKEND", "Cache cleanup: removed \(keysToRemove.count) old entries")
         }
     }
-    
+
     private func restoreCachedThreads() {
         var restoredCount = 0
         for (index, email) in emails.enumerated() {
@@ -859,7 +861,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
             Log.debug("BACKEND", "Restored \(restoredCount) threads from cache")
         }
     }
-    
+
     private func prefetchInitialBodiesInternal(count: Int = 5) async {
         let emailsToFetch = emails.prefix(count).filter { email in
             if case .notLoaded = email.bodyState { return true }
@@ -896,11 +898,11 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
             try? await Task.sleep(for: .milliseconds(200))
             guard !Task.isCancelled, let self else { return }
 
-            guard let cursorIndex = self.emails.firstIndex(where: { $0.id == cursorId }) else {
+            guard let cursorIndex = emails.firstIndex(where: { $0.id == cursorId }) else {
                 return
             }
 
-            let toFetch = self.selectEmailsAroundCursor(
+            let toFetch = selectEmailsAroundCursor(
                 cursorIndex: cursorIndex,
                 before: before,
                 after: after

@@ -1,6 +1,6 @@
-import XCTest
-import SwiftUI
 @testable import durian_lib
+import SwiftUI
+import XCTest
 
 @MainActor
 final class SyncManagerTests: XCTestCase {

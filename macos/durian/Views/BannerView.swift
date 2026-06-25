@@ -5,8 +5,8 @@
 //  Banner view for displaying user-facing messages
 //
 
-import SwiftUI
 import AppKit
+import SwiftUI
 
 struct BannerView: View {
     let banner: BannerMessage

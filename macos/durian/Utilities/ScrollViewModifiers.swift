@@ -1,12 +1,12 @@
-import SwiftUI
 import AppKit
+import SwiftUI
 
 // MARK: - Overlay Scrollbars Modifier
 
 extension View {
     /// Makes ScrollView use thin overlay-style scrollbars (like modern macOS apps)
     func overlayScrollbars() -> some View {
-        self.background(ScrollViewStyleConfigurator())
+        background(ScrollViewStyleConfigurator())
     }
 }
 
@@ -22,9 +22,9 @@ private struct ScrollViewStyleConfigurator: NSViewRepresentable {
         }
         return view
     }
-    
+
     func updateNSView(_ nsView: NSView, context: Context) {}
-    
+
     /// Traverses up the view hierarchy to find the enclosing NSScrollView
     private func findScrollView(from view: NSView) -> NSScrollView? {
         var current: NSView? = view

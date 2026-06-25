@@ -6,8 +6,8 @@
 //  async save before dismissal.
 //
 
-import SwiftUI
 import AppKit
+import SwiftUI
 
 struct WindowCloseGuard: NSViewRepresentable {
     @Binding var allowClose: Bool
@@ -50,15 +50,15 @@ struct WindowCloseGuard: NSViewRepresentable {
             guard let window = view.window else { return }
             self.window = window
             context.coordinator.originalDelegate = window.delegate
-            context.coordinator.allowClose = self.allowClose
-            context.coordinator.onCloseAttempt = self.onCloseAttempt
+            context.coordinator.allowClose = allowClose
+            context.coordinator.onCloseAttempt = onCloseAttempt
             window.delegate = context.coordinator
         }
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        context.coordinator.allowClose = self.allowClose
-        context.coordinator.onCloseAttempt = self.onCloseAttempt
+        context.coordinator.allowClose = allowClose
+        context.coordinator.onCloseAttempt = onCloseAttempt
     }
 }

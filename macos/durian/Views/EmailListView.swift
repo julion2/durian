@@ -30,7 +30,7 @@ enum DateGrouping: Hashable, Comparable {
         case .yesterday: return 1
         case .thisWeek: return 2
         case .lastWeek: return 3
-        case .month(let year, let month): 
+        case .month(let year, let month):
             // Must be > 3 (after lastWeek), newer months = smaller value
             return 100 + (2100 - year) * 12 + (12 - month)
         }
@@ -47,7 +47,7 @@ struct EmailListView: View {
     @Binding var cursorId: String?           // Current cursor position (highlighted)
     @Binding var selection: Set<String>      // Marked emails (for batch operations)
     let onEmailAppear: (MailMessage) -> Void
-    
+
     // Context menu callbacks
     var onTogglePin: ((String) -> Void)?
     var onToggleRead: ((String) -> Void)?
@@ -87,7 +87,7 @@ struct EmailListView: View {
             }
         }
     }
-    
+
     @ViewBuilder
     private func listItemView(_ item: ListItem, groupPositions: [String: (isFirst: Bool, isLast: Bool)]) -> some View {
         switch item {
@@ -97,7 +97,7 @@ struct EmailListView: View {
             emailRow(email: email, groupPositions: groupPositions)
         }
     }
-    
+
     @ViewBuilder
     private func headerView(title: String, style: HeaderStyle) -> some View {
         Text(title)
@@ -109,17 +109,17 @@ struct EmailListView: View {
             .padding(.bottom, 4)
             .padding(.horizontal, 12)
     }
-    
+
     // MARK: - List Building
-    
+
     private enum HeaderStyle {
         case pinned, date
     }
-    
+
     private enum ListItem: Identifiable {
         case header(String, HeaderStyle)
         case email(MailMessage)
-        
+
         var id: String {
             switch self {
             case .header(let title, _): return "header-\(title)"
@@ -127,29 +127,29 @@ struct EmailListView: View {
             }
         }
     }
-    
+
     private func buildEmailList() -> [ListItem] {
         var items: [ListItem] = []
-        
+
         // Pinned emails first
         let pinnedEmails = emails.filter { $0.isPinned }.sorted { $0.timestamp > $1.timestamp }
         if !pinnedEmails.isEmpty {
             items.append(.header("Pinned", .pinned))
             items.append(contentsOf: pinnedEmails.map { .email($0) })
         }
-        
+
         // Then unpinned emails grouped by date
         let unpinnedEmails = emails.filter { !$0.isPinned }
         let grouped = groupEmails(unpinnedEmails)
-        
+
         for (group, groupEmails) in grouped {
             items.append(.header(group.displayName, .date))
             items.append(contentsOf: groupEmails.map { .email($0) })
         }
-        
+
         return items
     }
-    
+
     /// Pre-computed selection group positions — O(n) instead of O(n²)
     /// Takes pre-built items to avoid double buildEmailList() call
     private func computeGroupPositions(from items: [ListItem]) -> [String: (isFirst: Bool, isLast: Bool)] {
@@ -173,18 +173,18 @@ struct EmailListView: View {
         }
         return result
     }
-    
+
     @ViewBuilder
     private func emailRow(email: MailMessage, groupPositions: [String: (isFirst: Bool, isLast: Bool)]) -> some View {
         // Cursor position gets highlight, marked emails show selection indicator
         let isCursor = cursorId == email.id
         let isMarked = selection.contains(email.id)
         let isSelected = isCursor || isMarked
-        
+
         // Pre-computed position in selection group for corner radius
         let pos = groupPositions[email.id] ?? (true, true)
         let (isFirstInGroup, isLastInGroup) = pos
-        
+
         EquatableView(content: EmailRowView(
             email: email,
             isSelected: isSelected,

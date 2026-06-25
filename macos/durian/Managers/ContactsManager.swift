@@ -36,17 +36,18 @@ struct Contact: Identifiable, Hashable {
 
     /// Convert from API response to domain model
     init(from response: ContactResponse) {
-        self.id = response.id
-        self.email = response.email
-        self.name = response.name
-        self.usageCount = response.usage_count
-        self.source = response.source
-        self.lastUsed = Self.parseDate(response.last_used)
-        self.createdAt = Self.parseDate(response.created_at) ?? Date()
+        id = response.id
+        email = response.email
+        name = response.name
+        usageCount = response.usage_count
+        source = response.source
+        lastUsed = Self.parseDate(response.last_used)
+        createdAt = Self.parseDate(response.created_at) ?? Date()
     }
 
     init(id: String, email: String, name: String?, lastUsed: Date? = nil,
-         usageCount: Int, source: String, createdAt: Date) {
+         usageCount: Int, source: String, createdAt: Date)
+    {
         self.id = id
         self.email = email
         self.name = name

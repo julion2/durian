@@ -20,14 +20,14 @@ class SearchManager: ObservableObject {
     private let profileFilterProvider: (String) -> String
 
     init() {
-        self.backendProvider = { AccountManager.shared.emailBackend }
-        self.profileFilterProvider = { ProfileManager.shared.applyProfileFilter(to: $0) }
+        backendProvider = { AccountManager.shared.emailBackend }
+        profileFilterProvider = { ProfileManager.shared.applyProfileFilter(to: $0) }
     }
 
     /// Test-only initializer for dependency injection
     init(backend: @escaping () -> (any SearchBackend)?, profileFilter: @escaping (String) -> String) {
-        self.backendProvider = backend
-        self.profileFilterProvider = profileFilter
+        backendProvider = backend
+        profileFilterProvider = profileFilter
     }
 
     /// Search emails with debounce

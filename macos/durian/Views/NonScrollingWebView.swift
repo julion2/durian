@@ -15,7 +15,7 @@ import WebKit
 class ScrollPassthroughWebView: WKWebView {
     override func scrollWheel(with event: NSEvent) {
         // Pass scroll events to parent instead of handling them
-        self.nextResponder?.scrollWheel(with: event)
+        nextResponder?.scrollWheel(with: event)
     }
 }
 
@@ -28,49 +28,49 @@ struct NonScrollingWebView: NSViewRepresentable {
     let loadRemoteImages: Bool     // Security: block tracking pixels by default
     let emailId: String            // Track which email this WebView belongs to (for race condition prevention)
     @Binding var contentHeight: CGFloat
-    
+
     init(html: String, theme: String = "system", loadRemoteImages: Bool = false, emailId: String = "", contentHeight: Binding<CGFloat>) {
         self.html = html
         self.theme = theme
         self.loadRemoteImages = loadRemoteImages
         self.emailId = emailId
-        self._contentHeight = contentHeight
+        _contentHeight = contentHeight
     }
-    
+
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
-        
+
         // Enable JavaScript for height measurement only
         // Note: We need JS enabled to measure content height, but CSP blocks external scripts
         config.defaultWebpagePreferences.allowsContentJavaScript = true
-        
+
         // SECURITY: Disable auto-opening windows
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
-        
+
         // Use custom WebView that passes scroll events to parent
         let webView = ScrollPassthroughWebView(frame: .zero, configuration: config)
         #if DEBUG
         webView.isInspectable = true
         #endif
         webView.navigationDelegate = context.coordinator
-        
+
         // Transparent background (let parent handle background color)
         webView.setValue(false, forKey: "drawsBackground")
         webView.wantsLayer = true
         webView.layer?.backgroundColor = NSColor.clear.cgColor
-        
+
         context.coordinator.webView = webView
         context.coordinator.parent = self
-        
+
         return webView
     }
-    
+
     func updateNSView(_ webView: WKWebView, context: Context) {
         // Update parent reference for height binding
         context.coordinator.parent = self
-        
+
         let styledHTML = buildSecureHTML(html: html, theme: theme, loadRemoteImages: loadRemoteImages)
-        
+
         // Only reload if HTML actually changed - prevents infinite loop
         // (contentHeight binding triggers re-render → updateNSView → reload → didFinish → height update → loop)
         if context.coordinator.lastLoadedHTML != styledHTML {
@@ -79,7 +79,7 @@ struct NonScrollingWebView: NSViewRepresentable {
             webView.loadHTMLString(styledHTML, baseURL: nil)
         }
     }
-    
+
     private func buildSecureHTML(html: String, theme: String, loadRemoteImages: Bool) -> String {
         // Dynamic CSP based on loadRemoteImages setting
         // Note: script-src stays 'none' — evaluateJavaScript() from Swift bypasses CSP,
@@ -90,7 +90,7 @@ struct NonScrollingWebView: NSViewRepresentable {
         } else {
             csp = "default-src 'none'; style-src 'unsafe-inline'; img-src data: cid:;"
         }
-        
+
         // Theme CSS with robust dark mode (CSS filter invert)
         let themeCSS: String
         switch theme {
@@ -111,7 +111,7 @@ struct NonScrollingWebView: NSViewRepresentable {
                 }
             """
         }
-        
+
         return """
         <!DOCTYPE html>
         <html>
@@ -140,17 +140,17 @@ struct NonScrollingWebView: NSViewRepresentable {
         </html>
         """
     }
-    
+
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
-    
+
     class Coordinator: NSObject, WKNavigationDelegate {
         weak var webView: WKWebView?
         var parent: NonScrollingWebView?
         var lastLoadedHTML: String?  // Track to prevent reload loops
         var loadedForEmailId: String?  // Track which email we loaded for (race condition prevention)
-        
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             // Capture email ID at callback time to detect stale callbacks
             let expectedEmailId = loadedForEmailId
@@ -183,11 +183,12 @@ struct NonScrollingWebView: NSViewRepresentable {
             }
         }
 
-        
+
         // Links open in default browser
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             if navigationAction.navigationType == .linkActivated,
-               let url = navigationAction.request.url {
+               let url = navigationAction.request.url
+            {
                 NSWorkspace.shared.open(url)
                 decisionHandler(.cancel)
             } else {
