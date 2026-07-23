@@ -65,6 +65,12 @@ func ExchangeCode(provider *Provider, clientID, clientSecret, redirectURI, code,
 		"code":          {code},
 		"redirect_uri":  {redirectURI},
 		"code_verifier": {codeVerifier},
+		// Single-resource scope for the primary (IMAP/SMTP) access token. Azure
+		// requires this when the consent spanned multiple resources (otherwise
+		// AADSTS28003: scope cannot be empty); the refresh token still covers all
+		// consented scopes, so GetGraphToken can mint a Graph token separately.
+		// Google ignores this scope on the code grant.
+		"scope": {strings.Join(provider.Scopes, " ")},
 	}
 
 	// Google requires client_secret even with PKCE
@@ -100,9 +106,18 @@ func ExchangeCode(provider *Provider, clientID, clientSecret, redirectURI, code,
 	}, nil
 }
 
-// RefreshAccessToken uses the refresh token to get a new access token
+// RefreshAccessToken uses the refresh token to get a new access token for the
+// provider's primary (IMAP/SMTP) resource.
 // clientSecret is optional for Microsoft but required for Google
 func RefreshAccessToken(provider *Provider, clientID, clientSecret string, token *Token) (*Token, error) {
+	return refreshWithScopes(provider, clientID, clientSecret, token, provider.Scopes)
+}
+
+// refreshWithScopes redeems the refresh token for an access token scoped to the
+// given scopes. Azure issues one token per resource, so callers pass a
+// single-resource scope set (provider.Scopes for IMAP/SMTP, provider.GraphScopes
+// for Graph); the refresh token is shared across resources.
+func refreshWithScopes(provider *Provider, clientID, clientSecret string, token *Token, scopes []string) (*Token, error) {
 	clientID, clientSecret = provider.ResolveCredentials(clientID, clientSecret)
 
 	if token.RefreshToken == "" {
@@ -113,7 +128,7 @@ func RefreshAccessToken(provider *Provider, clientID, clientSecret string, token
 		"client_id":     {clientID},
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {token.RefreshToken},
-		"scope":         {strings.Join(provider.Scopes, " ")},
+		"scope":         {strings.Join(scopes, " ")},
 	}
 
 	// Google requires client_secret for refresh
@@ -196,4 +211,48 @@ func GetValidToken(email, clientID, clientSecret, tenant string) (*Token, error)
 	}
 
 	return newToken, nil
+}
+
+// GetGraphToken mints a Microsoft Graph access token for the account from the
+// stored refresh token, which must have been consented for the provider's
+// GraphScopes (a one-time re-consent via `durian auth login`). Azure issues one
+// token per resource, so this is separate from the IMAP/SMTP token: it redeems
+// the same refresh token with the Graph scopes.
+//
+// Azure rotates refresh tokens on use, so the rotated refresh token is persisted
+// back into the stored token while its IMAP/SMTP access token is left untouched
+// — both resources keep working from one shared, always-current refresh token.
+// The returned Graph token is NOT stored as the primary token; callers should
+// cache it in memory until it expires.
+func GetGraphToken(email, clientID, clientSecret, tenant string) (*Token, error) {
+	stored, err := LoadToken(email)
+	if err != nil {
+		return nil, err
+	}
+
+	provider, err := GetProvider(stored.Provider, tenant)
+	if err != nil {
+		return nil, err
+	}
+	if len(provider.GraphScopes) == 0 {
+		return nil, fmt.Errorf("provider %q has no Graph scopes", provider.Name)
+	}
+
+	graphToken, err := refreshWithScopes(provider, clientID, clientSecret, stored, provider.GraphScopes)
+	if err != nil {
+		// A missing Graph consent surfaces as invalid_grant/interaction_required;
+		// surface the re-authenticate hint like the IMAP path does.
+		return nil, err
+	}
+
+	// Persist the rotated refresh token so the IMAP/SMTP path keeps working;
+	// keep the stored access token (IMAP resource) as-is.
+	if graphToken.RefreshToken != "" && graphToken.RefreshToken != stored.RefreshToken {
+		stored.RefreshToken = graphToken.RefreshToken
+		if err := SaveToken(email, stored); err != nil {
+			return nil, fmt.Errorf("failed to persist rotated refresh token: %w", err)
+		}
+	}
+
+	return graphToken, nil
 }

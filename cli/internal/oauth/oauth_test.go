@@ -114,7 +114,7 @@ func TestAuthorizationURL(t *testing.T) {
 		Method:    "S256",
 	}
 
-	url := provider.AuthorizationURL("client-123", "http://localhost:8080/callback", "state-xyz", pkce)
+	url := provider.AuthorizationURL("client-123", "http://localhost:8080/callback", "state-xyz", "user@example.com", pkce)
 
 	// Check URL contains required parameters
 	requiredParams := []string{
@@ -124,6 +124,7 @@ func TestAuthorizationURL(t *testing.T) {
 		"state=state-xyz",
 		"code_challenge=test-challenge",
 		"code_challenge_method=S256",
+		"login_hint=user%40example.com",
 	}
 
 	for _, param := range requiredParams {
