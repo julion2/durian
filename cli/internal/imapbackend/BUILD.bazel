@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "imapbackend",
+    srcs = ["imapbackend.go"],
+    importpath = "github.com/julion2/durian/cli/internal/imapbackend",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "//cli/internal/backend",
+        "//cli/internal/config",
+        "//cli/internal/imap",
+        "@com_github_emersion_go_imap//:go-imap",
+    ],
+)
