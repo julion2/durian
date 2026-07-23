@@ -151,6 +151,16 @@ func ValidateConfig(cfg *Config) []ValidationError {
 				}
 			}
 		}
+
+		// Sync engine selection
+		switch acct.SyncEngine {
+		case "", "legacy", "engine":
+		default:
+			add(prefix+".sync_engine", fmt.Sprintf("must be \"legacy\" or \"engine\", got %q", acct.SyncEngine))
+		}
+		if acct.SyncEngine == "engine" && acct.OAuth != nil && acct.OAuth.Provider == "google" {
+			add(prefix+".sync_engine", "the experimental \"engine\" path does not support Gmail (X-GM-LABELS); use \"legacy\" for Google accounts")
+		}
 	}
 
 	if defaultCount > 1 {

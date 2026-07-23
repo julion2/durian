@@ -62,6 +62,18 @@ type AccountConfig struct {
 	IMAP             IMAPConfig   `pkl:"imap" json:"imap"`
 	Auth             *AuthConfig  `pkl:"auth" json:"auth"`
 	OAuth            *OAuthConfig `pkl:"oauth" json:"oauth"`
+	// SyncEngine selects the sync implementation for this account: "" or
+	// "legacy" (default) uses the classic IMAP syncer; "engine" uses the new
+	// provider-agnostic sync engine (experimental). The backend is chosen by
+	// provider — IMAP today, Microsoft Graph in a later phase. Not supported
+	// for Google accounts (the engine has no X-GM-LABELS path).
+	SyncEngine string `pkl:"sync_engine" json:"sync_engine"`
+}
+
+// UsesSyncEngine reports whether this account should sync via the new
+// provider-agnostic engine instead of the legacy IMAP syncer.
+func (a *AccountConfig) UsesSyncEngine() bool {
+	return a.SyncEngine == "engine"
 }
 
 // GetAuthEmail returns the email used for OAuth token lookup.

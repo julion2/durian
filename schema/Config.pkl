@@ -83,6 +83,9 @@ class AccountConfig {
   imap: IMAPConfig
   auth: AuthConfig?
   oauth: OAuthConfig?
+  /// Sync implementation: "legacy" (default) uses the classic IMAP syncer;
+  /// "engine" uses the experimental provider-agnostic engine. Not for Gmail.
+  sync_engine: "legacy"|"engine" = "legacy"
 }
 
 // ── Provider Templates ─────────────────────────────────────
