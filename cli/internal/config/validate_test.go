@@ -115,6 +115,49 @@ func TestValidateConfig_SyncEngineRejectsGmail(t *testing.T) {
 	}
 }
 
+func TestValidateConfig_CalendarConflictPolicy(t *testing.T) {
+	cfg := &Config{Accounts: []AccountConfig{{
+		Name: "Test", Email: "test@example.com",
+		OAuth:    &OAuthConfig{Provider: "microsoft"},
+		Calendar: &AccountCalendarConfig{Conflict: "merge"},
+	}}}
+	errs := ValidateConfig(cfg)
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Field, "calendar.conflict") && e.Severity == "error" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected error for invalid calendar conflict policy, got errors: %v", errs)
+	}
+
+	// Valid values (and empty) pass.
+	for _, valid := range []string{"", "remote", "local", "newer"} {
+		cfg.Accounts[0].Calendar.Conflict = valid
+		for _, e := range ValidateConfig(cfg) {
+			if strings.Contains(e.Field, "calendar.conflict") {
+				t.Errorf("unexpected error for conflict=%q: %s", valid, e)
+			}
+		}
+	}
+}
+
+func TestAccountCalendarConflictPolicyDefault(t *testing.T) {
+	a := &AccountConfig{}
+	if got := a.CalendarConflictPolicy(); got != "remote" {
+		t.Errorf("nil calendar block: policy = %q, want remote", got)
+	}
+	a.Calendar = &AccountCalendarConfig{}
+	if got := a.CalendarConflictPolicy(); got != "remote" {
+		t.Errorf("empty conflict: policy = %q, want remote", got)
+	}
+	a.Calendar.Conflict = "newer"
+	if got := a.CalendarConflictPolicy(); got != "newer" {
+		t.Errorf("policy = %q, want newer", got)
+	}
+}
+
 func TestValidateConfig_SignatureRefMissing(t *testing.T) {
 	cfg := &Config{
 		Signatures: map[string]string{"default": "Best regards"},

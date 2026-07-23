@@ -4,20 +4,31 @@ go_library(
     name = "graphcalendar",
     srcs = [
         "graphcalendar.go",
+        "ical_roundtrip.go",
         "ics.go",
+        "state.go",
+        "twosync.go",
         "vdir.go",
+        "write.go",
     ],
     importpath = "github.com/julion2/durian/cli/internal/graphcalendar",
     visibility = ["//cli:__subpackages__"],
     deps = [
         "//cli/internal/config",
         "//cli/internal/oauth",
+        "@com_github_emersion_go_ical//:go-ical",
+        "@com_github_teambition_rrule_go//:rrule-go",
     ],
 )
 
 go_test(
     name = "graphcalendar_test",
     size = "small",
-    srcs = ["graphcalendar_test.go"],
+    srcs = [
+        "graphcalendar_test.go",
+        "ical_roundtrip_test.go",
+        "twosync_test.go",
+        "write_test.go",
+    ],
     embed = [":graphcalendar"],
 )

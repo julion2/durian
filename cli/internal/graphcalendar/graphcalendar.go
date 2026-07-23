@@ -1,15 +1,22 @@
-// Package graphcalendar implements a one-way export of Microsoft Graph
-// (Outlook) calendars into a vdir layout — one directory per calendar, one
-// .ics file per event — that vdirsyncer / khal can consume. It is strictly
-// read-only (Calendars.Read); there is no two-way sync.
+// Package graphcalendar talks to Microsoft Graph (Outlook) calendars. It
+// covers two paths:
 //
-// Events are fetched via the Graph calendarView endpoint, which expands
-// recurring series into concrete instances within the requested window, so no
-// RRULE handling is needed (see ics.go).
+//   - A one-way export into a vdir layout — one directory per calendar, one
+//     .ics file per event — that vdirsyncer / khal can consume. Events come
+//     from the Graph calendarView endpoint, which expands recurring series
+//     into concrete instances within the requested window, so no RRULE
+//     handling is needed there (see ics.go).
+//   - The foundation for two-way sync: FetchMasterEvents retrieves
+//     singleInstance and seriesMaster events (with their recurrence
+//     definition and changeKey etag), and ical_roundtrip.go converts them
+//     to/from standalone iCalendar documents including RRULEs.
 package graphcalendar
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +41,11 @@ const (
 	// the .ics writer needs.
 	eventSelect = "id,iCalUId,subject,start,end,isAllDay,location,bodyPreview,lastModifiedDateTime"
 
+	// masterEventSelect is the field set requested on /events queries (master
+	// events for two-way sync): eventSelect plus the full body, the recurrence
+	// definition, the event type, and the changeKey etag.
+	masterEventSelect = "id,iCalUId,subject,body,bodyPreview,start,end,isAllDay,location,recurrence,type,changeKey,lastModifiedDateTime"
+
 	// preferUTC asks Graph to return event start/end dateTimes in UTC, so
 	// parsing never has to interpret Windows timezone names.
 	preferUTC = `outlook.timezone="UTC"`
@@ -43,7 +55,9 @@ const (
 	tokenExpiryBuffer = 5 * time.Minute
 )
 
-// Client is a minimal, read-only Microsoft Graph calendar client.
+// Client is a minimal Microsoft Graph calendar client: read paths for the
+// vdir export and two-way sync download direction, plus the event write
+// operations (create/update/delete, see write.go) for the upload direction.
 type Client struct {
 	account      *config.AccountConfig
 	clientID     string
@@ -136,11 +150,31 @@ func IsAuthError(err error) bool {
 	return false
 }
 
-// doJSON executes one authenticated Graph GET with throttle handling — up to 3
-// retries on 429 honoring Retry-After, and one retry with a short backoff on
-// 503/504 — then decodes the JSON response into out. All waits respect ctx
-// cancellation. Non-2xx responses become a statusError with a body snippet.
+// doJSON executes one authenticated Graph GET and decodes the JSON response
+// into out. See doRequest for the retry behavior.
 func (c *Client) doJSON(ctx context.Context, reqURL string, extraHeaders map[string]string, out any) error {
+	return c.doRequest(ctx, http.MethodGet, reqURL, extraHeaders, nil, out)
+}
+
+// doJSONBody marshals in as the JSON request body and executes one
+// authenticated Graph request (POST/PATCH) via doRequest, decoding the JSON
+// response into out.
+func (c *Client) doJSONBody(ctx context.Context, method, reqURL string, extraHeaders map[string]string, in, out any) error {
+	payload, err := json.Marshal(in)
+	if err != nil {
+		return fmt.Errorf("failed to marshal graph request body: %w", err)
+	}
+	return c.doRequest(ctx, method, reqURL, extraHeaders, payload, out)
+}
+
+// doRequest executes one authenticated Graph request with throttle handling —
+// up to 3 retries on 429 honoring Retry-After, and one retry with a short
+// backoff on 503/504 — then decodes the JSON response into out (skipped when
+// out is nil, e.g. for DELETE). body, when non-nil, is sent as an
+// application/json request body (re-sent from the start on every retry). All
+// waits respect ctx cancellation. Non-2xx responses become a statusError with
+// a body snippet.
+func (c *Client) doRequest(ctx context.Context, method, reqURL string, extraHeaders map[string]string, body []byte, out any) error {
 	const (
 		maxThrottleRetries = 3
 		transientBackoff   = 2 * time.Second
@@ -154,11 +188,18 @@ func (c *Client) doJSON(ctx context.Context, reqURL string, extraHeaders map[str
 			return err
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, reqURL, reader)
 		if err != nil {
 			return fmt.Errorf("failed to build graph request: %w", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
 		for k, v := range extraHeaders {
 			req.Header.Set(k, v)
 		}
@@ -287,9 +328,14 @@ func (c *Client) ListCalendars(ctx context.Context) ([]Calendar, error) {
 
 // MARK: - Events
 
-// Event is one concrete event instance from a Graph calendarView. Recurring
-// series arrive pre-expanded, so ID is unique per occurrence while ICalUID is
-// shared across a series.
+// Event is one Graph calendar event. Two fetch paths fill it:
+//
+//   - FetchEvents (calendarView) returns pre-expanded concrete instances, so
+//     ID is unique per occurrence while ICalUID is shared across a series;
+//     Type, ChangeKey and Recurrence stay empty.
+//   - FetchMasterEvents (/events) returns singleInstance and seriesMaster
+//     events; seriesMaster carries the series definition in Recurrence, and
+//     ChangeKey/Type are populated for the two-way sync engine.
 type Event struct {
 	ID           string
 	ICalUID      string
@@ -300,6 +346,96 @@ type Event struct {
 	End          time.Time
 	AllDay       bool
 	LastModified time.Time
+
+	// ChangeKey is the remote etag of the event; it changes on every remote
+	// modification.
+	ChangeKey string
+	// Type is the Graph event type: "singleInstance", "seriesMaster",
+	// "occurrence" or "exception". Empty for calendarView results.
+	Type string
+	// Recurrence is the series definition of a seriesMaster event; nil for
+	// non-recurring events.
+	Recurrence *Recurrence
+}
+
+// eventContentHash returns a SHA-256 hex digest over the MEANINGFUL content of
+// an event — the fields a user actually edits — serialized deterministically.
+// The two-way sync engine uses it as the remote-change signal: same content
+// yields the same hash no matter which read path produced the Event
+// (FetchMasterEvents, GetEvent, or a CreateEvent response).
+//
+// Volatile identity/bookkeeping fields are deliberately excluded: ChangeKey is
+// NOT a stable etag — Graph rewrites it between a write and subsequent reads
+// (and over time) without any content change — and LastModified churns with
+// it. ID, ICalUID and Type are identity/shape, not content. Fields are joined
+// with NUL separators (no meaningful field contains NUL) so adjacent values
+// can never be confused; Description line endings are normalized to LF, and a
+// Recurrence is canonicalized via its fixed-field JSON encoding.
+func eventContentHash(e Event) string {
+	var recurrence string
+	if e.Recurrence != nil {
+		data, err := json.Marshal(e.Recurrence)
+		if err != nil {
+			// Unreachable for a plain struct; keep a deterministic fallback
+			// rather than failing the hash.
+			slog.Warn("Failed to marshal recurrence for content hash", "module", "GRAPHCAL",
+				"id", e.ID, "err", err)
+			recurrence = fmt.Sprintf("%+v", *e.Recurrence)
+		} else {
+			recurrence = string(data)
+		}
+	}
+
+	h := sha256.New()
+	for _, field := range []string{
+		e.Subject,
+		e.Start.UTC().Format(time.RFC3339),
+		e.End.UTC().Format(time.RFC3339),
+		strconv.FormatBool(e.AllDay),
+		e.Location,
+		normalizeText(e.Description),
+		recurrence,
+	} {
+		h.Write([]byte(field))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Recurrence mirrors the Graph patternedRecurrence resource: how a series
+// repeats (Pattern) and over which span (Range).
+type Recurrence struct {
+	Pattern RecurrencePattern `json:"pattern"`
+	Range   RecurrenceRange   `json:"range"`
+}
+
+// RecurrencePattern is the Graph recurrencePattern resource. Type is one of
+// daily, weekly, absoluteMonthly, relativeMonthly, absoluteYearly,
+// relativeYearly.
+type RecurrencePattern struct {
+	Type     string `json:"type"`
+	Interval int    `json:"interval"`
+	// DaysOfWeek holds lowercase day names ("monday", ...) for weekly and
+	// relative patterns.
+	DaysOfWeek []string `json:"daysOfWeek,omitempty"`
+	// DayOfMonth applies to absoluteMonthly/absoluteYearly patterns.
+	DayOfMonth int `json:"dayOfMonth,omitempty"`
+	// Month (1-12) applies to yearly patterns.
+	Month int `json:"month,omitempty"`
+	// Index is the week ordinal for relative patterns: first, second, third,
+	// fourth or last.
+	Index          string `json:"index,omitempty"`
+	FirstDayOfWeek string `json:"firstDayOfWeek,omitempty"`
+}
+
+// RecurrenceRange is the Graph recurrenceRange resource. Type is one of
+// noEnd, endDate, numbered. Dates are "YYYY-MM-DD" strings as Graph sends
+// them.
+type RecurrenceRange struct {
+	Type                string `json:"type"`
+	StartDate           string `json:"startDate,omitempty"`
+	EndDate             string `json:"endDate,omitempty"`
+	NumberOfOccurrences int    `json:"numberOfOccurrences,omitempty"`
 }
 
 // graphDateTime is Graph's {dateTime, timeZone} pair. With the preferUTC
@@ -309,7 +445,9 @@ type graphDateTime struct {
 	TimeZone string `json:"timeZone"`
 }
 
-// graphEvent is the subset of a Graph event resource we consume.
+// graphEvent is the subset of a Graph event resource we consume. Body,
+// Recurrence, Type and ChangeKey are only present on /events (master)
+// queries, never on calendarView queries.
 type graphEvent struct {
 	ID       string        `json:"id"`
 	ICalUID  string        `json:"iCalUId"`
@@ -320,8 +458,55 @@ type graphEvent struct {
 	Location struct {
 		DisplayName string `json:"displayName"`
 	} `json:"location"`
-	BodyPreview          string `json:"bodyPreview"`
-	LastModifiedDateTime string `json:"lastModifiedDateTime"`
+	Body struct {
+		ContentType string `json:"contentType"`
+		Content     string `json:"content"`
+	} `json:"body"`
+	BodyPreview          string      `json:"bodyPreview"`
+	Recurrence           *Recurrence `json:"recurrence"`
+	Type                 string      `json:"type"`
+	ChangeKey            string      `json:"changeKey"`
+	LastModifiedDateTime string      `json:"lastModifiedDateTime"`
+}
+
+// eventFromGraph converts one Graph event resource into an Event. It reports
+// ok=false (with a warning logged) when the start or end timestamp is
+// unparseable. The description prefers the full body content when Graph
+// delivered a plain-text body, falling back to bodyPreview (always the case
+// for calendarView queries, which do not select body).
+func eventFromGraph(ge graphEvent) (Event, bool) {
+	start, err := parseGraphDateTime(ge.Start.DateTime)
+	if err != nil {
+		slog.Warn("Skipping event with unparseable start", "module", "GRAPHCAL",
+			"id", ge.ID, "value", ge.Start.DateTime, "err", err)
+		return Event{}, false
+	}
+	end, err := parseGraphDateTime(ge.End.DateTime)
+	if err != nil {
+		slog.Warn("Skipping event with unparseable end", "module", "GRAPHCAL",
+			"id", ge.ID, "value", ge.End.DateTime, "err", err)
+		return Event{}, false
+	}
+
+	description := ge.BodyPreview
+	if strings.EqualFold(ge.Body.ContentType, "text") && ge.Body.Content != "" {
+		description = ge.Body.Content
+	}
+
+	return Event{
+		ID:           ge.ID,
+		ICalUID:      ge.ICalUID,
+		Subject:      ge.Subject,
+		Location:     ge.Location.DisplayName,
+		Description:  description,
+		Start:        start,
+		End:          end,
+		AllDay:       ge.IsAllDay,
+		LastModified: parseGraphTimestamp(ge.LastModifiedDateTime),
+		ChangeKey:    ge.ChangeKey,
+		Type:         ge.Type,
+		Recurrence:   ge.Recurrence,
+	}, true
 }
 
 // eventPage is one page of a calendarView query.
@@ -351,29 +536,9 @@ func (c *Client) FetchEvents(ctx context.Context, calendarID string, from, to ti
 			return nil, fmt.Errorf("failed to fetch calendar view for %s: %w", calendarID, err)
 		}
 		for _, ge := range page.Value {
-			start, err := parseGraphDateTime(ge.Start.DateTime)
-			if err != nil {
-				slog.Warn("Skipping event with unparseable start", "module", "GRAPHCAL",
-					"id", ge.ID, "value", ge.Start.DateTime, "err", err)
-				continue
+			if ev, ok := eventFromGraph(ge); ok {
+				events = append(events, ev)
 			}
-			end, err := parseGraphDateTime(ge.End.DateTime)
-			if err != nil {
-				slog.Warn("Skipping event with unparseable end", "module", "GRAPHCAL",
-					"id", ge.ID, "value", ge.End.DateTime, "err", err)
-				continue
-			}
-			events = append(events, Event{
-				ID:           ge.ID,
-				ICalUID:      ge.ICalUID,
-				Subject:      ge.Subject,
-				Location:     ge.Location.DisplayName,
-				Description:  ge.BodyPreview,
-				Start:        start,
-				End:          end,
-				AllDay:       ge.IsAllDay,
-				LastModified: parseGraphTimestamp(ge.LastModifiedDateTime),
-			})
 		}
 		pageURL = page.NextLink
 	}
@@ -381,6 +546,64 @@ func (c *Client) FetchEvents(ctx context.Context, calendarID string, from, to ti
 	slog.Debug("Fetched calendar view", "module", "GRAPHCAL",
 		"calendar", calendarID, "events", len(events))
 	return events, nil
+}
+
+// FetchMasterEvents returns all master events of the calendar via the Graph
+// /events endpoint: singleInstance events and seriesMaster events carrying
+// their Recurrence definition. Expanded "occurrence" and "exception" entries
+// are skipped — the two-way sync engine works on series definitions, not
+// instances. The Prefer: outlook.timezone="UTC" header is sent on every page
+// (including @odata.nextLink follow-ups) so start/end come back in UTC.
+func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]Event, error) {
+	headers := map[string]string{"Prefer": preferUTC}
+
+	var events []Event
+	pageURL := fmt.Sprintf("%s/me/calendars/%s/events?$select=%s&$top=100",
+		c.baseURL, url.PathEscape(calendarID), masterEventSelect)
+	for pageURL != "" {
+		var page eventPage
+		if err := c.doJSON(ctx, pageURL, headers, &page); err != nil {
+			return nil, fmt.Errorf("failed to fetch master events for %s: %w", calendarID, err)
+		}
+		for _, ge := range page.Value {
+			if ge.Type != "singleInstance" && ge.Type != "seriesMaster" {
+				slog.Debug("Skipping non-master event", "module", "GRAPHCAL",
+					"id", ge.ID, "type", ge.Type)
+				continue
+			}
+			if ev, ok := eventFromGraph(ge); ok {
+				events = append(events, ev)
+			}
+		}
+		pageURL = page.NextLink
+	}
+
+	slog.Debug("Fetched master events", "module", "GRAPHCAL",
+		"calendar", calendarID, "events", len(events))
+	return events, nil
+}
+
+// GetEvent returns one event by its Graph event id, requesting the same field
+// set (masterEventSelect) and UTC preference as FetchMasterEvents — so the
+// returned content is exactly what the next FetchMasterEvents will report for
+// this event. The sync engine reads an event back through this after a
+// create/update, because Graph normalizes events server-side right after a
+// write, so the settled read-back — not the POST/PATCH response — is the
+// canonical content the eventContentHash baseline must be computed from.
+func (c *Client) GetEvent(ctx context.Context, eventID string) (Event, error) {
+	reqURL := fmt.Sprintf("%s/me/events/%s?$select=%s",
+		c.baseURL, url.PathEscape(eventID), masterEventSelect)
+
+	var ge graphEvent
+	if err := c.doJSON(ctx, reqURL, map[string]string{"Prefer": preferUTC}, &ge); err != nil {
+		return Event{}, fmt.Errorf("failed to get event %s: %w", eventID, err)
+	}
+	ev, ok := eventFromGraph(ge)
+	if !ok {
+		return Event{}, fmt.Errorf("failed to parse event %s", eventID)
+	}
+	slog.Debug("Fetched event", "module", "GRAPHCAL", "id", ev.ID, "changeKey", ev.ChangeKey)
+	return ev, nil
 }
 
 // parseGraphDateTime parses a Graph event dateTime like

@@ -60,6 +60,11 @@ type CalendarConfig struct {
 type AccountCalendarConfig struct {
 	Dir     string   `pkl:"dir" json:"dir"`         // Subdir name under the vdir base path (default: alias, else lowercased name)
 	Include []string `pkl:"include" json:"include"` // Calendar display names to export (empty = all)
+	// Conflict is the two-way sync conflict policy when an event changed on
+	// both sides: "remote" (default) keeps the Outlook version (the local
+	// file is backed up first), "local" keeps the local file, "newer" keeps
+	// the side modified last.
+	Conflict string `pkl:"conflict" json:"conflict"`
 }
 
 // AccountConfig represents a single email account
@@ -118,6 +123,15 @@ func (a *AccountConfig) CalendarInclude() []string {
 		return nil
 	}
 	return a.Calendar.Include
+}
+
+// CalendarConflictPolicy returns the two-way calendar sync conflict policy
+// for this account: "remote" (the default), "local" or "newer".
+func (a *AccountConfig) CalendarConflictPolicy() string {
+	if a.Calendar != nil && a.Calendar.Conflict != "" {
+		return a.Calendar.Conflict
+	}
+	return "remote"
 }
 
 // GetAuthEmail returns the email used for OAuth token lookup.

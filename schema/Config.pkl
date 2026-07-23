@@ -52,6 +52,11 @@ class AccountCalendarConfig {
   dir: String?
   /// Calendar display names to export (empty = all calendars).
   include: Listing<String> = new {}
+  /// Two-way sync conflict policy when an event changed on both sides:
+  /// "remote" (default) keeps the Outlook version (the local file is backed
+  /// up to <file>.conflict-<timestamp> first), "local" keeps the local file,
+  /// "newer" keeps the side modified last.
+  conflict: "remote"|"local"|"newer" = "remote"
 }
 
 // ── Account ────────────────────────────────────────────────

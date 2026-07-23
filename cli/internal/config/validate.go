@@ -156,6 +156,13 @@ func ValidateConfig(cfg *Config) []ValidationError {
 		if acct.Calendar != nil && (acct.OAuth == nil || acct.OAuth.Provider != "microsoft") {
 			warn(prefix+".calendar", "calendar export only works for Microsoft accounts; this block will be ignored")
 		}
+		if acct.Calendar != nil {
+			switch acct.Calendar.Conflict {
+			case "", "remote", "local", "newer":
+			default:
+				add(prefix+".calendar.conflict", fmt.Sprintf("must be \"remote\", \"local\" or \"newer\", got %q", acct.Calendar.Conflict))
+			}
+		}
 
 		// Sync engine selection
 		switch acct.SyncEngine {
