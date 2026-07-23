@@ -21,6 +21,12 @@ type Message struct {
 	Size      int
 	// FetchedBody indicates whether the full body has been fetched (vs headers-only).
 	FetchedBody bool
+	// RemoteRef is the backend's provider handle for the message
+	// (IMAP UID as a decimal string, Microsoft Graph message id).
+	RemoteRef string
+	// SyncedFlags is the last-synced flag baseline as a comma-joined
+	// IMAP-style flag string (same format as Flags, e.g. `\Seen,\Flagged`).
+	SyncedFlags string
 	// Account is the account identifier for this message (e.g. "work").
 	// Each account has its own row — UNIQUE(message_id, account).
 	Account string

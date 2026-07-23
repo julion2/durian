@@ -228,7 +228,6 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 			})
 
 			state.AddSyncedUID(msg.Uid)
-			state.SetMessageFlags(msg.Uid, flagState)
 			state.SetMessageID(msg.Uid, messageID)
 		}
 	}
@@ -303,6 +302,55 @@ func (b *Backend) ApplyFlags(_ context.Context, ref backend.RemoteRef, add, remo
 		}
 		return nil
 	})
+}
+
+// FetchFlags returns the current server flag state for the given messages,
+// keyed by RemoteRef.ID (the decimal UID). Refs whose ID is empty or not a
+// valid UID, and UIDs the server no longer holds, are simply absent from the
+// result. The three-way merge against the last-synced baseline lives in the
+// sync engine; this method only reports server state.
+func (b *Backend) FetchFlags(_ context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
+	uids := make([]uint32, 0, len(refs))
+	refIDByUID := make(map[uint32]string, len(refs))
+	for _, ref := range refs {
+		uid, err := parseUID(ref)
+		if err != nil {
+			continue // No usable UID handle (e.g. fresh Append/Move) — skip.
+		}
+		uids = append(uids, uid)
+		refIDByUID[uid] = ref.ID
+	}
+	if len(uids) == 0 {
+		return map[string]backend.Flags{}, nil
+	}
+
+	var result map[string]backend.Flags
+	// Retry-safe: read-only, re-selects the folder on every attempt.
+	err := b.withReconnect(func() error {
+		if _, err := b.client.SelectMailbox(folder); err != nil {
+			return fmt.Errorf("failed to select %s: %w", folder, err)
+		}
+		serverFlags, err := b.client.FetchFlags(uids)
+		if err != nil {
+			return fmt.Errorf("failed to fetch flags in %s: %w", folder, err)
+		}
+		result = make(map[string]backend.Flags, len(serverFlags))
+		for uid, flags := range serverFlags {
+			refID, ok := refIDByUID[uid]
+			if !ok {
+				continue // Server returned a UID we did not ask about.
+			}
+			result[refID] = toBackendFlags(imap.FlagStateFromIMAP(flags))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	slog.Debug("Fetched flags", "module", "IMAPBACKEND", "folder", folder,
+		"requested", len(uids), "resolved", len(result))
+	return result, nil
 }
 
 // Move relocates ref into destFolder via the IMAP copy + \Deleted + expunge

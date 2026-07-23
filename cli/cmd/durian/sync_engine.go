@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/julion2/durian/cli/internal/config"
@@ -17,10 +18,12 @@ import (
 // failures are captured in the result's Error field and the run continues to
 // the next account (parity with imap.SyncAccounts).
 //
-// Not yet honored on this path (legacy-only for now): --no-flags and
-// --backfill-headers. The engine always runs its download-side flag pass unless
-// the mode is upload-only or dry-run.
+// --backfill-headers is legacy-only: the engine indexes headers on every
+// ingest, so there is nothing to backfill on this path (see the warning below).
 func runEngineSync(ctx context.Context, accounts []*config.AccountConfig, options *imap.SyncOptions) []*imap.SyncResult {
+	if options.BackfillHeaders && len(accounts) > 0 {
+		slog.Warn("--backfill-headers is not supported on the engine sync path: headers are indexed at ingest; use a legacy account or re-sync", "module", "SYNCENGINE")
+	}
 	results := make([]*imap.SyncResult, 0, len(accounts))
 	for _, account := range accounts {
 		results = append(results, syncOneWithEngine(ctx, account, options))
@@ -50,6 +53,7 @@ func syncOneWithEngine(ctx context.Context, account *config.AccountConfig, optio
 		Mode:         engineMode(options.Mode),
 		Folders:      options.Mailboxes,
 		DryRun:       options.DryRun,
+		NoFlags:      options.NoFlags,
 		Ingest: syncengine.IngestOptions{
 			Account:        account.AccountIdentifier(),
 			FilterRules:    options.FilterRules,

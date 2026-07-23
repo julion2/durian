@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/julion2/durian/cli/internal/backend"
+	"github.com/julion2/durian/cli/internal/imap"
 	"github.com/julion2/durian/cli/internal/store"
 )
 
@@ -53,6 +54,10 @@ type Options struct {
 	// DryRun logs what would happen without writing to the store or advancing
 	// cursors.
 	DryRun bool
+	// NoFlags skips the per-folder flag reconciliation pass entirely (parity
+	// with the legacy --no-flags). Messages still get their flag-derived tags
+	// at ingest time; only the three-way upload/download pass is disabled.
+	NoFlags bool
 }
 
 // Result aggregates the outcome of one Engine.Sync run.
@@ -69,7 +74,7 @@ type Result struct {
 }
 
 // Engine drives a backend.Backend: folder discovery, cursor-paged incremental
-// fetch, ingest, deletions, and a download-side flag pass.
+// fetch, ingest, deletions, and a per-folder three-way flag pass.
 type Engine struct {
 	opts Options
 }
@@ -116,7 +121,9 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 			slog.Warn("Folder sync failed, continuing", "module", "SYNCENGINE",
 				"account", e.opts.Account, "folder", folder.Name, "err", err)
 			result.Errors = append(result.Errors, fmt.Errorf("folder %s: %w", folder.Name, err))
+			continue
 		}
+		e.reconcileFolderFlags(ctx, b, folder, result)
 	}
 
 	slog.Info("Sync complete", "module", "SYNCENGINE", "account", e.opts.Account,
@@ -186,8 +193,6 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 			}
 			sessionRefs[msg.Ref.ID] = messageID
 			result.New++
-
-			e.applyDownloadFlagRemovals(messageID, msg.Flags, result)
 		}
 
 		for _, del := range res.Deleted {
@@ -227,32 +232,144 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 	}
 }
 
-// applyDownloadFlagRemovals applies the remove half of the server flag state
-// to local tags (Ingest applies the add half, matching the legacy insert
-// path). Together they make the server flags authoritative for messages that
-// came through the delta — e.g. a message marked read on the server sheds its
-// local "unread" tag on re-fetch.
+// reconcileFolderFlags runs the three-way flag pass for one folder after its
+// fetch loop completed. The engine owns the merge (a port of the legacy
+// (*imap.Syncer).syncFlags three-way, cli/internal/imap/sync_flags.go): per
+// message it compares the flag state implied by local tags and the current
+// server flags (Backend.FetchFlags) against the store's last-synced baseline
+// (synced_flags). Local changes vs the baseline are uploaded via ApplyFlags;
+// server changes are downloaded into tags via ToTagOps; conflicts merge with
+// local winning for Seen/Flagged/Answered and the server winning for
+// Deleted/Completed. Keeping the merge here makes it provider-neutral: a
+// backend only reports and applies flags, so cursors (e.g. a Graph deltaLink)
+// never need to carry per-message baselines.
 //
-// This is the pragmatic Phase 1 flag sync: download-only, no three-way merge.
-// The legacy syncer's three-way model (sync_flags.go) needs a persisted
-// last-synced flag baseline per message, which does not exist yet on the
-// engine path. TODO(Phase 2): persist per-message flag baselines alongside
-// RemoteRefs and port the NeedsUpload/NeedsDownload/Merge logic, including
-// the upload half via backend.ApplyFlags. Until then, local flag changes are
-// not uploaded, and a local unsynced change can be overwritten by the next
-// server delta for that message.
-func (e *Engine) applyDownloadFlagRemovals(messageID string, flags backend.Flags, result *Result) {
-	if e.opts.Mode == UploadOnly || e.opts.DryRun {
+// Unlike the legacy syncer there is no "no baseline / first sync" branch:
+// every engine-ingested message gets its initial baseline at ingest time (the
+// server flags it arrived with), so a missing-baseline state cannot occur —
+// an empty synced_flags string simply means "no flags set at last sync".
+//
+// New messages ingested this run already carry their flag tags and baseline,
+// so the pass no-ops for them. The pass is skipped entirely in DryRun: it
+// would otherwise write to the server, tags and baselines.
+func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, folder backend.Folder, result *Result) {
+	if e.opts.NoFlags || e.opts.DryRun {
 		return
 	}
-	_, remove := flagStateFromBackend(flags).ToTagOps()
-	if len(remove) == 0 {
+	if ctx.Err() != nil {
 		return
 	}
-	if err := e.opts.Store.ModifyTagsByMessageIDAndAccount(messageID, e.opts.Account, nil, remove); err != nil {
-		slog.Debug("Flag tag removal failed", "module", "SYNCENGINE", "message_id", messageID, "err", err)
-		result.Errors = append(result.Errors, fmt.Errorf("flag tags for %s: %w", messageID, err))
+
+	upload := e.opts.Mode != DownloadOnly
+	download := e.opts.Mode != UploadOnly
+
+	rows, err := e.opts.Store.GetFolderFlagState(e.opts.Account, folder.Name)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("flag sync %s: load flag state: %w", folder.Name, err))
+		return
 	}
+	if len(rows) == 0 {
+		return
+	}
+
+	refs := make([]backend.RemoteRef, 0, len(rows))
+	for _, row := range rows {
+		refs = append(refs, backend.RemoteRef{Folder: folder.Name, ID: row.RemoteRef})
+	}
+
+	server, err := b.FetchFlags(ctx, folder.Name, refs)
+	if err != nil {
+		slog.Warn("Flag fetch failed, continuing", "module", "SYNCENGINE",
+			"account", e.opts.Account, "folder", folder.Name, "err", err)
+		result.Errors = append(result.Errors, fmt.Errorf("flag sync %s: %w", folder.Name, err))
+		return
+	}
+
+	uploaded, downloaded := 0, 0
+	for _, row := range rows {
+		serverFlags, ok := server[row.RemoteRef]
+		if !ok {
+			continue // Not on the server (anymore); the deletion path owns removals.
+		}
+
+		local := imap.FlagStateFromTags(row.Tags)
+		serverState := flagStateFromBackend(serverFlags)
+		// The ORIGINAL stored baseline; both branches below deliberately compare
+		// against it (not one the upload branch may have just advanced),
+		// mirroring the legacy three-way's conflict detection.
+		baseline := imap.FlagStateFromIMAP(splitFlags(row.SyncedFlags))
+
+		// Local changed vs the baseline: push the local-vs-server diff so the
+		// server converges on local. DiffFlags only ever emits the user flags
+		// ToIMAPFlags covers (Seen/Flagged/Answered/Deleted), never the
+		// server-only $Completed keyword — same as the legacy upload path.
+		// Note: imap.FlagStateFromTags never sets Deleted, so the legacy
+		// copy-to-trash delete branch cannot fire on this path.
+		if upload && imap.NeedsUpload(local, baseline) {
+			ref := backend.RemoteRef{Folder: folder.Name, ID: row.RemoteRef}
+			toAdd, toRemove := imap.DiffFlags(local, serverState)
+			add := backendFlagsFromState(imap.FlagStateFromIMAP(toAdd))
+			remove := backendFlagsFromState(imap.FlagStateFromIMAP(toRemove))
+			if err := b.ApplyFlags(ctx, ref, add, remove); err != nil {
+				// Continue with the remaining messages (legacy behavior); the
+				// baseline stays put so the upload is retried next sync.
+				slog.Warn("Flag upload failed", "module", "SYNCENGINE",
+					"folder", folder.Name, "message_id", row.MessageID, "err", err)
+				result.Errors = append(result.Errors, fmt.Errorf("flag upload for %s: %w", row.MessageID, err))
+			} else {
+				if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, joinFlags(local)); err != nil {
+					result.Errors = append(result.Errors, fmt.Errorf("flag baseline for %s: %w", row.MessageID, err))
+				}
+				uploaded++
+			}
+		}
+
+		// Server changed vs the baseline: bring the change down. When both
+		// sides changed (conflict), merge with local winning for
+		// Seen/Flagged/Answered and the server winning for Deleted/Completed.
+		if download && imap.NeedsDownload(serverState, baseline) {
+			target := serverState
+			if imap.NeedsUpload(local, baseline) {
+				target = local.Merge(serverState)
+			}
+			if !target.Equal(local) {
+				add, remove := target.ToTagOps()
+				if err := e.opts.Store.ModifyTagsByMessageIDAndAccount(row.MessageID, e.opts.Account, add, remove); err != nil {
+					result.Errors = append(result.Errors, fmt.Errorf("flag tags for %s: %w", row.MessageID, err))
+					continue // Baseline stays put so the download is retried next sync.
+				}
+			}
+			if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, joinFlags(target)); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("flag baseline for %s: %w", row.MessageID, err))
+			}
+			downloaded++
+		}
+	}
+
+	slog.Debug("Flag pass complete", "module", "SYNCENGINE",
+		"folder", folder.Name, "uploaded", uploaded, "downloaded", downloaded)
+}
+
+// splitFlags splits a comma-joined IMAP flag string (the store's synced_flags
+// baseline format); "" yields nil (no flags set at last sync).
+func splitFlags(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
+}
+
+// joinFlags renders a FlagState into the store's comma-joined baseline format.
+// Unlike ToIMAPFlags (used for uploads, which must never push $Completed), the
+// baseline INCLUDES $Completed so a server-side completed message round-trips
+// and does not re-trigger a download every sync. FlagStateFromIMAP parses it
+// back. Single source of truth for baseline serialization; ingest uses it too.
+func joinFlags(f imap.FlagState) string {
+	flags := f.ToIMAPFlags()
+	if f.Completed {
+		flags = append(flags, "$Completed")
+	}
+	return strings.Join(flags, ",")
 }
 
 // handleDeleted processes one handle the source no longer holds in the folder.

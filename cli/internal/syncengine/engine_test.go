@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/julion2/durian/cli/internal/backend"
@@ -69,6 +70,19 @@ func (m *memCursorStore) Set(account, folder string, cursor backend.Cursor) erro
 	return nil
 }
 
+// fetchFlagsCall records one FetchFlags invocation for assertions.
+type fetchFlagsCall struct {
+	folder string
+	refs   []backend.RemoteRef
+}
+
+// applyFlagsCall records one ApplyFlags invocation for assertions.
+type applyFlagsCall struct {
+	ref    backend.RemoteRef
+	add    backend.Flags
+	remove backend.Flags
+}
+
 // fakeBackend implements backend.Backend with per-folder scripted FetchResults.
 // Successive FetchMessages calls for a folder consume the script in order; when
 // the script is exhausted it reports an unchanged folder (prior cursor, no
@@ -78,6 +92,14 @@ type fakeBackend struct {
 	scripts     map[string][]backend.FetchResult
 	calls       map[string]int
 	seenCursors map[string][]backend.Cursor // cursor argument of each FetchMessages call
+
+	// flagsByRef scripts the server flag state FetchFlags reports per
+	// RemoteRef.ID. Empty by default, so unrelated tests see "not on server"
+	// for every message and the engine's flag pass no-ops.
+	flagsByRef map[string]backend.Flags
+	// fetchFlagsCalls / applyFlagsCalls record the flag-pass invocations.
+	fetchFlagsCalls []fetchFlagsCall
+	applyFlagsCalls []applyFlagsCall
 }
 
 func newFakeBackend(folders []backend.Folder, scripts map[string][]backend.FetchResult) *fakeBackend {
@@ -86,6 +108,7 @@ func newFakeBackend(folders []backend.Folder, scripts map[string][]backend.Fetch
 		scripts:     scripts,
 		calls:       make(map[string]int),
 		seenCursors: make(map[string][]backend.Cursor),
+		flagsByRef:  make(map[string]backend.Flags),
 	}
 }
 
@@ -110,7 +133,19 @@ func (f *fakeBackend) FetchBody(ctx context.Context, ref backend.RemoteRef, w io
 }
 
 func (f *fakeBackend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, remove backend.Flags) error {
+	f.applyFlagsCalls = append(f.applyFlagsCalls, applyFlagsCall{ref: ref, add: add, remove: remove})
 	return nil
+}
+
+func (f *fakeBackend) FetchFlags(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
+	f.fetchFlagsCalls = append(f.fetchFlagsCalls, fetchFlagsCall{folder: folder, refs: slices.Clone(refs)})
+	result := make(map[string]backend.Flags)
+	for _, ref := range refs {
+		if flags, ok := f.flagsByRef[ref.ID]; ok {
+			result[ref.ID] = flags
+		}
+	}
+	return result, nil
 }
 
 func (f *fakeBackend) Move(ctx context.Context, ref backend.RemoteRef, destFolder string) (backend.RemoteRef, error) {
@@ -482,6 +517,128 @@ func TestEngineMaxPerFolder(t *testing.T) {
 	}
 	if msg, _ := db.GetByMessageID("cap3@example.com"); msg != nil {
 		t.Error("third message ingested, want skipped by the per-folder cap")
+	}
+}
+
+// TestEngineFlagUpload proves the upload half of the engine's three-way flag
+// pass: a message ingested unread (Seen=false, so its stored baseline has no
+// \Seen) that the user then marks read locally (unread tag removed) is pushed
+// to the server via ApplyFlags with add.Seen=true on the next sync, and the
+// store's synced_flags baseline advances to include \Seen.
+func TestEngineFlagUpload(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{
+		{Name: "INBOX", Role: backend.RoleInbox, Selectable: true},
+	}
+	scripts := map[string][]backend.FetchResult{
+		"INBOX": {{
+			Messages: []backend.Message{{
+				MessageID: "flagup@example.com",
+				Ref:       backend.RemoteRef{Folder: "INBOX", ID: "601"},
+				Raw:       rawMessage("flagup@example.com", "gina@example.com", testAccount, "Mark me read", "flag body"),
+				Flags:     backend.Flags{Seen: false},
+			}},
+			Cursor: backend.Cursor("flag-c1"),
+		}},
+	}
+	fake := newFakeBackend(folders, scripts)
+	engine := newTestEngine(db, newMemCursorStore())
+
+	if _, err := engine.Sync(context.Background(), fake); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if n := len(fake.applyFlagsCalls); n != 0 {
+		t.Fatalf("ApplyFlags called %d times on first sync, want 0 (nothing changed)", n)
+	}
+
+	// The server still reports the message unread (unchanged since ingest).
+	fake.flagsByRef["601"] = backend.Flags{Seen: false}
+
+	// The user marks the message read locally: the unread tag is removed.
+	if err := db.ModifyTagsByMessageIDAndAccount("flagup@example.com", testAccount, nil, []string{"unread"}); err != nil {
+		t.Fatalf("mark read locally: %v", err)
+	}
+
+	res, err := engine.Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if len(res.Errors) != 0 {
+		t.Fatalf("second sync errors: %v", res.Errors)
+	}
+
+	// The local Seen change must have been uploaded via ApplyFlags.
+	if len(fake.applyFlagsCalls) != 1 {
+		t.Fatalf("ApplyFlags calls = %d, want exactly 1", len(fake.applyFlagsCalls))
+	}
+	call := fake.applyFlagsCalls[0]
+	if call.ref.Folder != "INBOX" || call.ref.ID != "601" {
+		t.Errorf("ApplyFlags ref = %+v, want {INBOX 601}", call.ref)
+	}
+	if !call.add.Seen {
+		t.Errorf("ApplyFlags add = %+v, want Seen=true", call.add)
+	}
+	if call.remove != (backend.Flags{}) {
+		t.Errorf("ApplyFlags remove = %+v, want no flags removed", call.remove)
+	}
+
+	// The stored baseline must have advanced to include \Seen, so the next
+	// sync no longer treats the change as pending.
+	rows, err := db.GetFolderFlagState(testAccount, "INBOX")
+	if err != nil {
+		t.Fatalf("get folder flag state: %v", err)
+	}
+	var found bool
+	for _, row := range rows {
+		if row.MessageID == "flagup@example.com" {
+			found = true
+			if !strings.Contains(row.SyncedFlags, `\Seen`) {
+				t.Errorf("synced_flags baseline = %q, want to contain \\Seen", row.SyncedFlags)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no folder flag row for flagup@example.com")
+	}
+}
+
+// TestEngineNoFlags proves Options.NoFlags disables the flag pass entirely:
+// FetchFlags must never be called.
+func TestEngineNoFlags(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{
+		{Name: "INBOX", Role: backend.RoleInbox, Selectable: true},
+	}
+	scripts := map[string][]backend.FetchResult{
+		"INBOX": {{
+			Messages: []backend.Message{{
+				MessageID: "noflags@example.com",
+				Ref:       backend.RemoteRef{Folder: "INBOX", ID: "701"},
+				Raw:       rawMessage("noflags@example.com", "hank@example.com", testAccount, "No flag pass", "body"),
+				Flags:     backend.Flags{Seen: false},
+			}},
+			Cursor: backend.Cursor("nf-c1"),
+		}},
+	}
+	fake := newFakeBackend(folders, scripts)
+
+	engine := New(Options{
+		Store:   db,
+		Cursors: newMemCursorStore(),
+		Account: testAccount,
+		NoFlags: true,
+		Ingest:  IngestOptions{Account: testAccount},
+	})
+
+	res, err := engine.Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if res.New != 1 {
+		t.Errorf("Result.New = %d, want 1 (ingest must still run)", res.New)
+	}
+	if n := len(fake.fetchFlagsCalls); n != 0 {
+		t.Errorf("FetchFlags called %d times with NoFlags=true, want 0", n)
 	}
 }
 

@@ -123,8 +123,9 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 			body_text_ct, body_html_ct,
 			mailbox_id, account_id,
 			is_seen, is_flagged, is_deleted, flags_other,
-			uid, size, fetched_body
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			uid, size, fetched_body,
+			remote_ref, synced_flags
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id, IFNULL(account_id, 0)) DO UPDATE SET
 			subject_ct = excluded.subject_ct,
 			from_addr = excluded.from_addr,
@@ -141,7 +142,11 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 			flags_other = excluded.flags_other,
 			uid = CASE WHEN excluded.uid > 0 THEN excluded.uid ELSE messages.uid END,
 			mailbox_id = CASE WHEN excluded.mailbox_id IS NOT NULL
-			                 THEN excluded.mailbox_id ELSE messages.mailbox_id END
+			                 THEN excluded.mailbox_id ELSE messages.mailbox_id END,
+			remote_ref = CASE WHEN excluded.remote_ref != ''
+			                 THEN excluded.remote_ref ELSE messages.remote_ref END,
+			synced_flags = CASE WHEN excluded.synced_flags != ''
+			                 THEN excluded.synced_flags ELSE messages.synced_flags END
 		RETURNING id`,
 		msg.MessageID, threadID, msg.InReplyTo, msg.Refs, subjectCT,
 		msg.FromAddr, msg.ToAddrs, msg.CCAddrs,
@@ -150,6 +155,7 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 		nullableID(mailboxID), nullableID(accountID),
 		isSeen, isFlagged, isDeleted, flagsOtherCT,
 		msg.UID, msg.Size, fetchedBody,
+		msg.RemoteRef, msg.SyncedFlags,
 	).Scan(&msg.ID)
 	if err != nil {
 		return fmt.Errorf("upsert message: %w", err)
@@ -422,6 +428,101 @@ func (d *DB) DeleteByMessageIDAndAccount(messageID, account string) error {
 		messageID, accountID)
 	if err != nil {
 		return fmt.Errorf("delete message: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("message not found: %s (account %s)", messageID, account)
+	}
+	return nil
+}
+
+// FolderFlagRow is one message's flag-sync state within a folder: its
+// provider handle (RemoteRef), the last-synced flag baseline
+// (SyncedFlags, comma-joined IMAP-style flag string) and its current
+// local tags. The sync engine's flag three-way merge is driven off this.
+type FolderFlagRow struct {
+	MessageID   string
+	RemoteRef   string
+	SyncedFlags string
+	Tags        []string
+}
+
+// GetFolderFlagState returns the flag-sync state for every message in the
+// given account+mailbox that has a non-empty remote_ref.
+//
+// Mailbox + account are resolved to their FK ids the same way
+// GetAllMessagesWithTags does; unknown names return an empty slice
+// without an error (no rows can match).
+func (d *DB) GetFolderFlagState(account, mailbox string) ([]FolderFlagRow, error) {
+	if strings.EqualFold(mailbox, "INBOX") {
+		mailbox = "INBOX"
+	}
+	var mailboxID int64
+	if err := d.db.QueryRow("SELECT id FROM mailboxes WHERE name = ?", mailbox).Scan(&mailboxID); err != nil {
+		if err == sql.ErrNoRows {
+			return []FolderFlagRow{}, nil
+		}
+		return nil, fmt.Errorf("lookup mailbox id: %w", err)
+	}
+	var accountID int64
+	if err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID); err != nil {
+		if err == sql.ErrNoRows {
+			return []FolderFlagRow{}, nil
+		}
+		return nil, fmt.Errorf("lookup account id: %w", err)
+	}
+
+	// LEFT JOIN (vs the inner JOIN in GetAllMessagesWithTags): a message
+	// with no tags still needs a row so the three-way sees its empty
+	// local state. ORDER BY m.id groups a message's tag rows together.
+	rows, err := d.db.Query(`
+		SELECT m.message_id, m.remote_ref, m.synced_flags, IFNULL(t.tag, '')
+		FROM messages m
+		LEFT JOIN tags t ON t.message_id = m.id
+		WHERE m.mailbox_id = ? AND m.account_id = ? AND m.remote_ref != ''
+		ORDER BY m.id`, mailboxID, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("get folder flag state: %w", err)
+	}
+	defer rows.Close()
+
+	result := []FolderFlagRow{}
+	for rows.Next() {
+		var msgID, remoteRef, syncedFlags, tag string
+		if err := rows.Scan(&msgID, &remoteRef, &syncedFlags, &tag); err != nil {
+			return nil, fmt.Errorf("scan folder flag row: %w", err)
+		}
+		if n := len(result); n == 0 || result[n-1].MessageID != msgID {
+			result = append(result, FolderFlagRow{
+				MessageID:   msgID,
+				RemoteRef:   remoteRef,
+				SyncedFlags: syncedFlags,
+			})
+		}
+		if tag != "" {
+			result[len(result)-1].Tags = append(result[len(result)-1].Tags, tag)
+		}
+	}
+	return result, rows.Err()
+}
+
+// SetSyncedFlags updates the last-synced flag baseline for a message
+// identified by message_id and account. The account name is resolved to
+// its accounts.id; an unknown account or message returns an error.
+func (d *DB) SetSyncedFlags(messageID, account, syncedFlags string) error {
+	var accountID int64
+	err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("message not found: %s (account %s)", messageID, account)
+	}
+	if err != nil {
+		return fmt.Errorf("lookup account id: %w", err)
+	}
+	result, err := d.db.Exec(
+		"UPDATE messages SET synced_flags = ? WHERE message_id = ? AND account_id = ?",
+		syncedFlags, messageID, accountID)
+	if err != nil {
+		return fmt.Errorf("set synced flags: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {

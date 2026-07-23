@@ -145,6 +145,12 @@ type Backend interface {
 	// ApplyFlags adds and removes flags on ref.
 	ApplyFlags(ctx context.Context, ref RemoteRef, add, remove Flags) error
 
+	// FetchFlags returns the current server flag state for the given messages in a
+	// folder, keyed by RemoteRef.ID. Messages the backend cannot resolve are simply
+	// absent from the map. The engine drives the three-way merge; the backend only
+	// reports server state (and applies changes via ApplyFlags).
+	FetchFlags(ctx context.Context, folder string, refs []RemoteRef) (map[string]Flags, error)
+
 	// Move relocates ref into destFolder, returning its new handle.
 	Move(ctx context.Context, ref RemoteRef, destFolder string) (RemoteRef, error)
 

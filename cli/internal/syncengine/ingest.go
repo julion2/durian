@@ -73,6 +73,19 @@ func flagStateFromBackend(f backend.Flags) imap.FlagState {
 	}
 }
 
+// backendFlagsFromState is the inverse of flagStateFromBackend: it converts an
+// imap.FlagState (e.g. derived from local tags via imap.FlagStateFromTags)
+// into the neutral backend.Flags handed to Backend.ApplyFlags.
+func backendFlagsFromState(f imap.FlagState) backend.Flags {
+	return backend.Flags{
+		Seen:      f.Seen,
+		Flagged:   f.Flagged,
+		Answered:  f.Answered,
+		Deleted:   f.Deleted,
+		Completed: f.Completed,
+	}
+}
+
 // IngestOptions configures message ingestion.
 type IngestOptions struct {
 	// Account is the account identifier (the store's account column).
@@ -162,6 +175,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	// elsewhere, so derive it via FlagState.ToIMAPFlags to keep the format
 	// byte-identical with rows written by the legacy syncer.
 	flagState := flagStateFromBackend(msg.Flags)
+	flagStr := strings.Join(flagState.ToIMAPFlags(), ",")
 
 	storeMsg := &store.Message{
 		MessageID: messageID,
@@ -176,14 +190,20 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		Date:      dateUnix,
 		CreatedAt: time.Now().Unix(),
 		Mailbox:   folderName,
-		Flags:     strings.Join(flagState.ToIMAPFlags(), ","),
+		Flags:     flagStr,
 		// UID stays 0 on the engine path: the uint32 UID column is an IMAP
-		// implementation detail; durable RemoteRef persistence is a later
-		// phase of the migration.
+		// implementation detail; the neutral RemoteRef column carries the
+		// provider handle instead.
 		UID:         0,
 		Size:        len(msg.Raw),
 		FetchedBody: true,
 		Account:     opts.Account,
+		RemoteRef:   msg.Ref.ID,
+		// The message's current server flags are the correct initial
+		// baseline: the first post-ingest flag pass is then a no-op unless
+		// the user changed something locally. joinFlags (not flagStr) so the
+		// baseline round-trips $Completed and avoids per-sync download churn.
+		SyncedFlags: joinFlags(flagState),
 	}
 
 	if err := db.InsertMessage(storeMsg); err != nil {
@@ -229,8 +249,9 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	}
 
 	// Flag-based tags (unread, flagged, replied). Like the legacy insert path
-	// this only applies the add half; the engine's flag download pass applies
-	// the removals so re-fetched (updated) messages shed stale flag tags.
+	// this only applies the add half; the engine's per-folder flag
+	// reconciliation pass applies removals so re-fetched (updated) messages
+	// shed stale flag tags.
 	flagAdd, _ := flagState.ToTagOps()
 	for _, tag := range flagAdd {
 		if err := db.AddTag(storeMsg.ID, tag); err != nil {
