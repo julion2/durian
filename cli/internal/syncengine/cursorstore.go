@@ -44,10 +44,22 @@ type FileCursorStore struct {
 	// account argument; when non-empty arguments are passed they win, so one
 	// FileCursorStore can serve multiple accounts (one file each).
 	account string
+	// suffix namespaces the cursor file by backend, so a cursor written by one
+	// backend (e.g. an IMAP MailboxState) is never fed to a different backend
+	// (e.g. a Graph deltaLink) for the same account. Empty for IMAP, "-graph"
+	// for the Graph backend.
+	suffix string
 }
 
-// NewFileCursorStore creates a cursor store for the given account.
+// NewFileCursorStore creates a cursor store for the given account (IMAP backend).
 func NewFileCursorStore(account string) *FileCursorStore {
+	return NewFileCursorStoreWithSuffix(account, "")
+}
+
+// NewFileCursorStoreWithSuffix creates a cursor store whose file name is
+// namespaced by suffix, so different backends for the same account keep separate
+// cursor files (their cursor payloads are not interchangeable).
+func NewFileCursorStoreWithSuffix(account, suffix string) *FileCursorStore {
 	cacheDir := os.Getenv("XDG_CACHE_HOME")
 	if cacheDir == "" {
 		home, _ := os.UserHomeDir()
@@ -56,6 +68,7 @@ func NewFileCursorStore(account string) *FileCursorStore {
 	return &FileCursorStore{
 		cacheDir: filepath.Join(cacheDir, "durian"),
 		account:  account,
+		suffix:   suffix,
 	}
 }
 
@@ -69,7 +82,7 @@ func (f *FileCursorStore) resolveAccount(account string) string {
 
 // path returns the cursor file path for an account.
 func (f *FileCursorStore) path(account string) string {
-	return filepath.Join(f.cacheDir, fmt.Sprintf("%s-backend-cursors.json", account))
+	return filepath.Join(f.cacheDir, fmt.Sprintf("%s%s-backend-cursors.json", account, f.suffix))
 }
 
 // acquireLock takes an exclusive flock on <path>.lock, retrying with backoff
@@ -92,7 +105,7 @@ func (f *FileCursorStore) acquireLock(account string) (*os.File, error) {
 		return lockFile, nil
 	}
 
-	slog.Debug("Cursor lock busy, waiting", "module", "SYNCENGINE", "account", account)
+	slog.Debug("Cursor lock busy, waiting", "module", "SYNCENGINE", "account", account) // encgrep:allow account identifier (config name), not an encrypted column
 	deadline := time.Now().Add(5 * time.Second)
 	delay := 250 * time.Millisecond
 	for time.Now().Before(deadline) {

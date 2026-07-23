@@ -531,6 +531,45 @@ func (d *DB) SetSyncedFlags(messageID, account, syncedFlags string) error {
 	return nil
 }
 
+// GetMessageIDByRemoteRef returns the Message-ID of the message in the given
+// account+mailbox whose remote_ref matches, or "" if none. Used to resolve a
+// backend deletion that carries only the provider handle (e.g. a Graph delta
+// @removed item, which has no internetMessageId) to the durable key. Unknown
+// account/mailbox or no match returns "" without an error.
+func (d *DB) GetMessageIDByRemoteRef(account, mailbox, remoteRef string) (string, error) {
+	if remoteRef == "" {
+		return "", nil
+	}
+	if strings.EqualFold(mailbox, "INBOX") {
+		mailbox = "INBOX"
+	}
+	var mailboxID int64
+	if err := d.db.QueryRow("SELECT id FROM mailboxes WHERE name = ?", mailbox).Scan(&mailboxID); err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", fmt.Errorf("lookup mailbox id: %w", err)
+	}
+	var accountID int64
+	if err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID); err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", fmt.Errorf("lookup account id: %w", err)
+	}
+	var messageID string
+	err := d.db.QueryRow(
+		"SELECT message_id FROM messages WHERE mailbox_id = ? AND account_id = ? AND remote_ref = ? LIMIT 1",
+		mailboxID, accountID, remoteRef).Scan(&messageID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", fmt.Errorf("lookup message by remote_ref: %w", err)
+	}
+	return messageID, nil
+}
+
 // GetSenderCounts returns unique From addresses with their message counts.
 func (d *DB) GetSenderCounts() (map[string]int, error) {
 	rows, err := d.db.Query(`SELECT from_addr, COUNT(*) FROM messages WHERE from_addr != '' GROUP BY from_addr`)

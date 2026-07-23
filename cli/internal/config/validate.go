@@ -154,12 +154,15 @@ func ValidateConfig(cfg *Config) []ValidationError {
 
 		// Sync engine selection
 		switch acct.SyncEngine {
-		case "", "legacy", "engine":
+		case "", "legacy", "engine", "graph":
 		default:
-			add(prefix+".sync_engine", fmt.Sprintf("must be \"legacy\" or \"engine\", got %q", acct.SyncEngine))
+			add(prefix+".sync_engine", fmt.Sprintf("must be \"legacy\", \"engine\", or \"graph\", got %q", acct.SyncEngine))
 		}
-		if acct.SyncEngine == "engine" && acct.OAuth != nil && acct.OAuth.Provider == "google" {
-			add(prefix+".sync_engine", "the experimental \"engine\" path does not support Gmail (X-GM-LABELS); use \"legacy\" for Google accounts")
+		if acct.UsesSyncEngine() && acct.OAuth != nil && acct.OAuth.Provider == "google" {
+			add(prefix+".sync_engine", "the engine path does not support Gmail (X-GM-LABELS); use \"legacy\" for Google accounts")
+		}
+		if acct.SyncEngine == "graph" && (acct.OAuth == nil || acct.OAuth.Provider != "microsoft") {
+			add(prefix+".sync_engine", "\"graph\" requires a Microsoft OAuth account")
 		}
 	}
 

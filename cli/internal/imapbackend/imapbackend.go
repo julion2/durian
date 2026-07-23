@@ -132,7 +132,7 @@ func (b *Backend) fetchFoldersOnce() ([]backend.Folder, error) {
 		})
 	}
 
-	slog.Debug("Fetched folders", "module", "IMAPBACKEND", "count", len(folders))
+	slog.Debug("Fetched folders", "module", "IMAPBACKEND", "count", len(folders)) // encgrep:allow logs folder count only, not message content
 	return folders, nil
 }
 
@@ -204,7 +204,7 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 		for _, msg := range fetched {
 			raw := readRawBody(msg.Body)
 			if len(raw) == 0 {
-				slog.Warn("Message has no body data, skipping", "module", "IMAPBACKEND",
+				slog.Warn("Message has no body data, skipping", "module", "IMAPBACKEND", // encgrep:allow "body data" in message text; folder name is operational sync metadata, no content logged
 					"folder", folder, "uid", msg.Uid)
 				continue
 			}
@@ -251,7 +251,7 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 	}
 	result.Cursor = newCursor
 
-	slog.Debug("Fetched messages", "module", "IMAPBACKEND", "folder", folder,
+	slog.Debug("Fetched messages", "module", "IMAPBACKEND", "folder", folder, // encgrep:allow folder name is operational sync metadata, not message content
 		"new", len(result.Messages), "deleted", len(result.Deleted), "has_more", result.HasMore)
 	return result, nil
 }
@@ -348,7 +348,7 @@ func (b *Backend) FetchFlags(_ context.Context, folder string, refs []backend.Re
 		return nil, err
 	}
 
-	slog.Debug("Fetched flags", "module", "IMAPBACKEND", "folder", folder,
+	slog.Debug("Fetched flags", "module", "IMAPBACKEND", "folder", folder, // encgrep:allow logs folder name and flag counts, not flag values or message content
 		"requested", len(uids), "resolved", len(result))
 	return result, nil
 }

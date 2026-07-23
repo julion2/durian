@@ -335,7 +335,7 @@ func (b *Backend) FetchFolders(ctx context.Context) ([]backend.Folder, error) {
 		pageURL = page.NextLink
 	}
 
-	slog.Debug("Fetched folders", "module", "GRAPHBACKEND", "count", len(folders))
+	slog.Debug("Fetched folders", "module", "GRAPHBACKEND", "count", len(folders)) // encgrep:allow logs folder count only, not message content
 	return folders, nil
 }
 
@@ -450,7 +450,7 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 		result.Cursor = backend.Cursor(page.DeltaLink)
 	}
 
-	slog.Debug("Fetched delta page", "module", "GRAPHBACKEND", "folder", folder,
+	slog.Debug("Fetched delta page", "module", "GRAPHBACKEND", "folder", folder, // encgrep:allow folder name is operational sync metadata, not message content
 		"new", len(result.Messages), "deleted", len(result.Deleted), "has_more", result.HasMore)
 	return result, nil
 }
@@ -551,7 +551,7 @@ func (b *Backend) FetchFlags(ctx context.Context, folder string, refs []backend.
 		}
 	}
 
-	slog.Debug("Fetched flags", "module", "GRAPHBACKEND", "folder", folder,
+	slog.Debug("Fetched flags", "module", "GRAPHBACKEND", "folder", folder, // encgrep:allow logs folder name and flag counts, not flag values or message content
 		"requested", len(refs), "resolved", len(flags))
 	return flags, nil
 }
@@ -587,7 +587,7 @@ func (b *Backend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, re
 	if err := b.doJSON(ctx, http.MethodPatch, reqURL, body, nil); err != nil {
 		return fmt.Errorf("failed to apply flags to %s in %s: %w", ref.ID, ref.Folder, err)
 	}
-	slog.Debug("Applied flags", "module", "GRAPHBACKEND", "id", ref.ID, "add", add, "remove", remove)
+	slog.Debug("Applied flags", "module", "GRAPHBACKEND", "id", ref.ID, "add", add, "remove", remove) // encgrep:allow logs IMAP/Graph flag names (\Seen etc.), not an ADR-0001 encrypted column
 	return nil
 }
 

@@ -84,7 +84,7 @@ func runAuthVerifyGraph(cmd *cobra.Command, args []string) error {
 	for _, f := range folders.Value {
 		names = append(names, f.DisplayName)
 	}
-	fmt.Printf("Graph access OK: Mail.ReadWrite works, %d top-level folder(s): %s\n", len(names), strings.Join(names, ", "))
+	fmt.Printf("Graph access OK: Mail.ReadWrite works, %d top-level folder(s): %s\n", len(names), strings.Join(names, ", ")) // encgrep:allow user-facing diagnostic of the account owner's own folder names
 	fmt.Printf("Graph token valid for %s\n", formatDuration(token.ExpiresIn()))
 	return nil
 }

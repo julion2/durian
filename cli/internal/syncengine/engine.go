@@ -126,7 +126,7 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 		e.reconcileFolderFlags(ctx, b, folder, result)
 	}
 
-	slog.Info("Sync complete", "module", "SYNCENGINE", "account", e.opts.Account,
+	slog.Info("Sync complete", "module", "SYNCENGINE", "account", e.opts.Account, // encgrep:allow account identifier (config name) and counts, not an encrypted column
 		"folders", result.Folders, "new", result.New, "deleted", result.Deleted,
 		"errors", len(result.Errors), "dry_run", e.opts.DryRun)
 	return result, nil
@@ -219,7 +219,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		// folder does not page its entire history — parity with the legacy
 		// syncer's GetIMAPMaxMessages.
 		if e.opts.MaxPerFolder > 0 && fetched >= e.opts.MaxPerFolder {
-			slog.Debug("Reached per-folder message cap, stopping", "module", "SYNCENGINE",
+			slog.Debug("Reached per-folder message cap, stopping", "module", "SYNCENGINE", // encgrep:allow folder name and cap counts are operational sync metadata, not message content
 				"folder", folder.Name, "cap", e.opts.MaxPerFolder, "fetched", fetched)
 			return nil
 		}
@@ -380,10 +380,19 @@ func joinFlags(f imap.FlagState) string {
 // folder (the Mailbox column moved on), in which case deleting would destroy a
 // live message. Reports whether a local change was actually applied.
 func (e *Engine) handleDeleted(folder backend.Folder, del backend.Deletion, sessionRefs map[string]string, result *Result) bool {
-	// Prefer the durable Message-ID the backend resolved from its own map;
-	// fall back to a message ingested earlier in THIS run (rare same-run
-	// arrive-then-delete). If neither resolves, skip safely.
+	// Prefer the durable Message-ID the backend resolved from its own map
+	// (IMAP). Otherwise resolve the provider handle via the persisted remote_ref
+	// (Graph deletions carry only the id). Finally fall back to a message
+	// ingested earlier in THIS run. If nothing resolves, skip safely.
 	messageID := del.MessageID
+	if messageID == "" && del.Ref.ID != "" {
+		if mid, err := e.opts.Store.GetMessageIDByRemoteRef(e.opts.Account, del.Ref.Folder, del.Ref.ID); err != nil {
+			slog.Debug("remote_ref deletion lookup failed", "module", "SYNCENGINE",
+				"folder", folder.Name, "ref", del.Ref.ID, "err", err)
+		} else {
+			messageID = mid
+		}
+	}
 	if messageID == "" {
 		messageID = sessionRefs[del.Ref.ID]
 	}
@@ -401,10 +410,10 @@ func (e *Engine) handleDeleted(folder backend.Folder, del backend.Deletion, sess
 	}
 
 	if mapping := tagMappingForRole(folder.Role); mapping != nil && len(mapping.addTags) > 0 {
-		slog.Debug("Removing folder tags for moved message", "module", "SYNCENGINE",
+		slog.Debug("Removing folder tags for moved message", "module", "SYNCENGINE", // encgrep:allow folder name, tag names and Message-ID are operational sync metadata, not encrypted columns
 			"folder", folder.Name, "message_id", messageID, "tags", mapping.addTags)
 		if err := e.opts.Store.ModifyTagsByMessageIDAndAccount(messageID, e.opts.Account, nil, mapping.addTags); err != nil {
-			slog.Warn("Remove folder tags failed", "module", "SYNCENGINE", "message_id", messageID, "err", err)
+			slog.Warn("Remove folder tags failed", "module", "SYNCENGINE", "message_id", messageID, "err", err) // encgrep:allow Message-ID is a plaintext RFC822 header / stable key, not an encrypted column
 			result.Errors = append(result.Errors, fmt.Errorf("untag deleted %s: %w", messageID, err))
 			return false
 		}
@@ -415,12 +424,12 @@ func (e *Engine) handleDeleted(folder backend.Folder, del backend.Deletion, sess
 	// has since been ingested from a different folder in this same run (the
 	// Mailbox column reflects the latest ingest).
 	if existing, err := e.opts.Store.GetByMessageID(messageID); err == nil && existing != nil && existing.Mailbox != folder.Name {
-		slog.Debug("Message moved to another folder, keeping row", "module", "SYNCENGINE",
+		slog.Debug("Message moved to another folder, keeping row", "module", "SYNCENGINE", // encgrep:allow Message-ID and folder/mailbox names are operational sync metadata, not encrypted columns
 			"message_id", messageID, "folder", folder.Name, "current_mailbox", existing.Mailbox)
 		return false
 	}
 
-	slog.Debug("Deleting message removed from untagged folder", "module", "SYNCENGINE",
+	slog.Debug("Deleting message removed from untagged folder", "module", "SYNCENGINE", // encgrep:allow folder name and Message-ID are operational sync metadata, not encrypted columns
 		"folder", folder.Name, "message_id", messageID)
 	if err := e.opts.Store.DeleteByMessageIDAndAccount(messageID, e.opts.Account); err != nil {
 		slog.Warn("Store delete failed", "module", "SYNCENGINE", "message_id", messageID, "err", err)

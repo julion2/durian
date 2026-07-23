@@ -351,6 +351,52 @@ func TestEngineSyncDeletion(t *testing.T) {
 		}
 	})
 
+	t.Run("graph-style deletion resolves via remote_ref", func(t *testing.T) {
+		// Graph delta @removed items carry only the provider id (no Message-ID);
+		// the engine must resolve it to the durable key via the persisted
+		// remote_ref (Ingest stores Ref.ID as remote_ref).
+		db := newTestDB(t)
+		folders := []backend.Folder{
+			{Name: "Projects", Role: backend.RoleNone, Selectable: true},
+		}
+		scripts := map[string][]backend.FetchResult{
+			"Projects": {
+				{
+					Messages: []backend.Message{{
+						MessageID: "graph-del@example.com",
+						Ref:       backend.RemoteRef{Folder: "Projects", ID: "graph-id-9"},
+						Raw:       rawMessage("graph-del@example.com", "carol@example.com", testAccount, "Plan", "body"),
+						Flags:     backend.Flags{Seen: true},
+					}},
+					Cursor: backend.Cursor("g-c1"),
+				},
+				{ // deletion with NO Message-ID, only the provider handle
+					Deleted: []backend.Deletion{{
+						Ref:       backend.RemoteRef{Folder: "Projects", ID: "graph-id-9"},
+						MessageID: "",
+					}},
+					Cursor: backend.Cursor("g-c2"),
+				},
+			},
+		}
+		fake := newFakeBackend(folders, scripts)
+		engine := newTestEngine(db, newMemCursorStore())
+
+		if _, err := engine.Sync(context.Background(), fake); err != nil {
+			t.Fatalf("first sync: %v", err)
+		}
+		res, err := engine.Sync(context.Background(), fake)
+		if err != nil {
+			t.Fatalf("second sync: %v", err)
+		}
+		if res.Deleted != 1 {
+			t.Errorf("Result.Deleted = %d, want 1 (resolved via remote_ref)", res.Deleted)
+		}
+		if msg, _ := db.GetByMessageID("graph-del@example.com"); msg != nil {
+			t.Error("row still present; deletion did not resolve via remote_ref")
+		}
+	})
+
 	t.Run("role folder removes tag, keeps row", func(t *testing.T) {
 		db := newTestDB(t)
 		folders := []backend.Folder{
