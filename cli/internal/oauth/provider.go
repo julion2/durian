@@ -58,6 +58,10 @@ func Microsoft(tenant string) *Provider {
 		GraphScopes: []string{
 			"https://graph.microsoft.com/Mail.ReadWrite",
 			"https://graph.microsoft.com/Mail.Send",
+			// Calendar read/write for the two-way vdir sync (same
+			// graph.microsoft.com resource as Mail, so it rides the same Graph
+			// token). ReadWrite supersedes Read.
+			"https://graph.microsoft.com/Calendars.ReadWrite",
 		},
 		SASlMethod:      "XOAUTH2",
 		DefaultClientID: "d1969673-bd8a-4bf6-ad8f-f541879730a8",

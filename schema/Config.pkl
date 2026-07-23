@@ -41,6 +41,19 @@ class ContactsConfig {
   db_path: String?
 }
 
+class CalendarConfig {
+  /// Base directory for exported vdir calendars (khal/vdirsyncer layout:
+  /// <vdir_path>/<account-dir>/<calendar>/<event>.ics).
+  vdir_path: String = "~/.local/share/durian/calendars"
+}
+
+class AccountCalendarConfig {
+  /// Subdirectory name under vdir_path (default: account alias, else lowercased name).
+  dir: String?
+  /// Calendar display names to export (empty = all calendars).
+  include: Listing<String> = new {}
+}
+
 // ── Account ────────────────────────────────────────────────
 
 class SMTPConfig {
@@ -83,12 +96,20 @@ class AccountConfig {
   imap: IMAPConfig
   auth: AuthConfig?
   oauth: OAuthConfig?
+  /// Vdir calendar export settings (Microsoft accounts only).
+  calendar: AccountCalendarConfig?
   /// Sync implementation: "legacy" (default) uses the classic IMAP syncer;
   /// "engine" uses the provider-agnostic engine on the IMAP backend; "graph"
   /// uses the engine on the Microsoft Graph backend (Microsoft accounts only).
   /// Not for Gmail.
   sync_engine: "legacy"|"engine"|"graph" = "legacy"
 }
+
+// ── Defaults ───────────────────────────────────────────────
+
+/// Default calendar export settings. Use in config.pkl:
+///   calendar: C.CalendarConfig = (C.calendar) { vdir_path = "~/calendars" }
+calendar: CalendarConfig = new {}
 
 // ── Provider Templates ─────────────────────────────────────
 
