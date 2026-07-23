@@ -85,6 +85,16 @@ type Message struct {
 	InternalDate time.Time
 }
 
+// Deletion is a message the source no longer holds in a folder. MessageID is
+// the durable RFC822 Message-ID when the backend can resolve it — IMAP from its
+// UID<->Message-ID map, Graph from the delta payload — so the engine can act on
+// a message synced in an earlier run. It may be empty if the backend cannot
+// resolve the handle, in which case the engine falls back to same-run tracking.
+type Deletion struct {
+	Ref       RemoteRef
+	MessageID string
+}
+
 // FetchResult is the outcome of one incremental FetchMessages call: the changes
 // in a folder since the caller's cursor, plus a fresh cursor to persist.
 type FetchResult struct {
@@ -92,9 +102,9 @@ type FetchResult struct {
 	// fetches metadata-first; the engine writes them to the store keyed by
 	// (MessageID, account).
 	Messages []Message
-	// Deleted are handles the source no longer holds in this folder; the engine
-	// resolves each to (MessageID, account) via its RemoteRef and untags/removes.
-	Deleted []RemoteRef
+	// Deleted are messages the source no longer holds in this folder; the engine
+	// resolves each to (MessageID, account) and untags/removes it.
+	Deleted []Deletion
 	// Cursor is the token to persist and pass back next time. Never nil after a
 	// successful call — an unchanged folder returns the prior cursor verbatim.
 	Cursor Cursor

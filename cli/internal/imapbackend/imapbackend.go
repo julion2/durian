@@ -234,7 +234,13 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 	}
 
 	for _, uid := range deletedUIDs {
-		result.Deleted = append(result.Deleted, backend.RemoteRef{Folder: folder, ID: formatUID(uid)})
+		// Resolve the durable Message-ID from the cursor's UID map before we
+		// drop the UID below, so the engine can act on deletions of messages
+		// synced in earlier runs (not just this session).
+		result.Deleted = append(result.Deleted, backend.Deletion{
+			Ref:       backend.RemoteRef{Folder: folder, ID: formatUID(uid)},
+			MessageID: state.UIDToMessageID[uid],
+		})
 	}
 	for _, uid := range deletedUIDs {
 		state.RemoveSyncedUID(uid)

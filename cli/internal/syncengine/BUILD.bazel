@@ -1,0 +1,27 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "syncengine",
+    srcs = [
+        "cursorstore.go",
+        "engine.go",
+        "ingest.go",
+    ],
+    importpath = "github.com/julion2/durian/cli/internal/syncengine",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "//cli/internal/backend",
+        "//cli/internal/config",
+        "//cli/internal/imap",
+        "//cli/internal/mail",
+        "//cli/internal/store",
+    ],
+)
+
+go_test(
+    name = "syncengine_test",
+    size = "small",
+    srcs = ["engine_test.go"],
+    embed = [":syncengine"],
+    deps = ["//cli/internal/dbcrypto"],
+)
