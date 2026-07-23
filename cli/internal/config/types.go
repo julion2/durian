@@ -1,10 +1,13 @@
 package config
 
+import "strings"
+
 // Config represents the complete Durian configuration
 type Config struct {
 	Settings   SettingsConfig    `pkl:"settings" json:"settings"`
 	Sync       SyncConfig        `pkl:"sync" json:"sync"`
 	Contacts   ContactsConfig    `pkl:"contacts" json:"contacts"`
+	Calendar   CalendarConfig    `pkl:"calendar" json:"calendar"`
 	Signatures map[string]string `pkl:"signatures" json:"signatures"`
 	Accounts   []AccountConfig   `pkl:"accounts" json:"accounts"`
 }
@@ -48,20 +51,32 @@ type ContactsConfig struct {
 	DBPath string `pkl:"db_path" json:"db_path"` // Path to SQLite DB (default: ~/.local/share/durian/contacts.db)
 }
 
+// CalendarConfig contains global calendar export settings.
+type CalendarConfig struct {
+	VdirPath string `pkl:"vdir_path" json:"vdir_path"` // Base dir for exported vdir calendars (default: ~/.local/share/durian/calendars)
+}
+
+// AccountCalendarConfig configures the vdir calendar export of one account.
+type AccountCalendarConfig struct {
+	Dir     string   `pkl:"dir" json:"dir"`         // Subdir name under the vdir base path (default: alias, else lowercased name)
+	Include []string `pkl:"include" json:"include"` // Calendar display names to export (empty = all)
+}
+
 // AccountConfig represents a single email account
 type AccountConfig struct {
-	Name             string       `pkl:"name" json:"name"`
-	DisplayName      string       `pkl:"display_name" json:"display_name"` // Full name for From header (e.g., "Julian Schenker")
-	Email            string       `pkl:"email" json:"email"`
-	AuthEmail        string       `pkl:"auth_email" json:"auth_email"` // Delegating user for shared mailbox OAuth (token owner)
-	Alias            string       `pkl:"alias" json:"alias"`           // Short alias for CLI (e.g., "work", "personal")
-	Default          bool         `pkl:"default" json:"default"`
-	DefaultSignature string       `pkl:"default_signature" json:"default_signature"`
-	Notifications    *bool        `pkl:"notifications" json:"notifications"` // Per-account notification override (nil = use global setting)
-	SMTP             SMTPConfig   `pkl:"smtp" json:"smtp"`
-	IMAP             IMAPConfig   `pkl:"imap" json:"imap"`
-	Auth             *AuthConfig  `pkl:"auth" json:"auth"`
-	OAuth            *OAuthConfig `pkl:"oauth" json:"oauth"`
+	Name             string                 `pkl:"name" json:"name"`
+	DisplayName      string                 `pkl:"display_name" json:"display_name"` // Full name for From header (e.g., "Julian Schenker")
+	Email            string                 `pkl:"email" json:"email"`
+	AuthEmail        string                 `pkl:"auth_email" json:"auth_email"` // Delegating user for shared mailbox OAuth (token owner)
+	Alias            string                 `pkl:"alias" json:"alias"`           // Short alias for CLI (e.g., "work", "personal")
+	Default          bool                   `pkl:"default" json:"default"`
+	DefaultSignature string                 `pkl:"default_signature" json:"default_signature"`
+	Notifications    *bool                  `pkl:"notifications" json:"notifications"` // Per-account notification override (nil = use global setting)
+	SMTP             SMTPConfig             `pkl:"smtp" json:"smtp"`
+	IMAP             IMAPConfig             `pkl:"imap" json:"imap"`
+	Auth             *AuthConfig            `pkl:"auth" json:"auth"`
+	OAuth            *OAuthConfig           `pkl:"oauth" json:"oauth"`
+	Calendar         *AccountCalendarConfig `pkl:"calendar" json:"calendar"` // Vdir calendar export settings (nil = defaults)
 	// SyncEngine selects the sync implementation for this account:
 	//   ""/"legacy" (default) — the classic IMAP syncer;
 	//   "engine"              — the provider-agnostic engine on the IMAP backend;
@@ -81,6 +96,28 @@ func (a *AccountConfig) UsesSyncEngine() bool {
 // backend rather than the IMAP backend for this account.
 func (a *AccountConfig) UsesGraphBackend() bool {
 	return a.SyncEngine == "graph"
+}
+
+// CalendarDir returns the subdirectory name under the vdir base path for this
+// account's calendar export: the configured calendar dir if set, else the
+// account alias, else the lowercased account name.
+func (a *AccountConfig) CalendarDir() string {
+	if a.Calendar != nil && a.Calendar.Dir != "" {
+		return a.Calendar.Dir
+	}
+	if a.Alias != "" {
+		return a.Alias
+	}
+	return strings.ToLower(a.Name)
+}
+
+// CalendarInclude returns the list of calendar display names to export for
+// this account, or nil to export all calendars.
+func (a *AccountConfig) CalendarInclude() []string {
+	if a.Calendar == nil {
+		return nil
+	}
+	return a.Calendar.Include
 }
 
 // GetAuthEmail returns the email used for OAuth token lookup.

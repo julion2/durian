@@ -152,6 +152,11 @@ func ValidateConfig(cfg *Config) []ValidationError {
 			}
 		}
 
+		// Calendar export (Microsoft Graph only)
+		if acct.Calendar != nil && (acct.OAuth == nil || acct.OAuth.Provider != "microsoft") {
+			warn(prefix+".calendar", "calendar export only works for Microsoft accounts; this block will be ignored")
+		}
+
 		// Sync engine selection
 		switch acct.SyncEngine {
 		case "", "legacy", "engine", "graph":

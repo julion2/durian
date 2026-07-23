@@ -5,6 +5,7 @@ go 1.25.12
 require (
 	filippo.io/age v1.3.1
 	github.com/apple/pkl-go v0.13.2
+	github.com/emersion/go-ical v0.0.0-20250609112844-439c63cef608
 	github.com/emersion/go-imap v1.2.1
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/fatih/color v1.19.0
@@ -32,6 +33,7 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
+	github.com/teambition/rrule-go v1.8.2 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
