@@ -125,10 +125,28 @@ func runSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Regular sync
-	results, err := imap.SyncAccounts(accounts, options)
-	if err != nil {
-		return err
+	// Partition accounts by sync implementation. Engine accounts (opt-in via
+	// account.sync_engine = "engine" in config.pkl) use the provider-agnostic
+	// engine; all others use the classic IMAP syncer.
+	var legacyAccounts, engineAccounts []*config.AccountConfig
+	for _, a := range accounts {
+		if a.UsesSyncEngine() {
+			engineAccounts = append(engineAccounts, a)
+		} else {
+			legacyAccounts = append(legacyAccounts, a)
+		}
+	}
+
+	var results []*imap.SyncResult
+	if len(legacyAccounts) > 0 {
+		r, err := imap.SyncAccounts(legacyAccounts, options)
+		if err != nil {
+			return err
+		}
+		results = append(results, r...)
+	}
+	if len(engineAccounts) > 0 {
+		results = append(results, runEngineSync(cmd.Context(), engineAccounts, options)...)
 	}
 
 	// Tag sync: push journal entries, then pull remote changes

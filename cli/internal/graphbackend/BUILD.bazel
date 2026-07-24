@@ -1,0 +1,24 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "graphbackend",
+    srcs = ["graphbackend.go"],
+    importpath = "github.com/julion2/durian/cli/internal/graphbackend",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "//cli/internal/backend",
+        "//cli/internal/config",
+        "//cli/internal/oauth",
+    ],
+)
+
+go_test(
+    name = "graphbackend_test",
+    size = "small",
+    srcs = ["graphbackend_test.go"],
+    embed = [":graphbackend"],
+    deps = [
+        "//cli/internal/backend",
+        "//cli/internal/config",
+    ],
+)

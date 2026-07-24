@@ -79,6 +79,42 @@ func TestValidateConfig_OAuthGoogleRequiresClientID(t *testing.T) {
 	}
 }
 
+func TestValidateConfig_SyncEngineInvalidValue(t *testing.T) {
+	cfg := &Config{Accounts: []AccountConfig{{
+		Name: "Test", Email: "test@example.com",
+		SyncEngine: "turbo",
+	}}}
+	errs := ValidateConfig(cfg)
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Field, "sync_engine") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected error for invalid sync_engine value, got errors: %v", errs)
+	}
+}
+
+func TestValidateConfig_SyncEngineRejectsGmail(t *testing.T) {
+	cfg := &Config{Accounts: []AccountConfig{{
+		Name: "Test", Email: "test@example.com",
+		SMTP:       SMTPConfig{Host: "smtp.gmail.com", Port: 587, Auth: "oauth2"},
+		OAuth:      &OAuthConfig{Provider: "google", ClientID: "id", ClientSecret: "secret"},
+		SyncEngine: "engine",
+	}}}
+	errs := ValidateConfig(cfg)
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Field, "sync_engine") && strings.Contains(e.Message, "Gmail") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected error rejecting sync_engine=engine for Google account, got errors: %v", errs)
+	}
+}
+
 func TestValidateConfig_SignatureRefMissing(t *testing.T) {
 	cfg := &Config{
 		Signatures: map[string]string{"default": "Best regards"},

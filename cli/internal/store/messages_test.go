@@ -50,6 +50,118 @@ func TestInsertAndGetMessage(t *testing.T) {
 	}
 }
 
+func TestFolderFlagState_RoundTrip(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+
+	insert := func(messageID, mailbox, remoteRef, syncedFlags string) *Message {
+		t.Helper()
+		msg := &Message{
+			MessageID:   messageID,
+			Subject:     "Flag state",
+			Date:        now,
+			CreatedAt:   now,
+			Mailbox:     mailbox,
+			Account:     "work",
+			RemoteRef:   remoteRef,
+			SyncedFlags: syncedFlags,
+		}
+		if err := db.InsertMessage(msg); err != nil {
+			t.Fatalf("insert %s: %v", messageID, err)
+		}
+		return msg
+	}
+
+	tagged := insert("tagged@example.com", "INBOX", "101", `\Seen,\Flagged`)
+	for _, tag := range []string{"inbox", "flagged"} {
+		if err := db.AddTag(tagged.ID, tag); err != nil {
+			t.Fatalf("add tag: %v", err)
+		}
+	}
+	insert("untagged@example.com", "INBOX", "102", "")
+	insert("no-ref@example.com", "INBOX", "", "")         // excluded: empty remote_ref
+	insert("elsewhere@example.com", "Archive", "103", "") // excluded: other mailbox
+
+	rows, err := db.GetFolderFlagState("work", "INBOX")
+	if err != nil {
+		t.Fatalf("get folder flag state: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2 (%+v)", len(rows), rows)
+	}
+	byID := make(map[string]FolderFlagRow, len(rows))
+	for _, r := range rows {
+		byID[r.MessageID] = r
+	}
+	got, ok := byID["tagged@example.com"]
+	if !ok {
+		t.Fatal("tagged@example.com missing")
+	}
+	if got.RemoteRef != "101" {
+		t.Errorf("remote_ref = %q, want %q", got.RemoteRef, "101")
+	}
+	if got.SyncedFlags != `\Seen,\Flagged` {
+		t.Errorf("synced_flags = %q, want %q", got.SyncedFlags, `\Seen,\Flagged`)
+	}
+	if len(got.Tags) != 2 {
+		t.Errorf("tags = %v, want [inbox flagged]", got.Tags)
+	}
+	got, ok = byID["untagged@example.com"]
+	if !ok {
+		t.Fatal("untagged@example.com missing (tag-less messages must still appear)")
+	}
+	if len(got.Tags) != 0 {
+		t.Errorf("tags = %v, want none", got.Tags)
+	}
+
+	// Re-upsert with empty remote_ref / synced_flags must NOT clobber the
+	// stored values (CASE ... != '' upsert rules).
+	insert("tagged@example.com", "INBOX", "", "")
+	rows, err = db.GetFolderFlagState("work", "INBOX")
+	if err != nil {
+		t.Fatalf("get after re-upsert: %v", err)
+	}
+	byID = make(map[string]FolderFlagRow, len(rows))
+	for _, r := range rows {
+		byID[r.MessageID] = r
+	}
+	if got := byID["tagged@example.com"]; got.RemoteRef != "101" || got.SyncedFlags != `\Seen,\Flagged` {
+		t.Errorf("after empty re-upsert: remote_ref = %q, synced_flags = %q; want preserved", got.RemoteRef, got.SyncedFlags)
+	}
+
+	// SetSyncedFlags updates the baseline in place.
+	if err := db.SetSyncedFlags("tagged@example.com", "work", `\Seen`); err != nil {
+		t.Fatalf("set synced flags: %v", err)
+	}
+	rows, err = db.GetFolderFlagState("work", "INBOX")
+	if err != nil {
+		t.Fatalf("get after set: %v", err)
+	}
+	byID = make(map[string]FolderFlagRow, len(rows))
+	for _, r := range rows {
+		byID[r.MessageID] = r
+	}
+	if got := byID["tagged@example.com"]; got.SyncedFlags != `\Seen` {
+		t.Errorf("synced_flags after set = %q, want %q", got.SyncedFlags, `\Seen`)
+	}
+
+	// Unknown message / account must error.
+	if err := db.SetSyncedFlags("nope@example.com", "work", `\Seen`); err == nil {
+		t.Error("SetSyncedFlags(unknown message) should error")
+	}
+	if err := db.SetSyncedFlags("tagged@example.com", "nobody", `\Seen`); err == nil {
+		t.Error("SetSyncedFlags(unknown account) should error")
+	}
+
+	// Unknown mailbox / account resolve to no rows without error.
+	if rows, err := db.GetFolderFlagState("work", "NoSuchBox"); err != nil || len(rows) != 0 {
+		t.Errorf("unknown mailbox: rows = %v, err = %v; want empty, nil", rows, err)
+	}
+	if rows, err := db.GetFolderFlagState("nobody", "INBOX"); err != nil || len(rows) != 0 {
+		t.Errorf("unknown account: rows = %v, err = %v; want empty, nil", rows, err)
+	}
+}
+
 func TestUpsert_HeadersOnlyThenBody(t *testing.T) {
 	db := newTestDB(t)
 	now := time.Now().Unix()

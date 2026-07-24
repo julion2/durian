@@ -1007,6 +1007,27 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 23 {
+		// Backend-neutral flag-sync state: remote_ref is the provider's
+		// handle for the message (IMAP UID as decimal string, later a
+		// Microsoft Graph message id) and synced_flags is the last-synced
+		// flag baseline as a comma-joined IMAP-style flag string (same
+		// format as the legacy flags column, e.g. `\Seen,\Flagged`).
+		// Persisting the baseline per message lets the flag three-way
+		// merge live in the store instead of the provider-specific
+		// cursor — Graph's deltaLink cursor cannot carry per-message
+		// baselines the way the IMAP cursor's flag snapshot did.
+		if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN remote_ref TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("migrate v22→v23 add remote_ref: %w", err)
+		}
+		if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN synced_flags TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("migrate v22→v23 add synced_flags: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 23 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v22→v23 bump: %w", err)
+		}
+	}
+
 	return nil
 }
 

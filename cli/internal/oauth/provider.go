@@ -12,7 +12,11 @@ type Provider struct {
 	AuthorizeEndpoint string
 	TokenEndpoint     string
 	Scopes            []string
-	SASlMethod        string // XOAUTH2 or OAUTHBEARER
+	// GraphScopes are Microsoft Graph resource scopes, requested at consent time
+	// alongside Scopes but minted into a SEPARATE token (Azure issues one access
+	// token per resource). Empty for providers without a Graph backend.
+	GraphScopes []string
+	SASlMethod  string // XOAUTH2 or OAUTHBEARER
 
 	// Default credentials embedded in the binary.
 	// Users can override these in config.pkl.
@@ -47,6 +51,14 @@ func Microsoft(tenant string) *Provider {
 			"https://outlook.office.com/SMTP.Send",
 			"https://outlook.office.com/IMAP.AccessAsUser.All",
 		},
+		// Graph scopes for the graphbackend. Requested at consent time so one
+		// re-consent covers both resources; minted into a separate Graph token
+		// via GetGraphToken. The IMAP/SMTP refresh path never sees these (mixing
+		// resources in one token request is rejected by Azure, AADSTS70011).
+		GraphScopes: []string{
+			"https://graph.microsoft.com/Mail.ReadWrite",
+			"https://graph.microsoft.com/Mail.Send",
+		},
 		SASlMethod:      "XOAUTH2",
 		DefaultClientID: "d1969673-bd8a-4bf6-ad8f-f541879730a8",
 	}
@@ -79,16 +91,35 @@ func GetProvider(name, tenant string) (*Provider, error) {
 	}
 }
 
-// AuthorizationURL builds the OAuth authorization URL with PKCE
-func (p *Provider) AuthorizationURL(clientID, redirectURI, state string, pkce *PKCE) string {
+// ConsentScopes returns the scopes to request at authorization (consent) time.
+// It appends GraphScopes to Scopes so a single user consent covers both the
+// IMAP/SMTP and Microsoft Graph resources (coexistence). Only the /authorize
+// request uses this; token and refresh requests stay single-resource because
+// Azure issues one access token per resource.
+func (p *Provider) ConsentScopes() []string {
+	if len(p.GraphScopes) == 0 {
+		return p.Scopes
+	}
+	return append(append([]string{}, p.Scopes...), p.GraphScopes...)
+}
+
+// AuthorizationURL builds the OAuth authorization URL with PKCE. loginHint, when
+// non-empty, pre-selects the account to authenticate as — critical for tenant
+// "common", where without it the browser silently uses whatever Microsoft
+// account is already signed in and the token ends up for the wrong mailbox.
+func (p *Provider) AuthorizationURL(clientID, redirectURI, state, loginHint string, pkce *PKCE) string {
 	params := url.Values{
 		"client_id":             {clientID},
 		"response_type":         {"code"},
 		"redirect_uri":          {redirectURI},
-		"scope":                 {strings.Join(p.Scopes, " ")},
+		"scope":                 {strings.Join(p.ConsentScopes(), " ")},
 		"state":                 {state},
 		"code_challenge":        {pkce.Challenge},
 		"code_challenge_method": {pkce.Method},
+	}
+
+	if loginHint != "" {
+		params.Set("login_hint", loginHint)
 	}
 
 	// Google requires access_type=offline to return a refresh token

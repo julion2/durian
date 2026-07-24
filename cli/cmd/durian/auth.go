@@ -70,6 +70,7 @@ func init() {
 	authCmd.AddCommand(authStatusCmd)
 	authCmd.AddCommand(authLogoutCmd)
 	authCmd.AddCommand(authRefreshCmd)
+	authCmd.AddCommand(authVerifyGraphCmd)
 }
 
 func runAuthLogin(cmd *cobra.Command, args []string) error {

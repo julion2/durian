@@ -30,7 +30,7 @@ type FlowResult struct {
 
 // StartFlow initiates the OAuth authorization flow
 // It opens the browser to the authorization URL and waits for the callback
-func StartFlow(provider *Provider, clientID, redirectURI string, pkce *PKCE) (*FlowResult, error) {
+func StartFlow(provider *Provider, clientID, redirectURI, loginHint string, pkce *PKCE) (*FlowResult, error) {
 	// Generate random state for CSRF protection
 	stateBytes := make([]byte, 16)
 	if _, err := rand.Read(stateBytes); err != nil {
@@ -39,7 +39,7 @@ func StartFlow(provider *Provider, clientID, redirectURI string, pkce *PKCE) (*F
 	state := hex.EncodeToString(stateBytes)
 
 	// Build authorization URL
-	authURL := provider.AuthorizationURL(clientID, redirectURI, state, pkce)
+	authURL := provider.AuthorizationURL(clientID, redirectURI, state, loginHint, pkce)
 
 	// Start callback server
 	resultChan := make(chan *FlowResult, 1)
@@ -213,7 +213,7 @@ func Authenticate(provider *Provider, clientID, clientSecret, email string) (*To
 
 	redirectURI := "http://localhost:8080" + CallbackPath
 
-	result, err := StartFlow(provider, clientID, redirectURI, pkce)
+	result, err := StartFlow(provider, clientID, redirectURI, email, pkce)
 	if err != nil {
 		return nil, err
 	}
