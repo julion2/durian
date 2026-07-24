@@ -116,3 +116,43 @@ func TestEventToGraphBodyWeeklyRecurrence(t *testing.T) {
 		t.Errorf("range = %v, want endDate 2026-07-20..2026-12-31", rng)
 	}
 }
+
+func TestEventToGraphBodyOmitsMeetingMetadata(t *testing.T) {
+	// Stage 1 regression: meeting metadata is read-only. Even when the Event
+	// carries attendees/organizer/online-meeting/cancellation state, the
+	// uploaded body must contain ONLY the original fields — otherwise Graph
+	// would send invitation/update/cancellation emails on our writes.
+	m := marshalBody(t, Event{
+		Subject: "Design review",
+		Start:   time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC),
+		End:     time.Date(2026, 7, 23, 11, 0, 0, 0, time.UTC),
+		Attendees: []Attendee{
+			{Name: "Alice Example", Email: "alice@example.com", Type: "required", Response: "accepted"},
+		},
+		Organizer:        &Person{Name: "Olivia Organizer", Email: "olivia@example.com"},
+		IsOrganizer:      true,
+		IsCancelled:      true,
+		IsOnlineMeeting:  true,
+		OnlineMeetingURL: "https://teams.microsoft.com/l/meetup-join/abc123",
+		MyResponse:       "accepted",
+	})
+
+	allowed := map[string]bool{
+		"subject": true, "body": true, "start": true, "end": true,
+		"isAllDay": true, "location": true, "recurrence": true,
+	}
+	for key := range m {
+		if !allowed[key] {
+			t.Errorf("graph body contains forbidden key %q", key)
+		}
+	}
+	for _, forbidden := range []string{
+		"attendees", "organizer", "responseStatus",
+		"isOnlineMeeting", "onlineMeeting", "onlineMeetingUrl",
+		"isCancelled", "isOrganizer",
+	} {
+		if _, ok := m[forbidden]; ok {
+			t.Errorf("graph body must not contain %q", forbidden)
+		}
+	}
+}

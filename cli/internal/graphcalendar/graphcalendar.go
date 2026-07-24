@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,8 +44,11 @@ const (
 
 	// masterEventSelect is the field set requested on /events queries (master
 	// events for two-way sync): eventSelect plus the full body, the recurrence
-	// definition, the event type, and the changeKey etag.
-	masterEventSelect = "id,iCalUId,subject,body,bodyPreview,start,end,isAllDay,location,recurrence,type,changeKey,lastModifiedDateTime"
+	// definition, the event type, the changeKey etag, and the read-only meeting
+	// metadata (attendees, organizer, the user's RSVP state, online-meeting
+	// join info, cancellation flags).
+	masterEventSelect = "id,iCalUId,subject,body,bodyPreview,start,end,isAllDay,location,recurrence,type,changeKey,lastModifiedDateTime," +
+		"attendees,organizer,responseStatus,isOnlineMeeting,onlineMeeting,onlineMeetingUrl,isCancelled,isOrganizer"
 
 	// preferUTC asks Graph to return event start/end dateTimes in UTC, so
 	// parsing never has to interpret Windows timezone names.
@@ -356,6 +360,47 @@ type Event struct {
 	// Recurrence is the series definition of a seriesMaster event; nil for
 	// non-recurring events.
 	Recurrence *Recurrence
+
+	// Meeting metadata (Stage 1: READ-ONLY). The fields below are downloaded
+	// from Graph, surfaced in the .ics and factored into eventContentHash, but
+	// EventToGraphBody never uploads them — so durian can never trigger
+	// invitation, update or cancellation emails. calendarView results leave
+	// them zero (eventSelect does not request them).
+
+	// Attendees is the meeting's attendee list; empty for plain appointments.
+	Attendees []Attendee
+	// Organizer is the meeting organizer; nil for plain appointments.
+	Organizer *Person
+	// IsOrganizer reports whether the account owner organizes this meeting.
+	IsOrganizer bool
+	// IsCancelled reports whether the meeting has been cancelled remotely.
+	IsCancelled bool
+	// IsOnlineMeeting reports whether the event is an online meeting.
+	IsOnlineMeeting bool
+	// OnlineMeetingURL is the join link (Teams etc.): onlineMeeting.joinUrl,
+	// falling back to the legacy onlineMeetingUrl field. Empty when the event
+	// is not an online meeting.
+	OnlineMeetingURL string
+	// MyResponse is the account owner's RSVP to this meeting, one of Graph's
+	// "none", "organizer", "tentativelyAccepted", "accepted", "declined" or
+	// "notResponded". Empty for calendarView results.
+	MyResponse string
+}
+
+// Attendee is one meeting attendee as Graph reports it. Type is the Graph
+// attendee type: "required", "optional" or "resource". Response is the
+// attendee's RSVP, same enum as Event.MyResponse.
+type Attendee struct {
+	Name     string
+	Email    string
+	Type     string
+	Response string
+}
+
+// Person is a name/email pair, e.g. the meeting organizer.
+type Person struct {
+	Name  string
+	Email string
 }
 
 // eventContentHash returns a SHA-256 hex digest over the MEANINGFUL content of
@@ -371,6 +416,13 @@ type Event struct {
 // with NUL separators (no meaningful field contains NUL) so adjacent values
 // can never be confused; Description line endings are normalized to LF, and a
 // Recurrence is canonicalized via its fixed-field JSON encoding.
+//
+// The read-only meeting metadata (attendees, organizer, cancellation, join
+// link, own RSVP) is part of the hash too, so a server-side change — someone
+// RSVPs, an attendee is added or removed, a meeting is cancelled, a join link
+// changes — is detected as a remote change and re-downloaded. Attendees are
+// canonicalized as a SORTED list of "email|type|response" entries so the hash
+// does not depend on Graph's ordering.
 func eventContentHash(e Event) string {
 	var recurrence string
 	if e.Recurrence != nil {
@@ -386,6 +438,17 @@ func eventContentHash(e Event) string {
 		}
 	}
 
+	attendees := make([]string, 0, len(e.Attendees))
+	for _, a := range e.Attendees {
+		attendees = append(attendees, a.Email+"|"+a.Type+"|"+a.Response)
+	}
+	sort.Strings(attendees)
+
+	var organizerEmail string
+	if e.Organizer != nil {
+		organizerEmail = e.Organizer.Email
+	}
+
 	h := sha256.New()
 	for _, field := range []string{
 		e.Subject,
@@ -395,6 +458,12 @@ func eventContentHash(e Event) string {
 		e.Location,
 		normalizeText(e.Description),
 		recurrence,
+		strings.Join(attendees, "\n"),
+		organizerEmail,
+		strconv.FormatBool(e.IsOnlineMeeting),
+		e.OnlineMeetingURL,
+		strconv.FormatBool(e.IsCancelled),
+		e.MyResponse,
 	} {
 		h.Write([]byte(field))
 		h.Write([]byte{0})
@@ -445,9 +514,22 @@ type graphDateTime struct {
 	TimeZone string `json:"timeZone"`
 }
 
+// graphEmailAddress is Graph's {name, address} pair used inside attendees and
+// organizer.
+type graphEmailAddress struct {
+	Name    string `json:"name"`
+	Address string `json:"address"`
+}
+
+// graphResponseStatus is Graph's responseStatus resource: an RSVP enum plus a
+// timestamp (ignored — it churns without content changes).
+type graphResponseStatus struct {
+	Response string `json:"response"`
+}
+
 // graphEvent is the subset of a Graph event resource we consume. Body,
-// Recurrence, Type and ChangeKey are only present on /events (master)
-// queries, never on calendarView queries.
+// Recurrence, Type, ChangeKey and the meeting metadata are only present on
+// /events (master) queries, never on calendarView queries.
 type graphEvent struct {
 	ID       string        `json:"id"`
 	ICalUID  string        `json:"iCalUId"`
@@ -467,6 +549,24 @@ type graphEvent struct {
 	Type                 string      `json:"type"`
 	ChangeKey            string      `json:"changeKey"`
 	LastModifiedDateTime string      `json:"lastModifiedDateTime"`
+	Attendees            []struct {
+		Type         string              `json:"type"`
+		Status       graphResponseStatus `json:"status"`
+		EmailAddress graphEmailAddress   `json:"emailAddress"`
+	} `json:"attendees"`
+	Organizer *struct {
+		EmailAddress graphEmailAddress `json:"emailAddress"`
+	} `json:"organizer"`
+	ResponseStatus  graphResponseStatus `json:"responseStatus"`
+	IsOnlineMeeting bool                `json:"isOnlineMeeting"`
+	OnlineMeeting   *struct {
+		JoinURL string `json:"joinUrl"`
+	} `json:"onlineMeeting"`
+	// OnlineMeetingURL is the legacy join-link field, used as fallback when
+	// onlineMeeting is null.
+	OnlineMeetingURL string `json:"onlineMeetingUrl"`
+	IsCancelled      bool   `json:"isCancelled"`
+	IsOrganizer      bool   `json:"isOrganizer"`
 }
 
 // eventFromGraph converts one Graph event resource into an Event. It reports
@@ -493,6 +593,24 @@ func eventFromGraph(ge graphEvent) (Event, bool) {
 		description = ge.Body.Content
 	}
 
+	var attendees []Attendee
+	for _, a := range ge.Attendees {
+		attendees = append(attendees, Attendee{
+			Name:     a.EmailAddress.Name,
+			Email:    a.EmailAddress.Address,
+			Type:     a.Type,
+			Response: a.Status.Response,
+		})
+	}
+	var organizer *Person
+	if ge.Organizer != nil {
+		organizer = &Person{Name: ge.Organizer.EmailAddress.Name, Email: ge.Organizer.EmailAddress.Address}
+	}
+	onlineMeetingURL := ge.OnlineMeetingURL
+	if ge.OnlineMeeting != nil && ge.OnlineMeeting.JoinURL != "" {
+		onlineMeetingURL = ge.OnlineMeeting.JoinURL
+	}
+
 	return Event{
 		ID:           ge.ID,
 		ICalUID:      ge.ICalUID,
@@ -506,6 +624,14 @@ func eventFromGraph(ge graphEvent) (Event, bool) {
 		ChangeKey:    ge.ChangeKey,
 		Type:         ge.Type,
 		Recurrence:   ge.Recurrence,
+
+		Attendees:        attendees,
+		Organizer:        organizer,
+		IsOrganizer:      ge.IsOrganizer,
+		IsCancelled:      ge.IsCancelled,
+		IsOnlineMeeting:  ge.IsOnlineMeeting,
+		OnlineMeetingURL: onlineMeetingURL,
+		MyResponse:       ge.ResponseStatus.Response,
 	}, true
 }
 
