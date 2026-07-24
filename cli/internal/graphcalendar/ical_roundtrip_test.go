@@ -356,3 +356,115 @@ func TestFetchMasterEvents(t *testing.T) {
 		t.Errorf("master.Start = %v, want %v", master.Start, want)
 	}
 }
+
+// MARK: - Meeting metadata serialization (Stage 1, read-only)
+
+func TestEventToICalMeetingMetadata(t *testing.T) {
+	orig := Event{
+		ID:      "MEET1",
+		ICalUID: "ical-meet1",
+		Subject: "Design review",
+		Start:   time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC),
+		End:     time.Date(2026, 7, 23, 11, 0, 0, 0, time.UTC),
+		// Deliberately unsorted: bob before alice. Output must sort by email.
+		Attendees: []Attendee{
+			{Name: "Bob Example", Email: "bob@example.com", Type: "optional", Response: "declined"},
+			{Name: "Alice Example", Email: "alice@example.com", Type: "required", Response: "accepted"},
+		},
+		Organizer:        &Person{Name: "Olivia Organizer", Email: "olivia@example.com"},
+		IsOnlineMeeting:  true,
+		OnlineMeetingURL: "https://teams.microsoft.com/l/meetup-join/abc123",
+		MyResponse:       "accepted",
+	}
+
+	data, err := EventToICal(orig)
+	if err != nil {
+		t.Fatalf("EventToICal: %v", err)
+	}
+	ics := string(data)
+
+	// go-ical emits params sorted alphabetically: CN, PARTSTAT, ROLE, RSVP.
+	aliceLine := "ATTENDEE;CN=Alice Example;PARTSTAT=ACCEPTED;ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:alice@example.com\r\n"
+	bobLine := "ATTENDEE;CN=Bob Example;PARTSTAT=DECLINED;ROLE=OPT-PARTICIPANT;RSVP=TRUE:mailto:bob@example.com\r\n"
+	for _, want := range []string{
+		"ORGANIZER;CN=Olivia Organizer:mailto:olivia@example.com\r\n",
+		aliceLine,
+		bobLine,
+		"URL:https://teams.microsoft.com/l/meetup-join/abc123\r\n",
+		"X-MICROSOFT-SKYPETEAMSMEETINGURL:https://teams.microsoft.com/l/meetup-join/abc123\r\n",
+	} {
+		if !strings.Contains(ics, want) {
+			t.Errorf("ICS missing %q:\n%s", want, ics)
+		}
+	}
+	// Not cancelled: no STATUS line.
+	if strings.Contains(ics, "STATUS:") {
+		t.Errorf("non-cancelled ICS must not contain STATUS:\n%s", ics)
+	}
+	// Attendees sorted by email: alice before bob.
+	if strings.Index(ics, aliceLine) > strings.Index(ics, bobLine) {
+		t.Errorf("attendees not sorted by email:\n%s", ics)
+	}
+
+	// The document must still parse; meeting metadata is display-only and is
+	// deliberately not parsed back into the Event.
+	got, err := ICalToEvent(data)
+	if err != nil {
+		t.Fatalf("ICalToEvent: %v", err)
+	}
+	if got.Subject != orig.Subject || !got.Start.Equal(orig.Start) {
+		t.Errorf("core fields lost: %+v", got)
+	}
+	if len(got.Attendees) != 0 || got.Organizer != nil || got.OnlineMeetingURL != "" {
+		t.Errorf("meeting metadata unexpectedly parsed back: %+v", got)
+	}
+}
+
+func TestEventToICalCancelled(t *testing.T) {
+	data, err := EventToICal(Event{
+		ID:          "CANC1",
+		ICalUID:     "ical-canc1",
+		Subject:     "Cancelled meeting",
+		Start:       time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC),
+		End:         time.Date(2026, 7, 23, 11, 0, 0, 0, time.UTC),
+		IsCancelled: true,
+	})
+	if err != nil {
+		t.Fatalf("EventToICal: %v", err)
+	}
+	if want := "STATUS:CANCELLED\r\n"; !strings.Contains(string(data), want) {
+		t.Errorf("cancelled ICS missing %q:\n%s", want, data)
+	}
+}
+
+func TestEventToICalAttendeePartStatMapping(t *testing.T) {
+	data, err := EventToICal(Event{
+		ID:      "PART1",
+		ICalUID: "ical-part1",
+		Subject: "PARTSTAT mapping",
+		Start:   time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC),
+		End:     time.Date(2026, 7, 23, 11, 0, 0, 0, time.UTC),
+		Attendees: []Attendee{
+			{Email: "a@example.com", Type: "required", Response: "tentativelyAccepted"},
+			{Email: "b@example.com", Type: "required", Response: "notResponded"},
+			{Email: "c@example.com", Type: "required", Response: "none"},
+			{Email: "d@example.com", Type: "required", Response: "organizer"},
+			{Email: "e@example.com", Type: "resource", Response: "accepted"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("EventToICal: %v", err)
+	}
+	ics := string(data)
+	for _, want := range []string{
+		"ATTENDEE;PARTSTAT=TENTATIVE;ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:a@example.com\r\n",
+		"ATTENDEE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:b@example.com\r\n",
+		"ATTENDEE;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:c@example.com\r\n",
+		"ATTENDEE;PARTSTAT=ACCEPTED;ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:d@example.com\r\n",
+		"ATTENDEE;PARTSTAT=ACCEPTED;ROLE=NON-PARTICIPANT;RSVP=TRUE:mailto:e@example.com\r\n",
+	} {
+		if !strings.Contains(ics, want) {
+			t.Errorf("ICS missing %q:\n%s", want, ics)
+		}
+	}
+}

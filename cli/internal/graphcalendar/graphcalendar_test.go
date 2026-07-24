@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -325,5 +326,186 @@ func TestExport(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(incDir, "Work_Team")); !os.IsNotExist(err) {
 		t.Errorf("Work_Team not in include list but was exported (err=%v)", err)
+	}
+}
+
+// MARK: - Meeting metadata (Stage 1, read-only)
+
+// meetingGraphJSON is a Graph /events resource for an online meeting with two
+// attendees, an organizer, and the account owner's accepted RSVP.
+const meetingGraphJSON = `{
+	"id": "meet1",
+	"iCalUId": "ical-meet1",
+	"subject": "Design review",
+	"body": {"contentType": "text", "content": "please review the drafts"},
+	"bodyPreview": "please review the drafts",
+	"start": {"dateTime": "2026-07-23T10:00:00.0000000", "timeZone": "UTC"},
+	"end": {"dateTime": "2026-07-23T11:00:00.0000000", "timeZone": "UTC"},
+	"isAllDay": false,
+	"location": {"displayName": "Teams"},
+	"type": "singleInstance",
+	"changeKey": "ck-meet1",
+	"lastModifiedDateTime": "2026-07-20T09:00:00Z",
+	"attendees": [
+		{
+			"type": "required",
+			"status": {"response": "accepted", "time": "2026-07-19T08:00:00Z"},
+			"emailAddress": {"name": "Alice Example", "address": "alice@example.com"}
+		},
+		{
+			"type": "optional",
+			"status": {"response": "declined", "time": "2026-07-19T09:00:00Z"},
+			"emailAddress": {"name": "Bob Example", "address": "bob@example.com"}
+		}
+	],
+	"organizer": {"emailAddress": {"name": "Olivia Organizer", "address": "olivia@example.com"}},
+	"responseStatus": {"response": "accepted", "time": "2026-07-19T10:00:00Z"},
+	"isOnlineMeeting": true,
+	"onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/abc123"},
+	"isCancelled": false,
+	"isOrganizer": false
+}`
+
+// meetingEvent parses meetingGraphJSON into an Event.
+func meetingEvent(t *testing.T) Event {
+	t.Helper()
+	var ge graphEvent
+	if err := json.Unmarshal([]byte(meetingGraphJSON), &ge); err != nil {
+		t.Fatalf("unmarshal meeting JSON: %v", err)
+	}
+	ev, ok := eventFromGraph(ge)
+	if !ok {
+		t.Fatalf("eventFromGraph returned ok=false")
+	}
+	return ev
+}
+
+func TestEventFromGraphMeetingMetadata(t *testing.T) {
+	ev := meetingEvent(t)
+
+	wantAttendees := []Attendee{
+		{Name: "Alice Example", Email: "alice@example.com", Type: "required", Response: "accepted"},
+		{Name: "Bob Example", Email: "bob@example.com", Type: "optional", Response: "declined"},
+	}
+	if !reflect.DeepEqual(ev.Attendees, wantAttendees) {
+		t.Errorf("Attendees = %+v, want %+v", ev.Attendees, wantAttendees)
+	}
+	if ev.Organizer == nil || ev.Organizer.Name != "Olivia Organizer" || ev.Organizer.Email != "olivia@example.com" {
+		t.Errorf("Organizer = %+v, want Olivia Organizer <olivia@example.com>", ev.Organizer)
+	}
+	if !ev.IsOnlineMeeting {
+		t.Errorf("IsOnlineMeeting = false, want true")
+	}
+	if want := "https://teams.microsoft.com/l/meetup-join/abc123"; ev.OnlineMeetingURL != want {
+		t.Errorf("OnlineMeetingURL = %q, want %q", ev.OnlineMeetingURL, want)
+	}
+	if ev.MyResponse != "accepted" {
+		t.Errorf("MyResponse = %q, want accepted", ev.MyResponse)
+	}
+	if ev.IsCancelled {
+		t.Errorf("IsCancelled = true, want false")
+	}
+	if ev.IsOrganizer {
+		t.Errorf("IsOrganizer = true, want false")
+	}
+}
+
+func TestEventFromGraphMeetingMetadataAbsent(t *testing.T) {
+	// A plain appointment: no attendees/organizer/onlineMeeting keys at all
+	// (calendarView results and simple events) must parse to zero values.
+	var ge graphEvent
+	if err := json.Unmarshal([]byte(`{
+		"id": "plain1",
+		"subject": "Dentist",
+		"start": {"dateTime": "2026-07-23T10:00:00.0000000", "timeZone": "UTC"},
+		"end": {"dateTime": "2026-07-23T11:00:00.0000000", "timeZone": "UTC"}
+	}`), &ge); err != nil {
+		t.Fatalf("unmarshal plain JSON: %v", err)
+	}
+	ev, ok := eventFromGraph(ge)
+	if !ok {
+		t.Fatalf("eventFromGraph returned ok=false")
+	}
+	if len(ev.Attendees) != 0 || ev.Organizer != nil || ev.IsOnlineMeeting ||
+		ev.OnlineMeetingURL != "" || ev.IsCancelled || ev.MyResponse != "" {
+		t.Errorf("plain event carries meeting metadata: %+v", ev)
+	}
+}
+
+func TestEventFromGraphLegacyOnlineMeetingURL(t *testing.T) {
+	// onlineMeeting null but the legacy onlineMeetingUrl set: fall back.
+	var ge graphEvent
+	if err := json.Unmarshal([]byte(`{
+		"id": "legacy1",
+		"subject": "Old-style meeting",
+		"start": {"dateTime": "2026-07-23T10:00:00.0000000", "timeZone": "UTC"},
+		"end": {"dateTime": "2026-07-23T11:00:00.0000000", "timeZone": "UTC"},
+		"isOnlineMeeting": true,
+		"onlineMeeting": null,
+		"onlineMeetingUrl": "https://meet.example.com/legacy"
+	}`), &ge); err != nil {
+		t.Fatalf("unmarshal legacy JSON: %v", err)
+	}
+	ev, ok := eventFromGraph(ge)
+	if !ok {
+		t.Fatalf("eventFromGraph returned ok=false")
+	}
+	if want := "https://meet.example.com/legacy"; ev.OnlineMeetingURL != want {
+		t.Errorf("OnlineMeetingURL = %q, want legacy fallback %q", ev.OnlineMeetingURL, want)
+	}
+}
+
+func TestEventContentHashMeetingMetadata(t *testing.T) {
+	base := meetingEvent(t)
+	baseHash := eventContentHash(base)
+
+	// Volatile bookkeeping churn must NOT move the hash.
+	churned := base
+	churned.ChangeKey = "ck-other"
+	churned.LastModified = base.LastModified.Add(time.Hour)
+	if eventContentHash(churned) != baseHash {
+		t.Errorf("changeKey/lastModified churn moved the hash")
+	}
+
+	// Attendee ordering must not matter: the hash sorts attendees itself.
+	swapped := base
+	swapped.Attendees = []Attendee{base.Attendees[1], base.Attendees[0]}
+	if eventContentHash(swapped) != baseHash {
+		t.Errorf("attendee order moved the hash")
+	}
+
+	// Every meaningful meeting change must move the hash.
+	changes := map[string]func(*Event){
+		"attendee response": func(e *Event) {
+			attendees := append([]Attendee(nil), e.Attendees...)
+			attendees[1].Response = "accepted"
+			e.Attendees = attendees
+		},
+		"attendee added": func(e *Event) {
+			e.Attendees = append(append([]Attendee(nil), e.Attendees...),
+				Attendee{Name: "Carol", Email: "carol@example.com", Type: "required", Response: "notResponded"})
+		},
+		"attendee removed": func(e *Event) {
+			e.Attendees = e.Attendees[:1]
+		},
+		"cancelled": func(e *Event) {
+			e.IsCancelled = true
+		},
+		"join url": func(e *Event) {
+			e.OnlineMeetingURL = "https://teams.microsoft.com/l/meetup-join/other"
+		},
+		"my response": func(e *Event) {
+			e.MyResponse = "declined"
+		},
+		"organizer": func(e *Event) {
+			e.Organizer = &Person{Name: "New Org", Email: "neworg@example.com"}
+		},
+	}
+	for name, change := range changes {
+		ev := base
+		change(&ev)
+		if eventContentHash(ev) == baseHash {
+			t.Errorf("%s change did not move the hash", name)
+		}
 	}
 }

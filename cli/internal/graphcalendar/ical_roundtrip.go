@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -35,6 +36,10 @@ import (
 
 // icalProdID identifies durian-generated iCalendar documents.
 const icalProdID = "-//durian//graphcalendar//EN"
+
+// propTeamsMeetingURL is the Microsoft X-prop carrying the Teams join link;
+// khal and other clients look for it alongside URL.
+const propTeamsMeetingURL = "X-MICROSOFT-SKYPETEAMSMEETINGURL"
 
 // graphDateFormat is the "YYYY-MM-DD" layout of Graph recurrenceRange dates.
 const graphDateFormat = "2006-01-02"
@@ -47,6 +52,13 @@ const graphDateFormat = "2006-01-02"
 // Recurrence becomes an RRULE per the mapping documented in the file header;
 // an unmappable recurrence is dropped with a warning so the event itself still
 // round-trips.
+//
+// Read-only meeting metadata is surfaced as standard properties: ORGANIZER
+// (with CN), one ATTENDEE per attendee (CN/ROLE/PARTSTAT/RSVP, sorted by email
+// so the output is deterministic), URL plus X-MICROSOFT-SKYPETEAMSMEETINGURL
+// for the online-meeting join link, and STATUS:CANCELLED for cancelled
+// meetings. These are display-only — the upload path never sends them back to
+// Graph (see EventToGraphBody).
 func EventToICal(e Event) ([]byte, error) {
 	uid := e.ICalUID
 	if uid == "" {
@@ -89,6 +101,33 @@ func EventToICal(e Event) ([]byte, error) {
 		}
 	}
 
+	if e.Organizer != nil && e.Organizer.Email != "" {
+		ev.Props.Set(calAddressProp(ical.PropOrganizer, e.Organizer.Name, e.Organizer.Email))
+	}
+	for _, a := range sortedAttendees(e.Attendees) {
+		if a.Email == "" {
+			continue
+		}
+		prop := calAddressProp(ical.PropAttendee, a.Name, a.Email)
+		prop.Params.Set(ical.ParamRole, attendeeRole(a.Type))
+		prop.Params.Set(ical.ParamParticipationStatus, attendeePartStat(a.Response))
+		prop.Params.Set(ical.ParamRSVP, "TRUE")
+		ev.Props.Add(prop)
+	}
+	if e.OnlineMeetingURL != "" {
+		urlProp := ical.NewProp(ical.PropURL)
+		urlProp.Value = e.OnlineMeetingURL
+		ev.Props.Set(urlProp)
+		// khal and other clients pick the Teams join link up from the
+		// Microsoft X-prop as well.
+		teamsProp := ical.NewProp(propTeamsMeetingURL)
+		teamsProp.Value = e.OnlineMeetingURL
+		ev.Props.Set(teamsProp)
+	}
+	if e.IsCancelled {
+		ev.Props.SetText(ical.PropStatus, string(ical.EventCancelled))
+	}
+
 	cal := ical.NewCalendar()
 	cal.Props.SetText(ical.PropProductID, icalProdID)
 	cal.Props.SetText(ical.PropVersion, "2.0")
@@ -108,6 +147,61 @@ func normalizeText(s string) string {
 	return strings.ReplaceAll(s, "\r", "\n")
 }
 
+// calAddressProp builds a CAL-ADDRESS property (ORGANIZER/ATTENDEE): a
+// mailto: URI value with an optional CN parameter.
+func calAddressProp(name, cn, email string) *ical.Prop {
+	prop := ical.NewProp(name)
+	if cn != "" {
+		prop.Params.Set(ical.ParamCommonName, sanitizeParamValue(cn))
+	}
+	prop.Value = "mailto:" + email
+	return prop
+}
+
+// sanitizeParamValue makes a display name safe as an iCalendar parameter
+// value: go-ical quotes values containing ";:," itself but rejects double
+// quotes and CR/LF at encode time, so those are replaced.
+func sanitizeParamValue(s string) string {
+	s = strings.ReplaceAll(normalizeText(s), "\n", " ")
+	return strings.ReplaceAll(s, `"`, "'")
+}
+
+// sortedAttendees returns a copy of the attendee list sorted by email, so the
+// emitted ATTENDEE lines are deterministic regardless of Graph's ordering.
+func sortedAttendees(attendees []Attendee) []Attendee {
+	out := make([]Attendee, len(attendees))
+	copy(out, attendees)
+	sort.Slice(out, func(i, j int) bool { return out[i].Email < out[j].Email })
+	return out
+}
+
+// attendeeRole maps a Graph attendee type to an iCalendar ROLE.
+func attendeeRole(attendeeType string) string {
+	switch attendeeType {
+	case "optional":
+		return "OPT-PARTICIPANT"
+	case "resource":
+		return "NON-PARTICIPANT"
+	default: // "required" and anything unknown
+		return "REQ-PARTICIPANT"
+	}
+}
+
+// attendeePartStat maps a Graph response status to an iCalendar PARTSTAT. The
+// organizer implicitly attends, so "organizer" maps to ACCEPTED.
+func attendeePartStat(response string) string {
+	switch response {
+	case "accepted", "organizer":
+		return "ACCEPTED"
+	case "declined":
+		return "DECLINED"
+	case "tentativelyAccepted":
+		return "TENTATIVE"
+	default: // "none", "notResponded" and anything unknown
+		return "NEEDS-ACTION"
+	}
+}
+
 // MARK: - Parse
 
 // ICalToEvent parses a VCALENDAR containing a single VEVENT (the inverse of
@@ -116,6 +210,14 @@ func normalizeText(s string) string {
 // Recurrence; an RRULE outside the supported mapping leaves Recurrence nil
 // with a warning. ID/ChangeKey/Type are not part of the iCal representation
 // and stay empty.
+//
+// The read-only meeting metadata (ATTENDEE/ORGANIZER/URL/STATUS, see
+// EventToICal) is deliberately NOT parsed back: the upload path ignores those
+// fields anyway (Stage 1 never sends them to Graph), and several Graph enums
+// collapse to one PARTSTAT ("none" and "notResponded" both map to
+// NEEDS-ACTION), so a reparse could not reproduce the downloaded event
+// faithfully. The zero values keep local edits from ever carrying meeting
+// state.
 func ICalToEvent(data []byte) (Event, error) {
 	cal, err := ical.NewDecoder(bytes.NewReader(data)).Decode()
 	if err != nil {

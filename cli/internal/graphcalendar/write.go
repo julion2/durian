@@ -33,6 +33,10 @@ const graphWriteDateFormat = "2006-01-02T15:04:05"
 // recurrence key is always present — a Graph patternedRecurrence object for a
 // series, or null so a PATCH clears the recurrence when the local file
 // dropped its RRULE.
+//
+// Stage 1 is read-only for attendees/organizer/online-meeting — never
+// uploaded, so edits/creates never email attendees. Do NOT add attendees,
+// organizer, responseStatus, onlineMeeting or isCancelled here.
 func EventToGraphBody(e Event) map[string]any {
 	formatDT := func(t time.Time) string {
 		t = t.UTC()
