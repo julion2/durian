@@ -14,10 +14,14 @@ import (
 	"time"
 )
 
+// testOwnerEmail is the mailbox owner of every test client.
+const testOwnerEmail = "me@example.com"
+
 // testClient builds a Client pointed at the given httptest server, with a
 // static token so no OAuth path is exercised.
 func testClient(srv *httptest.Server) *Client {
 	return &Client{
+		owner:      testOwnerEmail,
 		httpClient: srv.Client(),
 		baseURL:    srv.URL,
 		tokenFn: func(context.Context) (string, error) {
@@ -399,8 +403,8 @@ func TestEventFromGraphMeetingMetadata(t *testing.T) {
 	if want := "https://teams.microsoft.com/l/meetup-join/abc123"; ev.OnlineMeetingURL != want {
 		t.Errorf("OnlineMeetingURL = %q, want %q", ev.OnlineMeetingURL, want)
 	}
-	if ev.MyResponse != "accepted" {
-		t.Errorf("MyResponse = %q, want accepted", ev.MyResponse)
+	if ev.OwnerResponse != OwnerRespAccepted {
+		t.Errorf("OwnerResponse = %q, want accepted", ev.OwnerResponse)
 	}
 	if ev.IsCancelled {
 		t.Errorf("IsCancelled = true, want false")
@@ -427,7 +431,7 @@ func TestEventFromGraphMeetingMetadataAbsent(t *testing.T) {
 		t.Fatalf("eventFromGraph returned ok=false")
 	}
 	if len(ev.Attendees) != 0 || ev.Organizer != nil || ev.IsOnlineMeeting ||
-		ev.OnlineMeetingURL != "" || ev.IsCancelled || ev.MyResponse != "" {
+		ev.OnlineMeetingURL != "" || ev.IsCancelled || ev.OwnerResponse != OwnerRespNone {
 		t.Errorf("plain event carries meeting metadata: %+v", ev)
 	}
 }
@@ -457,20 +461,20 @@ func TestEventFromGraphLegacyOnlineMeetingURL(t *testing.T) {
 
 func TestEventContentHashMeetingMetadata(t *testing.T) {
 	base := meetingEvent(t)
-	baseHash := eventContentHash(base)
+	baseHash := eventContentHash(base, testOwnerEmail)
 
 	// Volatile bookkeeping churn must NOT move the hash.
 	churned := base
 	churned.ChangeKey = "ck-other"
 	churned.LastModified = base.LastModified.Add(time.Hour)
-	if eventContentHash(churned) != baseHash {
+	if eventContentHash(churned, testOwnerEmail) != baseHash {
 		t.Errorf("changeKey/lastModified churn moved the hash")
 	}
 
 	// Attendee ordering must not matter: the hash sorts attendees itself.
 	swapped := base
 	swapped.Attendees = []Attendee{base.Attendees[1], base.Attendees[0]}
-	if eventContentHash(swapped) != baseHash {
+	if eventContentHash(swapped, testOwnerEmail) != baseHash {
 		t.Errorf("attendee order moved the hash")
 	}
 
@@ -494,9 +498,6 @@ func TestEventContentHashMeetingMetadata(t *testing.T) {
 		"join url": func(e *Event) {
 			e.OnlineMeetingURL = "https://teams.microsoft.com/l/meetup-join/other"
 		},
-		"my response": func(e *Event) {
-			e.MyResponse = "declined"
-		},
 		"organizer": func(e *Event) {
 			e.Organizer = &Person{Name: "New Org", Email: "neworg@example.com"}
 		},
@@ -504,8 +505,43 @@ func TestEventContentHashMeetingMetadata(t *testing.T) {
 	for name, change := range changes {
 		ev := base
 		change(&ev)
-		if eventContentHash(ev) == baseHash {
+		if eventContentHash(ev, testOwnerEmail) == baseHash {
 			t.Errorf("%s change did not move the hash", name)
 		}
+	}
+}
+
+func TestEventContentHashExcludesOwnerState(t *testing.T) {
+	// The owner's own RSVP — the responseStatus enum AND the owner's own
+	// attendee entry — must never move the content hash: an owner RSVP is
+	// handled by the ActionRsvp three-way diff, not as a content change.
+	base := meetingEvent(t)
+	base.Attendees = append(append([]Attendee(nil), base.Attendees...),
+		Attendee{Name: "Me", Email: "ME@example.com", Type: "required", Response: "notResponded"})
+	baseHash := eventContentHash(base, testOwnerEmail)
+
+	responded := base
+	responded.OwnerResponse = OwnerRespDeclined
+	attendees := append([]Attendee(nil), base.Attendees...)
+	attendees[len(attendees)-1].Response = "declined"
+	responded.Attendees = attendees
+	if eventContentHash(responded, testOwnerEmail) != baseHash {
+		t.Error("owner RSVP (responseStatus + own attendee entry, case-insensitive) moved the hash")
+	}
+
+	// Removing the owner's attendee entry entirely must not move it either.
+	withoutOwner := base
+	withoutOwner.Attendees = base.Attendees[:len(base.Attendees)-1]
+	if eventContentHash(withoutOwner, testOwnerEmail) != baseHash {
+		t.Error("presence of the owner's own attendee entry moved the hash")
+	}
+
+	// Another attendee's response still moves the hash.
+	other := base
+	attendees = append([]Attendee(nil), base.Attendees...)
+	attendees[0].Response = "declined"
+	other.Attendees = attendees
+	if eventContentHash(other, testOwnerEmail) == baseHash {
+		t.Error("another attendee's response change did not move the hash")
 	}
 }

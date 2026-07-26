@@ -6,6 +6,7 @@ go_library(
         "graphcalendar.go",
         "ical_roundtrip.go",
         "ics.go",
+        "notify.go",
         "state.go",
         "twosync.go",
         "vdir.go",
@@ -17,6 +18,7 @@ go_library(
         "//cli/internal/config",
         "//cli/internal/oauth",
         "@com_github_emersion_go_ical//:go-ical",
+        "@com_github_google_uuid//:uuid",
         "@com_github_teambition_rrule_go//:rrule-go",
     ],
 )

@@ -41,6 +41,12 @@ const icalProdID = "-//durian//graphcalendar//EN"
 // khal and other clients look for it alongside URL.
 const propTeamsMeetingURL = "X-MICROSOFT-SKYPETEAMSMEETINGURL"
 
+// propCreateTeamsMeeting is the durian marker property a user adds to a local
+// .ics to request a Teams online meeting on CREATE. It is honored one-shot:
+// EventToICal never re-emits it, so the post-create rewrite of the local file
+// drops it and the next sync is a no-op.
+const propCreateTeamsMeeting = "X-DURIAN-CREATE-TEAMS-MEETING"
+
 // graphDateFormat is the "YYYY-MM-DD" layout of Graph recurrenceRange dates.
 const graphDateFormat = "2006-01-02"
 
@@ -53,12 +59,13 @@ const graphDateFormat = "2006-01-02"
 // an unmappable recurrence is dropped with a warning so the event itself still
 // round-trips.
 //
-// Read-only meeting metadata is surfaced as standard properties: ORGANIZER
-// (with CN), one ATTENDEE per attendee (CN/ROLE/PARTSTAT/RSVP, sorted by email
-// so the output is deterministic), URL plus X-MICROSOFT-SKYPETEAMSMEETINGURL
-// for the online-meeting join link, and STATUS:CANCELLED for cancelled
-// meetings. These are display-only — the upload path never sends them back to
-// Graph (see EventToGraphBody).
+// Meeting metadata is surfaced as standard properties: ORGANIZER (with CN),
+// one ATTENDEE per attendee (CN/ROLE/PARTSTAT/RSVP, sorted by email so the
+// output is deterministic), URL plus X-MICROSOFT-SKYPETEAMSMEETINGURL for the
+// online-meeting join link, and STATUS:CANCELLED for cancelled meetings.
+// ATTENDEE and ORGANIZER round-trip through ICalToEvent; URL and STATUS are
+// display-only. The X-DURIAN-CREATE-TEAMS-MEETING marker is deliberately
+// never emitted, keeping it one-shot.
 func EventToICal(e Event) ([]byte, error) {
 	uid := e.ICalUID
 	if uid == "" {
@@ -211,14 +218,16 @@ func attendeePartStat(response string) string {
 // with a warning. ID/ChangeKey/Type are not part of the iCal representation
 // and stay empty.
 //
-// The read-only meeting metadata (ATTENDEE/ORGANIZER/URL/STATUS, see
-// EventToICal) is deliberately NOT parsed back: the upload path ignores those
-// fields anyway (Stage 1 never sends them to Graph), and several Graph enums
-// collapse to one PARTSTAT ("none" and "notResponded" both map to
-// NEEDS-ACTION), so a reparse could not reproduce the downloaded event
-// faithfully. The zero values keep local edits from ever carrying meeting
-// state.
-func ICalToEvent(data []byte) (Event, error) {
+// Meeting metadata is parsed back: every ATTENDEE line becomes an Attendee
+// (name from CN, type from ROLE, response from PARTSTAT — lossy where Graph
+// enums collapse: "none"/"notResponded" both render as NEEDS-ACTION and parse
+// back as "none") and ORGANIZER becomes Organizer. accountEmail identifies
+// the owner: OwnerResponse comes from the owner's own ATTENDEE line (matched
+// case-insensitively on the address), or OwnerRespOrganizer when the
+// ORGANIZER is the owner. URL and STATUS remain display-only and are not
+// parsed back. The X-DURIAN-CREATE-TEAMS-MEETING:TRUE marker sets
+// RequestOnlineMeeting (honored on create only, see createFromLocal).
+func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 	cal, err := ical.NewDecoder(bytes.NewReader(data)).Decode()
 	if err != nil {
 		return Event{}, fmt.Errorf("failed to decode iCal: %w", err)
@@ -279,6 +288,42 @@ func ICalToEvent(data []byte) (Event, error) {
 		}
 	}
 
+	var attendees []Attendee
+	for _, prop := range ev.Props[ical.PropAttendee] {
+		address := mailtoAddress(prop.Value)
+		if address == "" {
+			slog.Warn("Ignoring ATTENDEE without mailto address", "module", "GRAPHCAL", "uid", uid)
+			continue
+		}
+		attendees = append(attendees, Attendee{
+			Name:     prop.Params.Get(ical.ParamCommonName),
+			Email:    address,
+			Type:     attendeeTypeFromRole(prop.Params.Get(ical.ParamRole)),
+			Response: responseFromPartStat(prop.Params.Get(ical.ParamParticipationStatus)),
+		})
+	}
+	var organizer *Person
+	if prop := ev.Props.Get(ical.PropOrganizer); prop != nil {
+		if address := mailtoAddress(prop.Value); address != "" {
+			organizer = &Person{Name: prop.Params.Get(ical.ParamCommonName), Email: address}
+		}
+	}
+	ownerResponse := OwnerRespNone
+	for _, a := range attendees {
+		if accountEmail != "" && strings.EqualFold(a.Email, accountEmail) {
+			ownerResponse = ownerRespFromGraph(a.Response)
+		}
+	}
+	if organizer != nil && accountEmail != "" && strings.EqualFold(organizer.Email, accountEmail) {
+		ownerResponse = OwnerRespOrganizer
+	}
+
+	requestOnlineMeeting := false
+	if prop := ev.Props.Get(propCreateTeamsMeeting); prop != nil &&
+		strings.EqualFold(strings.TrimSpace(prop.Value), "TRUE") {
+		requestOnlineMeeting = true
+	}
+
 	return Event{
 		ICalUID:      uid,
 		Subject:      subject,
@@ -289,7 +334,52 @@ func ICalToEvent(data []byte) (Event, error) {
 		AllDay:       allDay,
 		LastModified: lastModified.UTC(),
 		Recurrence:   recurrence,
+
+		Attendees:            attendees,
+		Organizer:            organizer,
+		OwnerResponse:        ownerResponse,
+		RequestOnlineMeeting: requestOnlineMeeting,
 	}, nil
+}
+
+// mailtoAddress extracts the email address from a CAL-ADDRESS value
+// ("mailto:user@host", scheme case-insensitive); "" when it is no mailto URI.
+func mailtoAddress(value string) string {
+	const scheme = "mailto:"
+	if len(value) <= len(scheme) || !strings.EqualFold(value[:len(scheme)], scheme) {
+		return ""
+	}
+	return value[len(scheme):]
+}
+
+// attendeeTypeFromRole maps an iCalendar ROLE back to the Graph attendee
+// type — the inverse of attendeeRole.
+func attendeeTypeFromRole(role string) string {
+	switch strings.ToUpper(role) {
+	case "OPT-PARTICIPANT":
+		return "optional"
+	case "NON-PARTICIPANT":
+		return "resource"
+	default: // REQ-PARTICIPANT, CHAIR, absent, unknown
+		return "required"
+	}
+}
+
+// responseFromPartStat maps an iCalendar PARTSTAT back to the Graph response
+// enum — the (lossy) inverse of attendeePartStat: NEEDS-ACTION covers both
+// "none" and "notResponded" and parses back as "none"; "organizer" rendered
+// as ACCEPTED parses back as "accepted".
+func responseFromPartStat(partStat string) string {
+	switch strings.ToUpper(partStat) {
+	case "ACCEPTED":
+		return "accepted"
+	case "DECLINED":
+		return "declined"
+	case "TENTATIVE":
+		return "tentativelyAccepted"
+	default: // NEEDS-ACTION, absent, unknown
+		return "none"
+	}
 }
 
 // MARK: - Recurrence mapping

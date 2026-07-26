@@ -49,7 +49,7 @@ func TestICalRoundTripTimed(t *testing.T) {
 		t.Errorf("ICS contains bare newlines:\n%s", ics)
 	}
 
-	got, err := ICalToEvent(data)
+	got, err := ICalToEvent(data, "")
 	if err != nil {
 		t.Fatalf("ICalToEvent: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestICalRoundTripAllDay(t *testing.T) {
 		t.Errorf("all-day ICS must not contain a timed DTSTART:\n%s", ics)
 	}
 
-	got, err := ICalToEvent(data)
+	got, err := ICalToEvent(data, "")
 	if err != nil {
 		t.Fatalf("ICalToEvent: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestICalRoundTripWeeklyRecurrence(t *testing.T) {
 		t.Errorf("ICS missing %q:\n%s", wantRRule, ics)
 	}
 
-	got, err := ICalToEvent(data)
+	got, err := ICalToEvent(data, "")
 	if err != nil {
 		t.Fatalf("ICalToEvent: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestICalRoundTripNumberedDaily(t *testing.T) {
 		t.Errorf("ICS missing %q:\n%s", want, data)
 	}
 
-	got, err := ICalToEvent(data)
+	got, err := ICalToEvent(data, "")
 	if err != nil {
 		t.Fatalf("ICalToEvent: %v", err)
 	}
@@ -310,8 +310,8 @@ func TestFetchMasterEvents(t *testing.T) {
 		t.Fatalf("expected 2 pages fetched, got %d", len(preferHeaders))
 	}
 	for i, h := range preferHeaders {
-		if h != `outlook.timezone="UTC"` {
-			t.Errorf("page %d Prefer header = %q, want outlook.timezone UTC", i+1, h)
+		if h != `outlook.timezone="UTC", IdType="ImmutableId"` {
+			t.Errorf("page %d Prefer header = %q, want outlook.timezone UTC + immutable ids", i+1, h)
 		}
 	}
 
@@ -374,7 +374,7 @@ func TestEventToICalMeetingMetadata(t *testing.T) {
 		Organizer:        &Person{Name: "Olivia Organizer", Email: "olivia@example.com"},
 		IsOnlineMeeting:  true,
 		OnlineMeetingURL: "https://teams.microsoft.com/l/meetup-join/abc123",
-		MyResponse:       "accepted",
+		OwnerResponse:    OwnerRespAccepted,
 	}
 
 	data, err := EventToICal(orig)
@@ -406,17 +406,124 @@ func TestEventToICalMeetingMetadata(t *testing.T) {
 		t.Errorf("attendees not sorted by email:\n%s", ics)
 	}
 
-	// The document must still parse; meeting metadata is display-only and is
-	// deliberately not parsed back into the Event.
-	got, err := ICalToEvent(data)
+	// The document must parse back with attendees and organizer intact
+	// (attendees sorted by email); URL stays display-only.
+	got, err := ICalToEvent(data, "")
 	if err != nil {
 		t.Fatalf("ICalToEvent: %v", err)
 	}
 	if got.Subject != orig.Subject || !got.Start.Equal(orig.Start) {
 		t.Errorf("core fields lost: %+v", got)
 	}
-	if len(got.Attendees) != 0 || got.Organizer != nil || got.OnlineMeetingURL != "" {
-		t.Errorf("meeting metadata unexpectedly parsed back: %+v", got)
+	wantAttendees := []Attendee{
+		{Name: "Alice Example", Email: "alice@example.com", Type: "required", Response: "accepted"},
+		{Name: "Bob Example", Email: "bob@example.com", Type: "optional", Response: "declined"},
+	}
+	if !reflect.DeepEqual(got.Attendees, wantAttendees) {
+		t.Errorf("Attendees = %+v, want %+v", got.Attendees, wantAttendees)
+	}
+	if got.Organizer == nil || got.Organizer.Email != "olivia@example.com" || got.Organizer.Name != "Olivia Organizer" {
+		t.Errorf("Organizer = %+v, want Olivia Organizer <olivia@example.com>", got.Organizer)
+	}
+	if got.OnlineMeetingURL != "" {
+		t.Errorf("OnlineMeetingURL = %q, want display-only (not parsed back)", got.OnlineMeetingURL)
+	}
+}
+
+func TestICalRoundTripMeetingMetadata(t *testing.T) {
+	// Golden round-trip: ICalToEvent(EventToICal(ev), owner) preserves
+	// Attendees, Organizer and OwnerResponse for representable values.
+	orig := Event{
+		ID:      "MEET2",
+		ICalUID: "ical-meet2",
+		Subject: "Planning",
+		Start:   time.Date(2026, 8, 3, 9, 0, 0, 0, time.UTC),
+		End:     time.Date(2026, 8, 3, 10, 0, 0, 0, time.UTC),
+		Attendees: []Attendee{
+			{Name: "Alice Example", Email: "alice@example.com", Type: "required", Response: "accepted"},
+			{Name: "Bob Example", Email: "bob@example.com", Type: "optional", Response: "tentativelyAccepted"},
+			{Name: "Me Myself", Email: "me@example.com", Type: "required", Response: "declined"},
+		},
+		Organizer:     &Person{Name: "Olivia Organizer", Email: "olivia@example.com"},
+		OwnerResponse: OwnerRespDeclined,
+	}
+
+	data, err := EventToICal(orig)
+	if err != nil {
+		t.Fatalf("EventToICal: %v", err)
+	}
+	got, err := ICalToEvent(data, "ME@EXAMPLE.COM") // owner match is case-insensitive
+	if err != nil {
+		t.Fatalf("ICalToEvent: %v", err)
+	}
+
+	if !reflect.DeepEqual(got.Attendees, orig.Attendees) {
+		t.Errorf("Attendees = %+v, want %+v", got.Attendees, orig.Attendees)
+	}
+	if got.Organizer == nil || *got.Organizer != *orig.Organizer {
+		t.Errorf("Organizer = %+v, want %+v", got.Organizer, orig.Organizer)
+	}
+	if got.OwnerResponse != OwnerRespDeclined {
+		t.Errorf("OwnerResponse = %q, want declined (from the owner's ATTENDEE PARTSTAT)", got.OwnerResponse)
+	}
+	if got.RequestOnlineMeeting {
+		t.Error("RequestOnlineMeeting = true without a marker")
+	}
+}
+
+func TestICalToEventOwnerAsOrganizer(t *testing.T) {
+	data, err := EventToICal(Event{
+		ID:        "ORG1",
+		ICalUID:   "ical-org1",
+		Subject:   "My meeting",
+		Start:     time.Date(2026, 8, 3, 9, 0, 0, 0, time.UTC),
+		End:       time.Date(2026, 8, 3, 10, 0, 0, 0, time.UTC),
+		Organizer: &Person{Name: "Me", Email: "me@example.com"},
+		Attendees: []Attendee{
+			{Name: "Alice", Email: "alice@example.com", Type: "required", Response: "none"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("EventToICal: %v", err)
+	}
+	got, err := ICalToEvent(data, "me@example.com")
+	if err != nil {
+		t.Fatalf("ICalToEvent: %v", err)
+	}
+	if got.OwnerResponse != OwnerRespOrganizer {
+		t.Errorf("OwnerResponse = %q, want organizer (ORGANIZER matches owner)", got.OwnerResponse)
+	}
+}
+
+func TestICalToEventTeamsMarker(t *testing.T) {
+	data, err := EventToICal(Event{
+		ID:      "TEAMS1",
+		ICalUID: "ical-teams1",
+		Subject: "Teams meeting",
+		Start:   time.Date(2026, 8, 3, 9, 0, 0, 0, time.UTC),
+		End:     time.Date(2026, 8, 3, 10, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("EventToICal: %v", err)
+	}
+	marked := strings.Replace(string(data), "END:VEVENT",
+		"X-DURIAN-CREATE-TEAMS-MEETING:TRUE\r\nEND:VEVENT", 1)
+
+	got, err := ICalToEvent([]byte(marked), "me@example.com")
+	if err != nil {
+		t.Fatalf("ICalToEvent: %v", err)
+	}
+	if !got.RequestOnlineMeeting {
+		t.Error("RequestOnlineMeeting = false, want true (marker present)")
+	}
+
+	// EventToICal never re-emits the marker: one-shot by construction.
+	rendered, err := EventToICal(got)
+	if err != nil {
+		t.Fatalf("EventToICal re-render: %v", err)
+	}
+	if strings.Contains(string(rendered), "X-DURIAN-CREATE-TEAMS-MEETING") {
+		t.Error("re-rendered ICS still carries the Teams marker")
 	}
 }
 

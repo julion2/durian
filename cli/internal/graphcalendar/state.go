@@ -39,6 +39,16 @@ type ItemStatus struct {
 	// LocalHash is the SHA-256 hex digest of the local .ics file bytes at last
 	// sync; a differing current hash means the local side changed.
 	LocalHash string `json:"local_hash"`
+	// OwnerResponse is the owner's RSVP at last sync — the baseline B of the
+	// ActionRsvp three-way diff (local L vs baseline B vs remote R). The zero
+	// value ("", None) doubles as the pre-Stage-2 default, which the
+	// idempotency guard re-baselines without any Graph call.
+	OwnerResponse OwnerResp `json:"owner_response,omitempty"`
+	// AttendeeHash is the attendeeSetHash of the attendee set (emails+types,
+	// responses excluded) at last sync, so an attendee add/remove is detected
+	// as a real scheduling change and attendee-only edits can be scoped into
+	// their own PATCH. "" means unknown (pre-Stage-2 status file).
+	AttendeeHash string `json:"attendee_hash,omitempty"`
 }
 
 // CalendarStatus is the sync status of one calendar: one ItemStatus per item

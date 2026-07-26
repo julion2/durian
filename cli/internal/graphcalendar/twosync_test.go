@@ -32,10 +32,9 @@ func masterEvent(id, uid, subject, changeKey string) map[string]any {
 	}
 }
 
-// contentHashOf decodes one fake master-event JSON object exactly like the
-// client does and returns its eventContentHash — the expected RemoteHash
-// baseline after syncing against that event.
-func contentHashOf(t *testing.T, m map[string]any) string {
+// eventOf decodes one fake master-event JSON object exactly like the client
+// does.
+func eventOf(t *testing.T, m map[string]any) Event {
 	t.Helper()
 	data, err := json.Marshal(m)
 	if err != nil {
@@ -49,7 +48,40 @@ func contentHashOf(t *testing.T, m map[string]any) string {
 	if !ok {
 		t.Fatal("eventFromGraph rejected the fake master event")
 	}
-	return eventContentHash(ev)
+	return ev
+}
+
+// contentHashOf returns the eventContentHash of one fake master-event JSON
+// object — the expected RemoteHash baseline after syncing against it.
+func contentHashOf(t *testing.T, m map[string]any) string {
+	t.Helper()
+	return eventContentHash(eventOf(t, m), testOwnerEmail)
+}
+
+// att builds one Graph attendee JSON object.
+func att(name, email, typ, resp string) map[string]any {
+	return map[string]any{
+		"type":         typ,
+		"status":       map[string]any{"response": resp},
+		"emailAddress": map[string]any{"name": name, "address": email},
+	}
+}
+
+// meetingMaster builds a Graph master-event JSON object for a meeting: the
+// organizer is the owner (isOrganizer=true) or organizer@example.com, myResp
+// is the owner's responseStatus, and attendees are Graph attendee objects
+// (see att).
+func meetingMaster(id, uid, subject, changeKey string, isOrganizer bool, myResp string, attendees ...map[string]any) map[string]any {
+	m := masterEvent(id, uid, subject, changeKey)
+	organizer := "organizer@example.com"
+	if isOrganizer {
+		organizer = testOwnerEmail
+	}
+	m["attendees"] = attendees
+	m["organizer"] = map[string]any{"emailAddress": map[string]any{"name": "Org", "address": organizer}}
+	m["isOrganizer"] = isOrganizer
+	m["responseStatus"] = map[string]any{"response": myResp}
+	return m
 }
 
 // syncHarness serves the Graph read and write endpoints of calendar cal1 from
@@ -79,21 +111,45 @@ type syncHarness struct {
 	// without one fails the test.
 	patchResponses map[string]map[string]any
 	patchBodies    map[string]map[string]any
-	deletedIDs     []string
+	// patchStatus, when non-zero, is returned for every PATCH instead of the
+	// configured response (e.g. 412 for If-Match tests).
+	patchStatus  int
+	patchIfMatch map[string]string
+	deletedIDs   []string
 	// deleteStatus is the HTTP status for DELETE (default 204).
-	deleteStatus int
-	// mutations counts every POST/PATCH/DELETE received.
+	deleteStatus  int
+	deleteIfMatch map[string]string
+	// rsvpCalls records every POST /me/events/{id}/{accept|decline|
+	// tentativelyAccept} with its sendResponse flag.
+	rsvpCalls []rsvpCall
+	// mutations counts every POST/PATCH/DELETE received — ANY write endpoint.
 	mutations int
+	// notifications counts writes that actually make Graph send mail: creates
+	// with attendees, patches/deletes of ids registered in organizerMeeting,
+	// and RSVP posts with sendResponse=true.
+	notifications int
+	// organizerMeeting marks event ids that are organizer-owned meetings with
+	// attendees, i.e. whose PATCH/DELETE notifies the attendees.
+	organizerMeeting map[string]bool
+}
+
+type rsvpCall struct {
+	ID   string
+	Verb string
+	Send bool
 }
 
 func newSyncHarness(t *testing.T) *syncHarness {
 	t.Helper()
 	h := &syncHarness{
-		t:            t,
-		calDir:       t.TempDir(),
-		status:       CalendarStatus{Items: map[string]ItemStatus{}},
-		patchBodies:  map[string]map[string]any{},
-		deleteStatus: http.StatusNoContent,
+		t:                t,
+		calDir:           t.TempDir(),
+		status:           CalendarStatus{Items: map[string]ItemStatus{}},
+		patchBodies:      map[string]map[string]any{},
+		patchIfMatch:     map[string]string{},
+		deleteStatus:     http.StatusNoContent,
+		deleteIfMatch:    map[string]string{},
+		organizerMeeting: map[string]bool{},
 	}
 
 	mux := http.NewServeMux()
@@ -110,6 +166,9 @@ func newSyncHarness(t *testing.T) *syncHarness {
 			t.Errorf("decode create body: %v", err)
 		}
 		h.createBodies = append(h.createBodies, body)
+		if attendees, ok := body["attendees"].([]any); ok && len(attendees) > 0 {
+			h.notifications++ // a create with attendees sends invitations
+		}
 		if h.createResponse == nil {
 			t.Error("unexpected POST create (no createResponse configured)")
 			w.WriteHeader(http.StatusInternalServerError)
@@ -120,6 +179,25 @@ func newSyncHarness(t *testing.T) *syncHarness {
 		if err := json.NewEncoder(w).Encode(h.createResponse); err != nil {
 			t.Errorf("encode create response: %v", err)
 		}
+	})
+	mux.HandleFunc("POST /me/events/{id}/{verb}", func(w http.ResponseWriter, r *http.Request) {
+		h.mutations++
+		id, verb := r.PathValue("id"), r.PathValue("verb")
+		if verb != "accept" && verb != "decline" && verb != "tentativelyAccept" {
+			t.Errorf("unexpected POST /me/events/%s/%s", id, verb)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode rsvp body: %v", err)
+		}
+		send, _ := body["sendResponse"].(bool)
+		h.rsvpCalls = append(h.rsvpCalls, rsvpCall{ID: id, Verb: verb, Send: send})
+		if send {
+			h.notifications++ // the organizer receives a response email
+		}
+		w.WriteHeader(http.StatusAccepted)
 	})
 	mux.HandleFunc("GET /me/events/{id}", func(w http.ResponseWriter, r *http.Request) {
 		resp, ok := h.getResponses[r.PathValue("id")]
@@ -135,11 +213,19 @@ func newSyncHarness(t *testing.T) *syncHarness {
 	mux.HandleFunc("PATCH /me/events/{id}", func(w http.ResponseWriter, r *http.Request) {
 		h.mutations++
 		id := r.PathValue("id")
+		h.patchIfMatch[id] = r.Header.Get("If-Match")
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("decode patch body: %v", err)
 		}
 		h.patchBodies[id] = body
+		if h.organizerMeeting[id] {
+			h.notifications++ // an organizer edit of a meeting notifies the attendees
+		}
+		if h.patchStatus != 0 {
+			w.WriteHeader(h.patchStatus)
+			return
+		}
 		resp, ok := h.patchResponses[id]
 		if !ok {
 			t.Errorf("unexpected PATCH for %s (no patchResponse configured)", id)
@@ -153,7 +239,12 @@ func newSyncHarness(t *testing.T) *syncHarness {
 	})
 	mux.HandleFunc("DELETE /me/events/{id}", func(w http.ResponseWriter, r *http.Request) {
 		h.mutations++
-		h.deletedIDs = append(h.deletedIDs, r.PathValue("id"))
+		id := r.PathValue("id")
+		h.deletedIDs = append(h.deletedIDs, id)
+		h.deleteIfMatch[id] = r.Header.Get("If-Match")
+		if h.organizerMeeting[id] {
+			h.notifications++ // cancelling an organizer meeting notifies the attendees
+		}
 		w.WriteHeader(h.deleteStatus)
 	})
 
@@ -207,6 +298,38 @@ func (h *syncHarness) writeLocal(uid, subject string) string {
 		h.t.Fatalf("write local ics: %v", err)
 	}
 	return path
+}
+
+// rewriteLocal simulates a user edit of a downloaded .ics: parse (as the
+// owner), mutate, re-serialize, write back.
+func (h *syncHarness) rewriteLocal(uid string, mutate func(*Event)) {
+	h.t.Helper()
+	path := h.icsPath(uid)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		h.t.Fatalf("read local ics: %v", err)
+	}
+	ev, err := ICalToEvent(data, testOwnerEmail)
+	if err != nil {
+		h.t.Fatalf("parse local ics: %v", err)
+	}
+	mutate(&ev)
+	out, err := EventToICal(ev)
+	if err != nil {
+		h.t.Fatalf("serialize local ics: %v", err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		h.t.Fatalf("write local ics: %v", err)
+	}
+}
+
+// setOwnerPartstat flips the owner's own attendee response in an Event.
+func setOwnerPartstat(ev *Event, response string) {
+	for i := range ev.Attendees {
+		if strings.EqualFold(ev.Attendees[i].Email, testOwnerEmail) {
+			ev.Attendees[i].Response = response
+		}
+	}
 }
 
 // conflictBackups returns the .conflict-* backups of the given file.
@@ -797,7 +920,7 @@ func TestScanLocalItemsSkipsBadFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	items, err := scanLocalItems(h.calDir)
+	items, err := scanLocalItems(h.calDir, testOwnerEmail)
 	if err != nil {
 		t.Fatalf("scanLocalItems: %v", err)
 	}
@@ -836,7 +959,7 @@ func TestEventContentHashIgnoresVolatileFields(t *testing.T) {
 	churned.ChangeKey = "ck-churned"
 	churned.LastModified = base.LastModified.Add(48 * time.Hour)
 	churned.Type = "seriesMaster"
-	if eventContentHash(churned) != eventContentHash(base) {
+	if eventContentHash(churned, testOwnerEmail) != eventContentHash(base, testOwnerEmail) {
 		t.Error("hash must ignore ID/ICalUID/ChangeKey/LastModified/Type")
 	}
 
@@ -845,7 +968,7 @@ func TestEventContentHashIgnoresVolatileFields(t *testing.T) {
 	crlf.Description = "line1\r\nline2"
 	lf := base
 	lf.Description = "line1\nline2"
-	if eventContentHash(crlf) != eventContentHash(lf) {
+	if eventContentHash(crlf, testOwnerEmail) != eventContentHash(lf, testOwnerEmail) {
 		t.Error("hash must normalize description line endings")
 	}
 
@@ -866,7 +989,7 @@ func TestEventContentHashIgnoresVolatileFields(t *testing.T) {
 	} {
 		changed := base
 		mutate(&changed)
-		if eventContentHash(changed) == eventContentHash(base) {
+		if eventContentHash(changed, testOwnerEmail) == eventContentHash(base, testOwnerEmail) {
 			t.Errorf("hash must change when %s changes", name)
 		}
 	}
@@ -922,5 +1045,644 @@ func TestFileStateStoreRoundTrip(t *testing.T) {
 	}
 	if len(recovered.Calendars) != 0 {
 		t.Errorf("corrupted state not treated as empty: %+v", recovered)
+	}
+}
+
+// MARK: - Owner RSVP
+
+func TestRSVPSendsOnlyOnRealResponseChange(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{meetingMaster("g1", "uid-1", "Design sync", "ck1", false, "accepted",
+		att("Me", testOwnerEmail, "required", "accepted"),
+		att("Alice", "alice@example.com", "required", "accepted"))}
+	h.sync(SyncOptions{})
+
+	// The user flips their own PARTSTAT to DECLINED — nothing else.
+	h.rewriteLocal("uid-1", func(ev *Event) { setOwnerPartstat(ev, "declined") })
+
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{Rsvps: 1}) {
+		t.Fatalf("stats = %+v, want Rsvps=1 only", stats)
+	}
+	if len(h.rsvpCalls) != 1 || h.rsvpCalls[0] != (rsvpCall{ID: "g1", Verb: "decline", Send: true}) {
+		t.Fatalf("rsvpCalls = %+v, want exactly one decline with sendResponse=true", h.rsvpCalls)
+	}
+	if h.mutations != 1 {
+		t.Errorf("mutations = %d, want 1 (the decline only)", h.mutations)
+	}
+	if st := h.status.Items["uid-1"]; st.OwnerResponse != OwnerRespDeclined {
+		t.Errorf("baseline OwnerResponse = %q, want declined", st.OwnerResponse)
+	}
+
+	// Remote now reflects the decline (churned changeKey): clean no-op, no
+	// second RSVP.
+	h.events = []map[string]any{meetingMaster("g1", "uid-1", "Design sync", "ck-churned", false, "declined",
+		att("Me", testOwnerEmail, "required", "declined"),
+		att("Alice", "alice@example.com", "required", "accepted"))}
+	if stats := h.sync(SyncOptions{}); stats != (SyncStats{}) {
+		t.Fatalf("third run stats = %+v, want all zero", stats)
+	}
+	if len(h.rsvpCalls) != 1 {
+		t.Errorf("rsvpCalls = %+v, want still exactly one", h.rsvpCalls)
+	}
+}
+
+func TestRSVPSilentFlag(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{meetingMaster("g1", "uid-1", "Design sync", "ck1", false, "accepted",
+		att("Me", testOwnerEmail, "required", "accepted"),
+		att("Alice", "alice@example.com", "required", "accepted"))}
+	h.sync(SyncOptions{})
+	h.rewriteLocal("uid-1", func(ev *Event) { setOwnerPartstat(ev, "tentativelyAccepted") })
+
+	stats := h.sync(SyncOptions{SilentRSVP: true})
+	if stats != (SyncStats{Rsvps: 1}) {
+		t.Fatalf("stats = %+v, want Rsvps=1 only", stats)
+	}
+	if len(h.rsvpCalls) != 1 || h.rsvpCalls[0] != (rsvpCall{ID: "g1", Verb: "tentativelyAccept", Send: false}) {
+		t.Fatalf("rsvpCalls = %+v, want one tentativelyAccept with sendResponse=false", h.rsvpCalls)
+	}
+	if h.notifications != 0 {
+		t.Errorf("notifications = %d, want 0 (silent RSVP)", h.notifications)
+	}
+}
+
+func TestRSVPLossyPartstatRoundTripIsNoop(t *testing.T) {
+	t.Run("owner listed as attendee", func(t *testing.T) {
+		h := newSyncHarness(t)
+		h.events = []map[string]any{meetingMaster("g1", "uid-1", "Design sync", "ck1", false, "accepted",
+			att("Me", testOwnerEmail, "required", "accepted"),
+			att("Alice", "alice@example.com", "required", "notResponded"))}
+		h.sync(SyncOptions{})
+
+		h.events = []map[string]any{meetingMaster("g1", "uid-1", "Design sync", "ck-churned", false, "accepted",
+			att("Me", testOwnerEmail, "required", "accepted"),
+			att("Alice", "alice@example.com", "required", "notResponded"))}
+		if stats := h.sync(SyncOptions{}); stats != (SyncStats{}) {
+			t.Fatalf("re-sync stats = %+v, want all zero", stats)
+		}
+		if len(h.rsvpCalls) != 0 || h.mutations != 0 {
+			t.Errorf("re-sync performed rsvp/mutations: %+v / %d", h.rsvpCalls, h.mutations)
+		}
+	})
+
+	t.Run("owner absent from attendee list", func(t *testing.T) {
+		// The local file cannot express the owner's response at all (L=None
+		// after the lossy round-trip); the accepted baseline must never turn
+		// into an un-respond or any other call.
+		h := newSyncHarness(t)
+		var m map[string]any
+		if err := json.Unmarshal([]byte(meetingGraphJSON), &m); err != nil {
+			t.Fatal(err)
+		}
+		h.events = []map[string]any{m}
+		h.sync(SyncOptions{})
+
+		var m2 map[string]any
+		if err := json.Unmarshal([]byte(meetingGraphJSON), &m2); err != nil {
+			t.Fatal(err)
+		}
+		m2["changeKey"] = "ck-churned"
+		h.events = []map[string]any{m2}
+		if stats := h.sync(SyncOptions{}); stats != (SyncStats{}) {
+			t.Fatalf("re-sync stats = %+v, want all zero", stats)
+		}
+		if len(h.rsvpCalls) != 0 || h.mutations != 0 {
+			t.Errorf("re-sync performed rsvp/mutations: %+v / %d", h.rsvpCalls, h.mutations)
+		}
+	})
+}
+
+func TestRSVPIdempotentWhenLocalMatchesRemote(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{meetingMaster("g1", "uid-1", "Design sync", "ck1", false, "accepted",
+		att("Me", testOwnerEmail, "required", "accepted"),
+		att("Alice", "alice@example.com", "required", "accepted"))}
+	h.sync(SyncOptions{})
+
+	// The user declined locally AND the response is already recorded in
+	// Outlook (L == R != B): rebaseline only, no Graph call.
+	h.rewriteLocal("uid-1", func(ev *Event) { setOwnerPartstat(ev, "declined") })
+	h.events = []map[string]any{meetingMaster("g1", "uid-1", "Design sync", "ck-churned", false, "declined",
+		att("Me", testOwnerEmail, "required", "declined"),
+		att("Alice", "alice@example.com", "required", "accepted"))}
+
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{}) {
+		t.Fatalf("stats = %+v, want all zero (rebaseline only)", stats)
+	}
+	if len(h.rsvpCalls) != 0 || h.mutations != 0 {
+		t.Fatalf("idempotency guard failed: rsvpCalls=%+v mutations=%d", h.rsvpCalls, h.mutations)
+	}
+	if st := h.status.Items["uid-1"]; st.OwnerResponse != OwnerRespDeclined {
+		t.Errorf("baseline OwnerResponse = %q, want rebaselined to declined", st.OwnerResponse)
+	}
+
+	// And the rebaseline sticks: another run does nothing.
+	if stats := h.sync(SyncOptions{}); stats != (SyncStats{}) {
+		t.Fatalf("second run stats = %+v, want all zero", stats)
+	}
+}
+
+// MARK: - Organizer vs non-meeting writes
+
+func TestOrganizerContentEditNotifiesAttendees(t *testing.T) {
+	attendees := func(aliceResp string) []map[string]any {
+		return []map[string]any{
+			att("Alice", "alice@example.com", "required", aliceResp),
+			att("Bob", "bob@example.com", "optional", "notResponded"),
+		}
+	}
+	h := newSyncHarness(t)
+	h.events = []map[string]any{meetingMaster("g1", "uid-1", "Roadmap", "ck1", true, "organizer", attendees("accepted")...)}
+	h.sync(SyncOptions{})
+
+	h.rewriteLocal("uid-1", func(ev *Event) { ev.Subject = "Roadmap v2" })
+	h.organizerMeeting["g1"] = true
+	h.patchResponses = map[string]map[string]any{"g1": {"id": "g1", "changeKey": "ck2"}}
+	h.getResponses = map[string]map[string]any{
+		"g1": meetingMaster("g1", "uid-1", "Roadmap v2", "ck2", true, "organizer", attendees("accepted")...),
+	}
+
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{Uploaded: 1}) {
+		t.Fatalf("stats = %+v, want Uploaded=1 only", stats)
+	}
+	if h.patchBodies["g1"] == nil || h.patchBodies["g1"]["subject"] != "Roadmap v2" {
+		t.Errorf("PATCH body = %v, want subject Roadmap v2", h.patchBodies["g1"])
+	}
+	// Attendee set unchanged: the PATCH must not re-send the attendee list.
+	if _, ok := h.patchBodies["g1"]["attendees"]; ok {
+		t.Error("content-only edit must not include attendees in the PATCH")
+	}
+	if h.patchIfMatch["g1"] != "ck1" {
+		t.Errorf("PATCH If-Match = %q, want the planned changeKey ck1", h.patchIfMatch["g1"])
+	}
+	if h.notifications != 1 {
+		t.Errorf("notifications = %d, want 1 (attendees notified of the update)", h.notifications)
+	}
+}
+
+func TestNonMeetingEditSendsNothing(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{masterEvent("g1", "uid-1", "Standup", "ck1")}
+	h.sync(SyncOptions{})
+
+	h.writeLocal("uid-1", "Standup v2")
+	h.patchResponses = map[string]map[string]any{"g1": {"id": "g1", "changeKey": "ck2"}}
+	h.getResponses = map[string]map[string]any{"g1": masterEvent("g1", "uid-1", "Standup v2", "ck2")}
+
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{Uploaded: 1}) {
+		t.Fatalf("stats = %+v, want Uploaded=1 only", stats)
+	}
+	if h.notifications != 0 {
+		t.Errorf("notifications = %d, want 0 for a plain appointment edit", h.notifications)
+	}
+	if _, ok := h.patchBodies["g1"]["attendees"]; ok {
+		t.Error("plain appointment PATCH must not carry attendees")
+	}
+}
+
+func TestUploadCreateWithAttendeesInvites(t *testing.T) {
+	h := newSyncHarness(t)
+	data, err := EventToICal(Event{
+		ICalUID:      "uid-local",
+		Subject:      "Kickoff",
+		Start:        time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC),
+		End:          time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC),
+		LastModified: time.Date(2026, 7, 29, 8, 0, 0, 0, time.UTC),
+		Attendees: []Attendee{
+			{Name: "Alice", Email: "alice@example.com", Type: "required", Response: "none"},
+			{Name: "Bob", Email: "bob@example.com", Type: "optional", Response: "none"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.icsPath("uid-local"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	created := meetingMaster("g-new", "remote-uid-1", "Kickoff", "ck-new", true, "organizer",
+		att("Alice", "alice@example.com", "required", "none"),
+		att("Bob", "bob@example.com", "optional", "none"))
+	h.createResponse = created
+	h.getResponses = map[string]map[string]any{"g-new": created}
+
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{Uploaded: 1}) {
+		t.Fatalf("stats = %+v, want Uploaded=1 only", stats)
+	}
+	if len(h.createBodies) != 1 {
+		t.Fatalf("createBodies = %d, want exactly one POST", len(h.createBodies))
+	}
+	body := h.createBodies[0]
+	attendeesSent, _ := body["attendees"].([]any)
+	if len(attendeesSent) != 2 {
+		t.Errorf("POST attendees = %v, want 2 entries", body["attendees"])
+	}
+	if txn, _ := body["transactionId"].(string); txn == "" {
+		t.Error("POST body missing transactionId (create retry dedup)")
+	}
+	if _, ok := body["organizer"]; ok {
+		t.Error("POST body must never carry an organizer")
+	}
+	if h.notifications != 1 {
+		t.Errorf("notifications = %d, want 1 (one invitation wave)", h.notifications)
+	}
+
+	// Re-sync of the settled event is a clean no-op: no second invite wave.
+	h.events = []map[string]any{meetingMaster("g-new", "remote-uid-1", "Kickoff", "ck-churned", true, "organizer",
+		att("Alice", "alice@example.com", "required", "none"),
+		att("Bob", "bob@example.com", "optional", "none"))}
+	if stats := h.sync(SyncOptions{}); stats != (SyncStats{}) {
+		t.Fatalf("second run stats = %+v, want all zero", stats)
+	}
+	if len(h.createBodies) != 1 || h.notifications != 1 {
+		t.Errorf("second run re-created/re-notified: creates=%d notifications=%d", len(h.createBodies), h.notifications)
+	}
+}
+
+func TestFirstSightNeverNotifies(t *testing.T) {
+	// Untracked pair on both sides with differing content, attendees on both,
+	// no state file: must resolve toward remote (download) with ZERO writes.
+	h := newSyncHarness(t)
+	h.events = []map[string]any{meetingMaster("g1", "uid-1", "Design sync", "ck1", false, "accepted",
+		att("Me", testOwnerEmail, "required", "accepted"),
+		att("Alice", "alice@example.com", "required", "accepted"))}
+	data, err := EventToICal(Event{
+		ICalUID: "uid-1",
+		Subject: "Divergent local meeting",
+		Start:   time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC),
+		End:     time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC),
+		Attendees: []Attendee{
+			{Name: "Me", Email: testOwnerEmail, Type: "required", Response: "declined"},
+			{Name: "Alice", Email: "alice@example.com", Type: "required", Response: "none"},
+		},
+		Organizer: &Person{Name: "Org", Email: "organizer@example.com"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.icsPath("uid-1"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{Downloaded: 1}) {
+		t.Fatalf("stats = %+v, want Downloaded=1 only (remote wins on first sight)", stats)
+	}
+	if h.mutations != 0 || h.notifications != 0 || len(h.rsvpCalls) != 0 {
+		t.Errorf("first sight wrote remotely: mutations=%d notifications=%d rsvps=%+v",
+			h.mutations, h.notifications, h.rsvpCalls)
+	}
+	if body, _ := os.ReadFile(h.icsPath("uid-1")); !strings.Contains(string(body), "SUMMARY:Design sync") {
+		t.Errorf("remote content did not win:\n%s", body)
+	}
+}
+
+// MARK: - Delete routing
+
+func TestDeleteAsAttendeeRoutesToDecline(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{meetingMaster("g1", "uid-1", "Design sync", "ck1", false, "accepted",
+		att("Me", testOwnerEmail, "required", "accepted"),
+		att("Alice", "alice@example.com", "required", "accepted"))}
+	h.sync(SyncOptions{})
+
+	if err := os.Remove(h.icsPath("uid-1")); err != nil {
+		t.Fatal(err)
+	}
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{DeletedRemote: 1}) {
+		t.Fatalf("stats = %+v, want DeletedRemote=1 only", stats)
+	}
+	if len(h.deletedIDs) != 0 {
+		t.Errorf("deletedIDs = %v, want none (decline, not raw delete)", h.deletedIDs)
+	}
+	if len(h.rsvpCalls) != 1 || h.rsvpCalls[0] != (rsvpCall{ID: "g1", Verb: "decline", Send: true}) {
+		t.Fatalf("rsvpCalls = %+v, want one decline with sendResponse=true", h.rsvpCalls)
+	}
+	if _, ok := h.status.Items["uid-1"]; ok {
+		t.Error("status entry not dropped after decline-routed delete")
+	}
+}
+
+func TestDeleteAsAttendeeSilentRSVP(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{meetingMaster("g1", "uid-1", "Design sync", "ck1", false, "accepted",
+		att("Me", testOwnerEmail, "required", "accepted"),
+		att("Alice", "alice@example.com", "required", "accepted"))}
+	h.sync(SyncOptions{})
+
+	if err := os.Remove(h.icsPath("uid-1")); err != nil {
+		t.Fatal(err)
+	}
+	if stats := h.sync(SyncOptions{SilentRSVP: true}); stats != (SyncStats{DeletedRemote: 1}) {
+		t.Fatalf("stats = %+v, want DeletedRemote=1 only", stats)
+	}
+	if len(h.rsvpCalls) != 1 || h.rsvpCalls[0].Send {
+		t.Fatalf("rsvpCalls = %+v, want one decline with sendResponse=false", h.rsvpCalls)
+	}
+	if h.notifications != 0 {
+		t.Errorf("notifications = %d, want 0", h.notifications)
+	}
+}
+
+func TestDeleteAsOrganizerCancels(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{meetingMaster("g1", "uid-1", "Roadmap", "ck1", true, "organizer",
+		att("Alice", "alice@example.com", "required", "accepted"),
+		att("Bob", "bob@example.com", "optional", "notResponded"))}
+	h.sync(SyncOptions{})
+	h.organizerMeeting["g1"] = true
+
+	if err := os.Remove(h.icsPath("uid-1")); err != nil {
+		t.Fatal(err)
+	}
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{DeletedRemote: 1}) {
+		t.Fatalf("stats = %+v, want DeletedRemote=1 only", stats)
+	}
+	if len(h.deletedIDs) != 1 || h.deletedIDs[0] != "g1" {
+		t.Errorf("deletedIDs = %v, want [g1] (organizer cancels via DELETE)", h.deletedIDs)
+	}
+	if len(h.rsvpCalls) != 0 {
+		t.Errorf("rsvpCalls = %+v, want none", h.rsvpCalls)
+	}
+	if h.deleteIfMatch["g1"] != "ck1" {
+		t.Errorf("DELETE If-Match = %q, want the planned changeKey ck1", h.deleteIfMatch["g1"])
+	}
+	if h.notifications != 1 {
+		t.Errorf("notifications = %d, want 1 (cancellation wave)", h.notifications)
+	}
+	if _, ok := h.status.Items["uid-1"]; ok {
+		t.Error("status entry not dropped after cancel")
+	}
+}
+
+// MARK: - Conflict safety
+
+func TestConflictNoDeleteRecreateWithAttendees(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{meetingMaster("g1", "uid-1", "Roadmap", "ck1", true, "organizer",
+		att("Alice", "alice@example.com", "required", "accepted"),
+		att("Bob", "bob@example.com", "optional", "notResponded"))}
+	h.sync(SyncOptions{})
+
+	h.rewriteLocal("uid-1", func(ev *Event) { ev.Subject = "Roadmap edited" })
+	h.events = nil // remote deleted
+
+	stats := h.sync(SyncOptions{Conflict: "local"})
+	if stats != (SyncStats{Skipped: 1}) {
+		t.Fatalf("stats = %+v, want Skipped=1 only (refused meeting re-create)", stats)
+	}
+	if h.mutations != 0 || h.notifications != 0 {
+		t.Errorf("refused re-create still wrote remotely: mutations=%d notifications=%d",
+			h.mutations, h.notifications)
+	}
+	if _, err := os.Stat(h.icsPath("uid-1")); err != nil {
+		t.Errorf("local file must survive the refusal: %v", err)
+	}
+	if _, ok := h.status.Items["uid-1"]; !ok {
+		t.Error("status entry must survive the refusal (re-planned next run)")
+	}
+}
+
+func TestPatchPreconditionFailedSkipsAction(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{masterEvent("g1", "uid-1", "Standup", "ck1")}
+	h.sync(SyncOptions{})
+
+	h.writeLocal("uid-1", "Standup edited")
+	h.patchStatus = http.StatusPreconditionFailed
+
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{Skipped: 1}) {
+		t.Fatalf("stats = %+v, want Skipped=1 only (412 skipped, not fatal)", stats)
+	}
+	if h.mutations != 1 {
+		t.Errorf("mutations = %d, want 1 (the rejected PATCH attempt)", h.mutations)
+	}
+	// The baseline stays untouched, so the next run re-plans from scratch.
+	if st := h.status.Items["uid-1"]; st.RemoteHash != contentHashOf(t, h.events[0]) {
+		t.Errorf("412 must not move the baseline: %+v", st)
+	}
+}
+
+// MARK: - Teams marker
+
+func TestTeamsMarkerCreatesOnlineMeetingOnceThenNoop(t *testing.T) {
+	h := newSyncHarness(t)
+	h.writeLocal("uid-local", "My event")
+	raw, err := os.ReadFile(h.icsPath("uid-local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marked := strings.Replace(string(raw), "END:VEVENT",
+		"X-DURIAN-CREATE-TEAMS-MEETING:TRUE\r\nEND:VEVENT", 1)
+	if err := os.WriteFile(h.icsPath("uid-local"), []byte(marked), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	settled := masterEvent("g-new", "remote-uid-1", "My event", "ck-settled")
+	settled["isOnlineMeeting"] = true
+	settled["onlineMeeting"] = map[string]any{"joinUrl": "https://teams.microsoft.com/l/meetup-join/xyz"}
+	h.createResponse = settled
+	h.getResponses = map[string]map[string]any{"g-new": settled}
+
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{Uploaded: 1}) {
+		t.Fatalf("stats = %+v, want Uploaded=1 only", stats)
+	}
+	body := h.createBodies[0]
+	if body["isOnlineMeeting"] != true || body["onlineMeetingProvider"] != "teamsForBusiness" {
+		t.Errorf("create body = %v, want isOnlineMeeting=true provider=teamsForBusiness", body)
+	}
+
+	// The rewritten local file carries the join link but NOT the marker.
+	rewritten, err := os.ReadFile(h.icsPath("remote-uid-1"))
+	if err != nil {
+		t.Fatalf("rewritten .ics missing: %v", err)
+	}
+	if strings.Contains(string(rewritten), "X-DURIAN-CREATE-TEAMS-MEETING") {
+		t.Error("rewritten file still carries the one-shot marker")
+	}
+	if !strings.Contains(string(rewritten), "teams.microsoft.com") {
+		t.Errorf("rewritten file lacks the join link:\n%s", rewritten)
+	}
+
+	// Second sync: settled remote (churned changeKey), no local edits: no-op.
+	churned := masterEvent("g-new", "remote-uid-1", "My event", "ck-churned")
+	churned["isOnlineMeeting"] = true
+	churned["onlineMeeting"] = map[string]any{"joinUrl": "https://teams.microsoft.com/l/meetup-join/xyz"}
+	h.events = []map[string]any{churned}
+	if stats := h.sync(SyncOptions{}); stats != (SyncStats{}) {
+		t.Fatalf("second run stats = %+v, want all zero", stats)
+	}
+	if len(h.createBodies) != 1 {
+		t.Errorf("second run created again: %d creates", len(h.createBodies))
+	}
+}
+
+// MARK: - Plain re-sync and dry-run safety
+
+func TestPlainResyncOfDownloadedMeetingSendsNothing(t *testing.T) {
+	for _, policy := range []string{"", "local", "newer"} {
+		name := policy
+		if name == "" {
+			name = "remote(default)"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := newSyncHarness(t)
+			var m map[string]any
+			if err := json.Unmarshal([]byte(meetingGraphJSON), &m); err != nil {
+				t.Fatal(err)
+			}
+			h.events = []map[string]any{m}
+			if stats := h.sync(SyncOptions{Conflict: policy}); stats != (SyncStats{Downloaded: 1}) {
+				t.Fatalf("download stats = %+v, want Downloaded=1 only", stats)
+			}
+
+			var m2 map[string]any
+			if err := json.Unmarshal([]byte(meetingGraphJSON), &m2); err != nil {
+				t.Fatal(err)
+			}
+			m2["changeKey"] = "ck-churned"
+			h.events = []map[string]any{m2}
+			if stats := h.sync(SyncOptions{Conflict: policy}); stats != (SyncStats{}) {
+				t.Fatalf("re-sync stats = %+v, want all zero", stats)
+			}
+			if h.mutations != 0 || h.notifications != 0 {
+				t.Errorf("plain re-sync wrote remotely: mutations=%d notifications=%d",
+					h.mutations, h.notifications)
+			}
+		})
+	}
+}
+
+func TestDryRunHitsNoWriteEndpoints(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{
+		meetingMaster("g1", "uid-1", "A", "ck1", false, "accepted",
+			att("Me", testOwnerEmail, "required", "accepted"),
+			att("Alice", "alice@example.com", "required", "accepted")),
+		meetingMaster("g2", "uid-2", "B", "ck1", false, "accepted",
+			att("Me", testOwnerEmail, "required", "accepted"),
+			att("Alice", "alice@example.com", "required", "accepted")),
+	}
+	h.sync(SyncOptions{})
+
+	// Pending: an RSVP (uid-1), a decline-routed delete (uid-2), and an
+	// invite-carrying create (uid-local). No create/patch responses are
+	// configured — ANY write endpoint hit fails the test.
+	h.rewriteLocal("uid-1", func(ev *Event) { setOwnerPartstat(ev, "declined") })
+	if err := os.Remove(h.icsPath("uid-2")); err != nil {
+		t.Fatal(err)
+	}
+	data, err := EventToICal(Event{
+		ICalUID: "uid-local",
+		Subject: "Kickoff",
+		Start:   time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC),
+		End:     time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC),
+		Attendees: []Attendee{
+			{Name: "Alice", Email: "alice@example.com", Type: "required", Response: "none"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.icsPath("uid-local"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mutationsBefore := h.mutations
+
+	stats := h.sync(SyncOptions{DryRun: true})
+	if stats != (SyncStats{Uploaded: 1, DeletedRemote: 1, Rsvps: 1}) {
+		t.Fatalf("dry-run stats = %+v, want Uploaded=1 DeletedRemote=1 Rsvps=1", stats)
+	}
+	if h.mutations != mutationsBefore || len(h.rsvpCalls) != 0 || h.notifications != 0 {
+		t.Errorf("dry run hit write endpoints: mutations=%d rsvps=%+v notifications=%d",
+			h.mutations-mutationsBefore, h.rsvpCalls, h.notifications)
+	}
+	if st := h.status.Items["uid-1"]; st.OwnerResponse != OwnerRespAccepted {
+		t.Errorf("dry run mutated the RSVP baseline: %+v", st)
+	}
+}
+
+// MARK: - Notification preview
+
+func TestPlanNotificationsPreview(t *testing.T) {
+	meeting := Event{Attendees: []Attendee{
+		{Email: "alice@example.com", Type: "required"},
+		{Email: "bob@example.com", Type: "required"},
+	}}
+	plans := []CalendarPlan{{
+		Calendar: Calendar{ID: "cal1", Name: "Work"},
+		Actions: []Action{
+			{Kind: ActionUploadCreate, Summary: `"Kickoff" 2026-08-01`, OwnerIsOrganizer: true, Recipients: 3},
+			{Kind: ActionUploadCreate, Summary: "plain create", OwnerIsOrganizer: true, Recipients: 0},
+			{Kind: ActionUploadUpdate, Summary: "meeting update", OwnerIsOrganizer: true, Recipients: 2},
+			{Kind: ActionUploadUpdate, Summary: "attendee-side edit", OwnerIsOrganizer: false, Recipients: 2},
+			{Kind: ActionDeleteRemote, Summary: "cancel", OwnerIsOrganizer: true, Recipients: 2, RemoteExists: true, Remote: meeting},
+			{Kind: ActionDeleteRemote, Summary: "decline", OwnerIsOrganizer: false, Recipients: 1, RemoteExists: true, Remote: meeting},
+			{Kind: ActionDeleteRemote, Summary: "plain delete", OwnerIsOrganizer: true, RemoteExists: true},
+			{Kind: ActionRsvp, Summary: "rsvp", RsvpCall: true},
+			{Kind: ActionRsvp, Summary: "rebaseline", RsvpCall: false},
+			{Kind: ActionDownloadNew, Summary: "download"},
+		},
+	}}
+
+	got := PlanNotifications(plans, "remote", false)
+	want := []struct {
+		category   string
+		recipients int
+	}{
+		{NotifyInvite, 3},
+		{NotifyUpdate, 2},
+		{NotifyCancel, 2},
+		{NotifyRSVP, 1},
+		{NotifyRSVP, 1},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("notifications = %+v, want %d entries", got, len(want))
+	}
+	for i, w := range want {
+		if got[i].Category != w.category || got[i].Recipients != w.recipients || got[i].Calendar != "Work" {
+			t.Errorf("notification[%d] = %+v, want %s to %d recipients", i, got[i], w.category, w.recipients)
+		}
+	}
+
+	// silent RSVP drops exactly the RSVP messages.
+	silent := PlanNotifications(plans, "remote", true)
+	if len(silent) != 3 {
+		t.Errorf("silent notifications = %+v, want 3 entries (no RSVPs)", silent)
+	}
+
+	// Conflicts follow the policy: remote-wins sends nothing, local-wins on a
+	// surviving pair is an update, local-wins on a deleted remote meeting is
+	// refused (R3) and sends nothing.
+	conflictPlans := []CalendarPlan{{
+		Calendar: Calendar{Name: "Work"},
+		Actions: []Action{
+			{Kind: ActionConflict, OwnerIsOrganizer: true, Recipients: 2, RemoteExists: true, LocalExists: true, Remote: meeting},
+			{Kind: ActionConflict, OwnerIsOrganizer: true, Recipients: 2, RemoteExists: false, LocalExists: true,
+				LocalEvent: meeting},
+		},
+	}}
+	if got := PlanNotifications(conflictPlans, "remote", false); len(got) != 0 {
+		t.Errorf("remote-wins conflicts must send nothing, got %+v", got)
+	}
+	got = PlanNotifications(conflictPlans, "local", false)
+	if len(got) != 1 || got[0].Category != NotifyUpdate || got[0].Recipients != 2 {
+		t.Errorf("local-wins conflict preview = %+v, want one UPDATE to 2", got)
+	}
+
+	// NotifiesRecipients mirrors the preview for plain kinds.
+	if ok, n := plans[0].Actions[0].NotifiesRecipients(); !ok || n != 3 {
+		t.Errorf("NotifiesRecipients(invite) = %v/%d, want true/3", ok, n)
+	}
+	if ok, _ := plans[0].Actions[9].NotifiesRecipients(); ok {
+		t.Error("NotifiesRecipients(download) = true, want false")
 	}
 }
