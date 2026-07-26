@@ -48,11 +48,19 @@ Conflicts — events changed on both sides — are resolved per the account's
 calendar conflict policy ("remote" by default; a conflicting local file is
 always backed up to <file>.conflict-<timestamp> first).
 
-The sync first builds a plan and prints it. If the plan contains changes to
-Outlook (uploads, remote deletes, conflicts), it asks for confirmation before
-applying — declining aborts the entire run, local-only actions included, so
-"no" always means no changes anywhere. --yes skips the prompt; --dry-run
-stops after printing the plan.`,
+Meetings are fully supported: creating an event with ATTENDEE lines sends
+invitations, organizer edits send updates, deleting an organizer meeting
+sends cancellations, deleting a meeting you merely attend declines it, and
+changing your own PARTSTAT sends an RSVP to the organizer (suppress the
+response email with --silent-rsvp). An X-DURIAN-CREATE-TEAMS-MEETING:TRUE
+line requests a Teams meeting on create.
+
+The sync first builds a plan and prints it, including a preview of every
+email the plan will cause Graph to send. If the plan contains changes to
+Outlook (uploads, remote deletes, conflicts, RSVPs), it asks for confirmation
+before applying — declining aborts the entire run, local-only actions
+included, so "no" always means no changes anywhere. --yes skips the prompt;
+--dry-run stops after printing the plan.`,
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: completeAccounts,
 	RunE:              runCalendarSync,
@@ -63,9 +71,10 @@ var (
 	calendarExportDaysBack    int
 	calendarExportDaysForward int
 
-	calendarSyncOut    string
-	calendarSyncDryRun bool
-	calendarSyncYes    bool
+	calendarSyncOut        string
+	calendarSyncDryRun     bool
+	calendarSyncYes        bool
+	calendarSyncSilentRSVP bool
 )
 
 func init() {
@@ -86,6 +95,8 @@ func init() {
 		"Print the sync plan without writing files, changing Outlook or saving state")
 	calendarSyncCmd.Flags().BoolVar(&calendarSyncYes, "yes", false,
 		"Apply changes to Outlook without asking for confirmation")
+	calendarSyncCmd.Flags().BoolVar(&calendarSyncSilentRSVP, "silent-rsvp", false,
+		"Record RSVP responses (accept/decline) without notifying the organizer")
 }
 
 // calendarBaseDir resolves the vdir base directory: the --out override wins,
@@ -186,9 +197,10 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 
 	policy := account.CalendarConflictPolicy()
 	summary := summarizePlans(plans, policy)
-	fmt.Fprintf(os.Stderr, "Plan for %s: %d download(s), %d prune(s), %d upload(s), %d update(s), %d remote delete(s), %d conflict(s)\n",
+	fmt.Fprintf(os.Stderr, "Plan for %s: %d download(s), %d prune(s), %d upload(s), %d update(s), %d remote delete(s), %d conflict(s), %d RSVP(s)\n",
 		account.GetAliasOrName(), summary.downloads, summary.prunes,
-		summary.uploadCreates, summary.uploadUpdates, summary.deleteRemotes, summary.conflicts)
+		summary.uploadCreates, summary.uploadUpdates, summary.deleteRemotes,
+		summary.conflicts, summary.rsvps)
 	const maxListed = 20
 	for i, line := range summary.remoteLines {
 		if i == maxListed {
@@ -198,6 +210,11 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(os.Stderr, "  "+line)
 	}
 
+	// Notification preview: every email applying this plan will make Graph
+	// send, enumerated BEFORE the confirmation gate.
+	notifications := graphcalendar.PlanNotifications(plans, policy, calendarSyncSilentRSVP)
+	printNotificationPreview(notifications)
+
 	if calendarSyncDryRun {
 		fmt.Println("Dry run: nothing applied.")
 		return nil
@@ -205,8 +222,9 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 
 	remoteCount := len(summary.remoteLines)
 	if remoteCount > 0 && !calendarSyncYes {
-		fmt.Fprintf(os.Stderr, "Apply %d change(s) to Outlook (%d uploads, %d remote deletes, %d conflicts)? [y/N] ",
-			remoteCount, summary.uploadCreates+summary.uploadUpdates, summary.deleteRemotes, summary.conflicts)
+		fmt.Fprintf(os.Stderr, "Apply %d change(s) to Outlook (%d uploads, %d remote deletes, %d conflicts, %d RSVPs; %d notification message(s))? [y/N] ",
+			remoteCount, summary.uploadCreates+summary.uploadUpdates, summary.deleteRemotes,
+			summary.conflicts, summary.rsvps, len(notifications))
 		answer, readErr := bufio.NewReader(os.Stdin).ReadString('\n')
 		answer = strings.ToLower(strings.TrimSpace(answer))
 		// A read error (closed/empty stdin, non-tty) counts as "no". Declining
@@ -218,7 +236,7 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	opts := graphcalendar.SyncOptions{Conflict: policy}
+	opts := graphcalendar.SyncOptions{Conflict: policy, SilentRSVP: calendarSyncSilentRSVP}
 	stats, applyErr := graphcalendar.ApplyAll(cmd.Context(), client, state, plans, opts)
 	// Save state even on partial failure: remote operations that already
 	// succeeded are recorded in the status and must not be replayed.
@@ -237,10 +255,28 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("calendar sync failed: %w", applyErr)
 	}
 
-	fmt.Printf("Calendar sync for %s: %d downloaded, %d pruned, %d uploaded, %d deleted remotely, %d conflict(s) resolved (%s wins) (dir: %s)\n",
+	fmt.Printf("Calendar sync for %s: %d downloaded, %d pruned, %d uploaded, %d deleted remotely, %d RSVP(s) sent, %d conflict(s) resolved (%s wins), %d skipped (dir: %s)\n",
 		account.GetAliasOrName(), stats.Downloaded, stats.Pruned,
-		stats.Uploaded, stats.DeletedRemote, stats.Conflicts, policy, accountDir)
+		stats.Uploaded, stats.DeletedRemote, stats.Rsvps, stats.Conflicts, policy,
+		stats.Skipped, accountDir)
 	return nil
+}
+
+// printNotificationPreview lists every email message the plan will make Graph
+// send — category, event, calendar, recipient count — plus a total line, or
+// an explicit all-clear when the plan sends nothing.
+func printNotificationPreview(notifications []graphcalendar.Notification) {
+	if len(notifications) == 0 {
+		fmt.Fprintln(os.Stderr, "No emails will be sent.") // encgrep:allow static user-facing CLI text, no message content
+		return
+	}
+	total := 0
+	for _, n := range notifications {
+		fmt.Fprintf(os.Stderr, "  %s: %s [%s] -> %d recipient(s)\n",
+			n.Category, n.Summary, n.Calendar, n.Recipients)
+		total += n.Recipients
+	}
+	fmt.Fprintf(os.Stderr, "%d message(s) to %d recipient(s) will be sent.\n", len(notifications), total)
 }
 
 // planSummary aggregates the per-kind counts of all calendar plans plus the
@@ -252,6 +288,7 @@ type planSummary struct {
 	uploadUpdates int
 	deleteRemotes int
 	conflicts     int
+	rsvps         int
 	remoteLines   []string
 }
 
@@ -278,6 +315,13 @@ func summarizePlans(plans []graphcalendar.CalendarPlan, conflictPolicy string) p
 			case graphcalendar.ActionConflict:
 				s.conflicts++
 				s.remoteLines = append(s.remoteLines, fmt.Sprintf("CONFLICT (%s wins): %s [%s]", conflictPolicy, a.Summary, p.Calendar.Name))
+			case graphcalendar.ActionRsvp:
+				// Rebaseline-only RSVPs touch no remote state and are not
+				// listed; a real response is a gated remote mutation.
+				if a.RemoteMutation() {
+					s.rsvps++
+					s.remoteLines = append(s.remoteLines, fmt.Sprintf("RSVP (%s): %s [%s]", a.Rsvp, a.Summary, p.Calendar.Name))
+				}
 			}
 		}
 	}

@@ -17,7 +17,8 @@
 //     called (or is skipped with --yes). With SyncOptions.DryRun, Apply only
 //     counts what it would do.
 //
-// Decision matrix:
+// Decision matrix ("changed" is content-hash based; the owner's own RSVP is
+// excluded from content, see below):
 //
 //	not tracked, remote only            -> DownloadNew
 //	not tracked, local only             -> UploadCreate
@@ -27,15 +28,55 @@
 //	tracked, only local changed         -> UploadUpdate
 //	tracked, both changed               -> Conflict
 //	tracked, remote deleted, local same -> PruneLocal
-//	tracked, local deleted, remote same -> DeleteRemote
+//	tracked, local deleted, remote same -> DeleteRemote (routed: organizer
+//	  cancels via DELETE, a mere attendee declines via POST /decline, a plain
+//	  appointment is deleted silently)
 //	tracked, deleted one side + changed
 //	  on the other                      -> Conflict
 //	tracked, deleted both sides         -> DropStatus
 //
-// "Remote wins on first sight" is a deliberate first-sync convergence choice:
-// when an untracked UID exists on both sides with differing content there is
-// no baseline to diff against, so the local file is overwritten with the
-// remote rendering and the pair is tracked from there.
+// Owner-RSVP sub-matrix (only for TRACKED pairs whose content is unchanged on
+// both sides; L = owner response parsed from the local file, B = tracked
+// baseline, R = remote owner response; a local edit that only touches the
+// owner's own PARTSTAT — or pure formatting — does not count as a content
+// change):
+//
+//	owner is organizer                  -> no RSVP action ever (rebaseline only)
+//	L == B, R == B                      -> no action
+//	L != B, L == R                      -> Rsvp rebaseline (idempotency guard,
+//	                                       NO Graph call)
+//	L != B, L != R, L != None           -> Rsvp (POST accept/decline/
+//	                                       tentativelyAccept, sendResponse per
+//	                                       SilentRSVP)
+//	L != B, L != R, L == None           -> no Graph action (a file cannot
+//	                                       express "un-respond"; also covers
+//	                                       files that lack the owner's
+//	                                       ATTENDEE line entirely)
+//	L == B, R != B                      -> DownloadUpdate (responded elsewhere:
+//	                                       refresh local rendering + baseline)
+//
+// First-sight (!tracked) NEVER yields a notifying action or an Rsvp — only
+// Download/Adopt/UploadCreate. "Remote wins on first sight" is a deliberate
+// first-sync convergence choice: when an untracked UID exists on both sides
+// with differing content there is no baseline to diff against, so the local
+// file is overwritten with the remote rendering and the pair is tracked from
+// there.
+//
+// Scheduling safety rails (a bug here emails real people):
+//
+//   - Creates carry a client-generated transactionId, so a retried POST can
+//     never produce a duplicate event or a second invitation wave.
+//   - Updates/deletes send the planned changeKey as If-Match; a 412 (remote
+//     changed since planning) skips that action — counted in Stats.Skipped —
+//     and the next run re-plans from fresh state instead of clobbering.
+//   - Attendees are only uploaded for meetings the OWNER organizes (role
+//     gate); for meetings the owner merely attends, attendee changes are
+//     never pushed and a local deletion is routed as a decline.
+//   - A conflict must never cancel+re-invite: the "local wins, remote
+//     deleted" resolution refuses to re-create an event that has attendees
+//     (logged + counted as skipped) instead of blasting a new invite wave.
+//   - When only the attendee set changed, the PATCH contains just the
+//     attendees, so Graph notifies only the added/removed attendees.
 //
 // Conflicts are resolved by SyncOptions.Conflict ("remote" when empty):
 //
@@ -72,13 +113,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // MARK: - Plan types
@@ -108,6 +153,10 @@ const (
 	// ActionConflict resolves an item changed (or deleted) on both sides per
 	// the configured conflict policy.
 	ActionConflict ActionKind = "conflict"
+	// ActionRsvp records (and, with RsvpCall, sends) an owner RSVP change —
+	// only ever emitted for tracked, content-unchanged, non-organizer pairs
+	// (see the owner-RSVP sub-matrix in the file header).
+	ActionRsvp ActionKind = "rsvp"
 )
 
 // Action is one planned sync operation for one UID, carrying everything
@@ -133,6 +182,25 @@ type Action struct {
 	// GraphID is the tracked Graph event id (updates, deletes, conflicts).
 	GraphID string
 
+	// Prior is the tracked ItemStatus baseline; only meaningful when Tracked.
+	Prior   ItemStatus
+	Tracked bool
+
+	// OwnerIsOrganizer reports whether the account owner organizes this event
+	// (from the remote event when present, else from the local file's
+	// ORGANIZER). It role-gates every attendee upload and the delete routing,
+	// and is precomputed here so the plan preview and Apply agree.
+	OwnerIsOrganizer bool
+	// Recipients is the number of attendees other than the owner — the
+	// recipient count of any invitation/update/cancellation this action may
+	// trigger.
+	Recipients int
+
+	// Rsvp is the owner response ActionRsvp records; sent to Graph only when
+	// RsvpCall is set (otherwise the action just rebaselines the status).
+	Rsvp     OwnerResp
+	RsvpCall bool
+
 	// Summary is a short human-readable description ("subject" date) for the
 	// command's plan listing.
 	Summary string
@@ -140,11 +208,14 @@ type Action struct {
 
 // RemoteMutation reports whether applying this action may write to Outlook.
 // Conflicts always count — even under the "remote" policy they are gated
-// behind the confirmation, since they overwrite one side.
+// behind the confirmation, since they overwrite one side. An ActionRsvp
+// counts only when it actually calls Graph (a rebaseline is status-only).
 func (a Action) RemoteMutation() bool {
 	switch a.Kind {
 	case ActionUploadCreate, ActionUploadUpdate, ActionDeleteRemote, ActionConflict:
 		return true
+	case ActionRsvp:
+		return a.RsvpCall
 	}
 	return false
 }
@@ -182,6 +253,12 @@ type SyncStats struct {
 	DeletedRemote int
 	// Conflicts counts items changed on both sides resolved per the policy.
 	Conflicts int
+	// Rsvps counts owner RSVP responses sent to Graph.
+	Rsvps int
+	// Skipped counts actions aborted gracefully instead of risking a wrong
+	// notification: 412 precondition failures (remote changed since planning)
+	// and refused meeting re-creates. They re-plan on the next run.
+	Skipped int
 }
 
 // add accumulates another calendar's stats into s.
@@ -191,6 +268,8 @@ func (s *SyncStats) add(o SyncStats) {
 	s.Uploaded += o.Uploaded
 	s.DeletedRemote += o.DeletedRemote
 	s.Conflicts += o.Conflicts
+	s.Rsvps += o.Rsvps
+	s.Skipped += o.Skipped
 }
 
 // SyncOptions tunes one Apply run.
@@ -201,6 +280,10 @@ type SyncOptions struct {
 	// Conflict is the conflict resolution policy: "remote" (default when
 	// empty), "local" or "newer". See the file header.
 	Conflict string
+	// SilentRSVP suppresses the response email to the organizer on RSVPs and
+	// decline-routed deletes (Graph sendResponse=false). The zero value sends
+	// the response — the standard scheduling-client behavior.
+	SilentRSVP bool
 }
 
 // conflictPolicy returns the effective conflict policy.
@@ -281,7 +364,7 @@ func Plan(ctx context.Context, c *Client, cal Calendar, calDir string, status Ca
 		remote[ev.ICalUID] = ev
 	}
 
-	local, err := scanLocalItems(calDir)
+	local, err := scanLocalItems(calDir, c.owner)
 	if err != nil {
 		return plan, err
 	}
@@ -291,16 +374,18 @@ func Plan(ctx context.Context, c *Client, cal Calendar, calDir string, status Ca
 		li, localHas := local[uid]
 		st, tracked := status.Items[uid]
 
-		remoteChanged := remoteHas && (!tracked || st.RemoteHash != eventContentHash(rev))
+		remoteChanged := remoteHas && (!tracked || st.RemoteHash != eventContentHash(rev, c.owner))
 		localChanged := localHas && (!tracked || st.LocalHash != li.hash)
 		remoteDeleted := tracked && !remoteHas
 		localDeleted := tracked && !localHas
 
-		a := Action{UID: uid, GraphID: st.GraphID}
+		a := Action{UID: uid, GraphID: st.GraphID, Prior: st, Tracked: tracked}
 		if remoteHas {
 			a.Remote = rev
 			a.RemoteExists = true
 			a.Summary = summarizeEvent(rev)
+			a.OwnerIsOrganizer = ownerIsOrganizer(rev, c.owner)
+			a.Recipients = countRecipients(rev.Attendees, c.owner)
 		}
 		if localHas {
 			a.LocalPath = li.path
@@ -310,6 +395,8 @@ func Plan(ctx context.Context, c *Client, cal Calendar, calDir string, status Ca
 			a.LocalExists = true
 			if !remoteHas {
 				a.Summary = summarizeEvent(li.event)
+				a.OwnerIsOrganizer = localOwnerIsOrganizer(li.event, c.owner)
+				a.Recipients = countRecipients(li.event.Attendees, c.owner)
 			}
 		}
 
@@ -323,7 +410,8 @@ func Plan(ctx context.Context, c *Client, cal Calendar, calDir string, status Ca
 		case !tracked: // remoteHas && localHas
 			// First sight of a pair present on both sides: adopt if the local
 			// file already matches the remote rendering, else remote wins (see
-			// file header for the rationale).
+			// file header for the rationale). First sight can never notify:
+			// only Download/Adopt come out of this branch.
 			data, err := EventToICal(rev)
 			if err != nil {
 				return plan, fmt.Errorf("failed to serialize remote event %s: %w", uid, err)
@@ -335,16 +423,23 @@ func Plan(ctx context.Context, c *Client, cal Calendar, calDir string, status Ca
 			}
 
 		case remoteHas && localHas:
+			// A local edit that only touches the owner's own PARTSTAT (or pure
+			// formatting) is not a content change — it feeds the owner-RSVP
+			// sub-matrix below instead of a notifying upload.
+			ownerEditOnly := localChanged && !remoteChanged &&
+				localEventMatchesRemote(li.event, rev, c.owner)
 			switch {
 			case remoteChanged && localChanged:
 				a.Kind = ActionConflict
 			case remoteChanged:
 				a.Kind = ActionDownloadUpdate
-			case localChanged:
+			case localChanged && !ownerEditOnly:
 				a.Kind = ActionUploadUpdate
 			default:
-				// Unchanged on both sides.
-				continue
+				// Content unchanged on both sides: owner-RSVP sub-matrix.
+				if !planRsvp(&a, li.event, rev, st, localChanged) {
+					continue
+				}
 			}
 
 		case remoteDeleted && localDeleted:
@@ -387,6 +482,145 @@ func summarizeEvent(e Event) string {
 	return fmt.Sprintf("%q %s", subject, e.Start.UTC().Format(graphDateFormat))
 }
 
+// planRsvp classifies the owner-RSVP state of a tracked pair whose content is
+// unchanged on both sides, per the owner-RSVP sub-matrix in the file header.
+// It fills a.Kind (and Rsvp/RsvpCall) and reports whether an action is needed
+// at all. localBytesChanged marks a byte-level local edit that turned out to
+// be owner-RSVP-only or formatting-only — those still need a LocalHash
+// rebaseline so they stop being re-examined every run.
+func planRsvp(a *Action, local, remote Event, st ItemStatus, localBytesChanged bool) bool {
+	l, b, r := local.OwnerResponse, st.OwnerResponse, remote.OwnerResponse
+
+	rebaseline := func(resp OwnerResp) bool {
+		a.Kind = ActionRsvp
+		a.Rsvp = resp
+		a.RsvpCall = false
+		return true
+	}
+
+	switch {
+	case a.OwnerIsOrganizer:
+		// The organizer has no RSVP to send; only rebaseline a formatting
+		// edit so it is not re-examined forever.
+		if !localBytesChanged {
+			return false
+		}
+		return rebaseline(b)
+	case l != b && l == r:
+		// Local already matches remote (the response was also recorded in
+		// Outlook, or the baseline predates Stage 2): rebaseline only — the
+		// idempotency guard. No Graph call, no email.
+		return rebaseline(l)
+	case l != b && l != OwnerRespNone:
+		a.Kind = ActionRsvp
+		a.Rsvp = l
+		a.RsvpCall = true
+		return true
+	case l != b:
+		// l == None: a local file cannot express "un-respond" (and files that
+		// simply lack the owner's ATTENDEE line land here too) — never turn
+		// this into a Graph call.
+		if !localBytesChanged {
+			return false
+		}
+		return rebaseline(b)
+	case r != b:
+		// The owner responded elsewhere (Outlook, phone): refresh the local
+		// rendering and baseline. Download-direction only, no email.
+		a.Kind = ActionDownloadUpdate
+		return true
+	default:
+		if !localBytesChanged {
+			return false
+		}
+		return rebaseline(b)
+	}
+}
+
+// localEventMatchesRemote reports whether a locally parsed event matches the
+// remote event in every uploadable respect EXCEPT the owner's own RSVP: core
+// content, organizer, and the attendee set excluding the owner. Fields the
+// iCal parse cannot recover (online-meeting link, cancellation) are ignored,
+// and the lossy iCal round-trip is applied to the remote side so a faithful
+// re-parse compares equal. Used to classify owner-RSVP-only local edits.
+func localEventMatchesRemote(local, remote Event, owner string) bool {
+	if !coreContentEqual(local, remote) {
+		return false
+	}
+	var localOrg, remoteOrg string
+	if local.Organizer != nil {
+		localOrg = strings.ToLower(local.Organizer.Email)
+	}
+	if remote.Organizer != nil {
+		remoteOrg = strings.ToLower(remote.Organizer.Email)
+	}
+	if localOrg != remoteOrg {
+		return false
+	}
+	return lossyAttendeeSet(local.Attendees, owner) == lossyAttendeeSet(remote.Attendees, owner)
+}
+
+// coreContentEqual reports whether the user-editable core (subject, times,
+// all-day flag, location, description, recurrence) of a locally parsed event
+// matches the remote event. The remote recurrence is passed through the lossy
+// RRULE round-trip first, so Graph-only details a local re-parse cannot
+// reproduce (e.g. firstDayOfWeek) do not read as differences.
+func coreContentEqual(local, remote Event) bool {
+	if local.Subject != remote.Subject ||
+		!local.Start.Equal(remote.Start) ||
+		!local.End.Equal(remote.End) ||
+		local.AllDay != remote.AllDay ||
+		local.Location != remote.Location ||
+		normalizeText(local.Description) != normalizeText(remote.Description) {
+		return false
+	}
+	return recurrenceJSON(local.Recurrence, "") ==
+		recurrenceJSON(lossyRecurrence(remote.Recurrence, remote.Start), "")
+}
+
+// lossyRecurrence passes a Graph recurrence through the RRULE round-trip
+// (recurrenceToROption -> roptionToRecurrence), yielding exactly what a
+// faithful local re-parse of the emitted .ics produces. Unmappable
+// recurrences come back unchanged.
+func lossyRecurrence(rec *Recurrence, start time.Time) *Recurrence {
+	if rec == nil {
+		return nil
+	}
+	opt, err := recurrenceToROption(*rec)
+	if err != nil {
+		return rec
+	}
+	out, err := roptionToRecurrence(opt, start)
+	if err != nil {
+		return rec
+	}
+	return out
+}
+
+// lossyAttendeeSet canonicalizes an attendee list (excluding the owner) with
+// the lossy iCal round-trip applied to type and response, so a remote value
+// and its local re-parse compare equal.
+func lossyAttendeeSet(attendees []Attendee, owner string) string {
+	keys := make([]string, 0, len(attendees))
+	for _, a := range attendees {
+		if owner != "" && strings.EqualFold(a.Email, owner) {
+			continue
+		}
+		keys = append(keys, strings.ToLower(a.Email)+
+			"|"+attendeeTypeFromRole(attendeeRole(a.Type))+
+			"|"+responseFromPartStat(attendeePartStat(a.Response)))
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, "\n")
+}
+
+// isPreconditionFailed reports whether err is a Graph 412 — the If-Match
+// guard tripped because the remote event changed after planning.
+func isPreconditionFailed(err error) bool {
+	var se *statusError
+	return errors.As(err, &se) && se.status == http.StatusPreconditionFailed
+}
+
 // MARK: - Applying
 
 // ApplyAll executes the plans (see Apply), storing each calendar's updated
@@ -415,7 +649,8 @@ func ApplyAll(ctx context.Context, c *Client, state *SyncState, plans []Calendar
 	slog.Info("Calendar sync complete", "module", "GRAPHCAL",
 		"downloaded", total.Downloaded, "pruned", total.Pruned,
 		"uploaded", total.Uploaded, "deletedRemote", total.DeletedRemote,
-		"conflicts", total.Conflicts, "dryRun", opts.DryRun)
+		"conflicts", total.Conflicts, "rsvps", total.Rsvps,
+		"skipped", total.Skipped, "dryRun", opts.DryRun)
 	return total, nil
 }
 
@@ -465,6 +700,10 @@ func Apply(ctx context.Context, c *Client, plan CalendarPlan, status *CalendarSt
 				stats.DeletedRemote++
 			case ActionConflict:
 				stats.Conflicts++
+			case ActionRsvp:
+				if a.RsvpCall {
+					stats.Rsvps++
+				}
 			}
 		}
 		slog.Info("Dry run: plan not applied", "module", "GRAPHCAL",
@@ -482,14 +721,20 @@ func Apply(ctx context.Context, c *Client, plan CalendarPlan, status *CalendarSt
 		case ActionDownloadNew, ActionDownloadUpdate:
 			slog.Info("Downloading remote event", "module", "GRAPHCAL",
 				"calendar", plan.Calendar.Name, "uid", a.UID, "kind", a.Kind)
-			if err = writeRemoteEvent(plan.Dir, a.LocalPath, a.UID, a.Remote, status); err == nil {
+			if err = writeRemoteEvent(plan.Dir, a.LocalPath, a.UID, a.Remote, status, c.owner); err == nil {
 				stats.Downloaded++
 			}
 
 		case ActionAdopt:
 			slog.Debug("Adopting identical untracked pair", "module", "GRAPHCAL",
 				"calendar", plan.Calendar.Name, "uid", a.UID)
-			status.Items[a.UID] = ItemStatus{GraphID: a.Remote.ID, RemoteHash: eventContentHash(a.Remote), LocalHash: a.LocalHash}
+			status.Items[a.UID] = ItemStatus{
+				GraphID:       a.Remote.ID,
+				RemoteHash:    eventContentHash(a.Remote, c.owner),
+				LocalHash:     a.LocalHash,
+				OwnerResponse: a.Remote.OwnerResponse,
+				AttendeeHash:  attendeeSetHash(a.Remote.Attendees),
+			}
 
 		case ActionDropStatus:
 			slog.Debug("Event deleted on both sides, dropping status", "module", "GRAPHCAL",
@@ -517,19 +762,53 @@ func Apply(ctx context.Context, c *Client, plan CalendarPlan, status *CalendarSt
 			}
 
 		case ActionDeleteRemote:
-			slog.Info("Deleting remote event (local file deleted)", "module", "GRAPHCAL",
-				"calendar", plan.Calendar.Name, "uid", a.UID, "graphID", a.GraphID)
-			if err = c.DeleteEvent(ctx, a.GraphID); err == nil {
+			if err = removeRemoteEvent(ctx, c, plan, a, opts); err == nil {
 				delete(status.Items, a.UID)
 				stats.DeletedRemote++
 			}
 
+		case ActionRsvp:
+			st := status.Items[a.UID]
+			if a.RsvpCall {
+				slog.Info("Sending owner RSVP", "module", "GRAPHCAL",
+					"calendar", plan.Calendar.Name, "uid", a.UID, "graphID", a.GraphID,
+					"response", a.Rsvp, "send", !opts.SilentRSVP)
+				err = c.RespondToEvent(ctx, a.GraphID, a.Rsvp, !opts.SilentRSVP, "")
+			} else {
+				slog.Debug("Rebaselining owner RSVP, no Graph call", "module", "GRAPHCAL",
+					"calendar", plan.Calendar.Name, "uid", a.UID, "response", a.Rsvp)
+			}
+			if err == nil {
+				st.OwnerResponse = a.Rsvp
+				if a.LocalExists {
+					st.LocalHash = a.LocalHash
+				}
+				status.Items[a.UID] = st
+				if a.RsvpCall {
+					stats.Rsvps++
+				}
+			}
+
 		case ActionConflict:
-			if err = applyConflict(ctx, c, plan, a, status, opts.conflictPolicy()); err == nil {
-				stats.Conflicts++
+			var skipped bool
+			if skipped, err = applyConflict(ctx, c, plan, a, status, opts); err == nil {
+				if skipped {
+					stats.Skipped++
+				} else {
+					stats.Conflicts++
+				}
 			}
 		}
 		if err != nil {
+			if isPreconditionFailed(err) {
+				// The remote event changed between planning and this write:
+				// never clobber — skip and let the next run re-plan from
+				// fresh state (R2).
+				slog.Warn("Remote event changed since planning, skipping action", "module", "GRAPHCAL",
+					"calendar", plan.Calendar.Name, "uid", a.UID, "kind", a.Kind)
+				stats.Skipped++
+				continue
+			}
 			return stats, err
 		}
 	}
@@ -540,8 +819,9 @@ func Apply(ctx context.Context, c *Client, plan CalendarPlan, status *CalendarSt
 }
 
 // writeRemoteEvent serializes ev and writes it to path — the UID-derived
-// default when path is empty — recording the pair in status.
-func writeRemoteEvent(calDir, path, uid string, ev Event, status *CalendarStatus) error {
+// default when path is empty — recording the pair in status (content, owner
+// RSVP and attendee-set baselines).
+func writeRemoteEvent(calDir, path, uid string, ev Event, status *CalendarStatus, owner string) error {
 	if path == "" {
 		path = filepath.Join(calDir, sanitizeName(uid)+".ics")
 	}
@@ -552,7 +832,13 @@ func writeRemoteEvent(calDir, path, uid string, ev Event, status *CalendarStatus
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write %s: %w", path, err)
 	}
-	status.Items[uid] = ItemStatus{GraphID: ev.ID, RemoteHash: eventContentHash(ev), LocalHash: hashBytes(data)}
+	status.Items[uid] = ItemStatus{
+		GraphID:       ev.ID,
+		RemoteHash:    eventContentHash(ev, owner),
+		LocalHash:     hashBytes(data),
+		OwnerResponse: ev.OwnerResponse,
+		AttendeeHash:  attendeeSetHash(ev.Attendees),
+	}
 	return nil
 }
 
@@ -570,10 +856,27 @@ func writeRemoteEvent(calDir, path, uid string, ev Event, status *CalendarStatus
 // clean no-op. If the read-back fails, the create response is hashed instead
 // — a slightly worse baseline, but never a failed sync.
 func createFromLocal(ctx context.Context, c *Client, plan CalendarPlan, a Action, status *CalendarStatus) error {
+	// Role gate: attendees (= invitations) go out only when the owner is the
+	// organizer of this event. A file carrying a foreign ORGANIZER never
+	// invites on that person's behalf.
+	includeAttendees := a.OwnerIsOrganizer && len(a.LocalEvent.Attendees) > 0
 	slog.Info("Creating remote event from local file", "module", "GRAPHCAL",
-		"calendar", plan.Calendar.Name, "uid", a.UID, "path", a.LocalPath)
+		"calendar", plan.Calendar.Name, "uid", a.UID, "path", a.LocalPath,
+		"invites", includeAttendees, "recipients", a.Recipients)
 
-	created, err := c.CreateEvent(ctx, plan.Calendar.ID, EventToGraphBody(a.LocalEvent))
+	body := EventToGraphBody(a.LocalEvent, includeAttendees)
+	if a.LocalEvent.RequestOnlineMeeting {
+		// One-shot Teams marker: honored on create only. The post-create
+		// rewrite below drops the marker from the local file.
+		body["isOnlineMeeting"] = true
+		body["onlineMeetingProvider"] = "teamsForBusiness"
+	}
+	// transactionId dedups a retried POST server-side (R1): the same create
+	// replayed after a throttle/transient retry can never produce a duplicate
+	// event or a second invitation wave.
+	body["transactionId"] = uuid.NewString()
+
+	created, err := c.CreateEvent(ctx, plan.Calendar.ID, body)
 	if err != nil {
 		return fmt.Errorf("failed to create remote event for %s: %w", a.UID, err)
 	}
@@ -592,7 +895,7 @@ func createFromLocal(ctx context.Context, c *Client, plan CalendarPlan, a Action
 	if uid != a.UID {
 		path = filepath.Join(plan.Dir, sanitizeName(uid)+".ics")
 	}
-	if err := writeRemoteEvent(plan.Dir, path, uid, settled, status); err != nil {
+	if err := writeRemoteEvent(plan.Dir, path, uid, settled, status, c.owner); err != nil {
 		return err
 	}
 	if uid != a.UID {
@@ -619,46 +922,131 @@ func createFromLocal(ctx context.Context, c *Client, plan CalendarPlan, a Action
 // rewrite — so the next sync sees neither side changed and is a clean no-op.
 // If the read-back fails, the uploaded local event is hashed instead (the
 // PATCH response carries no content) rather than failing the sync.
+//
+// Scheduling behavior: the planned changeKey travels as If-Match, so a
+// concurrent remote edit yields a 412 (skipped by Apply) instead of a
+// clobber. Attendees are included only when the owner organizes the meeting
+// AND the attendee set actually changed against the baseline; when ONLY the
+// attendee set changed, the PATCH carries just the attendees, so Graph
+// notifies only the added/removed attendees instead of everyone.
 func patchFromLocal(ctx context.Context, c *Client, plan CalendarPlan, a Action, status *CalendarStatus) error {
-	slog.Info("Updating remote event from local edit", "module", "GRAPHCAL",
-		"calendar", plan.Calendar.Name, "uid", a.UID, "graphID", a.GraphID, "path", a.LocalPath)
+	attendeeBase := a.Prior.AttendeeHash
+	if attendeeBase == "" {
+		// Unknown baseline (pre-Stage-2 status, or a conflict where the
+		// remote side changed too): diff against the current remote set.
+		attendeeBase = attendeeSetHash(a.Remote.Attendees)
+	}
+	attendeesChanged := a.OwnerIsOrganizer &&
+		attendeeSetHash(a.LocalEvent.Attendees) != attendeeBase
+	coreChanged := !coreContentEqual(a.LocalEvent, a.Remote)
 
-	if _, err := c.UpdateEvent(ctx, a.GraphID, EventToGraphBody(a.LocalEvent)); err != nil {
+	var body map[string]any
+	switch {
+	case attendeesChanged && !coreChanged:
+		body = map[string]any{"attendees": attendeesToGraph(a.LocalEvent.Attendees)}
+	default:
+		body = EventToGraphBody(a.LocalEvent, attendeesChanged)
+	}
+
+	var etag string
+	if a.RemoteExists {
+		etag = a.Remote.ChangeKey
+	}
+	slog.Info("Updating remote event from local edit", "module", "GRAPHCAL",
+		"calendar", plan.Calendar.Name, "uid", a.UID, "graphID", a.GraphID, "path", a.LocalPath,
+		"attendeesChanged", attendeesChanged, "recipients", a.Recipients)
+
+	if _, err := c.UpdateEvent(ctx, a.GraphID, etag, body); err != nil {
 		return fmt.Errorf("failed to update remote event for %s: %w", a.UID, err)
 	}
-	remoteHash := eventContentHash(a.LocalEvent)
+	remoteHash := eventContentHash(a.LocalEvent, c.owner)
+	ownerResp := a.Prior.OwnerResponse
+	attendeeHash := attendeeSetHash(a.LocalEvent.Attendees)
 	if settled, err := c.GetEvent(ctx, a.GraphID); err != nil {
 		slog.Warn("Failed to read back updated event, recording uploaded-content baseline", "module", "GRAPHCAL",
 			"calendar", plan.Calendar.Name, "id", a.GraphID, "err", err)
 	} else {
-		remoteHash = eventContentHash(settled)
+		remoteHash = eventContentHash(settled, c.owner)
+		ownerResp = settled.OwnerResponse
+		attendeeHash = attendeeSetHash(settled.Attendees)
 	}
-	status.Items[a.UID] = ItemStatus{GraphID: a.GraphID, RemoteHash: remoteHash, LocalHash: a.LocalHash}
+	status.Items[a.UID] = ItemStatus{
+		GraphID:       a.GraphID,
+		RemoteHash:    remoteHash,
+		LocalHash:     a.LocalHash,
+		OwnerResponse: ownerResp,
+		AttendeeHash:  attendeeHash,
+	}
 	return nil
+}
+
+// removeRemoteEvent propagates a local deletion to Graph with meeting-aware
+// routing: a meeting the owner merely attends is DECLINED (POST /decline,
+// sendResponse per SilentRSVP) so the organizer's tracking stays correct;
+// everything else — organizer-owned meetings (Graph cancels all attendees)
+// and plain appointments (silent) — is DELETEd with the planned changeKey as
+// If-Match.
+func removeRemoteEvent(ctx context.Context, c *Client, plan CalendarPlan, a Action, opts SyncOptions) error {
+	if a.RemoteExists && !a.OwnerIsOrganizer && len(a.Remote.Attendees) > 0 {
+		slog.Info("Declining remote meeting (local file deleted)", "module", "GRAPHCAL",
+			"calendar", plan.Calendar.Name, "uid", a.UID, "graphID", a.GraphID,
+			"send", !opts.SilentRSVP)
+		err := c.RespondToEvent(ctx, a.GraphID, OwnerRespDeclined, !opts.SilentRSVP, "")
+		var se *statusError
+		if errors.As(err, &se) && se.status == http.StatusNotFound {
+			slog.Info("Remote event already gone on decline", "module", "GRAPHCAL", "id", a.GraphID)
+			return nil
+		}
+		return err
+	}
+
+	var etag string
+	if a.RemoteExists {
+		etag = a.Remote.ChangeKey
+	}
+	slog.Info("Deleting remote event (local file deleted)", "module", "GRAPHCAL",
+		"calendar", plan.Calendar.Name, "uid", a.UID, "graphID", a.GraphID,
+		"cancelsMeeting", a.OwnerIsOrganizer && a.Recipients > 0, "recipients", a.Recipients)
+	return c.DeleteEvent(ctx, a.GraphID, etag)
+}
+
+// conflictWinner resolves which side a conflict action favors under the
+// policy: "local", or "remote" (also the fallback for unknown policy strings
+// — the conservative default). For "newer" the side modified later wins;
+// a deleted side carries no timestamp, so the surviving side wins.
+func conflictWinner(a Action, policy string) string {
+	switch policy {
+	case "local":
+		return "local"
+	case "newer":
+		switch {
+		case !a.RemoteExists:
+			return "local"
+		case !a.LocalExists:
+			return "remote"
+		}
+		localMod := a.LocalEvent.LastModified
+		if localMod.IsZero() {
+			localMod = a.LocalMtime
+		}
+		if localMod.After(a.Remote.LastModified) {
+			return "local"
+		}
+		return "remote"
+	default:
+		return "remote"
+	}
 }
 
 // applyConflict resolves one conflict per the policy (see the file header).
 // A local file is always backed up before being overwritten or removed —
-// conflicting local data is never silently lost.
-func applyConflict(ctx context.Context, c *Client, plan CalendarPlan, a Action, status *CalendarStatus, policy string) error {
-	winner := policy
+// conflicting local data is never silently lost. skipped reports a refused
+// resolution (re-creating a deleted meeting with attendees would re-invite
+// everyone — R3): nothing is changed and the next run re-plans it.
+func applyConflict(ctx context.Context, c *Client, plan CalendarPlan, a Action, status *CalendarStatus, opts SyncOptions) (skipped bool, err error) {
+	policy := opts.conflictPolicy()
+	winner := conflictWinner(a, policy)
 	if policy == "newer" {
-		switch {
-		case !a.RemoteExists:
-			winner = "local"
-		case !a.LocalExists:
-			winner = "remote"
-		default:
-			localMod := a.LocalEvent.LastModified
-			if localMod.IsZero() {
-				localMod = a.LocalMtime
-			}
-			if localMod.After(a.Remote.LastModified) {
-				winner = "local"
-			} else {
-				winner = "remote"
-			}
-		}
 		slog.Info("Conflict: newer side wins", "module", "GRAPHCAL",
 			"calendar", plan.Calendar.Name, "uid", a.UID, "winner", winner,
 			"remoteModified", a.Remote.LastModified, "localModified", a.LocalEvent.LastModified)
@@ -667,43 +1055,53 @@ func applyConflict(ctx context.Context, c *Client, plan CalendarPlan, a Action, 
 	if winner == "local" {
 		switch {
 		case !a.LocalExists:
-			// The local deletion wins over the remote edit.
-			slog.Warn("Conflict: local deletion wins, deleting remote event", "module", "GRAPHCAL",
+			// The local deletion wins over the remote edit; routed like a
+			// plain delete (organizer cancels, attendee declines).
+			slog.Warn("Conflict: local deletion wins, removing remote event", "module", "GRAPHCAL",
 				"calendar", plan.Calendar.Name, "uid", a.UID, "graphID", a.GraphID)
-			if err := c.DeleteEvent(ctx, a.GraphID); err != nil {
-				return fmt.Errorf("failed to delete remote event for conflict %s: %w", a.UID, err)
+			if err := removeRemoteEvent(ctx, c, plan, a, opts); err != nil {
+				return false, fmt.Errorf("failed to remove remote event for conflict %s: %w", a.UID, err)
 			}
 			delete(status.Items, a.UID)
 		case !a.RemoteExists:
-			// The remote event was deleted but the local edit wins: re-create.
+			if len(a.LocalEvent.Attendees) > 0 {
+				// R3: re-creating a meeting would send a fresh invitation
+				// wave for an event someone deliberately cancelled. Refuse
+				// and leave both sides untouched for manual resolution.
+				slog.Warn("Conflict: remote meeting deleted but local edit wins — refusing to re-create a meeting, resolve manually", "module", "GRAPHCAL",
+					"calendar", plan.Calendar.Name, "uid", a.UID, "path", a.LocalPath,
+					"recipients", a.Recipients)
+				return true, nil
+			}
+			// The remote event was deleted but the local edit wins: re-create
+			// (attendee-free, so no invitations are involved).
 			slog.Warn("Conflict: local edit wins, re-creating deleted remote event", "module", "GRAPHCAL",
 				"calendar", plan.Calendar.Name, "uid", a.UID, "path", a.LocalPath)
 			if err := createFromLocal(ctx, c, plan, a, status); err != nil {
-				return err
+				return false, err
 			}
 		default:
 			slog.Warn("Conflict: local wins, overwriting remote event", "module", "GRAPHCAL",
 				"calendar", plan.Calendar.Name, "uid", a.UID, "graphID", a.GraphID)
 			if err := patchFromLocal(ctx, c, plan, a, status); err != nil {
-				return err
+				return false, err
 			}
 		}
-		return nil
+		return false, nil
 	}
 
-	// Remote wins (also the fallback for an unknown policy string — the
-	// conservative default).
+	// Remote wins.
 	if a.LocalExists {
 		backupPath := fmt.Sprintf("%s.conflict-%d", a.LocalPath, time.Now().Unix())
 		if err := os.Rename(a.LocalPath, backupPath); err != nil {
-			return fmt.Errorf("failed to back up conflicting file %s: %w", a.LocalPath, err)
+			return false, fmt.Errorf("failed to back up conflicting file %s: %w", a.LocalPath, err)
 		}
 		slog.Warn("Conflict: remote wins, local file backed up", "module", "GRAPHCAL",
 			"calendar", plan.Calendar.Name, "uid", a.UID, "backup", backupPath)
 	}
 	if a.RemoteExists {
-		if err := writeRemoteEvent(plan.Dir, a.LocalPath, a.UID, a.Remote, status); err != nil {
-			return err
+		if err := writeRemoteEvent(plan.Dir, a.LocalPath, a.UID, a.Remote, status, c.owner); err != nil {
+			return false, err
 		}
 	} else {
 		// The remote deletion wins; the local edit survives only as the
@@ -712,7 +1110,7 @@ func applyConflict(ctx context.Context, c *Client, plan CalendarPlan, a Action, 
 			"calendar", plan.Calendar.Name, "uid", a.UID)
 		delete(status.Items, a.UID)
 	}
-	return nil
+	return false, nil
 }
 
 // writeCalendarMeta ensures calDir exists and carries the vdir displayname and
@@ -739,7 +1137,9 @@ func writeCalendarMeta(calDir string, cal Calendar) error {
 // that fail to parse, lack a UID or duplicate an already-seen UID are logged
 // and skipped — they are invisible to the diff, never treated as items.
 // Conflict backups (<file>.conflict-<ts>) do not end in .ics and are ignored.
-func scanLocalItems(calDir string) (map[string]localItem, error) {
+// owner is the account email, threaded into ICalToEvent so the owner's RSVP
+// is recognized in the parsed events.
+func scanLocalItems(calDir, owner string) (map[string]localItem, error) {
 	entries, err := os.ReadDir(calDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -758,7 +1158,7 @@ func scanLocalItems(calDir string) (map[string]localItem, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to read %s: %w", path, err)
 		}
-		ev, err := ICalToEvent(data)
+		ev, err := ICalToEvent(data, owner)
 		if err != nil {
 			slog.Warn("Skipping unparseable local .ics", "module", "GRAPHCAL",
 				"path", path, "err", err)

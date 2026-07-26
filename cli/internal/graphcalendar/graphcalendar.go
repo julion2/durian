@@ -44,7 +44,7 @@ const (
 
 	// masterEventSelect is the field set requested on /events queries (master
 	// events for two-way sync): eventSelect plus the full body, the recurrence
-	// definition, the event type, the changeKey etag, and the read-only meeting
+	// definition, the event type, the changeKey etag, and the meeting
 	// metadata (attendees, organizer, the user's RSVP state, online-meeting
 	// join info, cancellation flags).
 	masterEventSelect = "id,iCalUId,subject,body,bodyPreview,start,end,isAllDay,location,recurrence,type,changeKey,lastModifiedDateTime," +
@@ -53,6 +53,11 @@ const (
 	// preferUTC asks Graph to return event start/end dateTimes in UTC, so
 	// parsing never has to interpret Windows timezone names.
 	preferUTC = `outlook.timezone="UTC"`
+
+	// preferMaster is the Prefer header for the two-way sync read/write paths:
+	// UTC dateTimes plus immutable event ids, so the Graph ids recorded in the
+	// sync status survive folder moves.
+	preferMaster = preferUTC + `, IdType="ImmutableId"`
 
 	// tokenExpiryBuffer refreshes the cached Graph token this long before its
 	// actual expiry, so a request never starts with an about-to-expire token.
@@ -67,6 +72,11 @@ type Client struct {
 	clientID     string
 	clientSecret string
 	tenant       string
+
+	// owner is the mailbox owner's email address (the account auth email),
+	// used to recognize the owner's own attendee entry and to role-gate
+	// attendee uploads. Tests set it directly.
+	owner string
 
 	httpClient *http.Client
 	// baseURL is the Graph API root without trailing slash. Defaults to
@@ -94,6 +104,7 @@ func New(account *config.AccountConfig) (*Client, error) {
 		clientID:     account.OAuth.ClientID,
 		clientSecret: account.OAuth.ClientSecret,
 		tenant:       account.OAuth.Tenant,
+		owner:        account.GetAuthEmail(),
 		httpClient:   &http.Client{Timeout: 60 * time.Second},
 		baseURL:      defaultBaseURL,
 	}
@@ -361,17 +372,19 @@ type Event struct {
 	// non-recurring events.
 	Recurrence *Recurrence
 
-	// Meeting metadata (Stage 1: READ-ONLY). The fields below are downloaded
-	// from Graph, surfaced in the .ics and factored into eventContentHash, but
-	// EventToGraphBody never uploads them — so durian can never trigger
-	// invitation, update or cancellation emails. calendarView results leave
-	// them zero (eventSelect does not request them).
+	// Meeting metadata (Stage 2: read/write). Attendees and the owner's RSVP
+	// are parsed on both read paths (Graph and local iCal) and — role-gated
+	// on the owner being the organizer — uploaded again, so durian acts as a
+	// full scheduling client. calendarView results leave the fields zero
+	// (eventSelect does not request them).
 
 	// Attendees is the meeting's attendee list; empty for plain appointments.
 	Attendees []Attendee
 	// Organizer is the meeting organizer; nil for plain appointments.
 	Organizer *Person
 	// IsOrganizer reports whether the account owner organizes this meeting.
+	// Only set on the Graph read path; local files identify the organizer via
+	// Organizer/owner email comparison instead.
 	IsOrganizer bool
 	// IsCancelled reports whether the meeting has been cancelled remotely.
 	IsCancelled bool
@@ -381,10 +394,46 @@ type Event struct {
 	// falling back to the legacy onlineMeetingUrl field. Empty when the event
 	// is not an online meeting.
 	OnlineMeetingURL string
-	// MyResponse is the account owner's RSVP to this meeting, one of Graph's
-	// "none", "organizer", "tentativelyAccepted", "accepted", "declined" or
-	// "notResponded". Empty for calendarView results.
-	MyResponse string
+	// OwnerResponse is the account owner's RSVP to this meeting, canonical
+	// across both read paths (Graph responseStatus, iCal owner PARTSTAT).
+	// Deliberately excluded from eventContentHash — an owner RSVP is handled
+	// by the dedicated ActionRsvp three-way diff, never as a content change.
+	OwnerResponse OwnerResp
+	// RequestOnlineMeeting is the local-only X-DURIAN-CREATE-TEAMS-MEETING
+	// marker: the create path requests a Teams online meeting for this event.
+	// Excluded from every hash and never round-tripped back into the .ics.
+	RequestOnlineMeeting bool
+}
+
+// OwnerResp is the canonical owner-RSVP state of an event, mapped from both
+// Graph's responseStatus.response enum and iCal PARTSTAT values. The zero
+// value OwnerRespNone means "not (yet) responded": Graph's "none" and
+// "notResponded" and iCal's NEEDS-ACTION all collapse to it.
+type OwnerResp string
+
+const (
+	OwnerRespNone      OwnerResp = ""
+	OwnerRespTentative OwnerResp = "tentative"
+	OwnerRespAccepted  OwnerResp = "accepted"
+	OwnerRespDeclined  OwnerResp = "declined"
+	OwnerRespOrganizer OwnerResp = "organizer"
+)
+
+// ownerRespFromGraph maps Graph's responseStatus.response enum to the
+// canonical OwnerResp.
+func ownerRespFromGraph(s string) OwnerResp {
+	switch s {
+	case "tentativelyAccepted":
+		return OwnerRespTentative
+	case "accepted":
+		return OwnerRespAccepted
+	case "declined":
+		return OwnerRespDeclined
+	case "organizer":
+		return OwnerRespOrganizer
+	default: // "none", "notResponded", "", unknown
+		return OwnerRespNone
+	}
 }
 
 // Attendee is one meeting attendee as Graph reports it. Type is the Graph
@@ -417,29 +466,24 @@ type Person struct {
 // can never be confused; Description line endings are normalized to LF, and a
 // Recurrence is canonicalized via its fixed-field JSON encoding.
 //
-// The read-only meeting metadata (attendees, organizer, cancellation, join
-// link, own RSVP) is part of the hash too, so a server-side change — someone
-// RSVPs, an attendee is added or removed, a meeting is cancelled, a join link
-// changes — is detected as a remote change and re-downloaded. Attendees are
+// The meeting metadata (attendees, organizer, cancellation, join link) is
+// part of the hash too, so a server-side change — another attendee RSVPs, an
+// attendee is added or removed, a meeting is cancelled, a join link changes —
+// is detected as a remote change and re-downloaded. Attendees are
 // canonicalized as a SORTED list of "email|type|response" entries so the hash
 // does not depend on Graph's ordering.
-func eventContentHash(e Event) string {
-	var recurrence string
-	if e.Recurrence != nil {
-		data, err := json.Marshal(e.Recurrence)
-		if err != nil {
-			// Unreachable for a plain struct; keep a deterministic fallback
-			// rather than failing the hash.
-			slog.Warn("Failed to marshal recurrence for content hash", "module", "GRAPHCAL",
-				"id", e.ID, "err", err)
-			recurrence = fmt.Sprintf("%+v", *e.Recurrence)
-		} else {
-			recurrence = string(data)
-		}
-	}
-
+//
+// The OWNER'S own state is deliberately excluded: neither OwnerResponse nor
+// the owner's own attendee entry (matched by ownerEmail, case-insensitive on
+// the address) is hashed, so an owner RSVP — locally or in Outlook — never
+// registers as a content change. Owner RSVPs are handled by the dedicated
+// ActionRsvp three-way diff instead (see twosync.go).
+func eventContentHash(e Event, ownerEmail string) string {
 	attendees := make([]string, 0, len(e.Attendees))
 	for _, a := range e.Attendees {
+		if ownerEmail != "" && strings.EqualFold(a.Email, ownerEmail) {
+			continue
+		}
 		attendees = append(attendees, a.Email+"|"+a.Type+"|"+a.Response)
 	}
 	sort.Strings(attendees)
@@ -457,18 +501,83 @@ func eventContentHash(e Event) string {
 		strconv.FormatBool(e.AllDay),
 		e.Location,
 		normalizeText(e.Description),
-		recurrence,
+		recurrenceJSON(e.Recurrence, e.ID),
 		strings.Join(attendees, "\n"),
 		organizerEmail,
 		strconv.FormatBool(e.IsOnlineMeeting),
 		e.OnlineMeetingURL,
 		strconv.FormatBool(e.IsCancelled),
-		e.MyResponse,
 	} {
 		h.Write([]byte(field))
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// recurrenceJSON canonicalizes a Recurrence as its fixed-field JSON encoding
+// ("" for nil), for hashing and equality checks. id is only used in the
+// (unreachable for plain structs) marshal-failure warning.
+func recurrenceJSON(rec *Recurrence, id string) string {
+	if rec == nil {
+		return ""
+	}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		// Keep a deterministic fallback rather than failing the hash.
+		slog.Warn("Failed to marshal recurrence for content hash", "module", "GRAPHCAL",
+			"id", id, "err", err)
+		return fmt.Sprintf("%+v", *rec)
+	}
+	return string(data)
+}
+
+// attendeeSetHash returns a SHA-256 hex digest of the attendee SET — sorted
+// "email|type" entries, responses excluded — used as the ItemStatus baseline
+// that detects attendee adds/removes as real scheduling changes. The digest
+// of an empty list is still a non-empty string, so "" can mean "unknown
+// baseline" (pre-Stage-2 status files).
+func attendeeSetHash(attendees []Attendee) string {
+	entries := make([]string, 0, len(attendees))
+	for _, a := range attendees {
+		entries = append(entries, strings.ToLower(a.Email)+"|"+a.Type)
+	}
+	sort.Strings(entries)
+	sum := sha256.Sum256([]byte(strings.Join(entries, "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
+// ownerIsOrganizer reports whether the account owner organizes this remote
+// event: Graph's IsOrganizer flag, or the organizer email matching the owner.
+func ownerIsOrganizer(e Event, owner string) bool {
+	if e.IsOrganizer {
+		return true
+	}
+	return e.Organizer != nil && owner != "" && strings.EqualFold(e.Organizer.Email, owner)
+}
+
+// localOwnerIsOrganizer reports whether the account owner organizes a locally
+// parsed event: no ORGANIZER in the file (the owner creates, so Graph will
+// make them the organizer) or an ORGANIZER matching the owner. A foreign
+// ORGANIZER means the file was copied from someone else's meeting — durian
+// must not invite on their behalf.
+func localOwnerIsOrganizer(e Event, owner string) bool {
+	if e.Organizer == nil {
+		return true
+	}
+	return owner != "" && strings.EqualFold(e.Organizer.Email, owner)
+}
+
+// countRecipients counts the attendees other than the owner — the recipients
+// of an invitation/update/cancellation for this event.
+func countRecipients(attendees []Attendee, owner string) int {
+	n := 0
+	for _, a := range attendees {
+		if owner != "" && strings.EqualFold(a.Email, owner) {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // Recurrence mirrors the Graph patternedRecurrence resource: how a series
@@ -631,7 +740,7 @@ func eventFromGraph(ge graphEvent) (Event, bool) {
 		IsCancelled:      ge.IsCancelled,
 		IsOnlineMeeting:  ge.IsOnlineMeeting,
 		OnlineMeetingURL: onlineMeetingURL,
-		MyResponse:       ge.ResponseStatus.Response,
+		OwnerResponse:    ownerRespFromGraph(ge.ResponseStatus.Response),
 	}, true
 }
 
@@ -678,10 +787,10 @@ func (c *Client) FetchEvents(ctx context.Context, calendarID string, from, to ti
 // /events endpoint: singleInstance events and seriesMaster events carrying
 // their Recurrence definition. Expanded "occurrence" and "exception" entries
 // are skipped — the two-way sync engine works on series definitions, not
-// instances. The Prefer: outlook.timezone="UTC" header is sent on every page
-// (including @odata.nextLink follow-ups) so start/end come back in UTC.
+// instances. The Prefer header (UTC dateTimes, immutable ids) is sent on
+// every page (including @odata.nextLink follow-ups).
 func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]Event, error) {
-	headers := map[string]string{"Prefer": preferUTC}
+	headers := map[string]string{"Prefer": preferMaster}
 
 	var events []Event
 	pageURL := fmt.Sprintf("%s/me/calendars/%s/events?$select=%s&$top=100",
@@ -721,7 +830,7 @@ func (c *Client) GetEvent(ctx context.Context, eventID string) (Event, error) {
 		c.baseURL, url.PathEscape(eventID), masterEventSelect)
 
 	var ge graphEvent
-	if err := c.doJSON(ctx, reqURL, map[string]string{"Prefer": preferUTC}, &ge); err != nil {
+	if err := c.doJSON(ctx, reqURL, map[string]string{"Prefer": preferMaster}, &ge); err != nil {
 		return Event{}, fmt.Errorf("failed to get event %s: %w", eventID, err)
 	}
 	ev, ok := eventFromGraph(ge)

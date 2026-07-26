@@ -10,7 +10,12 @@ import (
 // assertions see exactly the wire shape Graph would receive.
 func marshalBody(t *testing.T, e Event) map[string]any {
 	t.Helper()
-	data, err := json.Marshal(EventToGraphBody(e))
+	return marshalBodyAttendees(t, e, false)
+}
+
+func marshalBodyAttendees(t *testing.T, e Event, includeAttendees bool) map[string]any {
+	t.Helper()
+	data, err := json.Marshal(EventToGraphBody(e, includeAttendees))
 	if err != nil {
 		t.Fatalf("marshal graph body: %v", err)
 	}
@@ -117,39 +122,58 @@ func TestEventToGraphBodyWeeklyRecurrence(t *testing.T) {
 	}
 }
 
-func TestEventToGraphBodyOmitsMeetingMetadata(t *testing.T) {
-	// Stage 1 regression: meeting metadata is read-only. Even when the Event
-	// carries attendees/organizer/online-meeting/cancellation state, the
-	// uploaded body must contain ONLY the original fields — otherwise Graph
-	// would send invitation/update/cancellation emails on our writes.
-	m := marshalBody(t, Event{
+func TestEventToGraphBodyAttendeeGating(t *testing.T) {
+	meeting := Event{
 		Subject: "Design review",
 		Start:   time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC),
 		End:     time.Date(2026, 7, 23, 11, 0, 0, 0, time.UTC),
 		Attendees: []Attendee{
 			{Name: "Alice Example", Email: "alice@example.com", Type: "required", Response: "accepted"},
+			{Name: "Bob Example", Email: "bob@example.com", Type: "optional", Response: "declined"},
 		},
-		Organizer:        &Person{Name: "Olivia Organizer", Email: "olivia@example.com"},
-		IsOrganizer:      true,
-		IsCancelled:      true,
-		IsOnlineMeeting:  true,
-		OnlineMeetingURL: "https://teams.microsoft.com/l/meetup-join/abc123",
-		MyResponse:       "accepted",
-	})
+		Organizer:            &Person{Name: "Olivia Organizer", Email: "olivia@example.com"},
+		IsOrganizer:          true,
+		IsCancelled:          true,
+		IsOnlineMeeting:      true,
+		OnlineMeetingURL:     "https://teams.microsoft.com/l/meetup-join/abc123",
+		OwnerResponse:        OwnerRespAccepted,
+		RequestOnlineMeeting: true,
+	}
 
+	// Without includeAttendees (non-organizer writes) the body must contain
+	// ONLY the core fields — no attendee/organizer/RSVP/meeting keys, so a
+	// PATCH can never trigger scheduling mail.
+	m := marshalBodyAttendees(t, meeting, false)
 	allowed := map[string]bool{
 		"subject": true, "body": true, "start": true, "end": true,
 		"isAllDay": true, "location": true, "recurrence": true,
 	}
 	for key := range m {
 		if !allowed[key] {
-			t.Errorf("graph body contains forbidden key %q", key)
+			t.Errorf("attendee-free graph body contains forbidden key %q", key)
 		}
 	}
+
+	// With includeAttendees (organizer writes) ONLY the attendee list is
+	// added: never the organizer, responses, cancellation or online-meeting
+	// state — Graph owns those.
+	m = marshalBodyAttendees(t, meeting, true)
+	attendees, ok := m["attendees"].([]any)
+	if !ok || len(attendees) != 2 {
+		t.Fatalf("attendees = %v, want 2 entries", m["attendees"])
+	}
+	first, _ := attendees[0].(map[string]any)
+	addr, _ := first["emailAddress"].(map[string]any)
+	if first["type"] != "required" || addr["address"] != "alice@example.com" || addr["name"] != "Alice Example" {
+		t.Errorf("attendee[0] = %v, want required alice@example.com", first)
+	}
+	if _, ok := first["status"]; ok {
+		t.Error("attendee upload must not carry a response status")
+	}
 	for _, forbidden := range []string{
-		"attendees", "organizer", "responseStatus",
-		"isOnlineMeeting", "onlineMeeting", "onlineMeetingUrl",
-		"isCancelled", "isOrganizer",
+		"organizer", "responseStatus",
+		"isOnlineMeeting", "onlineMeeting", "onlineMeetingUrl", "onlineMeetingProvider",
+		"isCancelled", "isOrganizer", "transactionId",
 	} {
 		if _, ok := m[forbidden]; ok {
 			t.Errorf("graph body must not contain %q", forbidden)
