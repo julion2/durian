@@ -1,6 +1,6 @@
 module github.com/julion2/durian/cli
 
-go 1.25.11
+go 1.25.12
 
 require (
 	filippo.io/age v1.3.1
@@ -15,7 +15,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/net v0.55.0
 	golang.org/x/term v0.43.0
-	golang.org/x/text v0.37.0
+	golang.org/x/text v0.39.0
 	modernc.org/sqlite v1.41.0
 )
 
