@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,8 +15,10 @@ import (
 )
 
 // newCalendarHandler builds a Handler whose config points at a temp vdir seeded
-// with two events in one "Calendar" of account alias "work".
-func newCalendarHandler(t *testing.T) http.Handler {
+// with two events in one "Calendar" of account alias "work" (owner
+// me@example.com), returning the router and the calendar directory for tests
+// that seed additional events.
+func newCalendarHandler(t *testing.T) (http.Handler, string) {
 	t.Helper()
 	base := t.TempDir()
 	calDir := filepath.Join(base, "work", "Calendar")
@@ -25,19 +28,16 @@ func newCalendarHandler(t *testing.T) http.Handler {
 	if err := os.WriteFile(filepath.Join(calDir, "displayname"), []byte("Calendar\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeEvent := func(uid, subject string, start time.Time) {
-		data, err := graphcalendar.EventToICal(graphcalendar.Event{
-			ICalUID: uid, Subject: subject, Start: start, End: start.Add(time.Hour),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(calDir, uid+".ics"), data, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	writeEvent("evt-lunch", "Team Lunch", time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC))
-	writeEvent("evt-review", "Design Review", time.Date(2026, 8, 5, 9, 0, 0, 0, time.UTC))
+	writeCalendarTestEvent(t, calDir, graphcalendar.Event{
+		ICalUID: "evt-lunch", Subject: "Team Lunch",
+		Start: time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 8, 1, 13, 0, 0, 0, time.UTC),
+	})
+	writeCalendarTestEvent(t, calDir, graphcalendar.Event{
+		ICalUID: "evt-review", Subject: "Design Review",
+		Start: time.Date(2026, 8, 5, 9, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC),
+	})
 
 	cfg := &config.Config{
 		Calendar: config.CalendarConfig{VdirPath: base},
@@ -45,7 +45,19 @@ func newCalendarHandler(t *testing.T) http.Handler {
 	}
 	h := New(nil, nil)
 	h.SetConfig(cfg)
-	return newTestRouter(h, nil)
+	return newTestRouter(h, nil), calDir
+}
+
+// writeCalendarTestEvent serializes an event into calDir under its UID name.
+func writeCalendarTestEvent(t *testing.T, calDir string, ev graphcalendar.Event) {
+	t.Helper()
+	data, err := graphcalendar.EventToICal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(calDir, ev.ICalUID+".ics"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func getJSON(t *testing.T, r http.Handler, url string, out any) int {
@@ -61,7 +73,7 @@ func getJSON(t *testing.T, r http.Handler, url string, out any) int {
 }
 
 func TestCalendarsHandler(t *testing.T) {
-	r := newCalendarHandler(t)
+	r, _ := newCalendarHandler(t)
 	var resp struct {
 		OK        bool                        `json:"ok"`
 		Calendars []graphcalendar.CalendarDTO `json:"calendars"`
@@ -78,7 +90,7 @@ func TestCalendarsHandler(t *testing.T) {
 }
 
 func TestCalendarEventsWindow(t *testing.T) {
-	r := newCalendarHandler(t)
+	r, _ := newCalendarHandler(t)
 	var resp struct {
 		OK     bool                          `json:"ok"`
 		Events []graphcalendar.CalendarEvent `json:"events"`
@@ -98,7 +110,7 @@ func TestCalendarEventsWindow(t *testing.T) {
 }
 
 func TestCalendarEventsWindowExcludes(t *testing.T) {
-	r := newCalendarHandler(t)
+	r, _ := newCalendarHandler(t)
 	var resp struct {
 		Events []graphcalendar.CalendarEvent `json:"events"`
 	}
@@ -110,7 +122,7 @@ func TestCalendarEventsWindowExcludes(t *testing.T) {
 }
 
 func TestCalendarEventsSearch(t *testing.T) {
-	r := newCalendarHandler(t)
+	r, _ := newCalendarHandler(t)
 	var resp struct {
 		Events []graphcalendar.CalendarEvent `json:"events"`
 	}
@@ -121,7 +133,7 @@ func TestCalendarEventsSearch(t *testing.T) {
 }
 
 func TestCalendarEventDetail(t *testing.T) {
-	r := newCalendarHandler(t)
+	r, _ := newCalendarHandler(t)
 	var resp struct {
 		OK    bool                        `json:"ok"`
 		Event graphcalendar.CalendarEvent `json:"event"`
@@ -134,8 +146,182 @@ func TestCalendarEventDetail(t *testing.T) {
 	}
 }
 
+func TestCalendarPutGetDeleteRoundTrip(t *testing.T) {
+	r, _ := newCalendarHandler(t)
+
+	body := `{"account":"work","calendar":"Calendar","subject":"New Event","start":"2026-08-03T09:00:00Z","end":"2026-08-03T10:00:00Z","location":"Room 1"}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT status %d: %s", w.Code, w.Body.String())
+	}
+	var put struct {
+		OK    bool                        `json:"ok"`
+		Event graphcalendar.CalendarEvent `json:"event"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &put); err != nil {
+		t.Fatal(err)
+	}
+	if !put.OK || put.Event.UID == "" || put.Event.Subject != "New Event" {
+		t.Fatalf("put response = %+v", put)
+	}
+	uid := put.Event.UID
+
+	// Read it back.
+	var got struct {
+		Event graphcalendar.CalendarEvent `json:"event"`
+	}
+	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref="+uid, &got); code != http.StatusOK {
+		t.Fatalf("GET after PUT status %d", code)
+	}
+	if got.Event.Subject != "New Event" || got.Event.Location != "Room 1" {
+		t.Errorf("round-tripped event = %+v", got.Event)
+	}
+
+	// Delete it.
+	wd := httptest.NewRecorder()
+	r.ServeHTTP(wd, httptest.NewRequest("DELETE", "/api/v1/calendars/event?account=work&ref="+uid, nil))
+	if wd.Code != http.StatusOK {
+		t.Fatalf("DELETE status %d", wd.Code)
+	}
+	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref="+uid, nil); code != http.StatusNotFound {
+		t.Errorf("GET after DELETE = %d, want 404", code)
+	}
+}
+
+func TestCalendarPutValidation(t *testing.T) {
+	r, _ := newCalendarHandler(t)
+	cases := []struct {
+		body string
+		want int
+	}{
+		{`{"account":"work","calendar":"Calendar","start":"nope","end":"2026-08-03T10:00:00Z"}`, http.StatusBadRequest},
+		{`{"account":"work","subject":"x","start":"2026-08-03T09:00:00Z","end":"2026-08-03T10:00:00Z"}`, http.StatusBadRequest},
+		{`{"account":"work","calendar":"Calendar","start":"2026-08-03T10:00:00Z","end":"2026-08-03T09:00:00Z"}`, http.StatusBadRequest},
+		{`{"calendar":"Calendar","start":"2026-08-03T09:00:00Z","end":"2026-08-03T10:00:00Z"}`, http.StatusBadRequest},
+	}
+	for _, c := range cases {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(c.body)))
+		if w.Code != c.want {
+			t.Errorf("PUT %q = %d, want %d", c.body, w.Code, c.want)
+		}
+	}
+}
+
+func TestCalendarPutAllDaySnap(t *testing.T) {
+	// An all-day event shorter than a full day (Graph would reject it) is
+	// normalized to midnight UTC day boundaries and snapped to one day.
+	r, _ := newCalendarHandler(t)
+	body := `{"account":"work","calendar":"Calendar","subject":"Holiday","all_day":true,"start":"2026-08-03T09:00:00Z","end":"2026-08-03T10:00:00Z"}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT status %d: %s", w.Code, w.Body.String())
+	}
+	var put struct {
+		Event graphcalendar.CalendarEvent `json:"event"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &put); err != nil {
+		t.Fatal(err)
+	}
+	if !put.Event.AllDay {
+		t.Error("all_day not preserved")
+	}
+	wantStart := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	wantEnd := time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)
+	if !put.Event.Start.Equal(wantStart) || !put.Event.End.Equal(wantEnd) {
+		t.Errorf("start/end = %v / %v, want %v / %v", put.Event.Start, put.Event.End, wantStart, wantEnd)
+	}
+
+	// The stored .ics agrees: reading it back yields the snapped day span.
+	var got struct {
+		Event graphcalendar.CalendarEvent `json:"event"`
+	}
+	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref="+put.Event.UID, &got); code != http.StatusOK {
+		t.Fatalf("GET after PUT status %d", code)
+	}
+	if !got.Event.AllDay || !got.Event.Start.Equal(wantStart) || !got.Event.End.Equal(wantEnd) {
+		t.Errorf("stored event = %+v, want all-day %v..%v", got.Event, wantStart, wantEnd)
+	}
+}
+
+func TestCalendarPutUpdatePreservesMeetingFields(t *testing.T) {
+	// A GUI edit only carries subject/time/location/description. The update
+	// must merge over the existing event — organizer, attendees, recurrence
+	// and the owner's RSVP survive — otherwise the next sync would push the
+	// stripped event (e.g. an uninvite wave) to Graph.
+	r, calDir := newCalendarHandler(t)
+	writeCalendarTestEvent(t, calDir, graphcalendar.Event{
+		ICalUID: "evt-meeting", Subject: "Weekly Sync",
+		Start: time.Date(2026, 8, 6, 9, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 8, 6, 10, 0, 0, 0, time.UTC),
+		Attendees: []graphcalendar.Attendee{
+			{Name: "Me", Email: "me@example.com", Type: "required", Response: "accepted"},
+			{Name: "Alice", Email: "alice@example.com", Type: "required", Response: "accepted"},
+		},
+		Organizer: &graphcalendar.Person{Name: "Org", Email: "organizer@example.com"},
+		Recurrence: &graphcalendar.Recurrence{
+			Pattern: graphcalendar.RecurrencePattern{Type: "weekly", Interval: 1, DaysOfWeek: []string{"thursday"}},
+			Range:   graphcalendar.RecurrenceRange{Type: "noEnd", StartDate: "2026-08-06"},
+		},
+	})
+
+	body := `{"account":"work","calendar":"Calendar","uid":"evt-meeting","subject":"Weekly Sync (moved)","start":"2026-08-06T10:00:00Z","end":"2026-08-06T11:00:00Z"}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT status %d: %s", w.Code, w.Body.String())
+	}
+
+	var got struct {
+		Event graphcalendar.CalendarEvent `json:"event"`
+	}
+	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref=evt-meeting", &got); code != http.StatusOK {
+		t.Fatalf("GET after PUT status %d", code)
+	}
+	e := got.Event
+	if e.Subject != "Weekly Sync (moved)" {
+		t.Errorf("subject = %q, want the edit applied", e.Subject)
+	}
+	if len(e.Attendees) != 2 {
+		t.Fatalf("attendees = %+v, want the 2 preserved", e.Attendees)
+	}
+	if e.Organizer == nil || e.Organizer.Email != "organizer@example.com" {
+		t.Errorf("organizer = %+v, want preserved", e.Organizer)
+	}
+	if !e.Recurring {
+		t.Error("recurrence not preserved")
+	}
+	if e.MyResponse != "accepted" {
+		t.Errorf("my_response = %q, want the preserved RSVP", e.MyResponse)
+	}
+
+	// An explicit attendee list in the request replaces the existing one.
+	body = `{"account":"work","calendar":"Calendar","uid":"evt-meeting","subject":"Weekly Sync (moved)","start":"2026-08-06T10:00:00Z","end":"2026-08-06T11:00:00Z","attendees":[{"email":"bob@example.com","type":"required"}]}`
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT with attendees status %d: %s", w.Code, w.Body.String())
+	}
+	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref=evt-meeting", &got); code != http.StatusOK {
+		t.Fatalf("GET status %d", code)
+	}
+	if len(got.Event.Attendees) != 1 || got.Event.Attendees[0].Email != "bob@example.com" {
+		t.Errorf("attendees = %+v, want the explicit replacement", got.Event.Attendees)
+	}
+
+	// Moving an event to another calendar is rejected.
+	body = `{"account":"work","calendar":"Other","uid":"evt-meeting","subject":"x","start":"2026-08-06T10:00:00Z","end":"2026-08-06T11:00:00Z"}`
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("PUT calendar move = %d, want 400", w.Code)
+	}
+}
+
 func TestCalendarHandlerErrors(t *testing.T) {
-	r := newCalendarHandler(t)
+	r, _ := newCalendarHandler(t)
 	cases := []struct {
 		url  string
 		want int

@@ -178,6 +178,8 @@ func runServe(cmd *cobra.Command, args []string) {
 	// paths first so /calendars does not shadow /calendars/events.
 	r.HandleFunc("/api/v1/calendars/events", h.CalendarEventsHandler).Methods("GET")
 	r.HandleFunc("/api/v1/calendars/event", h.CalendarEventHandler).Methods("GET")
+	r.HandleFunc("/api/v1/calendars/event", h.CalendarPutEventHandler).Methods("PUT")
+	r.HandleFunc("/api/v1/calendars/event", h.CalendarDeleteEventHandler).Methods("DELETE")
 	r.HandleFunc("/api/v1/calendars", h.CalendarsHandler).Methods("GET")
 
 	// Outbox routes

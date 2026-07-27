@@ -107,6 +107,9 @@ type syncHarness struct {
 	// the test (unexpected remote write).
 	createResponse map[string]any
 	createBodies   []map[string]any
+	// createStatus, when non-zero, is returned for every POST create instead
+	// of the configured response (e.g. 400 for continue-on-error tests).
+	createStatus int
 	// patchResponses maps event id -> PATCH response body; a PATCH for an id
 	// without one fails the test.
 	patchResponses map[string]map[string]any
@@ -166,6 +169,10 @@ func newSyncHarness(t *testing.T) *syncHarness {
 			t.Errorf("decode create body: %v", err)
 		}
 		h.createBodies = append(h.createBodies, body)
+		if h.createStatus != 0 {
+			w.WriteHeader(h.createStatus)
+			return
+		}
 		if attendees, ok := body["attendees"].([]any); ok && len(attendees) > 0 {
 			h.notifications++ // a create with attendees sends invitations
 		}
@@ -1005,6 +1012,82 @@ func TestSyncDryRunSkipsRemoteWrites(t *testing.T) {
 	}
 	if len(h.status.Items) != 0 {
 		t.Errorf("dry run mutated status: %+v", h.status.Items)
+	}
+}
+
+// MARK: - Continue on per-event failure
+
+func TestSyncContinuesAfterEventFailure(t *testing.T) {
+	// Two tracked events edited locally; every PATCH fails with a Graph 400
+	// (e.g. a rejected event body). The failures must be counted — not abort
+	// the run — and the unrelated new remote event (sorting AFTER the failing
+	// uploads) must still be downloaded.
+	h := newSyncHarness(t)
+	h.events = []map[string]any{
+		masterEvent("g1", "uid-a-1", "One", "ck1"),
+		masterEvent("g2", "uid-a-2", "Two", "ck1"),
+	}
+	h.sync(SyncOptions{})
+	baseline1 := h.status.Items["uid-a-1"]
+	baseline2 := h.status.Items["uid-a-2"]
+
+	h.writeLocal("uid-a-1", "One edited")
+	h.writeLocal("uid-a-2", "Two edited")
+	h.events = append(h.events, masterEvent("g3", "uid-z-new", "Three", "ck1"))
+	h.patchStatus = http.StatusBadRequest
+
+	stats := h.sync(SyncOptions{})
+	if stats.Failed != 2 || stats.Downloaded != 1 || stats.Uploaded != 0 {
+		t.Fatalf("stats = %+v, want Failed=2 Downloaded=1 Uploaded=0", stats)
+	}
+	// The failed items keep their old baseline so the next run re-plans them.
+	if h.status.Items["uid-a-1"] != baseline1 || h.status.Items["uid-a-2"] != baseline2 {
+		t.Error("failed uploads must not advance their status baseline")
+	}
+	// The download after the failures still landed.
+	if _, err := os.Stat(h.icsPath("uid-z-new")); err != nil {
+		t.Errorf("unrelated download missing after failures: %v", err)
+	}
+	// The local edits survive untouched for the retry.
+	if body, _ := os.ReadFile(h.icsPath("uid-a-1")); !strings.Contains(string(body), "One edited") {
+		t.Error("failed upload must keep the local edit")
+	}
+}
+
+func TestSyncCreateFailureContinues(t *testing.T) {
+	// A Graph 400 on one create (e.g. "all-day must span whole days") must not
+	// block the rest of the plan.
+	h := newSyncHarness(t)
+	h.writeLocal("aaa-local", "Broken create")
+	h.events = []map[string]any{masterEvent("g1", "uid-remote", "Fine", "ck1")}
+	h.createStatus = http.StatusBadRequest
+
+	stats := h.sync(SyncOptions{})
+	if stats.Failed != 1 || stats.Downloaded != 1 || stats.Uploaded != 0 {
+		t.Fatalf("stats = %+v, want Failed=1 Downloaded=1 Uploaded=0", stats)
+	}
+	// The failed create keeps its local file and stays untracked for the
+	// next run.
+	if _, err := os.Stat(h.icsPath("aaa-local")); err != nil {
+		t.Errorf("failed create must keep the local file: %v", err)
+	}
+	if _, ok := h.status.Items["aaa-local"]; ok {
+		t.Error("failed create must not be tracked")
+	}
+}
+
+func TestSyncAbortsOnAuthError(t *testing.T) {
+	// A 401 means every remaining action would fail identically — the run
+	// aborts so the command can print the auth hint.
+	h := newSyncHarness(t)
+	h.events = []map[string]any{masterEvent("g1", "uid-1", "One", "ck1")}
+	h.sync(SyncOptions{})
+	h.writeLocal("uid-1", "One edited")
+	h.patchStatus = http.StatusUnauthorized
+
+	_, err := Sync(context.Background(), h.client, Calendar{ID: "cal1", Name: "Work"}, h.calDir, &h.status, SyncOptions{})
+	if err == nil || !IsAuthError(err) {
+		t.Fatalf("Sync err = %v, want an auth error abort", err)
 	}
 }
 

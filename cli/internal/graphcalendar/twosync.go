@@ -279,6 +279,13 @@ type SyncStats struct {
 	// notification: 412 precondition failures (remote changed since planning)
 	// and refused meeting re-creates. They re-plan on the next run.
 	Skipped int
+	// Failed counts actions that errored (e.g. a Graph 400 rejecting one
+	// event, or a local file write failure) without aborting the run: the
+	// error is logged, the item's status baseline is left untouched, and the
+	// remaining actions still execute. Failed items re-plan on the next run.
+	// Auth errors and context cancellation still abort the whole Apply —
+	// they would fail every remaining action identically.
+	Failed int
 }
 
 // add accumulates another calendar's stats into s.
@@ -290,6 +297,7 @@ func (s *SyncStats) add(o SyncStats) {
 	s.Conflicts += o.Conflicts
 	s.Rsvps += o.Rsvps
 	s.Skipped += o.Skipped
+	s.Failed += o.Failed
 }
 
 // SyncOptions tunes one Apply run.
@@ -691,7 +699,7 @@ func ApplyAll(ctx context.Context, c *Client, state *SyncState, plans []Calendar
 		"downloaded", total.Downloaded, "pruned", total.Pruned,
 		"uploaded", total.Uploaded, "deletedRemote", total.DeletedRemote,
 		"conflicts", total.Conflicts, "rsvps", total.Rsvps,
-		"skipped", total.Skipped, "dryRun", opts.DryRun)
+		"skipped", total.Skipped, "failed", total.Failed, "dryRun", opts.DryRun)
 	return total, nil
 }
 
@@ -848,16 +856,33 @@ func Apply(ctx context.Context, c *Client, plan CalendarPlan, status *CalendarSt
 			}
 		}
 		if err != nil {
-			if isPreconditionFailed(err) {
+			switch {
+			case isPreconditionFailed(err):
 				// The remote event changed between planning and this write:
 				// never clobber — skip and let the next run re-plan from
 				// fresh state (R2).
 				slog.Warn("Remote event changed since planning, skipping action", "module", "GRAPHCAL",
 					"calendar", plan.Calendar.Name, "uid", a.UID, "kind", a.Kind)
 				stats.Skipped++
-				continue
+			case ctx.Err() != nil:
+				// Cancellation fails every remaining action the same way:
+				// abort instead of logging one failure per event.
+				return stats, err
+			case IsAuthError(err):
+				// An expired token / missing consent also fails everything
+				// identically — abort so the command can print the auth hint.
+				return stats, err
+			default:
+				// One bad event (a malformed local file, a Graph 400 like
+				// "all-day must span whole days", a transient 5xx that ran
+				// out of retries) must not block syncing the rest: log it,
+				// leave its baseline untouched so the next run re-plans it,
+				// and continue with the remaining actions.
+				slog.Error("Sync action failed, continuing with remaining events", "module", "GRAPHCAL",
+					"calendar", plan.Calendar.Name, "uid", a.UID, "kind", a.Kind, "err", err)
+				stats.Failed++
 			}
-			return stats, err
+			continue
 		}
 	}
 

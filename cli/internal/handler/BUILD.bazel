@@ -4,6 +4,7 @@ go_library(
     name = "handler",
     srcs = [
         "calendar.go",
+        "calendar_write.go",
         "contacts.go",
         "drafts.go",
         "error_sanitize.go",
@@ -34,6 +35,7 @@ go_library(
         "//cli/internal/store",
         "//cli/internal/tagsync",
         "@com_github_emersion_go_imap//:go-imap",
+        "@com_github_google_uuid//:uuid",
         "@com_github_gorilla_mux//:mux",
     ],
 )

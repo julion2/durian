@@ -16,6 +16,7 @@ enum KeymapContext: String, CaseIterable, Hashable {
     case tagPicker = "tag_picker"
     case thread = "thread"
     case composeNormal = "compose_normal"
+    case calendar = "calendar"
 }
 
 // MARK: - KeymapAction Enum
@@ -76,6 +77,15 @@ enum KeymapAction: String, CaseIterable {
     case prevMessage = "prev_message"
     case scrollDown = "scroll_down"
     case scrollUp = "scroll_up"
+
+    // Calendar
+    case goCalendar = "go_calendar"
+    case calendarToday = "calendar_today"
+    case calendarPrevPeriod = "calendar_prev_period"
+    case calendarNextPeriod = "calendar_next_period"
+    case calendarEdit = "calendar_edit"
+    case calendarNew = "calendar_new"
+    case calendarDelete = "calendar_delete"
 
     // Note: supportsCount is now defined in keymaps.pkl per-action
     // Use SequenceMatcher.shared.supportsCount(action) to check

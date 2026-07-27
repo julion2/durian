@@ -275,6 +275,28 @@ assert_jq "GET /calendars/event .event.uid matches" "$RESP" '.event.uid == "int-
 assert_jq "GET /calendars/event .event.subject is string" "$RESP" '.event.subject | type == "string"'
 assert_http_code "GET /calendars/event unknown ref → 404" "$BASE/calendars/event?account=test&ref=nope" "GET" "404"
 
+# PUT (create) → GET → DELETE round-trip (local-first write)
+RESP=$(curl -s "${AUTH[@]}" -X PUT "$BASE/calendars/event" -H "Content-Type: application/json" \
+  -d '{"account":"test","calendar":"Work","subject":"API Created","start":"2026-08-01T09:00:00Z","end":"2026-08-01T10:00:00Z","location":"Room 1"}')
+assert_jq "PUT /calendars/event .ok is true" "$RESP" '.ok == true'
+assert_jq "PUT /calendars/event returns a uid" "$RESP" '.event.uid | type == "string"'
+NEW_UID=$(echo "$RESP" | jq -r '.event.uid')
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/calendars/event?account=test&ref=$NEW_UID")
+assert_jq "GET created event has subject" "$RESP" '.event.subject == "API Created"'
+assert_jq "GET created event has location" "$RESP" '.event.location == "Room 1"'
+assert_http_code "DELETE /calendars/event → 200" "$BASE/calendars/event?account=test&ref=$NEW_UID" "DELETE" "200"
+assert_http_code "GET after DELETE → 404" "$BASE/calendars/event?account=test&ref=$NEW_UID" "GET" "404"
+assert_http_code "PUT missing calendar → 400" "$BASE/calendars/event" "PUT" "400" '{"account":"test","subject":"x","start":"2026-08-01T09:00:00Z","end":"2026-08-01T10:00:00Z"}'
+
+# All-day snap: a sub-day all-day event is normalized to a full midnight-UTC day
+RESP=$(curl -s "${AUTH[@]}" -X PUT "$BASE/calendars/event" -H "Content-Type: application/json" \
+  -d '{"account":"test","calendar":"Work","subject":"API All Day","all_day":true,"start":"2026-08-02T09:00:00Z","end":"2026-08-02T10:00:00Z"}')
+assert_jq "PUT all-day .ok is true" "$RESP" '.ok == true'
+assert_jq "PUT all-day start snapped to midnight" "$RESP" '.event.start | startswith("2026-08-02T00:00:00")'
+assert_jq "PUT all-day end snapped to next day" "$RESP" '.event.end | startswith("2026-08-03T00:00:00")'
+ALLDAY_UID=$(echo "$RESP" | jq -r '.event.uid')
+assert_http_code "DELETE all-day event → 200" "$BASE/calendars/event?account=test&ref=$ALLDAY_UID" "DELETE" "200"
+
 # ─────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────

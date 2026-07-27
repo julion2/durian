@@ -29,7 +29,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"time"
 )
 
 // graphWriteDateFormat is the zone-less dateTime layout Graph expects in
@@ -39,7 +38,10 @@ const graphWriteDateFormat = "2006-01-02T15:04:05"
 // EventToGraphBody builds the Graph event resource JSON for a create (POST)
 // or update (PATCH) from a parsed local Event. Start/end are written as
 // zone-less UTC dateTimes with timeZone "UTC"; all-day events use the date at
-// 00:00:00 (Graph requires midnight boundaries together with isAllDay). The
+// 00:00:00 (Graph requires midnight boundaries together with isAllDay), and —
+// because Graph rejects an all-day event spanning less than one full day —
+// an all-day end date that is not after the start date is snapped to
+// start + 1 day, so a bad-duration all-day event can never reach Graph. The
 // recurrence key is always present — a Graph patternedRecurrence object for a
 // series, or null so a PATCH clears the recurrence when the local file
 // dropped its RRULE.
@@ -51,19 +53,28 @@ const graphWriteDateFormat = "2006-01-02T15:04:05"
 // never emitted here (RSVPs go through RespondToEvent; Teams meetings are
 // requested by the create path via extra keys, see createFromLocal).
 func EventToGraphBody(e Event, includeAttendees bool) map[string]any {
-	formatDT := func(t time.Time) string {
-		t = t.UTC()
-		if e.AllDay {
-			return t.Format(graphDateFormat) + "T00:00:00"
+	var startDT, endDT string
+	if e.AllDay {
+		// Midnight date boundaries; Graph rejects an all-day event shorter
+		// than 24h, so an end date not after the start date snaps to the
+		// next day (a one-day event) instead of producing a Graph 400.
+		startDay := dateOnly(e.Start)
+		endDay := dateOnly(e.End)
+		if !endDay.After(startDay) {
+			endDay = startDay.AddDate(0, 0, 1)
 		}
-		return t.Format(graphWriteDateFormat)
+		startDT = startDay.Format(graphDateFormat) + "T00:00:00"
+		endDT = endDay.Format(graphDateFormat) + "T00:00:00"
+	} else {
+		startDT = e.Start.UTC().Format(graphWriteDateFormat)
+		endDT = e.End.UTC().Format(graphWriteDateFormat)
 	}
 
 	body := map[string]any{
 		"subject":  e.Subject,
 		"body":     map[string]string{"contentType": "text", "content": e.Description},
-		"start":    map[string]string{"dateTime": formatDT(e.Start), "timeZone": "UTC"},
-		"end":      map[string]string{"dateTime": formatDT(e.End), "timeZone": "UTC"},
+		"start":    map[string]string{"dateTime": startDT, "timeZone": "UTC"},
+		"end":      map[string]string{"dateTime": endDT, "timeZone": "UTC"},
 		"isAllDay": e.AllDay,
 		"location": map[string]string{"displayName": e.Location},
 	}

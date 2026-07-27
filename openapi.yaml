@@ -503,6 +503,62 @@ paths:
           description: Missing account or ref
         '404':
           description: Account or event not found (or ambiguous reference)
+    put:
+      summary: Create or update an event locally (applied to Outlook on next sync)
+      description: >-
+        Upserts a local .ics from the posted event — a new UID is generated when
+        absent (create), otherwise the existing file is overwritten (update).
+        Local-first: only the vdir is written; nothing is sent to Outlook until
+        the next `durian calendar sync`.
+
+        An all-day event is normalized to midnight-UTC day boundaries and its
+        end is snapped to at least start + 1 day (the shape Graph requires).
+        An update preserves the existing event's organizer, recurrence, RSVP
+        state, online-meeting link — and its attendees unless the request
+        carries an attendee list — and must target the calendar the event
+        already lives in (moving between calendars is rejected with 400).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CalendarEventWrite'
+      responses:
+        '200':
+          description: The written event
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalendarEventResponse'
+        '400':
+          description: Missing/invalid fields (account, calendar, start/end)
+        '404':
+          description: Account not found
+    delete:
+      summary: Delete an event locally (applied to Outlook on next sync)
+      parameters:
+        - name: account
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: ref
+          in: query
+          required: true
+          description: Event reference — iCalUID (exact or prefix) or a unique subject substring
+          schema:
+            type: string
+        - name: calendar
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deleted
+        '400':
+          description: Missing account or ref
+        '404':
+          description: Account or event not found
 
 components:
   schemas:
@@ -931,3 +987,34 @@ components:
         event:
           $ref: '#/components/schemas/CalendarEvent'
       required: [ok, event]
+    CalendarEventWrite:
+      type: object
+      description: Body for PUT /calendars/event (create when uid is empty, else update).
+      properties:
+        account:
+          type: string
+        calendar:
+          type: string
+          description: Target calendar display name
+        uid:
+          type: string
+          description: Empty to create a new event; set to update an existing one
+        subject:
+          type: string
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        all_day:
+          type: boolean
+        location:
+          type: string
+        description:
+          type: string
+        attendees:
+          type: array
+          items:
+            $ref: '#/components/schemas/CalendarAttendee'
+      required: [account, calendar, subject, start, end]

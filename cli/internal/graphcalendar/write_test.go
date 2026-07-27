@@ -85,6 +85,64 @@ func TestEventToGraphBodyAllDay(t *testing.T) {
 	}
 }
 
+func TestEventToGraphBodyAllDaySnap(t *testing.T) {
+	// Graph rejects an all-day event spanning less than one full day; the
+	// write boundary must snap such events to a one-day span so they can
+	// never reach Graph malformed.
+	cases := []struct {
+		name       string
+		start, end time.Time
+		wantStart  string
+		wantEnd    string
+	}{
+		{
+			name:      "same-instant end snaps to next day",
+			start:     time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
+			end:       time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
+			wantStart: "2026-07-23T00:00:00",
+			wantEnd:   "2026-07-24T00:00:00",
+		},
+		{
+			name:      "sub-day timed span snaps to next day",
+			start:     time.Date(2026, 7, 23, 9, 0, 0, 0, time.UTC),
+			end:       time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC),
+			wantStart: "2026-07-23T00:00:00",
+			wantEnd:   "2026-07-24T00:00:00",
+		},
+		{
+			name:      "end before start snaps to next day",
+			start:     time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
+			end:       time.Date(2026, 7, 22, 0, 0, 0, 0, time.UTC),
+			wantStart: "2026-07-23T00:00:00",
+			wantEnd:   "2026-07-24T00:00:00",
+		},
+		{
+			name:      "cross-midnight sub-24h span keeps its day boundary",
+			start:     time.Date(2026, 7, 23, 20, 0, 0, 0, time.UTC),
+			end:       time.Date(2026, 7, 24, 2, 0, 0, 0, time.UTC),
+			wantStart: "2026-07-23T00:00:00",
+			wantEnd:   "2026-07-24T00:00:00",
+		},
+		{
+			name:      "multi-day span preserved",
+			start:     time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
+			end:       time.Date(2026, 7, 26, 0, 0, 0, 0, time.UTC),
+			wantStart: "2026-07-23T00:00:00",
+			wantEnd:   "2026-07-26T00:00:00",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := marshalBody(t, Event{Subject: "Holiday", AllDay: true, Start: c.start, End: c.end})
+			start, _ := m["start"].(map[string]any)
+			end, _ := m["end"].(map[string]any)
+			if start["dateTime"] != c.wantStart || end["dateTime"] != c.wantEnd {
+				t.Errorf("start/end = %v / %v, want %s / %s", start["dateTime"], end["dateTime"], c.wantStart, c.wantEnd)
+			}
+		})
+	}
+}
+
 func TestEventToGraphBodyWeeklyRecurrence(t *testing.T) {
 	m := marshalBody(t, Event{
 		Subject: "Weekly sync",

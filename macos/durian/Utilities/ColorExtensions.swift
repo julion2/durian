@@ -14,10 +14,19 @@ extension Color {
     init(hex: String) {
         let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
         var int: UInt64 = 0
-        Scanner(string: hex).scanHexInt64(&int)
+        // A non-hex string (e.g. a malformed vdir color file) must fall back
+        // instead of silently rendering black.
+        guard Scanner(string: hex).scanHexInt64(&int) else {
+            self.init(red: 0.6, green: 0.4, blue: 0.2)
+            return
+        }
         let r, g, b: Double
         switch hex.count {
-        case 6: // RGB (e.g. "FF5733")
+        case 3: // RGB (e.g. "F53" → "FF5533")
+            r = Double((int >> 8) & 0xF) / 15
+            g = Double((int >> 4) & 0xF) / 15
+            b = Double(int & 0xF) / 15
+        case 6: // RRGGBB (e.g. "FF5733")
             r = Double((int >> 16) & 0xFF) / 255
             g = Double((int >> 8) & 0xFF) / 255
             b = Double(int & 0xFF) / 255

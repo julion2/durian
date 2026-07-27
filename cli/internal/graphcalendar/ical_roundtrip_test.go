@@ -129,6 +129,48 @@ func TestICalRoundTripAllDay(t *testing.T) {
 	}
 }
 
+func TestICalRoundTripAllDayNonMidnight(t *testing.T) {
+	// An all-day event whose Start/End carry stray times (a hand-edited file,
+	// or a zone-shifted source) serializes as pure DATE values and parses back
+	// at the midnight day boundaries — the .ics can never carry a timed
+	// all-day boundary.
+	orig := Event{
+		ID:      "DDD000",
+		Subject: "Offsite",
+		AllDay:  true,
+		Start:   time.Date(2026, 7, 23, 9, 30, 0, 0, time.UTC),
+		End:     time.Date(2026, 7, 25, 18, 0, 0, 0, time.UTC),
+	}
+
+	data, err := EventToICal(orig)
+	if err != nil {
+		t.Fatalf("EventToICal: %v", err)
+	}
+	ics := string(data)
+	for _, want := range []string{
+		"DTSTART;VALUE=DATE:20260723\r\n",
+		"DTEND;VALUE=DATE:20260725\r\n",
+	} {
+		if !strings.Contains(ics, want) {
+			t.Errorf("all-day ICS missing %q:\n%s", want, ics)
+		}
+	}
+
+	got, err := ICalToEvent(data, "")
+	if err != nil {
+		t.Fatalf("ICalToEvent: %v", err)
+	}
+	if !got.AllDay {
+		t.Error("AllDay = false, want true")
+	}
+	if !got.Start.Equal(time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("Start = %v, want 2026-07-23 midnight UTC", got.Start)
+	}
+	if !got.End.Equal(time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("End = %v, want 2026-07-25 midnight UTC", got.End)
+	}
+}
+
 func TestICalRoundTripWeeklyRecurrence(t *testing.T) {
 	orig := Event{
 		ID:      "CCC789",

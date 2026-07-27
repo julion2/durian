@@ -2,8 +2,11 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/fatih/color"
 )
@@ -89,4 +92,62 @@ const (
 // okLine formats a success line "✓ <msg>" with the check and message in green.
 func okLine(format string, a ...any) string {
 	return styOK(glyphOK + " " + fmt.Sprintf(format, a...))
+}
+
+// MARK: - Column alignment for colored cells
+
+// ansiSGRPattern matches ANSI SGR (color/style) escape sequences, so padding
+// can be computed on the VISIBLE width of a styled cell. text/tabwriter counts
+// the escape bytes as width and misaligns colored columns — never feed styled
+// cells into a tabwriter; use printColumns instead.
+var ansiSGRPattern = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+// visibleWidth returns the display width (in runes) of s with ANSI SGR
+// sequences stripped.
+func visibleWidth(s string) int {
+	return utf8.RuneCountInString(ansiSGRPattern.ReplaceAllString(s, ""))
+}
+
+// padVisible right-pads s with spaces to visible width w (styled text keeps
+// its escapes; only the visible characters count).
+func padVisible(s string, w int) string {
+	if d := w - visibleWidth(s); d > 0 {
+		return s + strings.Repeat(" ", d)
+	}
+	return s
+}
+
+// printColumns renders rows as columns separated by two spaces, padding each
+// cell to the column's maximum VISIBLE width so colored and plain cells align
+// identically. Rows with fewer than two cells (section headers, blank
+// separator lines) are printed verbatim and excluded from width computation.
+// The last cell of a row is never padded, so lines carry no trailing spaces.
+func printColumns(w io.Writer, rows [][]string) {
+	widths := map[int]int{}
+	for _, row := range rows {
+		if len(row) < 2 {
+			continue
+		}
+		for i, cell := range row[:len(row)-1] {
+			if vw := visibleWidth(cell); vw > widths[i] {
+				widths[i] = vw
+			}
+		}
+	}
+	for _, row := range rows {
+		if len(row) < 2 {
+			fmt.Fprintln(w, strings.Join(row, ""))
+			continue
+		}
+		var b strings.Builder
+		for i, cell := range row {
+			if i < len(row)-1 {
+				b.WriteString(padVisible(cell, widths[i]))
+				b.WriteString("  ")
+			} else {
+				b.WriteString(cell)
+			}
+		}
+		fmt.Fprintln(w, strings.TrimRight(b.String(), " "))
+	}
 }

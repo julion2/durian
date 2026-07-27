@@ -124,7 +124,14 @@ func runCalendarNew(cmd *cobra.Command, args []string) error {
 
 	attendees := make([]graphcalendar.Attendee, 0, len(calNewAttendees))
 	for _, email := range calNewAttendees {
-		attendees = append(attendees, graphcalendar.Attendee{Email: strings.TrimSpace(email), Type: "required"})
+		email = strings.TrimSpace(email)
+		if email == "" {
+			continue
+		}
+		if !strings.Contains(email, "@") {
+			return fmt.Errorf("invalid --attendee %q: not an email address", email)
+		}
+		attendees = append(attendees, graphcalendar.Attendee{Email: email, Type: "required"})
 	}
 
 	event := graphcalendar.Event{
@@ -153,21 +160,31 @@ func runCalendarNew(cmd *cobra.Command, args []string) error {
 // eventEnd computes the end time from --end/--duration, or a default (1h for a
 // timed event, +1 day for an all-day one).
 func eventEnd(start time.Time, allDay bool, now time.Time) (time.Time, error) {
+	var end time.Time
 	switch {
 	case calNewEnd != "":
-		end, _, err := graphcalendar.ParseWhen(calNewEnd, now)
-		return end, err
+		e, _, err := graphcalendar.ParseWhen(calNewEnd, now)
+		if err != nil {
+			return time.Time{}, err
+		}
+		end = e
 	case calNewDuration != "":
 		d, err := time.ParseDuration(calNewDuration)
 		if err != nil {
 			return time.Time{}, fmt.Errorf("invalid --duration %q: %w", calNewDuration, err)
 		}
-		return start.Add(d), nil
+		end = start.Add(d)
 	case allDay:
-		return start.AddDate(0, 0, 1), nil
+		end = start.AddDate(0, 0, 1)
 	default:
-		return start.Add(time.Hour), nil
+		end = start.Add(time.Hour)
 	}
+	// All-day events span whole days; Graph rejects an all-day event shorter
+	// than 24h, so snap a shorter span (e.g. --start today --duration 1h) up.
+	if allDay && end.Sub(start) < 24*time.Hour {
+		end = start.AddDate(0, 0, 1)
+	}
+	return end, nil
 }
 
 func runCalendarRsvp(cmd *cobra.Command, args []string) error {

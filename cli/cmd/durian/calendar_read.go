@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/julion2/durian/cli/internal/config"
@@ -164,24 +163,28 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 		styHeader("Calendar "+account.GetAliasOrName()),
 		from.Format("2006-01-02"), to.Format("2006-01-02"), len(occs))
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	// Colored cells must not go through text/tabwriter (it counts the ANSI
+	// escape bytes as width); printColumns pads on the visible width instead.
+	var rows [][]string
 	var lastDay string
 	for _, o := range occs {
 		day := o.event.Start.Format("Mon 2006-01-02")
 		if day != lastDay {
 			if lastDay != "" {
-				fmt.Fprintln(w)
+				rows = append(rows, []string{""})
 			}
-			fmt.Fprintln(w, styHeader(day))
+			rows = append(rows, []string{styHeader(day)})
 			lastDay = day
 		}
-		fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n",
-			eventTimeCol(o.event),
+		rows = append(rows, []string{
+			"  " + eventTimeCol(o.event),
 			styAccent(truncate(orDash(o.event.Subject), 50)),
 			styDim(truncate(o.event.Location, 24)),
-			calSwatch(o.cal.HexColor, o.cal.Name)+eventMarkers(o.event))
+			calSwatch(o.cal.HexColor, o.cal.Name) + eventMarkers(o.event),
+		})
 	}
-	return w.Flush()
+	printColumns(os.Stdout, rows)
+	return nil
 }
 
 // listWindow computes [from, to) from the list flags, relative to now, reusing
@@ -273,15 +276,18 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, styHeader("DATE\tSUBJECT\tCALENDAR"))
+	// Header and cells are styled per cell (not per line), so printColumns can
+	// align them on their visible widths.
+	rows := [][]string{{styHeader("DATE"), styHeader("SUBJECT"), styHeader("CALENDAR")}}
 	for _, o := range matches {
-		fmt.Fprintf(w, "%s\t%s\t%s\n",
+		rows = append(rows, []string{
 			o.event.Start.Format("2006-01-02 15:04"),
 			styAccent(truncate(orDash(o.event.Subject), 50)),
-			calSwatch(o.cal.HexColor, o.cal.Name))
+			calSwatch(o.cal.HexColor, o.cal.Name),
+		})
 	}
-	return w.Flush()
+	printColumns(os.Stdout, rows)
+	return nil
 }
 
 func runCalendarShow(cmd *cobra.Command, args []string) error {

@@ -243,10 +243,16 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("calendar sync failed: %w", applyErr)
 	}
 
-	fmt.Printf("Calendar sync for %s: %d downloaded, %d pruned, %d uploaded, %d deleted remotely, %d RSVP(s) sent, %d conflict(s) resolved (%s wins), %d skipped (dir: %s)\n",
+	fmt.Printf("Calendar sync for %s: %d downloaded, %d pruned, %d uploaded, %d deleted remotely, %d RSVP(s) sent, %d conflict(s) resolved (%s wins), %d skipped, %d failed (dir: %s)\n",
 		account.GetAliasOrName(), stats.Downloaded, stats.Pruned,
 		stats.Uploaded, stats.DeletedRemote, stats.Rsvps, stats.Conflicts, policy,
-		stats.Skipped, accountDir)
+		stats.Skipped, stats.Failed, accountDir)
+	if stats.Failed > 0 {
+		// Per-event failures did not abort the run (the remaining events
+		// synced), but they must not pass silently either: report them and
+		// exit non-zero. The failed items re-plan on the next run.
+		return fmt.Errorf("%d event(s) failed to sync — see the log for details, the rest was synced", stats.Failed)
+	}
 	return nil
 }
 
