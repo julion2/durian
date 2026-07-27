@@ -224,7 +224,9 @@ func attendeePartStat(response string) string {
 // back as "none") and ORGANIZER becomes Organizer. accountEmail identifies
 // the owner: OwnerResponse comes from the owner's own ATTENDEE line (matched
 // case-insensitively on the address), or OwnerRespOrganizer when the
-// ORGANIZER is the owner. URL and STATUS remain display-only and are not
+// ORGANIZER is the owner. The online-meeting join link is parsed from URL (or
+// the Teams X-prop) into OnlineMeetingURL/IsOnlineMeeting for DISPLAY ONLY (it
+// never feeds sync change detection and is never uploaded); STATUS is not
 // parsed back. The X-DURIAN-CREATE-TEAMS-MEETING:TRUE marker sets
 // RequestOnlineMeeting (honored on create only, see createFromLocal).
 func ICalToEvent(data []byte, accountEmail string) (Event, error) {
@@ -324,6 +326,21 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 		requestOnlineMeeting = true
 	}
 
+	// Online-meeting join link, DISPLAY-ONLY: recovered from URL (falling back
+	// to the Teams X-prop) purely so list/show can surface it. It never affects
+	// sync change detection — that runs on the file-byte LocalHash and the
+	// remote-event RemoteHash, and coreContentEqual/localEventMatchesRemote
+	// exclude online-meeting fields — and EventToGraphBody never uploads it.
+	onlineMeetingURL := ""
+	if prop := ev.Props.Get(ical.PropURL); prop != nil {
+		onlineMeetingURL = strings.TrimSpace(prop.Value)
+	}
+	if onlineMeetingURL == "" {
+		if prop := ev.Props.Get(propTeamsMeetingURL); prop != nil {
+			onlineMeetingURL = strings.TrimSpace(prop.Value)
+		}
+	}
+
 	return Event{
 		ICalUID:      uid,
 		Subject:      subject,
@@ -338,6 +355,8 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 		Attendees:            attendees,
 		Organizer:            organizer,
 		OwnerResponse:        ownerResponse,
+		IsOnlineMeeting:      onlineMeetingURL != "",
+		OnlineMeetingURL:     onlineMeetingURL,
 		RequestOnlineMeeting: requestOnlineMeeting,
 	}, nil
 }

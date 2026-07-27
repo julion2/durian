@@ -7,6 +7,7 @@ go_library(
         "ical_roundtrip.go",
         "ics.go",
         "notify.go",
+        "read_local.go",
         "state.go",
         "twosync.go",
         "vdir.go",
@@ -29,6 +30,7 @@ go_test(
     srcs = [
         "graphcalendar_test.go",
         "ical_roundtrip_test.go",
+        "read_local_test.go",
         "twosync_test.go",
         "write_test.go",
     ],

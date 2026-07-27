@@ -407,7 +407,7 @@ func TestEventToICalMeetingMetadata(t *testing.T) {
 	}
 
 	// The document must parse back with attendees and organizer intact
-	// (attendees sorted by email); URL stays display-only.
+	// (attendees sorted by email); the join URL parses back for display.
 	got, err := ICalToEvent(data, "")
 	if err != nil {
 		t.Fatalf("ICalToEvent: %v", err)
@@ -425,8 +425,11 @@ func TestEventToICalMeetingMetadata(t *testing.T) {
 	if got.Organizer == nil || got.Organizer.Email != "olivia@example.com" || got.Organizer.Name != "Olivia Organizer" {
 		t.Errorf("Organizer = %+v, want Olivia Organizer <olivia@example.com>", got.Organizer)
 	}
-	if got.OnlineMeetingURL != "" {
-		t.Errorf("OnlineMeetingURL = %q, want display-only (not parsed back)", got.OnlineMeetingURL)
+	if got.OnlineMeetingURL != orig.OnlineMeetingURL {
+		t.Errorf("OnlineMeetingURL = %q, want %q (parsed back for display)", got.OnlineMeetingURL, orig.OnlineMeetingURL)
+	}
+	if !got.IsOnlineMeeting {
+		t.Error("IsOnlineMeeting = false, want true (join URL present)")
 	}
 }
 

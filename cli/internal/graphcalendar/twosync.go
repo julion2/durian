@@ -119,8 +119,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -1148,36 +1150,85 @@ func scanLocalItems(calDir, owner string) (map[string]localItem, error) {
 		return nil, fmt.Errorf("failed to read calendar dir %s: %w", calDir, err)
 	}
 
-	items := make(map[string]localItem)
+	// Collect .ics entries in directory order; dedup happens after parsing so
+	// "keep first" stays deterministic regardless of worker scheduling.
+	type fileJob struct {
+		path  string
+		mtime time.Time
+	}
+	var jobs []fileJob
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".ics") {
-			continue
-		}
-		path := filepath.Join(calDir, entry.Name())
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read %s: %w", path, err)
-		}
-		ev, err := ICalToEvent(data, owner)
-		if err != nil {
-			slog.Warn("Skipping unparseable local .ics", "module", "GRAPHCAL",
-				"path", path, "err", err)
-			continue
-		}
-		if ev.ICalUID == "" {
-			slog.Warn("Skipping local .ics without UID", "module", "GRAPHCAL", "path", path)
-			continue
-		}
-		if prev, dup := items[ev.ICalUID]; dup {
-			slog.Warn("Skipping local .ics with duplicate UID", "module", "GRAPHCAL",
-				"path", path, "uid", ev.ICalUID, "kept", prev.path)
 			continue
 		}
 		var mtime time.Time
 		if info, err := entry.Info(); err == nil {
 			mtime = info.ModTime()
 		}
-		items[ev.ICalUID] = localItem{path: path, hash: hashBytes(data), event: ev, mtime: mtime}
+		jobs = append(jobs, fileJob{path: filepath.Join(calDir, entry.Name()), mtime: mtime})
+	}
+
+	// Parse files concurrently: go-ical decoding dominates the cost, so a
+	// worker pool across cores turns a serial O(n) parse into ~O(n/cores).
+	type parseResult struct {
+		item    localItem
+		ok      bool
+		readErr error
+	}
+	results := make([]parseResult, len(jobs))
+	workers := runtime.NumCPU()
+	if workers > len(jobs) {
+		workers = len(jobs)
+	}
+	if workers > 0 {
+		next := make(chan int, len(jobs))
+		for i := range jobs {
+			next <- i
+		}
+		close(next)
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range next {
+					data, err := os.ReadFile(jobs[i].path)
+					if err != nil {
+						results[i] = parseResult{readErr: fmt.Errorf("failed to read %s: %w", jobs[i].path, err)}
+						continue
+					}
+					ev, err := ICalToEvent(data, owner)
+					if err != nil {
+						slog.Warn("Skipping unparseable local .ics", "module", "GRAPHCAL",
+							"path", jobs[i].path, "err", err)
+						continue
+					}
+					if ev.ICalUID == "" {
+						slog.Warn("Skipping local .ics without UID", "module", "GRAPHCAL", "path", jobs[i].path)
+						continue
+					}
+					results[i] = parseResult{item: localItem{path: jobs[i].path, hash: hashBytes(data), event: ev, mtime: jobs[i].mtime}, ok: true}
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
+	items := make(map[string]localItem)
+	for i := range results {
+		switch {
+		case results[i].readErr != nil:
+			return nil, results[i].readErr
+		case !results[i].ok:
+			continue
+		}
+		it := results[i].item
+		if prev, dup := items[it.event.ICalUID]; dup {
+			slog.Warn("Skipping local .ics with duplicate UID", "module", "GRAPHCAL",
+				"path", it.path, "uid", it.event.ICalUID, "kept", prev.path)
+			continue
+		}
+		items[it.event.ICalUID] = it
 	}
 	return items, nil
 }
