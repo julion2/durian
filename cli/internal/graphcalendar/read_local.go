@@ -86,15 +86,17 @@ func readMetaFile(calDir, name, fallback string) string {
 	return fallback
 }
 
-// ExpandOccurrences returns the concrete occurrences of e that start within
-// [from, to). A non-recurring event yields itself when its start falls in the
-// window; a seriesMaster is expanded via its RRULE. Every occurrence preserves
-// the master's duration (End = Start + (e.End - e.Start)) and copies all other
-// fields (subject, location, attendees, ...) from the master — only Start/End
-// shift.
+// ExpandOccurrences returns the concrete occurrences of e that overlap
+// [from, to): included iff start < to && end > from (half-open, so an event
+// merely touching an edge — end == from or start == to — is dropped). A
+// non-recurring event yields itself when it overlaps the window, including one
+// that started before `from` but is still running inside it; a seriesMaster is
+// expanded via its RRULE. Every occurrence preserves the master's duration
+// (End = Start + (e.End - e.Start)) and copies all other fields (subject,
+// location, attendees, ...) from the master — only Start/End shift.
 func ExpandOccurrences(e Event, from, to time.Time) []Event {
 	if e.Recurrence == nil {
-		if inWindow(e.Start, from, to) {
+		if overlaps(e.Start, e.End, from, to) {
 			return []Event{e}
 		}
 		return nil
@@ -104,7 +106,7 @@ func ExpandOccurrences(e Event, from, to time.Time) []Event {
 	if err != nil {
 		slog.Warn("Cannot expand recurrence, showing master only", "module", "GRAPHCAL",
 			"uid", e.ICalUID, "err", err)
-		if inWindow(e.Start, from, to) {
+		if overlaps(e.Start, e.End, from, to) {
 			return []Event{e}
 		}
 		return nil
@@ -114,7 +116,7 @@ func ExpandOccurrences(e Event, from, to time.Time) []Event {
 	if err != nil {
 		slog.Warn("Cannot build recurrence rule, showing master only", "module", "GRAPHCAL",
 			"uid", e.ICalUID, "err", err)
-		if inWindow(e.Start, from, to) {
+		if overlaps(e.Start, e.End, from, to) {
 			return []Event{e}
 		}
 		return nil
@@ -122,25 +124,33 @@ func ExpandOccurrences(e Event, from, to time.Time) []Event {
 
 	duration := e.End.Sub(e.Start)
 	var out []Event
-	// Between(from, to, true) is inclusive on both ends; our window is
-	// end-exclusive ([from, to)), so an occurrence landing exactly on `to` is
-	// dropped to stay consistent with inWindow (used for single events).
-	for _, start := range rule.Between(from, to, true) {
+	// Between matches occurrence STARTS only, so it would miss an occurrence
+	// that begins before `from` yet is still running inside the window. Widen
+	// the lower bound by one occurrence duration to catch it; the overlap test
+	// below filters precisely, so the widening never admits an occurrence that
+	// ends at or before `from`. Between(a, b, true) is inclusive on both ends;
+	// our window is end-exclusive ([from, to)), so an occurrence landing
+	// exactly on `to` is dropped to stay consistent with the single-event case.
+	for _, start := range rule.Between(from.Add(-duration), to, true) {
 		if !start.Before(to) {
 			continue
 		}
 		occ := e
 		occ.Start = start.UTC()
 		occ.End = start.UTC().Add(duration)
+		if !overlaps(occ.Start, occ.End, from, to) {
+			continue
+		}
 		out = append(out, occ)
 	}
 	return out
 }
 
-// inWindow reports whether t is within [from, to) (start inclusive, end
-// exclusive).
-func inWindow(t, from, to time.Time) bool {
-	return !t.Before(from) && t.Before(to)
+// overlaps reports whether the event interval [start, end) intersects the
+// query window [from, to). Both intervals are half-open: an event whose end
+// equals `from`, or whose start equals `to`, does not overlap.
+func overlaps(start, end, from, to time.Time) bool {
+	return start.Before(to) && end.After(from)
 }
 
 // ResolveLocalEvent finds exactly one event in the vdir for a short reference

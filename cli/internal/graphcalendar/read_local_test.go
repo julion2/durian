@@ -40,15 +40,34 @@ func writeLocalCalendar(t *testing.T, accountDir, name string, events ...Event) 
 }
 
 func TestExpandOccurrencesNonRecurring(t *testing.T) {
-	e := Event{ICalUID: "a", Subject: "one", Start: mustTime(t, "2026-01-10T09:00:00Z"), End: mustTime(t, "2026-01-10T10:00:00Z")}
-	from := mustTime(t, "2026-01-01T00:00:00Z")
-	to := mustTime(t, "2026-01-31T00:00:00Z")
-
-	if got := ExpandOccurrences(e, from, to); len(got) != 1 {
-		t.Fatalf("in-window: want 1 occurrence, got %d", len(got))
+	from := mustTime(t, "2026-01-10T00:00:00Z")
+	to := mustTime(t, "2026-01-11T00:00:00Z")
+	cases := []struct {
+		name       string
+		start, end string
+		want       int
+	}{
+		{"inside window", "2026-01-10T09:00:00Z", "2026-01-10T10:00:00Z", 1},
+		{"starts before from, ends inside", "2026-01-09T23:00:00Z", "2026-01-10T01:00:00Z", 1},
+		{"starts inside, ends after to", "2026-01-10T23:00:00Z", "2026-01-11T01:00:00Z", 1},
+		{"multi-day spanning the whole window", "2026-01-08T00:00:00Z", "2026-01-13T00:00:00Z", 1},
+		{"entirely before window", "2026-01-08T09:00:00Z", "2026-01-08T10:00:00Z", 0},
+		{"entirely after window", "2026-01-12T09:00:00Z", "2026-01-12T10:00:00Z", 0},
+		{"end touches from (end == from)", "2026-01-09T23:00:00Z", "2026-01-10T00:00:00Z", 0},
+		{"start touches to (start == to)", "2026-01-11T00:00:00Z", "2026-01-11T01:00:00Z", 0},
+		{"barely overlaps from (end just after)", "2026-01-09T23:00:00Z", "2026-01-10T00:00:01Z", 1},
+		{"barely overlaps to (start just before)", "2026-01-10T23:59:59Z", "2026-01-11T01:00:00Z", 1},
 	}
-	if got := ExpandOccurrences(e, mustTime(t, "2026-02-01T00:00:00Z"), mustTime(t, "2026-03-01T00:00:00Z")); len(got) != 0 {
-		t.Fatalf("out-of-window: want 0 occurrences, got %d", len(got))
+	for _, c := range cases {
+		e := Event{ICalUID: "a", Subject: "one", Start: mustTime(t, c.start), End: mustTime(t, c.end)}
+		got := ExpandOccurrences(e, from, to)
+		if len(got) != c.want {
+			t.Errorf("%s: want %d occurrences, got %d", c.name, c.want, len(got))
+			continue
+		}
+		if c.want == 1 && (!got[0].Start.Equal(e.Start) || !got[0].End.Equal(e.End)) {
+			t.Errorf("%s: occurrence times changed: got %s-%s", c.name, got[0].Start, got[0].End)
+		}
 	}
 }
 
@@ -76,6 +95,49 @@ func TestExpandOccurrencesWeeklyEndExclusive(t *testing.T) {
 		if occ.Start.Weekday() != time.Monday {
 			t.Errorf("occurrence not on Monday: %s", occ.Start)
 		}
+	}
+}
+
+func TestExpandOccurrencesRecurringOverlap(t *testing.T) {
+	// Daily 23:00-01:00 (crosses midnight), starting Thu 2026-01-08.
+	e := Event{
+		ICalUID: "n", Subject: "night shift",
+		Start: mustTime(t, "2026-01-08T23:00:00Z"),
+		End:   mustTime(t, "2026-01-09T01:00:00Z"),
+		Recurrence: &Recurrence{
+			Pattern: RecurrencePattern{Type: "daily", Interval: 1},
+			Range:   RecurrenceRange{Type: "noEnd", StartDate: "2026-01-08"},
+		},
+	}
+	// Window [Jan 10, Jan 11): the Jan 9 23:00 occurrence starts before the
+	// window but runs until Jan 10 01:00, so it overlaps; the Jan 10 23:00
+	// occurrence starts inside. The Jan 8 23:00 occurrence ends Jan 9 01:00,
+	// well before the window, and Jan 11 23:00 starts after the exclusive end.
+	got := ExpandOccurrences(e, mustTime(t, "2026-01-10T00:00:00Z"), mustTime(t, "2026-01-11T00:00:00Z"))
+	if len(got) != 2 {
+		t.Fatalf("want 2 occurrences (pre-window overlapper + in-window), got %d", len(got))
+	}
+	if !got[0].Start.Equal(mustTime(t, "2026-01-09T23:00:00Z")) || !got[0].End.Equal(mustTime(t, "2026-01-10T01:00:00Z")) {
+		t.Errorf("first occurrence = %s-%s, want Jan 9 23:00 - Jan 10 01:00", got[0].Start, got[0].End)
+	}
+	if !got[1].Start.Equal(mustTime(t, "2026-01-10T23:00:00Z")) || !got[1].End.Equal(mustTime(t, "2026-01-11T01:00:00Z")) {
+		t.Errorf("second occurrence = %s-%s, want Jan 10 23:00 - Jan 11 01:00", got[1].Start, got[1].End)
+	}
+	seen := map[string]bool{}
+	for _, occ := range got {
+		key := occ.Start.Format(time.RFC3339)
+		if seen[key] {
+			t.Errorf("duplicate occurrence at %s", key)
+		}
+		seen[key] = true
+	}
+
+	// An occurrence whose end touches `from` exactly does not overlap: with
+	// window [Jan 10 01:00, Jan 11), the Jan 9 23:00 occurrence ends at
+	// Jan 10 01:00 == from and must be dropped.
+	got = ExpandOccurrences(e, mustTime(t, "2026-01-10T01:00:00Z"), mustTime(t, "2026-01-11T00:00:00Z"))
+	if len(got) != 1 || !got[0].Start.Equal(mustTime(t, "2026-01-10T23:00:00Z")) {
+		t.Fatalf("end==from occurrence must be dropped: got %d occurrence(s)", len(got))
 	}
 }
 

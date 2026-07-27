@@ -430,7 +430,7 @@ paths:
       summary: List or search calendar events (read-only, from the local vdir)
       description: >-
         Without `q`, returns the events (recurring series expanded into
-        occurrences) starting within [from, to), defaulting to the next 7 days.
+        occurrences) overlapping [from, to), defaulting to the next 7 days.
         With `q`, returns a full-text search across all events (the window is
         ignored). Events carry only summary fields (no attendees/description).
       parameters:
