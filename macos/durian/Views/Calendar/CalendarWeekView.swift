@@ -8,7 +8,18 @@
 //  concurrently than fit the column width, the surplus collapses into a
 //  "+X" block. Tapping an event selects it.
 //
+//  The lane layout lives in DayLayoutIndex (overlap-aware, so multi-day and
+//  midnight-spanning events render clamped blocks on every day they touch)
+//  and is memoized by WeekLayoutCache. All pixel<->time conversions go
+//  through one TimeGeometry instance. A move drag targets the ABSOLUTE
+//  pointer position in the grid's named coordinate space, minus the grab
+//  offset recorded at drag start — so where a block lands depends only on
+//  where the block visually is, never on where inside it it was grabbed or
+//  on the original start's sub-slot offset. Escape cancels an in-progress
+//  drag/resize without committing.
+//
 
+import AppKit
 import SwiftUI
 
 struct CalendarWeekView: View {
@@ -20,21 +31,95 @@ struct CalendarWeekView: View {
     private let startHour = 0
     private let endHour = 24
 
+    /// The named space the move gesture reads absolute positions in: the
+    /// grid HStack including the leading time axis, so x values line up with
+    /// TimeGeometry.x(forDayIndex:).
+    private static let gridSpace = "weekgrid"
+
+    /// Memoized per-day lane layouts — see WeekLayoutCache for the
+    /// invalidation signature.
+    @State private var layoutCache = WeekLayoutCache()
+
+    // MARK: - Drag state (move / resize)
+
+    private enum DragKind { case move, resizeStart, resizeEnd }
+
+    /// The in-progress drag. A move records the grab offset (pointer to
+    /// block origin, fixed for the whole gesture) and routes its per-frame
+    /// snapped target through dragPreview, so only the floating preview
+    /// re-renders while the pointer moves. A resize keeps its raw
+    /// translation here (the block grows/shifts in place; the grid body
+    /// re-evaluates but the layout cache hits). Committed times come from
+    /// the same shared functions the previews use (TimeGeometry.moveTarget /
+    /// resizedMinutes), so preview and drop cannot disagree.
+    private struct DragSession {
+        let eventID: EventID
+        let kind: DragKind
+        var grabOffset: CGSize = .zero
+        var translation: CGSize = .zero
+    }
+
+    @State private var drag: DragSession?
+
+    /// True from an Escape cancel until the still-held pointer is released:
+    /// the remaining gesture events of the cancelled sequence must do
+    /// nothing (no session reopen, no commit on release).
+    @State private var dragCancelled = false
+
+    /// The local Escape key monitor, alive only while a drag session runs.
+    /// Installed when a session opens, removed in endDragSession — the one
+    /// teardown path drop, cancel and view disappearance all use.
+    @State private var escapeMonitor: Any?
+
+    /// Carries the move drag's snapped landing cell outside of view state:
+    /// only MovePreview subscribes, so publishing it while the pointer moves
+    /// does not recompute the week grid (which would re-run the lane layout
+    /// for all seven columns per frame).
+    private final class DragPreviewModel: ObservableObject {
+        @Published var target: TimeGeometry.MoveTarget?
+    }
+
+    @State private var dragPreview = DragPreviewModel()
+
     var body: some View {
         // The GeometryReader supplies the day-column width the lane layout
         // needs (the HStack splits the remainder after the time axis evenly
         // across the 7 flexible columns).
         GeometryReader { geo in
             let colWidth = max((geo.size.width - timeColumnWidth) / 7, 1)
+            let geometry = TimeGeometry(hourHeight: hourHeight, dayWidth: colWidth,
+                                        timeColumnWidth: timeColumnWidth,
+                                        startHour: startHour, endHour: endHour)
+            // Computed ONCE per body for all 7 columns (and the move
+            // preview) — a cache hit when neither events nor lane cap
+            // changed, e.g. on every resize-drag step.
+            let layouts = layoutCache.layouts(days: weekDays, events: manager.events,
+                                              maxVisibleLanes: maxVisibleLanes(colWidth),
+                                              calendar: calendar)
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
                         Section {
                             HStack(alignment: .top, spacing: 0) {
                                 timeAxis
-                                ForEach(weekDays, id: \.self) { day in
-                                    dayColumn(day, colWidth: colWidth).frame(maxWidth: .infinity)
+                                ForEach(Array(weekDays.enumerated()), id: \.element) { index, day in
+                                    dayColumn(layouts[day] ?? DayLayoutIndex(), day: day,
+                                              dayIndex: index, geometry: geometry)
+                                        .frame(maxWidth: .infinity)
                                 }
+                            }
+                            // The space the move gesture and the floating
+                            // copy share: absolute pointer x/y here map
+                            // straight through TimeGeometry.
+                            .coordinateSpace(.named(Self.gridSpace))
+                            // The move drag renders as one floating copy up
+                            // here, above all columns, instead of offsetting
+                            // the block inside its column: crossing column
+                            // boundaries there fought the sibling z-order and
+                            // moved the gesture's own host view every frame,
+                            // which is what made the move drag flicker.
+                            .overlay(alignment: .topLeading) {
+                                movePreview(geometry: geometry)
                             }
                         } header: {
                             VStack(spacing: 0) {
@@ -49,6 +134,9 @@ struct CalendarWeekView: View {
                 .onChange(of: manager.selectedEventID) { _, _ in
                     scrollToSelectedHour(proxy)
                 }
+                // A drag session must not outlive the grid: tear it down (and
+                // its Escape monitor) if the view goes away mid-drag.
+                .onDisappear { endDragSession() }
             }
         }
     }
@@ -119,30 +207,38 @@ struct CalendarWeekView: View {
         .frame(width: timeColumnWidth)
     }
 
-    private func dayColumn(_ day: Date, colWidth: CGFloat) -> some View {
-        let layout = dayLayout(timedEvents(day), maxVisibleLanes: maxVisibleLanes(colWidth))
+    private func dayColumn(_ layout: DayLayoutIndex, day: Date, dayIndex: Int,
+                           geometry: TimeGeometry) -> some View {
         func laneWidth(_ laneCount: Int) -> CGFloat {
-            colWidth / CGFloat(max(laneCount, 1))
+            geometry.dayWidth / CGFloat(max(laneCount, 1))
         }
         return ZStack(alignment: .topLeading) {
             ForEach(startHour ... endHour, id: \.self) { hour in
                 Rectangle().fill(Color.Detail.border.opacity(0.6))
                     .frame(height: 0.5)
                     .frame(maxWidth: .infinity, alignment: .top)
-                    .offset(y: CGFloat(hour - startHour) * hourHeight)
+                    .offset(y: geometry.y(forMinutes: hour * 60))
             }
-            ForEach(layout.visible) { item in
-                timedBlock(item.event)
-                    .frame(width: laneWidth(item.laneCount))
-                    .offset(x: CGFloat(item.lane) * laneWidth(item.laneCount), y: yOffset(item.event))
+            ForEach(layout.visible) { block in
+                // The block never moves during a drag: a move shows the
+                // floating copy in movePreview while the original stays here
+                // dimmed (keeping the gesture's host view stationary), and a
+                // resize only shifts an edge in place.
+                timedBlock(block, dayIndex: dayIndex, geometry: geometry)
+                    .frame(width: laneWidth(block.laneCount))
+                    .offset(x: CGFloat(block.lane) * laneWidth(block.laneCount),
+                            y: blockY(block, geometry: geometry))
+                    // Keep the block being resized on top of its neighbours.
+                    .zIndex(drag?.eventID == block.event.id ? 1 : 0)
             }
             ForEach(layout.overflow) { item in
-                overflowBlock(item)
+                overflowBlock(item, geometry: geometry)
                     .frame(width: laneWidth(item.laneCount))
-                    .offset(x: CGFloat(item.lane) * laneWidth(item.laneCount), y: minuteOffset(item.startMinute))
+                    .offset(x: CGFloat(item.lane) * laneWidth(item.laneCount),
+                            y: geometry.y(forMinutes: item.startMinute))
             }
         }
-        .frame(height: CGFloat(endHour - startHour) * hourHeight, alignment: .top)
+        .frame(height: geometry.totalHeight, alignment: .top)
         .overlay(alignment: .trailing) {
             Rectangle().fill(Color.Detail.border.opacity(0.6)).frame(width: 0.5)
         }
@@ -164,32 +260,321 @@ struct CalendarWeekView: View {
         return calendar.date(from: comps)
     }
 
-    private func timedBlock(_ event: CalendarEvent) -> some View {
+    /// The block's y offset: the committed start, except while its top edge
+    /// is being dragged — then the live snapped start from the SAME function
+    /// the drop commits through.
+    private func blockY(_ block: DayLayoutIndex.Block, geometry: TimeGeometry) -> CGFloat {
+        if let live = activeResize(block.event, geometry: geometry) {
+            return geometry.y(forMinutes: live.start)
+        }
+        return geometry.y(forMinutes: block.startMinute)
+    }
+
+    private func timedBlock(_ block: DayLayoutIndex.Block, dayIndex: Int,
+                            geometry: TimeGeometry) -> some View {
+        let event = block.event
         let selected = manager.selectedEventID == event.id
+        let moving = drag?.eventID == event.id && drag?.kind == .move
+        let resizing = activeResize(event, geometry: geometry) != nil
+        // Recurring/all-day events keep their series/whole-day semantics,
+        // which a free-form drag can't express, and a block clamped at a day
+        // edge is only a slice of a longer event, so dragging it is equally
+        // ambiguous — all of those stay editable via the form.
+        let draggable = !event.recurring && !event.allDay
+            && !block.continuesBefore && !block.continuesAfter
+        let committedHeight = geometry.height(forMinutes: block.minutes)
+        // While an edge is dragged, the height previews the live snapped
+        // range (blockY handles the top edge's offset).
+        let height: CGFloat
+        if let live = activeResize(event, geometry: geometry) {
+            height = max(geometry.height(forMinutes: live.end - live.start), 16)
+        } else {
+            height = max(committedHeight, 16)
+        }
+        // Square off an edge the day boundary cut, so the block reads as
+        // continuing into the neighbouring day rather than ending here.
+        let shape = UnevenRoundedRectangle(
+            topLeadingRadius: block.continuesBefore ? 0 : 4,
+            bottomLeadingRadius: block.continuesAfter ? 0 : 4,
+            bottomTrailingRadius: block.continuesAfter ? 0 : 4,
+            topTrailingRadius: block.continuesBefore ? 0 : 4
+        )
         return VStack(alignment: .leading, spacing: 1) {
             Text(event.displaySubject).font(.system(size: 10)).fontWeight(.medium).lineLimit(2)
-            if blockHeight(event) > 26 {
+            // Keyed to the committed height, not the live one, so the label
+            // doesn't flicker in and out while the block is being resized.
+            if committedHeight > 26 {
                 Text(Self.timeFormatter.string(from: event.start)).font(.system(size: 8))
             }
         }
         .padding(.horizontal, 3).padding(.vertical, 2)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .frame(height: max(blockHeight(event), 16), alignment: .top)
-        .background(RoundedRectangle(cornerRadius: 4).fill(color(for: event).opacity(selected ? 1.0 : 0.9)))
-        .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Color.primary, lineWidth: selected ? 2 : 0))
+        .frame(height: height, alignment: .top)
+        .background(shape.fill(color(for: event).opacity(selected ? 1.0 : 0.9)))
+        .overlay(shape.strokeBorder(Color.primary, lineWidth: selected ? 2 : 0))
+        .overlay(alignment: .top) {
+            if draggable { resizeHandle(event, edge: .resizeStart, blockHeight: height, geometry: geometry) }
+        }
+        .overlay(alignment: .bottom) {
+            if draggable { resizeHandle(event, edge: .resizeEnd, blockHeight: height, geometry: geometry) }
+        }
         .foregroundStyle(.white)
+        // While moving, the original stays put as a faint ghost marking the
+        // origin (the floating copy carries the shadow); while resizing the
+        // block itself is the live preview, so it gets the lifted look.
+        .opacity(moving ? 0.35 : (resizing ? 0.85 : 1))
+        .shadow(color: .black.opacity(resizing ? 0.3 : 0), radius: 4, y: 2)
         .padding(.horizontal, 1)
         .contentShape(Rectangle())
         .onTapGesture { manager.selectedEventID = event.id }
+        // Drag the body to move the event in time (and across days). The
+        // resize handles sit on top of the edges, so they win there.
+        .gesture(moveGesture(block, dayIndex: dayIndex, geometry: geometry, enabled: draggable))
+    }
+
+    /// A thin grip on the block's top or bottom edge: the top one drags the
+    /// START (end fixed), the bottom one the END (start fixed). The grip
+    /// height adapts to the block so the two handles never swallow a short
+    /// block's move-draggable middle.
+    private func resizeHandle(_ event: CalendarEvent, edge: DragKind, blockHeight: CGFloat,
+                              geometry: TimeGeometry) -> some View {
+        Color.white.opacity(0.001) // invisible but hit-testable
+            .frame(height: min(8, max(blockHeight / 4, 4)))
+            .overlay(alignment: edge == .resizeStart ? .top : .bottom) {
+                Capsule().fill(Color.white.opacity(0.6))
+                    .frame(width: 18, height: 2)
+                    .padding(edge == .resizeStart ? .top : .bottom, 1)
+            }
+            .contentShape(Rectangle())
+            .onHover { inside in
+                if inside { NSCursor.resizeUpDown.set() } else { NSCursor.arrow.set() }
+            }
+            .gesture(resizeGesture(event, edge: edge, geometry: geometry))
+    }
+
+    private func resizeGesture(_ event: CalendarEvent, edge: DragKind,
+                               geometry: TimeGeometry) -> some Gesture {
+        DragGesture(minimumDistance: 2)
+            .onChanged { value in
+                guard !dragCancelled else { return }
+                if drag == nil { installEscapeMonitor() }
+                drag = DragSession(eventID: event.id, kind: edge, translation: value.translation)
+            }
+            .onEnded { value in
+                if dragCancelled { dragCancelled = false; return }
+                guard drag?.eventID == event.id else { return }
+                let live = resizedMinutes(event, edge: edge,
+                                          translationHeight: value.translation.height,
+                                          geometry: geometry)
+                let day = calendar.startOfDay(for: event.start)
+                let start = edge == .resizeStart ? (date(on: day, minutes: live.start) ?? event.start) : event.start
+                let end = edge == .resizeEnd ? (date(on: day, minutes: live.end) ?? event.end) : event.end
+                // Ease from the live drag to the snapped result so the block
+                // settles instead of jumping.
+                withAnimation(.easeOut(duration: 0.12)) {
+                    endDragSession()
+                    manager.reschedule(event, start: start, end: end)
+                }
+            }
+    }
+
+    /// The move gesture for an event body, in the grid's named coordinate
+    /// space so pointer positions are absolute. When disabled (recurring/
+    /// all-day/day-edge slice) it still returns a gesture so the type is
+    /// stable, but does nothing.
+    private func moveGesture(_ block: DayLayoutIndex.Block, dayIndex: Int,
+                             geometry: TimeGeometry, enabled: Bool) -> some Gesture {
+        let event = block.event
+        return DragGesture(minimumDistance: 6, coordinateSpace: .named(Self.gridSpace))
+            .onChanged { value in
+                guard enabled, !dragCancelled else { return }
+                if drag == nil {
+                    // Record the grab offset ONCE: pointer minus the block's
+                    // grid-space origin. Fixed for the whole gesture, it
+                    // makes the landing cell a function of the block's own
+                    // position, not of where inside it the drag started.
+                    let laneWidth = geometry.dayWidth / CGFloat(max(block.laneCount, 1))
+                    let origin = CGPoint(
+                        x: geometry.x(forDayIndex: dayIndex) + CGFloat(block.lane) * laneWidth,
+                        y: geometry.y(forMinutes: block.startMinute)
+                    )
+                    drag = DragSession(eventID: event.id, kind: .move,
+                                       grabOffset: CGSize(width: value.startLocation.x - origin.x,
+                                                          height: value.startLocation.y - origin.y))
+                    installEscapeMonitor()
+                }
+                guard let session = drag, session.eventID == event.id, session.kind == .move else { return }
+                let target = geometry.moveTarget(location: value.location,
+                                                 grabOffset: session.grabOffset,
+                                                 durationMinutes: blockMinutes(event))
+                // Publish only actual cell changes: the floating copy snaps
+                // from slot to slot, so most pointer frames are no-ops.
+                if dragPreview.target != target { dragPreview.target = target }
+            }
+            .onEnded { value in
+                if dragCancelled { dragCancelled = false; return }
+                guard enabled, let session = drag, session.eventID == event.id,
+                      session.kind == .move else { return }
+                // The SAME targeting function the preview used — the drop
+                // lands exactly on the cell the floating copy showed.
+                let target = geometry.moveTarget(location: value.location,
+                                                 grabOffset: session.grabOffset,
+                                                 durationMinutes: blockMinutes(event))
+                withAnimation(.easeOut(duration: 0.12)) {
+                    endDragSession()
+                    if target.dayIndex < weekDays.count,
+                       let start = date(on: weekDays[target.dayIndex], minutes: target.startMinute) {
+                        let end = start.addingTimeInterval(event.end.timeIntervalSince(event.start))
+                        manager.reschedule(event, start: start, end: end)
+                    }
+                }
+            }
+    }
+
+    // MARK: - Session lifecycle (Escape cancels)
+
+    /// Installs a local key monitor for the duration of a drag session:
+    /// Escape cancels the drag, settling everything back and committing
+    /// nothing.
+    private func installEscapeMonitor() {
+        guard escapeMonitor == nil else { return }
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard event.keyCode == 53 else { return event } // Escape
+            // The pointer is still held: mark the sequence dead so its
+            // remaining onChanged/onEnded do nothing until release.
+            dragCancelled = true
+            withAnimation(.easeOut(duration: 0.12)) {
+                endDragSession()
+            }
+            return nil // consumed
+        }
+    }
+
+    /// The single teardown path for a drag session — drop, Escape cancel and
+    /// view disappearance all come through here, so the key monitor can
+    /// never leak.
+    private func endDragSession() {
+        if let monitor = escapeMonitor {
+            NSEvent.removeMonitor(monitor)
+            escapeMonitor = nil
+        }
+        drag = nil
+        dragPreview.target = nil
+    }
+
+    // MARK: - Drag preview + snapping
+
+    /// The move drag's floating copy: the dragged event rendered once, above
+    /// all columns, snapped to the landing cell the drop will commit to.
+    @ViewBuilder
+    private func movePreview(geometry: TimeGeometry) -> some View {
+        if let d = drag, d.kind == .move,
+           let event = manager.events.first(where: { $0.id == d.eventID }) {
+            MovePreview(model: dragPreview, geometry: geometry) {
+                previewBlock(event, geometry: geometry)
+                    // Full column width: until the drop re-lays-out the day,
+                    // the landing cell is the whole column (the dimmed
+                    // original keeps marking the origin lane).
+                    .frame(width: geometry.dayWidth)
+            }
+        }
+    }
+
+    /// The visual body of the floating copy: same look as timedBlock but
+    /// inert — no gestures, no resize handles, no hit testing — so pointer
+    /// events keep flowing to the stationary original underneath it.
+    private func previewBlock(_ event: CalendarEvent, geometry: TimeGeometry) -> some View {
+        let committedHeight = geometry.height(forMinutes: blockMinutes(event))
+        return VStack(alignment: .leading, spacing: 1) {
+            Text(event.displaySubject).font(.system(size: 10)).fontWeight(.medium).lineLimit(2)
+            if committedHeight > 26 {
+                Text(Self.timeFormatter.string(from: event.start)).font(.system(size: 8))
+            }
+        }
+        .padding(.horizontal, 3).padding(.vertical, 2)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(height: max(committedHeight, 16), alignment: .top)
+        .background(RoundedRectangle(cornerRadius: 4).fill(color(for: event).opacity(0.9)))
+        .foregroundStyle(.white)
+        .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
+        .padding(.horizontal, 1)
+        .allowsHitTesting(false)
+    }
+
+    /// Positions the floating copy at the snapped landing cell. A dedicated
+    /// subview observing the preview model so each cell change re-renders
+    /// only this view, never the week grid. Renders nothing until the first
+    /// onChanged publishes a target.
+    private struct MovePreview<Content: View>: View {
+        @ObservedObject var model: DragPreviewModel
+        let geometry: TimeGeometry
+        let content: Content
+
+        init(model: DragPreviewModel, geometry: TimeGeometry,
+             @ViewBuilder content: () -> Content) {
+            self.model = model
+            self.geometry = geometry
+            self.content = content()
+        }
+
+        var body: some View {
+            // The copy sits exactly on the cell the drop commits to (the
+            // target comes from the moveTarget call onEnded repeats): what
+            // you see is where it lands, clicking from slot to slot instead
+            // of tracking the pointer continuously.
+            if let target = model.target {
+                content.offset(x: geometry.x(forDayIndex: target.dayIndex),
+                               y: geometry.y(forMinutes: target.startMinute))
+            }
+        }
+    }
+
+    /// The live snapped [start, end] minutes of the block being resized, nil
+    /// when this event is not in a resize session. Both the in-place preview
+    /// (blockY + block height) and the drop commit read resizedMinutes, so
+    /// they cannot disagree.
+    private func activeResize(_ event: CalendarEvent, geometry: TimeGeometry) -> (start: Int, end: Int)? {
+        guard let d = drag, d.eventID == event.id,
+              d.kind == .resizeStart || d.kind == .resizeEnd else { return nil }
+        return resizedMinutes(event, edge: d.kind, translationHeight: d.translation.height,
+                              geometry: geometry)
+    }
+
+    /// Snapped start/end minutes for a resize drag. Top edge: the start
+    /// moves within [0, end - one slot] (end fixed); bottom edge: the end
+    /// moves within [start + one slot, midnight] (start fixed).
+    private func resizedMinutes(_ event: CalendarEvent, edge: DragKind, translationHeight: CGFloat,
+                                geometry: TimeGeometry) -> (start: Int, end: Int) {
+        let startMin = minutesFromMidnight(event.start)
+        // Duration-based end so an event ending exactly at midnight reads
+        // 1440, not 0 (draggable blocks never continue past their day).
+        let endMin = startMin + blockMinutes(event)
+        let delta = geometry.snappedMinuteDelta(fromPoints: translationHeight)
+        switch edge {
+        case .resizeStart:
+            return (min(max(startMin + delta, 0), endMin - geometry.snapMinutes), endMin)
+        case .resizeEnd:
+            return (startMin, min(max(endMin + delta, startMin + geometry.snapMinutes), 24 * 60))
+        case .move:
+            return (startMin, endMin)
+        }
+    }
+
+    /// The Date at a wall-clock minute-of-day on `day`'s calendar day.
+    private func date(on day: Date, minutes: Int) -> Date? {
+        var comps = calendar.dateComponents([.year, .month, .day], from: day)
+        comps.hour = minutes / 60
+        comps.minute = minutes % 60
+        return calendar.date(from: comps)
     }
 
     /// A "+X" block standing in for concurrent events that exceed the visible
     /// lanes. Tapping selects the earliest hidden event; tapping again cycles
     /// through the rest, so every hidden event stays reachable via the detail
     /// pane.
-    private func overflowBlock(_ item: OverflowItem) -> some View {
+    private func overflowBlock(_ item: DayLayoutIndex.OverflowBlock, geometry: TimeGeometry) -> some View {
         let selected = item.events.contains { $0.id == manager.selectedEventID }
-        let height = max(CGFloat(item.endMinute - item.startMinute) / 60 * hourHeight, 16)
+        let height = max(geometry.height(forMinutes: item.endMinute - item.startMinute), 16)
         return Text("+\(item.events.count)")
             .font(.system(size: 10)).fontWeight(.semibold)
             .padding(.horizontal, 3).padding(.vertical, 2)
@@ -223,39 +608,6 @@ struct CalendarWeekView: View {
             .onTapGesture { manager.selectedEventID = event.id }
     }
 
-    // MARK: - Overlap lanes
-
-    /// Placement for one visible timed event: its lane and the lane count of
-    /// its overlap cluster (which determines the lane width).
-    private struct LaidOutEvent: Identifiable {
-        let event: CalendarEvent
-        let lane: Int
-        let laneCount: Int
-        var id: String { event.id }
-    }
-
-    /// A "+X" block collapsing the events of the overflow lanes of one
-    /// cluster into the last visible lane over their combined time span.
-    private struct OverflowItem: Identifiable {
-        let events: [CalendarEvent] // hidden events, sorted by start
-        let startMinute: Int
-        let endMinute: Int
-        let lane: Int
-        let laneCount: Int
-        var id: String { "overflow-\(startMinute)-\(events.first?.id ?? "")" }
-    }
-
-    private struct DayLayout {
-        var visible: [LaidOutEvent] = []
-        var overflow: [OverflowItem] = []
-    }
-
-    private struct LaneEntry {
-        let event: CalendarEvent
-        let startMinute: Int
-        let endMinute: Int
-    }
-
     /// How many side-by-side lanes the column width supports (~40pt per lane,
     /// at least 1, at most 4). A week column is typically only ~110-120pt wide
     /// (7 columns share the width), so 60pt/lane collapsed even two concurrent
@@ -264,95 +616,12 @@ struct CalendarWeekView: View {
         min(max(Int(colWidth / 40), 1), 4)
     }
 
-    /// Groups a day's timed events into overlap clusters (an event joins the
-    /// current cluster while it starts before the cluster's running maximum
-    /// end) and lays each cluster out into lanes.
-    private func dayLayout(_ events: [CalendarEvent], maxVisibleLanes: Int) -> DayLayout {
-        var layout = DayLayout()
-        guard !events.isEmpty else { return layout }
-        // Longer events first on equal starts so they take the leftmost lane;
-        // id as the final key keeps the layout stable across refreshes.
-        let sorted = events.sorted { a, b in
-            if a.start != b.start { return a.start < b.start }
-            if a.end != b.end { return a.end > b.end }
-            return a.id < b.id
-        }
-        var cluster: [LaneEntry] = []
-        var clusterMaxEnd = Int.min
-        for event in sorted {
-            let start = minutesFromMidnight(event.start)
-            // Overlap uses the rendered extent: at least the 15-minute visual
-            // minimum, so zero-duration events still claim their block's space.
-            let end = max(start + Int(event.end.timeIntervalSince(event.start) / 60), start + 15)
-            if !cluster.isEmpty && start >= clusterMaxEnd {
-                layoutCluster(cluster, maxVisibleLanes: maxVisibleLanes, into: &layout)
-                cluster.removeAll()
-            }
-            cluster.append(LaneEntry(event: event, startMinute: start, endMinute: end))
-            clusterMaxEnd = cluster.count == 1 ? end : max(clusterMaxEnd, end)
-        }
-        layoutCluster(cluster, maxVisibleLanes: maxVisibleLanes, into: &layout)
-        return layout
-    }
+    // MARK: - Geometry helpers
 
-    /// Assigns each cluster event the lowest lane that is free at its start
-    /// (greedy sweep). When the cluster needs more lanes than fit, the events
-    /// of the surplus lanes collapse into one OverflowItem in the last
-    /// visible lane.
-    private func layoutCluster(_ cluster: [LaneEntry], maxVisibleLanes: Int, into layout: inout DayLayout) {
-        guard !cluster.isEmpty else { return }
-        var laneEnds: [Int] = []
-        var lanes: [Int] = []
-        for entry in cluster {
-            if let lane = laneEnds.indices.first(where: { laneEnds[$0] <= entry.startMinute }) {
-                laneEnds[lane] = entry.endMinute
-                lanes.append(lane)
-            } else {
-                laneEnds.append(entry.endMinute)
-                lanes.append(laneEnds.count - 1)
-            }
-        }
-        let laneCount = laneEnds.count
-        if laneCount <= maxVisibleLanes {
-            for (i, entry) in cluster.enumerated() {
-                layout.visible.append(LaidOutEvent(event: entry.event, lane: lanes[i], laneCount: laneCount))
-            }
-            return
-        }
-        // More concurrent events than lanes: the last visible lane becomes
-        // the "+X" block for everything at or beyond it.
-        let overflowLane = maxVisibleLanes - 1
-        var hidden: [LaneEntry] = []
-        for (i, entry) in cluster.enumerated() {
-            if lanes[i] < overflowLane {
-                layout.visible.append(LaidOutEvent(event: entry.event, lane: lanes[i], laneCount: maxVisibleLanes))
-            } else {
-                hidden.append(entry)
-            }
-        }
-        guard let first = hidden.first else { return }
-        layout.overflow.append(OverflowItem(
-            events: hidden.map(\.event),
-            startMinute: hidden.map(\.startMinute).min() ?? first.startMinute,
-            endMinute: hidden.map(\.endMinute).max() ?? first.endMinute,
-            lane: overflowLane,
-            laneCount: maxVisibleLanes
-        ))
-    }
-
-    // MARK: - Geometry
-
-    private func yOffset(_ event: CalendarEvent) -> CGFloat {
-        minuteOffset(minutesFromMidnight(event.start))
-    }
-
-    private func minuteOffset(_ minute: Int) -> CGFloat {
-        CGFloat(minute - startHour * 60) / 60 * hourHeight
-    }
-
-    private func blockHeight(_ event: CalendarEvent) -> CGFloat {
-        let minutes = max(event.end.timeIntervalSince(event.start) / 60, 15)
-        return CGFloat(minutes) / 60 * hourHeight
+    /// The event's rendered duration in minutes (15-minute visual minimum) —
+    /// used by the floating move preview, which shows the unclamped event.
+    private func blockMinutes(_ event: CalendarEvent) -> Int {
+        max(Int(event.end.timeIntervalSince(event.start) / 60), 15)
     }
 
     private func minutesFromMidnight(_ date: Date) -> Int {
@@ -371,17 +640,14 @@ struct CalendarWeekView: View {
         return (0 ..< 7).compactMap { calendar.date(byAdding: .day, value: $0, to: interval.start) }
     }
 
-    private func eventsOn(_ day: Date) -> [CalendarEvent] {
-        let start = calendar.startOfDay(for: day)
-        return manager.events.filter { calendar.isDate($0.start, inSameDayAs: start) }
-    }
-
-    private func timedEvents(_ day: Date) -> [CalendarEvent] {
-        eventsOn(day).filter { !$0.allDay }.sorted { $0.start < $1.start }
-    }
-
+    /// Overlap-based, like the timed grid: a multi-day all-day event shows
+    /// its chip on every day it covers, not only its first.
     private func allDayEvents(_ day: Date) -> [CalendarEvent] {
-        eventsOn(day).filter { $0.allDay }
+        let dayStart = calendar.startOfDay(for: day)
+        guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) else { return [] }
+        return manager.events.filter {
+            $0.allDay && DayLayoutIndex.overlaps($0, dayStart: dayStart, dayEnd: dayEnd)
+        }
     }
 
     private static let weekdayFormatter: DateFormatter = {

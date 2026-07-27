@@ -24,7 +24,9 @@ final class AppRouter: ObservableObject {
 
     func showCalendar() {
         mode = .calendar
-        CalendarManager.shared.refresh()
+        // Entering the calendar is the natural moment to pick up background
+        // sync changes, so bypass the coverage skip.
+        CalendarManager.shared.refresh(force: true)
     }
 
     func showMail() {

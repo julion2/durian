@@ -148,6 +148,41 @@ swift_test(
     deps = [":durian_testlib"],
 )
 
+swift_test(
+    name = "calendar_event_store_test",
+    size = "small",
+    srcs = ["tests/CalendarEventStoreTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
+    name = "calendar_range_coverage_test",
+    size = "small",
+    srcs = ["tests/CalendarRangeCoverageTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
+    name = "time_geometry_test",
+    size = "small",
+    srcs = ["tests/TimeGeometryTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
+    name = "day_layout_index_test",
+    size = "small",
+    srcs = ["tests/DayLayoutIndexTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
+    name = "week_drag_targeting_test",
+    size = "small",
+    srcs = ["tests/WeekDragTargetingTests.swift"],
+    deps = [":durian_testlib"],
+)
+
 genrule(
     name = "StampedInfoPlist",
     srcs = ["Info.plist"],

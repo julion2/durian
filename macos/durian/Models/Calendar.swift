@@ -84,12 +84,51 @@ struct CalendarAttendee: Identifiable, Hashable {
     }
 }
 
+// MARK: - Event identity
+
+/// Stable identity for a calendar event. For a non-recurring event the
+/// identity is (account, calendar, uid) and `occurrence` is nil — moving or
+/// resizing the event does NOT change its identity, so SwiftUI diffs it as an
+/// update instead of remove+insert and the selection survives edits.
+/// Occurrences of a recurring series share a uid, so they carry their start
+/// as `occurrence` to disambiguate; a series' occurrence times only change
+/// via series edits, which refetch anyway.
+struct EventID: Hashable, Codable {
+    let account: String
+    let calendar: String
+    let uid: String
+    let occurrence: Date?
+
+    init(account: String, calendar: String, uid: String, occurrence: Date?) {
+        self.account = account
+        self.calendar = calendar
+        self.uid = uid
+        self.occurrence = occurrence
+    }
+
+    init(_ event: CalendarEvent) {
+        account = event.account
+        calendar = event.calendar
+        uid = event.uid
+        occurrence = event.recurring ? event.start : nil
+    }
+}
+
+extension EventID: Comparable {
+    /// Deterministic ordering so equal-start events keep a stable sort key
+    /// (used as the final tie-break in the store projection and lane layout).
+    static func < (lhs: EventID, rhs: EventID) -> Bool {
+        if lhs.account != rhs.account { return lhs.account < rhs.account }
+        if lhs.calendar != rhs.calendar { return lhs.calendar < rhs.calendar }
+        if lhs.uid != rhs.uid { return lhs.uid < rhs.uid }
+        return (lhs.occurrence ?? .distantPast) < (rhs.occurrence ?? .distantPast)
+    }
+}
+
 // MARK: - Event
 
 struct CalendarEvent: Identifiable, Hashable {
-    /// Occurrences of a recurring series share a UID, so the identity also
-    /// carries the start time.
-    var id: String { "\(uid)@\(start.timeIntervalSince1970)" }
+    var id: EventID { EventID(self) }
     let uid: String
     let calendar: String
     let subject: String
@@ -115,6 +154,34 @@ struct CalendarEvent: Identifiable, Hashable {
     var seriesEnd: Date?
 
     var displaySubject: String { subject.isEmpty ? "(no subject)" : subject }
+
+    /// Direct construction, used for optimistic local updates (an edited copy
+    /// of a stored event before the server round-trip) and for tests. The wire
+    /// init below stays the only decode path.
+    init(uid: String, calendar: String, subject: String, start: Date, end: Date,
+         allDay: Bool = false, location: String? = nil, myResponse: String? = nil,
+         onlineMeeting: Bool = false, onlineMeetingURL: String? = nil,
+         recurring: Bool = false, organizer: CalendarPerson? = nil,
+         attendees: [CalendarAttendee] = [], description: String? = nil,
+         account: String = "", seriesStart: Date? = nil, seriesEnd: Date? = nil) {
+        self.uid = uid
+        self.calendar = calendar
+        self.subject = subject
+        self.start = start
+        self.end = end
+        self.allDay = allDay
+        self.location = location
+        self.myResponse = myResponse
+        self.onlineMeeting = onlineMeeting
+        self.onlineMeetingURL = onlineMeetingURL
+        self.recurring = recurring
+        self.organizer = organizer
+        self.attendees = attendees
+        self.description = description
+        self.account = account
+        self.seriesStart = seriesStart
+        self.seriesEnd = seriesEnd
+    }
 
     /// Fails when the start/end timestamps cannot be parsed.
     init?(from wire: CalendarEventWire) {

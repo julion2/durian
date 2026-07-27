@@ -24,15 +24,49 @@ enum CalendarViewMode: String, CaseIterable, Identifiable {
 @MainActor
 final class CalendarManager: ObservableObject {
     static let shared = CalendarManager()
-    private init() {}
+
+    private init() {
+        // Mirror the store's projection into the published `events` the views
+        // read, limited to the current view window: the store deliberately
+        // holds MORE than the view shows (prefetched neighbours, preserved
+        // out-of-window events), and showing them would leak neighbours of
+        // other periods into e.g. the agenda. This sink only fires on store
+        // changes — a `visibleWindow`-only change (the skip path) must call
+        // reproject() explicitly.
+        store.$events
+            .sink { [weak self] all in
+                self?.project(all)
+            }
+            .store(in: &cancellables)
+    }
 
     private let backend = CalendarBackend()
+    private let store = CalendarEventStore()
+    private var cancellables: Set<AnyCancellable> = []
     private var loadTask: Task<Void, Never>?
     private var detailTask: Task<Void, Never>?
 
+    /// The window the current view shows (nil in search mode) — bounds the
+    /// visible projection above. Always the REQUESTED window, never the wider
+    /// augmented one, so prefetched neighbours sit in the store without
+    /// leaking into the view.
+    private var visibleWindow: DateInterval?
+
+    /// The union of the AUGMENTED windows the completed fetches covered
+    /// (overlapping fetches accumulate, bounded — see
+    /// CalendarRangeCoverage.accumulate), and the account set they were
+    /// fetched under. While a requested window stays inside `loadedRange`
+    /// (same accounts, not in search, not forced), refresh() skips the
+    /// network entirely. Search mode never records a
+    /// range (its fetch is query-scoped, not window-scoped), so leaving
+    /// search always refetches; an account-set change fails the equality
+    /// check and refetches too.
+    private var loadedRange: DateInterval?
+    private var loadedAccounts: [String] = []
+
     @Published var calendars: [CalendarInfo] = []
-    @Published var events: [CalendarEvent] = []
-    @Published var selectedEventID: String? {
+    @Published private(set) var events: [CalendarEvent] = []
+    @Published var selectedEventID: EventID? {
         didSet {
             if selectedEventID != oldValue { loadDetail() }
         }
@@ -49,7 +83,7 @@ final class CalendarManager: ObservableObject {
 
     var selectedEvent: CalendarEvent? {
         guard let id = selectedEventID else { return nil }
-        return events.first { $0.id == id }
+        return store.byID[id]
     }
 
     /// Which accounts' calendars to show. The calendar is deliberately NOT
@@ -62,11 +96,39 @@ final class CalendarManager: ObservableObject {
 
     // MARK: - Loading
 
-    func refresh() {
-        loadTask?.cancel()
+    /// Refreshes the view for the current mode/anchor/query. Fetches cover an
+    /// AUGMENTED window (2x the requested width, centered — see
+    /// CalendarRangeCoverage), so as long as navigation stays inside the last
+    /// fetched band the network — and the loading spinner — are skipped and
+    /// only the projection window moves. `force` bypasses the skip: after a
+    /// local write the store must reconcile against the server even when the
+    /// range is covered.
+    func refresh(force: Bool = false) {
         let accounts = accountIdentifiers
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let (from, to) = window()
+        let requested = DateInterval(start: from, end: to)
+
+        // The projection window follows the VIEW immediately (both paths):
+        // the store may already hold events for the new range, and the sink
+        // only re-filters on store changes, so re-project explicitly.
+        visibleWindow = query.isEmpty ? requested : nil
+        reproject()
+
+        if !force, query.isEmpty, accounts == loadedAccounts,
+           CalendarRangeCoverage.covers(loadedRange, requested) {
+            // Already prefetched: the store holds everything this window can
+            // show. No spinner, no fetch, no calendar re-list — and an
+            // in-flight load (if any) keeps running and will reconcile into
+            // the store under the projection window set above.
+            revalidateSelection()
+            return
+        }
+
+        loadTask?.cancel()
+        // Prefetch around the view (skip augmentation in search mode: that
+        // fetch is query-scoped, not window-scoped).
+        let fetchWindow = query.isEmpty ? CalendarRangeCoverage.augmented(requested) : nil
 
         loadTask = Task { [weak self] in
             guard let self else { return }
@@ -88,8 +150,8 @@ final class CalendarManager: ObservableObject {
                 }
                 let wire = await backend.listEvents(
                     account: account,
-                    from: query.isEmpty ? from : nil,
-                    to: query.isEmpty ? to : nil,
+                    from: fetchWindow?.start,
+                    to: fetchWindow?.end,
                     query: query.isEmpty ? nil : query
                 )
                 for w in wire {
@@ -101,15 +163,61 @@ final class CalendarManager: ObservableObject {
             }
             if Task.isCancelled { return }
 
-            loadedEvents.sort { $0.start < $1.start }
             calendars = Self.dedup(loadedCalendars)
-            events = loadedEvents
-            // Keep a valid selection.
-            if let id = selectedEventID, !loadedEvents.contains(where: { $0.id == id }) {
-                selectedEventID = loadedEvents.first?.id
-            } else if selectedEventID == nil {
-                selectedEventID = loadedEvents.first?.id
+            // Diff the fetch into the store instead of replacing the array:
+            // unchanged events keep their identity, so the views settle once.
+            // Reconcile is scoped to the window the fetch ACTUALLY covered
+            // (the augmented one), so windowed removal stays correct; in
+            // search mode the result is the full visible set (nil window).
+            store.reconcile(fetched: loadedEvents, within: fetchWindow)
+            if let fetchWindow {
+                // Widening band: an overlapping fetch UNIONS into the
+                // previous coverage (so stepping back over visited weeks
+                // stays spinner-free), a disjoint jump or an oversized union
+                // resets — see CalendarRangeCoverage.accumulate. Coverage
+                // fetched under a different account set never unions: those
+                // events were not fetched for the new set.
+                loadedRange = accounts == loadedAccounts
+                    ? CalendarRangeCoverage.accumulate(loadedRange, adding: fetchWindow)
+                    : fetchWindow
+            } else {
+                loadedRange = nil
             }
+            loadedAccounts = accounts
+            // Keep a valid selection (the store sink has already updated
+            // `events` synchronously above).
+            revalidateSelection()
+        }
+    }
+
+    /// Re-filters `events` from the store under the current `visibleWindow`.
+    /// Needed whenever the window changes WITHOUT a store change (the skip
+    /// path): the store sink does not fire then.
+    private func reproject() {
+        project(store.events)
+    }
+
+    private func project(_ all: [CalendarEvent]) {
+        if let window = visibleWindow {
+            // Overlap, not start-containment: a multi-day event that starts
+            // before the window must still reach the week grid, which renders
+            // it clamped on each day it touches. Agenda/month/year bucket by
+            // start day, so such an event simply groups under its own
+            // (possibly pre-window) start day — per-day spanning there is
+            // deferred.
+            events = all.filter { CalendarEventStore.overlaps(window, start: $0.start, end: $0.end) }
+        } else {
+            events = all
+        }
+    }
+
+    /// Keeps the selection pointing at a visible event, falling back to the
+    /// first one when it left the window (or nothing was selected yet).
+    private func revalidateSelection() {
+        if let id = selectedEventID, !events.contains(where: { $0.id == id }) {
+            selectedEventID = events.first?.id
+        } else if selectedEventID == nil {
+            selectedEventID = events.first?.id
         }
     }
 
@@ -214,6 +322,7 @@ final class CalendarManager: ObservableObject {
     /// refreshes.
     func commitDraft(_ draft: CalendarEventDraft) {
         editingDraft = nil
+        applyDraftOptimistically(draft)
         Task { [weak self] in
             guard let self else { return }
             if await backend.putEvent(draft.toWrite()) == nil {
@@ -222,7 +331,63 @@ final class CalendarManager: ObservableObject {
                     message: "The write failed — make sure the durian CLI is up to date."
                 )
             }
-            refresh()
+            // A local edit must reconcile against the server even when the
+            // window is covered by a previous fetch.
+            refresh(force: true)
+        }
+    }
+
+    /// Shows an edit's result immediately by upserting the edited copy into
+    /// the store; the refresh after the PUT reconciles with the server. Only
+    /// safe for an existing NON-recurring event still in the same calendar:
+    /// a new event has no uid yet, a series edit writes the master (the
+    /// occurrences' times are derived server-side), and a calendar change
+    /// changes the identity — those simply wait for the refetch.
+    private func applyDraftOptimistically(_ draft: CalendarEventDraft) {
+        guard !draft.isNew, !draft.recurring else { return }
+        let id = EventID(account: draft.account, calendar: draft.calendar, uid: draft.uid, occurrence: nil)
+        guard let existing = store.byID[id] else { return }
+        let updated = CalendarEvent(
+            uid: existing.uid, calendar: existing.calendar, subject: draft.subject,
+            start: draft.start, end: draft.end, allDay: draft.allDay,
+            location: draft.location.isEmpty ? nil : draft.location,
+            myResponse: existing.myResponse, onlineMeeting: existing.onlineMeeting,
+            onlineMeetingURL: existing.onlineMeetingURL, recurring: existing.recurring,
+            organizer: existing.organizer, attendees: existing.attendees,
+            description: draft.description.isEmpty ? nil : draft.description,
+            account: existing.account
+        )
+        store.applyOptimistic(updated)
+    }
+
+    /// Reschedules a timed event from a drag (move or resize) by writing new
+    /// start/end to the local .ics, preserving everything else (the API's
+    /// update-merge keeps attendees/RRULE). Recurring and all-day events are
+    /// left to the edit form — their series/whole-day semantics don't map onto
+    /// a free-form drag.
+    func reschedule(_ event: CalendarEvent, start newStart: Date, end newEnd: Date) {
+        guard !event.recurring, !event.allDay, !event.account.isEmpty else { return }
+        guard newStart != event.start || newEnd != event.end else { return }
+        var draft = CalendarEventDraft(from: event)
+        draft.start = newStart
+        draft.end = newEnd
+        // Optimistic: settle the block at its new spot before the round-trip so
+        // the drag feels immediate; refresh() reconciles with the server. The
+        // id is stable across a move (non-recurring), so the upsert lands on
+        // the same entry and an existing selection stays valid by itself.
+        var moved = event
+        moved.start = newStart
+        moved.end = newEnd
+        store.applyOptimistic(moved)
+        Task { [weak self] in
+            guard let self else { return }
+            if await backend.putEvent(draft.toWrite()) == nil {
+                BannerManager.shared.showWarning(
+                    title: "Couldn't move event",
+                    message: "The write failed — make sure the durian CLI is up to date."
+                )
+            }
+            refresh(force: true)
         }
     }
 
@@ -233,6 +398,9 @@ final class CalendarManager: ObservableObject {
         let uid = event.uid
         let calendar = event.calendar
         selectedEventID = nil
+        // Optimistic: drop the event (for a series, this occurrence — the
+        // refresh clears its siblings) so the UI reacts before the round-trip.
+        store.remove(event.id)
         Task { [weak self] in
             guard let self else { return }
             if await backend.deleteEvent(account: account, ref: uid, calendar: calendar) == false {
@@ -241,7 +409,7 @@ final class CalendarManager: ObservableObject {
                     message: "The delete failed — make sure the durian CLI is up to date."
                 )
             }
-            refresh()
+            refresh(force: true)
         }
     }
 
@@ -251,7 +419,7 @@ final class CalendarManager: ObservableObject {
         detailTask?.cancel()
         detailEvent = nil
         guard let id = selectedEventID,
-              let summary = events.first(where: { $0.id == id })
+              let summary = store.byID[id]
         else { return }
 
         let account = summary.account

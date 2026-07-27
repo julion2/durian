@@ -102,7 +102,9 @@ struct ContentView: View {
         .onChange(of: appRouter.mode) { _, mode in
             if mode == .calendar {
                 keymapHandler.engine.setContext(.calendar)
-                CalendarManager.shared.refresh()
+                // Force: entering the calendar picks up background sync
+                // changes even when the window is still covered.
+                CalendarManager.shared.refresh(force: true)
             } else {
                 keymapHandler.engine.setContext(.list)
             }
