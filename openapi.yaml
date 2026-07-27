@@ -404,6 +404,105 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TagResponse'
+  /calendars:
+    get:
+      summary: List the calendars of an account (read-only, from the local vdir)
+      parameters:
+        - name: account
+          in: query
+          required: true
+          description: Account identifier (email, alias or name)
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The account's calendars
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalendarsResponse'
+        '400':
+          description: Missing account parameter
+        '404':
+          description: Account not found
+  /calendars/events:
+    get:
+      summary: List or search calendar events (read-only, from the local vdir)
+      description: >-
+        Without `q`, returns the events (recurring series expanded into
+        occurrences) starting within [from, to), defaulting to the next 7 days.
+        With `q`, returns a full-text search across all events (the window is
+        ignored). Events carry only summary fields (no attendees/description).
+      parameters:
+        - name: account
+          in: query
+          required: true
+          description: Account identifier (email, alias or name)
+          schema:
+            type: string
+        - name: from
+          in: query
+          description: Window start (RFC3339, "2006-01-02 15:04", "2006-01-02", today, tomorrow)
+          schema:
+            type: string
+        - name: to
+          in: query
+          description: Window end (same formats as from)
+          schema:
+            type: string
+        - name: calendar
+          in: query
+          description: Restrict to a single calendar by display name
+          schema:
+            type: string
+        - name: q
+          in: query
+          description: Full-text query over subject, location, description and attendees
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The matching events
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalendarEventsResponse'
+        '400':
+          description: Missing account or invalid window
+        '404':
+          description: Account not found
+  /calendars/event:
+    get:
+      summary: Get one calendar event in detail (read-only, from the local vdir)
+      parameters:
+        - name: account
+          in: query
+          required: true
+          description: Account identifier (email, alias or name)
+          schema:
+            type: string
+        - name: ref
+          in: query
+          required: true
+          description: Event reference — iCalUID (exact or prefix) or a unique subject substring
+          schema:
+            type: string
+        - name: calendar
+          in: query
+          description: Restrict the lookup to a single calendar by display name
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The event (full detail)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalendarEventResponse'
+        '400':
+          description: Missing account or ref
+        '404':
+          description: Account or event not found (or ambiguous reference)
 
 components:
   schemas:
@@ -720,3 +819,115 @@ components:
           type: string
         content_id:
           type: string
+    Calendar:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Calendar display name
+        color:
+          type: string
+          description: Calendar color as "#RRGGBB" (omitted when none)
+        event_count:
+          type: integer
+          description: Number of master events stored locally
+      required: [name, event_count]
+    CalendarPerson:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+      required: [email]
+    CalendarAttendee:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+        type:
+          type: string
+          description: required | optional | resource
+        response:
+          type: string
+          description: Graph response (accepted, declined, tentativelyAccepted, none, ...)
+      required: [email]
+    CalendarEvent:
+      type: object
+      description: >-
+        One event or expanded occurrence. Summary fields are always present;
+        organizer, attendees and description are only included by the
+        single-event detail endpoint (/calendars/event).
+      properties:
+        calendar:
+          type: string
+          description: Display name of the containing calendar
+        uid:
+          type: string
+          description: iCalUID (shared across a recurring series)
+        subject:
+          type: string
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        all_day:
+          type: boolean
+        location:
+          type: string
+        my_response:
+          type: string
+          description: The account owner's RSVP (accepted, declined, tentative, organizer, none)
+        online_meeting:
+          type: boolean
+        online_meeting_url:
+          type: string
+        recurring:
+          type: boolean
+        organizer:
+          $ref: '#/components/schemas/CalendarPerson'
+        attendees:
+          type: array
+          items:
+            $ref: '#/components/schemas/CalendarAttendee'
+        description:
+          type: string
+      required: [calendar, uid, subject, start, end, all_day]
+    CalendarsResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
+        calendars:
+          type: array
+          items:
+            $ref: '#/components/schemas/Calendar'
+      required: [ok, calendars]
+    CalendarEventsResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/CalendarEvent'
+      required: [ok, events]
+    CalendarEventResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
+        event:
+          $ref: '#/components/schemas/CalendarEvent'
+      required: [ok, event]

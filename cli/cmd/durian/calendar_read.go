@@ -90,29 +90,6 @@ func init() {
 	calendarShowCmd.Flags().StringVar(&calShowCalendar, "calendar", "", "Only this calendar (by display name)")
 }
 
-// calendarEventJSON is the machine-output shape for list/search: a flattened
-// occurrence with its calendar name.
-type calendarEventJSON struct {
-	Calendar      string    `json:"calendar"`
-	UID           string    `json:"uid"`
-	Subject       string    `json:"subject"`
-	Start         time.Time `json:"start"`
-	End           time.Time `json:"end"`
-	AllDay        bool      `json:"all_day"`
-	Location      string    `json:"location,omitempty"`
-	OnlineMeeting bool      `json:"online_meeting,omitempty"`
-	MyResponse    string    `json:"my_response,omitempty"`
-}
-
-func toEventJSON(cal string, e graphcalendar.Event) calendarEventJSON {
-	return calendarEventJSON{
-		Calendar: cal, UID: e.ICalUID, Subject: e.Subject,
-		Start: e.Start, End: e.End, AllDay: e.AllDay, Location: e.Location,
-		OnlineMeeting: e.IsOnlineMeeting || e.OnlineMeetingURL != "",
-		MyResponse:    string(e.OwnerResponse),
-	}
-}
-
 // resolveVdirAccount resolves the account and its local vdir directory. It does
 // not touch the network; a missing vdir is fine (the readers handle it).
 func resolveVdirAccount(identifier string) (accountDir, owner string, account *config.AccountConfig, err error) {
@@ -124,7 +101,7 @@ func resolveVdirAccount(identifier string) (accountDir, owner string, account *c
 	if err != nil {
 		return "", "", nil, fmt.Errorf("account not found: %s\nAvailable accounts: %s", identifier, cfg.ListAccountIdentifiers())
 	}
-	accountDir = filepath.Join(calendarBaseDir(cfg, ""), account.CalendarDir())
+	accountDir = filepath.Join(config.CalendarBaseDir(cfg, ""), account.CalendarDir())
 	return accountDir, account.GetAuthEmail(), account, nil
 }
 
@@ -164,9 +141,9 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 	sort.Slice(occs, func(i, j int) bool { return occs[i].event.Start.Before(occs[j].event.Start) })
 
 	if jsonOutput {
-		out := make([]calendarEventJSON, 0, len(occs))
+		out := make([]graphcalendar.CalendarEvent, 0, len(occs))
 		for _, o := range occs {
-			out = append(out, toEventJSON(o.cal.Name, o.event))
+			out = append(out, graphcalendar.ToCalendarEvent(o.cal.Name, o.event, false))
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -207,15 +184,10 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 	return w.Flush()
 }
 
-// listWindow computes [from, to) from the list flags, relative to now.
+// listWindow computes [from, to) from the list flags, relative to now, reusing
+// the shared graphcalendar.CalendarWindow (the --today/--month flags only pick
+// the default span).
 func listWindow(now time.Time) (from, to time.Time, err error) {
-	from = dateOnlyLocal(now)
-	if calListFrom != "" {
-		if from, _, err = graphcalendar.ParseWhen(calListFrom, now); err != nil {
-			return time.Time{}, time.Time{}, err
-		}
-	}
-
 	span := 7 * 24 * time.Hour
 	switch {
 	case calListToday:
@@ -223,22 +195,7 @@ func listWindow(now time.Time) (from, to time.Time, err error) {
 	case calListMonth:
 		span = 30 * 24 * time.Hour
 	}
-	to = from.Add(span)
-	if calListTo != "" {
-		if to, _, err = graphcalendar.ParseWhen(calListTo, now); err != nil {
-			return time.Time{}, time.Time{}, err
-		}
-	}
-	if !to.After(from) {
-		return time.Time{}, time.Time{}, fmt.Errorf("window end %s is not after start %s", to.Format(time.RFC3339), from.Format(time.RFC3339))
-	}
-	return from, to, nil
-}
-
-// dateOnlyLocal truncates now to midnight UTC of its day (the vdir stores UTC).
-func dateOnlyLocal(now time.Time) time.Time {
-	now = now.UTC()
-	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	return graphcalendar.CalendarWindow(calListFrom, calListTo, span, now)
 }
 
 // eventTimeCol renders the time column: "all-day" or "HH:MM".
@@ -294,7 +251,7 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 			continue
 		}
 		for _, e := range cal.Events {
-			if eventMatchesQuery(e, query) {
+			if graphcalendar.EventMatchesQuery(e, query) {
 				matches = append(matches, occurrence{cal: cal, event: e})
 			}
 		}
@@ -302,9 +259,9 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 	sort.Slice(matches, func(i, j int) bool { return matches[i].event.Start.Before(matches[j].event.Start) })
 
 	if jsonOutput {
-		out := make([]calendarEventJSON, 0, len(matches))
+		out := make([]graphcalendar.CalendarEvent, 0, len(matches))
 		for _, o := range matches {
-			out = append(out, toEventJSON(o.cal.Name, o.event))
+			out = append(out, graphcalendar.ToCalendarEvent(o.cal.Name, o.event, false))
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -327,25 +284,6 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 	return w.Flush()
 }
 
-// eventMatchesQuery reports whether q (already lower-cased) occurs in the
-// subject, location, description or any attendee name/address of e.
-func eventMatchesQuery(e graphcalendar.Event, q string) bool {
-	if q == "" {
-		return true
-	}
-	if strings.Contains(strings.ToLower(e.Subject), q) ||
-		strings.Contains(strings.ToLower(e.Location), q) ||
-		strings.Contains(strings.ToLower(e.Description), q) {
-		return true
-	}
-	for _, a := range e.Attendees {
-		if strings.Contains(strings.ToLower(a.Email), q) || strings.Contains(strings.ToLower(a.Name), q) {
-			return true
-		}
-	}
-	return false
-}
-
 func runCalendarShow(cmd *cobra.Command, args []string) error {
 	accountDir, owner, _, err := resolveVdirAccount(args[0])
 	if err != nil {
@@ -361,7 +299,7 @@ func runCalendarShow(cmd *cobra.Command, args []string) error {
 	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(e)
+		return enc.Encode(graphcalendar.ToCalendarEvent(calName, e, true))
 	}
 
 	printEventDetail(e, calName)

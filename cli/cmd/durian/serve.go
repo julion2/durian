@@ -174,6 +174,12 @@ func runServe(cmd *cobra.Command, args []string) {
 	r.HandleFunc("/api/v1/contacts", h.ListContactsHandler).Methods("GET")
 	r.Handle("/api/v1/events", eventHub).Methods("GET")
 
+	// Calendar routes (read-only, served from the local vdir). More specific
+	// paths first so /calendars does not shadow /calendars/events.
+	r.HandleFunc("/api/v1/calendars/events", h.CalendarEventsHandler).Methods("GET")
+	r.HandleFunc("/api/v1/calendars/event", h.CalendarEventHandler).Methods("GET")
+	r.HandleFunc("/api/v1/calendars", h.CalendarsHandler).Methods("GET")
+
 	// Outbox routes
 	r.HandleFunc("/api/v1/outbox/send", h.EnqueueOutboxHandler).Methods("POST")
 	r.HandleFunc("/api/v1/outbox", h.ListOutboxHandler).Methods("GET")

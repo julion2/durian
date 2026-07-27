@@ -260,6 +260,51 @@ func dateOnly(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 }
 
+// CalendarWindow computes the [from, to) window for a list query. fromStr/toStr
+// (see ParseWhen) override the defaults; when absent, from is midnight today
+// and to is from + defaultSpan. Shared by the CLI `list` command and the HTTP
+// API. Returns an error if the resulting end is not after the start.
+func CalendarWindow(fromStr, toStr string, defaultSpan time.Duration, now time.Time) (from, to time.Time, err error) {
+	from = dateOnly(now)
+	if strings.TrimSpace(fromStr) != "" {
+		if from, _, err = ParseWhen(fromStr, now); err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+	}
+	to = from.Add(defaultSpan)
+	if strings.TrimSpace(toStr) != "" {
+		if to, _, err = ParseWhen(toStr, now); err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+	}
+	if !to.After(from) {
+		return time.Time{}, time.Time{}, fmt.Errorf("window end %s is not after start %s",
+			to.Format(time.RFC3339), from.Format(time.RFC3339))
+	}
+	return from, to, nil
+}
+
+// EventMatchesQuery reports whether the already-lower-cased query occurs in the
+// event's subject, location, description or any attendee name/address. An empty
+// query matches everything. Shared by the CLI `search` command and the HTTP API.
+func EventMatchesQuery(e Event, lowerQuery string) bool {
+	if lowerQuery == "" {
+		return true
+	}
+	if strings.Contains(strings.ToLower(e.Subject), lowerQuery) ||
+		strings.Contains(strings.ToLower(e.Location), lowerQuery) ||
+		strings.Contains(strings.ToLower(e.Description), lowerQuery) {
+		return true
+	}
+	for _, a := range e.Attendees {
+		if strings.Contains(strings.ToLower(a.Email), lowerQuery) ||
+			strings.Contains(strings.ToLower(a.Name), lowerQuery) {
+			return true
+		}
+	}
+	return false
+}
+
 // WriteLocalEvent serializes e into a new .ics file in the calendar directory
 // whose display name matches calendarName (case-insensitive), returning the
 // written path. The calendar directory must already exist (created by a prior

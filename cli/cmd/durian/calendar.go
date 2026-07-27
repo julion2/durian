@@ -99,18 +99,6 @@ func init() {
 		"Record RSVP responses (accept/decline) without notifying the organizer")
 }
 
-// calendarBaseDir resolves the vdir base directory: the --out override wins,
-// then the configured calendar vdir_path, then the default data dir.
-func calendarBaseDir(cfg *config.Config, override string) string {
-	if override != "" {
-		return override
-	}
-	if base := config.ExpandPath(cfg.Calendar.VdirPath); base != "" {
-		return base
-	}
-	return filepath.Join(config.DefaultDataDir(), "calendars")
-}
-
 func runCalendarExport(cmd *cobra.Command, args []string) error {
 	cfg := GetConfig()
 	if cfg == nil {
@@ -132,7 +120,7 @@ func runCalendarExport(cmd *cobra.Command, args []string) error {
 
 	// Base dir: --out overrides; else the configured vdir_path; else the default.
 	// The account's calendars go under base/<account-dir>/ (khal layout).
-	outDir := filepath.Join(calendarBaseDir(cfg, calendarExportOut), account.CalendarDir())
+	outDir := filepath.Join(config.CalendarBaseDir(cfg, calendarExportOut), account.CalendarDir())
 
 	now := time.Now()
 	from := now.AddDate(0, 0, -calendarExportDaysBack)
@@ -175,7 +163,7 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	accountDir := filepath.Join(calendarBaseDir(cfg, calendarSyncOut), account.CalendarDir())
+	accountDir := filepath.Join(config.CalendarBaseDir(cfg, calendarSyncOut), account.CalendarDir())
 
 	// The status lives inside accountDir, so it is bound to this exact local
 	// collection (see FileStateStore doc): syncing the same account to a

@@ -12,8 +12,15 @@ TEST_CONFIG="$3"
 PORT=19723
 TMPDIR=$(mktemp -d /tmp/durian-inttest-XXXXXX)
 export HOME="${HOME:-$TMPDIR}"
+# Point the calendar vdir (config.DefaultDataDir → XDG_DATA_HOME/durian) at the
+# temp dir and seed one calendar with one event for the read-only calendar API.
+export XDG_DATA_HOME="$TMPDIR/data"
 EMAIL_DB="$TMPDIR/email.db"
 CONTACTS_DB="$TMPDIR/contacts.db"
+CAL_DIR="$XDG_DATA_HOME/durian/calendars/test/Work"
+mkdir -p "$CAL_DIR"
+printf 'Work\n' > "$CAL_DIR/displayname"
+printf 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//durian//test//EN\r\nBEGIN:VEVENT\r\nUID:int-evt-1\r\nSUMMARY:Integration Meeting\r\nDTSTART:20260801T120000Z\r\nDTEND:20260801T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n' > "$CAL_DIR/int-evt-1.ics"
 FAILURES=0
 PASSED=0
 
@@ -244,6 +251,29 @@ assert_jq "GET /local-drafts empty after delete" "$RESP" 'length == 0'
 # ─────────────────────────────────────────────
 RESP=$(curl -sf "${AUTH[@]}" "$BASE/outbox")
 assert_jq "GET /outbox is array" "$RESP" 'type == "array"'
+
+# ─────────────────────────────────────────────
+# 11. Calendar (read-only, from the seeded vdir)
+# ─────────────────────────────────────────────
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/calendars?account=test")
+assert_jq "GET /calendars .ok is true" "$RESP" '.ok == true'
+assert_jq "GET /calendars .calendars is array" "$RESP" '.calendars | type == "array"'
+assert_jq "GET /calendars includes seeded Work" "$RESP" '[.calendars[].name] | index("Work") != null'
+assert_jq "GET /calendars Work.event_count is number" "$RESP" '.calendars[] | select(.name=="Work") | .event_count | type == "number"'
+assert_http_code "GET /calendars without account → 400" "$BASE/calendars" "GET" "400"
+assert_http_code "GET /calendars unknown account → 404" "$BASE/calendars?account=nope" "GET" "404"
+
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/calendars/events?account=test&from=2026-08-01&to=2026-08-10")
+assert_jq "GET /calendars/events .ok is true" "$RESP" '.ok == true'
+assert_jq "GET /calendars/events .events is array" "$RESP" '.events | type == "array"'
+assert_jq "GET /calendars/events finds seeded event" "$RESP" '[.events[].uid] | index("int-evt-1") != null'
+assert_jq "GET /calendars/events event.start is string" "$RESP" '.events[0].start | type == "string"'
+
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/calendars/event?account=test&ref=int-evt-1")
+assert_jq "GET /calendars/event .ok is true" "$RESP" '.ok == true'
+assert_jq "GET /calendars/event .event.uid matches" "$RESP" '.event.uid == "int-evt-1"'
+assert_jq "GET /calendars/event .event.subject is string" "$RESP" '.event.subject | type == "string"'
+assert_http_code "GET /calendars/event unknown ref → 404" "$BASE/calendars/event?account=test&ref=nope" "GET" "404"
 
 # ─────────────────────────────────────────────
 # Summary

@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "handler",
     srcs = [
+        "calendar.go",
         "contacts.go",
         "drafts.go",
         "error_sanitize.go",
@@ -24,6 +25,7 @@ go_library(
         "//cli/internal/config",
         "//cli/internal/contacts",
         "//cli/internal/encoding",
+        "//cli/internal/graphcalendar",
         "//cli/internal/imap",
         "//cli/internal/mail",
         "//cli/internal/protocol",
@@ -40,6 +42,7 @@ go_test(
     name = "handler_test",
     size = "small",
     srcs = [
+        "calendar_test.go",
         "convert_thread_test.go",
         "drafts_test.go",
         "error_sanitize_test.go",
@@ -50,8 +53,10 @@ go_test(
     ],
     embed = [":handler"],
     deps = [
+        "//cli/internal/config",
         "//cli/internal/contacts",
         "//cli/internal/dbcrypto",
+        "//cli/internal/graphcalendar",
         "//cli/internal/protocol",
         "//cli/internal/smtp",
         "//cli/internal/store",
