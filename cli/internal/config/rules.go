@@ -36,7 +36,7 @@ func LoadRules(path string) ([]RuleConfig, error) {
 	}
 
 	var cfg RulesConfig
-	if err := loadInto(path, &cfg); err != nil {
+	if err := cachedLoad(path, &cfg, func() error { return loadInto(path, &cfg) }); err != nil {
 		return nil, fmt.Errorf("failed to load rules: %w", err)
 	}
 

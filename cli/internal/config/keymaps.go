@@ -44,7 +44,7 @@ func LoadKeymaps(path string) (*KeymapConfig, error) {
 	}
 
 	var cfg KeymapConfig
-	if err := loadInto(path, &cfg); err != nil {
+	if err := cachedLoad(path, &cfg, func() error { return loadInto(path, &cfg) }); err != nil {
 		return nil, fmt.Errorf("failed to load keymaps: %w", err)
 	}
 
