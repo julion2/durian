@@ -1,0 +1,29 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "calendar",
+    srcs = [
+        "calendar.go",
+        "dto.go",
+        "ical_roundtrip.go",
+        "ics.go",
+        "local_scan.go",
+        "read_local.go",
+    ],
+    importpath = "github.com/julion2/durian/cli/internal/calendar",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "@com_github_emersion_go_ical//:go-ical",
+        "@com_github_teambition_rrule_go//:rrule-go",
+    ],
+)
+
+go_test(
+    name = "calendar_test",
+    size = "small",
+    srcs = [
+        "ical_roundtrip_test.go",
+        "read_local_test.go",
+    ],
+    embed = [":calendar"],
+)

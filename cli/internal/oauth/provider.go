@@ -76,6 +76,10 @@ func Google() *Provider {
 		TokenEndpoint:     "https://oauth2.googleapis.com/token",
 		Scopes: []string{
 			"https://mail.google.com/",
+			// Calendar read/write for the two-way calendar sync. Adding this
+			// means existing Google accounts must re-run 'durian auth login'
+			// once to mint a refresh token that carries the new scope.
+			"https://www.googleapis.com/auth/calendar",
 		},
 		SASlMethod: "OAUTHBEARER",
 		// No default credentials — users must configure their own Google OAuth app.

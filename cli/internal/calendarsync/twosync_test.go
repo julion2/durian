@@ -1,4 +1,11 @@
-package graphcalendar
+// The engine tests moved here from the Graph package: the httptest harness
+// serves fake Graph endpoints and drives the neutral engine THROUGH the real
+// graphcalendar provider, so every decision-matrix and safety-rail behavior
+// is exercised across the provider seam exactly as in production. The test
+// package is external (calendarsync_test) because it imports graphcalendar,
+// which itself depends on calendarsync.
+
+package calendarsync_test
 
 import (
 	"context"
@@ -10,7 +17,111 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/calendar"
+	"github.com/julion2/durian/cli/internal/calendarsync"
+	"github.com/julion2/durian/cli/internal/graphcalendar"
 )
+
+// MARK: - Shorthand
+
+// Aliases keeping the moved tests textually close to their pre-split form.
+type (
+	Event             = calendar.Event
+	Attendee          = calendar.Attendee
+	Person            = calendar.Person
+	Recurrence        = calendar.Recurrence
+	RecurrencePattern = calendar.RecurrencePattern
+	RecurrenceRange   = calendar.RecurrenceRange
+
+	Calendar       = calendarsync.Calendar
+	CalendarPlan   = calendarsync.CalendarPlan
+	CalendarStatus = calendarsync.CalendarStatus
+	ItemStatus     = calendarsync.ItemStatus
+	Action         = calendarsync.Action
+	ActionKind     = calendarsync.ActionKind
+	SyncOptions    = calendarsync.SyncOptions
+	SyncStats      = calendarsync.SyncStats
+)
+
+const (
+	OwnerRespAccepted = calendar.OwnerRespAccepted
+	OwnerRespDeclined = calendar.OwnerRespDeclined
+
+	ActionDownloadNew    = calendarsync.ActionDownloadNew
+	ActionDownloadUpdate = calendarsync.ActionDownloadUpdate
+	ActionAdopt          = calendarsync.ActionAdopt
+	ActionPruneLocal     = calendarsync.ActionPruneLocal
+	ActionDropStatus     = calendarsync.ActionDropStatus
+	ActionUploadCreate   = calendarsync.ActionUploadCreate
+	ActionUploadUpdate   = calendarsync.ActionUploadUpdate
+	ActionDeleteRemote   = calendarsync.ActionDeleteRemote
+	ActionConflict       = calendarsync.ActionConflict
+	ActionRsvp           = calendarsync.ActionRsvp
+
+	NotifyInvite = calendarsync.NotifyInvite
+	NotifyUpdate = calendarsync.NotifyUpdate
+	NotifyCancel = calendarsync.NotifyCancel
+	NotifyRSVP   = calendarsync.NotifyRSVP
+)
+
+var (
+	Sync              = calendarsync.Sync
+	Plan              = calendarsync.Plan
+	PlanNotifications = calendarsync.PlanNotifications
+	NewFileStateStore = calendarsync.NewFileStateStore
+
+	EventToICal      = calendar.EventToICal
+	ICalToEvent      = calendar.ICalToEvent
+	eventContentHash = calendar.EventContentHash
+	hashBytes        = calendar.HashBytes
+	sanitizeName     = calendar.SanitizeName
+	scanLocalItems   = calendar.ScanLocalItems
+)
+
+// testOwnerEmail is the mailbox owner of every test client.
+const testOwnerEmail = "me@example.com"
+
+// testClient builds a real Graph provider pointed at the given httptest
+// server, with a static token so no OAuth path is exercised.
+func testClient(srv *httptest.Server) *graphcalendar.Client {
+	return graphcalendar.NewWithToken(testOwnerEmail, srv.URL, "test-token", srv.Client())
+}
+
+// meetingGraphJSON is a Graph /events resource for an online meeting with two
+// attendees, an organizer, and the account owner's accepted RSVP.
+const meetingGraphJSON = `{
+	"id": "meet1",
+	"iCalUId": "ical-meet1",
+	"subject": "Design review",
+	"body": {"contentType": "text", "content": "please review the drafts"},
+	"bodyPreview": "please review the drafts",
+	"start": {"dateTime": "2026-07-23T10:00:00.0000000", "timeZone": "UTC"},
+	"end": {"dateTime": "2026-07-23T11:00:00.0000000", "timeZone": "UTC"},
+	"isAllDay": false,
+	"location": {"displayName": "Teams"},
+	"type": "singleInstance",
+	"changeKey": "ck-meet1",
+	"lastModifiedDateTime": "2026-07-20T09:00:00Z",
+	"attendees": [
+		{
+			"type": "required",
+			"status": {"response": "accepted", "time": "2026-07-19T08:00:00Z"},
+			"emailAddress": {"name": "Alice Example", "address": "alice@example.com"}
+		},
+		{
+			"type": "optional",
+			"status": {"response": "declined", "time": "2026-07-19T09:00:00Z"},
+			"emailAddress": {"name": "Bob Example", "address": "bob@example.com"}
+		}
+	],
+	"organizer": {"emailAddress": {"name": "Olivia Organizer", "address": "olivia@example.com"}},
+	"responseStatus": {"response": "accepted", "time": "2026-07-19T10:00:00Z"},
+	"isOnlineMeeting": true,
+	"onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/abc123"},
+	"isCancelled": false,
+	"isOrganizer": false
+}`
 
 // MARK: - Test harness
 
@@ -40,13 +151,9 @@ func eventOf(t *testing.T, m map[string]any) Event {
 	if err != nil {
 		t.Fatalf("marshal master event: %v", err)
 	}
-	var ge graphEvent
-	if err := json.Unmarshal(data, &ge); err != nil {
-		t.Fatalf("unmarshal master event: %v", err)
-	}
-	ev, ok := eventFromGraph(ge)
+	ev, ok := graphcalendar.ParseEventJSON(data)
 	if !ok {
-		t.Fatal("eventFromGraph rejected the fake master event")
+		t.Fatal("ParseEventJSON rejected the fake master event")
 	}
 	return ev
 }
@@ -90,7 +197,7 @@ func meetingMaster(id, uid, subject, changeKey string, isOrganizer bool, myResp 
 type syncHarness struct {
 	t      *testing.T
 	srv    *httptest.Server
-	client *Client
+	client *graphcalendar.Client
 	calDir string
 	status CalendarStatus
 
@@ -372,8 +479,8 @@ func TestSyncDownloadNewRemote(t *testing.T) {
 	if !ok {
 		t.Fatal("status entry for uid-1 not recorded")
 	}
-	if st.GraphID != "g1" || st.RemoteHash != contentHashOf(t, h.events[0]) || st.LocalHash != hashBytes(body) {
-		t.Errorf("status = %+v, want GraphID=g1 RemoteHash of remote content LocalHash of file bytes", st)
+	if st.RemoteID != "g1" || st.RemoteHash != contentHashOf(t, h.events[0]) || st.LocalHash != hashBytes(body) {
+		t.Errorf("status = %+v, want RemoteID=g1 RemoteHash of remote content LocalHash of file bytes", st)
 	}
 
 	// vdir metadata is written like Export.
@@ -456,7 +563,7 @@ func TestSyncUntrackedBothPresent(t *testing.T) {
 	if stats != (SyncStats{}) {
 		t.Fatalf("adopt stats = %+v, want all zero", stats)
 	}
-	if st, ok := h.status.Items["uid-1"]; !ok || st.GraphID != "g1" || st.RemoteHash != contentHashOf(t, h.events[0]) || st.LocalHash != hashBytes(canonical) {
+	if st, ok := h.status.Items["uid-1"]; !ok || st.RemoteID != "g1" || st.RemoteHash != contentHashOf(t, h.events[0]) || st.LocalHash != hashBytes(canonical) {
 		t.Errorf("adopt did not record status: %+v ok=%v", st, ok)
 	}
 
@@ -556,8 +663,8 @@ func TestSyncUploadCreate(t *testing.T) {
 	if !ok {
 		t.Fatal("status entry for remote-uid-1 not recorded")
 	}
-	if st.GraphID != "g-new" || st.RemoteHash != contentHashOf(t, h.getResponses["g-new"]) || st.LocalHash != hashBytes(newBody) {
-		t.Errorf("status = %+v, want GraphID=g-new RemoteHash of read-back content LocalHash of rewritten bytes", st)
+	if st.RemoteID != "g-new" || st.RemoteHash != contentHashOf(t, h.getResponses["g-new"]) || st.LocalHash != hashBytes(newBody) {
+		t.Errorf("status = %+v, want RemoteID=g-new RemoteHash of read-back content LocalHash of rewritten bytes", st)
 	}
 	if _, ok := h.status.Items["uid-local"]; ok {
 		t.Error("stale status under the local UID must not exist")
@@ -586,7 +693,7 @@ func TestSyncUploadUpdate(t *testing.T) {
 		t.Error("upload update must not overwrite the local edit")
 	}
 	st := h.status.Items["uid-1"]
-	if st.GraphID != "g1" || st.RemoteHash != contentHashOf(t, h.getResponses["g1"]) || st.LocalHash != hashBytes(localBody) {
+	if st.RemoteID != "g1" || st.RemoteHash != contentHashOf(t, h.getResponses["g1"]) || st.LocalHash != hashBytes(localBody) {
 		t.Errorf("status = %+v, want RemoteHash of read-back content LocalHash of local bytes", st)
 	}
 }
@@ -1086,7 +1193,7 @@ func TestSyncAbortsOnAuthError(t *testing.T) {
 	h.patchStatus = http.StatusUnauthorized
 
 	_, err := Sync(context.Background(), h.client, Calendar{ID: "cal1", Name: "Work"}, h.calDir, &h.status, SyncOptions{})
-	if err == nil || !IsAuthError(err) {
+	if err == nil || !graphcalendar.IsAuthError(err) {
 		t.Fatalf("Sync err = %v, want an auth error abort", err)
 	}
 }
@@ -1114,7 +1221,7 @@ func TestScanLocalItemsSkipsBadFiles(t *testing.T) {
 	if !ok {
 		t.Fatalf("uid-good missing from scan: %v", items)
 	}
-	if li.event.Subject != "Fine" || li.mtime.IsZero() {
+	if li.Event.Subject != "Fine" || li.Mtime.IsZero() {
 		t.Errorf("scan did not keep parsed event/mtime: %+v", li)
 	}
 }
@@ -1131,7 +1238,7 @@ func TestEventContentHashIgnoresVolatileFields(t *testing.T) {
 		Start:        time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC),
 		End:          time.Date(2026, 7, 23, 11, 0, 0, 0, time.UTC),
 		LastModified: time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC),
-		ChangeKey:    "ck1",
+		ETag:         "ck1",
 		Type:         "singleInstance",
 	}
 
@@ -1139,11 +1246,11 @@ func TestEventContentHashIgnoresVolatileFields(t *testing.T) {
 	churned := base
 	churned.ID = "g-other"
 	churned.ICalUID = "uid-other"
-	churned.ChangeKey = "ck-churned"
+	churned.ETag = "ck-churned"
 	churned.LastModified = base.LastModified.Add(48 * time.Hour)
 	churned.Type = "seriesMaster"
 	if eventContentHash(churned, testOwnerEmail) != eventContentHash(base, testOwnerEmail) {
-		t.Error("hash must ignore ID/ICalUID/ChangeKey/LastModified/Type")
+		t.Error("hash must ignore ID/ICalUID/ETag/LastModified/Type")
 	}
 
 	// CRLF vs LF descriptions are the same content.
@@ -1194,7 +1301,7 @@ func TestFileStateStoreRoundTrip(t *testing.T) {
 	}
 
 	state.Calendars["cal1"] = CalendarStatus{Items: map[string]ItemStatus{
-		"uid-1": {GraphID: "g1", RemoteHash: "rh1", LocalHash: "abc"},
+		"uid-1": {RemoteID: "g1", RemoteHash: "rh1", LocalHash: "abc"},
 	}}
 	if err := store.Save(state); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -1205,7 +1312,7 @@ func TestFileStateStoreRoundTrip(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	got, ok := loaded.Calendars["cal1"].Items["uid-1"]
-	if !ok || got != (ItemStatus{GraphID: "g1", RemoteHash: "rh1", LocalHash: "abc"}) {
+	if !ok || got != (ItemStatus{RemoteID: "g1", RemoteHash: "rh1", LocalHash: "abc"}) {
 		t.Errorf("round-trip mismatch: %+v ok=%v", got, ok)
 	}
 
@@ -1219,7 +1326,8 @@ func TestFileStateStoreRoundTrip(t *testing.T) {
 	}
 
 	// A corrupted file is backed up and treated as empty.
-	if err := os.WriteFile(store.path(), []byte("{corrupt"), 0o600); err != nil {
+	statePath := filepath.Join(dir, ".durian-calsync-state.json")
+	if err := os.WriteFile(statePath, []byte("{corrupt"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	recovered, err := store.Load()

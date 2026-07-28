@@ -4,7 +4,7 @@
 // types carry Microsoft-Graph-shaped JSON tags and bookkeeping fields
 // (changeKey, type, …); these DTOs are the stable, minimal wire contract.
 
-package graphcalendar
+package calendar
 
 import "time"
 

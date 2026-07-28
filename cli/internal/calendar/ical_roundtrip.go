@@ -20,7 +20,7 @@
 // direction inverts the same table; an RRULE outside it leaves Recurrence nil
 // with a warning.
 
-package graphcalendar
+package calendar
 
 import (
 	"bytes"
@@ -47,8 +47,8 @@ const propTeamsMeetingURL = "X-MICROSOFT-SKYPETEAMSMEETINGURL"
 // drops it and the next sync is a no-op.
 const propCreateTeamsMeeting = "X-DURIAN-CREATE-TEAMS-MEETING"
 
-// graphDateFormat is the "YYYY-MM-DD" layout of Graph recurrenceRange dates.
-const graphDateFormat = "2006-01-02"
+// GraphDateFormat is the "YYYY-MM-DD" layout of Graph recurrenceRange dates.
+const GraphDateFormat = "2006-01-02"
 
 // MARK: - Serialize
 
@@ -83,13 +83,13 @@ func EventToICal(e Event) ([]byte, error) {
 		ev.Props.SetDateTime(ical.PropLastModified, e.LastModified.UTC())
 	}
 	if e.Subject != "" {
-		ev.Props.SetText(ical.PropSummary, normalizeText(e.Subject))
+		ev.Props.SetText(ical.PropSummary, NormalizeText(e.Subject))
 	}
 	if e.Location != "" {
-		ev.Props.SetText(ical.PropLocation, normalizeText(e.Location))
+		ev.Props.SetText(ical.PropLocation, NormalizeText(e.Location))
 	}
 	if e.Description != "" {
-		ev.Props.SetText(ical.PropDescription, normalizeText(e.Description))
+		ev.Props.SetText(ical.PropDescription, NormalizeText(e.Description))
 	}
 	if e.AllDay {
 		ev.Props.SetDate(ical.PropDateTimeStart, e.Start.UTC())
@@ -99,7 +99,7 @@ func EventToICal(e Event) ([]byte, error) {
 		ev.Props.SetDateTime(ical.PropDateTimeEnd, e.End.UTC())
 	}
 	if e.Recurrence != nil {
-		opt, err := recurrenceToROption(*e.Recurrence)
+		opt, err := RecurrenceToROption(*e.Recurrence)
 		if err != nil {
 			slog.Warn("Dropping unmappable recurrence from ICS", "module", "GRAPHCAL",
 				"id", e.ID, "pattern", e.Recurrence.Pattern.Type, "err", err)
@@ -116,8 +116,8 @@ func EventToICal(e Event) ([]byte, error) {
 			continue
 		}
 		prop := calAddressProp(ical.PropAttendee, a.Name, a.Email)
-		prop.Params.Set(ical.ParamRole, attendeeRole(a.Type))
-		prop.Params.Set(ical.ParamParticipationStatus, attendeePartStat(a.Response))
+		prop.Params.Set(ical.ParamRole, AttendeeRole(a.Type))
+		prop.Params.Set(ical.ParamParticipationStatus, AttendeePartStat(a.Response))
 		prop.Params.Set(ical.ParamRSVP, "TRUE")
 		ev.Props.Add(prop)
 	}
@@ -147,9 +147,9 @@ func EventToICal(e Event) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// normalizeText collapses CR/CRLF to LF; go-ical escapes LF itself but would
+// NormalizeText collapses CR/CRLF to LF; go-ical escapes LF itself but would
 // reject a raw CR at encode time.
-func normalizeText(s string) string {
+func NormalizeText(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	return strings.ReplaceAll(s, "\r", "\n")
 }
@@ -169,7 +169,7 @@ func calAddressProp(name, cn, email string) *ical.Prop {
 // value: go-ical quotes values containing ";:," itself but rejects double
 // quotes and CR/LF at encode time, so those are replaced.
 func sanitizeParamValue(s string) string {
-	s = strings.ReplaceAll(normalizeText(s), "\n", " ")
+	s = strings.ReplaceAll(NormalizeText(s), "\n", " ")
 	return strings.ReplaceAll(s, `"`, "'")
 }
 
@@ -182,8 +182,8 @@ func sortedAttendees(attendees []Attendee) []Attendee {
 	return out
 }
 
-// attendeeRole maps a Graph attendee type to an iCalendar ROLE.
-func attendeeRole(attendeeType string) string {
+// AttendeeRole maps a Graph attendee type to an iCalendar ROLE.
+func AttendeeRole(attendeeType string) string {
 	switch attendeeType {
 	case "optional":
 		return "OPT-PARTICIPANT"
@@ -194,9 +194,9 @@ func attendeeRole(attendeeType string) string {
 	}
 }
 
-// attendeePartStat maps a Graph response status to an iCalendar PARTSTAT. The
+// AttendeePartStat maps a Graph response status to an iCalendar PARTSTAT. The
 // organizer implicitly attends, so "organizer" maps to ACCEPTED.
-func attendeePartStat(response string) string {
+func AttendeePartStat(response string) string {
 	switch response {
 	case "accepted", "organizer":
 		return "ACCEPTED"
@@ -215,7 +215,7 @@ func attendeePartStat(response string) string {
 // EventToICal) into an Event. A VALUE=DATE DTSTART marks the event all-day;
 // all times are interpreted in UTC. An RRULE is mapped back into a Graph
 // Recurrence; an RRULE outside the supported mapping leaves Recurrence nil
-// with a warning. ID/ChangeKey/Type are not part of the iCal representation
+// with a warning. ID/ETag/Type are not part of the iCal representation
 // and stay empty.
 //
 // Meeting metadata is parsed back: every ATTENDEE line becomes an Attendee
@@ -283,7 +283,7 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 	if opt, err := ev.Props.RecurrenceRule(); err != nil {
 		slog.Warn("Ignoring unparseable RRULE", "module", "GRAPHCAL", "uid", uid, "err", err)
 	} else if opt != nil {
-		recurrence, err = roptionToRecurrence(opt, start)
+		recurrence, err = ROptionToRecurrence(opt, start)
 		if err != nil {
 			slog.Warn("Ignoring unmappable RRULE", "module", "GRAPHCAL", "uid", uid, "err", err)
 			recurrence = nil
@@ -300,8 +300,8 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 		attendees = append(attendees, Attendee{
 			Name:     prop.Params.Get(ical.ParamCommonName),
 			Email:    address,
-			Type:     attendeeTypeFromRole(prop.Params.Get(ical.ParamRole)),
-			Response: responseFromPartStat(prop.Params.Get(ical.ParamParticipationStatus)),
+			Type:     AttendeeTypeFromRole(prop.Params.Get(ical.ParamRole)),
+			Response: ResponseFromPartStat(prop.Params.Get(ical.ParamParticipationStatus)),
 		})
 	}
 	var organizer *Person
@@ -313,7 +313,7 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 	ownerResponse := OwnerRespNone
 	for _, a := range attendees {
 		if accountEmail != "" && strings.EqualFold(a.Email, accountEmail) {
-			ownerResponse = ownerRespFromGraph(a.Response)
+			ownerResponse = OwnerRespFromGraph(a.Response)
 		}
 	}
 	if organizer != nil && accountEmail != "" && strings.EqualFold(organizer.Email, accountEmail) {
@@ -383,9 +383,9 @@ func mailtoAddress(value string) string {
 	return value[len(scheme):]
 }
 
-// attendeeTypeFromRole maps an iCalendar ROLE back to the Graph attendee
-// type — the inverse of attendeeRole.
-func attendeeTypeFromRole(role string) string {
+// AttendeeTypeFromRole maps an iCalendar ROLE back to the Graph attendee
+// type — the inverse of AttendeeRole.
+func AttendeeTypeFromRole(role string) string {
 	switch strings.ToUpper(role) {
 	case "OPT-PARTICIPANT":
 		return "optional"
@@ -396,11 +396,11 @@ func attendeeTypeFromRole(role string) string {
 	}
 }
 
-// responseFromPartStat maps an iCalendar PARTSTAT back to the Graph response
-// enum — the (lossy) inverse of attendeePartStat: NEEDS-ACTION covers both
+// ResponseFromPartStat maps an iCalendar PARTSTAT back to the Graph response
+// enum — the (lossy) inverse of AttendeePartStat: NEEDS-ACTION covers both
 // "none" and "notResponded" and parses back as "none"; "organizer" rendered
 // as ACCEPTED parses back as "accepted".
-func responseFromPartStat(partStat string) string {
+func ResponseFromPartStat(partStat string) string {
 	switch strings.ToUpper(partStat) {
 	case "ACCEPTED":
 		return "accepted"
@@ -442,10 +442,10 @@ var graphIndexToSetPos = map[string]int{
 	"last":   -1,
 }
 
-// recurrenceToROption builds an rrule.ROption from a Graph recurrence per the
+// RecurrenceToROption builds an rrule.ROption from a Graph recurrence per the
 // mapping documented in the file header. It fails (instead of guessing) on
 // pattern or range types outside that mapping.
-func recurrenceToROption(rec Recurrence) (*rrule.ROption, error) {
+func RecurrenceToROption(rec Recurrence) (*rrule.ROption, error) {
 	opt := &rrule.ROption{}
 	if rec.Pattern.Interval > 1 {
 		opt.Interval = rec.Pattern.Interval
@@ -486,7 +486,7 @@ func recurrenceToROption(rec Recurrence) (*rrule.ROption, error) {
 
 	switch rec.Range.Type {
 	case "endDate":
-		endDate, err := time.ParseInLocation(graphDateFormat, rec.Range.EndDate, time.UTC)
+		endDate, err := time.ParseInLocation(GraphDateFormat, rec.Range.EndDate, time.UTC)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse recurrence end date %q: %w", rec.Range.EndDate, err)
 		}
@@ -535,13 +535,13 @@ func graphDaysToRRule(days []string) ([]rrule.Weekday, error) {
 	return out, nil
 }
 
-// roptionToRecurrence maps a parsed RRULE back into a Graph recurrence — the
-// inverse of recurrenceToROption. start (DTSTART) provides range.startDate,
+// ROptionToRecurrence maps a parsed RRULE back into a Graph recurrence — the
+// inverse of RecurrenceToROption. start (DTSTART) provides range.startDate,
 // which Graph requires on the series master. RRULEs outside the supported
 // mapping (other frequencies, multiple BYMONTHDAY/BYSETPOS values, nth-weekday
 // BYDAY offsets beyond first..fourth/last, ...) yield an error; the caller
 // treats that as "no recurrence" with a warning.
-func roptionToRecurrence(opt *rrule.ROption, start time.Time) (*Recurrence, error) {
+func ROptionToRecurrence(opt *rrule.ROption, start time.Time) (*Recurrence, error) {
 	rec := &Recurrence{}
 
 	interval := opt.Interval
@@ -606,14 +606,14 @@ func roptionToRecurrence(opt *rrule.ROption, start time.Time) (*Recurrence, erro
 		return nil, fmt.Errorf("unsupported rrule with both UNTIL and COUNT")
 	case !opt.Until.IsZero():
 		rec.Range.Type = "endDate"
-		rec.Range.EndDate = opt.Until.UTC().Format(graphDateFormat)
+		rec.Range.EndDate = opt.Until.UTC().Format(GraphDateFormat)
 	case opt.Count > 0:
 		rec.Range.Type = "numbered"
 		rec.Range.NumberOfOccurrences = opt.Count
 	default:
 		rec.Range.Type = "noEnd"
 	}
-	rec.Range.StartDate = start.UTC().Format(graphDateFormat)
+	rec.Range.StartDate = start.UTC().Format(GraphDateFormat)
 
 	return rec, nil
 }

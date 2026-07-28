@@ -9,15 +9,34 @@ import (
 	"strings"
 	"time"
 
+	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/googlecalendar"
 	"github.com/julion2/durian/cli/internal/graphcalendar"
 	"github.com/spf13/cobra"
 )
 
+// newCalendarProvider builds the calendar sync backend for an account from its
+// OAuth provider. Both backends satisfy calendarsync.CalendarProvider, so the
+// commands below are provider-agnostic once constructed.
+func newCalendarProvider(account *config.AccountConfig) (calendarsync.CalendarProvider, error) {
+	if account.OAuth == nil {
+		return nil, errors.New("calendar sync requires an OAuth account")
+	}
+	switch account.OAuth.Provider {
+	case "microsoft":
+		return graphcalendar.New(account)
+	case "google":
+		return googlecalendar.New(account)
+	default:
+		return nil, fmt.Errorf("calendar sync not supported for provider %q", account.OAuth.Provider)
+	}
+}
+
 var calendarCmd = &cobra.Command{
 	Use:   "calendar",
 	Short: "Calendar operations",
-	Long:  "Work with Outlook calendars via Microsoft Graph.",
+	Long:  "Work with your calendars (Microsoft Outlook or Google Calendar) via a local vdir.",
 }
 
 var calendarExportCmd = &cobra.Command{
@@ -109,11 +128,7 @@ func runCalendarExport(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("account not found: %s\nAvailable accounts: %s", args[0], cfg.ListAccountIdentifiers())
 	}
-	if account.OAuth == nil || account.OAuth.Provider != "microsoft" {
-		return errors.New("calendar export requires a Microsoft OAuth account")
-	}
-
-	client, err := graphcalendar.New(account)
+	client, err := newCalendarProvider(account)
 	if err != nil {
 		return err
 	}
@@ -127,10 +142,10 @@ func runCalendarExport(cmd *cobra.Command, args []string) error {
 	to := now.AddDate(0, 0, calendarExportDaysForward)
 
 	include := account.CalendarInclude()
-	stats, err := graphcalendar.Export(cmd.Context(), client, outDir, from, to, include)
+	stats, err := calendarsync.Export(cmd.Context(), client, outDir, from, to, include)
 	if err != nil {
-		if graphcalendar.IsAuthError(err) {
-			return fmt.Errorf("calendar export failed — Graph consent may be missing, run 'durian auth login %s' to consent Calendars.Read: %w",
+		if client.IsAuthError(err) {
+			return fmt.Errorf("calendar export failed — calendar access may not be granted, run 'durian auth login %s' to consent: %w",
 				account.GetAliasOrName(), err)
 		}
 		return fmt.Errorf("calendar export failed: %w", err)
@@ -154,11 +169,7 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("account not found: %s\nAvailable accounts: %s", args[0], cfg.ListAccountIdentifiers())
 	}
-	if account.OAuth == nil || account.OAuth.Provider != "microsoft" {
-		return errors.New("calendar sync requires a Microsoft OAuth account")
-	}
-
-	client, err := graphcalendar.New(account)
+	client, err := newCalendarProvider(account)
 	if err != nil {
 		return err
 	}
@@ -168,16 +179,16 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 	// The status lives inside accountDir, so it is bound to this exact local
 	// collection (see FileStateStore doc): syncing the same account to a
 	// different directory must not reuse another directory's status.
-	store := graphcalendar.NewFileStateStore(accountDir)
+	store := calendarsync.NewFileStateStore(accountDir)
 	state, err := store.Load()
 	if err != nil {
 		return fmt.Errorf("failed to load calendar sync state: %w", err)
 	}
 
-	plans, err := graphcalendar.PlanAll(cmd.Context(), client, accountDir, account.CalendarInclude(), state)
+	plans, err := calendarsync.PlanAll(cmd.Context(), client, accountDir, account.CalendarInclude(), state)
 	if err != nil {
-		if graphcalendar.IsAuthError(err) {
-			return fmt.Errorf("calendar sync failed — Graph consent may be missing, run 'durian auth login %s' to consent Calendars.ReadWrite: %w",
+		if client.IsAuthError(err) {
+			return fmt.Errorf("calendar sync failed — calendar access may not be granted, run 'durian auth login %s' to consent: %w",
 				account.GetAliasOrName(), err)
 		}
 		return fmt.Errorf("calendar sync failed: %w", err)
@@ -200,7 +211,7 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 
 	// Notification preview: every email applying this plan will make Graph
 	// send, enumerated BEFORE the confirmation gate.
-	notifications := graphcalendar.PlanNotifications(plans, policy, calendarSyncSilentRSVP)
+	notifications := calendarsync.PlanNotifications(plans, policy, calendarSyncSilentRSVP)
 	printNotificationPreview(notifications)
 
 	if calendarSyncDryRun {
@@ -224,8 +235,8 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	opts := graphcalendar.SyncOptions{Conflict: policy, SilentRSVP: calendarSyncSilentRSVP}
-	stats, applyErr := graphcalendar.ApplyAll(cmd.Context(), client, state, plans, opts)
+	opts := calendarsync.SyncOptions{Conflict: policy, SilentRSVP: calendarSyncSilentRSVP}
+	stats, applyErr := calendarsync.ApplyAll(cmd.Context(), client, state, plans, opts)
 	// Save state even on partial failure: remote operations that already
 	// succeeded are recorded in the status and must not be replayed.
 	if saveErr := store.Save(state); saveErr != nil {
@@ -236,8 +247,8 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 		return saveErr
 	}
 	if applyErr != nil {
-		if graphcalendar.IsAuthError(applyErr) {
-			return fmt.Errorf("calendar sync failed — Graph consent may be missing, run 'durian auth login %s' to consent Calendars.ReadWrite: %w",
+		if client.IsAuthError(applyErr) {
+			return fmt.Errorf("calendar sync failed — calendar access may not be granted, run 'durian auth login %s' to consent: %w",
 				account.GetAliasOrName(), applyErr)
 		}
 		return fmt.Errorf("calendar sync failed: %w", applyErr)
@@ -259,7 +270,7 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 // printNotificationPreview lists every email message the plan will make Graph
 // send — category, event, calendar, recipient count — plus a total line, or
 // an explicit all-clear when the plan sends nothing.
-func printNotificationPreview(notifications []graphcalendar.Notification) {
+func printNotificationPreview(notifications []calendarsync.Notification) {
 	if len(notifications) == 0 {
 		fmt.Fprintln(os.Stderr, "No emails will be sent.") // encgrep:allow static user-facing CLI text, no message content
 		return
@@ -288,28 +299,28 @@ type planSummary struct {
 
 // summarizePlans counts every planned action and renders one human-readable
 // line per action that would change the Outlook calendar.
-func summarizePlans(plans []graphcalendar.CalendarPlan, conflictPolicy string) planSummary {
+func summarizePlans(plans []calendarsync.CalendarPlan, conflictPolicy string) planSummary {
 	var s planSummary
 	for _, p := range plans {
 		for _, a := range p.Actions {
 			switch a.Kind {
-			case graphcalendar.ActionDownloadNew, graphcalendar.ActionDownloadUpdate:
+			case calendarsync.ActionDownloadNew, calendarsync.ActionDownloadUpdate:
 				s.downloads++
-			case graphcalendar.ActionPruneLocal:
+			case calendarsync.ActionPruneLocal:
 				s.prunes++
-			case graphcalendar.ActionUploadCreate:
+			case calendarsync.ActionUploadCreate:
 				s.uploadCreates++
 				s.remoteLines = append(s.remoteLines, fmt.Sprintf("UPLOAD (create): %s [%s]", a.Summary, p.Calendar.Name))
-			case graphcalendar.ActionUploadUpdate:
+			case calendarsync.ActionUploadUpdate:
 				s.uploadUpdates++
 				s.remoteLines = append(s.remoteLines, fmt.Sprintf("UPLOAD (update): %s [%s]", a.Summary, p.Calendar.Name))
-			case graphcalendar.ActionDeleteRemote:
+			case calendarsync.ActionDeleteRemote:
 				s.deleteRemotes++
 				s.remoteLines = append(s.remoteLines, fmt.Sprintf("DELETE REMOTE: %s [%s]", a.Summary, p.Calendar.Name))
-			case graphcalendar.ActionConflict:
+			case calendarsync.ActionConflict:
 				s.conflicts++
 				s.remoteLines = append(s.remoteLines, fmt.Sprintf("CONFLICT (%s wins): %s [%s]", conflictPolicy, a.Summary, p.Calendar.Name))
-			case graphcalendar.ActionRsvp:
+			case calendarsync.ActionRsvp:
 				// Rebaseline-only RSVPs touch no remote state and are not
 				// listed; a real response is a gated remote mutation.
 				if a.RemoteMutation() {

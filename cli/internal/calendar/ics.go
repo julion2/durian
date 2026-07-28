@@ -1,4 +1,4 @@
-package graphcalendar
+package calendar
 
 import (
 	"strings"

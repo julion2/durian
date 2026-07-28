@@ -7,7 +7,7 @@
 // new/rsvp/delete): every one of them reads or writes the vdir only, and the
 // actual Outlook effect happens later through `durian calendar sync`.
 
-package graphcalendar
+package calendar
 
 import (
 	"fmt"
@@ -52,13 +52,13 @@ func ReadCalendars(accountDir, owner string) ([]LocalCalendar, error) {
 			continue
 		}
 		calDir := filepath.Join(accountDir, entry.Name())
-		items, _, err := scanLocalItems(calDir, owner)
+		items, _, err := ScanLocalItems(calDir, owner)
 		if err != nil {
 			return nil, err
 		}
 		events := make([]Event, 0, len(items))
 		for _, it := range items {
-			events = append(events, it.event)
+			events = append(events, it.Event)
 		}
 		sort.Slice(events, func(i, j int) bool { return events[i].Start.Before(events[j].Start) })
 
@@ -102,7 +102,7 @@ func ExpandOccurrences(e Event, from, to time.Time) []Event {
 		return nil
 	}
 
-	opt, err := recurrenceToROption(*e.Recurrence)
+	opt, err := RecurrenceToROption(*e.Recurrence)
 	if err != nil {
 		slog.Warn("Cannot expand recurrence, showing master only", "module", "GRAPHCAL",
 			"uid", e.ICalUID, "err", err)
@@ -181,7 +181,7 @@ func ResolveLocalEvent(accountDir, owner, ref, calFilter string) (path string, e
 		if calFilter != "" && !strings.EqualFold(calName, calFilter) {
 			continue
 		}
-		p := filepath.Join(calDir, sanitizeName(ref)+".ics")
+		p := filepath.Join(calDir, SanitizeName(ref)+".ics")
 		data, readErr := os.ReadFile(p)
 		if readErr != nil {
 			continue
@@ -207,18 +207,18 @@ func ResolveLocalEvent(accountDir, owner, ref, calFilter string) (path string, e
 		if calFilter != "" && !strings.EqualFold(calName, calFilter) {
 			continue
 		}
-		items, _, err := scanLocalItems(calDir, owner)
+		items, _, err := ScanLocalItems(calDir, owner)
 		if err != nil {
 			return "", Event{}, "", err
 		}
 		for _, it := range items {
-			m := match{path: it.path, event: it.event, calendar: calName}
+			m := match{path: it.Path, event: it.Event, calendar: calName}
 			switch {
-			case it.event.ICalUID == ref:
+			case it.Event.ICalUID == ref:
 				exact = append(exact, m)
-			case strings.HasPrefix(it.event.ICalUID, ref):
+			case strings.HasPrefix(it.Event.ICalUID, ref):
 				prefix = append(prefix, m)
-			case strings.Contains(strings.ToLower(it.event.Subject), lowerRef):
+			case strings.Contains(strings.ToLower(it.Event.Subject), lowerRef):
 				subject = append(subject, m)
 			}
 		}
@@ -248,9 +248,9 @@ func ParseWhen(s string, now time.Time) (t time.Time, allDay bool, err error) {
 	s = strings.TrimSpace(s)
 	switch strings.ToLower(s) {
 	case "today":
-		return dateOnly(now), true, nil
+		return DateOnly(now), true, nil
 	case "tomorrow":
-		return dateOnly(now).AddDate(0, 0, 1), true, nil
+		return DateOnly(now).AddDate(0, 0, 1), true, nil
 	}
 	if t, err = time.Parse(time.RFC3339, s); err == nil {
 		return t.UTC(), false, nil
@@ -264,8 +264,8 @@ func ParseWhen(s string, now time.Time) (t time.Time, allDay bool, err error) {
 	return time.Time{}, false, fmt.Errorf("cannot parse date/time %q (use RFC3339, \"2006-01-02 15:04\", \"2006-01-02\", today or tomorrow)", s)
 }
 
-// dateOnly truncates t to midnight UTC of its calendar day.
-func dateOnly(t time.Time) time.Time {
+// DateOnly truncates t to midnight UTC of its calendar day.
+func DateOnly(t time.Time) time.Time {
 	t = t.UTC()
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 }
@@ -275,7 +275,7 @@ func dateOnly(t time.Time) time.Time {
 // and to is from + defaultSpan. Shared by the CLI `list` command and the HTTP
 // API. Returns an error if the resulting end is not after the start.
 func CalendarWindow(fromStr, toStr string, defaultSpan time.Duration, now time.Time) (from, to time.Time, err error) {
-	from = dateOnly(now)
+	from = DateOnly(now)
 	if strings.TrimSpace(fromStr) != "" {
 		if from, _, err = ParseWhen(fromStr, now); err != nil {
 			return time.Time{}, time.Time{}, err
@@ -346,7 +346,7 @@ func WriteLocalEvent(accountDir, calendarName string, e Event) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to serialize new event: %w", err)
 	}
-	path := filepath.Join(dir, sanitizeName(e.ICalUID)+".ics")
+	path := filepath.Join(dir, SanitizeName(e.ICalUID)+".ics")
 	if err := WriteFileAtomic(path, data, 0o600); err != nil {
 		return "", err
 	}

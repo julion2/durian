@@ -6,17 +6,21 @@
 //     from the Graph calendarView endpoint, which expands recurring series
 //     into concrete instances within the requested window, so no RRULE
 //     handling is needed there (see ics.go).
-//   - The foundation for two-way sync: FetchMasterEvents retrieves
+//   - The remote side of the two-way sync: Client implements
+//     calendarsync.CalendarProvider — FetchMasterEvents retrieves
 //     singleInstance and seriesMaster events (with their recurrence
-//     definition and changeKey etag), and ical_roundtrip.go converts them
-//     to/from standalone iCalendar documents including RRULEs.
+//     definition and changeKey etag), write.go performs the event mutations,
+//     and the calendar package's iCalendar round-trip converts events to/from
+//     standalone iCalendar documents including RRULEs.
+//
+// The provider-neutral event model and the local vdir layer live in the
+// calendar package and are re-exported here via aliases.go; the sync engine
+// itself lives in the calendarsync package.
 package graphcalendar
 
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,12 +28,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/oauth"
 )
@@ -67,6 +71,7 @@ const (
 // Client is a minimal Microsoft Graph calendar client: read paths for the
 // vdir export and two-way sync download direction, plus the event write
 // operations (create/update/delete, see write.go) for the upload direction.
+// It implements calendarsync.CalendarProvider.
 type Client struct {
 	account      *config.AccountConfig
 	clientID     string
@@ -110,6 +115,34 @@ func New(account *config.AccountConfig) (*Client, error) {
 	}
 	c.tokenFn = c.cachedGraphToken
 	return c, nil
+}
+
+// Client satisfies the neutral provider seam of the sync engine.
+var _ calendarsync.CalendarProvider = (*Client)(nil)
+
+// NewWithToken creates a client bound to a fixed bearer token and base URL —
+// no OAuth involved. Tests (this package's and the sync engine's harness) use
+// it to drive the real client against a local fake server.
+func NewWithToken(owner, baseURL, token string, httpClient *http.Client) *Client {
+	return &Client{
+		owner:      owner,
+		httpClient: httpClient,
+		baseURL:    baseURL,
+		tokenFn: func(context.Context) (string, error) {
+			return token, nil
+		},
+	}
+}
+
+// Owner returns the mailbox owner's email address (the account auth email).
+func (c *Client) Owner() string {
+	return c.owner
+}
+
+// IsAuthError implements the provider seam by delegating to the package-level
+// IsAuthError.
+func (c *Client) IsAuthError(err error) bool {
+	return IsAuthError(err)
 }
 
 // MARK: - Token source
@@ -299,14 +332,10 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 
 // MARK: - Calendars
 
-// Calendar is one Outlook calendar.
-type Calendar struct {
-	ID   string
-	Name string
-	// HexColor is the calendar's "#RRGGBB" color, or "" when the calendar has
-	// no explicit color (Graph reports "" or "auto").
-	HexColor string
-}
+// Calendar is one Outlook calendar, in the neutral list shape of the sync
+// engine (Graph reports "" or "auto" for a calendar without explicit color;
+// both become an empty HexColor).
+type Calendar = calendarsync.Calendar
 
 // calendarPage is one page of GET /me/calendars.
 type calendarPage struct {
@@ -343,278 +372,10 @@ func (c *Client) ListCalendars(ctx context.Context) ([]Calendar, error) {
 
 // MARK: - Events
 
-// Event is one Graph calendar event. Two fetch paths fill it:
-//
-//   - FetchEvents (calendarView) returns pre-expanded concrete instances, so
-//     ID is unique per occurrence while ICalUID is shared across a series;
-//     Type, ChangeKey and Recurrence stay empty.
-//   - FetchMasterEvents (/events) returns singleInstance and seriesMaster
-//     events; seriesMaster carries the series definition in Recurrence, and
-//     ChangeKey/Type are populated for the two-way sync engine.
-type Event struct {
-	ID           string
-	ICalUID      string
-	Subject      string
-	Location     string
-	Description  string
-	Start        time.Time
-	End          time.Time
-	AllDay       bool
-	LastModified time.Time
-
-	// ChangeKey is the remote etag of the event; it changes on every remote
-	// modification.
-	ChangeKey string
-	// Type is the Graph event type: "singleInstance", "seriesMaster",
-	// "occurrence" or "exception". Empty for calendarView results.
-	Type string
-	// Recurrence is the series definition of a seriesMaster event; nil for
-	// non-recurring events.
-	Recurrence *Recurrence
-
-	// Meeting metadata (Stage 2: read/write). Attendees and the owner's RSVP
-	// are parsed on both read paths (Graph and local iCal) and — role-gated
-	// on the owner being the organizer — uploaded again, so durian acts as a
-	// full scheduling client. calendarView results leave the fields zero
-	// (eventSelect does not request them).
-
-	// Attendees is the meeting's attendee list; empty for plain appointments.
-	Attendees []Attendee
-	// Organizer is the meeting organizer; nil for plain appointments.
-	Organizer *Person
-	// IsOrganizer reports whether the account owner organizes this meeting.
-	// Only set on the Graph read path; local files identify the organizer via
-	// Organizer/owner email comparison instead.
-	IsOrganizer bool
-	// IsCancelled reports whether the meeting has been cancelled remotely.
-	IsCancelled bool
-	// IsOnlineMeeting reports whether the event is an online meeting.
-	IsOnlineMeeting bool
-	// OnlineMeetingURL is the join link (Teams etc.): onlineMeeting.joinUrl,
-	// falling back to the legacy onlineMeetingUrl field. Empty when the event
-	// is not an online meeting.
-	OnlineMeetingURL string
-	// OwnerResponse is the account owner's RSVP to this meeting, canonical
-	// across both read paths (Graph responseStatus, iCal owner PARTSTAT).
-	// Deliberately excluded from eventContentHash — an owner RSVP is handled
-	// by the dedicated ActionRsvp three-way diff, never as a content change.
-	OwnerResponse OwnerResp
-	// RequestOnlineMeeting is the local-only X-DURIAN-CREATE-TEAMS-MEETING
-	// marker: the create path requests a Teams online meeting for this event.
-	// Excluded from every hash and never round-tripped back into the .ics.
-	RequestOnlineMeeting bool
-}
-
-// OwnerResp is the canonical owner-RSVP state of an event, mapped from both
-// Graph's responseStatus.response enum and iCal PARTSTAT values. The zero
-// value OwnerRespNone means "not (yet) responded": Graph's "none" and
-// "notResponded" and iCal's NEEDS-ACTION all collapse to it.
-type OwnerResp string
-
-const (
-	OwnerRespNone      OwnerResp = ""
-	OwnerRespTentative OwnerResp = "tentative"
-	OwnerRespAccepted  OwnerResp = "accepted"
-	OwnerRespDeclined  OwnerResp = "declined"
-	OwnerRespOrganizer OwnerResp = "organizer"
-)
-
-// ownerRespFromGraph maps Graph's responseStatus.response enum to the
-// canonical OwnerResp.
-func ownerRespFromGraph(s string) OwnerResp {
-	switch s {
-	case "tentativelyAccepted":
-		return OwnerRespTentative
-	case "accepted":
-		return OwnerRespAccepted
-	case "declined":
-		return OwnerRespDeclined
-	case "organizer":
-		return OwnerRespOrganizer
-	default: // "none", "notResponded", "", unknown
-		return OwnerRespNone
-	}
-}
-
-// Attendee is one meeting attendee as Graph reports it. Type is the Graph
-// attendee type: "required", "optional" or "resource". Response is the
-// attendee's RSVP, same enum as Event.MyResponse.
-type Attendee struct {
-	Name     string
-	Email    string
-	Type     string
-	Response string
-}
-
-// Person is a name/email pair, e.g. the meeting organizer.
-type Person struct {
-	Name  string
-	Email string
-}
-
-// eventContentHash returns a SHA-256 hex digest over the MEANINGFUL content of
-// an event — the fields a user actually edits — serialized deterministically.
-// The two-way sync engine uses it as the remote-change signal: same content
-// yields the same hash no matter which read path produced the Event
-// (FetchMasterEvents, GetEvent, or a CreateEvent response).
-//
-// Volatile identity/bookkeeping fields are deliberately excluded: ChangeKey is
-// NOT a stable etag — Graph rewrites it between a write and subsequent reads
-// (and over time) without any content change — and LastModified churns with
-// it. ID, ICalUID and Type are identity/shape, not content. Fields are joined
-// with NUL separators (no meaningful field contains NUL) so adjacent values
-// can never be confused; Description line endings are normalized to LF, and a
-// Recurrence is canonicalized via its fixed-field JSON encoding.
-//
-// The meeting metadata (attendees, organizer, cancellation, join link) is
-// part of the hash too, so a server-side change — another attendee RSVPs, an
-// attendee is added or removed, a meeting is cancelled, a join link changes —
-// is detected as a remote change and re-downloaded. Attendees are
-// canonicalized as a SORTED list of "email|type|response" entries so the hash
-// does not depend on Graph's ordering.
-//
-// The OWNER'S own state is deliberately excluded: neither OwnerResponse nor
-// the owner's own attendee entry (matched by ownerEmail, case-insensitive on
-// the address) is hashed, so an owner RSVP — locally or in Outlook — never
-// registers as a content change. Owner RSVPs are handled by the dedicated
-// ActionRsvp three-way diff instead (see twosync.go).
-func eventContentHash(e Event, ownerEmail string) string {
-	attendees := make([]string, 0, len(e.Attendees))
-	for _, a := range e.Attendees {
-		if ownerEmail != "" && strings.EqualFold(a.Email, ownerEmail) {
-			continue
-		}
-		attendees = append(attendees, a.Email+"|"+a.Type+"|"+a.Response)
-	}
-	sort.Strings(attendees)
-
-	var organizerEmail string
-	if e.Organizer != nil {
-		organizerEmail = e.Organizer.Email
-	}
-
-	h := sha256.New()
-	for _, field := range []string{
-		e.Subject,
-		e.Start.UTC().Format(time.RFC3339),
-		e.End.UTC().Format(time.RFC3339),
-		strconv.FormatBool(e.AllDay),
-		e.Location,
-		normalizeText(e.Description),
-		recurrenceJSON(e.Recurrence, e.ID),
-		strings.Join(attendees, "\n"),
-		organizerEmail,
-		strconv.FormatBool(e.IsOnlineMeeting),
-		e.OnlineMeetingURL,
-		strconv.FormatBool(e.IsCancelled),
-	} {
-		h.Write([]byte(field))
-		h.Write([]byte{0})
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-// recurrenceJSON canonicalizes a Recurrence as its fixed-field JSON encoding
-// ("" for nil), for hashing and equality checks. id is only used in the
-// (unreachable for plain structs) marshal-failure warning.
-func recurrenceJSON(rec *Recurrence, id string) string {
-	if rec == nil {
-		return ""
-	}
-	data, err := json.Marshal(rec)
-	if err != nil {
-		// Keep a deterministic fallback rather than failing the hash.
-		slog.Warn("Failed to marshal recurrence for content hash", "module", "GRAPHCAL",
-			"id", id, "err", err)
-		return fmt.Sprintf("%+v", *rec)
-	}
-	return string(data)
-}
-
-// attendeeSetHash returns a SHA-256 hex digest of the attendee SET — sorted
-// "email|type" entries, responses excluded — used as the ItemStatus baseline
-// that detects attendee adds/removes as real scheduling changes. The digest
-// of an empty list is still a non-empty string, so "" can mean "unknown
-// baseline" (pre-Stage-2 status files).
-func attendeeSetHash(attendees []Attendee) string {
-	entries := make([]string, 0, len(attendees))
-	for _, a := range attendees {
-		entries = append(entries, strings.ToLower(a.Email)+"|"+a.Type)
-	}
-	sort.Strings(entries)
-	sum := sha256.Sum256([]byte(strings.Join(entries, "\n")))
-	return hex.EncodeToString(sum[:])
-}
-
-// ownerIsOrganizer reports whether the account owner organizes this remote
-// event: Graph's IsOrganizer flag, or the organizer email matching the owner.
-func ownerIsOrganizer(e Event, owner string) bool {
-	if e.IsOrganizer {
-		return true
-	}
-	return e.Organizer != nil && owner != "" && strings.EqualFold(e.Organizer.Email, owner)
-}
-
-// localOwnerIsOrganizer reports whether the account owner organizes a locally
-// parsed event: no ORGANIZER in the file (the owner creates, so Graph will
-// make them the organizer) or an ORGANIZER matching the owner. A foreign
-// ORGANIZER means the file was copied from someone else's meeting — durian
-// must not invite on their behalf.
-func localOwnerIsOrganizer(e Event, owner string) bool {
-	if e.Organizer == nil {
-		return true
-	}
-	return owner != "" && strings.EqualFold(e.Organizer.Email, owner)
-}
-
-// countRecipients counts the attendees other than the owner — the recipients
-// of an invitation/update/cancellation for this event.
-func countRecipients(attendees []Attendee, owner string) int {
-	n := 0
-	for _, a := range attendees {
-		if owner != "" && strings.EqualFold(a.Email, owner) {
-			continue
-		}
-		n++
-	}
-	return n
-}
-
-// Recurrence mirrors the Graph patternedRecurrence resource: how a series
-// repeats (Pattern) and over which span (Range).
-type Recurrence struct {
-	Pattern RecurrencePattern `json:"pattern"`
-	Range   RecurrenceRange   `json:"range"`
-}
-
-// RecurrencePattern is the Graph recurrencePattern resource. Type is one of
-// daily, weekly, absoluteMonthly, relativeMonthly, absoluteYearly,
-// relativeYearly.
-type RecurrencePattern struct {
-	Type     string `json:"type"`
-	Interval int    `json:"interval"`
-	// DaysOfWeek holds lowercase day names ("monday", ...) for weekly and
-	// relative patterns.
-	DaysOfWeek []string `json:"daysOfWeek,omitempty"`
-	// DayOfMonth applies to absoluteMonthly/absoluteYearly patterns.
-	DayOfMonth int `json:"dayOfMonth,omitempty"`
-	// Month (1-12) applies to yearly patterns.
-	Month int `json:"month,omitempty"`
-	// Index is the week ordinal for relative patterns: first, second, third,
-	// fourth or last.
-	Index          string `json:"index,omitempty"`
-	FirstDayOfWeek string `json:"firstDayOfWeek,omitempty"`
-}
-
-// RecurrenceRange is the Graph recurrenceRange resource. Type is one of
-// noEnd, endDate, numbered. Dates are "YYYY-MM-DD" strings as Graph sends
-// them.
-type RecurrenceRange struct {
-	Type                string `json:"type"`
-	StartDate           string `json:"startDate,omitempty"`
-	EndDate             string `json:"endDate,omitempty"`
-	NumberOfOccurrences int    `json:"numberOfOccurrences,omitempty"`
-}
+// The neutral event model (Event, Attendee, Person, OwnerResp, Recurrence and
+// the content hashes) lives in the provider-neutral calendar package; this
+// package re-exports it through aliases (see aliases.go) so existing callers
+// keep compiling unchanged.
 
 // graphDateTime is Graph's {dateTime, timeZone} pair. With the preferUTC
 // header, dateTime is already UTC.
@@ -730,7 +491,7 @@ func eventFromGraph(ge graphEvent) (Event, bool) {
 		End:          end,
 		AllDay:       ge.IsAllDay,
 		LastModified: parseGraphTimestamp(ge.LastModifiedDateTime),
-		ChangeKey:    ge.ChangeKey,
+		ETag:         ge.ChangeKey,
 		Type:         ge.Type,
 		Recurrence:   ge.Recurrence,
 
@@ -783,6 +544,12 @@ func (c *Client) FetchEvents(ctx context.Context, calendarID string, from, to ti
 	return events, nil
 }
 
+// FetchInstances implements the provider seam: the windowed, series-expanded
+// calendarView fetch (see FetchEvents).
+func (c *Client) FetchInstances(ctx context.Context, calendarID string, from, to time.Time) ([]Event, error) {
+	return c.FetchEvents(ctx, calendarID, from, to)
+}
+
 // FetchMasterEvents returns all master events of the calendar via the Graph
 // /events endpoint: singleInstance events and seriesMaster events carrying
 // their Recurrence definition. Expanded "occurrence" and "exception" entries
@@ -825,7 +592,9 @@ func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]Ev
 // create/update, because Graph normalizes events server-side right after a
 // write, so the settled read-back — not the POST/PATCH response — is the
 // canonical content the eventContentHash baseline must be computed from.
-func (c *Client) GetEvent(ctx context.Context, eventID string) (Event, error) {
+// calendarID is unused: Graph event ids are mailbox-global.
+func (c *Client) GetEvent(ctx context.Context, calendarID, eventID string) (Event, error) {
+	_ = calendarID
 	reqURL := fmt.Sprintf("%s/me/events/%s?$select=%s",
 		c.baseURL, url.PathEscape(eventID), masterEventSelect)
 
@@ -837,8 +606,20 @@ func (c *Client) GetEvent(ctx context.Context, eventID string) (Event, error) {
 	if !ok {
 		return Event{}, fmt.Errorf("failed to parse event %s", eventID)
 	}
-	slog.Debug("Fetched event", "module", "GRAPHCAL", "id", ev.ID, "changeKey", ev.ChangeKey)
+	slog.Debug("Fetched event", "module", "GRAPHCAL", "id", ev.ID, "changeKey", ev.ETag)
 	return ev, nil
+}
+
+// ParseEventJSON decodes one raw Graph event resource into the neutral Event,
+// exactly like the fetch paths do (ok=false on undecodable/unparseable
+// input). The sync-engine tests use it to compute the expected content-hash
+// baselines for the fake Graph payloads they serve.
+func ParseEventJSON(data []byte) (Event, bool) {
+	var ge graphEvent
+	if err := json.Unmarshal(data, &ge); err != nil {
+		return Event{}, false
+	}
+	return eventFromGraph(ge)
 }
 
 // parseGraphDateTime parses a Graph event dateTime like

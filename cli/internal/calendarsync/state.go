@@ -1,9 +1,9 @@
 // Persistent status for the two-way calendar sync (vdirsyncer model): per
-// calendar, per item UID, the last-synced identity of both sides — the Graph
-// event id, the content hash of the remote event and the hash of the local
-// .ics file. Comparing the current state of each side against this status is
-// what lets the sync engine distinguish "changed here" from "changed there"
-// from "deleted".
+// calendar, per item UID, the last-synced identity of both sides — the
+// provider's event id, the content hash of the remote event and the hash of
+// the local .ics file. Comparing the current state of each side against this
+// status is what lets the sync engine distinguish "changed here" from
+// "changed there" from "deleted".
 //
 // FileStateStore mirrors syncengine.FileCursorStore / imap.StateManager file
 // handling: one JSON file per account under the XDG cache dir, an exclusive
@@ -11,7 +11,7 @@
 // corrupted files backed up and treated as empty (a lost status only costs a
 // re-convergence run, never data).
 
-package graphcalendar
+package calendarsync
 
 import (
 	"encoding/json"
@@ -26,15 +26,15 @@ import (
 // ItemStatus is the last-synced snapshot of one calendar item (keyed by its
 // iCalendar UID) on both sides.
 type ItemStatus struct {
-	// GraphID is the Graph event id, needed to address the remote event for
-	// future uploads/deletes.
-	GraphID string `json:"graph_id"`
+	// RemoteID is the provider's event id, needed to address the remote event
+	// for future uploads/deletes. The JSON tag keeps the historical "graph_id"
+	// name so existing state files stay valid.
+	RemoteID string `json:"graph_id"`
 	// RemoteHash is the eventContentHash of the remote event at last sync; a
-	// differing current content hash means the remote side changed. The Graph
-	// changeKey is deliberately NOT used here: it is not a stable etag — Graph
-	// rewrites it between a write and subsequent reads without any content
-	// change, which would misread every freshly written pair as "remote
-	// changed".
+	// differing current content hash means the remote side changed. The remote
+	// etag is deliberately NOT used here: it is not stable — Graph rewrites it
+	// between a write and subsequent reads without any content change, which
+	// would misread every freshly written pair as "remote changed".
 	RemoteHash string `json:"remote_hash"`
 	// LocalHash is the SHA-256 hex digest of the local .ics file bytes at last
 	// sync; a differing current hash means the local side changed.
@@ -42,7 +42,7 @@ type ItemStatus struct {
 	// OwnerResponse is the owner's RSVP at last sync — the baseline B of the
 	// ActionRsvp three-way diff (local L vs baseline B vs remote R). The zero
 	// value ("", None) doubles as the pre-Stage-2 default, which the
-	// idempotency guard re-baselines without any Graph call.
+	// idempotency guard re-baselines without any remote call.
 	OwnerResponse OwnerResp `json:"owner_response,omitempty"`
 	// AttendeeHash is the attendeeSetHash of the attendee set (emails+types,
 	// responses excluded) at last sync, so an attendee add/remove is detected
@@ -58,7 +58,7 @@ type CalendarStatus struct {
 }
 
 // SyncState is the whole per-account sync status: one CalendarStatus per
-// Graph calendar id.
+// remote calendar id.
 type SyncState struct {
 	Calendars map[string]CalendarStatus `json:"calendars"`
 }
@@ -125,7 +125,7 @@ func (f *FileStateStore) acquireLock() (*os.File, error) {
 		return lockFile, nil
 	}
 
-	slog.Debug("Calendar state lock busy, waiting", "module", "GRAPHCAL", "dir", f.dir)
+	slog.Debug("Calendar state lock busy, waiting", "module", "CALSYNC", "dir", f.dir)
 	deadline := time.Now().Add(5 * time.Second)
 	delay := 250 * time.Millisecond
 	for time.Now().Before(deadline) {
@@ -188,10 +188,10 @@ func (f *FileStateStore) Load() (*SyncState, error) {
 	if err := json.Unmarshal(data, state); err != nil {
 		backupPath := fmt.Sprintf("%s.corrupted.%d", path, time.Now().Unix())
 		if renameErr := os.Rename(path, backupPath); renameErr != nil {
-			slog.Warn("Corrupted calendar state file, backup failed", "module", "GRAPHCAL",
+			slog.Warn("Corrupted calendar state file, backup failed", "module", "CALSYNC",
 				"path", path, "err", renameErr)
 		} else {
-			slog.Warn("Corrupted calendar state file backed up, starting fresh", "module", "GRAPHCAL",
+			slog.Warn("Corrupted calendar state file backed up, starting fresh", "module", "CALSYNC",
 				"backup", backupPath)
 		}
 		return newSyncState(), nil

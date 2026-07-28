@@ -1,12 +1,12 @@
 // Notification preview for the two-way calendar sync: before the CLI's
 // confirmation gate, every email message that applying the plans would make
-// Graph send is enumerated — invitations (creates with attendees), updates
+// the provider send is enumerated — invitations (creates with attendees), updates
 // (organizer edits of meetings), cancellations (organizer deletes) and RSVP
 // responses (owner replies and decline-routed deletes). The classification
 // here mirrors exactly what Apply does (both read the same precomputed
 // Action fields), so the preview and the execution can never disagree.
 
-package graphcalendar
+package calendarsync
 
 // Notification categories.
 const (
@@ -17,7 +17,7 @@ const (
 )
 
 // Notification describes one email message that applying a plan will make
-// Graph send: its category, the affected event, the calendar, and how many
+// the provider send: its category, the affected event, the calendar, and how many
 // recipients it reaches (all attendees for invite/update/cancel; the
 // organizer — one recipient — for an RSVP).
 type Notification struct {
@@ -27,8 +27,8 @@ type Notification struct {
 	Recipients int
 }
 
-// NotifiesRecipients reports whether applying this action makes Graph send
-// email, and to how many recipients. Conflicts answer for the worst case (a
+// NotifiesRecipients reports whether applying this action makes the provider
+// send email, and to how many recipients. Conflicts answer for the worst case (a
 // local-wins resolution) and RSVPs assume the response is sent; use
 // PlanNotifications for the policy- and flag-aware preview.
 func (a Action) NotifiesRecipients() (bool, int) {
@@ -61,7 +61,7 @@ func notificationFor(a Action, policy string, silentRSVP bool) (Notification, bo
 	kind := a.Kind
 	if kind == ActionConflict {
 		if conflictWinner(a, policy) != "local" {
-			// Remote wins: only local files change, no Graph write.
+			// Remote wins: only local files change, no remote write.
 			return Notification{}, false
 		}
 		switch {

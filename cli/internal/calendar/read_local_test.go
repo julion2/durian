@@ -1,4 +1,4 @@
-package graphcalendar
+package calendar
 
 import (
 	"os"
@@ -20,7 +20,7 @@ func mustTime(t *testing.T, s string) time.Time {
 // events serialized via EventToICal.
 func writeLocalCalendar(t *testing.T, accountDir, name string, events ...Event) string {
 	t.Helper()
-	calDir := filepath.Join(accountDir, sanitizeName(name))
+	calDir := filepath.Join(accountDir, SanitizeName(name))
 	if err := os.MkdirAll(calDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func writeLocalCalendar(t *testing.T, accountDir, name string, events ...Event) 
 		if err != nil {
 			t.Fatalf("EventToICal: %v", err)
 		}
-		if err := os.WriteFile(filepath.Join(calDir, sanitizeName(e.ICalUID)+".ics"), data, 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(calDir, SanitizeName(e.ICalUID)+".ics"), data, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -1,22 +1,24 @@
-// Graph event write operations for the two-way sync upload direction:
-// EventToGraphBody builds the Graph event JSON from a locally parsed Event
-// (the inverse of eventFromGraph), and CreateEvent / UpdateEvent /
-// DeleteEvent / RespondToEvent perform the POST / PATCH / DELETE calls
-// through doRequest, so bearer auth and throttle retries apply exactly like
-// on the read paths.
+// Graph event write operations — the provider side of the sync engine's
+// upload direction (calendarsync.CalendarProvider): EventToGraphBody builds
+// the Graph event JSON from a locally parsed Event (the inverse of
+// eventFromGraph), and CreateEvent / UpdateEvent / DeleteEvent /
+// RespondToEvent perform the POST / PATCH / DELETE calls through doRequest,
+// so bearer auth and throttle retries apply exactly like on the read paths.
 //
 // iCalUId caveat: Graph assigns its own immutable iCalUId on POST and ignores
 // any client-supplied UID, so a created event's UID never matches the UID of
 // the local .ics that triggered the create. The sync engine handles this by
-// rewriting the local file from the created event (see applyUploadCreate in
-// twosync.go).
+// rewriting the local file from the created event (see createFromLocal in
+// calendarsync).
 //
 // Robustness rails baked in here:
-//   - UpdateEvent and DeleteEvent send the last-read changeKey as an If-Match
-//     header, so a concurrently edited event yields a 412 instead of being
-//     clobbered (the sync engine skips that action and re-plans next run).
-//   - Attendees are only included when the caller explicitly asks for them
-//     (role-gated in twosync.go: only for meetings the owner organizes) and
+//   - UpdateEvent and DeleteEvent send the engine-planned etag as an If-Match
+//     header; a Graph 412 is wrapped as calendarsync.ErrPrecondition so the
+//     engine skips that action instead of clobbering, and a 404/410 is
+//     wrapped as calendarsync.ErrNotFound so the engine can fold "already
+//     gone" into success.
+//   - Attendees are only serialized when the engine explicitly asks for them
+//     (role-gated in the engine: only for meetings the owner organizes) and
 //     the organizer is NEVER uploaded — Graph derives it from the mailbox,
 //     and durian must not invite on someone else's behalf.
 
@@ -29,11 +31,31 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+
+	"github.com/julion2/durian/cli/internal/calendarsync"
 )
 
 // graphWriteDateFormat is the zone-less dateTime layout Graph expects in
 // start/end bodies (the timeZone field carries the zone).
 const graphWriteDateFormat = "2006-01-02T15:04:05"
+
+// classifyWriteError wraps a Graph write failure in the neutral sentinel the
+// sync engine reacts to: 412 -> calendarsync.ErrPrecondition (If-Match guard
+// tripped), 404/410 -> calendarsync.ErrNotFound (event already gone). Other
+// errors pass through unchanged; the original error stays in the chain.
+func classifyWriteError(err error) error {
+	var se *statusError
+	if !errors.As(err, &se) {
+		return err
+	}
+	switch se.status {
+	case http.StatusPreconditionFailed:
+		return fmt.Errorf("%w: %w", calendarsync.ErrPrecondition, err)
+	case http.StatusNotFound, http.StatusGone:
+		return fmt.Errorf("%w: %w", calendarsync.ErrNotFound, err)
+	}
+	return err
+}
 
 // EventToGraphBody builds the Graph event resource JSON for a create (POST)
 // or update (PATCH) from a parsed local Event. Start/end are written as
@@ -46,12 +68,12 @@ const graphWriteDateFormat = "2006-01-02T15:04:05"
 // series, or null so a PATCH clears the recurrence when the local file
 // dropped its RRULE.
 //
-// includeAttendees adds the attendee list (see attendeesToGraph); callers
-// must only set it for meetings the account owner organizes, because a
+// includeAttendees adds the attendee list (see attendeesToGraph); the engine
+// only sets it for meetings the account owner organizes, because a
 // create/update carrying attendees makes Graph send invitation/update emails.
 // organizer, responseStatus, isCancelled and the online-meeting fields are
 // never emitted here (RSVPs go through RespondToEvent; Teams meetings are
-// requested by the create path via extra keys, see createFromLocal).
+// requested by CreateEvent via extra keys when the engine asks for one).
 func EventToGraphBody(e Event, includeAttendees bool) map[string]any {
 	var startDT, endDT string
 	if e.AllDay {
@@ -105,52 +127,76 @@ func attendeesToGraph(attendees []Attendee) []map[string]any {
 
 // CreateEvent POSTs a new event into the calendar and returns the created
 // event as Graph rendered it — including the server-assigned id, iCalUId and
-// changeKey the sync status needs. Callers should include a client-generated
-// transactionId in the body so a retried POST cannot create a duplicate event
-// (and a second invitation wave); see createFromLocal.
-func (c *Client) CreateEvent(ctx context.Context, calendarID string, body any) (Event, error) {
+// changeKey the sync status needs. The body is serialized per opts:
+// opts.IncludeAttendees adds the attendee list (invitations go out),
+// opts.RequestOnlineMeeting adds the Teams online-meeting keys, and
+// opts.IdempotencyKey travels as the Graph transactionId so a retried POST
+// cannot create a duplicate event (or a second invitation wave).
+func (c *Client) CreateEvent(ctx context.Context, calendarID string, ev Event, opts calendarsync.CreateOptions) (Event, error) {
+	body := EventToGraphBody(ev, opts.IncludeAttendees)
+	if opts.RequestOnlineMeeting {
+		body["isOnlineMeeting"] = true
+		body["onlineMeetingProvider"] = "teamsForBusiness"
+	}
+	if opts.IdempotencyKey != "" {
+		body["transactionId"] = opts.IdempotencyKey
+	}
 	reqURL := fmt.Sprintf("%s/me/calendars/%s/events", c.baseURL, url.PathEscape(calendarID))
 
 	var ge graphEvent
 	if err := c.doJSONBody(ctx, http.MethodPost, reqURL, map[string]string{"Prefer": preferMaster}, body, &ge); err != nil {
-		return Event{}, fmt.Errorf("failed to create event in calendar %s: %w", calendarID, err)
+		return Event{}, fmt.Errorf("failed to create event in calendar %s: %w", calendarID, classifyWriteError(err))
 	}
-	ev, ok := eventFromGraph(ge)
+	created, ok := eventFromGraph(ge)
 	if !ok {
 		return Event{}, fmt.Errorf("failed to parse created event %s (calendar %s)", ge.ID, calendarID)
 	}
 	slog.Debug("Created remote event", "module", "GRAPHCAL",
-		"calendar", calendarID, "id", ev.ID, "uid", ev.ICalUID)
-	return ev, nil
+		"calendar", calendarID, "id", created.ID, "uid", created.ICalUID)
+	return created, nil
 }
 
-// UpdateEvent PATCHes an existing event and returns the new changeKey (the
-// remote etag after the update). etag, when non-empty, is sent as an If-Match
-// header so a remote edit that happened after the last read fails with 412
-// instead of being overwritten.
-func (c *Client) UpdateEvent(ctx context.Context, eventID, etag string, body any) (string, error) {
+// UpdateEvent PATCHes an existing event per spec. spec.ETag, when non-empty,
+// is sent as an If-Match header so a remote edit that happened after the last
+// read fails with calendarsync.ErrPrecondition instead of being overwritten.
+// With spec.AttendeesOnly the PATCH body carries just the attendee list, so
+// Graph notifies only the added/removed attendees; otherwise the full body is
+// sent (attendees included only when spec.IncludeAttendees). calendarID is
+// unused: Graph event ids are mailbox-global.
+func (c *Client) UpdateEvent(ctx context.Context, calendarID, eventID string, spec calendarsync.UpdateSpec) error {
+	_ = calendarID
+	var body map[string]any
+	if spec.AttendeesOnly {
+		body = map[string]any{"attendees": attendeesToGraph(spec.Event.Attendees)}
+	} else {
+		body = EventToGraphBody(spec.Event, spec.IncludeAttendees)
+	}
+
 	reqURL := c.baseURL + "/me/events/" + url.PathEscape(eventID)
 	headers := map[string]string{"Prefer": preferMaster}
-	if etag != "" {
-		headers["If-Match"] = etag
+	if spec.ETag != "" {
+		headers["If-Match"] = spec.ETag
 	}
 
 	var resp struct {
 		ChangeKey string `json:"changeKey"`
 	}
 	if err := c.doJSONBody(ctx, http.MethodPatch, reqURL, headers, body, &resp); err != nil {
-		return "", fmt.Errorf("failed to update event %s: %w", eventID, err)
+		return fmt.Errorf("failed to update event %s: %w", eventID, classifyWriteError(err))
 	}
 	slog.Debug("Updated remote event", "module", "GRAPHCAL",
 		"id", eventID, "changeKey", resp.ChangeKey)
-	return resp.ChangeKey, nil
+	return nil
 }
 
-// DeleteEvent DELETEs an event. A 404 means the event is already gone and is
-// treated as success — the goal (event absent remotely) is reached either
-// way. etag, when non-empty, is sent as an If-Match header (see UpdateEvent);
-// a 412 surfaces to the caller, which skips the action and re-plans.
-func (c *Client) DeleteEvent(ctx context.Context, eventID, etag string) error {
+// DeleteEvent DELETEs an event. A 404/410 surfaces as
+// calendarsync.ErrNotFound — the engine folds it into success, since the goal
+// (event absent remotely) is reached either way. etag, when non-empty, is
+// sent as an If-Match header (see UpdateEvent); a 412 surfaces as
+// calendarsync.ErrPrecondition, which the engine skips and re-plans.
+// calendarID is unused: Graph event ids are mailbox-global.
+func (c *Client) DeleteEvent(ctx context.Context, calendarID, eventID, etag string) error {
+	_ = calendarID
 	reqURL := c.baseURL + "/me/events/" + url.PathEscape(eventID)
 	headers := map[string]string{"Prefer": preferMaster}
 	if etag != "" {
@@ -158,12 +204,7 @@ func (c *Client) DeleteEvent(ctx context.Context, eventID, etag string) error {
 	}
 
 	if err := c.doRequest(ctx, http.MethodDelete, reqURL, headers, nil, nil); err != nil {
-		var se *statusError
-		if errors.As(err, &se) && se.status == http.StatusNotFound {
-			slog.Info("Remote event already gone on delete", "module", "GRAPHCAL", "id", eventID)
-			return nil
-		}
-		return fmt.Errorf("failed to delete event %s: %w", eventID, err)
+		return fmt.Errorf("failed to delete event %s: %w", eventID, classifyWriteError(err))
 	}
 	slog.Debug("Deleted remote event", "module", "GRAPHCAL", "id", eventID)
 	return nil
@@ -175,8 +216,11 @@ func (c *Client) DeleteEvent(ctx context.Context, eventID, etag string) error {
 // in it. Graph answers 202 with an empty body. Responding with the same value
 // again is harmless (Graph records the same state), so a re-planned RSVP
 // after a partial failure cannot corrupt anything. resp must be Accepted,
-// Declined or Tentative — None and Organizer have no Graph action.
-func (c *Client) RespondToEvent(ctx context.Context, eventID string, resp OwnerResp, sendResponse bool, comment string) error {
+// Declined or Tentative — None and Organizer have no Graph action. A 404/410
+// surfaces as calendarsync.ErrNotFound. calendarID is unused: Graph event ids
+// are mailbox-global.
+func (c *Client) RespondToEvent(ctx context.Context, calendarID, eventID string, resp OwnerResp, sendResponse bool, comment string) error {
+	_ = calendarID
 	var verb string
 	switch resp {
 	case OwnerRespAccepted:
@@ -192,7 +236,7 @@ func (c *Client) RespondToEvent(ctx context.Context, eventID string, resp OwnerR
 
 	body := map[string]any{"comment": comment, "sendResponse": sendResponse}
 	if err := c.doJSONBody(ctx, http.MethodPost, reqURL, nil, body, nil); err != nil {
-		return fmt.Errorf("failed to %s event %s: %w", verb, eventID, err)
+		return fmt.Errorf("failed to %s event %s: %w", verb, eventID, classifyWriteError(err))
 	}
 	slog.Info("Sent RSVP", "module", "GRAPHCAL", "id", eventID, "verb", verb, "sendResponse", sendResponse)
 	return nil
