@@ -37,6 +37,25 @@ extension Color {
     }
 }
 
+// MARK: - Calendar Event Tints
+
+extension Color {
+    /// A soft wash of a calendar color for a timed event pill's fill. Meant
+    /// to be layered over an opaque surface (Color.Detail.cardBackground):
+    /// the low opacity keeps the hue recognizable over both the light and
+    /// dark surface while titles stay in the primary text color.
+    func eventTint(selected: Bool = false) -> Color {
+        opacity(selected ? 0.32 : 0.16)
+    }
+
+    /// The near-solid fill an all-day chip uses — strong enough to carry
+    /// white text, dialed back a step when unselected so a selected chip
+    /// reads a notch stronger.
+    func eventSolid(selected: Bool = false) -> Color {
+        opacity(selected ? 1.0 : 0.9)
+    }
+}
+
 // MARK: - Design System Colors (from Figma)
 
 extension Color {

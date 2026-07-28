@@ -2,8 +2,10 @@
 //  CalendarEventRow.swift
 //  Durian
 //
-//  One agenda row: time, subject, a colored dot for the owning calendar, and
-//  dim markers (online / RSVP). Selection highlight matches the mail list.
+//  One agenda row: the shared event pill in its compact form — calendar
+//  color as accent bar + soft tint, subject on the left, right-aligned
+//  time — with a colored dot carrying the RSVP state (dashed ring for
+//  tentative, dimmed for declined). Selection is the pill's ring.
 //
 
 import SwiftUI
@@ -13,7 +15,6 @@ struct CalendarEventRow: View {
     let isSelected: Bool
 
     @ObservedObject private var manager = CalendarManager.shared
-    @ObservedObject private var profileManager = ProfileManager.shared
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -25,40 +26,49 @@ struct CalendarEventRow: View {
                 Text(event.displaySubject)
                     .font(.headline)
                     .lineLimit(1)
-                    .strikethrough(isDeclined, color: isSelected ? .white : .secondary)
+                    .strikethrough(isDeclined, color: .secondary)
                     .foregroundStyle(subjectColor)
                     .opacity(isTentative ? 0.8 : 1.0)
 
-                HStack(spacing: 6) {
-                    Text(timeText)
-                        .font(.caption)
-                        .foregroundStyle(isSelected ? Color.white.opacity(0.85) : .secondary)
-                    if let location = event.location, !location.isEmpty {
-                        Text("· \(location)")
-                            .font(.caption)
-                            .lineLimit(1)
-                            .foregroundStyle(isSelected ? Color.white.opacity(0.85) : .secondary)
-                    }
-                    ForEach(markers, id: \.self) { marker in
-                        Text(marker)
-                            .font(.caption2)
-                            .foregroundStyle(isSelected ? Color.white.opacity(0.75) : Color.secondary)
+                if hasSubline {
+                    HStack(spacing: 6) {
+                        if let location = event.location, !location.isEmpty {
+                            Text(location)
+                                .font(.caption)
+                                .lineLimit(1)
+                                .foregroundStyle(Color.Detail.textSecondary)
+                        }
+                        ForEach(markers, id: \.self) { marker in
+                            Text(marker)
+                                .font(.caption2)
+                                .foregroundStyle(Color.Detail.textTertiary)
+                        }
                     }
                 }
             }
-            Spacer(minLength: 0)
+
+            Spacer(minLength: 8)
+
+            Text(timeText)
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(Color.Detail.textSecondary)
+                .padding(.top, 3)
         }
         .padding(.vertical, 6)
         .padding(.horizontal, 12)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(isSelected ? profileManager.resolvedAccentColor : Color.clear)
-        )
+        .eventPill(calendarColor, variant: .timed, selected: isSelected, cornerRadius: 6)
         .padding(.horizontal, 8)
+        // The agenda list stacks rows with zero spacing; without this the
+        // tinted pills would touch and read as one slab.
+        .padding(.vertical, 1.5)
     }
 
     private var isTentative: Bool { event.myResponse == "tentativelyAccepted" }
     private var isDeclined: Bool { event.myResponse == "declined" }
+    private var hasSubline: Bool {
+        !(event.location ?? "").isEmpty || !markers.isEmpty
+    }
 
     /// A dashed ring for a tentative RSVP, a dimmed dot for a declined one,
     /// otherwise a filled dot in the calendar's color.
@@ -72,9 +82,7 @@ struct CalendarEventRow: View {
     }
 
     private var subjectColor: Color {
-        if isSelected { return .white }
-        if isDeclined { return .secondary }
-        return Color.Detail.textPrimary
+        isDeclined ? .secondary : Color.Detail.textPrimary
     }
 
     private var calendarColor: Color {

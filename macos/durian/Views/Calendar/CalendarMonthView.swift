@@ -3,8 +3,9 @@
 //  Durian
 //
 //  A classic month grid: 6 weeks × 7 days, each cell showing the day number and
-//  up to three colored event chips. Tapping a chip selects the event; tapping
-//  an empty part of a day drills into that day's agenda.
+//  up to three events in the shared pill style (EventPill.swift). Tapping a
+//  pill selects the event; tapping an empty part of a day drills into that
+//  day's agenda.
 //
 
 import SwiftUI
@@ -16,7 +17,7 @@ struct CalendarMonthView: View {
     var body: some View {
         VStack(spacing: 0) {
             weekdayHeader
-            Divider()
+            line(width: nil, height: 0.5)
             GeometryReader { geo in
                 let rows = weeks
                 let rowHeight = geo.size.height / CGFloat(max(rows.count, 1))
@@ -37,36 +38,42 @@ struct CalendarMonthView: View {
         HStack(spacing: 0) {
             ForEach(weekdaySymbols, id: \.self) { symbol in
                 Text(symbol)
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.caption2).fontWeight(.semibold)
+                    .foregroundStyle(Color.Detail.textSecondary)
                     .frame(maxWidth: .infinity)
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
     }
 
     private func dayCell(_ day: Date) -> some View {
         let inMonth = calendar.isDate(day, equalTo: manager.anchorDate, toGranularity: .month)
-        let isToday = calendar.isDateInToday(day)
         let dayEvents = eventsByDay[calendar.startOfDay(for: day)] ?? []
-        return VStack(alignment: .leading, spacing: 2) {
-            Text("\(calendar.component(.day, from: day))")
-                .font(.caption)
-                .fontWeight(isToday ? .bold : .regular)
-                .foregroundStyle(dayNumberColor(inMonth: inMonth, isToday: isToday))
-                .frame(maxWidth: .infinity, alignment: .trailing)
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
+                DayNumberBadge(date: day)
+                if calendar.component(.day, from: day) == 1 {
+                    monthBoundaryLabel(day)
+                }
+                Spacer(minLength: 0)
+            }
 
             ForEach(dayEvents.prefix(3)) { event in
                 monthChip(event)
             }
             if dayEvents.count > 3 {
                 Text("+\(dayEvents.count - 3) more")
-                    .font(.system(size: 9)).foregroundStyle(.secondary)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Color.Detail.textTertiary)
+                    .padding(.leading, 4)
             }
             Spacer(minLength: 0)
         }
         .padding(4)
+        // Days spilling in from the neighbouring months stay visible but
+        // clearly secondary.
+        .opacity(inMonth ? 1 : 0.45)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(isToday ? Color.accentColor.opacity(0.08) : Color.clear)
         .overlay(alignment: .bottom) { line(width: nil, height: 0.5) }
         .overlay(alignment: .trailing) { line(width: 0.5, height: nil) }
         .contentShape(Rectangle())
@@ -78,25 +85,54 @@ struct CalendarMonthView: View {
 
     private func monthChip(_ event: CalendarEvent) -> some View {
         let selected = manager.selectedEventID == event.id
-        return HStack(spacing: 3) {
-            Circle().fill(color(for: event)).frame(width: 5, height: 5)
-            Text(event.displaySubject)
-                .font(.system(size: 10)).lineLimit(1)
-                .foregroundStyle(Color.Detail.textBody)
+        let variant: EventPillChrome.Variant = event.allDay ? .allDay : .timed
+        // Show the start time right-aligned when the cell is wide enough for
+        // the full title plus the time; otherwise fall back to title only.
+        return ViewThatFits(in: .horizontal) {
+            chipLabel(event, variant: variant, withTime: !event.allDay)
+            chipLabel(event, variant: variant, withTime: false)
         }
-        .padding(.horizontal, 3).padding(.vertical, 1)
+        // The timed variant draws a 3pt accent bar on the leading edge; pad
+        // past it so the title doesn't touch the bar.
+        .padding(.leading, variant == .timed ? 7 : 5)
+        .padding(.trailing, 5)
+        .padding(.vertical, 2)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(selected ? Color.primary.opacity(0.14) : Color.clear, in: RoundedRectangle(cornerRadius: 3))
+        .eventPill(color(for: event), variant: variant, selected: selected, cornerRadius: 4)
         .contentShape(Rectangle())
         .onTapGesture { manager.selectedEventID = event.id }
     }
 
+    @ViewBuilder
+    private func chipLabel(_ event: CalendarEvent, variant: EventPillChrome.Variant,
+                           withTime: Bool) -> some View {
+        if withTime {
+            HStack(spacing: 4) {
+                Text(event.displaySubject)
+                    .font(.system(size: 10, weight: .medium)).lineLimit(1)
+                    .fixedSize()
+                Spacer(minLength: 4)
+                Text(Self.timeFormatter.string(from: event.start))
+                    .font(.system(size: 9))
+                    .foregroundStyle(Color.Detail.textSecondary)
+                    .fixedSize()
+            }
+        } else {
+            Text(event.displaySubject)
+                .font(.system(size: 10, weight: .medium)).lineLimit(1)
+        }
+    }
+
     // MARK: - Styling helpers
 
-    private func dayNumberColor(inMonth: Bool, isToday: Bool) -> Color {
-        if !inMonth { return Color.secondary.opacity(0.5) }
-        if isToday { return Color.accentColor }
-        return Color.Detail.textPrimary
+    /// A compact inverted pill naming the month, shown on its first day so
+    /// month boundaries stay readable inside the continuous six-week grid.
+    private func monthBoundaryLabel(_ day: Date) -> some View {
+        Text(Self.monthAbbrevFormatter.string(from: day))
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(Color.Detail.cardBackground)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(Color.Detail.textPrimary))
     }
 
     private func line(width: CGFloat?, height: CGFloat?) -> some View {
@@ -132,4 +168,16 @@ struct CalendarMonthView: View {
         let first = calendar.firstWeekday - 1
         return Array(symbols[first...] + symbols[..<first])
     }
+
+    // MARK: - Formatters
+
+    /// Fixed 24h "HH:mm", matching the week grid: a locale AM/PM suffix would
+    /// eat most of a narrow month cell.
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
+    }()
+
+    private static let monthAbbrevFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMM"; return f
+    }()
 }

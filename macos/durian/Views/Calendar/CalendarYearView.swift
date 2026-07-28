@@ -28,14 +28,18 @@ struct CalendarYearView: View {
 
     private func miniMonth(_ monthStart: Date) -> some View {
         let days = gridDays(monthStart)
+        let isCurrentMonth = calendar.isDate(monthStart, equalTo: Date(), toGranularity: .month)
         return VStack(spacing: 4) {
             Text(Self.monthFormatter.string(from: monthStart))
                 .font(.caption).fontWeight(.semibold)
+                .foregroundStyle(isCurrentMonth ? Color.accentColor : Color.Detail.textPrimary)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 1), count: 7), spacing: 2) {
                 ForEach(weekdayInitials.indices, id: \.self) { i in
-                    Text(weekdayInitials[i]).font(.system(size: 8)).foregroundStyle(.secondary)
+                    Text(weekdayInitials[i])
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundStyle(Color.Detail.textTertiary)
                 }
                 ForEach(days, id: \.self) { day in
                     dayCell(day, monthStart: monthStart)
@@ -43,7 +47,8 @@ struct CalendarYearView: View {
             }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.Detail.cardBackground))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.Detail.border, lineWidth: 0.5))
         .contentShape(Rectangle())
         .onTapGesture {
             manager.anchorDate = monthStart
@@ -57,10 +62,18 @@ struct CalendarYearView: View {
             let isToday = calendar.isDateInToday(day)
             let hasEvents = !(eventsByDay[calendar.startOfDay(for: day)] ?? []).isEmpty
             VStack(spacing: 1) {
+                // A miniature of the shared DayNumberBadge: a filled accent
+                // circle with contrasting text marks today.
                 Text("\(calendar.component(.day, from: day))")
                     .font(.system(size: 9))
-                    .fontWeight(isToday ? .bold : .regular)
-                    .foregroundStyle(isToday ? Color.accentColor : Color.Detail.textPrimary)
+                    .fontWeight(isToday ? .semibold : .regular)
+                    .foregroundStyle(isToday ? Color.white : Color.Detail.textPrimary)
+                    .frame(width: 14, height: 14)
+                    .background {
+                        if isToday {
+                            Circle().fill(Color.accentColor)
+                        }
+                    }
                 Circle()
                     .fill(hasEvents ? Color.accentColor : Color.clear)
                     .frame(width: 3, height: 3)
