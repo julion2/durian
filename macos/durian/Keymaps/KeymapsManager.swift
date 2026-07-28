@@ -133,6 +133,7 @@ class KeymapsManager: ObservableObject {
             KeymapEntry(action: "calendar_edit", key: "i", context: "calendar"),
             KeymapEntry(action: "calendar_new", key: "n", context: "calendar"),
             KeymapEntry(action: "calendar_delete", key: "dd", sequence: true, context: "calendar"),
+            KeymapEntry(action: "calendar_toggle_sidebar", key: "s", context: "calendar"),
             KeymapEntry(action: "close_detail", key: "q", context: "calendar"),
             KeymapEntry(action: "close_detail", key: "Escape", context: "calendar"),
         ]

@@ -156,6 +156,13 @@ swift_test(
 )
 
 swift_test(
+    name = "calendar_visibility_test",
+    size = "small",
+    srcs = ["tests/CalendarVisibilityTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
     name = "calendar_range_coverage_test",
     size = "small",
     srcs = ["tests/CalendarRangeCoverageTests.swift"],

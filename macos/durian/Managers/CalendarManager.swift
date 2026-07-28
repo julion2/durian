@@ -26,6 +26,12 @@ final class CalendarManager: ObservableObject {
     static let shared = CalendarManager()
 
     private init() {
+        // Restore the persisted sidebar state before the store sink exists.
+        // Direct assignments in init skip the didSet persistence observers,
+        // so loading never writes back.
+        hiddenCalendars = Self.loadHiddenCalendars()
+        sidebarVisible = UserDefaults.standard.bool(forKey: Self.sidebarVisibleKey)
+
         // Mirror the store's projection into the published `events` the views
         // read, limited to the current view window: the store deliberately
         // holds MORE than the view shows (prefetched neighbours, preserved
@@ -65,6 +71,30 @@ final class CalendarManager: ObservableObject {
     private var loadedAccounts: [String] = []
 
     @Published var calendars: [CalendarInfo] = []
+
+    /// Calendar names the user hid via the sidebar toggles. Persisted across
+    /// launches; the visible `events` projection excludes their events (the
+    /// store still holds them, so re-showing a calendar is instant).
+    @Published var hiddenCalendars: Set<String> = [] {
+        didSet {
+            guard hiddenCalendars != oldValue else { return }
+            Self.saveHiddenCalendars(hiddenCalendars)
+            // The store did not change, so the sink will not fire — re-filter
+            // explicitly and keep the selection on a still-visible event.
+            reproject()
+            revalidateSelection()
+        }
+    }
+
+    /// Whether the left calendar panel (mini month + calendar list) is shown.
+    /// Persisted; defaults to collapsed.
+    @Published var sidebarVisible: Bool = false {
+        didSet {
+            guard sidebarVisible != oldValue else { return }
+            UserDefaults.standard.set(sidebarVisible, forKey: Self.sidebarVisibleKey)
+        }
+    }
+
     @Published private(set) var events: [CalendarEvent] = []
     @Published var selectedEventID: EventID? {
         didSet {
@@ -198,16 +228,28 @@ final class CalendarManager: ObservableObject {
     }
 
     private func project(_ all: [CalendarEvent]) {
-        if let window = visibleWindow {
-            // Overlap, not start-containment: a multi-day event that starts
-            // before the window must still reach the week grid, which renders
-            // it clamped on each day it touches. Agenda/month/year bucket by
-            // start day, so such an event simply groups under its own
-            // (possibly pre-window) start day — per-day spanning there is
-            // deferred.
-            events = all.filter { CalendarEventStore.overlaps(window, start: $0.start, end: $0.end) }
-        } else {
-            events = all
+        events = Self.visibleEvents(all, window: visibleWindow, hidden: hiddenCalendars)
+    }
+
+    /// The single visibility filter behind the projection, extracted pure so
+    /// it is unit-testable: an event is visible when its calendar is not
+    /// hidden AND it overlaps the window (nil window = search mode, no
+    /// window bound). Overlap, not start-containment: a multi-day event that
+    /// starts before the window must still reach the week grid, which renders
+    /// it clamped on each day it touches. Agenda/month/year bucket by start
+    /// day, so such an event simply groups under its own (possibly
+    /// pre-window) start day — per-day spanning there is deferred.
+    nonisolated static func visibleEvents(_ events: [CalendarEvent], window: DateInterval?,
+                                          hidden: Set<String>) -> [CalendarEvent] {
+        events.filter { event in
+            // Visibility is scoped per (account, calendar), matching the
+            // hidden-set keys, so hiding "Work" in one account leaves another
+            // account's "Work" visible.
+            if hidden.contains(CalendarInfo.key(account: event.account, name: event.calendar)) {
+                return false
+            }
+            guard let window else { return true }
+            return CalendarEventStore.overlaps(window, start: event.start, end: event.end)
         }
     }
 
@@ -219,6 +261,44 @@ final class CalendarManager: ObservableObject {
         } else if selectedEventID == nil {
             selectedEventID = events.first?.id
         }
+    }
+
+    // MARK: - Sidebar & per-calendar visibility
+
+    func toggleSidebar() {
+        sidebarVisible.toggle()
+    }
+
+    /// Shows/hides a calendar's events; the didSet on `hiddenCalendars`
+    /// persists, re-projects and revalidates the selection.
+    func toggleCalendar(_ calendar: CalendarInfo) {
+        let key = calendar.visibilityKey
+        if hiddenCalendars.contains(key) {
+            hiddenCalendars.remove(key)
+        } else {
+            hiddenCalendars.insert(key)
+        }
+    }
+
+    func isCalendarVisible(_ calendar: CalendarInfo) -> Bool {
+        !hiddenCalendars.contains(calendar.visibilityKey)
+    }
+
+    // MARK: - Sidebar state persistence
+
+    private static let hiddenCalendarsKey = "durian.calendar.hiddenCalendars"
+    private static let sidebarVisibleKey = "durian.calendar.sidebarVisible"
+
+    /// Load/save split out with an injectable UserDefaults so the round-trip
+    /// is testable against a scratch suite.
+    nonisolated static func loadHiddenCalendars(from defaults: UserDefaults = .standard) -> Set<String> {
+        Set(defaults.stringArray(forKey: hiddenCalendarsKey) ?? [])
+    }
+
+    nonisolated static func saveHiddenCalendars(_ hidden: Set<String>,
+                                                to defaults: UserDefaults = .standard) {
+        // Sorted for a stable on-disk representation (sets have no order).
+        defaults.set(hidden.sorted(), forKey: hiddenCalendarsKey)
     }
 
     // MARK: - Navigation used by the menu / keymaps
@@ -495,6 +575,11 @@ final class CalendarManager: ObservableObject {
 
     private static func dedup(_ cals: [CalendarInfo]) -> [CalendarInfo] {
         var seen = Set<String>()
-        return cals.filter { seen.insert($0.name).inserted }.sorted { $0.name < $1.name }
+        // Dedup per (account, calendar): two accounts may each own a calendar
+        // of the same name, and both must survive. Ordered by account, then
+        // name, so the sidebar groups cleanly by account.
+        return cals
+            .filter { seen.insert($0.visibilityKey).inserted }
+            .sorted { ($0.account, $0.name) < ($1.account, $1.name) }
     }
 }

@@ -4,7 +4,8 @@
 //
 //  Vim-style bindings for the calendar. `gc` (from the mail list) opens the
 //  calendar; inside it, j/k move the event cursor, gg/G jump, [ / ] step the
-//  period, t goes to today, and q/Esc return to mail. Registered once from
+//  period, t goes to today, s toggles the sidebar, and q/Esc return to
+//  mail. Registered once from
 //  ContentView.onAppear alongside registerKeymapHandlers().
 //
 
@@ -41,6 +42,9 @@ extension ContentView {
         }
         keymapHandler.registerSimpleHandler(for: .calendarToday, context: .calendar) {
             CalendarManager.shared.goToToday()
+        }
+        keymapHandler.registerSimpleHandler(for: .calendarToggleSidebar, context: .calendar) {
+            CalendarManager.shared.toggleSidebar()
         }
 
         // Create / edit / delete (local-first writes).

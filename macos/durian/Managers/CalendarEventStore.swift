@@ -83,7 +83,7 @@ final class CalendarEventStore: ObservableObject {
     /// Half-open [start, end) containment, matching the API's fetch window —
     /// an event starting exactly at the window's end was not fetched, so it
     /// must not be reconciled away.
-    static func contains(_ window: DateInterval, _ date: Date) -> Bool {
+    nonisolated static func contains(_ window: DateInterval, _ date: Date) -> Bool {
         window.start <= date && date < window.end
     }
 
@@ -91,7 +91,7 @@ final class CalendarEventStore: ObservableObject {
     /// window.end). Used by the visible projection so a multi-day event that
     /// starts before the window still reaches the week grid. A zero-duration
     /// event counts when its start lies in the window, matching `contains`.
-    static func overlaps(_ window: DateInterval, start: Date, end: Date) -> Bool {
+    nonisolated static func overlaps(_ window: DateInterval, start: Date, end: Date) -> Bool {
         start < window.end && (end > window.start || start >= window.start)
     }
 

@@ -153,6 +153,11 @@ struct DurianApp: App {
                 }
                 .keyboardShortcut("c", modifiers: [.command, .option])
 
+                Button("Toggle Calendar Sidebar") {
+                    calendarManager.toggleSidebar()
+                }
+                .keyboardShortcut("s", modifiers: [.command, .option])
+
                 Divider()
 
                 ForEach(CalendarViewMode.allCases) { mode in

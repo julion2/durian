@@ -21,17 +21,23 @@ struct CalendarView: View {
         NavigationStack {
             GeometryReader { geo in
                 let sidebarWidth: CGFloat = 210
-                let rest = max(geo.size.width - sidebarWidth, 200)
+                // Collapsed: content + detail take the full width.
+                let rest = max(geo.size.width - (manager.sidebarVisible ? sidebarWidth : 0), 200)
                 // Agenda ≈ half/half; the grid views give the content ≈3/4.
                 let contentFraction: CGFloat = manager.viewMode == .agenda ? 0.55 : 0.74
                 HStack(spacing: 0) {
-                    sidebar.frame(width: sidebarWidth)
-                    Divider()
+                    if manager.sidebarVisible {
+                        sidebar
+                            .frame(width: sidebarWidth)
+                            .transition(.move(edge: .leading))
+                        Divider()
+                    }
                     mainColumn.frame(width: rest * contentFraction)
                     Divider()
                     detailPane.frame(maxWidth: .infinity)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .animation(.easeInOut(duration: 0.2), value: manager.sidebarVisible)
             }
             .navigationTitle("Calendar")
             .navigationSubtitle(manager.periodLabel)
@@ -58,13 +64,21 @@ struct CalendarView: View {
         }
     }
 
-    // MARK: - Sidebar (calendars)
+    // MARK: - Sidebar (mini month + calendars)
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
+            MiniMonthView()
+                .padding(.horizontal, 12)
+                .padding(.top, 12)
+
+            Divider()
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+
             Text("Calendars")
                 .font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
-                .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 6)
+                .padding(.horizontal, 16).padding(.bottom, 6)
 
             if manager.calendars.isEmpty {
                 Text("No calendars synced yet.")
@@ -73,22 +87,73 @@ struct CalendarView: View {
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(manager.calendars) { calendar in
-                            HStack(spacing: 8) {
-                                Circle().fill(calendar.color).frame(width: 9, height: 9)
-                                Text(calendar.name).font(.system(size: 13)).lineLimit(1)
-                                Spacer()
-                                Text("\(calendar.eventCount)")
-                                    .font(.caption).foregroundStyle(.secondary)
+                        ForEach(calendarsByAccount, id: \.account) { group in
+                            // Only label the group when more than one account is
+                            // present — a single account needs no header.
+                            if calendarsByAccount.count > 1 {
+                                Text(group.account)
+                                    .font(.system(size: 11)).fontWeight(.semibold)
+                                    .foregroundStyle(Color.Detail.textTertiary)
+                                    .lineLimit(1).truncationMode(.middle)
+                                    .padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 2)
                             }
-                            .padding(.horizontal, 12).padding(.vertical, 6)
-                            .padding(.horizontal, 8)
+                            ForEach(group.calendars) { calendar in
+                                calendarRow(calendar)
+                            }
                         }
                     }
                 }
             }
             Spacer()
         }
+    }
+
+    /// The sidebar calendars grouped by account, preserving the manager's
+    /// (account, name) ordering so groups render contiguously and sorted.
+    private var calendarsByAccount: [(account: String, calendars: [CalendarInfo])] {
+        var order: [String] = []
+        var groups: [String: [CalendarInfo]] = [:]
+        for calendar in manager.calendars {
+            if groups[calendar.account] == nil { order.append(calendar.account) }
+            groups[calendar.account, default: []].append(calendar)
+        }
+        return order.map { (account: $0, calendars: groups[$0] ?? []) }
+    }
+
+    /// One calendar in the sidebar list. The whole row toggles the
+    /// calendar's visibility; a hidden calendar renders dimmed with a
+    /// hollow swatch and a slashed eye.
+    private func calendarRow(_ calendar: CalendarInfo) -> some View {
+        let visible = manager.isCalendarVisible(calendar)
+        return Button {
+            manager.toggleCalendar(calendar)
+        } label: {
+            HStack(spacing: 8) {
+                Group {
+                    if visible {
+                        Circle().fill(calendar.color)
+                    } else {
+                        Circle().strokeBorder(calendar.color.opacity(0.6), lineWidth: 1.5)
+                    }
+                }
+                .frame(width: 9, height: 9)
+                Text(calendar.name)
+                    .font(.system(size: 13)).lineLimit(1)
+                    .foregroundStyle(visible ? Color.Detail.textPrimary : Color.Detail.textTertiary)
+                Spacer()
+                Text("\(calendar.eventCount)")
+                    .font(.caption)
+                    .foregroundStyle(visible ? Color.Detail.textSecondary : Color.Detail.textTertiary)
+                Image(systemName: visible ? "eye" : "eye.slash")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.Detail.textTertiary)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .padding(.horizontal, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(visible ? "Hide \(calendar.name)" : "Show \(calendar.name)")
     }
 
     // MARK: - Content column
@@ -111,6 +176,10 @@ struct CalendarView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            Button { manager.toggleSidebar() } label: { Image(systemName: "sidebar.leading") }
+                .help("Toggle calendar sidebar (s)")
+        }
         ToolbarItem(placement: .principal) {
             Picker("View", selection: Binding(
                 get: { manager.viewMode },

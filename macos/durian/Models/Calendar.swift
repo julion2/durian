@@ -12,13 +12,23 @@ import SwiftUI
 // MARK: - Calendar
 
 struct CalendarInfo: Identifiable, Hashable {
-    var id: String { name }
+    // Identity is account+name: two accounts can each have a calendar of the
+    // same name, and they must not collapse into one another.
+    var id: String { CalendarInfo.key(account: account, name: name) }
     let name: String
     let colorHex: String?
     let eventCount: Int
     /// The account this calendar belongs to (set by CalendarManager) — needed
-    /// to write events into it.
+    /// to write events into it and to scope its visibility.
     var account: String = ""
+
+    /// Stable per-(account, calendar) key used for identity and the
+    /// hidden-calendars set. The separator cannot appear in an email/name.
+    static func key(account: String, name: String) -> String {
+        account + "\n" + name
+    }
+
+    var visibilityKey: String { CalendarInfo.key(account: account, name: name) }
 
     /// The calendar's color, or a neutral gray when it has none.
     var color: Color {
