@@ -157,12 +157,41 @@ type Person struct {
 // registers as a content change. Owner RSVPs are handled by the dedicated
 // ActionRsvp three-way diff instead (see twosync.go).
 func EventContentHash(e Event, ownerEmail string) string {
+	return contentHash(e, ownerEmail, true)
+}
+
+// CoreContentHash is EventContentHash with the attendee RESPONSES excluded:
+// each attendee contributes only "email|type", so another attendee accepting
+// or declining does not move the hash, while every user-editable field —
+// subject, times, all-day flag, location, description, recurrence, the
+// attendee SET (adds/removes), organizer, online-meeting fields and
+// cancellation — still does. The owner's own attendee entry stays excluded
+// exactly like in EventContentHash.
+//
+// The two-way sync engine records it as the ItemStatus.CoreHash baseline and
+// diffs both sides against it for the CONFLICT decision: attendee responses
+// are orthogonal to the editable core, so a remote RSVP must refresh the
+// local rendering (EventContentHash moves -> download) without ever turning a
+// concurrent local core edit into a conflict.
+func CoreContentHash(e Event, ownerEmail string) string {
+	return contentHash(e, ownerEmail, false)
+}
+
+// contentHash is the shared deterministic serialization behind
+// EventContentHash and CoreContentHash; withResponses controls whether an
+// attendee entry carries the response ("email|type|response") or not
+// ("email|type").
+func contentHash(e Event, ownerEmail string, withResponses bool) string {
 	attendees := make([]string, 0, len(e.Attendees))
 	for _, a := range e.Attendees {
 		if ownerEmail != "" && strings.EqualFold(a.Email, ownerEmail) {
 			continue
 		}
-		attendees = append(attendees, a.Email+"|"+a.Type+"|"+a.Response)
+		entry := a.Email + "|" + a.Type
+		if withResponses {
+			entry += "|" + a.Response
+		}
+		attendees = append(attendees, entry)
 	}
 	sort.Strings(attendees)
 

@@ -182,6 +182,7 @@ var (
 	WriteFileAtomic = calendar.WriteFileAtomic
 
 	eventContentHash     = calendar.EventContentHash
+	coreContentHash      = calendar.CoreContentHash
 	recurrenceJSON       = calendar.RecurrenceJSON
 	attendeeSetHash      = calendar.AttendeeSetHash
 	ownerIsOrganizer     = calendar.OwnerIsOrganizer

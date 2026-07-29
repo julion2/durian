@@ -36,6 +36,15 @@ type ItemStatus struct {
 	// between a write and subsequent reads without any content change, which
 	// would misread every freshly written pair as "remote changed".
 	RemoteHash string `json:"remote_hash"`
+	// CoreHash is the CoreContentHash of the remote event at last sync — the
+	// EventContentHash with the attendee RESPONSES dropped. It is the baseline
+	// of the CONFLICT decision: only a side whose CORE moved counts as edited
+	// there, so a remote attendee RSVP (RemoteHash moves, CoreHash does not)
+	// refreshes the local rendering without turning a concurrent local core
+	// edit into a conflict. "" means unknown (state file written before
+	// CoreHash existed): such items keep the historical full-hash conflict
+	// behavior until their next rebaseline records one.
+	CoreHash string `json:"core_hash,omitempty"`
 	// LocalHash is the SHA-256 hex digest of the local .ics file bytes at last
 	// sync; a differing current hash means the local side changed.
 	LocalHash string `json:"local_hash"`

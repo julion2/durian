@@ -27,9 +27,19 @@
 //	not tracked, both present, differ   -> DownloadUpdate (remote wins on first
 //	  sight; the divergent local file is backed up to <file>.conflict-<unixts>
 //	  before being overwritten)
-//	tracked, only remote changed        -> DownloadUpdate
+//	tracked, only remote changed        -> DownloadUpdate (also when only
+//	  attendee RESPONSES changed remotely: the refresh keeps the local
+//	  PARTSTATs current)
 //	tracked, only local changed         -> UploadUpdate
-//	tracked, both changed               -> Conflict
+//	tracked, both changed               -> Conflict — EXCEPT when the local
+//	  side edited the CORE while the remote CORE is untouched (only attendee
+//	  responses churned there): that is an UploadUpdate whose read-back
+//	  baseline absorbs the fresh remote responses. "Core" is
+//	  calendar.CoreContentHash (attendee responses dropped) diffed against the
+//	  ItemStatus.CoreHash baseline; a legacy status without a CoreHash ("",
+//	  pre-upgrade state file) keeps the plain both-changed conflict test until
+//	  its next rebaseline records one, so upgrading alone never reclassifies
+//	  anything.
 //	tracked, remote deleted, local same -> PruneLocal
 //	tracked, local deleted, remote same -> DeleteRemote (routed: organizer
 //	  cancels via DeleteEvent, a mere attendee declines via RespondToEvent, a
@@ -508,6 +518,22 @@ func Plan(ctx context.Context, p CalendarProvider, cal Calendar, calDir string, 
 
 		remoteChanged := remoteHas && (!tracked || st.RemoteHash != eventContentHash(rev, owner))
 		localChanged := localHas && (!tracked || st.LocalHash != li.Hash)
+		// Core-change signals: like remoteChanged/localChanged, but diffed with
+		// CoreContentHash, which drops the attendee RESPONSES. They feed ONLY
+		// the conflict decision below; the full signals keep driving downloads
+		// (a remote RSVP still refreshes the local rendering) and uploads. Both
+		// require a recorded CoreHash baseline: a legacy status predates it
+		// ("" = unknown) and must NEVER read as core-changed — legacy items keep
+		// the historical full-hash behavior, and the first post-upgrade sync of
+		// an unchanged calendar stays a strict no-op, until a rebaseline writes
+		// the CoreHash. The full-change conjuncts make the guarantees explicit:
+		// a byte-identical local file or an unchanged remote can never register
+		// as core-edited (the local conjunct also shields against the lossy
+		// iCal re-parse of an untouched file).
+		remoteCoreChanged := remoteChanged && st.CoreHash != "" &&
+			st.CoreHash != coreContentHash(rev, owner)
+		localCoreChanged := localChanged && st.CoreHash != "" &&
+			st.CoreHash != coreContentHash(li.Event, owner)
 		remoteDeleted := tracked && !remoteHas
 		localDeleted := tracked && !localHas
 
@@ -577,12 +603,20 @@ func Plan(ctx context.Context, p CalendarProvider, cal Calendar, calDir string, 
 			// sub-matrix below instead of a notifying upload.
 			ownerEditOnly := localChanged && !remoteChanged &&
 				localEventMatchesRemote(li.Event, rev, owner)
+			// The one core-based reclassification: a remote change that left
+			// the CORE untouched (attendee responses churned, nothing else)
+			// must not turn a local core edit into a conflict — the local edit
+			// uploads instead, and the read-back baseline absorbs the fresh
+			// remote responses. Every other both-changed combination keeps the
+			// historical conflict classification: both cores edited is a real
+			// conflict, a legacy item (no CoreHash baseline) always is, and a
+			// local RESPONSE-only byte edit racing any remote change still
+			// conflicts rather than being silently overwritten by a download.
+			localCoreEditWins := localCoreChanged && !remoteCoreChanged
 			switch {
-			case remoteChanged && localChanged:
+			case remoteChanged && localChanged && !localCoreEditWins:
 				a.Kind = ActionConflict
-			case remoteChanged:
-				a.Kind = ActionDownloadUpdate
-			case localChanged && !ownerEditOnly:
+			case localChanged && !ownerEditOnly && (localCoreEditWins || !remoteChanged):
 				a.Kind = ActionUploadUpdate
 				// The remote-side count alone would miss attendees that exist
 				// only locally: adding the FIRST attendee(s) to a tracked
@@ -592,6 +626,8 @@ func Plan(ctx context.Context, p CalendarProvider, cal Calendar, calDir string, 
 				// UNION of both non-owner attendee sets — it feeds the
 				// notification preview and the Notifies predicate.
 				a.Recipients = unionRecipients(li.Event.Attendees, rev.Attendees, owner)
+			case remoteChanged:
+				a.Kind = ActionDownloadUpdate
 			default:
 				// Content unchanged on both sides: owner-RSVP sub-matrix.
 				if !planRsvp(&a, li.Event, rev, st, localChanged) {
@@ -914,6 +950,7 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 			status.Items[a.UID] = ItemStatus{
 				RemoteID:      a.Remote.ID,
 				RemoteHash:    eventContentHash(a.Remote, p.Owner()),
+				CoreHash:      coreContentHash(a.Remote, p.Owner()),
 				LocalHash:     a.LocalHash,
 				OwnerResponse: a.Remote.OwnerResponse,
 				AttendeeHash:  attendeeSetHash(a.Remote.Attendees),
@@ -1080,6 +1117,7 @@ func writeRemoteEvent(calDir, path, uid string, ev Event, status *CalendarStatus
 	status.Items[uid] = ItemStatus{
 		RemoteID:      ev.ID,
 		RemoteHash:    eventContentHash(ev, owner),
+		CoreHash:      coreContentHash(ev, owner),
 		LocalHash:     hashBytes(data),
 		OwnerResponse: ev.OwnerResponse,
 		AttendeeHash:  attendeeSetHash(ev.Attendees),
@@ -1246,6 +1284,7 @@ func patchFromLocal(ctx context.Context, p CalendarProvider, plan CalendarPlan, 
 		return fmt.Errorf("failed to update remote event for %s: %w", a.UID, err)
 	}
 	remoteHash := eventContentHash(a.LocalEvent, p.Owner())
+	coreHash := coreContentHash(a.LocalEvent, p.Owner())
 	ownerResp := a.Prior.OwnerResponse
 	attendeeHash := attendeeSetHash(a.LocalEvent.Attendees)
 	if settled, err := p.GetEvent(ctx, plan.Calendar.ID, a.RemoteID); err != nil {
@@ -1253,12 +1292,14 @@ func patchFromLocal(ctx context.Context, p CalendarProvider, plan CalendarPlan, 
 			"calendar", plan.Calendar.Name, "id", a.RemoteID, "err", err)
 	} else {
 		remoteHash = eventContentHash(settled, p.Owner())
+		coreHash = coreContentHash(settled, p.Owner())
 		ownerResp = settled.OwnerResponse
 		attendeeHash = attendeeSetHash(settled.Attendees)
 	}
 	status.Items[a.UID] = ItemStatus{
 		RemoteID:      a.RemoteID,
 		RemoteHash:    remoteHash,
+		CoreHash:      coreHash,
 		LocalHash:     a.LocalHash,
 		OwnerResponse: ownerResp,
 		AttendeeHash:  attendeeHash,

@@ -340,8 +340,11 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 	// Online-meeting join link, DISPLAY-ONLY: recovered from URL (falling back
 	// to the Teams X-prop) purely so list/show can surface it. It never affects
 	// sync change detection — that runs on the file-byte LocalHash and the
-	// remote-event RemoteHash, and coreContentEqual/localEventMatchesRemote
-	// exclude online-meeting fields — and EventToGraphBody never uploads it.
+	// remote-event RemoteHash, coreContentEqual/localEventMatchesRemote exclude
+	// online-meeting fields, and in the CoreHash conflict baseline a link that
+	// fails to round-trip can only read as "core changed", i.e. keep the
+	// conservative conflict classification — and EventToGraphBody never
+	// uploads it.
 	onlineMeetingURL := ""
 	if prop := ev.Props.Get(ical.PropURL); prop != nil {
 		onlineMeetingURL = strings.TrimSpace(prop.Value)

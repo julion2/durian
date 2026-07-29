@@ -22,6 +22,7 @@ go_test(
     name = "calendarsync_test",
     size = "small",
     srcs = [
+        "corechange_test.go",
         "downloadonly_test.go",
         "export_test.go",
         "nonnotifying_test.go",
