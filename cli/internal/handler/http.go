@@ -95,14 +95,14 @@ func (h *Handler) SearchCountHandler(w http.ResponseWriter, r *http.Request) {
 
 	expanded, err := h.expandGroups(query)
 	if err != nil {
-		slog.Error("Group expansion failed", "module", "HANDLER", "query", query, "err", err) // encgrep:allow query string is not encrypted plaintext, see audit
+		slog.Error("Group expansion failed", "module", "HANDLER", "err", err)
 		http.Error(w, "invalid group reference: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	count, err := h.store.SearchCount(expanded)
 	if err != nil {
-		slog.Error("Search count failed", "module", "HANDLER", "query", query, "err", err) // encgrep:allow query string is not encrypted plaintext, see audit
+		slog.Error("Search count failed", "module", "HANDLER", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}

@@ -667,10 +667,19 @@ statement. Mitigations, all part of the implementation PR:
   that name a sensitive key explicitly carry an `// encgrep:allow
   wrapper-protected slog key per redact.SensitiveSlogKeys` annotation
   so reviewers can audit the set at a glance.
-- IMAP / SMTP error paths sanitized: server responses can echo back
-  Subject lines. The IMAP layer's error wrapper truncates and base64s any
-  string that's longer than 80 characters, with a comment pointing at this
-  ADR.
+- IMAP / SMTP error paths sanitized at the log layer: server responses can
+  echo back Subject lines or quoted headers in `NO`/`BAD` errors, and `err`
+  is not a key-based redaction target. The redact `slog.Handler`
+  (`cli/internal/redact/sanitize.go`) runs every error-typed attribute value
+  — and string values at the `err` / `error` keys — through `sanitizeText`,
+  which base64-encodes any contiguous non-whitespace run longer than 80
+  characters. Short, readable diagnostics (our own error templates, library
+  messages like "connection reset by peer") pass through unchanged, so the
+  common path is untouched. **Limitation:** the heuristic targets raw
+  server-echoed data (long unbroken protocol literals); content shorter than
+  the run limit, or spread across whitespace, is not caught here — arbitrary
+  Subject text is stopped at the source by the grep gate + key-based
+  redaction above, not by this net.
 - Stack traces are stripped of sensitive arguments by using `errors.New` /
   `fmt.Errorf("...: %w", err)` with redaction-aware `%w` wrapping; we do
   **not** use `pkg/errors.Wrap` with full struct dumps.

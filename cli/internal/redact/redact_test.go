@@ -3,6 +3,7 @@ package redact
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -174,5 +175,52 @@ func TestIsSensitive(t *testing.T) {
 		if IsSensitive(key) {
 			t.Errorf("IsSensitive(%q) = true, want false (plaintext-by-design per ADR §3 β-revision)", key)
 		}
+	}
+}
+
+// TestHandle_SanitizesServerEchoInError asserts G2 of the encryption audit:
+// IMAP/SMTP server responses can echo mail content (Subject lines, quoted
+// headers) back in error text, and "err" is not a key-based redaction target.
+// A long server-echoed run must be base64'd out of the readable log.
+func TestHandle_SanitizesServerEchoInError(t *testing.T) {
+	// A single long run — the shape of a raw server literal / quoted header.
+	leak := "X-Confidential-Subject:TopSecretMergerWithAcmeCorpQ4-boardroom-only-do-not-forward-2026"
+	if len(leak) <= maxSafeRun {
+		t.Fatalf("test fixture must exceed maxSafeRun (%d), got %d", maxSafeRun, len(leak))
+	}
+
+	t.Run("error value", func(t *testing.T) {
+		var buf bytes.Buffer
+		log := newTestLogger(&buf)
+		log.Warn("append failed", "err", errors.New("imap: NO "+leak))
+		if strings.Contains(buf.String(), leak) {
+			t.Errorf("server-echoed run leaked via err value:\n%s", buf.String())
+		}
+		if !strings.Contains(buf.String(), "base64:") {
+			t.Errorf("expected base64 marker, got:\n%s", buf.String())
+		}
+	})
+
+	t.Run("err.Error() logged as string", func(t *testing.T) {
+		var buf bytes.Buffer
+		log := newTestLogger(&buf)
+		log.Warn("append failed", "err", "imap: NO "+leak)
+		if strings.Contains(buf.String(), leak) {
+			t.Errorf("server-echoed run leaked via err string:\n%s", buf.String())
+		}
+	})
+}
+
+// TestHandle_PreservesShortErrors asserts the sanitizer's blast radius is
+// zero on the common path: ordinary error diagnostics pass through readable.
+func TestHandle_PreservesShortErrors(t *testing.T) {
+	var buf bytes.Buffer
+	log := newTestLogger(&buf)
+	log.Warn("select failed", "err", errors.New("connection reset by peer"))
+	if !strings.Contains(buf.String(), "connection reset by peer") {
+		t.Errorf("short error was mangled:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "base64:") {
+		t.Errorf("short error should not be base64'd:\n%s", buf.String())
 	}
 }
