@@ -27,6 +27,17 @@ jobs:
       - name: Run gate
         run: .github/scripts/encryption-grep-gate.sh
 
+  swift-log-grep-gate:
+    # ADR-0001 §6, GUI side: fails if a Log.* call interpolates mail content
+    # or correspondents into the unified log store (readable via `log stream`
+    # / sysdiagnose). Counterpart to the Go encryption grep gate.
+    name: swift log grep gate (ADR-0001 §6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run gate
+        run: .github/scripts/swift-log-grep-gate.sh
+
   govulncheck:
     name: govulncheck (Go vuln DB)
     runs-on: ubuntu-latest

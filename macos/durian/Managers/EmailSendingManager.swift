@@ -252,15 +252,8 @@ class EmailSendingManager: ObservableObject {
         // Enqueue via HTTP
         sendingProgress = "Queuing email..."
         Log.debug("EMAIL", "Enqueuing to outbox")
-        Log.debug("EMAIL", "From: \(accountEmail)")
-        Log.debug("EMAIL", "To: \(draft.to.joined(separator: ", "))")
-        if !draft.cc.isEmpty {
-            Log.debug("EMAIL", "CC: \(draft.cc.joined(separator: ", "))")
-        }
-        if !draft.bcc.isEmpty {
-            Log.debug("EMAIL", "BCC: \(draft.bcc.joined(separator: ", "))")
-        }
-        Log.debug("EMAIL", "Subject: \(draft.subject)")
+        let recipientCount = draft.to.count + draft.cc.count + draft.bcc.count
+        Log.debug("EMAIL", "From: \(accountEmail), recipients=\(recipientCount)")
         if !draft.attachments.isEmpty {
             Log.debug("EMAIL", "Attachments: \(draft.attachments.count)")
         }

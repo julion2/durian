@@ -155,7 +155,7 @@ class EventStreamClient: ObservableObject {
                 let event = try JSONDecoder().decode(NewMailEvent.self, from: jsonData)
                 Log.info("EVENTS", "new_mail — \(event.total_new) message(s) for \(event.account)")
                 for msg in event.messages {
-                    Log.debug("EVENTS", "  thread=\(msg.thread_id) from=\(msg.from) subject=\(msg.subject)")
+                    Log.debug("EVENTS", "  thread=\(msg.thread_id)")
                 }
                 onNewMail?(event)
             } catch {
