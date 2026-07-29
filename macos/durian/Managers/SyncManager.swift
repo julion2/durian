@@ -108,6 +108,13 @@ class SyncManager: ObservableObject {
                 self?.handleOutboxUpdate(event)
             }
         }
+        stream.onCalendarUpdated = { _ in
+            // A background autosync changed the local vdir — refetch past the
+            // loadedRange cache so the new events show without a manual refresh.
+            Task { @MainActor in
+                CalendarManager.shared.refresh(force: true)
+            }
+        }
         stream.connect()
         eventStream = stream
 

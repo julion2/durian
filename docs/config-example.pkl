@@ -14,6 +14,17 @@ settings {
 // Default: ~/.local/share/durian/contacts.db (XDG_DATA_HOME)
 // contacts { db_path = "~/.local/share/durian/contacts.db" }
 
+// Optional: calendar settings. `durian serve` runs a background DOWNLOAD-ONLY
+// calendar sync (autosync): remote changes are pulled into the local vdir, but
+// nothing is ever uploaded, deleted remotely or RSVP'd automatically — those
+// need an interactive `durian calendar sync` with its confirmation prompt.
+// Disable per account with accounts[*].calendar { autosync = false }.
+// calendar {
+//   vdir_path = "~/.local/share/durian/calendars"
+//   autosync = true            // Background download-only sync in `durian serve`
+//   autosync_interval = 600    // Seconds between autosync runs (minimum 60)
+// }
+
 sync {
   gui_auto_sync = true                // GUI auto-syncs on launch and periodically
   auto_fetch_interval = 120           // Quick sync interval in seconds (GUI)

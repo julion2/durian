@@ -6,6 +6,7 @@ go_library(
         "calendarsync.go",
         "export.go",
         "notify.go",
+        "runlock.go",
         "state.go",
         "twosync.go",
     ],
@@ -21,6 +22,7 @@ go_test(
     name = "calendarsync_test",
     size = "small",
     srcs = [
+        "downloadonly_test.go",
         "export_test.go",
         "provider_test.go",
         "twosync_test.go",

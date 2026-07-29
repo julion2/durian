@@ -30,6 +30,14 @@ struct OutboxUpdateEvent: Decodable {
     let to: String?
 }
 
+/// Emitted by the serve calendar autosync loop after a download-only run that
+/// changed the local vdir, so the GUI can refetch instead of showing stale data.
+struct CalendarUpdatedEvent: Decodable {
+    let account: String
+    let downloaded: Int
+    let pruned: Int
+}
+
 // MARK: - Event Stream Client
 
 @MainActor
@@ -42,6 +50,7 @@ class EventStreamClient: ObservableObject {
 
     var onNewMail: ((NewMailEvent) -> Void)?
     var onOutboxUpdate: ((OutboxUpdateEvent) -> Void)?
+    var onCalendarUpdated: ((CalendarUpdatedEvent) -> Void)?
 
     // MARK: - Connection
 
@@ -169,6 +178,15 @@ class EventStreamClient: ObservableObject {
                 onOutboxUpdate?(event)
             } catch {
                 Log.error("EVENTS", "Failed to decode outbox_update event: \(error)")
+            }
+
+        case "calendar_updated":
+            do {
+                let event = try JSONDecoder().decode(CalendarUpdatedEvent.self, from: jsonData)
+                Log.info("EVENTS", "calendar_updated — \(event.downloaded) new, \(event.pruned) pruned for \(event.account)")
+                onCalendarUpdated?(event)
+            } catch {
+                Log.error("EVENTS", "Failed to decode calendar_updated event: \(error)")
             }
 
         default:

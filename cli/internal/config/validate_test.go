@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- ValidateConfig ---
@@ -155,6 +156,63 @@ func TestAccountCalendarConflictPolicyDefault(t *testing.T) {
 	a.Calendar.Conflict = "newer"
 	if got := a.CalendarConflictPolicy(); got != "newer" {
 		t.Errorf("policy = %q, want newer", got)
+	}
+}
+
+func TestCalendarAutosyncResolution(t *testing.T) {
+	on, off := true, false
+	cfg := &Config{}
+	a := &AccountConfig{}
+
+	// Absent everywhere: the schema default (on) applies — configs that do
+	// not amend the Pkl schema carry no calendar block at all.
+	if !cfg.CalendarAutosyncEnabled(a) {
+		t.Error("no calendar config anywhere: want the default (enabled)")
+	}
+	cfg.Calendar.Autosync = &on
+	if !cfg.CalendarAutosyncEnabled(a) {
+		t.Error("global on, no account block: want enabled")
+	}
+	a.Calendar = &AccountCalendarConfig{}
+	if !cfg.CalendarAutosyncEnabled(a) {
+		t.Error("global on, account block without override: want enabled")
+	}
+	a.Calendar.Autosync = &off
+	if cfg.CalendarAutosyncEnabled(a) {
+		t.Error("account override false must win over global on")
+	}
+	cfg.Calendar.Autosync = &off
+	a.Calendar.Autosync = &on
+	if !cfg.CalendarAutosyncEnabled(a) {
+		t.Error("account override true must win over global off")
+	}
+	a.Calendar.Autosync = nil
+	if cfg.CalendarAutosyncEnabled(a) {
+		t.Error("global off, no override: want disabled")
+	}
+	cfg.Calendar.Autosync = nil
+	a.Calendar.Autosync = &off
+	if cfg.CalendarAutosyncEnabled(a) {
+		t.Error("global absent, account override false: want disabled")
+	}
+}
+
+func TestCalendarAutosyncInterval(t *testing.T) {
+	cfg := &Config{}
+	if got := cfg.CalendarAutosyncInterval(); got != 600*time.Second {
+		t.Errorf("unset interval = %v, want the 600s default", got)
+	}
+	cfg.Calendar.AutosyncInterval = 300
+	if got := cfg.CalendarAutosyncInterval(); got != 300*time.Second {
+		t.Errorf("interval = %v, want 300s", got)
+	}
+	cfg.Calendar.AutosyncInterval = 60
+	if got := cfg.CalendarAutosyncInterval(); got != 60*time.Second {
+		t.Errorf("interval = %v, want 60s (schema minimum)", got)
+	}
+	cfg.Calendar.AutosyncInterval = 30
+	if got := cfg.CalendarAutosyncInterval(); got != 600*time.Second {
+		t.Errorf("below-minimum interval = %v, want the 600s default", got)
 	}
 }
 

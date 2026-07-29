@@ -1,6 +1,9 @@
 package config
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // Config represents the complete Durian configuration
 type Config struct {
@@ -54,6 +57,17 @@ type ContactsConfig struct {
 // CalendarConfig contains global calendar export settings.
 type CalendarConfig struct {
 	VdirPath string `pkl:"vdir_path" json:"vdir_path"` // Base dir for exported vdir calendars (default: ~/.local/share/durian/calendars)
+	// Autosync enables the background download-only calendar sync in
+	// `durian serve`. It NEVER writes to the remote calendar — uploads,
+	// remote deletes, conflicts and RSVPs stay behind the interactive
+	// `durian calendar sync` confirmation gate. A pointer so an absent
+	// calendar block (configs that do not amend the schema get no Pkl
+	// defaults) resolves to the schema default true instead of false.
+	Autosync *bool `pkl:"autosync" json:"autosync"`
+	// AutosyncInterval is the autosync interval in seconds (Pkl default 600,
+	// schema minimum 60). Use Config.CalendarAutosyncInterval for the
+	// resolved time.Duration.
+	AutosyncInterval int `pkl:"autosync_interval" json:"autosync_interval"`
 }
 
 // AccountCalendarConfig configures the vdir calendar export of one account.
@@ -65,6 +79,9 @@ type AccountCalendarConfig struct {
 	// file is backed up first), "local" keeps the local file, "newer" keeps
 	// the side modified last.
 	Conflict string `pkl:"conflict" json:"conflict"`
+	// Autosync overrides the global calendar.autosync toggle for this
+	// account (nil = use the global setting).
+	Autosync *bool `pkl:"autosync" json:"autosync"`
 }
 
 // AccountConfig represents a single email account
@@ -132,6 +149,35 @@ func (a *AccountConfig) CalendarConflictPolicy() string {
 		return a.Calendar.Conflict
 	}
 	return "remote"
+}
+
+// CalendarAutosyncEnabled resolves the effective calendar autosync toggle for
+// an account: the per-account override when set, else the global
+// calendar.autosync setting, else the schema default (on).
+func (c *Config) CalendarAutosyncEnabled(a *AccountConfig) bool {
+	if a.Calendar != nil && a.Calendar.Autosync != nil {
+		return *a.Calendar.Autosync
+	}
+	if c.Calendar.Autosync != nil {
+		return *c.Calendar.Autosync
+	}
+	return true // mirrors the Pkl schema default: autosync on
+}
+
+// calendarAutosyncDefaultInterval mirrors the Pkl schema default for
+// calendar.autosync_interval (600 s), used when the configured value is
+// missing or below the schema minimum of 60 s (e.g. a Go-constructed Config
+// that bypassed Pkl evaluation).
+const calendarAutosyncDefaultInterval = 600 * time.Second
+
+// CalendarAutosyncInterval returns the calendar autosync interval as a
+// duration, falling back to the 10-minute default when the configured value
+// is below the schema minimum of 60 seconds.
+func (c *Config) CalendarAutosyncInterval() time.Duration {
+	if c.Calendar.AutosyncInterval < 60 {
+		return calendarAutosyncDefaultInterval
+	}
+	return time.Duration(c.Calendar.AutosyncInterval) * time.Second
 }
 
 // GetAuthEmail returns the email used for OAuth token lookup.

@@ -258,6 +258,31 @@ func (p *CalendarPlan) RemoteMutations() []Action {
 	return out
 }
 
+// FilterDownloadOnly returns copies of the plans with every remote-mutating
+// action (see Action.RemoteMutation: uploads, remote deletes, conflicts, and
+// RSVPs that call the provider) removed, plus the count of removed actions.
+// The input plans are not mutated. Applying a filtered plan can therefore
+// never write to the remote calendar or make the provider send any email —
+// this is the safety mechanism behind unattended (autosync) runs, which must
+// leave every notifying action to the interactive `durian calendar sync`
+// confirmation gate. Non-mutating actions (downloads, prunes, adopts,
+// drop-status, RSVP rebaselines) are preserved in order.
+func FilterDownloadOnly(plans []CalendarPlan) (filtered []CalendarPlan, suppressed int) {
+	filtered = make([]CalendarPlan, 0, len(plans))
+	for _, p := range plans {
+		fp := CalendarPlan{Calendar: p.Calendar, Dir: p.Dir}
+		for _, a := range p.Actions {
+			if a.RemoteMutation() {
+				suppressed++
+				continue
+			}
+			fp.Actions = append(fp.Actions, a)
+		}
+		filtered = append(filtered, fp)
+	}
+	return filtered, suppressed
+}
+
 // MARK: - Stats and options
 
 // SyncStats reports what one Apply run did (or, in dry-run mode, would do).

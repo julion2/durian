@@ -244,6 +244,11 @@ func runServe(cmd *cobra.Command, args []string) {
 		// Start outbox background worker
 		outboxWorker := handler.NewOutboxWorker(emailDB, cfg, eventHub)
 		go outboxWorker.Start(watcherCtx)
+
+		// Start download-only calendar autosync loops. These pull remote
+		// calendar changes into the local vdir and NEVER write to the remote
+		// calendar (see calendar_autosync.go).
+		startCalendarAutosync(watcherCtx, eventHub, cfg)
 	}
 
 	server := &http.Server{

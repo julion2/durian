@@ -176,6 +176,19 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 
 	accountDir := filepath.Join(config.CalendarBaseDir(cfg, calendarSyncOut), account.CalendarDir())
 
+	// Run lock: one whole Load -> Plan -> Apply -> Save cycle per account dir
+	// at a time, across processes — the serve autosync loop takes the same
+	// lock, so a background run and this command can never plan from the same
+	// baseline and double-execute or clobber each other's saved state.
+	release, ok, err := calendarsync.AcquireRunLock(accountDir)
+	if err != nil {
+		return fmt.Errorf("failed to acquire calendar sync run lock: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("another calendar sync is running for this account (dir: %s) — try again in a moment", accountDir)
+	}
+	defer release()
+
 	// The status lives inside accountDir, so it is bound to this exact local
 	// collection (see FileStateStore doc): syncing the same account to a
 	// different directory must not reuse another directory's status.

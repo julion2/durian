@@ -45,6 +45,14 @@ class CalendarConfig {
   /// Base directory for exported vdir calendars (khal/vdirsyncer layout:
   /// <vdir_path>/<account-dir>/<calendar>/<event>.ics).
   vdir_path: String = "~/.local/share/durian/calendars"
+  /// Background download-only calendar sync in `durian serve`: remote changes
+  /// are pulled into the local vdir periodically. Never writes to the remote
+  /// calendar — uploads, remote deletes, conflicts and RSVPs stay behind the
+  /// interactive `durian calendar sync` confirmation. Per-account override:
+  /// accounts[*].calendar.autosync.
+  autosync: Boolean = true
+  /// Autosync interval in seconds (minimum 60, default 600 = 10 minutes).
+  autosync_interval: Int(this >= 60) = 600
 }
 
 class AccountCalendarConfig {
@@ -57,6 +65,9 @@ class AccountCalendarConfig {
   /// up to <file>.conflict-<timestamp> first), "local" keeps the local file,
   /// "newer" keeps the side modified last.
   conflict: "remote"|"local"|"newer" = "remote"
+  /// Per-account override of the global calendar.autosync toggle
+  /// (null = use the global setting).
+  autosync: Boolean?
 }
 
 // ── Account ────────────────────────────────────────────────
