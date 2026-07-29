@@ -269,3 +269,47 @@ final class CalendarEventStoreTests: XCTestCase {
         XCTAssertEqual(store.events.map(\.uid), once, "equal starts must order the same on every rebuild")
     }
 }
+
+// MARK: - Draft write payload (attendees / online meeting)
+
+final class CalendarEventDraftWriteTests: XCTestCase {
+
+    func testNewDraftCarriesAttendeesAndOnlineMeeting() {
+        var draft = CalendarEventDraft(
+            account: "me@example.com", calendar: "Calendar",
+            start: Date(timeIntervalSince1970: 1_780_000_000),
+            end: Date(timeIntervalSince1970: 1_780_003_600)
+        )
+        XCTAssertTrue(draft.attendees.isEmpty)
+        XCTAssertFalse(draft.requestOnlineMeeting)
+
+        draft.subject = "Kickoff"
+        draft.attendees = ["alice@example.com", "bob@example.com"]
+        draft.requestOnlineMeeting = true
+
+        let write = draft.toWrite()
+        XCTAssertEqual(write.attendees, ["alice@example.com", "bob@example.com"])
+        XCTAssertTrue(write.request_online_meeting)
+    }
+
+    func testExistingEventDraftNeverSendsAttendees() {
+        // Attendee editing is create-only: a draft of an existing event
+        // starts empty, and even a tampered draft sends the neutral values so
+        // the server-side merge preserves the meeting's attendee set.
+        let event = CalendarEvent(
+            uid: "evt-1", calendar: "Calendar", subject: "Sync",
+            start: Date(timeIntervalSince1970: 1_780_000_000),
+            end: Date(timeIntervalSince1970: 1_780_003_600),
+            account: "me@example.com"
+        )
+        var draft = CalendarEventDraft(from: event)
+        XCTAssertFalse(draft.isNew)
+        XCTAssertTrue(draft.attendees.isEmpty)
+
+        draft.attendees = ["alice@example.com"]
+        draft.requestOnlineMeeting = true
+        let write = draft.toWrite()
+        XCTAssertEqual(write.attendees, [])
+        XCTAssertFalse(write.request_online_meeting)
+    }
+}

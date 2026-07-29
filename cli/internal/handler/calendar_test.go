@@ -305,8 +305,9 @@ func TestCalendarPutUpdatePreservesMeetingFields(t *testing.T) {
 		t.Error("IsCancelled dropped by the update merge")
 	}
 
-	// An explicit attendee list in the request replaces the existing one.
-	body = `{"account":"work","calendar":"Calendar","uid":"evt-meeting","subject":"Weekly Sync (moved)","start":"2026-08-06T10:00:00Z","end":"2026-08-06T11:00:00Z","attendees":[{"email":"bob@example.com","type":"required"}]}`
+	// An explicit non-empty attendee list in the request replaces the
+	// existing one; an empty list (what the GUI edit form sends) does not.
+	body = `{"account":"work","calendar":"Calendar","uid":"evt-meeting","subject":"Weekly Sync (moved)","start":"2026-08-06T10:00:00Z","end":"2026-08-06T11:00:00Z","attendees":["bob@example.com"]}`
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
 	if w.Code != http.StatusOK {
@@ -325,6 +326,86 @@ func TestCalendarPutUpdatePreservesMeetingFields(t *testing.T) {
 	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("PUT calendar move = %d, want 400", w.Code)
+	}
+}
+
+func TestCalendarPutCreateWithAttendeesAndOnlineMeeting(t *testing.T) {
+	// A GUI create can carry an attendee email list and an online-meeting
+	// request. Both land in the local .ics only — the invitations and the
+	// online meeting are requested on the next `durian calendar sync`.
+	r, calDir := newCalendarHandler(t)
+	body := `{"account":"work","calendar":"Calendar","subject":"Kickoff",` +
+		`"start":"2026-08-10T09:00:00Z","end":"2026-08-10T10:00:00Z",` +
+		`"attendees":["alice@example.com"," alice@example.com","","Bob@Example.com"],` +
+		`"request_online_meeting":true}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT status %d: %s", w.Code, w.Body.String())
+	}
+	var put struct {
+		Event calendar.CalendarEvent `json:"event"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &put); err != nil {
+		t.Fatal(err)
+	}
+	if put.Event.UID == "" {
+		t.Fatal("created event has no uid")
+	}
+
+	// The written .ics carries the ATTENDEE lines (deduped, required role)
+	// and the pending online-meeting marker the sync's create picks up.
+	path := filepath.Join(calDir, put.Event.UID+".ics")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unfold the RFC 5545 75-octet line folding so substring checks work.
+	unfold := func(b []byte) string { return strings.ReplaceAll(string(b), "\r\n ", "") }
+	ics := unfold(data)
+	if got := strings.Count(ics, "ATTENDEE;"); got != 2 {
+		t.Errorf("ATTENDEE lines = %d, want 2 (deduped, blanks skipped):\n%s", got, ics)
+	}
+	for _, want := range []string{"mailto:alice@example.com", "mailto:Bob@Example.com", "ROLE=REQ-PARTICIPANT"} {
+		if !strings.Contains(ics, want) {
+			t.Errorf("ics missing %q:\n%s", want, ics)
+		}
+	}
+	if !strings.Contains(ics, "X-DURIAN-CREATE-TEAMS-MEETING:TRUE") {
+		t.Errorf("ics missing the online-meeting marker:\n%s", ics)
+	}
+
+	// A follow-up GUI edit (empty attendee list, flag false — what the edit
+	// form always sends) must not strip the attendees or the still-pending
+	// online-meeting request.
+	body = `{"account":"work","calendar":"Calendar","uid":"` + put.Event.UID + `",` +
+		`"subject":"Kickoff (moved)","start":"2026-08-10T11:00:00Z","end":"2026-08-10T12:00:00Z",` +
+		`"attendees":[],"request_online_meeting":false}`
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT update status %d: %s", w.Code, w.Body.String())
+	}
+	if data, err = os.ReadFile(path); err != nil {
+		t.Fatal(err)
+	}
+	ics = unfold(data)
+	if got := strings.Count(ics, "ATTENDEE;"); got != 2 {
+		t.Errorf("ATTENDEE lines after edit = %d, want the 2 preserved:\n%s", got, ics)
+	}
+	if !strings.Contains(ics, "X-DURIAN-CREATE-TEAMS-MEETING:TRUE") {
+		t.Errorf("online-meeting marker lost on edit:\n%s", ics)
+	}
+	if !strings.Contains(ics, "Kickoff (moved)") {
+		t.Errorf("edit not applied:\n%s", ics)
+	}
+
+	// An attendee entry that does not look like an email is rejected.
+	body = `{"account":"work","calendar":"Calendar","subject":"Bad","start":"2026-08-10T09:00:00Z","end":"2026-08-10T10:00:00Z","attendees":["not-an-email"]}`
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("PUT invalid attendee = %d, want 400", w.Code)
 	}
 }
 

@@ -436,10 +436,25 @@ final class CalendarManager: ObservableObject {
         applyDraftOptimistically(draft)
         Task { [weak self] in
             guard let self else { return }
-            if await backend.putEvent(draft.toWrite()) == nil {
+            guard await backend.putEvent(draft.toWrite()) != nil else {
                 BannerManager.shared.showWarning(
                     title: "Couldn't save event",
                     message: "The write failed — make sure the durian CLI is up to date."
+                )
+                refresh(force: true)
+                return
+            }
+            if draft.isNew && (!draft.attendees.isEmpty || draft.requestOnlineMeeting) {
+                // Make the local-first model explicit: inviting attendees (or
+                // requesting an online meeting) is a notifying action, so
+                // automatic sync will NOT push it — the invitations go out
+                // only on a manual sync, behind its preview gate.
+                let name = ConfigManager.shared.getAccounts()
+                    .first { $0.email == draft.account }?.name ?? draft.account
+                let syncTarget = name.contains(" ") ? "\"\(name)\"" : name
+                BannerManager.shared.showInfo(
+                    title: "Event saved locally",
+                    message: "Run 'durian calendar sync \(syncTarget)' to send the invitations — automatic sync does not send them."
                 )
             }
             // A local edit must reconcile against the server even when the

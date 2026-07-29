@@ -271,6 +271,13 @@ struct CalendarEventDraft: Identifiable {
     /// The edited event is a recurring series: the form warns that saving
     /// changes the whole series, and the draft times are the series master's.
     var recurring: Bool = false
+    /// Attendee emails to invite — meaningful for a NEW event only. Editing
+    /// the attendee set of an existing event is not supported yet, so drafts
+    /// of existing events keep this empty and the write path sends an empty
+    /// list, which the server treats as "preserve the existing attendees".
+    var attendees: [String] = []
+    /// Ask the provider to attach an online meeting (Teams/Meet) on create.
+    var requestOnlineMeeting: Bool = false
 
     var isNew: Bool { uid.isEmpty }
 
@@ -325,10 +332,17 @@ struct CalendarEventDraft: Identifiable {
         }
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
+        // Attendees and the online-meeting request only apply to a create;
+        // an edit of an existing event always sends the neutral values (the
+        // server preserves the existing attendee set for an empty list and
+        // ignores the flag on update), so an edit can never alter a meeting's
+        // invitations.
         return CalendarEventWrite(
             account: account, calendar: calendar, uid: uid, subject: subject,
             start: f.string(from: s), end: f.string(from: e),
-            all_day: allDay, location: location, description: description
+            all_day: allDay, location: location, description: description,
+            attendees: isNew ? attendees : [],
+            request_online_meeting: isNew ? requestOnlineMeeting : false
         )
     }
 }

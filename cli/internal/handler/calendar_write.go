@@ -22,22 +22,22 @@ import (
 // can email attendees on its own.
 
 // calendarEventWrite is the PUT /calendars/event request body (snake_case).
+// Attendees is a plain email list (each becomes a required attendee) and
+// RequestOnlineMeeting asks the provider for an online meeting — both are
+// honored on CREATE only; an update never wipes an existing meeting's
+// attendee set or pending online-meeting request (see the merge below).
 type calendarEventWrite struct {
-	Account     string `json:"account"`
-	Calendar    string `json:"calendar"`
-	UID         string `json:"uid"`
-	Subject     string `json:"subject"`
-	Start       string `json:"start"`
-	End         string `json:"end"`
-	AllDay      bool   `json:"all_day"`
-	Location    string `json:"location"`
-	Description string `json:"description"`
-	Attendees   []struct {
-		Name     string `json:"name"`
-		Email    string `json:"email"`
-		Type     string `json:"type"`
-		Response string `json:"response"`
-	} `json:"attendees"`
+	Account              string   `json:"account"`
+	Calendar             string   `json:"calendar"`
+	UID                  string   `json:"uid"`
+	Subject              string   `json:"subject"`
+	Start                string   `json:"start"`
+	End                  string   `json:"end"`
+	AllDay               bool     `json:"all_day"`
+	Location             string   `json:"location"`
+	Description          string   `json:"description"`
+	Attendees            []string `json:"attendees"`
+	RequestOnlineMeeting bool     `json:"request_online_meeting"`
 }
 
 // CalendarPutEventHandler upserts a local .ics from the posted event, generating
@@ -49,10 +49,12 @@ type calendarEventWrite struct {
 //     end = start + 1 day (Graph rejects shorter all-day events; same guard as
 //     the CLI `calendar new` and the sync write boundary).
 //   - An update (known UID) merges over the existing event: organizer,
-//     recurrence, the owner's RSVP and the online-meeting link are always
-//     preserved, and the attendee list is preserved unless the request carries
-//     one — so a GUI edit of subject/time can never silently strip a meeting's
-//     attendees (which the next sync would push as an uninvite wave).
+//     recurrence, the owner's RSVP, the online-meeting link and a pending
+//     online-meeting request are always preserved, and the attendee list is
+//     preserved unless the request carries a non-empty one — so a GUI edit of
+//     subject/time can never silently strip a meeting's attendees (which the
+//     next sync would push as an uninvite wave). request_online_meeting is
+//     honored on create only.
 //   - An update must target the calendar the event already lives in; moving an
 //     event between calendars (a remote delete + re-invite) is rejected.
 func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request) {
@@ -99,21 +101,30 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	ev := calendar.Event{
-		ICalUID:     req.UID,
-		Subject:     req.Subject,
-		Start:       start.UTC(),
-		End:         end.UTC(),
-		AllDay:      req.AllDay,
-		Location:    req.Location,
-		Description: req.Description,
+		ICalUID:              req.UID,
+		Subject:              req.Subject,
+		Start:                start.UTC(),
+		End:                  end.UTC(),
+		AllDay:               req.AllDay,
+		Location:             req.Location,
+		Description:          req.Description,
+		RequestOnlineMeeting: req.RequestOnlineMeeting,
 	}
-	for _, a := range req.Attendees {
-		if strings.TrimSpace(a.Email) == "" {
+	// Same attendee semantics as the CLI `calendar new --attendee`: every
+	// entry is a required attendee; blanks are skipped, duplicates collapse,
+	// and anything that does not look like an email is rejected.
+	seen := make(map[string]bool, len(req.Attendees))
+	for _, email := range req.Attendees {
+		email = strings.TrimSpace(email)
+		if email == "" || seen[strings.ToLower(email)] {
 			continue
 		}
-		ev.Attendees = append(ev.Attendees, calendar.Attendee{
-			Name: a.Name, Email: strings.TrimSpace(a.Email), Type: a.Type, Response: a.Response,
-		})
+		if !strings.Contains(email, "@") {
+			http.Error(w, "invalid attendee: not an email address", http.StatusBadRequest)
+			return
+		}
+		seen[strings.ToLower(email)] = true
+		ev.Attendees = append(ev.Attendees, calendar.Attendee{Email: email, Type: "required"})
 	}
 
 	// Update path: the UID already exists in the vdir. Merge over the existing
@@ -135,7 +146,13 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		// hash counts as a local edit — so the next sync would PATCH the
 		// cancelled event back to life against the provider.
 		ev.IsCancelled = existing.IsCancelled
-		if req.Attendees == nil {
+		// The online-meeting request is a create-time flag: an update never
+		// sets it, and a still-pending marker (created locally, not yet
+		// synced) survives an edit so the first sync still picks it up.
+		ev.RequestOnlineMeeting = existing.RequestOnlineMeeting
+		if len(ev.Attendees) == 0 {
+			// The GUI edit form sends an empty list (attendee editing is
+			// create-only for now); an empty list can never strip a meeting.
 			ev.Attendees = existing.Attendees
 		}
 		data, serErr := calendar.EventToICal(ev)

@@ -1045,7 +1045,22 @@ components:
         attendees:
           type: array
           items:
-            $ref: '#/components/schemas/CalendarAttendee'
+            type: string
+          default: []
+          description: >-
+            Attendee email addresses; each becomes a required attendee.
+            Honored on create only — local-first, the invitations are sent by
+            the next 'durian calendar sync' behind its notification gate. On
+            update an empty or absent list preserves the event's existing
+            attendees (attendee editing is not supported here).
+        request_online_meeting:
+          type: boolean
+          default: false
+          description: >-
+            Create the event with an online meeting (Teams for a Microsoft
+            account, Google Meet for a Google one). Honored on create only;
+            the provider attaches the meeting when the next
+            'durian calendar sync' uploads the event.
       required: [account, calendar, subject, start, end]
     CalendarRsvpRequest:
       type: object

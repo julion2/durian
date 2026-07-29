@@ -15,6 +15,9 @@ struct CalendarEventEditView: View {
     let onSave: (CalendarEventDraft) -> Void
     let onCancel: () -> Void
 
+    /// The attendee email being typed; committed to the draft on return.
+    @State private var attendeeInput: String = ""
+
     var body: some View {
         VStack(spacing: 0) {
             headerBar
@@ -24,6 +27,13 @@ struct CalendarEventEditView: View {
                     titleCard
                     calendarCard
                     timeCard
+                    if draft.isNew {
+                        // Attendees and the online-meeting request are
+                        // create-only; editing an existing meeting's attendee
+                        // set is not supported yet (the write path preserves
+                        // it), so no control is offered that could touch it.
+                        meetingCard
+                    }
                     notesCard
                     if !draft.isNew {
                         deleteButton
@@ -47,7 +57,11 @@ struct CalendarEventEditView: View {
                 Button("Cancel", role: .cancel) { onCancel() }
                     .keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Save") { onSave(draft) }
+                Button("Save") {
+                    // A typed-but-not-committed attendee email still counts.
+                    addAttendee()
+                    onSave(draft)
+                }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
                     .disabled(!isValid)
@@ -120,6 +134,79 @@ struct CalendarEventEditView: View {
                     .foregroundStyle(Color.Detail.textSecondary)
             }
         }
+    }
+
+    /// Attendees + online-meeting request for a NEW event. Local-first:
+    /// saving only writes the local .ics — the invitations (and the online
+    /// meeting) go out on the next manual `durian calendar sync`, which
+    /// previews them first; automatic sync never sends them.
+    private var meetingCard: some View {
+        card("Meeting") {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Online meeting")
+                        .font(.callout)
+                        .foregroundStyle(Color.Detail.textBody)
+                    Text("Teams for Microsoft, Meet for Google")
+                        .font(.caption)
+                        .foregroundStyle(Color.Detail.textSecondary)
+                }
+                Spacer()
+                Toggle("", isOn: $draft.requestOnlineMeeting)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+
+            Divider().overlay(Color.Detail.border)
+
+            ForEach(draft.attendees, id: \.self) { email in
+                HStack(spacing: 8) {
+                    Image(systemName: "person")
+                        .font(.caption)
+                        .foregroundStyle(Color.Detail.textSecondary)
+                    Text(email)
+                        .font(.callout)
+                        .foregroundStyle(Color.Detail.textBody)
+                    Spacer()
+                    Button {
+                        draft.attendees.removeAll { $0 == email }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(Color.Detail.textSecondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Remove \(email)")
+                }
+            }
+
+            TextField("Add attendee (email, press return)", text: $attendeeInput)
+                .textFieldStyle(.plain)
+                .font(.callout)
+                .foregroundStyle(Color.Detail.textBody)
+                .onSubmit(addAttendee)
+
+            if !draft.attendees.isEmpty || draft.requestOnlineMeeting {
+                Label("Saved locally first — invitations are sent when you run 'durian calendar sync' (automatic sync skips them).",
+                      systemImage: "paperplane")
+                    .font(.caption)
+                    .foregroundStyle(Color.Detail.textSecondary)
+            }
+        }
+    }
+
+    /// Commits the typed attendee email to the draft: trimmed, must look like
+    /// an email (user@host), duplicates (case-insensitive) and blanks ignored.
+    private func addAttendee() {
+        let email = attendeeInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !email.isEmpty else { return }
+        let parts = email.split(separator: "@")
+        guard parts.count == 2, !email.contains(" ") else { return }
+        guard !draft.attendees.contains(where: { $0.caseInsensitiveCompare(email) == .orderedSame }) else {
+            attendeeInput = ""
+            return
+        }
+        draft.attendees.append(email)
+        attendeeInput = ""
     }
 
     private var notesCard: some View {
