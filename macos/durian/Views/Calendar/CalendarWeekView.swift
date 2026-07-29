@@ -248,9 +248,10 @@ struct CalendarWeekView: View {
             Rectangle().fill(Color.Detail.border.opacity(0.6)).frame(width: 0.5)
         }
         .contentShape(Rectangle())
-        // Tap an empty part of a day to create a new event at that time.
-        // Event blocks handle their own tap, so this only fires on empty space.
-        .gesture(SpatialTapGesture().onEnded { value in
+        // Double-click an empty part of a day to create a new event at that
+        // time. Single clicks stay free for selecting/deselecting; event blocks
+        // handle their own tap, so this only fires on empty space.
+        .gesture(SpatialTapGesture(count: 2).onEnded { value in
             let hour = min(max(Int(value.location.y / hourHeight) + startHour, startHour), endHour - 1)
             if let date = dateAt(day, hour: hour) {
                 manager.beginCreate(at: date)

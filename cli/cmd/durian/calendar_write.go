@@ -22,11 +22,12 @@ var calendarNewCmd = &cobra.Command{
 	Use:   "new <account>",
 	Short: "Create a calendar event locally (pushed on next sync)",
 	Long: `Create a new event as a local .ics file in one of the account's synced
-calendars. Nothing is sent to Outlook now — the event is uploaded on the next
+calendars. Nothing is sent now — the event is uploaded on the next
 'durian calendar sync', which previews any invitations before sending. Add
---teams to request a Teams online meeting on creation.`,
+--online-meeting to request an online meeting on creation (Teams for a
+Microsoft account, Google Meet for a Google account).`,
 	Example: `  durian calendar new work --calendar "Calendar" -s "Lunch" --start "2026-08-01 12:00" --duration 1h
-  durian calendar new work --calendar "Calendar" -s "Review" --start "2026-08-02 09:00" --attendee a@x.com --teams`,
+  durian calendar new work --calendar "Calendar" -s "Review" --start "2026-08-02 09:00" --attendee a@x.com --online-meeting`,
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: completeAccounts,
 	RunE:              runCalendarNew,
@@ -88,7 +89,11 @@ func init() {
 	calendarNewCmd.Flags().StringVar(&calNewLocation, "location", "", "Location")
 	calendarNewCmd.Flags().StringVar(&calNewDescription, "description", "", "Description / body")
 	calendarNewCmd.Flags().StringArrayVar(&calNewAttendees, "attendee", nil, "Attendee email (repeatable)")
-	calendarNewCmd.Flags().BoolVar(&calNewTeams, "teams", false, "Create as a Teams online meeting")
+	calendarNewCmd.Flags().BoolVar(&calNewTeams, "online-meeting", false,
+		"Create with an online meeting (Teams for Microsoft, Google Meet for Google)")
+	// Provider-neutral rename; keep the old Microsoft-flavored flag working.
+	calendarNewCmd.Flags().BoolVar(&calNewTeams, "teams", false, "")
+	_ = calendarNewCmd.Flags().MarkDeprecated("teams", "use --online-meeting")
 
 	calendarRsvpCmd.Flags().StringVar(&calRsvpCalendar, "calendar", "", "Only this calendar (by display name)")
 	calendarDeleteCmd.Flags().StringVar(&calDeleteCalendar, "calendar", "", "Only this calendar (by display name)")
