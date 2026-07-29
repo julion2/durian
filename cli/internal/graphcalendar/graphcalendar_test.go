@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/calendar"
 )
 
 // testOwnerEmail is the mailbox owner of every test client.
@@ -32,7 +34,7 @@ func testClient(srv *httptest.Server) *Client {
 
 func TestEventToICS(t *testing.T) {
 	longDesc := strings.Repeat("x", 200)
-	timed := Event{
+	timed := calendar.Event{
 		ID:           "AAA123",
 		ICalUID:      "ical-uid-1",
 		Subject:      "Lunch, with; team\nnotes",
@@ -43,7 +45,7 @@ func TestEventToICS(t *testing.T) {
 		LastModified: time.Date(2026, 7, 1, 8, 30, 0, 0, time.UTC),
 	}
 
-	ics := EventToICS(timed, "-//durian//test//EN")
+	ics := calendar.EventToICS(timed, "-//durian//test//EN")
 
 	for _, want := range []string{
 		"BEGIN:VCALENDAR\r\n",
@@ -86,7 +88,7 @@ func TestEventToICS(t *testing.T) {
 		t.Errorf("unfolding did not restore DESCRIPTION:\n%s", unfolded)
 	}
 
-	allDay := Event{
+	allDay := calendar.Event{
 		ID:      "BBB456",
 		Subject: "Holiday",
 		AllDay:  true,
@@ -94,7 +96,7 @@ func TestEventToICS(t *testing.T) {
 		End:     time.Date(2026, 7, 24, 0, 0, 0, 0, time.UTC), // Exclusive end
 	}
 
-	ics = EventToICS(allDay, "-//durian//test//EN")
+	ics = calendar.EventToICS(allDay, "-//durian//test//EN")
 
 	for _, want := range []string{
 		"UID:BBB456\r\n", // Falls back to ID when ICalUID is empty
@@ -246,7 +248,7 @@ const meetingGraphJSON = `{
 }`
 
 // meetingEvent parses meetingGraphJSON into an Event.
-func meetingEvent(t *testing.T) Event {
+func meetingEvent(t *testing.T) calendar.Event {
 	t.Helper()
 	var ge graphEvent
 	if err := json.Unmarshal([]byte(meetingGraphJSON), &ge); err != nil {
@@ -262,7 +264,7 @@ func meetingEvent(t *testing.T) Event {
 func TestEventFromGraphMeetingMetadata(t *testing.T) {
 	ev := meetingEvent(t)
 
-	wantAttendees := []Attendee{
+	wantAttendees := []calendar.Attendee{
 		{Name: "Alice Example", Email: "alice@example.com", Type: "required", Response: "accepted"},
 		{Name: "Bob Example", Email: "bob@example.com", Type: "optional", Response: "declined"},
 	}
@@ -278,7 +280,7 @@ func TestEventFromGraphMeetingMetadata(t *testing.T) {
 	if want := "https://teams.microsoft.com/l/meetup-join/abc123"; ev.OnlineMeetingURL != want {
 		t.Errorf("OnlineMeetingURL = %q, want %q", ev.OnlineMeetingURL, want)
 	}
-	if ev.OwnerResponse != OwnerRespAccepted {
+	if ev.OwnerResponse != calendar.OwnerRespAccepted {
 		t.Errorf("OwnerResponse = %q, want accepted", ev.OwnerResponse)
 	}
 	if ev.IsCancelled {
@@ -306,7 +308,7 @@ func TestEventFromGraphMeetingMetadataAbsent(t *testing.T) {
 		t.Fatalf("eventFromGraph returned ok=false")
 	}
 	if len(ev.Attendees) != 0 || ev.Organizer != nil || ev.IsOnlineMeeting ||
-		ev.OnlineMeetingURL != "" || ev.IsCancelled || ev.OwnerResponse != OwnerRespNone {
+		ev.OnlineMeetingURL != "" || ev.IsCancelled || ev.OwnerResponse != calendar.OwnerRespNone {
 		t.Errorf("plain event carries meeting metadata: %+v", ev)
 	}
 }
@@ -336,51 +338,51 @@ func TestEventFromGraphLegacyOnlineMeetingURL(t *testing.T) {
 
 func TestEventContentHashMeetingMetadata(t *testing.T) {
 	base := meetingEvent(t)
-	baseHash := eventContentHash(base, testOwnerEmail)
+	baseHash := calendar.EventContentHash(base, testOwnerEmail)
 
 	// Volatile bookkeeping churn must NOT move the hash.
 	churned := base
 	churned.ETag = "ck-other"
 	churned.LastModified = base.LastModified.Add(time.Hour)
-	if eventContentHash(churned, testOwnerEmail) != baseHash {
+	if calendar.EventContentHash(churned, testOwnerEmail) != baseHash {
 		t.Errorf("changeKey/lastModified churn moved the hash")
 	}
 
 	// Attendee ordering must not matter: the hash sorts attendees itself.
 	swapped := base
-	swapped.Attendees = []Attendee{base.Attendees[1], base.Attendees[0]}
-	if eventContentHash(swapped, testOwnerEmail) != baseHash {
+	swapped.Attendees = []calendar.Attendee{base.Attendees[1], base.Attendees[0]}
+	if calendar.EventContentHash(swapped, testOwnerEmail) != baseHash {
 		t.Errorf("attendee order moved the hash")
 	}
 
 	// Every meaningful meeting change must move the hash.
-	changes := map[string]func(*Event){
-		"attendee response": func(e *Event) {
-			attendees := append([]Attendee(nil), e.Attendees...)
+	changes := map[string]func(*calendar.Event){
+		"attendee response": func(e *calendar.Event) {
+			attendees := append([]calendar.Attendee(nil), e.Attendees...)
 			attendees[1].Response = "accepted"
 			e.Attendees = attendees
 		},
-		"attendee added": func(e *Event) {
-			e.Attendees = append(append([]Attendee(nil), e.Attendees...),
-				Attendee{Name: "Carol", Email: "carol@example.com", Type: "required", Response: "notResponded"})
+		"attendee added": func(e *calendar.Event) {
+			e.Attendees = append(append([]calendar.Attendee(nil), e.Attendees...),
+				calendar.Attendee{Name: "Carol", Email: "carol@example.com", Type: "required", Response: "notResponded"})
 		},
-		"attendee removed": func(e *Event) {
+		"attendee removed": func(e *calendar.Event) {
 			e.Attendees = e.Attendees[:1]
 		},
-		"cancelled": func(e *Event) {
+		"cancelled": func(e *calendar.Event) {
 			e.IsCancelled = true
 		},
-		"join url": func(e *Event) {
+		"join url": func(e *calendar.Event) {
 			e.OnlineMeetingURL = "https://teams.microsoft.com/l/meetup-join/other"
 		},
-		"organizer": func(e *Event) {
-			e.Organizer = &Person{Name: "New Org", Email: "neworg@example.com"}
+		"organizer": func(e *calendar.Event) {
+			e.Organizer = &calendar.Person{Name: "New Org", Email: "neworg@example.com"}
 		},
 	}
 	for name, change := range changes {
 		ev := base
 		change(&ev)
-		if eventContentHash(ev, testOwnerEmail) == baseHash {
+		if calendar.EventContentHash(ev, testOwnerEmail) == baseHash {
 			t.Errorf("%s change did not move the hash", name)
 		}
 	}
@@ -391,32 +393,32 @@ func TestEventContentHashExcludesOwnerState(t *testing.T) {
 	// attendee entry — must never move the content hash: an owner RSVP is
 	// handled by the ActionRsvp three-way diff, not as a content change.
 	base := meetingEvent(t)
-	base.Attendees = append(append([]Attendee(nil), base.Attendees...),
-		Attendee{Name: "Me", Email: "ME@example.com", Type: "required", Response: "notResponded"})
-	baseHash := eventContentHash(base, testOwnerEmail)
+	base.Attendees = append(append([]calendar.Attendee(nil), base.Attendees...),
+		calendar.Attendee{Name: "Me", Email: "ME@example.com", Type: "required", Response: "notResponded"})
+	baseHash := calendar.EventContentHash(base, testOwnerEmail)
 
 	responded := base
-	responded.OwnerResponse = OwnerRespDeclined
-	attendees := append([]Attendee(nil), base.Attendees...)
+	responded.OwnerResponse = calendar.OwnerRespDeclined
+	attendees := append([]calendar.Attendee(nil), base.Attendees...)
 	attendees[len(attendees)-1].Response = "declined"
 	responded.Attendees = attendees
-	if eventContentHash(responded, testOwnerEmail) != baseHash {
+	if calendar.EventContentHash(responded, testOwnerEmail) != baseHash {
 		t.Error("owner RSVP (responseStatus + own attendee entry, case-insensitive) moved the hash")
 	}
 
 	// Removing the owner's attendee entry entirely must not move it either.
 	withoutOwner := base
 	withoutOwner.Attendees = base.Attendees[:len(base.Attendees)-1]
-	if eventContentHash(withoutOwner, testOwnerEmail) != baseHash {
+	if calendar.EventContentHash(withoutOwner, testOwnerEmail) != baseHash {
 		t.Error("presence of the owner's own attendee entry moved the hash")
 	}
 
 	// Another attendee's response still moves the hash.
 	other := base
-	attendees = append([]Attendee(nil), base.Attendees...)
+	attendees = append([]calendar.Attendee(nil), base.Attendees...)
 	attendees[0].Response = "declined"
 	other.Attendees = attendees
-	if eventContentHash(other, testOwnerEmail) == baseHash {
+	if calendar.EventContentHash(other, testOwnerEmail) == baseHash {
 		t.Error("another attendee's response change did not move the hash")
 	}
 }

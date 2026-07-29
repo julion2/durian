@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/julion2/durian/cli/internal/calendarsync"
 )
 
@@ -74,19 +75,19 @@ func classifyWriteError(err error) error {
 // organizer, responseStatus, isCancelled and the online-meeting fields are
 // never emitted here (RSVPs go through RespondToEvent; Teams meetings are
 // requested by CreateEvent via extra keys when the engine asks for one).
-func EventToGraphBody(e Event, includeAttendees bool) map[string]any {
+func EventToGraphBody(e calendar.Event, includeAttendees bool) map[string]any {
 	var startDT, endDT string
 	if e.AllDay {
 		// Midnight date boundaries; Graph rejects an all-day event shorter
 		// than 24h, so an end date not after the start date snaps to the
 		// next day (a one-day event) instead of producing a Graph 400.
-		startDay := dateOnly(e.Start)
-		endDay := dateOnly(e.End)
+		startDay := calendar.DateOnly(e.Start)
+		endDay := calendar.DateOnly(e.End)
 		if !endDay.After(startDay) {
 			endDay = startDay.AddDate(0, 0, 1)
 		}
-		startDT = startDay.Format(graphDateFormat) + "T00:00:00"
-		endDT = endDay.Format(graphDateFormat) + "T00:00:00"
+		startDT = startDay.Format(calendar.GraphDateFormat) + "T00:00:00"
+		endDT = endDay.Format(calendar.GraphDateFormat) + "T00:00:00"
 	} else {
 		startDT = e.Start.UTC().Format(graphWriteDateFormat)
 		endDT = e.End.UTC().Format(graphWriteDateFormat)
@@ -114,7 +115,7 @@ func EventToGraphBody(e Event, includeAttendees bool) map[string]any {
 // attendeesToGraph renders the attendee list as Graph attendee resources:
 // email address, display name and type only. Per-attendee responses are never
 // uploaded — Graph owns the RSVP state of other attendees.
-func attendeesToGraph(attendees []Attendee) []map[string]any {
+func attendeesToGraph(attendees []calendar.Attendee) []map[string]any {
 	out := make([]map[string]any, 0, len(attendees))
 	for _, a := range attendees {
 		out = append(out, map[string]any{
@@ -132,7 +133,7 @@ func attendeesToGraph(attendees []Attendee) []map[string]any {
 // opts.RequestOnlineMeeting adds the Teams online-meeting keys, and
 // opts.IdempotencyKey travels as the Graph transactionId so a retried POST
 // cannot create a duplicate event (or a second invitation wave).
-func (c *Client) CreateEvent(ctx context.Context, calendarID string, ev Event, opts calendarsync.CreateOptions) (Event, error) {
+func (c *Client) CreateEvent(ctx context.Context, calendarID string, ev calendar.Event, opts calendarsync.CreateOptions) (calendar.Event, error) {
 	body := EventToGraphBody(ev, opts.IncludeAttendees)
 	if opts.RequestOnlineMeeting {
 		body["isOnlineMeeting"] = true
@@ -145,11 +146,11 @@ func (c *Client) CreateEvent(ctx context.Context, calendarID string, ev Event, o
 
 	var ge graphEvent
 	if err := c.doJSONBody(ctx, http.MethodPost, reqURL, map[string]string{"Prefer": preferMaster}, body, &ge); err != nil {
-		return Event{}, fmt.Errorf("failed to create event in calendar %s: %w", calendarID, classifyWriteError(err))
+		return calendar.Event{}, fmt.Errorf("failed to create event in calendar %s: %w", calendarID, classifyWriteError(err))
 	}
 	created, ok := eventFromGraph(ge)
 	if !ok {
-		return Event{}, fmt.Errorf("failed to parse created event %s (calendar %s)", ge.ID, calendarID)
+		return calendar.Event{}, fmt.Errorf("failed to parse created event %s (calendar %s)", ge.ID, calendarID)
 	}
 	slog.Debug("Created remote event", "module", "GRAPHCAL",
 		"calendar", calendarID, "id", created.ID, "uid", created.ICalUID)
@@ -219,15 +220,15 @@ func (c *Client) DeleteEvent(ctx context.Context, calendarID, eventID, etag stri
 // Declined or Tentative — None and Organizer have no Graph action. A 404/410
 // surfaces as calendarsync.ErrNotFound. calendarID is unused: Graph event ids
 // are mailbox-global.
-func (c *Client) RespondToEvent(ctx context.Context, calendarID, eventID string, resp OwnerResp, sendResponse bool, comment string) error {
+func (c *Client) RespondToEvent(ctx context.Context, calendarID, eventID string, resp calendar.OwnerResp, sendResponse bool, comment string) error {
 	_ = calendarID
 	var verb string
 	switch resp {
-	case OwnerRespAccepted:
+	case calendar.OwnerRespAccepted:
 		verb = "accept"
-	case OwnerRespDeclined:
+	case calendar.OwnerRespDeclined:
 		verb = "decline"
-	case OwnerRespTentative:
+	case calendar.OwnerRespTentative:
 		verb = "tentativelyAccept"
 	default:
 		return fmt.Errorf("cannot send RSVP for owner response state %q", resp)

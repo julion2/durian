@@ -12,7 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/julion2/durian/cli/internal/graphcalendar"
+	"github.com/julion2/durian/cli/internal/calendar"
 )
 
 // Local-first calendar write endpoints. They only edit the on-disk vdir (create
@@ -98,7 +98,7 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		req.UID = uuid.NewString()
 	}
 
-	ev := graphcalendar.Event{
+	ev := calendar.Event{
 		ICalUID:     req.UID,
 		Subject:     req.Subject,
 		Start:       start.UTC(),
@@ -111,7 +111,7 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		if strings.TrimSpace(a.Email) == "" {
 			continue
 		}
-		ev.Attendees = append(ev.Attendees, graphcalendar.Attendee{
+		ev.Attendees = append(ev.Attendees, calendar.Attendee{
 			Name: a.Name, Email: strings.TrimSpace(a.Email), Type: a.Type, Response: a.Response,
 		})
 	}
@@ -120,7 +120,7 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 	// event so fields the write schema does not carry are never dropped, and
 	// write back to the event's existing file (its name may predate the
 	// UID-derived scheme).
-	if path, existing, calName, resolveErr := graphcalendar.ResolveLocalEvent(dir, owner, req.UID, ""); resolveErr == nil && existing.ICalUID == req.UID {
+	if path, existing, calName, resolveErr := calendar.ResolveLocalEvent(dir, owner, req.UID, ""); resolveErr == nil && existing.ICalUID == req.UID {
 		if !strings.EqualFold(calName, req.Calendar) {
 			http.Error(w, "event belongs to a different calendar; moving events between calendars is not supported", http.StatusBadRequest)
 			return
@@ -138,27 +138,27 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		if req.Attendees == nil {
 			ev.Attendees = existing.Attendees
 		}
-		data, serErr := graphcalendar.EventToICal(ev)
+		data, serErr := calendar.EventToICal(ev)
 		if serErr != nil {
 			slog.Error("Failed to serialize updated local event", "module", "API", "err", logSafe(serErr.Error()))
 			http.Error(w, "failed to serialize event", http.StatusInternalServerError)
 			return
 		}
-		if writeErr := graphcalendar.WriteFileAtomic(path, data, 0o600); writeErr != nil {
+		if writeErr := calendar.WriteFileAtomic(path, data, 0o600); writeErr != nil {
 			slog.Error("Failed to write local event", "module", "API", "err", logSafe(writeErr.Error()))
 			http.Error(w, "failed to write event", http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true, "event": graphcalendar.ToCalendarEvent(calName, ev, true)})
+		writeJSON(w, map[string]any{"ok": true, "event": calendar.ToCalendarEvent(calName, ev, true)})
 		return
 	}
 
-	if _, err := graphcalendar.WriteLocalEvent(dir, req.Calendar, ev); err != nil {
+	if _, err := calendar.WriteLocalEvent(dir, req.Calendar, ev); err != nil {
 		slog.Error("Failed to write local event", "module", "API", "err", logSafe(err.Error()))
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	writeJSON(w, map[string]any{"ok": true, "event": graphcalendar.ToCalendarEvent(req.Calendar, ev, true)})
+	writeJSON(w, map[string]any{"ok": true, "event": calendar.ToCalendarEvent(req.Calendar, ev, true)})
 }
 
 // CalendarDeleteEventHandler removes a local .ics by reference. The deletion is
@@ -174,7 +174,7 @@ func (h *Handler) CalendarDeleteEventHandler(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "missing required 'ref' query parameter", http.StatusBadRequest)
 		return
 	}
-	path, _, _, err := graphcalendar.ResolveLocalEvent(dir, owner, ref, q.Get("calendar"))
+	path, _, _, err := calendar.ResolveLocalEvent(dir, owner, ref, q.Get("calendar"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return

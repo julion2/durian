@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/julion2/durian/cli/internal/graphcalendar"
+	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/spf13/cobra"
 )
 
@@ -108,7 +108,7 @@ func runCalendarNew(cmd *cobra.Command, args []string) error {
 	}
 
 	now := time.Now()
-	start, startAllDay, err := graphcalendar.ParseWhen(calNewStart, now)
+	start, startAllDay, err := calendar.ParseWhen(calNewStart, now)
 	if err != nil {
 		return err
 	}
@@ -122,7 +122,7 @@ func runCalendarNew(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("end %s is not after start %s", end.Format(time.RFC3339), start.Format(time.RFC3339))
 	}
 
-	attendees := make([]graphcalendar.Attendee, 0, len(calNewAttendees))
+	attendees := make([]calendar.Attendee, 0, len(calNewAttendees))
 	for _, email := range calNewAttendees {
 		email = strings.TrimSpace(email)
 		if email == "" {
@@ -131,10 +131,10 @@ func runCalendarNew(cmd *cobra.Command, args []string) error {
 		if !strings.Contains(email, "@") {
 			return fmt.Errorf("invalid --attendee %q: not an email address", email)
 		}
-		attendees = append(attendees, graphcalendar.Attendee{Email: email, Type: "required"})
+		attendees = append(attendees, calendar.Attendee{Email: email, Type: "required"})
 	}
 
-	event := graphcalendar.Event{
+	event := calendar.Event{
 		ICalUID:              uuid.NewString(),
 		Subject:              calNewSubject,
 		Location:             calNewLocation,
@@ -146,7 +146,7 @@ func runCalendarNew(cmd *cobra.Command, args []string) error {
 		RequestOnlineMeeting: calNewTeams,
 	}
 
-	path, err := graphcalendar.WriteLocalEvent(accountDir, calNewCalendar, event)
+	path, err := calendar.WriteLocalEvent(accountDir, calNewCalendar, event)
 	if err != nil {
 		return err
 	}
@@ -163,7 +163,7 @@ func eventEnd(start time.Time, allDay bool, now time.Time) (time.Time, error) {
 	var end time.Time
 	switch {
 	case calNewEnd != "":
-		e, _, err := graphcalendar.ParseWhen(calNewEnd, now)
+		e, _, err := calendar.ParseWhen(calNewEnd, now)
 		if err != nil {
 			return time.Time{}, err
 		}
@@ -198,7 +198,7 @@ func runCalendarRsvp(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	path, event, calName, err := graphcalendar.ResolveLocalEvent(accountDir, owner, ref, calRsvpCalendar)
+	path, event, calName, err := calendar.ResolveLocalEvent(accountDir, owner, ref, calRsvpCalendar)
 	if err != nil {
 		return err
 	}
@@ -210,7 +210,7 @@ func runCalendarRsvp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("you (%s) are not an attendee of %q, cannot RSVP", owner, orDash(event.Subject))
 	}
 
-	data, err := graphcalendar.EventToICal(event)
+	data, err := calendar.EventToICal(event)
 	if err != nil {
 		return fmt.Errorf("failed to serialize event: %w", err)
 	}
@@ -224,24 +224,24 @@ func runCalendarRsvp(cmd *cobra.Command, args []string) error {
 }
 
 // parseRsvpVerb maps the CLI verb to the canonical owner response.
-func parseRsvpVerb(verb string) (graphcalendar.OwnerResp, error) {
+func parseRsvpVerb(verb string) (calendar.OwnerResp, error) {
 	switch strings.ToLower(verb) {
 	case "accept":
-		return graphcalendar.OwnerRespAccepted, nil
+		return calendar.OwnerRespAccepted, nil
 	case "decline":
-		return graphcalendar.OwnerRespDeclined, nil
+		return calendar.OwnerRespDeclined, nil
 	case "tentative":
-		return graphcalendar.OwnerRespTentative, nil
+		return calendar.OwnerRespTentative, nil
 	default:
 		return "", fmt.Errorf("unknown RSVP %q, use accept, decline or tentative", verb)
 	}
 }
 
-func rsvpVerbLabel(r graphcalendar.OwnerResp) string {
+func rsvpVerbLabel(r calendar.OwnerResp) string {
 	switch r {
-	case graphcalendar.OwnerRespAccepted:
+	case calendar.OwnerRespAccepted:
 		return "accepted"
-	case graphcalendar.OwnerRespDeclined:
+	case calendar.OwnerRespDeclined:
 		return "declined"
 	default:
 		return "tentative"
@@ -249,8 +249,8 @@ func rsvpVerbLabel(r graphcalendar.OwnerResp) string {
 }
 
 // isOwnerOrganizer reports whether the account owner organizes this event.
-func isOwnerOrganizer(e graphcalendar.Event, owner string) bool {
-	if e.OwnerResponse == graphcalendar.OwnerRespOrganizer {
+func isOwnerOrganizer(e calendar.Event, owner string) bool {
+	if e.OwnerResponse == calendar.OwnerRespOrganizer {
 		return true
 	}
 	return e.Organizer != nil && owner != "" && strings.EqualFold(e.Organizer.Email, owner)
@@ -261,11 +261,11 @@ func isOwnerOrganizer(e graphcalendar.Event, owner string) bool {
 // canonical OwnerResponse. It reports false when the owner is not among the
 // attendees, so a local file cannot carry an RSVP for a meeting the owner was
 // not invited to.
-func setOwnerResponse(e *graphcalendar.Event, owner string, resp graphcalendar.OwnerResp) bool {
-	graphResp := map[graphcalendar.OwnerResp]string{
-		graphcalendar.OwnerRespAccepted:  "accepted",
-		graphcalendar.OwnerRespDeclined:  "declined",
-		graphcalendar.OwnerRespTentative: "tentativelyAccepted",
+func setOwnerResponse(e *calendar.Event, owner string, resp calendar.OwnerResp) bool {
+	graphResp := map[calendar.OwnerResp]string{
+		calendar.OwnerRespAccepted:  "accepted",
+		calendar.OwnerRespDeclined:  "declined",
+		calendar.OwnerRespTentative: "tentativelyAccepted",
 	}[resp]
 	for i := range e.Attendees {
 		if strings.EqualFold(e.Attendees[i].Email, owner) {
@@ -284,7 +284,7 @@ func runCalendarDelete(cmd *cobra.Command, args []string) error {
 	}
 	ref := args[1]
 
-	path, event, calName, err := graphcalendar.ResolveLocalEvent(accountDir, owner, ref, calDeleteCalendar)
+	path, event, calName, err := calendar.ResolveLocalEvent(accountDir, owner, ref, calDeleteCalendar)
 	if err != nil {
 		return err
 	}

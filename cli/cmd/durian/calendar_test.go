@@ -5,14 +5,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/julion2/durian/cli/internal/graphcalendar"
+	"github.com/julion2/durian/cli/internal/calendar"
 )
 
 func TestParseRsvpVerb(t *testing.T) {
-	cases := map[string]graphcalendar.OwnerResp{
-		"accept":    graphcalendar.OwnerRespAccepted,
-		"Decline":   graphcalendar.OwnerRespDeclined,
-		"TENTATIVE": graphcalendar.OwnerRespTentative,
+	cases := map[string]calendar.OwnerResp{
+		"accept":    calendar.OwnerRespAccepted,
+		"Decline":   calendar.OwnerRespDeclined,
+		"TENTATIVE": calendar.OwnerRespTentative,
 	}
 	for in, want := range cases {
 		got, err := parseRsvpVerb(in)
@@ -27,14 +27,14 @@ func TestParseRsvpVerb(t *testing.T) {
 
 func TestSetOwnerResponse(t *testing.T) {
 	owner := "me@example.com"
-	e := graphcalendar.Event{Attendees: []graphcalendar.Attendee{
+	e := calendar.Event{Attendees: []calendar.Attendee{
 		{Email: "other@example.com", Response: "accepted"},
 		{Email: "ME@example.com", Response: "none"}, // owner, case-insensitive
 	}}
-	if !setOwnerResponse(&e, owner, graphcalendar.OwnerRespDeclined) {
+	if !setOwnerResponse(&e, owner, calendar.OwnerRespDeclined) {
 		t.Fatal("setOwnerResponse: want true (owner is an attendee)")
 	}
-	if e.OwnerResponse != graphcalendar.OwnerRespDeclined {
+	if e.OwnerResponse != calendar.OwnerRespDeclined {
 		t.Errorf("OwnerResponse = %q, want declined", e.OwnerResponse)
 	}
 	if e.Attendees[1].Response != "declined" {
@@ -45,8 +45,8 @@ func TestSetOwnerResponse(t *testing.T) {
 	}
 
 	// Owner not among attendees.
-	e2 := graphcalendar.Event{Attendees: []graphcalendar.Attendee{{Email: "x@example.com"}}}
-	if setOwnerResponse(&e2, owner, graphcalendar.OwnerRespAccepted) {
+	e2 := calendar.Event{Attendees: []calendar.Attendee{{Email: "x@example.com"}}}
+	if setOwnerResponse(&e2, owner, calendar.OwnerRespAccepted) {
 		t.Error("setOwnerResponse: want false when owner is not an attendee")
 	}
 }
@@ -153,15 +153,15 @@ func TestEventEndAllDaySnap(t *testing.T) {
 }
 
 func TestRecurrenceSummary(t *testing.T) {
-	e := graphcalendar.Event{Recurrence: &graphcalendar.Recurrence{
-		Pattern: graphcalendar.RecurrencePattern{Type: "weekly", Interval: 2, DaysOfWeek: []string{"monday", "wednesday"}},
-		Range:   graphcalendar.RecurrenceRange{Type: "numbered", NumberOfOccurrences: 10},
+	e := calendar.Event{Recurrence: &calendar.Recurrence{
+		Pattern: calendar.RecurrencePattern{Type: "weekly", Interval: 2, DaysOfWeek: []string{"monday", "wednesday"}},
+		Range:   calendar.RecurrenceRange{Type: "numbered", NumberOfOccurrences: 10},
 	}}
 	got := recurrenceSummary(e)
 	if got == "" {
 		t.Fatal("recurrenceSummary empty for a recurring event")
 	}
-	if recurrenceSummary(graphcalendar.Event{}) != "" {
+	if recurrenceSummary(calendar.Event{}) != "" {
 		t.Error("recurrenceSummary: want empty for non-recurring event")
 	}
 }

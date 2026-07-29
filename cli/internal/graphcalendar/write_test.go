@@ -4,16 +4,18 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/calendar"
 )
 
 // marshalBody round-trips an EventToGraphBody result through JSON so the
 // assertions see exactly the wire shape Graph would receive.
-func marshalBody(t *testing.T, e Event) map[string]any {
+func marshalBody(t *testing.T, e calendar.Event) map[string]any {
 	t.Helper()
 	return marshalBodyAttendees(t, e, false)
 }
 
-func marshalBodyAttendees(t *testing.T, e Event, includeAttendees bool) map[string]any {
+func marshalBodyAttendees(t *testing.T, e calendar.Event, includeAttendees bool) map[string]any {
 	t.Helper()
 	data, err := json.Marshal(EventToGraphBody(e, includeAttendees))
 	if err != nil {
@@ -27,7 +29,7 @@ func marshalBodyAttendees(t *testing.T, e Event, includeAttendees bool) map[stri
 }
 
 func TestEventToGraphBodyTimed(t *testing.T) {
-	m := marshalBody(t, Event{
+	m := marshalBody(t, calendar.Event{
 		Subject:     "Standup",
 		Description: "agenda",
 		Location:    "HQ",
@@ -65,7 +67,7 @@ func TestEventToGraphBodyTimed(t *testing.T) {
 }
 
 func TestEventToGraphBodyAllDay(t *testing.T) {
-	m := marshalBody(t, Event{
+	m := marshalBody(t, calendar.Event{
 		Subject: "Holiday",
 		AllDay:  true,
 		Start:   time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
@@ -133,7 +135,7 @@ func TestEventToGraphBodyAllDaySnap(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			m := marshalBody(t, Event{Subject: "Holiday", AllDay: true, Start: c.start, End: c.end})
+			m := marshalBody(t, calendar.Event{Subject: "Holiday", AllDay: true, Start: c.start, End: c.end})
 			start, _ := m["start"].(map[string]any)
 			end, _ := m["end"].(map[string]any)
 			if start["dateTime"] != c.wantStart || end["dateTime"] != c.wantEnd {
@@ -144,17 +146,17 @@ func TestEventToGraphBodyAllDaySnap(t *testing.T) {
 }
 
 func TestEventToGraphBodyWeeklyRecurrence(t *testing.T) {
-	m := marshalBody(t, Event{
+	m := marshalBody(t, calendar.Event{
 		Subject: "Weekly sync",
 		Start:   time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC),
 		End:     time.Date(2026, 7, 20, 9, 30, 0, 0, time.UTC),
-		Recurrence: &Recurrence{
-			Pattern: RecurrencePattern{
+		Recurrence: &calendar.Recurrence{
+			Pattern: calendar.RecurrencePattern{
 				Type:       "weekly",
 				Interval:   2,
 				DaysOfWeek: []string{"monday", "wednesday"},
 			},
-			Range: RecurrenceRange{
+			Range: calendar.RecurrenceRange{
 				Type:      "endDate",
 				StartDate: "2026-07-20",
 				EndDate:   "2026-12-31",
@@ -181,20 +183,20 @@ func TestEventToGraphBodyWeeklyRecurrence(t *testing.T) {
 }
 
 func TestEventToGraphBodyAttendeeGating(t *testing.T) {
-	meeting := Event{
+	meeting := calendar.Event{
 		Subject: "Design review",
 		Start:   time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC),
 		End:     time.Date(2026, 7, 23, 11, 0, 0, 0, time.UTC),
-		Attendees: []Attendee{
+		Attendees: []calendar.Attendee{
 			{Name: "Alice Example", Email: "alice@example.com", Type: "required", Response: "accepted"},
 			{Name: "Bob Example", Email: "bob@example.com", Type: "optional", Response: "declined"},
 		},
-		Organizer:            &Person{Name: "Olivia Organizer", Email: "olivia@example.com"},
+		Organizer:            &calendar.Person{Name: "Olivia Organizer", Email: "olivia@example.com"},
 		IsOrganizer:          true,
 		IsCancelled:          true,
 		IsOnlineMeeting:      true,
 		OnlineMeetingURL:     "https://teams.microsoft.com/l/meetup-join/abc123",
-		OwnerResponse:        OwnerRespAccepted,
+		OwnerResponse:        calendar.OwnerRespAccepted,
 		RequestOnlineMeeting: true,
 	}
 

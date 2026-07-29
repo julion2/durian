@@ -9,15 +9,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/julion2/durian/cli/internal/config"
-	"github.com/julion2/durian/cli/internal/graphcalendar"
 	"github.com/spf13/cobra"
 )
 
 // Local-first calendar read commands (list / search / show). All three read
 // only the on-disk vdir (populated by `durian calendar sync`/`export`) — no
 // Graph call, no token. Recurring masters are expanded into concrete
-// occurrences via graphcalendar.ExpandOccurrences.
+// occurrences via calendar.ExpandOccurrences.
 
 var calendarListCmd = &cobra.Command{
 	Use:   "list <account>",
@@ -106,8 +106,8 @@ func resolveVdirAccount(identifier string) (accountDir, owner string, account *c
 
 // occurrence pairs an expanded event with its calendar for sorting/printing.
 type occurrence struct {
-	cal   graphcalendar.LocalCalendar
-	event graphcalendar.Event
+	cal   calendar.LocalCalendar
+	event calendar.Event
 }
 
 func runCalendarList(cmd *cobra.Command, args []string) error {
@@ -121,7 +121,7 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	calendars, err := graphcalendar.ReadCalendars(accountDir, owner)
+	calendars, err := calendar.ReadCalendars(accountDir, owner)
 	if err != nil {
 		return fmt.Errorf("failed to read local calendars: %w", err)
 	}
@@ -132,7 +132,7 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 			continue
 		}
 		for _, e := range cal.Events {
-			for _, occ := range graphcalendar.ExpandOccurrences(e, from, to) {
+			for _, occ := range calendar.ExpandOccurrences(e, from, to) {
 				occs = append(occs, occurrence{cal: cal, event: occ})
 			}
 		}
@@ -140,9 +140,9 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 	sort.Slice(occs, func(i, j int) bool { return occs[i].event.Start.Before(occs[j].event.Start) })
 
 	if jsonOutput {
-		out := make([]graphcalendar.CalendarEvent, 0, len(occs))
+		out := make([]calendar.CalendarEvent, 0, len(occs))
 		for _, o := range occs {
-			out = append(out, graphcalendar.ToCalendarEvent(o.cal.Name, o.event, false))
+			out = append(out, calendar.ToCalendarEvent(o.cal.Name, o.event, false))
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -188,7 +188,7 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 }
 
 // listWindow computes [from, to) from the list flags, relative to now, reusing
-// the shared graphcalendar.CalendarWindow (the --today/--month flags only pick
+// the shared calendar.CalendarWindow (the --today/--month flags only pick
 // the default span).
 func listWindow(now time.Time) (from, to time.Time, err error) {
 	span := 7 * 24 * time.Hour
@@ -198,11 +198,11 @@ func listWindow(now time.Time) (from, to time.Time, err error) {
 	case calListMonth:
 		span = 30 * 24 * time.Hour
 	}
-	return graphcalendar.CalendarWindow(calListFrom, calListTo, span, now)
+	return calendar.CalendarWindow(calListFrom, calListTo, span, now)
 }
 
 // eventTimeCol renders the time column: "all-day" or "HH:MM".
-func eventTimeCol(e graphcalendar.Event) string {
+func eventTimeCol(e calendar.Event) string {
 	if e.AllDay {
 		return styDim("all-day")
 	}
@@ -210,17 +210,17 @@ func eventTimeCol(e graphcalendar.Event) string {
 }
 
 // eventMarkers appends dim markers for online meetings and the owner's RSVP.
-func eventMarkers(e graphcalendar.Event) string {
+func eventMarkers(e calendar.Event) string {
 	var m []string
 	if e.IsOnlineMeeting || e.OnlineMeetingURL != "" {
 		m = append(m, "online")
 	}
 	switch e.OwnerResponse {
-	case graphcalendar.OwnerRespAccepted:
+	case calendar.OwnerRespAccepted:
 		m = append(m, "accepted")
-	case graphcalendar.OwnerRespDeclined:
+	case calendar.OwnerRespDeclined:
 		m = append(m, "declined")
-	case graphcalendar.OwnerRespTentative:
+	case calendar.OwnerRespTentative:
 		m = append(m, "tentative")
 	}
 	if len(m) == 0 {
@@ -243,7 +243,7 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 	}
 	query := strings.ToLower(strings.Join(args[1:], " "))
 
-	calendars, err := graphcalendar.ReadCalendars(accountDir, owner)
+	calendars, err := calendar.ReadCalendars(accountDir, owner)
 	if err != nil {
 		return fmt.Errorf("failed to read local calendars: %w", err)
 	}
@@ -254,7 +254,7 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 			continue
 		}
 		for _, e := range cal.Events {
-			if graphcalendar.EventMatchesQuery(e, query) {
+			if calendar.EventMatchesQuery(e, query) {
 				matches = append(matches, occurrence{cal: cal, event: e})
 			}
 		}
@@ -262,9 +262,9 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 	sort.Slice(matches, func(i, j int) bool { return matches[i].event.Start.Before(matches[j].event.Start) })
 
 	if jsonOutput {
-		out := make([]graphcalendar.CalendarEvent, 0, len(matches))
+		out := make([]calendar.CalendarEvent, 0, len(matches))
 		for _, o := range matches {
-			out = append(out, graphcalendar.ToCalendarEvent(o.cal.Name, o.event, false))
+			out = append(out, calendar.ToCalendarEvent(o.cal.Name, o.event, false))
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -297,7 +297,7 @@ func runCalendarShow(cmd *cobra.Command, args []string) error {
 	}
 	ref := strings.Join(args[1:], " ")
 
-	_, e, calName, err := graphcalendar.ResolveLocalEvent(accountDir, owner, ref, calShowCalendar)
+	_, e, calName, err := calendar.ResolveLocalEvent(accountDir, owner, ref, calShowCalendar)
 	if err != nil {
 		return err
 	}
@@ -305,7 +305,7 @@ func runCalendarShow(cmd *cobra.Command, args []string) error {
 	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(graphcalendar.ToCalendarEvent(calName, e, true))
+		return enc.Encode(calendar.ToCalendarEvent(calName, e, true))
 	}
 
 	printEventDetail(e, calName)
@@ -313,7 +313,7 @@ func runCalendarShow(cmd *cobra.Command, args []string) error {
 }
 
 // printEventDetail renders one event as a labeled block (see show.go's style).
-func printEventDetail(e graphcalendar.Event, calName string) {
+func printEventDetail(e calendar.Event, calName string) {
 	fmt.Println(styAccent(orDash(e.Subject)))
 	fmt.Println(strings.Repeat("─", 50))
 	field := func(label, value string) {
@@ -328,7 +328,7 @@ func printEventDetail(e graphcalendar.Event, calName string) {
 	if e.Organizer != nil {
 		field("Organizer", personLabel(*e.Organizer))
 	}
-	if e.OwnerResponse != "" && e.OwnerResponse != graphcalendar.OwnerRespNone {
+	if e.OwnerResponse != "" && e.OwnerResponse != calendar.OwnerRespNone {
 		field("My status", string(e.OwnerResponse))
 	}
 	if e.OnlineMeetingURL != "" {
@@ -350,7 +350,7 @@ func printEventDetail(e graphcalendar.Event, calName string) {
 }
 
 // eventWhen renders the time span of an event for the detail view.
-func eventWhen(e graphcalendar.Event) string {
+func eventWhen(e calendar.Event) string {
 	if e.AllDay {
 		days := e.End.Sub(e.Start).Hours() / 24
 		if days <= 1 {
@@ -368,7 +368,7 @@ func eventWhen(e graphcalendar.Event) string {
 }
 
 // personLabel renders a Person as "Name <email>" (or bare email).
-func personLabel(p graphcalendar.Person) string {
+func personLabel(p calendar.Person) string {
 	if p.Name != "" && !strings.EqualFold(p.Name, p.Email) {
 		return fmt.Sprintf("%s <%s>", p.Name, p.Email)
 	}
@@ -377,8 +377,8 @@ func personLabel(p graphcalendar.Person) string {
 
 // attendeeLabel renders an attendee as personLabel plus a dim role suffix for
 // optional/resource attendees.
-func attendeeLabel(a graphcalendar.Attendee) string {
-	label := personLabel(graphcalendar.Person{Name: a.Name, Email: a.Email})
+func attendeeLabel(a calendar.Attendee) string {
+	label := personLabel(calendar.Person{Name: a.Name, Email: a.Email})
 	switch a.Type {
 	case "optional":
 		return label + styDim(" (optional)")
@@ -404,7 +404,7 @@ func partStatLabel(response string) string {
 
 // recurrenceSummary renders a one-line human description of a series, or "" for
 // a non-recurring event.
-func recurrenceSummary(e graphcalendar.Event) string {
+func recurrenceSummary(e calendar.Event) string {
 	if e.Recurrence == nil {
 		return ""
 	}

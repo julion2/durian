@@ -14,8 +14,7 @@
 //     standalone iCalendar documents including RRULEs.
 //
 // The provider-neutral event model and the local vdir layer live in the
-// calendar package and are re-exported here via aliases.go; the sync engine
-// itself lives in the calendarsync package.
+// calendar package; the sync engine itself lives in the calendarsync package.
 package graphcalendar
 
 import (
@@ -33,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/oauth"
@@ -373,9 +373,7 @@ func (c *Client) ListCalendars(ctx context.Context) ([]Calendar, error) {
 // MARK: - Events
 
 // The neutral event model (Event, Attendee, Person, OwnerResp, Recurrence and
-// the content hashes) lives in the provider-neutral calendar package; this
-// package re-exports it through aliases (see aliases.go) so existing callers
-// keep compiling unchanged.
+// the content hashes) lives in the provider-neutral calendar package.
 
 // graphDateTime is Graph's {dateTime, timeZone} pair. With the preferUTC
 // header, dateTime is already UTC.
@@ -414,11 +412,11 @@ type graphEvent struct {
 		ContentType string `json:"contentType"`
 		Content     string `json:"content"`
 	} `json:"body"`
-	BodyPreview          string      `json:"bodyPreview"`
-	Recurrence           *Recurrence `json:"recurrence"`
-	Type                 string      `json:"type"`
-	ChangeKey            string      `json:"changeKey"`
-	LastModifiedDateTime string      `json:"lastModifiedDateTime"`
+	BodyPreview          string               `json:"bodyPreview"`
+	Recurrence           *calendar.Recurrence `json:"recurrence"`
+	Type                 string               `json:"type"`
+	ChangeKey            string               `json:"changeKey"`
+	LastModifiedDateTime string               `json:"lastModifiedDateTime"`
 	Attendees            []struct {
 		Type         string              `json:"type"`
 		Status       graphResponseStatus `json:"status"`
@@ -444,18 +442,18 @@ type graphEvent struct {
 // unparseable. The description prefers the full body content when Graph
 // delivered a plain-text body, falling back to bodyPreview (always the case
 // for calendarView queries, which do not select body).
-func eventFromGraph(ge graphEvent) (Event, bool) {
+func eventFromGraph(ge graphEvent) (calendar.Event, bool) {
 	start, err := parseGraphDateTime(ge.Start.DateTime)
 	if err != nil {
 		slog.Warn("Skipping event with unparseable start", "module", "GRAPHCAL",
 			"id", ge.ID, "value", ge.Start.DateTime, "err", err)
-		return Event{}, false
+		return calendar.Event{}, false
 	}
 	end, err := parseGraphDateTime(ge.End.DateTime)
 	if err != nil {
 		slog.Warn("Skipping event with unparseable end", "module", "GRAPHCAL",
 			"id", ge.ID, "value", ge.End.DateTime, "err", err)
-		return Event{}, false
+		return calendar.Event{}, false
 	}
 
 	description := ge.BodyPreview
@@ -463,25 +461,25 @@ func eventFromGraph(ge graphEvent) (Event, bool) {
 		description = ge.Body.Content
 	}
 
-	var attendees []Attendee
+	var attendees []calendar.Attendee
 	for _, a := range ge.Attendees {
-		attendees = append(attendees, Attendee{
+		attendees = append(attendees, calendar.Attendee{
 			Name:     a.EmailAddress.Name,
 			Email:    a.EmailAddress.Address,
 			Type:     a.Type,
 			Response: a.Status.Response,
 		})
 	}
-	var organizer *Person
+	var organizer *calendar.Person
 	if ge.Organizer != nil {
-		organizer = &Person{Name: ge.Organizer.EmailAddress.Name, Email: ge.Organizer.EmailAddress.Address}
+		organizer = &calendar.Person{Name: ge.Organizer.EmailAddress.Name, Email: ge.Organizer.EmailAddress.Address}
 	}
 	onlineMeetingURL := ge.OnlineMeetingURL
 	if ge.OnlineMeeting != nil && ge.OnlineMeeting.JoinURL != "" {
 		onlineMeetingURL = ge.OnlineMeeting.JoinURL
 	}
 
-	return Event{
+	return calendar.Event{
 		ID:           ge.ID,
 		ICalUID:      ge.ICalUID,
 		Subject:      ge.Subject,
@@ -501,7 +499,7 @@ func eventFromGraph(ge graphEvent) (Event, bool) {
 		IsCancelled:      ge.IsCancelled,
 		IsOnlineMeeting:  ge.IsOnlineMeeting,
 		OnlineMeetingURL: onlineMeetingURL,
-		OwnerResponse:    ownerRespFromGraph(ge.ResponseStatus.Response),
+		OwnerResponse:    calendar.OwnerRespFromGraph(ge.ResponseStatus.Response),
 	}, true
 }
 
@@ -517,10 +515,10 @@ type eventPage struct {
 // every page (including @odata.nextLink follow-ups) so start/end come back in
 // UTC. For all-day events Graph reports midnight boundaries with an exclusive
 // end date; both are kept as-is.
-func (c *Client) FetchEvents(ctx context.Context, calendarID string, from, to time.Time) ([]Event, error) {
+func (c *Client) FetchEvents(ctx context.Context, calendarID string, from, to time.Time) ([]calendar.Event, error) {
 	headers := map[string]string{"Prefer": preferUTC}
 
-	var events []Event
+	var events []calendar.Event
 	pageURL := fmt.Sprintf("%s/me/calendars/%s/calendarView?startDateTime=%s&endDateTime=%s&$select=%s&$top=100",
 		c.baseURL, url.PathEscape(calendarID),
 		url.QueryEscape(from.UTC().Format(time.RFC3339)),
@@ -546,7 +544,7 @@ func (c *Client) FetchEvents(ctx context.Context, calendarID string, from, to ti
 
 // FetchInstances implements the provider seam: the windowed, series-expanded
 // calendarView fetch (see FetchEvents).
-func (c *Client) FetchInstances(ctx context.Context, calendarID string, from, to time.Time) ([]Event, error) {
+func (c *Client) FetchInstances(ctx context.Context, calendarID string, from, to time.Time) ([]calendar.Event, error) {
 	return c.FetchEvents(ctx, calendarID, from, to)
 }
 
@@ -556,10 +554,10 @@ func (c *Client) FetchInstances(ctx context.Context, calendarID string, from, to
 // are skipped — the two-way sync engine works on series definitions, not
 // instances. The Prefer header (UTC dateTimes, immutable ids) is sent on
 // every page (including @odata.nextLink follow-ups).
-func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]Event, error) {
+func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]calendar.Event, error) {
 	headers := map[string]string{"Prefer": preferMaster}
 
-	var events []Event
+	var events []calendar.Event
 	pageURL := fmt.Sprintf("%s/me/calendars/%s/events?$select=%s&$top=100",
 		c.baseURL, url.PathEscape(calendarID), masterEventSelect)
 	for pageURL != "" {
@@ -591,20 +589,21 @@ func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]Ev
 // this event. The sync engine reads an event back through this after a
 // create/update, because Graph normalizes events server-side right after a
 // write, so the settled read-back — not the POST/PATCH response — is the
-// canonical content the eventContentHash baseline must be computed from.
+// canonical content the calendar.EventContentHash baseline must be computed
+// from.
 // calendarID is unused: Graph event ids are mailbox-global.
-func (c *Client) GetEvent(ctx context.Context, calendarID, eventID string) (Event, error) {
+func (c *Client) GetEvent(ctx context.Context, calendarID, eventID string) (calendar.Event, error) {
 	_ = calendarID
 	reqURL := fmt.Sprintf("%s/me/events/%s?$select=%s",
 		c.baseURL, url.PathEscape(eventID), masterEventSelect)
 
 	var ge graphEvent
 	if err := c.doJSON(ctx, reqURL, map[string]string{"Prefer": preferMaster}, &ge); err != nil {
-		return Event{}, fmt.Errorf("failed to get event %s: %w", eventID, err)
+		return calendar.Event{}, fmt.Errorf("failed to get event %s: %w", eventID, err)
 	}
 	ev, ok := eventFromGraph(ge)
 	if !ok {
-		return Event{}, fmt.Errorf("failed to parse event %s", eventID)
+		return calendar.Event{}, fmt.Errorf("failed to parse event %s", eventID)
 	}
 	slog.Debug("Fetched event", "module", "GRAPHCAL", "id", ev.ID, "changeKey", ev.ETag)
 	return ev, nil
@@ -614,10 +613,10 @@ func (c *Client) GetEvent(ctx context.Context, calendarID, eventID string) (Even
 // exactly like the fetch paths do (ok=false on undecodable/unparseable
 // input). The sync-engine tests use it to compute the expected content-hash
 // baselines for the fake Graph payloads they serve.
-func ParseEventJSON(data []byte) (Event, bool) {
+func ParseEventJSON(data []byte) (calendar.Event, bool) {
 	var ge graphEvent
 	if err := json.Unmarshal(data, &ge); err != nil {
-		return Event{}, false
+		return calendar.Event{}, false
 	}
 	return eventFromGraph(ge)
 }

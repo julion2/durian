@@ -23,10 +23,10 @@ go_library(
     visibility = ["//cli:__subpackages__"],
     deps = [
         "//cli/internal/auth",
+        "//cli/internal/calendar",
         "//cli/internal/config",
         "//cli/internal/contacts",
         "//cli/internal/encoding",
-        "//cli/internal/graphcalendar",
         "//cli/internal/imap",
         "//cli/internal/mail",
         "//cli/internal/protocol",
@@ -55,10 +55,10 @@ go_test(
     ],
     embed = [":handler"],
     deps = [
+        "//cli/internal/calendar",
         "//cli/internal/config",
         "//cli/internal/contacts",
         "//cli/internal/dbcrypto",
-        "//cli/internal/graphcalendar",
         "//cli/internal/protocol",
         "//cli/internal/smtp",
         "//cli/internal/store",

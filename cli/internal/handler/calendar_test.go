@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/julion2/durian/cli/internal/config"
-	"github.com/julion2/durian/cli/internal/graphcalendar"
 )
 
 // newCalendarHandler builds a Handler whose config points at a temp vdir seeded
@@ -28,12 +28,12 @@ func newCalendarHandler(t *testing.T) (http.Handler, string) {
 	if err := os.WriteFile(filepath.Join(calDir, "displayname"), []byte("Calendar\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeCalendarTestEvent(t, calDir, graphcalendar.Event{
+	writeCalendarTestEvent(t, calDir, calendar.Event{
 		ICalUID: "evt-lunch", Subject: "Team Lunch",
 		Start: time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC),
 		End:   time.Date(2026, 8, 1, 13, 0, 0, 0, time.UTC),
 	})
-	writeCalendarTestEvent(t, calDir, graphcalendar.Event{
+	writeCalendarTestEvent(t, calDir, calendar.Event{
 		ICalUID: "evt-review", Subject: "Design Review",
 		Start: time.Date(2026, 8, 5, 9, 0, 0, 0, time.UTC),
 		End:   time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC),
@@ -49,9 +49,9 @@ func newCalendarHandler(t *testing.T) (http.Handler, string) {
 }
 
 // writeCalendarTestEvent serializes an event into calDir under its UID name.
-func writeCalendarTestEvent(t *testing.T, calDir string, ev graphcalendar.Event) {
+func writeCalendarTestEvent(t *testing.T, calDir string, ev calendar.Event) {
 	t.Helper()
-	data, err := graphcalendar.EventToICal(ev)
+	data, err := calendar.EventToICal(ev)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,8 +75,8 @@ func getJSON(t *testing.T, r http.Handler, url string, out any) int {
 func TestCalendarsHandler(t *testing.T) {
 	r, _ := newCalendarHandler(t)
 	var resp struct {
-		OK        bool                        `json:"ok"`
-		Calendars []graphcalendar.CalendarDTO `json:"calendars"`
+		OK        bool                   `json:"ok"`
+		Calendars []calendar.CalendarDTO `json:"calendars"`
 	}
 	if code := getJSON(t, r, "/api/v1/calendars?account=work", &resp); code != http.StatusOK {
 		t.Fatalf("status %d", code)
@@ -92,8 +92,8 @@ func TestCalendarsHandler(t *testing.T) {
 func TestCalendarEventsWindow(t *testing.T) {
 	r, _ := newCalendarHandler(t)
 	var resp struct {
-		OK     bool                          `json:"ok"`
-		Events []graphcalendar.CalendarEvent `json:"events"`
+		OK     bool                     `json:"ok"`
+		Events []calendar.CalendarEvent `json:"events"`
 	}
 	getJSON(t, r, "/api/v1/calendars/events?account=work&from=2026-08-01&to=2026-08-10", &resp)
 	if !resp.OK || len(resp.Events) != 2 {
@@ -112,7 +112,7 @@ func TestCalendarEventsWindow(t *testing.T) {
 func TestCalendarEventsWindowExcludes(t *testing.T) {
 	r, _ := newCalendarHandler(t)
 	var resp struct {
-		Events []graphcalendar.CalendarEvent `json:"events"`
+		Events []calendar.CalendarEvent `json:"events"`
 	}
 	// Window before both events.
 	getJSON(t, r, "/api/v1/calendars/events?account=work&from=2026-07-01&to=2026-07-31", &resp)
@@ -124,7 +124,7 @@ func TestCalendarEventsWindowExcludes(t *testing.T) {
 func TestCalendarEventsSearch(t *testing.T) {
 	r, _ := newCalendarHandler(t)
 	var resp struct {
-		Events []graphcalendar.CalendarEvent `json:"events"`
+		Events []calendar.CalendarEvent `json:"events"`
 	}
 	getJSON(t, r, "/api/v1/calendars/events?account=work&q=review", &resp)
 	if len(resp.Events) != 1 || resp.Events[0].Subject != "Design Review" {
@@ -135,8 +135,8 @@ func TestCalendarEventsSearch(t *testing.T) {
 func TestCalendarEventDetail(t *testing.T) {
 	r, _ := newCalendarHandler(t)
 	var resp struct {
-		OK    bool                        `json:"ok"`
-		Event graphcalendar.CalendarEvent `json:"event"`
+		OK    bool                   `json:"ok"`
+		Event calendar.CalendarEvent `json:"event"`
 	}
 	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref=lunch", &resp); code != http.StatusOK {
 		t.Fatalf("status %d", code)
@@ -156,8 +156,8 @@ func TestCalendarPutGetDeleteRoundTrip(t *testing.T) {
 		t.Fatalf("PUT status %d: %s", w.Code, w.Body.String())
 	}
 	var put struct {
-		OK    bool                        `json:"ok"`
-		Event graphcalendar.CalendarEvent `json:"event"`
+		OK    bool                   `json:"ok"`
+		Event calendar.CalendarEvent `json:"event"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &put); err != nil {
 		t.Fatal(err)
@@ -169,7 +169,7 @@ func TestCalendarPutGetDeleteRoundTrip(t *testing.T) {
 
 	// Read it back.
 	var got struct {
-		Event graphcalendar.CalendarEvent `json:"event"`
+		Event calendar.CalendarEvent `json:"event"`
 	}
 	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref="+uid, &got); code != http.StatusOK {
 		t.Fatalf("GET after PUT status %d", code)
@@ -220,7 +220,7 @@ func TestCalendarPutAllDaySnap(t *testing.T) {
 		t.Fatalf("PUT status %d: %s", w.Code, w.Body.String())
 	}
 	var put struct {
-		Event graphcalendar.CalendarEvent `json:"event"`
+		Event calendar.CalendarEvent `json:"event"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &put); err != nil {
 		t.Fatal(err)
@@ -236,7 +236,7 @@ func TestCalendarPutAllDaySnap(t *testing.T) {
 
 	// The stored .ics agrees: reading it back yields the snapped day span.
 	var got struct {
-		Event graphcalendar.CalendarEvent `json:"event"`
+		Event calendar.CalendarEvent `json:"event"`
 	}
 	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref="+put.Event.UID, &got); code != http.StatusOK {
 		t.Fatalf("GET after PUT status %d", code)
@@ -252,18 +252,18 @@ func TestCalendarPutUpdatePreservesMeetingFields(t *testing.T) {
 	// and the owner's RSVP survive — otherwise the next sync would push the
 	// stripped event (e.g. an uninvite wave) to Graph.
 	r, calDir := newCalendarHandler(t)
-	writeCalendarTestEvent(t, calDir, graphcalendar.Event{
+	writeCalendarTestEvent(t, calDir, calendar.Event{
 		ICalUID: "evt-meeting", Subject: "Weekly Sync",
 		Start: time.Date(2026, 8, 6, 9, 0, 0, 0, time.UTC),
 		End:   time.Date(2026, 8, 6, 10, 0, 0, 0, time.UTC),
-		Attendees: []graphcalendar.Attendee{
+		Attendees: []calendar.Attendee{
 			{Name: "Me", Email: "me@example.com", Type: "required", Response: "accepted"},
 			{Name: "Alice", Email: "alice@example.com", Type: "required", Response: "accepted"},
 		},
-		Organizer: &graphcalendar.Person{Name: "Org", Email: "organizer@example.com"},
-		Recurrence: &graphcalendar.Recurrence{
-			Pattern: graphcalendar.RecurrencePattern{Type: "weekly", Interval: 1, DaysOfWeek: []string{"thursday"}},
-			Range:   graphcalendar.RecurrenceRange{Type: "noEnd", StartDate: "2026-08-06"},
+		Organizer: &calendar.Person{Name: "Org", Email: "organizer@example.com"},
+		Recurrence: &calendar.Recurrence{
+			Pattern: calendar.RecurrencePattern{Type: "weekly", Interval: 1, DaysOfWeek: []string{"thursday"}},
+			Range:   calendar.RecurrenceRange{Type: "noEnd", StartDate: "2026-08-06"},
 		},
 		IsCancelled: true,
 	})
@@ -276,7 +276,7 @@ func TestCalendarPutUpdatePreservesMeetingFields(t *testing.T) {
 	}
 
 	var got struct {
-		Event graphcalendar.CalendarEvent `json:"event"`
+		Event calendar.CalendarEvent `json:"event"`
 	}
 	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref=evt-meeting", &got); code != http.StatusOK {
 		t.Fatalf("GET after PUT status %d", code)
@@ -348,13 +348,13 @@ func TestCalendarHandlerErrors(t *testing.T) {
 
 // readCalendarTestEvent parses the .ics the handler wrote, so a test can
 // assert on fields the JSON projection does not expose.
-func readCalendarTestEvent(t *testing.T, calDir, uid string) graphcalendar.Event {
+func readCalendarTestEvent(t *testing.T, calDir, uid string) calendar.Event {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(calDir, uid+".ics"))
 	if err != nil {
 		t.Fatalf("read %s.ics: %v", uid, err)
 	}
-	ev, err := graphcalendar.ICalToEvent(data, "me@example.com")
+	ev, err := calendar.ICalToEvent(data, "me@example.com")
 	if err != nil {
 		t.Fatalf("parse %s.ics: %v", uid, err)
 	}
@@ -366,7 +366,7 @@ func readCalendarTestEvent(t *testing.T, calDir, uid string) graphcalendar.Event
 // survive as a non-.ics sibling the local scan ignores.
 func TestCalendarDeleteKeepsBackup(t *testing.T) {
 	r, calDir := newCalendarHandler(t)
-	writeCalendarTestEvent(t, calDir, graphcalendar.Event{
+	writeCalendarTestEvent(t, calDir, calendar.Event{
 		ICalUID: "evt-gone", Subject: "Draft idea",
 		Start: time.Date(2026, 8, 6, 9, 0, 0, 0, time.UTC),
 		End:   time.Date(2026, 8, 6, 10, 0, 0, 0, time.UTC),

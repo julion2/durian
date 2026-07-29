@@ -72,6 +72,7 @@ var (
 	NewFileStateStore = calendarsync.NewFileStateStore
 
 	EventToICal      = calendar.EventToICal
+	WriteFileAtomic  = calendar.WriteFileAtomic
 	ICalToEvent      = calendar.ICalToEvent
 	eventContentHash = calendar.EventContentHash
 	hashBytes        = calendar.HashBytes
