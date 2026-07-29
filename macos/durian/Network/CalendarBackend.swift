@@ -75,6 +75,14 @@ struct CalendarEventWrite: Encodable {
     let description: String
 }
 
+/// POST /calendars/rsvp body (snake_case).
+struct CalendarRsvpWrite: Encodable {
+    let account: String
+    let calendar: String?
+    let ref: String
+    let response: String
+}
+
 // MARK: - Calendar Backend
 
 @MainActor
@@ -127,6 +135,16 @@ final class CalendarBackend {
     func putEvent(_ write: CalendarEventWrite) async -> CalendarEventWire? {
         guard let data = try? JSONEncoder().encode(write) else { return nil }
         let resp: CalendarEventResponse? = await request("/calendars/event", method: "PUT", bodyData: data)
+        return resp?.event
+    }
+
+    /// Sets the owner's RSVP on a meeting. Local-first: only the owner's
+    /// PARTSTAT in the local .ics changes — the organizer is notified on the
+    /// next `durian calendar sync`.
+    func rsvp(account: String, calendar: String?, ref: String, response: String) async -> CalendarEventWire? {
+        let body = CalendarRsvpWrite(account: account, calendar: calendar, ref: ref, response: response)
+        guard let data = try? JSONEncoder().encode(body) else { return nil }
+        let resp: CalendarEventResponse? = await request("/calendars/rsvp", method: "POST", bodyData: data)
         return resp?.event
     }
 

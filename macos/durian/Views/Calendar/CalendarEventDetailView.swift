@@ -126,7 +126,7 @@ struct CalendarEventDetailView: View {
                             .foregroundStyle(Color.Detail.textSecondary)
                     }
                 }
-                ForEach(event.attendees) { attendee in
+                ForEach(displayAttendees) { attendee in
                     HStack(spacing: 8) {
                         avatar(attendee.displayName)
                         Text(attendee.displayName)
@@ -141,14 +141,23 @@ struct CalendarEventDetailView: View {
         }
     }
 
+    /// Attendees without the organizer: some providers (e.g. Google) list the
+    /// organizer as a self-attendee, which would otherwise show them twice —
+    /// once in the organizer row and once here.
+    private var displayAttendees: [CalendarAttendee] {
+        guard let org = event.organizer?.email, !org.isEmpty else { return event.attendees }
+        return event.attendees.filter { $0.email.caseInsensitiveCompare(org) != .orderedSame }
+    }
+
     private var peopleTitle: String {
-        event.attendees.isEmpty ? "People" : "People (\(event.attendees.count))"
+        displayAttendees.isEmpty ? "People" : "People (\(displayAttendees.count))"
     }
 
     // MARK: - RSVP
 
     /// Shown for meetings the account owner attends (not organizes). The current
-    /// response is highlighted. Wired to a stub for now — see requestRSVP.
+    /// response is highlighted. The buttons save the response locally via
+    /// CalendarManager.requestRSVP; the organizer is notified on the next sync.
     private var isOrganizer: Bool { event.myResponse == "organizer" }
     private var showRSVP: Bool { !event.attendees.isEmpty && !isOrganizer }
 

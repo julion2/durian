@@ -9,6 +9,7 @@ go_library(
         "ics.go",
         "local_scan.go",
         "read_local.go",
+        "rsvp.go",
     ],
     importpath = "github.com/julion2/durian/cli/internal/calendar",
     visibility = ["//cli:__subpackages__"],
@@ -24,6 +25,7 @@ go_test(
     srcs = [
         "ical_roundtrip_test.go",
         "read_local_test.go",
+        "rsvp_test.go",
     ],
     embed = [":calendar"],
 )

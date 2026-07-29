@@ -345,12 +345,40 @@ final class CalendarManager: ObservableObject {
     func selectFirst() { selectedEventID = events.first?.id }
     func selectLast() { selectedEventID = events.last?.id }
 
-    /// RSVP to a meeting. TODO: wire to a write endpoint (POST /calendars/rsvp)
-    /// that edits the owner's PARTSTAT in the local .ics and applies the sync
-    /// (reusing the Stage-2 RSVP engine + safety rails). For now a no-op so the
-    /// detail view can show the controls.
+    /// RSVP to a meeting via the local-first write endpoint (POST
+    /// /calendars/rsvp): only the owner's PARTSTAT in the local .ics changes —
+    /// no mail is sent now. The organizer is notified on the next `durian
+    /// calendar sync`, which previews the reply behind its confirmation gate.
     func requestRSVP(_ event: CalendarEvent, response: String) {
-        Log.info("CALENDAR", "RSVP '\(response)' requested for \(event.uid) — write path not yet wired")
+        guard !event.account.isEmpty else { return }
+        let account = event.account
+        let uid = event.uid
+        let calendar = event.calendar
+        Task { [weak self] in
+            guard let self else { return }
+            guard await backend.rsvp(account: account, calendar: calendar,
+                                     ref: uid, response: response) != nil
+            else {
+                BannerManager.shared.showWarning(
+                    title: "Couldn't save RSVP",
+                    message: "The write failed — make sure the durian CLI is up to date."
+                )
+                return
+            }
+            // Make the local-first model explicit: the response is only saved
+            // locally until the next calendar sync notifies the organizer.
+            let name = ConfigManager.shared.getAccounts()
+                .first { $0.email == account }?.name ?? account
+            let syncTarget = name.contains(" ") ? "\"\(name)\"" : name
+            BannerManager.shared.showInfo(
+                title: "Response saved",
+                message: "Run 'durian calendar sync \(syncTarget)' (or wait for the next sync) to notify the organizer."
+            )
+            // Reconcile the store with the server and refetch the detail so
+            // the pane shows the new response.
+            refresh(force: true)
+            loadDetail()
+        }
     }
 
     // MARK: - Editing (local-first writes)

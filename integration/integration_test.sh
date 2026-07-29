@@ -21,6 +21,8 @@ CAL_DIR="$XDG_DATA_HOME/durian/calendars/test/Work"
 mkdir -p "$CAL_DIR"
 printf 'Work\n' > "$CAL_DIR/displayname"
 printf 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//durian//test//EN\r\nBEGIN:VEVENT\r\nUID:int-evt-1\r\nSUMMARY:Integration Meeting\r\nDTSTART:20260801T120000Z\r\nDTEND:20260801T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n' > "$CAL_DIR/int-evt-1.ics"
+# A meeting the owner (test@example.com) was invited to, for the RSVP endpoint.
+printf 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//durian//test//EN\r\nBEGIN:VEVENT\r\nUID:int-evt-rsvp\r\nSUMMARY:Invited Meeting\r\nDTSTART:20260802T120000Z\r\nDTEND:20260802T130000Z\r\nORGANIZER;CN=Boss:mailto:boss@example.com\r\nATTENDEE;CN=Boss;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:boss@example.com\r\nATTENDEE;CN=Me;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION:mailto:test@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n' > "$CAL_DIR/int-evt-rsvp.ics"
 FAILURES=0
 PASSED=0
 
@@ -287,6 +289,21 @@ assert_jq "GET created event has location" "$RESP" '.event.location == "Room 1"'
 assert_http_code "DELETE /calendars/event → 200" "$BASE/calendars/event?account=test&ref=$NEW_UID" "DELETE" "200"
 assert_http_code "GET after DELETE → 404" "$BASE/calendars/event?account=test&ref=$NEW_UID" "GET" "404"
 assert_http_code "PUT missing calendar → 400" "$BASE/calendars/event" "PUT" "400" '{"account":"test","subject":"x","start":"2026-08-01T09:00:00Z","end":"2026-08-01T10:00:00Z"}'
+
+# RSVP round-trip (local-first): the owner's PARTSTAT is rewritten in the .ics,
+# nothing is sent — the GUI-style Graph verb must be accepted.
+RESP=$(curl -s "${AUTH[@]}" -X POST "$BASE/calendars/rsvp" -H "Content-Type: application/json" \
+  -d '{"account":"test","ref":"int-evt-rsvp","response":"accepted"}')
+assert_jq "POST /calendars/rsvp .ok is true" "$RESP" '.ok == true'
+assert_jq "POST /calendars/rsvp .event.my_response accepted" "$RESP" '.event.my_response == "accepted"'
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/calendars/event?account=test&ref=int-evt-rsvp")
+assert_jq "GET after RSVP .event.my_response accepted" "$RESP" '.event.my_response == "accepted"'
+assert_http_code "POST /calendars/rsvp bad verb → 400" "$BASE/calendars/rsvp" "POST" "400" \
+  '{"account":"test","ref":"int-evt-rsvp","response":"maybe"}'
+assert_http_code "POST /calendars/rsvp not an attendee → 400" "$BASE/calendars/rsvp" "POST" "400" \
+  '{"account":"test","ref":"int-evt-1","response":"accepted"}'
+assert_http_code "POST /calendars/rsvp unknown ref → 404" "$BASE/calendars/rsvp" "POST" "404" \
+  '{"account":"test","ref":"nope","response":"accepted"}'
 
 # All-day snap: a sub-day all-day event is normalized to a full midnight-UTC day
 RESP=$(curl -s "${AUTH[@]}" -X PUT "$BASE/calendars/event" -H "Content-Type: application/json" \

@@ -8,48 +8,8 @@ import (
 	"github.com/julion2/durian/cli/internal/calendar"
 )
 
-func TestParseRsvpVerb(t *testing.T) {
-	cases := map[string]calendar.OwnerResp{
-		"accept":    calendar.OwnerRespAccepted,
-		"Decline":   calendar.OwnerRespDeclined,
-		"TENTATIVE": calendar.OwnerRespTentative,
-	}
-	for in, want := range cases {
-		got, err := parseRsvpVerb(in)
-		if err != nil || got != want {
-			t.Errorf("parseRsvpVerb(%q) = %q, %v; want %q", in, got, err, want)
-		}
-	}
-	if _, err := parseRsvpVerb("maybe"); err == nil {
-		t.Error("parseRsvpVerb(maybe): want error")
-	}
-}
-
-func TestSetOwnerResponse(t *testing.T) {
-	owner := "me@example.com"
-	e := calendar.Event{Attendees: []calendar.Attendee{
-		{Email: "other@example.com", Response: "accepted"},
-		{Email: "ME@example.com", Response: "none"}, // owner, case-insensitive
-	}}
-	if !setOwnerResponse(&e, owner, calendar.OwnerRespDeclined) {
-		t.Fatal("setOwnerResponse: want true (owner is an attendee)")
-	}
-	if e.OwnerResponse != calendar.OwnerRespDeclined {
-		t.Errorf("OwnerResponse = %q, want declined", e.OwnerResponse)
-	}
-	if e.Attendees[1].Response != "declined" {
-		t.Errorf("owner attendee Response = %q, want declined", e.Attendees[1].Response)
-	}
-	if e.Attendees[0].Response != "accepted" {
-		t.Error("non-owner attendee response must not change")
-	}
-
-	// Owner not among attendees.
-	e2 := calendar.Event{Attendees: []calendar.Attendee{{Email: "x@example.com"}}}
-	if setOwnerResponse(&e2, owner, calendar.OwnerRespAccepted) {
-		t.Error("setOwnerResponse: want false when owner is not an attendee")
-	}
-}
+// ParseRSVPVerb/SetOwnerResponse moved to cli/internal/calendar (rsvp_test.go
+// covers them); runCalendarRsvp calls the exported versions.
 
 func TestParseHexColor(t *testing.T) {
 	if r, g, b, ok := parseHexColor("#FF8000"); !ok || r != 255 || g != 128 || b != 0 {

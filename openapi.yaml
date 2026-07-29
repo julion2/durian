@@ -559,6 +559,35 @@ paths:
           description: Missing account or ref
         '404':
           description: Account or event not found
+  /calendars/rsvp:
+    post:
+      summary: Set the owner's RSVP on a meeting locally (sent on next sync)
+      description: >-
+        Sets the account owner's response (accept/tentative/decline) on a
+        meeting by rewriting the owner's ATTENDEE PARTSTAT in the local .ics.
+        Local-first: only the vdir is written — no provider call, no mail. The
+        organizer is notified on the next `durian calendar sync`, which
+        previews the reply before sending. Only works when the owner is an
+        attendee (not the organizer) of the meeting.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CalendarRsvpRequest'
+      responses:
+        '200':
+          description: The updated event (full detail)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalendarEventResponse'
+        '400':
+          description: >-
+            Missing account/ref, unknown response verb, owner is the organizer,
+            or owner is not an attendee of the event
+        '404':
+          description: Account or event not found (or ambiguous reference)
 
 components:
   schemas:
@@ -1018,3 +1047,22 @@ components:
           items:
             $ref: '#/components/schemas/CalendarAttendee'
       required: [account, calendar, subject, start, end]
+    CalendarRsvpRequest:
+      type: object
+      description: Body for POST /calendars/rsvp (local-first owner RSVP).
+      properties:
+        account:
+          type: string
+          description: Account identifier (email, alias or name)
+        calendar:
+          type: string
+          description: Restrict the event lookup to a single calendar by display name
+        ref:
+          type: string
+          description: Event reference — iCalUID (exact or prefix) or a unique subject substring
+        response:
+          type: string
+          description: >-
+            The owner's response — accept/decline/tentative or the Graph-style
+            accepted/declined/tentativelyAccepted (case-insensitive)
+      required: [account, ref, response]

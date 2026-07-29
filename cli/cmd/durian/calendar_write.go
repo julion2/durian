@@ -193,7 +193,7 @@ func runCalendarRsvp(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	ref := args[1]
-	response, err := parseRsvpVerb(args[2])
+	response, err := calendar.ParseRSVPVerb(args[2])
 	if err != nil {
 		return err
 	}
@@ -206,7 +206,7 @@ func runCalendarRsvp(cmd *cobra.Command, args []string) error {
 	if isOwnerOrganizer(event, owner) {
 		return fmt.Errorf("cannot RSVP to %q — you are the organizer", orDash(event.Subject))
 	}
-	if !setOwnerResponse(&event, owner, response) {
+	if !calendar.SetOwnerResponse(&event, owner, response) {
 		return fmt.Errorf("you (%s) are not an attendee of %q, cannot RSVP", owner, orDash(event.Subject))
 	}
 
@@ -221,20 +221,6 @@ func runCalendarRsvp(cmd *cobra.Command, args []string) error {
 	fmt.Println(okLine("RSVP %q set to %q in %q", orDash(event.Subject), rsvpVerbLabel(response), calName))
 	printSyncReminder(account.GetAliasOrName(), true)
 	return nil
-}
-
-// parseRsvpVerb maps the CLI verb to the canonical owner response.
-func parseRsvpVerb(verb string) (calendar.OwnerResp, error) {
-	switch strings.ToLower(verb) {
-	case "accept":
-		return calendar.OwnerRespAccepted, nil
-	case "decline":
-		return calendar.OwnerRespDeclined, nil
-	case "tentative":
-		return calendar.OwnerRespTentative, nil
-	default:
-		return "", fmt.Errorf("unknown RSVP %q, use accept, decline or tentative", verb)
-	}
 }
 
 func rsvpVerbLabel(r calendar.OwnerResp) string {
@@ -254,27 +240,6 @@ func isOwnerOrganizer(e calendar.Event, owner string) bool {
 		return true
 	}
 	return e.Organizer != nil && owner != "" && strings.EqualFold(e.Organizer.Email, owner)
-}
-
-// setOwnerResponse updates the owner's own ATTENDEE response (the field that
-// EventToICal turns into the PARTSTAT parameter the sync later reads) and the
-// canonical OwnerResponse. It reports false when the owner is not among the
-// attendees, so a local file cannot carry an RSVP for a meeting the owner was
-// not invited to.
-func setOwnerResponse(e *calendar.Event, owner string, resp calendar.OwnerResp) bool {
-	graphResp := map[calendar.OwnerResp]string{
-		calendar.OwnerRespAccepted:  "accepted",
-		calendar.OwnerRespDeclined:  "declined",
-		calendar.OwnerRespTentative: "tentativelyAccepted",
-	}[resp]
-	for i := range e.Attendees {
-		if strings.EqualFold(e.Attendees[i].Email, owner) {
-			e.Attendees[i].Response = graphResp
-			e.OwnerResponse = resp
-			return true
-		}
-	}
-	return false
 }
 
 func runCalendarDelete(cmd *cobra.Command, args []string) error {

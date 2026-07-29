@@ -328,6 +328,102 @@ func TestCalendarPutUpdatePreservesMeetingFields(t *testing.T) {
 	}
 }
 
+func TestCalendarRsvpHandler(t *testing.T) {
+	r, calDir := newCalendarHandler(t)
+	writeCalendarTestEvent(t, calDir, calendar.Event{
+		ICalUID: "evt-invite", Subject: "Planning",
+		Start: time.Date(2026, 8, 7, 9, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC),
+		Attendees: []calendar.Attendee{
+			{Name: "Me", Email: "ME@example.com", Type: "required", Response: "none"},
+			{Name: "Alice", Email: "alice@example.com", Type: "required", Response: "accepted"},
+		},
+		Organizer: &calendar.Person{Name: "Org", Email: "organizer@example.com"},
+	})
+
+	// The Graph-style verb the GUI sends round-trips into the local .ics.
+	body := `{"account":"work","calendar":"Calendar","ref":"evt-invite","response":"accepted"}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/calendars/rsvp", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST status %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		OK    bool                   `json:"ok"`
+		Event calendar.CalendarEvent `json:"event"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.Event.MyResponse != "accepted" {
+		t.Errorf("response = %+v, want ok + my_response accepted", resp)
+	}
+
+	// The stored .ics carries the owner's PARTSTAT=ACCEPTED; the other
+	// attendee's response is untouched.
+	data, err := os.ReadFile(filepath.Join(calDir, "evt-invite.ics"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, err := calendar.ICalToEvent(data, "me@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.OwnerResponse != calendar.OwnerRespAccepted {
+		t.Errorf("stored OwnerResponse = %q, want accepted", ev.OwnerResponse)
+	}
+	if !strings.Contains(string(data), "PARTSTAT=ACCEPTED") {
+		t.Error("stored .ics has no PARTSTAT=ACCEPTED for the owner")
+	}
+	for _, a := range ev.Attendees {
+		if strings.EqualFold(a.Email, "alice@example.com") && a.Response != "accepted" {
+			t.Errorf("other attendee response = %q, want untouched", a.Response)
+		}
+	}
+
+	// Error paths: bad verb, no attendee entry for the owner (the seeded
+	// evt-lunch has no attendees), organizer, unknown ref, missing account.
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"bad verb", `{"account":"work","ref":"evt-invite","response":"maybe"}`, http.StatusBadRequest},
+		{"not an attendee", `{"account":"work","ref":"evt-lunch","response":"accepted"}`, http.StatusBadRequest},
+		{"unknown ref", `{"account":"work","ref":"nonexistent","response":"accepted"}`, http.StatusNotFound},
+		{"missing ref", `{"account":"work","response":"accepted"}`, http.StatusBadRequest},
+		{"unknown account", `{"account":"nope","ref":"evt-invite","response":"accepted"}`, http.StatusNotFound},
+		{"invalid body", `not json`, http.StatusBadRequest},
+	}
+	for _, c := range cases {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/calendars/rsvp", strings.NewReader(c.body)))
+		if w.Code != c.want {
+			t.Errorf("%s: status %d, want %d", c.name, w.Code, c.want)
+		}
+	}
+}
+
+func TestCalendarRsvpHandlerOrganizer(t *testing.T) {
+	r, calDir := newCalendarHandler(t)
+	writeCalendarTestEvent(t, calDir, calendar.Event{
+		ICalUID: "evt-mine", Subject: "My Meeting",
+		Start: time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 8, 8, 10, 0, 0, 0, time.UTC),
+		Attendees: []calendar.Attendee{
+			{Name: "Me", Email: "me@example.com", Type: "required", Response: "organizer"},
+			{Name: "Alice", Email: "alice@example.com", Type: "required", Response: "none"},
+		},
+		Organizer: &calendar.Person{Name: "Me", Email: "me@example.com"},
+	})
+	body := `{"account":"work","ref":"evt-mine","response":"declined"}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/calendars/rsvp", strings.NewReader(body)))
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("organizer RSVP = %d, want 400", w.Code)
+	}
+}
+
 func TestCalendarHandlerErrors(t *testing.T) {
 	r, _ := newCalendarHandler(t)
 	cases := []struct {

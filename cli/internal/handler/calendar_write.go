@@ -161,6 +161,68 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 	writeJSON(w, map[string]any{"ok": true, "event": calendar.ToCalendarEvent(req.Calendar, ev, true)})
 }
 
+// calendarRsvpRequest is the POST /calendars/rsvp request body (snake_case).
+type calendarRsvpRequest struct {
+	Account  string `json:"account"`
+	Calendar string `json:"calendar"`
+	Ref      string `json:"ref"`
+	Response string `json:"response"`
+}
+
+// CalendarRsvpHandler sets the account owner's RSVP on a meeting by rewriting
+// the owner's ATTENDEE PARTSTAT (and the canonical owner response) in the
+// resolved local .ics. Strictly local-first: no provider call and no mail —
+// the organizer only learns of the response on the next `durian calendar
+// sync`, where an RSVP is a notifying action behind the preview/confirmation
+// gate.
+func (h *Handler) CalendarRsvpHandler(w http.ResponseWriter, r *http.Request) {
+	var req calendarRsvpRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	dir, owner, ok := h.resolveCalendarAccount(w, req.Account)
+	if !ok {
+		return
+	}
+	if req.Ref == "" {
+		http.Error(w, "missing required 'ref'", http.StatusBadRequest)
+		return
+	}
+	resp, err := calendar.ParseRSVPVerb(req.Response)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	path, event, calName, err := calendar.ResolveLocalEvent(dir, owner, req.Ref, req.Calendar)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	// Same rail as the CLI `calendar rsvp`: an organizer does not RSVP to
+	// their own meeting.
+	if event.OwnerResponse == calendar.OwnerRespOrganizer || calendar.OwnerIsOrganizer(event, owner) {
+		http.Error(w, "cannot RSVP: you are the organizer of this event", http.StatusBadRequest)
+		return
+	}
+	if !calendar.SetOwnerResponse(&event, owner, resp) {
+		http.Error(w, "not an attendee of this event", http.StatusBadRequest)
+		return
+	}
+	data, err := calendar.EventToICal(event)
+	if err != nil {
+		slog.Error("Failed to serialize RSVP into local event", "module", "API", "err", err)
+		http.Error(w, "failed to serialize event", http.StatusInternalServerError)
+		return
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		slog.Error("Failed to write local event", "module", "API", "err", err)
+		http.Error(w, "failed to write event", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "event": calendar.ToCalendarEvent(calName, event, true)})
+}
+
 // CalendarDeleteEventHandler removes a local .ics by reference. The deletion is
 // propagated to Outlook on the next sync.
 func (h *Handler) CalendarDeleteEventHandler(w http.ResponseWriter, r *http.Request) {

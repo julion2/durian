@@ -180,6 +180,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	r.HandleFunc("/api/v1/calendars/event", h.CalendarEventHandler).Methods("GET")
 	r.HandleFunc("/api/v1/calendars/event", h.CalendarPutEventHandler).Methods("PUT")
 	r.HandleFunc("/api/v1/calendars/event", h.CalendarDeleteEventHandler).Methods("DELETE")
+	r.HandleFunc("/api/v1/calendars/rsvp", h.CalendarRsvpHandler).Methods("POST")
 	r.HandleFunc("/api/v1/calendars", h.CalendarsHandler).Methods("GET")
 
 	// Outbox routes
