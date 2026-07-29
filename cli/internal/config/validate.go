@@ -159,9 +159,9 @@ func ValidateConfig(cfg *Config) []ValidationError {
 			}
 		}
 
-		// Calendar export (Microsoft Graph only)
-		if acct.Calendar != nil && (acct.OAuth == nil || acct.OAuth.Provider != "microsoft") {
-			warn(prefix+".calendar", "calendar export only works for Microsoft accounts; this block will be ignored")
+		// Calendar sync (Microsoft Graph or Google Calendar)
+		if acct.Calendar != nil && (acct.OAuth == nil || (acct.OAuth.Provider != "microsoft" && acct.OAuth.Provider != "google")) {
+			warn(prefix+".calendar", "calendar sync only works for Microsoft and Google OAuth accounts; this block will be ignored")
 		}
 		if acct.Calendar != nil {
 			switch acct.Calendar.Conflict {

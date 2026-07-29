@@ -3,7 +3,7 @@
 // Remove the example accounts below and add your own.
 import "modulepath:/Config.pkl" as C
 
-settings {
+settings: C.SettingsConfig = new {
   theme = "system"                    // "light", "dark", or "system"
   notifications_enabled = true        // Global notification toggle
   load_remote_images = false          // Block tracking pixels by default
@@ -12,7 +12,7 @@ settings {
 
 // Optional: override the contacts database location.
 // Default: ~/.local/share/durian/contacts.db (XDG_DATA_HOME)
-// contacts { db_path = "~/.local/share/durian/contacts.db" }
+// contacts: C.ContactsConfig = new { db_path = "~/.local/share/durian/contacts.db" }
 
 // Optional: calendar settings. `durian serve` runs a background calendar sync
 // (autosync): remote changes are pulled into the local vdir. By default
@@ -23,16 +23,17 @@ settings {
 // non-notifying local changes (creates/edits of events WITHOUT attendees);
 // remote deletes, conflicts, RSVPs and anything that could make the provider
 // send email still wait for the interactive sync.
-// Disable per account with accounts[*].calendar { autosync = false }.
-// calendar {
+// Override per account with accounts[*].calendar { autosync = false } or
+// accounts[*].calendar { autosync_upload = "safe" }.
+// calendar: C.CalendarConfig = new {
 //   vdir_path = "~/.local/share/durian/calendars"
 //   autosync = true            // Background sync in `durian serve`
-//   autosync_interval = 600    // Seconds between autosync runs (minimum 60)
+//   autosync_interval = 60     // Seconds between autosync runs (minimum and default 60)
 //   autosync_upload = "none"   // "none" = download-only; "safe" = also push
 //                              // non-notifying local changes (never deletes)
 // }
 
-sync {
+sync: C.SyncConfig = new {
   gui_auto_sync = true                // GUI auto-syncs on launch and periodically
   auto_fetch_interval = 120           // Quick sync interval in seconds (GUI)
   full_sync_interval = 7200           // Full sync interval in seconds (GUI)
@@ -42,9 +43,14 @@ sync {
 
   // Optional: attachment cache settings (GUI prefetches on thread open).
   // attachment_cache { max_size_mb = 100; ttl_days = 7 }
+
+  // Optional: extra MIME headers to fetch and index (for rules.pkl matching
+  // against provider-specific headers). After changing the list, run
+  // `durian sync --backfill-headers` once to populate existing messages.
+  // indexed_headers { "X-GitLab-NotificationReason"; "X-Spam-Status" }
 }
 
-signatures {
+signatures: Mapping<String, String> = new {
   ["default"] = "Best regards"
   ["work"] = """
     <b>Your Name</b><br>
@@ -57,7 +63,7 @@ signatures {
     """
 }
 
-accounts {
+accounts: Listing<C.AccountConfig> = new {
   // ── Password auth (e.g. GMX, Hostinger, LRZ) ──────────────
   new {
     name = "Personal"
@@ -65,8 +71,14 @@ accounts {
     display_name = "Your Name"         // Used in From header
     alias = "personal"                 // Short alias for CLI: durian sync personal
     default_signature = "default"      // Signature key from signatures {}
-    smtp { host = "smtp.example.com"; port = 587; auth = "password" }
-    imap { host = "imap.example.com"; port = 993; auth = "password"; max_messages = 5000 }
+    smtp {
+      host = "smtp.example.com"; port = 587; auth = "password"
+      // max_attachment_size = "10MB"   // Optional: outgoing attachment cap (default "25MB")
+    }
+    imap {
+      host = "imap.example.com"; port = 993; auth = "password"; max_messages = 5000
+      // batch_size = 100               // Optional: messages fetched per IMAP round trip (default 100)
+    }
     auth { username = "you@example.com" }
     // Then run: durian auth login personal
   }
@@ -80,6 +92,25 @@ accounts {
     default = true                     // Default account for compose
     default_signature = "work"
     notifications = true               // Per-account notification override
+
+    // Optional: single-tenant Azure app registration (default "common").
+    // oauth { tenant = "your-tenant-id" }
+
+    // Optional: sync via Microsoft Graph instead of the legacy IMAP syncer
+    // (Microsoft accounts only; default "legacy").
+    // sync_engine = "graph"
+
+    // Optional: per-account calendar sync settings (Microsoft and Google
+    // OAuth accounts). All keys are optional; the block itself is too —
+    // `durian calendar sync <alias>` works without it.
+    // calendar {
+    //   dir = "work"                   // Subdir under calendar.vdir_path (default: account alias)
+    //   include { "Calendar"; "Team" } // Calendar display names to sync (default: all)
+    //   conflict = "remote"            // "remote" (default; local file backed up first), "local", or "newer"
+    //   autosync = false               // Override the global calendar.autosync toggle
+    //   autosync_upload = "safe"       // Override the global calendar.autosync_upload mode
+    // }
+
     // Then run: durian auth login work
   }
 

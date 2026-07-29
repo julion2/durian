@@ -41,10 +41,11 @@ var calendarCmd = &cobra.Command{
 
 var calendarExportCmd = &cobra.Command{
 	Use:   "export <account>",
-	Short: "Export Outlook calendars as vdir .ics files",
-	Long: `Export all calendars of a Microsoft account into a vdir layout that
-vdirsyncer / khal can read: one directory per calendar (with a displayname
-file) and one .ics file per event instance in the export window.
+	Short: "Export your calendars as vdir .ics files",
+	Long: `Export all calendars of an account (Microsoft Outlook or Google
+Calendar) into a vdir layout that vdirsyncer / khal can read: one directory
+per calendar (with a displayname file) and one .ics file per event instance
+in the export window.
 
 The export is one-way and read-only (Calendars.Read); recurring events are
 written as expanded occurrences, so no RRULEs appear in the output.`,
@@ -55,14 +56,16 @@ written as expanded occurrences, so no RRULEs appear in the output.`,
 
 var calendarSyncCmd = &cobra.Command{
 	Use:   "sync <account>",
-	Short: "Two-way sync Outlook calendars with a local vdir",
-	Long: `Synchronize the calendars of a Microsoft account with a local vdir of
-.ics files (one directory per calendar, one file per master event, named by
-the event UID; recurring series are stored as their master with an RRULE).
+	Short: "Two-way sync your calendars with a local vdir",
+	Long: `Synchronize the calendars of an account (Microsoft Outlook or Google
+Calendar) with a local vdir of .ics files (one directory per calendar, one
+file per master event, named by the event UID; recurring series are stored
+as their master with an RRULE).
 
 Remote changes are applied locally (download new/updated events, prune events
-deleted in Outlook), and local changes are pushed to Outlook (create new
-events, update edited ones, delete remotely what was deleted locally).
+deleted remotely), and local changes are pushed to the remote calendar
+(create new events, update edited ones, delete remotely what was deleted
+locally).
 Conflicts — events changed on both sides — are resolved per the account's
 calendar conflict policy ("remote" by default; a conflicting local file is
 always backed up to <file>.conflict-<timestamp> first).
@@ -72,11 +75,11 @@ invitations, organizer edits send updates, deleting an organizer meeting
 sends cancellations, deleting a meeting you merely attend declines it, and
 changing your own PARTSTAT sends an RSVP to the organizer (suppress the
 response email with --silent-rsvp). An X-DURIAN-CREATE-TEAMS-MEETING:TRUE
-line requests a Teams meeting on create.
+line requests an online meeting (Teams or Google Meet) on create.
 
 The sync first builds a plan and prints it, including a preview of every
-email the plan will cause Graph to send. If the plan contains changes to
-Outlook (uploads, remote deletes, conflicts, RSVPs), it asks for confirmation
+email the plan will cause the provider to send. If the plan contains remote
+changes (uploads, remote deletes, conflicts, RSVPs), it asks for confirmation
 before applying — declining aborts the entire run, local-only actions
 included, so "no" always means no changes anywhere. --yes skips the prompt;
 --dry-run stops after printing the plan.`,
@@ -111,9 +114,9 @@ func init() {
 	calendarSyncCmd.Flags().StringVar(&calendarSyncOut, "out", "",
 		"Vdir base directory (default: $XDG_DATA_HOME/durian/calendars)")
 	calendarSyncCmd.Flags().BoolVar(&calendarSyncDryRun, "dry-run", false,
-		"Print the sync plan without writing files, changing Outlook or saving state")
+		"Print the sync plan without writing files, changing the remote calendar or saving state")
 	calendarSyncCmd.Flags().BoolVar(&calendarSyncYes, "yes", false,
-		"Apply changes to Outlook without asking for confirmation")
+		"Apply changes to the remote calendar without asking for confirmation")
 	calendarSyncCmd.Flags().BoolVar(&calendarSyncSilentRSVP, "silent-rsvp", false,
 		"Record RSVP responses (accept/decline) without notifying the organizer")
 }

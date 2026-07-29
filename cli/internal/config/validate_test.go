@@ -144,6 +144,40 @@ func TestValidateConfig_CalendarConflictPolicy(t *testing.T) {
 	}
 }
 
+func TestValidateConfig_CalendarProviderWarning(t *testing.T) {
+	base := func(oauth *OAuthConfig) *Config {
+		return &Config{Accounts: []AccountConfig{{
+			Name: "Test", Email: "test@example.com",
+			OAuth:    oauth,
+			Calendar: &AccountCalendarConfig{},
+		}}}
+	}
+	calendarWarned := func(cfg *Config) bool {
+		for _, e := range ValidateConfig(cfg) {
+			if e.Field == "accounts[0].calendar" && e.Severity == "warning" {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Microsoft and Google accounts support calendar sync: no warning.
+	if calendarWarned(base(&OAuthConfig{Provider: "microsoft"})) {
+		t.Error("microsoft account with calendar block: unexpected warning")
+	}
+	if calendarWarned(base(&OAuthConfig{Provider: "google", ClientID: "id", ClientSecret: "secret"})) {
+		t.Error("google account with calendar block: unexpected warning")
+	}
+
+	// No OAuth (password auth) or an unsupported provider: still warned.
+	if !calendarWarned(base(nil)) {
+		t.Error("account without oauth but with calendar block: expected warning")
+	}
+	if !calendarWarned(base(&OAuthConfig{Provider: "acme"})) {
+		t.Error("unsupported oauth provider with calendar block: expected warning")
+	}
+}
+
 func TestAccountCalendarConflictPolicyDefault(t *testing.T) {
 	a := &AccountConfig{}
 	if got := a.CalendarConflictPolicy(); got != "remote" {
