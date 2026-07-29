@@ -44,6 +44,10 @@ struct CalendarEventEditView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
+        // Escape cancels the edit. The Cancel button's .cancelAction shortcut
+        // does not fire reliably in a plain detail pane (no dialog context),
+        // so catch the exit command on the view itself.
+        .onExitCommand { onCancel() }
     }
 
     // MARK: - Header (Cancel / title / Save)
