@@ -215,6 +215,15 @@ func (a *AccountConfig) GetAuthEmail() string {
 	return a.Email
 }
 
+// IsDelegatedMailbox reports whether this account authenticates as a different
+// user than its own address (a shared mailbox reached via a delegating token
+// owner). Its calendar endpoints resolve to the TOKEN OWNER's mailbox (/me),
+// so calendar-syncing it would just re-fetch the owner account's calendars
+// into a second directory — calendar autosync skips these.
+func (a *AccountConfig) IsDelegatedMailbox() bool {
+	return a.AuthEmail != "" && a.AuthEmail != a.Email
+}
+
 // SMTPConfig contains SMTP server settings.
 // Note: TLS is decided by port (465 = implicit TLS, 587 = STARTTLS) in
 // cli/internal/smtp/client.go — there is intentionally no ssl flag.

@@ -48,6 +48,14 @@ func startCalendarAutosync(ctx context.Context, hub *handler.EventHub, cfg *conf
 		if account.OAuth == nil {
 			continue
 		}
+		// A shared/delegated mailbox authenticates as the token owner, whose
+		// /me calendars are already synced by the owner account — running it
+		// here would just duplicate them into a second directory.
+		if account.IsDelegatedMailbox() {
+			slog.Debug("Calendar autosync skipped for delegated mailbox", "module", "CALSYNC",
+				"account", account.GetAliasOrName()) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+			continue
+		}
 		if !cfg.CalendarAutosyncEnabled(account) {
 			slog.Debug("Calendar autosync disabled for account", "module", "CALSYNC", // encgrep:allow static message text, no content
 				"account", account.GetAliasOrName()) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys

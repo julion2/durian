@@ -159,6 +159,20 @@ func TestAccountCalendarConflictPolicyDefault(t *testing.T) {
 	}
 }
 
+func TestIsDelegatedMailbox(t *testing.T) {
+	// Own mailbox: no auth_email, or auth_email == email.
+	if (&AccountConfig{Email: "me@example.com"}).IsDelegatedMailbox() {
+		t.Error("no auth_email: want not delegated")
+	}
+	if (&AccountConfig{Email: "me@example.com", AuthEmail: "me@example.com"}).IsDelegatedMailbox() {
+		t.Error("auth_email == email: want not delegated")
+	}
+	// Shared mailbox delegating to a different token owner.
+	if !(&AccountConfig{Email: "team@example.com", AuthEmail: "owner@example.com"}).IsDelegatedMailbox() {
+		t.Error("auth_email != email: want delegated")
+	}
+}
+
 func TestCalendarAutosyncResolution(t *testing.T) {
 	on, off := true, false
 	cfg := &Config{}
