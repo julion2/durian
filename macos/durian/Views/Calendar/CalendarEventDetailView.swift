@@ -115,7 +115,7 @@ struct CalendarEventDetailView: View {
             VStack(alignment: .leading, spacing: 10) {
                 if let organizer = event.organizer {
                     HStack(spacing: 8) {
-                        avatar(organizer.displayName)
+                        AvatarView(name: organizer.displayName, email: organizer.email, size: 28)
                         Text(organizer.displayName)
                             .font(.callout)
                             .foregroundStyle(Color.Detail.textBody)
@@ -128,7 +128,7 @@ struct CalendarEventDetailView: View {
                 }
                 ForEach(displayAttendees) { attendee in
                     HStack(spacing: 8) {
-                        avatar(attendee.displayName)
+                        AvatarView(name: attendee.displayName, email: attendee.email, size: 28)
                         Text(attendee.displayName)
                             .font(.callout)
                             .foregroundStyle(Color.Detail.textBody)
@@ -237,25 +237,6 @@ struct CalendarEventDetailView: View {
         .background(Color.Detail.cardBackground)
         .clipShape(RoundedRectangle(cornerRadius: 11))
         .overlay(RoundedRectangle(cornerRadius: 11).stroke(Color.Detail.border, lineWidth: 1))
-    }
-
-    /// A small initials circle for organizer/attendee rows.
-    private func avatar(_ name: String) -> some View {
-        Text(initials(name))
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(Color.Detail.textSecondary)
-            .frame(width: 26, height: 26)
-            .background(Circle().fill(Color.Detail.buttonBackground))
-            .overlay(Circle().stroke(Color.Detail.border, lineWidth: 1))
-    }
-
-    private func initials(_ name: String) -> String {
-        let parts = name
-            .split(whereSeparator: { $0 == " " || $0 == "." || $0 == "@" })
-            .prefix(2)
-            .compactMap { $0.first }
-        guard !parts.isEmpty else { return "?" }
-        return String(parts).uppercased()
     }
 
     /// PARTSTAT glyph + label for an attendee row's trailing edge.

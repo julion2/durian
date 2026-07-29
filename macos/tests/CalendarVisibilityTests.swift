@@ -14,12 +14,14 @@ final class CalendarVisibilityTests: XCTestCase {
 
     private func makeEvent(uid: String, start: TimeInterval, durationMinutes: Double = 60,
                            calendar: String = "Calendar",
-                           account: String = "user@example.com") -> CalendarEvent
+                           account: String = "user@example.com",
+                           myResponse: String? = nil) -> CalendarEvent
     {
         let s = base.addingTimeInterval(start)
         return CalendarEvent(
             uid: uid, calendar: calendar, subject: "Event",
             start: s, end: s.addingTimeInterval(durationMinutes * 60),
+            myResponse: myResponse,
             account: account
         )
     }
@@ -127,6 +129,47 @@ final class CalendarVisibilityTests: XCTestCase {
         ]
         let visible = CalendarManager.visibleEvents(events, window: nil, hidden: [key("Work")])
         XCTAssertEqual(visible.map(\.uid), ["old"])
+    }
+
+    // MARK: - Hide-declined filter
+
+    func testDeclinedEventsHiddenWhenToggleOn() {
+        let events = [
+            makeEvent(uid: "declined", start: 0, myResponse: "declined"),
+            makeEvent(uid: "accepted", start: 3600, myResponse: "accepted"),
+            makeEvent(uid: "tentative", start: 7200, myResponse: "tentativelyAccepted"),
+            makeEvent(uid: "organizer", start: 10_800, myResponse: "organizer"),
+            makeEvent(uid: "plain", start: 14_400),
+        ]
+        let visible = CalendarManager.visibleEvents(
+            events, window: window(from: 0, to: 86_400), hidden: [], hideDeclined: true)
+        XCTAssertEqual(visible.map(\.uid), ["accepted", "tentative", "organizer", "plain"],
+                       "only the declined invitation disappears — own and other events stay")
+    }
+
+    func testDeclinedEventsKeptWhenToggleOff() {
+        let events = [
+            makeEvent(uid: "declined", start: 0, myResponse: "declined"),
+            makeEvent(uid: "accepted", start: 3600, myResponse: "accepted"),
+        ]
+        let visible = CalendarManager.visibleEvents(
+            events, window: window(from: 0, to: 86_400), hidden: [], hideDeclined: false)
+        XCTAssertEqual(visible.map(\.uid), ["declined", "accepted"],
+                       "with the toggle off, declined events stay visible")
+    }
+
+    func testHideDeclinedComposesWithHiddenCalendarsAndWindow() {
+        let events = [
+            makeEvent(uid: "keep", start: 0, calendar: "Home", myResponse: "accepted"),
+            makeEvent(uid: "declined", start: 3600, calendar: "Home", myResponse: "declined"),
+            makeEvent(uid: "hiddenCal", start: 7200, calendar: "Work", myResponse: "accepted"),
+            makeEvent(uid: "outside", start: 10 * 24 * 3600, calendar: "Home", myResponse: "accepted"),
+        ]
+        let visible = CalendarManager.visibleEvents(
+            events, window: window(from: 0, to: 86_400), hidden: [key("Work")],
+            hideDeclined: true)
+        XCTAssertEqual(visible.map(\.uid), ["keep"],
+                       "declined, hidden-calendar and out-of-window filters all compose")
     }
 
     // MARK: - Toggling in and out

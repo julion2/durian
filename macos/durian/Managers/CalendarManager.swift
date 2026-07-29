@@ -30,6 +30,7 @@ final class CalendarManager: ObservableObject {
         // Direct assignments in init skip the didSet persistence observers,
         // so loading never writes back.
         hiddenCalendars = Self.loadHiddenCalendars()
+        hideDeclined = UserDefaults.standard.bool(forKey: Self.hideDeclinedKey)
         sidebarVisible = UserDefaults.standard.bool(forKey: Self.sidebarVisibleKey)
 
         // Mirror the store's projection into the published `events` the views
@@ -79,6 +80,22 @@ final class CalendarManager: ObservableObject {
         didSet {
             guard hiddenCalendars != oldValue else { return }
             Self.saveHiddenCalendars(hiddenCalendars)
+            // The store did not change, so the sink will not fire — re-filter
+            // explicitly and keep the selection on a still-visible event.
+            reproject()
+            revalidateSelection()
+        }
+    }
+
+    /// Hides events the account owner DECLINED (myResponse == "declined").
+    /// Persisted; defaults to showing everything. Declining an event you
+    /// organize never sets that response, so only genuinely-declined
+    /// invitations disappear. Same shape as `hiddenCalendars`: the store keeps
+    /// the events, only the visible projection drops them.
+    @Published var hideDeclined: Bool = false {
+        didSet {
+            guard hideDeclined != oldValue else { return }
+            UserDefaults.standard.set(hideDeclined, forKey: Self.hideDeclinedKey)
             // The store did not change, so the sink will not fire — re-filter
             // explicitly and keep the selection on a still-visible event.
             reproject()
@@ -229,25 +246,31 @@ final class CalendarManager: ObservableObject {
     }
 
     private func project(_ all: [CalendarEvent]) {
-        events = Self.visibleEvents(all, window: visibleWindow, hidden: hiddenCalendars)
+        events = Self.visibleEvents(all, window: visibleWindow, hidden: hiddenCalendars,
+                                    hideDeclined: hideDeclined)
     }
 
     /// The single visibility filter behind the projection, extracted pure so
     /// it is unit-testable: an event is visible when its calendar is not
-    /// hidden AND it overlaps the window (nil window = search mode, no
+    /// hidden, it is not a declined invitation while `hideDeclined` is on,
+    /// AND it overlaps the window (nil window = search mode, no
     /// window bound). Overlap, not start-containment: a multi-day event that
     /// starts before the window must still reach the week grid, which renders
     /// it clamped on each day it touches. Agenda/month/year bucket by start
     /// day, so such an event simply groups under its own (possibly
     /// pre-window) start day — per-day spanning there is deferred.
     nonisolated static func visibleEvents(_ events: [CalendarEvent], window: DateInterval?,
-                                          hidden: Set<String>) -> [CalendarEvent]
+                                          hidden: Set<String>,
+                                          hideDeclined: Bool = false) -> [CalendarEvent]
     {
         events.filter { event in
             // Visibility is scoped per (account, calendar), matching the
             // hidden-set keys, so hiding "Work" in one account leaves another
             // account's "Work" visible.
             if hidden.contains(CalendarInfo.key(account: event.account, name: event.calendar)) {
+                return false
+            }
+            if hideDeclined, event.myResponse == "declined" {
                 return false
             }
             guard let window else { return true }
@@ -289,6 +312,7 @@ final class CalendarManager: ObservableObject {
     // MARK: - Sidebar state persistence
 
     private static let hiddenCalendarsKey = "durian.calendar.hiddenCalendars"
+    private static let hideDeclinedKey = "durian.calendar.hideDeclined"
     private static let sidebarVisibleKey = "durian.calendar.sidebarVisible"
 
     /// Load/save split out with an injectable UserDefaults so the round-trip

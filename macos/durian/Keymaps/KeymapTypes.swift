@@ -87,6 +87,7 @@ enum KeymapAction: String, CaseIterable {
     case calendarNew = "calendar_new"
     case calendarDelete = "calendar_delete"
     case calendarToggleSidebar = "calendar_toggle_sidebar"
+    case calendarToggleDeclined = "calendar_toggle_declined"
 
     // Note: supportsCount is now defined in keymaps.pkl per-action
     // Use SequenceMatcher.shared.supportsCount(action) to check

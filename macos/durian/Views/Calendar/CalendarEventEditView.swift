@@ -18,6 +18,10 @@ struct CalendarEventEditView: View {
     /// The attendee email being typed; committed to the draft on return.
     @State private var attendeeInput: String = ""
 
+    /// Title focus, requested on appear for a NEW event so typing can start
+    /// immediately (an edit keeps the existing title, so no field is grabbed).
+    @FocusState private var titleFocused: Bool
+
     var body: some View {
         VStack(spacing: 0) {
             headerBar
@@ -48,6 +52,13 @@ struct CalendarEventEditView: View {
         // does not fire reliably in a plain detail pane (no dialog context),
         // so catch the exit command on the view itself.
         .onExitCommand { onCancel() }
+        .onAppear {
+            // Deferred one tick: focus requested while the view is still being
+            // installed is dropped.
+            if draft.isNew {
+                DispatchQueue.main.async { titleFocused = true }
+            }
+        }
     }
 
     // MARK: - Header (Cancel / title / Save)
@@ -83,6 +94,7 @@ struct CalendarEventEditView: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(Color.Detail.textPrimary)
+                .focused($titleFocused)
             Divider().overlay(Color.Detail.border)
             TextField("Location", text: $draft.location)
                 .textFieldStyle(.plain)
@@ -127,6 +139,14 @@ struct CalendarEventEditView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
 
+            if draft.allDay {
+                // Make the all-day semantics explicit: the rows below only
+                // pick days, and the write path snaps them to full days.
+                Text("Covers whole days — no start or end time.")
+                    .font(.caption)
+                    .foregroundStyle(Color.Detail.textSecondary)
+            }
+
             dateRow("Starts", selection: $draft.start)
             Divider().overlay(Color.Detail.border)
             dateRow("Ends", selection: $draft.end)
@@ -168,10 +188,12 @@ struct CalendarEventEditView: View {
                     Image(systemName: "person")
                         .font(.caption)
                         .foregroundStyle(Color.Detail.textSecondary)
+                        .frame(width: 16)
                     Text(email)
                         .font(.callout)
                         .foregroundStyle(Color.Detail.textBody)
-                    Spacer()
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
                     Button {
                         draft.attendees.removeAll { $0 == email }
                     } label: {
@@ -179,15 +201,33 @@ struct CalendarEventEditView: View {
                             .foregroundStyle(Color.Detail.textSecondary)
                     }
                     .buttonStyle(.plain)
+                    .help("Remove attendee")
                     .accessibilityLabel("Remove \(email)")
                 }
             }
 
-            TextField("Add attendee (email, press return)", text: $attendeeInput)
-                .textFieldStyle(.plain)
-                .font(.callout)
-                .foregroundStyle(Color.Detail.textBody)
-                .onSubmit(addAttendee)
+            HStack(spacing: 8) {
+                Image(systemName: "person.badge.plus")
+                    .font(.caption)
+                    .foregroundStyle(Color.Detail.textSecondary)
+                    .frame(width: 16)
+                TextField("Add attendee (email, press Return)", text: $attendeeInput)
+                    .textFieldStyle(.plain)
+                    .font(.callout)
+                    .foregroundStyle(Color.Detail.textBody)
+                    .onSubmit(addAttendee)
+                if !trimmedAttendeeInput.isEmpty,
+                   !Self.looksLikeEmail(trimmedAttendeeInput)
+                {
+                    // Subtle malformed-email hint; Return simply does nothing
+                    // until the address parses, and Save ignores it.
+                    Image(systemName: "exclamationmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .help("Not a valid email address")
+                        .accessibilityLabel("Not a valid email address")
+                }
+            }
 
             if !draft.attendees.isEmpty || draft.requestOnlineMeeting {
                 Label("Saved locally first — invitations are sent when you run 'durian calendar sync' (automatic sync skips them).",
@@ -198,13 +238,23 @@ struct CalendarEventEditView: View {
         }
     }
 
+    /// The typed attendee email, trimmed — shared by the commit below and the
+    /// inline validation hint so both always agree.
+    private var trimmedAttendeeInput: String {
+        attendeeInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Minimal shape check (user@host, no spaces) — deliverability is the
+    /// provider's problem; this only guards against obvious typos.
+    private static func looksLikeEmail(_ candidate: String) -> Bool {
+        candidate.split(separator: "@").count == 2 && !candidate.contains(" ")
+    }
+
     /// Commits the typed attendee email to the draft: trimmed, must look like
     /// an email (user@host), duplicates (case-insensitive) and blanks ignored.
     private func addAttendee() {
-        let email = attendeeInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !email.isEmpty else { return }
-        let parts = email.split(separator: "@")
-        guard parts.count == 2, !email.contains(" ") else { return }
+        let email = trimmedAttendeeInput
+        guard !email.isEmpty, Self.looksLikeEmail(email) else { return }
         guard !draft.attendees.contains(where: { $0.caseInsensitiveCompare(email) == .orderedSame }) else {
             attendeeInput = ""
             return
@@ -217,9 +267,12 @@ struct CalendarEventEditView: View {
         card("Notes") {
             TextEditor(text: $draft.description)
                 .frame(minHeight: 100)
-                .font(.body)
+                .font(.callout)
                 .foregroundStyle(Color.Detail.textBody)
                 .scrollContentBackground(.hidden)
+                // Cancel the editor's built-in text inset so the notes text
+                // left-aligns with the card heading and the other fields.
+                .padding(.horizontal, -5)
         }
     }
 

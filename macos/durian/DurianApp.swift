@@ -158,6 +158,17 @@ struct DurianApp: App {
                 }
                 .keyboardShortcut("s", modifiers: [.command, .option])
 
+                Button(action: {
+                    calendarManager.hideDeclined.toggle()
+                }) {
+                    HStack {
+                        if calendarManager.hideDeclined {
+                            Image(systemName: "checkmark")
+                        }
+                        Text("Hide Declined Events")
+                    }
+                }
+
                 Divider()
 
                 ForEach(CalendarViewMode.allCases) { mode in
