@@ -428,13 +428,27 @@ func TestICalToEventTeamsMarker(t *testing.T) {
 		t.Error("RequestOnlineMeeting = false, want true (marker present)")
 	}
 
-	// EventToICal never re-emits the marker: one-shot by construction.
+	// A still-pending request re-emits the marker so the first sync's create
+	// picks it up (this is what `calendar new --teams` relies on).
 	rendered, err := EventToICal(got)
 	if err != nil {
 		t.Fatalf("EventToICal re-render: %v", err)
 	}
-	if strings.Contains(string(rendered), "X-DURIAN-CREATE-TEAMS-MEETING") {
-		t.Error("re-rendered ICS still carries the Teams marker")
+	if !strings.Contains(string(rendered), "X-DURIAN-CREATE-TEAMS-MEETING:TRUE") {
+		t.Error("pending request must emit the Teams marker")
+	}
+
+	// One-shot: a settled event (RequestOnlineMeeting false, join URL resolved,
+	// as the post-create read-back produces) carries no marker.
+	settled := got
+	settled.RequestOnlineMeeting = false
+	settled.OnlineMeetingURL = "https://teams.microsoft.com/l/meetup-join/x"
+	settledICS, err := EventToICal(settled)
+	if err != nil {
+		t.Fatalf("EventToICal settled: %v", err)
+	}
+	if strings.Contains(string(settledICS), "X-DURIAN-CREATE-TEAMS-MEETING") {
+		t.Error("settled event must not carry the Teams create marker")
 	}
 }
 

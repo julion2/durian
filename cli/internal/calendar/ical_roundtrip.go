@@ -64,8 +64,10 @@ const GraphDateFormat = "2006-01-02"
 // output is deterministic), URL plus X-MICROSOFT-SKYPETEAMSMEETINGURL for the
 // online-meeting join link, and STATUS:CANCELLED for cancelled meetings.
 // ATTENDEE and ORGANIZER round-trip through ICalToEvent; URL and STATUS are
-// display-only. The X-DURIAN-CREATE-TEAMS-MEETING marker is deliberately
-// never emitted, keeping it one-shot.
+// display-only. The X-DURIAN-CREATE-TEAMS-MEETING marker is emitted only for a
+// still-pending request (RequestOnlineMeeting), so `calendar new --teams`
+// reaches the first sync; it is one-shot because the post-create read-back
+// rewrites the file from the settled remote event, which carries no marker.
 func EventToICal(e Event) ([]byte, error) {
 	uid := e.ICalUID
 	if uid == "" {
@@ -130,6 +132,15 @@ func EventToICal(e Event) ([]byte, error) {
 		teamsProp := ical.NewProp(propTeamsMeetingURL)
 		teamsProp.Value = e.OnlineMeetingURL
 		ev.Props.Set(teamsProp)
+	}
+	// A pending "create as online meeting" request carries the marker so the
+	// first sync's create picks it up. It is one-shot in practice: after a
+	// successful create the engine rewrites the local file from the settled
+	// remote event, which has no marker (only the resolved join URL).
+	if e.RequestOnlineMeeting {
+		marker := ical.NewProp(propCreateTeamsMeeting)
+		marker.Value = "TRUE"
+		ev.Props.Set(marker)
 	}
 	if e.IsCancelled {
 		ev.Props.SetText(ical.PropStatus, string(ical.EventCancelled))
