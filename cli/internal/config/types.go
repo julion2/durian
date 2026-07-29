@@ -68,6 +68,15 @@ type CalendarConfig struct {
 	// schema minimum 60). Use Config.CalendarAutosyncInterval for the
 	// resolved time.Duration.
 	AutosyncInterval int `pkl:"autosync_interval" json:"autosync_interval"`
+	// AutosyncUpload selects what the background autosync may push to the
+	// remote calendar: "none" (default, also for "" / absent block) keeps
+	// autosync strictly download-only; "safe" additionally auto-applies
+	// provably non-notifying local changes — creates/edits of attendee-less
+	// events. Remote deletes, conflicts, RSVPs and anything that could make
+	// the provider send email always wait for the interactive
+	// `durian calendar sync`. Use Config.CalendarAutosyncUploadSafe for the
+	// per-account resolution.
+	AutosyncUpload string `pkl:"autosync_upload" json:"autosync_upload"`
 }
 
 // AccountCalendarConfig configures the vdir calendar export of one account.
@@ -82,6 +91,9 @@ type AccountCalendarConfig struct {
 	// Autosync overrides the global calendar.autosync toggle for this
 	// account (nil = use the global setting).
 	Autosync *bool `pkl:"autosync" json:"autosync"`
+	// AutosyncUpload overrides the global calendar.autosync_upload mode
+	// ("none" or "safe") for this account ("" = use the global setting).
+	AutosyncUpload string `pkl:"autosync_upload" json:"autosync_upload"`
 }
 
 // AccountConfig represents a single email account
@@ -164,11 +176,25 @@ func (c *Config) CalendarAutosyncEnabled(a *AccountConfig) bool {
 	return true // mirrors the Pkl schema default: autosync on
 }
 
+// CalendarAutosyncUploadSafe resolves whether the background calendar
+// autosync may auto-apply the provably non-notifying subset of local changes
+// for this account: the per-account calendar.autosync_upload override when
+// set, else the global calendar.autosync_upload, else "none". Only the exact
+// value "safe" enables it — every other value (including absent) stays
+// download-only, the fail-safe default.
+func (c *Config) CalendarAutosyncUploadSafe(a *AccountConfig) bool {
+	mode := c.Calendar.AutosyncUpload
+	if a != nil && a.Calendar != nil && a.Calendar.AutosyncUpload != "" {
+		mode = a.Calendar.AutosyncUpload
+	}
+	return mode == "safe"
+}
+
 // calendarAutosyncDefaultInterval mirrors the Pkl schema default for
-// calendar.autosync_interval (600 s), used when the configured value is
+// calendar.autosync_interval (60 s), used when the configured value is
 // missing or below the schema minimum of 60 s (e.g. a Go-constructed Config
 // that bypassed Pkl evaluation).
-const calendarAutosyncDefaultInterval = 600 * time.Second
+const calendarAutosyncDefaultInterval = 60 * time.Second
 
 // CalendarAutosyncInterval returns the calendar autosync interval as a
 // duration, falling back to the 10-minute default when the configured value

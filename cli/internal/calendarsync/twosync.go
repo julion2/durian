@@ -25,7 +25,8 @@
 //	not tracked, local only             -> UploadCreate
 //	not tracked, both present, equal    -> Adopt (record status, no write)
 //	not tracked, both present, differ   -> DownloadUpdate (remote wins on first
-//	  sight; the local file is backed up first)
+//	  sight; the divergent local file is backed up to <file>.conflict-<unixts>
+//	  before being overwritten)
 //	tracked, only remote changed        -> DownloadUpdate
 //	tracked, only local changed         -> UploadUpdate
 //	tracked, both changed               -> Conflict
@@ -61,10 +62,11 @@
 // Download/Adopt/UploadCreate. "Remote wins on first sight" is a deliberate
 // first-sync convergence choice: when an untracked UID exists on both sides
 // with differing content there is no baseline to diff against, so the local
-// file is overwritten with the remote rendering and the pair is tracked from
-// there. Because that local file may hold edits made before the first sync
-// ever ran, it is moved to <file>.conflict-<unixts> first — first sight loses
-// no local data, it only stops preferring it.
+// file is backed up to <file>.conflict-<unixts> (it may hold unsynced local
+// work, e.g. edits made before the first sync ever ran, or after a
+// corrupted-state reset), then overwritten with the remote rendering, and the
+// pair is tracked from there. First sight loses no local data, it only stops
+// preferring it.
 //
 // Unreadable local files: a tracked .ics that fails to parse is missing from
 // the local scan, which is byte-for-byte the same signal as the user deleting
@@ -238,6 +240,61 @@ func (a Action) RemoteMutation() bool {
 	return false
 }
 
+// Notifies reports whether applying this action may make the provider email
+// anyone — the WORST case, independent of the conflict policy and the
+// SilentRSVP flag (both can only reduce emails, never add any). It must never
+// under-report: FilterNonNotifying lets the unattended autosync auto-apply
+// only actions for which this is false, so a false negative here would email
+// real people from a background loop. Cross-checked against the apply-time
+// routing:
+//
+//   - upload-create: createFromLocal uploads the attendee list — invitations —
+//     when the local event has attendees and the owner organizes it; ANY local
+//     attendee counts here (the role gate is ignored: worst case).
+//   - upload-update: an organizer PATCH of a meeting notifies its attendees
+//     even when the attendee list itself is untouched, and an uploaded
+//     attendee list invites/uninvites the delta — so any attendee on EITHER
+//     side counts. Recipients carries the local∪remote non-owner union (see
+//     Plan), which catches the first locally added attendee; the raw attendee
+//     lists are checked too as defense in depth against a stale count.
+//   - delete-remote: removeRemoteEvent cancels (organizer) or declines
+//     (attendee, response email to the organizer) whenever the remote event
+//     has attendees; only an attendee-less appointment deletes silently.
+//   - rsvp: RespondToEvent emails the organizer when RsvpCall is set; a
+//     rebaseline-only RSVP calls nobody.
+//   - conflict: the outcome depends on the policy and both sides' state —
+//     conservatively always true.
+func (a Action) Notifies() bool {
+	switch a.Kind {
+	case ActionUploadCreate:
+		return len(a.LocalEvent.Attendees) > 0
+	case ActionUploadUpdate:
+		return a.Recipients > 0 || len(a.LocalEvent.Attendees) > 0 ||
+			(a.RemoteExists && len(a.Remote.Attendees) > 0)
+	case ActionDeleteRemote:
+		return a.RemoteExists && len(a.Remote.Attendees) > 0
+	case ActionRsvp:
+		return a.RsvpCall
+	case ActionConflict:
+		return true
+	}
+	return false
+}
+
+// AutoDeferred reports whether "safe" autosync must leave this action to the
+// interactive `durian calendar sync` confirmation gate: every conflict, every
+// remote delete (mass-delete safety — even attendee-less deletes are never
+// automated, a misplaced state reset must not silently empty a remote
+// calendar), and everything that may notify. Non-mutating actions are never
+// deferred. FilterNonNotifying drops exactly the actions for which this is
+// true.
+func (a Action) AutoDeferred() bool {
+	if !a.RemoteMutation() {
+		return false
+	}
+	return a.Kind == ActionConflict || a.Kind == ActionDeleteRemote || a.Notifies()
+}
+
 // CalendarPlan is the ordered action list for one calendar.
 type CalendarPlan struct {
 	Calendar Calendar
@@ -281,6 +338,35 @@ func FilterDownloadOnly(plans []CalendarPlan) (filtered []CalendarPlan, suppress
 		filtered = append(filtered, fp)
 	}
 	return filtered, suppressed
+}
+
+// FilterNonNotifying returns copies of the plans reduced to what an
+// unattended "safe" autosync run may apply: everything FilterDownloadOnly
+// keeps, PLUS the remote-mutating actions that are provably non-notifying —
+// uploads of attendee-less events (see Action.Notifies). Remote deletes are
+// excluded ENTIRELY, attendees or not (see Action.AutoDeferred), and so are
+// conflicts and provider-calling RSVPs. autoUploads counts the extra mutating
+// actions kept beyond download-only; deferred counts the mutating actions
+// dropped (notifying uploads, all deletes, conflicts, RSVP calls) — they wait
+// for the interactive `durian calendar sync` confirmation gate. The input
+// plans are not mutated.
+func FilterNonNotifying(plans []CalendarPlan) (filtered []CalendarPlan, autoUploads, deferred int) {
+	filtered = make([]CalendarPlan, 0, len(plans))
+	for _, p := range plans {
+		fp := CalendarPlan{Calendar: p.Calendar, Dir: p.Dir}
+		for _, a := range p.Actions {
+			switch {
+			case a.AutoDeferred():
+				deferred++
+				continue
+			case a.RemoteMutation():
+				autoUploads++
+			}
+			fp.Actions = append(fp.Actions, a)
+		}
+		filtered = append(filtered, fp)
+	}
+	return filtered, autoUploads, deferred
 }
 
 // MARK: - Stats and options
@@ -493,6 +579,14 @@ func Plan(ctx context.Context, p CalendarProvider, cal Calendar, calDir string, 
 				a.Kind = ActionDownloadUpdate
 			case localChanged && !ownerEditOnly:
 				a.Kind = ActionUploadUpdate
+				// The remote-side count alone would miss attendees that exist
+				// only locally: adding the FIRST attendee(s) to a tracked
+				// personal event would read as "0 recipients" while the PATCH
+				// uploads the local attendee list and the provider invites
+				// them. The upload-side recipient count is therefore the
+				// UNION of both non-owner attendee sets — it feeds the
+				// notification preview and the Notifies predicate.
+				a.Recipients = unionRecipients(li.Event.Attendees, rev.Attendees, owner)
 			default:
 				// Content unchanged on both sides: owner-RSVP sub-matrix.
 				if !planRsvp(&a, li.Event, rev, st, localChanged) {
@@ -672,6 +766,24 @@ func lossyAttendeeSet(attendees []Attendee, owner string) string {
 	return strings.Join(keys, "\n")
 }
 
+// unionRecipients counts the distinct non-owner attendee email addresses
+// present on EITHER side — the worst-case recipient set of an upload-update:
+// attendees only present locally are about to be invited, attendees only
+// present remotely are about to be removed (and notified of the removal), and
+// attendees on both sides receive the content update.
+func unionRecipients(local, remote []Attendee, owner string) int {
+	seen := make(map[string]struct{}, len(local)+len(remote))
+	for _, list := range [][]Attendee{local, remote} {
+		for _, a := range list {
+			if owner != "" && strings.EqualFold(a.Email, owner) {
+				continue
+			}
+			seen[strings.ToLower(a.Email)] = struct{}{}
+		}
+	}
+	return len(seen)
+}
+
 // localOwnerIsOrganizer reports whether the account owner organizes a locally
 // parsed event: no ORGANIZER in the file (the owner creates, so the provider
 // will make them the organizer) or an ORGANIZER matching the owner. A foreign
@@ -784,14 +896,7 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 		case ActionDownloadNew, ActionDownloadUpdate:
 			slog.Info("Downloading remote event", "module", "CALSYNC",
 				"calendar", plan.Calendar.Name, "uid", a.UID, "kind", a.Kind)
-			if a.BackupLocal && a.LocalExists {
-				if _, err = backupLocalFile(a.LocalPath); err != nil {
-					break
-				}
-				slog.Warn("First sight: remote wins, local file backed up", "module", "CALSYNC",
-					"calendar", plan.Calendar.Name, "uid", a.UID)
-			}
-			if err = writeRemoteEvent(plan.Dir, a.LocalPath, a.UID, a.Remote, status, p.Owner()); err == nil {
+			if err = downloadRemoteEvent(plan, a, status, p.Owner()); err == nil {
 				stats.Downloaded++
 			}
 
@@ -903,6 +1008,41 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 	slog.Debug("Applied calendar plan", "module", "CALSYNC",
 		"calendar", plan.Calendar.Name, "stats", fmt.Sprintf("%+v", stats))
 	return stats, nil
+}
+
+// downloadRemoteEvent executes one download action: it writes the remote
+// event over the local side via writeRemoteEvent, but FIRST backs up the
+// local file when the plan asked for it (Action.BackupLocal, set for the
+// "remote wins on first sight" overwrite of a divergent untracked pair).
+// First sight of a divergent pair carries no baseline to diff against — the
+// local file may hold unsynced local work (reachable e.g. after a
+// corrupted-state reset backed the status file up and started fresh), and
+// overwriting it without the <file>.conflict-<unixts> backup would silently
+// lose it. A tracked download-update needs no backup: it only ever overwrites
+// an unchanged local file (a changed one classifies as ActionConflict, which
+// has its own backup), and a first-sight download with no local file or
+// identical content (ActionAdopt) has nothing to lose.
+func downloadRemoteEvent(plan CalendarPlan, a Action, status *CalendarStatus, owner string) error {
+	if a.BackupLocal && a.LocalExists {
+		backupPath, err := backupLocalFile(a.LocalPath)
+		if err != nil {
+			return err
+		}
+		slog.Warn("First-sight overwrite: divergent local file backed up", "module", "CALSYNC",
+			"calendar", plan.Calendar.Name, "uid", a.UID, "backup", backupPath)
+	}
+	return writeRemoteEvent(plan.Dir, a.LocalPath, a.UID, a.Remote, status, owner)
+}
+
+// backupLocalFile moves path aside to <path>.conflict-<unixts> — the shared
+// never-silently-lose-local-data scheme of conflict resolution and first-sight
+// overwrites. The backup does not end in .ics, so the local scan ignores it.
+func backupLocalFile(path string) (string, error) {
+	backupPath := fmt.Sprintf("%s.conflict-%d", path, time.Now().Unix())
+	if err := os.Rename(path, backupPath); err != nil {
+		return "", fmt.Errorf("failed to back up conflicting file %s: %w", path, err)
+	}
+	return backupPath, nil
 }
 
 // writeRemoteEvent serializes ev and writes it to path — the UID-derived
@@ -1265,18 +1405,6 @@ func writeCalendarMeta(calDir string, cal Calendar) error {
 		}
 	}
 	return nil
-}
-
-// backupLocalFile moves path aside to <path>.conflict-<unixts> and returns the
-// backup path. Local data the sync is about to overwrite is never discarded
-// outright: the backup does not end in .ics, so the next scan ignores it and
-// the user can diff or restore it by hand.
-func backupLocalFile(path string) (string, error) {
-	backupPath := fmt.Sprintf("%s.conflict-%d", path, time.Now().Unix())
-	if err := os.Rename(path, backupPath); err != nil {
-		return "", fmt.Errorf("failed to back up local file %s: %w", path, err)
-	}
-	return backupPath, nil
 }
 
 // unionUIDs returns the sorted union of the UIDs of all three maps, so the

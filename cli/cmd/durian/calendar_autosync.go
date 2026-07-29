@@ -1,12 +1,22 @@
-// Background download-only calendar autosync for `durian serve`.
+// Background calendar autosync for `durian serve`.
 //
 // Each eligible account gets one loop that periodically pulls remote calendar
-// changes into the local vdir. The loop is DOWNLOAD-ONLY by construction:
-// every planned action passes through calendarsync.FilterDownloadOnly before
-// ApplyAll, which strips every action whose RemoteMutation() is true —
-// uploads, remote deletes, conflicts, RSVPs. Those remain exclusively behind
-// the interactive `durian calendar sync` confirmation gate. This file must
-// never call ApplyAll on an unfiltered plan.
+// changes into the local vdir. Every planned action passes through a safety
+// filter before ApplyAll — this file must never call ApplyAll on an
+// unfiltered plan:
+//
+//   - Default (calendar.autosync_upload "none"): FilterDownloadOnly strips
+//     every action whose RemoteMutation() is true — uploads, remote deletes,
+//     conflicts, RSVPs. The loop is download-only by construction.
+//   - Safe upload mode ("safe"): FilterNonNotifying additionally keeps the
+//     provably non-notifying uploads — creates/edits of attendee-less events
+//     (Action.Notifies() false) — and still defers every remote delete
+//     (attendees or not), every conflict, every RSVP call and every upload
+//     that may make the provider email anyone.
+//
+// In BOTH modes the deferred actions remain exclusively behind the
+// interactive `durian calendar sync` confirmation gate; no autosync run may
+// ever cause the provider to email a real person or delete a remote event.
 
 package main
 
@@ -53,12 +63,12 @@ func startCalendarAutosync(ctx context.Context, hub *handler.EventHub, cfg *conf
 		started++
 	}
 	if started > 0 {
-		slog.Info("Started calendar autosync loops (download-only)", "module", "CALSYNC",
+		slog.Info("Started calendar autosync loops", "module", "CALSYNC",
 			"accounts", started, "interval", interval) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	}
 }
 
-// calendarAutosyncLoop runs download-only sync cycles for one account until
+// calendarAutosyncLoop runs autosync cycles for one account until
 // ctx is cancelled: a jittered initial delay (30-90 s, so calendar sync does
 // not stampede with mail sync at server startup), then one run per ticker
 // interval. Errors never stop the loop — they are logged and the next tick
@@ -102,9 +112,10 @@ func calendarAutosyncLoop(ctx context.Context, hub *handler.EventHub, account *c
 	}
 }
 
-// calendarAutosyncOnce executes one download-only sync cycle for the account:
-// run lock -> Load -> PlanAll -> FilterDownloadOnly -> ApplyAll -> Save, then
-// an SSE calendar_updated broadcast when anything changed locally. Suppressed
+// calendarAutosyncOnce executes one autosync cycle for the account: run lock
+// -> Load -> PlanAll -> FilterDownloadOnly (or FilterNonNotifying in safe
+// upload mode) -> ApplyAll -> Save, then an SSE calendar_updated broadcast
+// when anything changed (downloads, prunes, auto-applied uploads). Deferred
 // remote mutations are only counted/logged — they wait for the interactive
 // `durian calendar sync`.
 func calendarAutosyncOnce(ctx context.Context, hub *handler.EventHub, account *config.AccountConfig, cfg *config.Config, authHintLogged *bool) {
@@ -149,9 +160,38 @@ func calendarAutosyncOnce(ctx context.Context, hub *handler.EventHub, account *c
 		return
 	}
 
-	// The safety mechanism: strip every action that could write to the
-	// remote calendar. ApplyAll below only ever sees the filtered plans.
-	filtered, suppressed := calendarsync.FilterDownloadOnly(plans)
+	// The safety mechanism: ApplyAll below only ever sees the filtered plans.
+	// Default mode strips every action that could write to the remote
+	// calendar; safe upload mode keeps only the provably non-notifying,
+	// non-delete uploads and defers everything else.
+	uploadSafe := cfg.CalendarAutosyncUploadSafe(account)
+	var filtered []calendarsync.CalendarPlan
+	var autoUploads, deferred int
+	if uploadSafe {
+		filtered, autoUploads, deferred = calendarsync.FilterNonNotifying(plans)
+	} else {
+		filtered, deferred = calendarsync.FilterDownloadOnly(plans)
+	}
+
+	// Pending-push visibility (both modes): the deferred local changes wait
+	// for the interactive confirmation gate. Per-action detail at Debug —
+	// action kind and event UID only, never event content.
+	if deferred > 0 {
+		slog.Info("Calendar autosync: local change(s) pending manual push, run 'durian calendar sync <account>' to apply them", "module", "CALSYNC", // encgrep:allow static message text, no content
+			"account", account.GetAliasOrName(), "pending", deferred, "uploadSafe", uploadSafe) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+		for _, p := range plans {
+			for _, a := range p.Actions {
+				if (uploadSafe && a.AutoDeferred()) || (!uploadSafe && a.RemoteMutation()) {
+					slog.Debug("Calendar autosync deferred action", "module", "CALSYNC",
+						"account", account.GetAliasOrName(), "kind", a.Kind, "uid", a.UID) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+				}
+			}
+		}
+	}
+	if autoUploads > 0 {
+		slog.Info("Calendar autosync auto-applying non-notifying local change(s)", "module", "CALSYNC",
+			"account", account.GetAliasOrName(), "actions", autoUploads) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+	}
 
 	stats, applyErr := calendarsync.ApplyAll(runCtx, provider, state, filtered, calendarsync.SyncOptions{})
 	// Save also on partial failure: completed local writes are recorded and
@@ -166,17 +206,14 @@ func calendarAutosyncOnce(ctx context.Context, hub *handler.EventHub, account *c
 	}
 	*authHintLogged = false // a full clean cycle resets the auth-hint damper
 
-	if suppressed > 0 {
-		slog.Info("Calendar autosync suppressed remote mutations, run 'durian calendar sync' to review them", "module", "CALSYNC",
-			"account", account.GetAliasOrName(), "suppressed", suppressed) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-	}
-	if stats.Downloaded+stats.Pruned > 0 {
-		slog.Info("Calendar autosync updated local calendars", "module", "CALSYNC",
-			"account", account.GetAliasOrName(), "downloaded", stats.Downloaded, "pruned", stats.Pruned) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+	if stats.Downloaded+stats.Pruned+stats.Uploaded > 0 {
+		slog.Info("Calendar autosync updated calendars", "module", "CALSYNC",
+			"account", account.GetAliasOrName(), "downloaded", stats.Downloaded, "pruned", stats.Pruned, "uploaded", stats.Uploaded) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		hub.BroadcastCalendar(handler.CalendarUpdatedEvent{
 			Account:    account.GetAliasOrName(),
 			Downloaded: stats.Downloaded,
 			Pruned:     stats.Pruned,
+			Uploaded:   stats.Uploaded,
 		})
 	}
 }

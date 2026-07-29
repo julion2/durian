@@ -34,13 +34,15 @@ type OutboxUpdateEvent struct {
 }
 
 // CalendarUpdatedEvent is broadcast over SSE after a background calendar
-// autosync changed the local vdir (events downloaded or pruned), so the GUI
-// can refresh its calendar views. It carries only the account identifier and
-// counts — never event content.
+// autosync changed anything (events downloaded or pruned locally, or —
+// in safe upload mode — non-notifying local changes pushed upstream), so the
+// GUI can refresh its calendar views. It carries only the account identifier
+// and counts — never event content.
 type CalendarUpdatedEvent struct {
 	Account    string `json:"account"`
 	Downloaded int    `json:"downloaded"`
 	Pruned     int    `json:"pruned"`
+	Uploaded   int    `json:"uploaded"`
 }
 
 // EventHub is a fan-out broadcaster for SSE events.

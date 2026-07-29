@@ -197,10 +197,88 @@ func TestCalendarAutosyncResolution(t *testing.T) {
 	}
 }
 
+func TestCalendarAutosyncUploadSafeResolution(t *testing.T) {
+	cfg := &Config{}
+	a := &AccountConfig{}
+
+	// Absent everywhere: download-only — the fail-safe default.
+	if cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("no autosync_upload anywhere: want download-only (not safe)")
+	}
+	cfg.Calendar.AutosyncUpload = "none"
+	if cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("global none: want download-only")
+	}
+	cfg.Calendar.AutosyncUpload = "safe"
+	if !cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("global safe, no account override: want safe")
+	}
+	a.Calendar = &AccountCalendarConfig{}
+	if !cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("global safe, account block without override: want safe")
+	}
+	a.Calendar.AutosyncUpload = "none"
+	if cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("account override none must win over global safe")
+	}
+	cfg.Calendar.AutosyncUpload = "none"
+	a.Calendar.AutosyncUpload = "safe"
+	if !cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("account override safe must win over global none")
+	}
+	cfg.Calendar.AutosyncUpload = ""
+	if !cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("global absent, account override safe: want safe")
+	}
+	// Any non-"safe" value (validation rejects it, but the resolver must
+	// still fail safe) means download-only.
+	a.Calendar.AutosyncUpload = "bogus"
+	if cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("unknown mode must resolve to download-only")
+	}
+}
+
+func TestValidateConfigCalendarAutosyncUpload(t *testing.T) {
+	base := func() *Config {
+		return &Config{Accounts: []AccountConfig{{
+			Name: "Test", Email: "test@example.com",
+			OAuth:    &OAuthConfig{Provider: "microsoft"},
+			Calendar: &AccountCalendarConfig{},
+		}}}
+	}
+
+	for _, valid := range []string{"", "none", "safe"} {
+		cfg := base()
+		cfg.Calendar.AutosyncUpload = valid
+		cfg.Accounts[0].Calendar.AutosyncUpload = valid
+		for _, e := range ValidateConfig(cfg) {
+			if strings.Contains(e.Field, "autosync_upload") {
+				t.Errorf("unexpected error for autosync_upload=%q: %s", valid, e)
+			}
+		}
+	}
+
+	cfg := base()
+	cfg.Calendar.AutosyncUpload = "always"
+	cfg.Accounts[0].Calendar.AutosyncUpload = "yes"
+	globalHit, accountHit := false, false
+	for _, e := range ValidateConfig(cfg) {
+		if e.Field == "calendar.autosync_upload" && e.Severity == "error" {
+			globalHit = true
+		}
+		if e.Field == "accounts[0].calendar.autosync_upload" && e.Severity == "error" {
+			accountHit = true
+		}
+	}
+	if !globalHit || !accountHit {
+		t.Errorf("invalid autosync_upload values not rejected: global=%v account=%v", globalHit, accountHit)
+	}
+}
+
 func TestCalendarAutosyncInterval(t *testing.T) {
 	cfg := &Config{}
-	if got := cfg.CalendarAutosyncInterval(); got != 600*time.Second {
-		t.Errorf("unset interval = %v, want the 600s default", got)
+	if got := cfg.CalendarAutosyncInterval(); got != 60*time.Second {
+		t.Errorf("unset interval = %v, want the 60s default", got)
 	}
 	cfg.Calendar.AutosyncInterval = 300
 	if got := cfg.CalendarAutosyncInterval(); got != 300*time.Second {
@@ -211,8 +289,8 @@ func TestCalendarAutosyncInterval(t *testing.T) {
 		t.Errorf("interval = %v, want 60s (schema minimum)", got)
 	}
 	cfg.Calendar.AutosyncInterval = 30
-	if got := cfg.CalendarAutosyncInterval(); got != 600*time.Second {
-		t.Errorf("below-minimum interval = %v, want the 600s default", got)
+	if got := cfg.CalendarAutosyncInterval(); got != 60*time.Second {
+		t.Errorf("below-minimum interval = %v, want the 60s default", got)
 	}
 }
 

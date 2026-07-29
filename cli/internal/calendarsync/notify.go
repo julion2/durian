@@ -18,8 +18,10 @@ const (
 
 // Notification describes one email message that applying a plan will make
 // the provider send: its category, the affected event, the calendar, and how many
-// recipients it reaches (all attendees for invite/update/cancel; the
-// organizer — one recipient — for an RSVP).
+// recipients it reaches (all attendees for invite/update/cancel — for an
+// update the local∪remote non-owner union, so newly added attendees are
+// counted before they exist remotely; the organizer — one recipient — for an
+// RSVP).
 type Notification struct {
 	Category   string
 	Summary    string

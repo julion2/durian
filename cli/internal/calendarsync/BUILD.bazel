@@ -24,6 +24,7 @@ go_test(
     srcs = [
         "downloadonly_test.go",
         "export_test.go",
+        "nonnotifying_test.go",
         "provider_test.go",
         "twosync_test.go",
     ],

@@ -14,15 +14,22 @@ settings {
 // Default: ~/.local/share/durian/contacts.db (XDG_DATA_HOME)
 // contacts { db_path = "~/.local/share/durian/contacts.db" }
 
-// Optional: calendar settings. `durian serve` runs a background DOWNLOAD-ONLY
-// calendar sync (autosync): remote changes are pulled into the local vdir, but
-// nothing is ever uploaded, deleted remotely or RSVP'd automatically — those
-// need an interactive `durian calendar sync` with its confirmation prompt.
+// Optional: calendar settings. `durian serve` runs a background calendar sync
+// (autosync): remote changes are pulled into the local vdir. By default
+// (autosync_upload = "none") it is DOWNLOAD-ONLY: nothing is ever uploaded,
+// deleted remotely or RSVP'd automatically — those need an interactive
+// `durian calendar sync` with its confirmation prompt. With
+// autosync_upload = "safe", autosync additionally auto-applies provably
+// non-notifying local changes (creates/edits of events WITHOUT attendees);
+// remote deletes, conflicts, RSVPs and anything that could make the provider
+// send email still wait for the interactive sync.
 // Disable per account with accounts[*].calendar { autosync = false }.
 // calendar {
 //   vdir_path = "~/.local/share/durian/calendars"
-//   autosync = true            // Background download-only sync in `durian serve`
+//   autosync = true            // Background sync in `durian serve`
 //   autosync_interval = 600    // Seconds between autosync runs (minimum 60)
+//   autosync_upload = "none"   // "none" = download-only; "safe" = also push
+//                              // non-notifying local changes (never deletes)
 // }
 
 sync {

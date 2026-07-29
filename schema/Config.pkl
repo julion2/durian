@@ -45,14 +45,23 @@ class CalendarConfig {
   /// Base directory for exported vdir calendars (khal/vdirsyncer layout:
   /// <vdir_path>/<account-dir>/<calendar>/<event>.ics).
   vdir_path: String = "~/.local/share/durian/calendars"
-  /// Background download-only calendar sync in `durian serve`: remote changes
-  /// are pulled into the local vdir periodically. Never writes to the remote
-  /// calendar — uploads, remote deletes, conflicts and RSVPs stay behind the
-  /// interactive `durian calendar sync` confirmation. Per-account override:
+  /// Background calendar sync in `durian serve`: remote changes are pulled
+  /// into the local vdir periodically. With the default autosync_upload
+  /// "none", it never writes to the remote calendar — uploads, remote
+  /// deletes, conflicts and RSVPs stay behind the interactive
+  /// `durian calendar sync` confirmation. Per-account override:
   /// accounts[*].calendar.autosync.
   autosync: Boolean = true
-  /// Autosync interval in seconds (minimum 60, default 600 = 10 minutes).
-  autosync_interval: Int(this >= 60) = 600
+  /// Autosync interval in seconds (minimum 60, default 60).
+  autosync_interval: Int(this >= 60) = 60
+  /// What autosync may push to the remote calendar: "none" (default) keeps
+  /// autosync strictly download-only; "safe" additionally auto-applies
+  /// provably non-notifying local changes — creates and edits of events
+  /// without attendees. Remote deletes, conflicts, RSVPs and anything that
+  /// could make the provider send email always wait for the interactive
+  /// `durian calendar sync`. Per-account override:
+  /// accounts[*].calendar.autosync_upload.
+  autosync_upload: "none"|"safe" = "none"
 }
 
 class AccountCalendarConfig {
@@ -68,6 +77,9 @@ class AccountCalendarConfig {
   /// Per-account override of the global calendar.autosync toggle
   /// (null = use the global setting).
   autosync: Boolean?
+  /// Per-account override of the global calendar.autosync_upload mode
+  /// (null = use the global setting).
+  autosync_upload: ("none"|"safe")?
 }
 
 // ── Account ────────────────────────────────────────────────

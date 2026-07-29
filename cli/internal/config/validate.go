@@ -61,6 +61,13 @@ func ValidateConfig(cfg *Config) []ValidationError {
 		}
 	}
 
+	// Calendar autosync upload mode ("" = absent block = "none")
+	switch cfg.Calendar.AutosyncUpload {
+	case "", "none", "safe":
+	default:
+		add("calendar.autosync_upload", fmt.Sprintf("must be \"none\" or \"safe\", got %q", cfg.Calendar.AutosyncUpload))
+	}
+
 	if len(cfg.Accounts) == 0 {
 		warn("accounts", "no accounts configured")
 		return errs
@@ -161,6 +168,11 @@ func ValidateConfig(cfg *Config) []ValidationError {
 			case "", "remote", "local", "newer":
 			default:
 				add(prefix+".calendar.conflict", fmt.Sprintf("must be \"remote\", \"local\" or \"newer\", got %q", acct.Calendar.Conflict))
+			}
+			switch acct.Calendar.AutosyncUpload {
+			case "", "none", "safe":
+			default:
+				add(prefix+".calendar.autosync_upload", fmt.Sprintf("must be \"none\" or \"safe\", got %q", acct.Calendar.AutosyncUpload))
 			}
 		}
 
