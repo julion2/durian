@@ -31,6 +31,9 @@ settings: C.SettingsConfig = new {
 //   autosync_interval = 60     // Seconds between autosync runs (minimum and default 60)
 //   autosync_upload = "none"   // "none" = download-only; "safe" = also push
 //                              // non-notifying local changes (never deletes)
+//   conflict = "newer"         // Both-sides edit: "newer" (default) keeps the
+//                              // last-modified side, "remote", or "local"
+//                              // (the losing local file is always backed up)
 // }
 
 sync: C.SyncConfig = new {

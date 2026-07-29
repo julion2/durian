@@ -77,16 +77,20 @@ type CalendarConfig struct {
 	// `durian calendar sync`. Use Config.CalendarAutosyncUploadSafe for the
 	// per-account resolution.
 	AutosyncUpload string `pkl:"autosync_upload" json:"autosync_upload"`
+	// Conflict is the GLOBAL two-way sync conflict policy ("remote"|"local"|
+	// "newer"), used when an account does not set its own. Empty resolves to
+	// the schema default "newer". Use Config.CalendarConflictPolicy.
+	Conflict string `pkl:"conflict" json:"conflict"`
 }
 
 // AccountCalendarConfig configures the vdir calendar export of one account.
 type AccountCalendarConfig struct {
 	Dir     string   `pkl:"dir" json:"dir"`         // Subdir name under the vdir base path (default: alias, else lowercased name)
 	Include []string `pkl:"include" json:"include"` // Calendar display names to export (empty = all)
-	// Conflict is the two-way sync conflict policy when an event changed on
-	// both sides: "remote" (default) keeps the Outlook version (the local
-	// file is backed up first), "local" keeps the local file, "newer" keeps
-	// the side modified last.
+	// Conflict overrides the global calendar.conflict policy for this account
+	// when an event changed on both sides: "remote" keeps the provider version
+	// (the local file is backed up first), "local" keeps the local file,
+	// "newer" keeps the side modified last. Empty = use the global setting.
 	Conflict string `pkl:"conflict" json:"conflict"`
 	// Autosync overrides the global calendar.autosync toggle for this
 	// account (nil = use the global setting).
@@ -154,13 +158,17 @@ func (a *AccountConfig) CalendarInclude() []string {
 	return a.Calendar.Include
 }
 
-// CalendarConflictPolicy returns the two-way calendar sync conflict policy
-// for this account: "remote" (the default), "local" or "newer".
-func (a *AccountConfig) CalendarConflictPolicy() string {
-	if a.Calendar != nil && a.Calendar.Conflict != "" {
+// CalendarConflictPolicy resolves the two-way calendar sync conflict policy
+// for an account: the account override if set, else the global
+// calendar.conflict, else the schema default "newer".
+func (c *Config) CalendarConflictPolicy(a *AccountConfig) string {
+	if a != nil && a.Calendar != nil && a.Calendar.Conflict != "" {
 		return a.Calendar.Conflict
 	}
-	return "remote"
+	if c.Calendar.Conflict != "" {
+		return c.Calendar.Conflict
+	}
+	return "newer"
 }
 
 // CalendarAutosyncEnabled resolves the effective calendar autosync toggle for

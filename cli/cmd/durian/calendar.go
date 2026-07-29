@@ -210,7 +210,7 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("calendar sync failed: %w", err)
 	}
 
-	policy := account.CalendarConflictPolicy()
+	policy := cfg.CalendarConflictPolicy(account)
 	summary := summarizePlans(plans, policy)
 	fmt.Fprintf(os.Stderr, "Plan for %s: %d download(s), %d prune(s), %d upload(s), %d update(s), %d remote delete(s), %d conflict(s), %d RSVP(s)\n",
 		account.GetAliasOrName(), summary.downloads, summary.prunes,

@@ -62,6 +62,12 @@ class CalendarConfig {
   /// `durian calendar sync`. Per-account override:
   /// accounts[*].calendar.autosync_upload.
   autosync_upload: "none"|"safe" = "none"
+  /// Two-way sync conflict policy when an event changed on both sides:
+  /// "newer" (default) keeps the side modified last, "remote" keeps the
+  /// remote version, "local" keeps the local file. The losing local file is
+  /// always backed up to <file>.conflict-<timestamp> first. Per-account
+  /// override: accounts[*].calendar.conflict.
+  conflict: "remote"|"local"|"newer" = "newer"
 }
 
 class AccountCalendarConfig {
@@ -69,11 +75,9 @@ class AccountCalendarConfig {
   dir: String?
   /// Calendar display names to export (empty = all calendars).
   include: Listing<String> = new {}
-  /// Two-way sync conflict policy when an event changed on both sides:
-  /// "remote" (default) keeps the remote version (the local file is backed
-  /// up to <file>.conflict-<timestamp> first), "local" keeps the local file,
-  /// "newer" keeps the side modified last.
-  conflict: "remote"|"local"|"newer" = "remote"
+  /// Per-account override of the global calendar.conflict policy
+  /// ("remote"|"local"|"newer"; null = use the global setting).
+  conflict: ("remote"|"local"|"newer")?
   /// Per-account override of the global calendar.autosync toggle
   /// (null = use the global setting).
   autosync: Boolean?

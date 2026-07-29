@@ -68,6 +68,13 @@ func ValidateConfig(cfg *Config) []ValidationError {
 		add("calendar.autosync_upload", fmt.Sprintf("must be \"none\" or \"safe\", got %q", cfg.Calendar.AutosyncUpload))
 	}
 
+	// Global conflict policy ("" = absent block = the "newer" default)
+	switch cfg.Calendar.Conflict {
+	case "", "remote", "local", "newer":
+	default:
+		add("calendar.conflict", fmt.Sprintf("must be \"remote\", \"local\" or \"newer\", got %q", cfg.Calendar.Conflict))
+	}
+
 	if len(cfg.Accounts) == 0 {
 		warn("accounts", "no accounts configured")
 		return errs

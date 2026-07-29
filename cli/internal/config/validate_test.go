@@ -178,18 +178,28 @@ func TestValidateConfig_CalendarProviderWarning(t *testing.T) {
 	}
 }
 
-func TestAccountCalendarConflictPolicyDefault(t *testing.T) {
+func TestCalendarConflictPolicyResolution(t *testing.T) {
+	cfg := &Config{}
 	a := &AccountConfig{}
-	if got := a.CalendarConflictPolicy(); got != "remote" {
-		t.Errorf("nil calendar block: policy = %q, want remote", got)
+
+	// Nothing set anywhere: the schema default "newer".
+	if got := cfg.CalendarConflictPolicy(a); got != "newer" {
+		t.Errorf("nothing set: policy = %q, want newer", got)
 	}
+	// Empty account calendar block: still the default.
 	a.Calendar = &AccountCalendarConfig{}
-	if got := a.CalendarConflictPolicy(); got != "remote" {
-		t.Errorf("empty conflict: policy = %q, want remote", got)
+	if got := cfg.CalendarConflictPolicy(a); got != "newer" {
+		t.Errorf("empty account block: policy = %q, want newer", got)
 	}
-	a.Calendar.Conflict = "newer"
-	if got := a.CalendarConflictPolicy(); got != "newer" {
-		t.Errorf("policy = %q, want newer", got)
+	// Global override, no account override.
+	cfg.Calendar.Conflict = "remote"
+	if got := cfg.CalendarConflictPolicy(a); got != "remote" {
+		t.Errorf("global remote: policy = %q, want remote", got)
+	}
+	// Account override wins over global.
+	a.Calendar.Conflict = "local"
+	if got := cfg.CalendarConflictPolicy(a); got != "local" {
+		t.Errorf("account override: policy = %q, want local", got)
 	}
 }
 
