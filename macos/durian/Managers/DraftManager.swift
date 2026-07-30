@@ -11,7 +11,7 @@ import Foundation
 class DraftManager {
     static let shared = DraftManager()
 
-    private let baseURL = URL(string: "http://localhost:9723/api/v1/local-drafts")!
+    private let baseURL = AppServer.localDraftsURL
     private let encoder: JSONEncoder = {
         let e = JSONEncoder()
         e.dateEncodingStrategy = .iso8601

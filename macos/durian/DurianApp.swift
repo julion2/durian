@@ -37,10 +37,24 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     }
 }
 
+// MARK: - App Lifecycle Delegate
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Terminate the child `durian serve` on a normal app quit so it never
+    /// orphans and holds the port. Force-quit / crash is covered server-side by
+    /// serve's --exit-when-orphaned poll.
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            AccountManager.shared.emailBackend?.terminateServerSync()
+        }
+    }
+}
+
 // MARK: - App
 
 @main
 struct DurianApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.openWindow) private var openWindow
     @StateObject private var profileManager = ProfileManager.shared
     @StateObject private var accountManager = AccountManager.shared

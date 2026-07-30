@@ -117,7 +117,7 @@ enum TagError: Error, LocalizedError {
 class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     private var durianProcess: Process?
     private let decoder = JSONDecoder()
-    private let baseURL = URL(string: "http://localhost:9723/api/v1")!
+    private let baseURL = AppServer.apiBaseURL
     // Auth token for the current server session — static for cross-component access
     nonisolated(unsafe) static var authToken: String?
 
@@ -185,14 +185,14 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
             return
         }
 
-        // Kill any existing durian serve process to free the port.
-        // This handles the case where another app instance (Nightly vs Release)
-        // or a stale process is already bound to :9723.
-        killExistingServeProcesses()
+        // Free this app's serve port before spawning (a stale orphan may still
+        // hold it). Scoped to AppServer.port so Nightly and Release don't kill
+        // each other's server.
+        freeServePort()
 
         durianProcess = Process()
         durianProcess?.executableURL = URL(fileURLWithPath: durianPath)
-        durianProcess?.arguments = ["serve"]
+        durianProcess?.arguments = ["serve", "--port", "\(AppServer.port)", "--exit-when-orphaned"]
 
         // Ensure child process can find durian and other tools
         var env = ProcessInfo.processInfo.environment
@@ -210,30 +210,10 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
             try durianProcess?.run()
             Log.info("BACKEND", "Started durian server process")
 
-            // Read the READY line from stdout (blocks until the server prints it)
-            let token = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
-                stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-                    let data = handle.availableData
-                    guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else {
-                        handle.readabilityHandler = nil
-                        continuation.resume(throwing: NSError(domain: "EmailBackend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Server closed stdout without READY"]))
-                        return
-                    }
-                    // Parse "READY token=<hex> addr=<addr>\n"
-                    if line.hasPrefix("READY token=") {
-                        handle.readabilityHandler = nil
-                        let parts = line.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ")
-                        for part in parts {
-                            if part.hasPrefix("token=") {
-                                let tokenValue = String(part.dropFirst(6))
-                                continuation.resume(returning: tokenValue)
-                                return
-                            }
-                        }
-                        continuation.resume(throwing: NSError(domain: "EmailBackend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Malformed READY line"]))
-                    }
-                }
-            }
+            // Read the "READY token=<hex> addr=<addr>" handshake, with a timeout
+            // so a serve that never binds can't hang the app, and line buffering
+            // so a chunk-split READY line still parses.
+            let token = try await Self.readReadyToken(from: stdoutPipe, timeout: 10)
 
             Self.authToken = token
             isConnected = true
@@ -258,19 +238,119 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         Log.info("BACKEND", "Disconnected and server terminated")
     }
 
-    /// Kill any existing `durian serve` processes to free port 9723.
-    private func killExistingServeProcesses() {
+    /// Synchronously terminate the child serve. Called from
+    /// applicationWillTerminate so the server doesn't outlive the app on a normal
+    /// quit; serve's own --exit-when-orphaned poll covers force-quit / crash.
+    func terminateServerSync() {
+        durianProcess?.terminate()
+        durianProcess = nil
+        isConnected = false
+    }
+
+    /// Free this app's serve port before spawning. Scoped to AppServer.port (not
+    /// a broad "durian serve" match) so the Nightly and Release apps never kill
+    /// each other's server, and waits until the port is actually free instead of
+    /// a blind sleep.
+    private func freeServePort() {
+        var pids = pidsHoldingPort(AppServer.port)
+        guard !pids.isEmpty else { return }
+        for pid in pids { kill(pid, SIGTERM) }
+        Log.info("BACKEND", "Terminated \(pids.count) stale process(es) on port \(AppServer.port)")
+
+        let deadline = Date().addingTimeInterval(3.0)
+        while Date() < deadline {
+            pids = pidsHoldingPort(AppServer.port)
+            if pids.isEmpty { return }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        // Last resort: anything still bound gets SIGKILL.
+        for pid in pidsHoldingPort(AppServer.port) { kill(pid, SIGKILL) }
+    }
+
+    /// PIDs listening on the given TCP port, via lsof.
+    private func pidsHoldingPort(_ port: Int) -> [pid_t] {
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        task.arguments = ["-f", "durian serve"]
-        task.standardOutput = FileHandle.nullDevice
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        task.arguments = ["-ti", "tcp:\(port)"]
+        let out = Pipe()
+        task.standardOutput = out
         task.standardError = FileHandle.nullDevice
-        try? task.run()
-        task.waitUntilExit()
-        if task.terminationStatus == 0 {
-            Log.info("BACKEND", "Killed existing durian serve process")
-            // Brief pause to let the port be released
-            Thread.sleep(forTimeInterval: 0.5)
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            return []
+        }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        guard let s = String(data: data, encoding: .utf8) else { return [] }
+        return s.split(separator: "\n").compactMap { pid_t($0.trimmingCharacters(in: .whitespaces)) }
+    }
+
+    /// Reads the `READY token=<hex> addr=<addr>` handshake line from serve's
+    /// stdout. Buffers partial reads until a newline (a split READY line still
+    /// parses), ignores any non-READY lines, and fails after `timeout` seconds so
+    /// a serve that never binds cannot hang the app. The continuation is resumed
+    /// exactly once (data vs timeout race guarded by ReadyReadState.claim).
+    nonisolated static func readReadyToken(from pipe: Pipe, timeout: TimeInterval) async throws -> String {
+        let state = ReadyReadState()
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+            let handle = pipe.fileHandleForReading
+
+            // Task-based timeout: captures only Sendable values (state,
+            // continuation), unlike a DispatchWorkItem that would have to capture
+            // the non-Sendable FileHandle.
+            let timeoutTask = Task {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                if state.claim() {
+                    continuation.resume(throwing: NSError(domain: "EmailBackend", code: -2,
+                        userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for server READY"]))
+                }
+            }
+
+            handle.readabilityHandler = { h in
+                let data = h.availableData
+                if data.isEmpty {
+                    if state.claim() {
+                        timeoutTask.cancel()
+                        h.readabilityHandler = nil
+                        continuation.resume(throwing: NSError(domain: "EmailBackend", code: -1,
+                            userInfo: [NSLocalizedDescriptionKey: "Server closed stdout without READY"]))
+                    }
+                    return
+                }
+                state.buffer += String(data: data, encoding: .utf8) ?? ""
+                // Scan complete lines; resume on the first READY line, ignore rest.
+                while let nl = state.buffer.firstIndex(of: "\n") {
+                    let line = String(state.buffer[..<nl])
+                    state.buffer = String(state.buffer[state.buffer.index(after: nl)...])
+                    guard line.hasPrefix("READY token=") else { continue }
+                    let token = line.split(separator: " ")
+                        .first(where: { $0.hasPrefix("token=") })
+                        .map { String($0.dropFirst(6)) } ?? ""
+                    if state.claim() {
+                        timeoutTask.cancel()
+                        h.readabilityHandler = nil
+                        continuation.resume(returning: token)
+                    }
+                    return
+                }
+            }
+        }
+    }
+
+    /// One-shot resume guard shared between the READY read and its timeout.
+    /// @unchecked Sendable: `claimed` is lock-guarded, `buffer` is touched only
+    /// on the FileHandle's serial readability queue.
+    private final class ReadyReadState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var claimed = false
+        var buffer = ""
+        /// Returns true to exactly one caller — the winner owns resuming.
+        func claim() -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            if claimed { return false }
+            claimed = true
+            return true
         }
     }
 
