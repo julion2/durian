@@ -86,6 +86,7 @@ func syncOneWithEngine(ctx context.Context, account *config.AccountConfig, optio
 	}
 	result.TotalNew = res.New
 	result.TotalDeleted = res.Deleted
+	result.TotalMoved = res.Moved
 	if len(res.Errors) > 0 {
 		// Surface the first per-folder error; the engine already logged them all.
 		result.Error = fmt.Errorf("%d folder error(s), first: %w", len(res.Errors), res.Errors[0])

@@ -68,6 +68,9 @@ type Result struct {
 	New int
 	// Deleted is the number of server-side deletions applied locally.
 	Deleted int
+	// Moved is the number of local archive/delete actions uploaded to the
+	// server (INBOX messages moved to Archive/Trash).
+	Moved int
 	// Errors collects per-folder and per-message errors; the sync continues
 	// past them (like the legacy syncer continues past a failed mailbox).
 	Errors []error
@@ -117,18 +120,29 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 		}
 
 		result.Folders++
-		if err := e.syncFolder(ctx, b, folder, result); err != nil {
-			slog.Warn("Folder sync failed, continuing", "module", "SYNCENGINE",
-				"account", e.opts.Account, "folder", folder.Name, "err", err)
-			result.Errors = append(result.Errors, fmt.Errorf("folder %s: %w", folder.Name, err))
-			continue
+		// UploadOnly skips the download/ingest pass entirely — used to push a
+		// backlog of local changes (folder moves, flag changes) WITHOUT
+		// re-fetching the server's copy, which would re-add role tags like
+		// "inbox" to messages the user archived but that haven't moved on the
+		// server yet, defeating the upload we're about to do.
+		if e.opts.Mode != UploadOnly {
+			if err := e.syncFolder(ctx, b, folder, result); err != nil {
+				slog.Warn("Folder sync failed, continuing", "module", "SYNCENGINE",
+					"account", e.opts.Account, "folder", folder.Name, "err", err)
+				result.Errors = append(result.Errors, fmt.Errorf("folder %s: %w", folder.Name, err))
+				continue
+			}
 		}
 		e.reconcileFolderFlags(ctx, b, folder, result)
 	}
 
+	// Upload local archive/delete actions (INBOX messages that lost the "inbox"
+	// tag) to the server. Runs after downloads so it sees the freshest folders.
+	e.uploadFolderMoves(ctx, b, folders, result)
+
 	slog.Info("Sync complete", "module", "SYNCENGINE", "account", e.opts.Account, // encgrep:allow account identifier (config name) and counts, not an encrypted column
 		"folders", result.Folders, "new", result.New, "deleted", result.Deleted,
-		"errors", len(result.Errors), "dry_run", e.opts.DryRun)
+		"moved", result.Moved, "errors", len(result.Errors), "dry_run", e.opts.DryRun)
 	return result, nil
 }
 
@@ -437,4 +451,106 @@ func (e *Engine) handleDeleted(folder backend.Folder, del backend.Deletion, sess
 		return false
 	}
 	return true
+}
+
+// uploadFolderMoves pushes local archive/delete actions to the server: INBOX
+// messages whose local tags no longer include "inbox" are moved to the Archive
+// (or Trash) folder via Backend.Move. This is the upload counterpart to the
+// download/flag passes — without it, archiving or deleting a message in the GUI
+// never reaches the server on the engine path. Skipped in DownloadOnly mode and
+// dry-run-safe (a dry run counts what would move without touching the server).
+//
+// Data-loss safety: after Move expunges the message from INBOX, the next INBOX
+// delta reports it deleted — but INBOX is role-mapped, so handleDeleted only
+// strips the "inbox" tag and keeps the row (it never deletes a role-mapped
+// folder's message). The row survives locally under its new folder.
+func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folders []backend.Folder, result *Result) {
+	if e.opts.Mode == DownloadOnly {
+		return
+	}
+	var inbox *backend.Folder
+	for i := range folders {
+		if folders[i].Role == backend.RoleInbox {
+			inbox = &folders[i]
+			break
+		}
+	}
+	if inbox == nil {
+		return
+	}
+
+	rows, err := e.opts.Store.GetFolderFlagState(e.opts.Account, inbox.Name)
+	if err != nil {
+		slog.Warn("Folder-move upload: load inbox state failed", "module", "SYNCENGINE",
+			"account", e.opts.Account, "err", err)
+		return
+	}
+
+	for _, r := range rows {
+		if tagsContain(r.Tags, "inbox") {
+			continue // still in inbox — nothing to upload
+		}
+		dest, ok := moveDestination(r.Tags, folders)
+		if !ok {
+			continue // no resolvable destination (e.g. no Archive folder) — leave in place
+		}
+		if e.opts.DryRun {
+			slog.Debug("[dry-run] Would move message out of inbox", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+				"message_id", r.MessageID, "dest", dest)
+			result.Moved++
+			continue
+		}
+		ref := backend.RemoteRef{Folder: inbox.Name, ID: r.RemoteRef}
+		if _, err := b.Move(ctx, ref, dest); err != nil {
+			slog.Warn("Folder-move upload failed", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+				"message_id", r.MessageID, "dest", dest, "err", err)
+			result.Errors = append(result.Errors, fmt.Errorf("move %s: %w", r.MessageID, err))
+			continue
+		}
+		if err := e.opts.Store.UpdateMailbox(r.MessageID, e.opts.Account, dest, 0); err != nil {
+			slog.Warn("Folder-move upload: update mailbox failed", "module", "SYNCENGINE", // encgrep:allow static message text mentions "mailbox"; only message_id (plaintext) and err are logged
+				"message_id", r.MessageID, "err", err)
+		}
+		result.Moved++
+		slog.Info("Moved message out of inbox", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+			"message_id", r.MessageID, "dest", dest)
+	}
+}
+
+// moveDestination decides where an INBOX message that lost the "inbox" tag
+// should go, from its remaining tags and the available server folders: a
+// message tagged "deleted" goes to Trash, otherwise to Archive. Returns
+// ("", false) — leave it in place — when the role has no folder on this
+// account, so a missing Archive/Trash never sends mail somewhere wrong.
+func moveDestination(tags []string, folders []backend.Folder) (string, bool) {
+	role := backend.RoleArchive
+	if tagsContain(tags, "deleted") {
+		role = backend.RoleTrash
+	}
+	dest := folderNameByRole(folders, role)
+	if dest == "" {
+		return "", false
+	}
+	return dest, true
+}
+
+// folderNameByRole returns the name of the first folder with the given role, or
+// "" if none. The name is what Backend.Move takes as its destination (an IMAP
+// mailbox name, or a Graph folder id).
+func folderNameByRole(folders []backend.Folder, role backend.Role) string {
+	for _, f := range folders {
+		if f.Role == role {
+			return f.Name
+		}
+	}
+	return ""
+}
+
+func tagsContain(tags []string, want string) bool {
+	for _, t := range tags {
+		if t == want {
+			return true
+		}
+	}
+	return false
 }
