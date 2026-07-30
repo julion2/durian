@@ -53,7 +53,28 @@ func detectMagic(data []byte, transferEncoding string) (mimeType, ext string) {
 }
 
 // Parser handles MIME parsing of email messages
-type Parser struct{}
+type Parser struct {
+	// captureIndex, when non-zero, makes the parse record the transfer-decoded
+	// bytes and media type of the attachment at that 1-based index in parse
+	// order — the same numbering the ingest path assigns as PartID. Used by
+	// ExtractAttachmentPart to serve one attachment from a raw body; zero (the
+	// default) disables capture so the normal metadata-only parse is unchanged.
+	captureIndex int
+	attnCount    int
+	capturedData []byte
+	capturedType string
+}
+
+// noteAttachment is called once per attachment in parse order. It counts
+// attachments and, when the count reaches captureIndex, records that
+// attachment's transfer-decoded bytes and media type.
+func (p *Parser) noteAttachment(rawBody []byte, transferEncoding, mediaType string) {
+	p.attnCount++
+	if p.captureIndex != 0 && p.captureIndex == p.attnCount {
+		p.capturedData = decodeTransferEncoding(rawBody, transferEncoding)
+		p.capturedType = mediaType
+	}
+}
 
 // NewParser creates a new mail parser
 func NewParser() *Parser {
@@ -83,6 +104,7 @@ func (p *Parser) Parse(msg *mail.Message) *MailContent {
 
 // extractBody extracts text, HTML and attachments from a mail message
 func (p *Parser) extractBody(msg *mail.Message) (string, string, []AttachmentInfo) {
+	p.attnCount = 0
 	contentType := msg.Header.Get("Content-Type")
 	transferEncoding := msg.Header.Get("Content-Transfer-Encoding")
 	charset := encoding.GetCharset(contentType)
@@ -150,6 +172,7 @@ func (p *Parser) extractBody(msg *mail.Message) (string, string, []AttachmentInf
 			Disposition: disposition,
 			ContentID:   msg.Header.Get("Content-Id"),
 		})
+		p.noteAttachment(body, transferEncoding, mediaType)
 		return "", "", attachments
 	}
 
@@ -205,6 +228,7 @@ func (p *Parser) extractMultipart(r io.Reader, boundary string) (string, string,
 				Disposition: disposition,
 				ContentID:   part.Header.Get("Content-Id"),
 			})
+			p.noteAttachment(attBody, transferEncoding, mediaType)
 			continue
 		}
 
