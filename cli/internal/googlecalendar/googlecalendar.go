@@ -711,10 +711,10 @@ type eventsPage struct {
 // absence from the returned set.
 func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]calendar.Event, error) {
 	base := c.baseURL + "/calendars/" + url.PathEscape(calendarID) + "/events"
-	q := url.Values{}
-	q.Set("maxResults", strconv.Itoa(pageSize))
-	q.Set("singleEvents", "false")
-	q.Set("showDeleted", "true")
+	// Same parameter set as the incremental round (see delta.go): a sync token
+	// is only replayable against the query that minted it, so the two paths
+	// must not be allowed to drift apart.
+	q := baseQuery()
 
 	var events []calendar.Event
 	// byID indexes into events by the Google master id the instances point at.

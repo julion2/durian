@@ -143,6 +143,33 @@ type CalendarProvider interface {
 	IsAuthError(err error) bool
 }
 
+// DeltaCalendarProvider is the optional incremental-download capability. A
+// provider that implements it lets the engine ask for "what changed since this
+// cursor" instead of re-reading the whole calendar every run; the engine type-
+// asserts for it and falls back to FetchMasterEvents when a provider does not.
+//
+// It is a separate interface rather than a method on CalendarProvider so that
+// a provider whose change feed is not usable yet stays a complete, honest
+// implementation instead of a required method that returns "unsupported".
+type DeltaCalendarProvider interface {
+	CalendarProvider
+	// FetchMasterEventsDelta returns the changes since cursor. An empty cursor
+	// asks for a full round, whose ChangedMasters are the complete remote set
+	// and whose Reset is true.
+	//
+	// A cursor the provider can no longer resume from is NOT an error: the
+	// implementation restarts on its own and reports Reset, because every
+	// provider invalidates cursors for reasons the client cannot avoid (a
+	// server-side cache eviction, an ACL change) and a sync that fails on
+	// those would fail routinely.
+	FetchMasterEventsDelta(ctx context.Context, calendarID, cursor string) (DeltaResult, error)
+	// DeltaParamFingerprint identifies the query shape the provider's cursors
+	// are bound to. The engine discards a cursor whose fingerprint no longer
+	// matches, so changing the query cannot silently produce a wrong or
+	// rejected incremental round.
+	DeltaParamFingerprint() string
+}
+
 // MARK: - Neutral-model shorthand
 
 // Aliases keeping the engine sources (moved here from the Graph package)
