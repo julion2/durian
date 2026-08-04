@@ -195,6 +195,10 @@ func ValidateConfig(cfg *Config) []ValidationError {
 		if acct.SyncEngine == "graph" && (acct.OAuth == nil || acct.OAuth.Provider != "microsoft") {
 			add(prefix+".sync_engine", "\"graph\" requires a Microsoft OAuth account")
 		}
+		if acct.OAuth != nil && acct.OAuth.Provider == "microsoft" &&
+			(acct.SyncEngine == "legacy" || acct.SyncEngine == "engine") {
+			add(prefix+".sync_engine", "Microsoft accounts sync via Graph; the IMAP path (\"legacy\"/\"engine\") is not supported")
+		}
 	}
 
 	if defaultCount > 1 {
