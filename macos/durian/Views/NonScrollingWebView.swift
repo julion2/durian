@@ -9,6 +9,59 @@
 import SwiftUI
 import WebKit
 
+// MARK: - Shared WebKit infrastructure
+
+/// Pooled WebKit resources reused across every email-card WebView in the
+/// app. Without these, each NonScrollingWebView+EditableWebView creates its
+/// own WKWebViewConfiguration → its own WKProcessPool → its own WebContent
+/// process. A 20-message thread becomes 20+ WebContent processes, all
+/// independently suspended/resumed by macOS on every window-occlusion
+/// transition.
+///
+/// Activity Monitor pre-pooling: ~16k `WebKit:ProcessSuspension` events / 12h.
+/// Expected post-pooling: one WebContent process per pool instead of one per
+/// card, so the suspend/resume churn scales with pools, not with the mailbox.
+///
+/// Occlusion throttling is NOT done here. macOS WKWebView exposes no public
+/// switch for it, and probing for a private selector would be a no-op at best
+/// and an App Store problem at worst.
+enum SharedWebKit {
+    /// Process pool shared by every read-only email-rendering WebView
+    /// (NonScrollingWebView). Lifetime = app process.
+    static let readOnlyPool = WKProcessPool()
+
+    /// Separate pool for the compose editor — keeps a stale editor renderer
+    /// from sharing a process with the reader fleet. The editor has its own
+    /// userContentController + message handlers, isolation is desirable.
+    static let composePool = WKProcessPool()
+
+    /// Ephemeral, in-memory data store shared across read-only WebViews.
+    ///
+    /// The HTTP cache was already shared before pooling — every WebView used
+    /// `WKWebsiteDataStore.default()`. What changes here is persistence:
+    /// `.nonPersistent()` keeps nothing on disk, so remote images are refetched
+    /// after an app restart, and no cookie or cache artefact of a tracking
+    /// pixel outlives the process. Email HTML is CSP'd (`script-src 'none'`),
+    /// so cookies/localStorage could never be written from the content anyway.
+    static let readOnlyDataStore: WKWebsiteDataStore = .nonPersistent()
+
+    /// Build a WKWebViewConfiguration pre-wired with the shared read-only
+    /// pool + data store + the read-only JS/window prefs. Returns a fresh
+    /// instance per call — the SHARED state is the inner pool, not the
+    /// config object.
+    static func makeReadOnlyConfig() -> WKWebViewConfiguration {
+        let config = WKWebViewConfiguration()
+        config.processPool = readOnlyPool
+        config.websiteDataStore = readOnlyDataStore
+        // JS is needed for one-shot height measurement; CSP blocks all
+        // inline + external scripts anyway.
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.preferences.javaScriptCanOpenWindowsAutomatically = false
+        return config
+    }
+
+}
+
 // MARK: - Custom WebView that passes scroll events to parent
 
 /// A WKWebView subclass that passes scroll wheel events to its parent ScrollView
@@ -38,17 +91,9 @@ struct NonScrollingWebView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-
-        // Enable JavaScript for height measurement only
-        // Note: We need JS enabled to measure content height, but CSP blocks external scripts
-        config.defaultWebpagePreferences.allowsContentJavaScript = true
-
-        // SECURITY: Disable auto-opening windows
-        config.preferences.javaScriptCanOpenWindowsAutomatically = false
-
-        // Use custom WebView that passes scroll events to parent
-        let webView = ScrollPassthroughWebView(frame: .zero, configuration: config)
+        // Use the shared read-only config — same WKProcessPool and
+        // WKWebsiteDataStore across every email card in the app.
+        let webView = ScrollPassthroughWebView(frame: .zero, configuration: SharedWebKit.makeReadOnlyConfig())
         #if DEBUG
         webView.isInspectable = true
         #endif
@@ -63,6 +108,13 @@ struct NonScrollingWebView: NSViewRepresentable {
         context.coordinator.parent = self
 
         return webView
+    }
+
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) {
+        // Stop any in-flight HTML/image load on teardown so we don't keep
+        // the WebContent process awake doing work whose result no view
+        // will ever consume.
+        nsView.stopLoading()
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
@@ -150,6 +202,22 @@ struct NonScrollingWebView: NSViewRepresentable {
         var parent: NonScrollingWebView?
         var lastLoadedHTML: String?  // Track to prevent reload loops
         var loadedForEmailId: String?  // Track which email we loaded for (race condition prevention)
+
+        /// Reload after a WebContent process crash.
+        ///
+        /// This matters more with a shared pool than without one: before
+        /// pooling a renderer crash blanked exactly the card that caused it,
+        /// now every card sharing the pool goes blank at once. WebKit does not
+        /// reload by itself — the view just stays empty — so a crash without
+        /// this handler reads to the user as "the app lost my mail".
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            Log.warning("WEBVIEW", "WebContent process terminated, reloading card")
+            // lastLoadedHTML stays as it is: the reload restores exactly the
+            // content updateNSView believes is on screen, so its
+            // "only reload when the HTML changed" guard remains correct.
+            guard let html = lastLoadedHTML else { return }
+            webView.loadHTMLString(html, baseURL: nil)
+        }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             // Capture email ID at callback time to detect stale callbacks
