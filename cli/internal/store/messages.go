@@ -618,7 +618,7 @@ const messageSelectColumns = `m.id, m.message_id, m.thread_id, m.in_reply_to, m.
 		m.body_text_ct, m.body_html_ct,
 		mb.name_ct, ac.name_ct,
 		m.is_seen, m.is_flagged, m.is_deleted, m.flags_other,
-		m.uid, m.size, m.fetched_body`
+		m.uid, m.size, m.fetched_body, m.remote_ref`
 
 const messageSelectFrom = `FROM messages m
 		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
@@ -639,7 +639,7 @@ func (d *DB) scanMessageRow(scan func(...any) error) (*Message, error) {
 		&bodyTextCT, &bodyHTMLCT,
 		&mailboxNameCT, &accountNameCT,
 		&isSeen, &isFlagged, &isDeleted, &flagsOtherCT,
-		&msg.UID, &msg.Size, &fetchedBody,
+		&msg.UID, &msg.Size, &fetchedBody, &msg.RemoteRef,
 	); err != nil {
 		return nil, err
 	}

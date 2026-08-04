@@ -137,6 +137,41 @@ func TestFetchFolders(t *testing.T) {
 	}
 }
 
+func TestFetchMessagesRecoversFromExpiredToken(t *testing.T) {
+	const rawMIME = "Message-ID: <abc@example.com>\r\nSubject: Hi\r\n\r\nBody\r\n"
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/mailFolders/folder1/messages/delta", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("$deltatoken") == "stale" {
+			w.WriteHeader(http.StatusGone)
+			_, _ = w.Write([]byte(`{"error":{"code":"SyncStateNotFound","message":"sync state generation is not found"}}`))
+			return
+		}
+		// Fresh restart (no stale token) returns the folder's messages.
+		writeJSON(t, w, map[string]any{
+			"value": []map[string]any{
+				{"id": "msg1", "internetMessageId": "<abc@example.com>", "isRead": true},
+			},
+			"@odata.deltaLink": srv.URL + "/v1.0/me/mailFolders/folder1/messages/delta?$deltatoken=fresh",
+		})
+	})
+	mux.HandleFunc("/v1.0/me/messages/msg1/$value", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(rawMIME))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	stale := backend.Cursor(srv.URL + "/v1.0/me/mailFolders/folder1/messages/delta?$deltatoken=stale")
+	result, err := b.FetchMessages(context.Background(), "folder1", stale, 50)
+	if err != nil {
+		t.Fatalf("FetchMessages should recover from 410 SyncStateNotFound, got: %v", err)
+	}
+	if len(result.Messages) != 1 || result.Messages[0].Ref.ID != "msg1" {
+		t.Fatalf("expected 1 recovered message, got %+v", result.Messages)
+	}
+}
+
 func TestFetchMessagesDelta(t *testing.T) {
 	const rawMIME = "Message-ID: <abc@example.com>\r\nSubject: Hi\r\n\r\nBody\r\n"
 

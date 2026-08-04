@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/mail"
 	"os"
@@ -11,6 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/julion2/durian/cli/internal/backend"
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/graphbackend"
+	"github.com/julion2/durian/cli/internal/imapbackend"
 	internmail "github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/protocol"
 	"github.com/julion2/durian/cli/internal/sanitize"
@@ -207,24 +213,71 @@ func (h *Handler) DownloadAttachment(messageID string, partID int, w http.Respon
 	w.Header().Set("Content-Type", storeAtt.ContentType)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+sanitizeFilename(storeAtt.Filename)+`"`)
 
-	// Fetch via IMAP (break-IDLE pattern)
-	if h.fetcher == nil {
-		return errors.New("no attachment fetcher available")
-	}
-
 	msg, err := h.store.GetByMessageID(messageID)
 	if err != nil {
 		return fmt.Errorf("lookup message: %w", err)
 	}
-	if msg == nil || msg.UID == 0 || msg.Account == "" || msg.Mailbox == "" {
-		return errors.New("message missing IMAP metadata for attachment fetch")
+	if msg == nil {
+		return errors.New("message not found")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	// Backend-neutral path: engine-synced messages carry a provider handle
+	// (remote_ref) instead of an IMAP UID. Fetch the raw body through the
+	// account's backend and slice out the requested part. Covers Graph accounts
+	// (no UID) and IMAP messages whose mailbox this process can't SELECT.
+	if msg.RemoteRef != "" && h.cfg != nil {
+		data, ctype, berr := h.fetchAttachmentViaBackend(ctx, msg, partID)
+		if berr == nil {
+			if ctype != "" {
+				w.Header().Set("Content-Type", ctype)
+			}
+			_, werr := w.Write(data)
+			return werr
+		}
+		slog.Warn("Backend attachment fetch failed, falling back to IMAP", "module", "HANDLER", "message_id", messageID, "err", berr)
+	}
+
+	// Legacy path: break-IDLE IMAP fetch by UID.
+	if h.fetcher == nil {
+		return errors.New("no attachment fetcher available")
+	}
+	if msg.UID == 0 || msg.Account == "" || msg.Mailbox == "" {
+		return errors.New("message missing IMAP metadata for attachment fetch")
+	}
 	return h.fetcher.FetchAttachment(ctx, msg.Account, msg.Mailbox,
 		msg.UID, messageID, storeAtt.Filename, storeAtt.ContentType, storeAtt.PartID, w)
+}
+
+// fetchAttachmentViaBackend fetches the message's raw body through the account's
+// backend and returns the requested attachment part's bytes and media type.
+func (h *Handler) fetchAttachmentViaBackend(ctx context.Context, msg *store.Message, partID int) ([]byte, string, error) {
+	account, err := h.cfg.GetAccountByIdentifier(msg.Account)
+	if err != nil {
+		return nil, "", fmt.Errorf("account %q: %w", msg.Account, err)
+	}
+	b, err := newMailBackend(account)
+	if err != nil {
+		return nil, "", err
+	}
+	defer b.Close()
+	var buf bytes.Buffer
+	ref := backend.RemoteRef{Folder: msg.Mailbox, ID: msg.RemoteRef}
+	if err := b.FetchBody(ctx, ref, &buf); err != nil {
+		return nil, "", fmt.Errorf("fetch body: %w", err)
+	}
+	return internmail.ExtractAttachmentPart(buf.Bytes(), partID)
+}
+
+// newMailBackend builds the backend for an account: Graph for Graph-backed
+// accounts, IMAP otherwise.
+func newMailBackend(account *config.AccountConfig) (backend.Backend, error) {
+	if account.UsesGraphBackend() {
+		return graphbackend.New(account)
+	}
+	return imapbackend.New(account)
 }
 
 // extractSenderEmail returns the lowercase email address from a

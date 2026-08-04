@@ -100,6 +100,13 @@ type fakeBackend struct {
 	// fetchFlagsCalls / applyFlagsCalls record the flag-pass invocations.
 	fetchFlagsCalls []fetchFlagsCall
 	applyFlagsCalls []applyFlagsCall
+	// moveCalls records Backend.Move invocations (folder-move upload pass).
+	moveCalls []moveCall
+}
+
+type moveCall struct {
+	ref  backend.RemoteRef
+	dest string
 }
 
 func newFakeBackend(folders []backend.Folder, scripts map[string][]backend.FetchResult) *fakeBackend {
@@ -149,6 +156,7 @@ func (f *fakeBackend) FetchFlags(ctx context.Context, folder string, refs []back
 }
 
 func (f *fakeBackend) Move(ctx context.Context, ref backend.RemoteRef, destFolder string) (backend.RemoteRef, error) {
+	f.moveCalls = append(f.moveCalls, moveCall{ref: ref, dest: destFolder})
 	return backend.RemoteRef{Folder: destFolder, ID: ref.ID}, nil
 }
 
@@ -186,6 +194,135 @@ func mustTags(t *testing.T, db *store.DB, messageID string) []string {
 		t.Fatalf("get tags for %s: %v", messageID, err)
 	}
 	return tags
+}
+
+// TestEngineUploadsFolderMoves proves the upload pass: an INBOX message whose
+// "inbox" tag was removed locally (GUI archive) is moved to Archive via
+// Backend.Move on the next sync, a "deleted"-tagged one goes to Trash, and an
+// untouched one stays put.
+func TestEngineUploadsFolderMoves(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{
+		{Name: "INBOX", Display: "Inbox", Role: backend.RoleInbox, Selectable: true},
+		{Name: "Archive", Display: "Archive", Role: backend.RoleArchive, Selectable: true},
+		{Name: "Trash", Display: "Trash", Role: backend.RoleTrash, Selectable: true},
+	}
+	scripts := map[string][]backend.FetchResult{
+		"INBOX": {{
+			Messages: []backend.Message{
+				{
+					MessageID: "keep@example.com",
+					Ref:       backend.RemoteRef{Folder: "INBOX", ID: "1"},
+					Raw:       rawMessage("keep@example.com", "a@example.com", testAccount, "Keep", "body"),
+				},
+				{
+					MessageID: "arch@example.com",
+					Ref:       backend.RemoteRef{Folder: "INBOX", ID: "2"},
+					Raw:       rawMessage("arch@example.com", "b@example.com", testAccount, "Archive me", "body"),
+				},
+				{
+					MessageID: "del@example.com",
+					Ref:       backend.RemoteRef{Folder: "INBOX", ID: "3"},
+					Raw:       rawMessage("del@example.com", "c@example.com", testAccount, "Delete me", "body"),
+				},
+			},
+			Cursor: backend.Cursor("c1"),
+		}},
+	}
+	fake := newFakeBackend(folders, scripts)
+	cursors := newMemCursorStore()
+
+	// First sync ingests all three into INBOX (each gets the "inbox" tag).
+	if _, err := newTestEngine(db, cursors).Sync(context.Background(), fake); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// Simulate GUI actions: archive one (drop inbox), delete another
+	// (drop inbox, add deleted).
+	if err := db.ModifyTagsByMessageIDAndAccount("arch@example.com", testAccount, nil, []string{"inbox"}); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if err := db.ModifyTagsByMessageIDAndAccount("del@example.com", testAccount, []string{"deleted"}, []string{"inbox"}); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	// Second sync uploads the moves.
+	res, err := newTestEngine(db, cursors).Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if res.Moved != 2 {
+		t.Errorf("Result.Moved = %d, want 2", res.Moved)
+	}
+
+	dests := map[string]string{} // Move ref.ID -> destination
+	for _, m := range fake.moveCalls {
+		dests[m.ref.ID] = m.dest
+	}
+	if len(fake.moveCalls) != 2 {
+		t.Fatalf("moveCalls = %d, want 2: %+v", len(fake.moveCalls), fake.moveCalls)
+	}
+	if dests["2"] != "Archive" {
+		t.Errorf("archived message dest = %q, want Archive", dests["2"])
+	}
+	if dests["3"] != "Trash" {
+		t.Errorf("deleted message dest = %q, want Trash", dests["3"])
+	}
+
+	// The kept message was never moved and stays in INBOX.
+	if keep, _ := db.GetByMessageID("keep@example.com"); keep == nil || keep.Mailbox != "INBOX" {
+		t.Errorf("kept message should remain in INBOX")
+	}
+	// The archived message's row now points at Archive (not deleted locally).
+	if arch, _ := db.GetByMessageID("arch@example.com"); arch == nil || arch.Mailbox != "Archive" {
+		t.Errorf("archived message should have mailbox Archive")
+	}
+}
+
+// TestEngineUploadOnlySkipsDownload proves --upload-only pushes local moves
+// without re-ingesting: the archived message moves, but nothing is downloaded
+// (so a still-in-server-INBOX message is not re-tagged "inbox").
+func TestEngineUploadOnlySkipsDownload(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{
+		{Name: "INBOX", Display: "Inbox", Role: backend.RoleInbox, Selectable: true},
+		{Name: "Archive", Display: "Archive", Role: backend.RoleArchive, Selectable: true},
+	}
+	scripts := map[string][]backend.FetchResult{
+		"INBOX": {{
+			Messages: []backend.Message{{
+				MessageID: "arch@example.com",
+				Ref:       backend.RemoteRef{Folder: "INBOX", ID: "9"},
+				Raw:       rawMessage("arch@example.com", "b@example.com", testAccount, "Archive me", "body"),
+			}},
+			Cursor: backend.Cursor("c1"),
+		}},
+	}
+	fake := newFakeBackend(folders, scripts)
+	cursors := newMemCursorStore()
+
+	// Ingest, then archive locally.
+	if _, err := newTestEngine(db, cursors).Sync(context.Background(), fake); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if err := db.ModifyTagsByMessageIDAndAccount("arch@example.com", testAccount, nil, []string{"inbox"}); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+
+	up := New(Options{Store: db, Cursors: cursors, Account: testAccount, Mode: UploadOnly, Ingest: IngestOptions{Account: testAccount}})
+	res, err := up.Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("upload-only sync: %v", err)
+	}
+	if res.New != 0 {
+		t.Errorf("upload-only Result.New = %d, want 0 (no download)", res.New)
+	}
+	if res.Moved != 1 {
+		t.Errorf("upload-only Result.Moved = %d, want 1", res.Moved)
+	}
+	if len(fake.moveCalls) != 1 || fake.moveCalls[0].dest != "Archive" {
+		t.Errorf("expected one move to Archive, got %+v", fake.moveCalls)
+	}
 }
 
 // TestEngineSyncIngests proves the end-to-end path: fake backend -> Engine.Sync

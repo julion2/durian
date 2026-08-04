@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "mail",
     srcs = [
+        "attachment.go",
         "parser.go",
         "types.go",
     ],
@@ -17,7 +18,10 @@ go_library(
 go_test(
     name = "mail_test",
     size = "small",
-    srcs = ["parser_test.go"],
+    srcs = [
+        "attachment_test.go",
+        "parser_test.go",
+    ],
     data = glob(["testdata/**"]),
     embed = [":mail"],
 )
