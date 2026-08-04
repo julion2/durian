@@ -138,15 +138,30 @@ func (f *FileStateStore) acquireLock() (*os.File, error) {
 		}
 	}
 
-	lockFile.Close()
+	closeLockFile(lockFile)
 	return nil, fmt.Errorf("calendar state lock timeout for %s", f.dir)
 }
 
 // releaseLock unlocks and closes the lock file.
 func releaseLock(lockFile *os.File) {
 	if lockFile != nil {
-		syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
-		lockFile.Close()
+		if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN); err != nil {
+			slog.Warn("Failed to release calendar state lock", "module", "GRAPHCAL",
+				"path", lockFile.Name(), "err", err)
+		}
+		closeLockFile(lockFile)
+	}
+}
+
+// closeLockFile closes the flock handle and reports a failure instead of
+// discarding it. Nothing is ever written through this descriptor — it exists
+// only to carry the advisory lock — so a Close error cannot lose data here,
+// but swallowing it would hide a descriptor leak, and an unexplained silent
+// Close is exactly what static analysis flags on a writable handle.
+func closeLockFile(lockFile *os.File) {
+	if err := lockFile.Close(); err != nil {
+		slog.Warn("Failed to close calendar state lock file", "module", "GRAPHCAL",
+			"path", lockFile.Name(), "err", err)
 	}
 }
 
