@@ -45,7 +45,7 @@ class EventStreamClient: ObservableObject {
     @Published var isConnected = false
 
     private var streamTask: Task<Void, Never>?
-    private let eventsURL = URL(string: "http://localhost:9723/api/v1/events")!
+    private let eventsURL = AppServer.eventsURL
     private let reconnectDelay: UInt64 = 5_000_000_000 // 5 seconds
 
     var onNewMail: ((NewMailEvent) -> Void)?

@@ -31,6 +31,7 @@ var servePort int
 var serveDB string
 var serveContactsDB string
 var serveNoAuth bool
+var serveExitWhenOrphaned bool
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -48,6 +49,7 @@ func init() {
 	serveCmd.Flags().StringVar(&serveDB, "db", "", "path to email database (default: ~/.local/share/durian/email.db)")
 	serveCmd.Flags().StringVar(&serveContactsDB, "contacts-db", "", "path to contacts database (default: ~/.local/share/durian/contacts.db)")
 	serveCmd.Flags().BoolVar(&serveNoAuth, "no-auth", false, "disable bearer-token auth (loopback-only; for experimental clients)")
+	serveCmd.Flags().BoolVar(&serveExitWhenOrphaned, "exit-when-orphaned", false, "exit when the parent process that spawned serve dies (used by the GUI so serve never orphans and holds the port)")
 	rootCmd.AddCommand(serveCmd)
 }
 
@@ -231,15 +233,28 @@ func runServe(cmd *cobra.Command, args []string) {
 			slog.Info("Tag sync enabled", "module", "SERVE", "url", cfg.Sync.TagSync.URL)
 		}
 
-		accounts := cfg.GetAccountsWithIMAP()
-		if len(accounts) == 0 {
-			slog.Info("No IMAP accounts configured, skipping watchers", "module", "SERVE") // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+		// The IDLE watcher runs the legacy IMAP syncer. For Graph-backend
+		// accounts that would ingest into IMAP-named mailboxes in parallel with
+		// the Graph sync's Graph-id-named mailboxes, splitting the store into two
+		// incompatible views of the same account. Exclude Graph accounts here —
+		// they sync via the engine (durian sync) only, until a Graph push-watcher
+		// lands to give them real-time updates natively.
+		var watched []*config.AccountConfig
+		for _, a := range cfg.GetAccountsWithIMAP() {
+			if a.UsesGraphBackend() {
+				slog.Info("Skipping IMAP watcher for Graph-backend account", "module", "SERVE", "account", a.AccountIdentifier()) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+				continue
+			}
+			watched = append(watched, a)
+		}
+		if len(watched) == 0 {
+			slog.Info("No IMAP watcher accounts configured, skipping watchers", "module", "SERVE") // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		} else {
 			watcher := handler.NewWatcherManager(eventHub, emailDB, rules, groups, cfg.Sync.IndexedHeaders)
 			h.SetFetcher(watcher)
 			h.SetSyncTrigger(watcher)
-			go watcher.Start(watcherCtx, accounts)
-			slog.Info("Started IDLE watchers", "module", "SERVE", "accounts", len(accounts)) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+			go watcher.Start(watcherCtx, watched)
+			slog.Info("Started IDLE watchers", "module", "SERVE", "accounts", len(watched)) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		}
 
 		// Start outbox background worker
@@ -261,11 +276,20 @@ func runServe(cmd *cobra.Command, args []string) {
 	}
 
 	// Bind first, then signal readiness with auth token on stdout
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		slog.Error("Could not listen", "module", "SERVE", "addr", addr, "err", err)
-		fmt.Fprintln(os.Stderr, "Error: could not listen on", addr, err)
-		os.Exit(1)
+	// Retry briefly: the GUI frees this port before spawning, but a just-killed
+	// predecessor can hold it for a moment while its socket drains.
+	var listener net.Listener
+	for attempt := 0; ; attempt++ {
+		listener, err = net.Listen("tcp", addr)
+		if err == nil {
+			break
+		}
+		if attempt >= 10 {
+			slog.Error("Could not listen", "module", "SERVE", "addr", addr, "err", err)
+			fmt.Fprintln(os.Stderr, "Error: could not listen on", addr, err)
+			os.Exit(1)
+		}
+		time.Sleep(300 * time.Millisecond)
 	}
 
 	go func() {
@@ -283,6 +307,15 @@ func runServe(cmd *cobra.Command, args []string) {
 	}
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// When spawned by the GUI, exit if the GUI dies (force-quit / crash): an
+	// orphaned child reparents to launchd (pid 1), so getppid changing off the
+	// original parent signals it. We re-raise SIGTERM to run the graceful
+	// shutdown below rather than a hard exit.
+	if serveExitWhenOrphaned {
+		go watchParent(os.Getppid())
+	}
+
 	<-quit
 	fmt.Println("Server is shutting down...")
 
@@ -298,6 +331,24 @@ func runServe(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Println("Server exiting")
+}
+
+// watchParent re-raises SIGTERM on this process once it is reparented away from
+// initialPPID (its spawner died), so the graceful shutdown path runs instead of
+// leaving the server orphaned and holding the port. Used with
+// --exit-when-orphaned.
+func watchParent(initialPPID int) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if os.Getppid() != initialPPID {
+			slog.Info("Parent process gone, shutting down", "module", "SERVE")
+			if p, err := os.FindProcess(os.Getpid()); err == nil {
+				_ = p.Signal(syscall.SIGTERM)
+			}
+			return
+		}
+	}
 }
 
 // tagSyncPollLoop periodically pulls remote tag changes.
