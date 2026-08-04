@@ -281,7 +281,7 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 	// failing the sync over — it only costs one full download next time.
 	if saveErr := mirrorStore.Save(mirror); saveErr != nil {
 		slog.Warn("Failed to save calendar mirror, next sync reads in full", "module", "CALENDAR",
-			"account", account.GetAliasOrName(), "err", saveErr)
+			"account", account.GetAliasOrName(), "err", saveErr) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	}
 	if applyErr != nil {
 		if client.IsAuthError(applyErr) {
