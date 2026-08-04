@@ -146,7 +146,8 @@ final class CalendarManager: ObservableObject {
         reproject()
 
         if !force, query.isEmpty, accounts == loadedAccounts,
-           CalendarRangeCoverage.covers(loadedRange, requested) {
+           CalendarRangeCoverage.covers(loadedRange, requested)
+        {
             // Already prefetched: the store holds everything this window can
             // show. No spinner, no fetch, no calendar re-list — and an
             // in-flight load (if any) keeps running and will reconcile into
@@ -240,7 +241,8 @@ final class CalendarManager: ObservableObject {
     /// day, so such an event simply groups under its own (possibly
     /// pre-window) start day — per-day spanning there is deferred.
     nonisolated static func visibleEvents(_ events: [CalendarEvent], window: DateInterval?,
-                                          hidden: Set<String>) -> [CalendarEvent] {
+                                          hidden: Set<String>) -> [CalendarEvent]
+    {
         events.filter { event in
             // Visibility is scoped per (account, calendar), matching the
             // hidden-set keys, so hiding "Work" in one account leaves another
@@ -296,7 +298,8 @@ final class CalendarManager: ObservableObject {
     }
 
     nonisolated static func saveHiddenCalendars(_ hidden: Set<String>,
-                                                to defaults: UserDefaults = .standard) {
+                                                to defaults: UserDefaults = .standard)
+    {
         // Sorted for a stable on-disk representation (sets have no order).
         defaults.set(hidden.sorted(), forKey: hiddenCalendarsKey)
     }

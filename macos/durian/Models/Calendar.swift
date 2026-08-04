@@ -173,7 +173,8 @@ struct CalendarEvent: Identifiable, Hashable {
          onlineMeeting: Bool = false, onlineMeetingURL: String? = nil,
          recurring: Bool = false, organizer: CalendarPerson? = nil,
          attendees: [CalendarAttendee] = [], description: String? = nil,
-         account: String = "", seriesStart: Date? = nil, seriesEnd: Date? = nil) {
+         account: String = "", seriesStart: Date? = nil, seriesEnd: Date? = nil)
+    {
         self.uid = uid
         self.calendar = calendar
         self.subject = subject

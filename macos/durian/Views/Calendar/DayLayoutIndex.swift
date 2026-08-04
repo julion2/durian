@@ -68,7 +68,8 @@ struct DayLayoutIndex {
     /// events are ignored (they live in the header row). `calendar` supplies
     /// the wall-clock minute mapping (injectable for deterministic tests).
     init(events: [CalendarEvent], dayStart: Date, dayEnd: Date,
-         maxVisibleLanes: Int, calendar: Foundation.Calendar = .current) {
+         maxVisibleLanes: Int, calendar: Foundation.Calendar = .current)
+    {
         let entries = events
             .filter { !$0.allDay && Self.overlaps($0, dayStart: dayStart, dayEnd: dayEnd) }
             .map { event -> Entry in
@@ -195,7 +196,8 @@ final class WeekLayoutCache {
     private var layouts: [Date: DayLayoutIndex] = [:]
 
     func layouts(days: [Date], events: [CalendarEvent], maxVisibleLanes: Int,
-                 calendar: Foundation.Calendar = .current) -> [Date: DayLayoutIndex] {
+                 calendar: Foundation.Calendar = .current) -> [Date: DayLayoutIndex]
+    {
         var hasher = Hasher()
         hasher.combine(days)
         hasher.combine(maxVisibleLanes)

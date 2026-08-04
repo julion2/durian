@@ -14,7 +14,8 @@ final class CalendarVisibilityTests: XCTestCase {
 
     private func makeEvent(uid: String, start: TimeInterval, durationMinutes: Double = 60,
                            calendar: String = "Calendar",
-                           account: String = "user@example.com") -> CalendarEvent {
+                           account: String = "user@example.com") -> CalendarEvent
+    {
         let s = base.addingTimeInterval(start)
         return CalendarEvent(
             uid: uid, calendar: calendar, subject: "Event",

@@ -209,7 +209,8 @@ struct CalendarWeekView: View {
     }
 
     private func dayColumn(_ layout: DayLayoutIndex, day: Date, dayIndex: Int,
-                           geometry: TimeGeometry) -> some View {
+                           geometry: TimeGeometry) -> some View
+    {
         func laneWidth(_ laneCount: Int) -> CGFloat {
             geometry.dayWidth / CGFloat(max(laneCount, 1))
         }
@@ -300,7 +301,8 @@ struct CalendarWeekView: View {
     }
 
     private func timedBlock(_ block: DayLayoutIndex.Block, dayIndex: Int,
-                            geometry: TimeGeometry) -> some View {
+                            geometry: TimeGeometry) -> some View
+    {
         let event = block.event
         let selected = manager.selectedEventID == event.id
         let moving = drag?.eventID == event.id && drag?.kind == .move
@@ -356,7 +358,8 @@ struct CalendarWeekView: View {
     /// height adapts to the block so the two handles never swallow a short
     /// block's move-draggable middle.
     private func resizeHandle(_ event: CalendarEvent, edge: DragKind, blockHeight: CGFloat,
-                              geometry: TimeGeometry) -> some View {
+                              geometry: TimeGeometry) -> some View
+    {
         // No persistent grip — the affordance is the resize cursor and a faint
         // edge line that appear only while the pointer is over the edge.
         let key = "\(event.uid)-\(edge == .resizeStart ? "s" : "e")"
@@ -376,7 +379,8 @@ struct CalendarWeekView: View {
     }
 
     private func resizeGesture(_ event: CalendarEvent, edge: DragKind,
-                               geometry: TimeGeometry) -> some Gesture {
+                               geometry: TimeGeometry) -> some Gesture
+    {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
                 guard !dragCancelled else { return }
@@ -406,7 +410,8 @@ struct CalendarWeekView: View {
     /// all-day/day-edge slice) it still returns a gesture so the type is
     /// stable, but does nothing.
     private func moveGesture(_ block: DayLayoutIndex.Block, dayIndex: Int,
-                             geometry: TimeGeometry, enabled: Bool) -> some Gesture {
+                             geometry: TimeGeometry, enabled: Bool) -> some Gesture
+    {
         let event = block.event
         return DragGesture(minimumDistance: 6, coordinateSpace: .named(Self.gridSpace))
             .onChanged { value in
@@ -446,7 +451,8 @@ struct CalendarWeekView: View {
                 withAnimation(.easeOut(duration: 0.12)) {
                     endDragSession()
                     if target.dayIndex < weekDays.count,
-                       let start = date(on: weekDays[target.dayIndex], minutes: target.startMinute) {
+                       let start = date(on: weekDays[target.dayIndex], minutes: target.startMinute)
+                    {
                         let end = start.addingTimeInterval(event.end.timeIntervalSince(event.start))
                         manager.reschedule(event, start: start, end: end)
                     }
@@ -492,7 +498,8 @@ struct CalendarWeekView: View {
     @ViewBuilder
     private func movePreview(geometry: TimeGeometry) -> some View {
         if let d = drag, d.kind == .move,
-           let event = manager.events.first(where: { $0.id == d.eventID }) {
+           let event = manager.events.first(where: { $0.id == d.eventID })
+        {
             MovePreview(model: dragPreview, geometry: geometry) {
                 previewBlock(event, geometry: geometry)
                     // Full column width: until the drop re-lays-out the day,
@@ -528,7 +535,8 @@ struct CalendarWeekView: View {
         let content: Content
 
         init(model: DragPreviewModel, geometry: TimeGeometry,
-             @ViewBuilder content: () -> Content) {
+             @ViewBuilder content: () -> Content)
+        {
             self.model = model
             self.geometry = geometry
             self.content = content()
@@ -561,7 +569,8 @@ struct CalendarWeekView: View {
     /// moves within [0, end - one slot] (end fixed); bottom edge: the end
     /// moves within [start + one slot, midnight] (start fixed).
     private func resizedMinutes(_ event: CalendarEvent, edge: DragKind, translationHeight: CGFloat,
-                                geometry: TimeGeometry) -> (start: Int, end: Int) {
+                                geometry: TimeGeometry) -> (start: Int, end: Int)
+    {
         let startMin = minutesFromMidnight(event.start)
         // Duration-based end so an event ending exactly at midnight reads
         // 1440, not 0 (draggable blocks never continue past their day).

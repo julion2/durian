@@ -71,7 +71,7 @@ struct TimeGeometry: Equatable {
     /// positions left of the time axis yield negative indices — callers
     /// bound the result to their day range.
     func dayIndex(atX x: CGFloat) -> Int {
-        Int((Double((x - timeColumnWidth) / dayWidth)).rounded(.down))
+        Int(Double((x - timeColumnWidth) / dayWidth).rounded(.down))
     }
 
     /// A horizontal drag translation -> the whole-day column delta it means
@@ -100,7 +100,8 @@ struct TimeGeometry: Equatable {
     /// disagree. The start is clamped so the whole [start, start + duration]
     /// block stays inside the grid day.
     func moveTarget(location: CGPoint, grabOffset: CGSize, durationMinutes: Int,
-                    dayCount: Int = 7) -> MoveTarget {
+                    dayCount: Int = 7) -> MoveTarget
+    {
         let originX = location.x - grabOffset.width
         let originY = location.y - grabOffset.height
         let day = min(max(dayIndex(atX: originX), 0), dayCount - 1)

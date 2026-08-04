@@ -20,7 +20,8 @@ final class DayLayoutIndexTests: XCTestCase {
     /// An event positioned in minutes relative to dayStart (negative =
     /// starts the previous day).
     private func event(_ uid: String, startMinute: Double, durationMinutes: Double,
-                       allDay: Bool = false) -> CalendarEvent {
+                       allDay: Bool = false) -> CalendarEvent
+    {
         let s = dayStart.addingTimeInterval(startMinute * 60)
         return CalendarEvent(uid: uid, calendar: "Cal", subject: uid,
                              start: s, end: s.addingTimeInterval(durationMinutes * 60),

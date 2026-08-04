@@ -213,7 +213,8 @@ struct CalendarEventDetailView: View {
     /// A grouped rounded card: hairline border over the card surface, with an
     /// optional caption heading above the content.
     private func card<Content: View>(_ title: String? = nil,
-                                     @ViewBuilder content: () -> Content) -> some View {
+                                     @ViewBuilder content: () -> Content) -> some View
+    {
         VStack(alignment: .leading, spacing: 8) {
             if let title {
                 Text(title)

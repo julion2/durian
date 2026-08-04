@@ -89,7 +89,8 @@ struct MiniMonthView: View {
 
     private var dayGrid: some View {
         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: 7),
-                  spacing: 2) {
+                  spacing: 2)
+        {
             ForEach(Array(monthCells().enumerated()), id: \.offset) { _, day in
                 if let day {
                     dayCell(day)

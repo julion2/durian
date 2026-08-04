@@ -105,7 +105,8 @@ struct CalendarMonthView: View {
 
     @ViewBuilder
     private func chipLabel(_ event: CalendarEvent, variant: EventPillChrome.Variant,
-                           withTime: Bool) -> some View {
+                           withTime: Bool) -> some View
+    {
         if withTime {
             HStack(spacing: 4) {
                 Text(event.displaySubject)

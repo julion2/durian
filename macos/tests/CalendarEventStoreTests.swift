@@ -12,7 +12,8 @@ final class CalendarEventStoreTests: XCTestCase {
     private func makeEvent(uid: String, start: TimeInterval, durationMinutes: Double = 60,
                            subject: String = "Event", calendar: String = "Calendar",
                            account: String = "user@example.com",
-                           recurring: Bool = false) -> CalendarEvent {
+                           recurring: Bool = false) -> CalendarEvent
+    {
         let s = base.addingTimeInterval(start)
         return CalendarEvent(
             uid: uid, calendar: calendar, subject: subject,

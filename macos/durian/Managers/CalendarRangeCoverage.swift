@@ -57,7 +57,8 @@ enum CalendarRangeCoverage {
     /// bounding how far the store's band — and the events it retains — can
     /// grow.
     static func accumulate(_ loaded: DateInterval?, adding fetched: DateInterval,
-                           maxSpan: TimeInterval = 180 * 86_400) -> DateInterval {
+                           maxSpan: TimeInterval = 180 * 86_400) -> DateInterval
+    {
         guard let loaded else { return fetched }
         guard loaded.start <= fetched.end && fetched.start <= loaded.end else { return fetched }
         let union = DateInterval(start: min(loaded.start, fetched.start),

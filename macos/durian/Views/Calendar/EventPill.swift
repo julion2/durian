@@ -87,7 +87,8 @@ extension View {
     /// Applies the shared event-pill chrome around this content.
     func eventPill(_ color: Color, variant: EventPillChrome.Variant,
                    selected: Bool, squareTop: Bool = false, squareBottom: Bool = false,
-                   cornerRadius: CGFloat = 5) -> some View {
+                   cornerRadius: CGFloat = 5) -> some View
+    {
         modifier(EventPillChrome(color: color, variant: variant, selected: selected,
                                  squareTop: squareTop, squareBottom: squareBottom,
                                  cornerRadius: cornerRadius))
