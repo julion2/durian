@@ -392,3 +392,20 @@ func TestCalendarDeleteKeepsBackup(t *testing.T) {
 		t.Error("the backup must not end in .ics, or the local scan would re-adopt it")
 	}
 }
+
+// TestLogSafeStripsControlCharacters pins the log-injection guard: a calendar
+// name or ref carrying newlines must not be able to forge extra log lines.
+func TestLogSafeStripsControlCharacters(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"Calendar", "Calendar"},
+		{"Work\nlevel=ERROR msg=\"forged\"", "Work_level=ERROR msg=\"forged\""},
+		{"a\rb\tc", "a_b_c"},
+		{"Büro — Termine", "Büro — Termine"},
+		{"\x00\x1b[31m", "__[31m"},
+	}
+	for _, tc := range cases {
+		if got := logSafe(tc.in); got != tc.want {
+			t.Errorf("logSafe(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

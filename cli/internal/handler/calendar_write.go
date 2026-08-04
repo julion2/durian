@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 
@@ -139,12 +140,12 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		}
 		data, serErr := graphcalendar.EventToICal(ev)
 		if serErr != nil {
-			slog.Error("Failed to serialize updated local event", "module", "API", "err", serErr)
+			slog.Error("Failed to serialize updated local event", "module", "API", "err", logSafe(serErr.Error()))
 			http.Error(w, "failed to serialize event", http.StatusInternalServerError)
 			return
 		}
 		if writeErr := graphcalendar.WriteFileAtomic(path, data, 0o600); writeErr != nil {
-			slog.Error("Failed to write local event", "module", "API", "err", writeErr)
+			slog.Error("Failed to write local event", "module", "API", "err", logSafe(writeErr.Error()))
 			http.Error(w, "failed to write event", http.StatusInternalServerError)
 			return
 		}
@@ -153,7 +154,7 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	if _, err := graphcalendar.WriteLocalEvent(dir, req.Calendar, ev); err != nil {
-		slog.Error("Failed to write local event", "module", "API", "err", err)
+		slog.Error("Failed to write local event", "module", "API", "err", logSafe(err.Error()))
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -187,10 +188,28 @@ func (h *Handler) CalendarDeleteEventHandler(w http.ResponseWriter, r *http.Requ
 	// silently lost.
 	backup := fmt.Sprintf("%s.deleted-%d", path, time.Now().Unix())
 	if err := os.Rename(path, backup); err != nil {
-		slog.Error("Failed to delete local event", "module", "API", "err", err)
+		slog.Error("Failed to delete local event", "module", "API", "err", logSafe(err.Error()))
 		http.Error(w, "failed to delete event", http.StatusInternalServerError)
 		return
 	}
-	slog.Info("Deleted local event, kept a backup", "module", "API", "backup", backup)
+	slog.Info("Deleted local event, kept a backup", "module", "API", "backup", logSafe(backup))
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+// logSafe strips control characters from a value that originates in a request
+// before it reaches the log.
+//
+// The calendar write endpoints echo request-derived data into their errors —
+// WriteLocalEvent names the requested calendar, ResolveLocalEvent the ref —
+// and those errors get logged. A newline in a JSON calendar name would
+// otherwise let a caller forge whole log lines (CodeQL go/log-injection). The
+// server is localhost-only, but a log a reader cannot trust is worth less than
+// the two lines it costs to keep it trustworthy.
+func logSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' || unicode.IsControl(r) {
+			return '_'
+		}
+		return r
+	}, s)
 }
