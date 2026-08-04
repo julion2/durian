@@ -50,7 +50,6 @@ struct EditableWebView: NSViewRepresentable {
         config.userContentController.add(handler, name: "vimSearch")
 
         let webView = ScrollPassthroughWebView(frame: .zero, configuration: config)
-        SharedWebKit.applyEnergyDefaults(to: webView)
         #if DEBUG
         webView.isInspectable = true
         #endif

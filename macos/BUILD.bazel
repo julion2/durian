@@ -184,6 +184,13 @@ swift_test(
 )
 
 swift_test(
+    name = "shared_webkit_test",
+    size = "small",
+    srcs = ["tests/SharedWebKitTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
     name = "week_drag_targeting_test",
     size = "small",
     srcs = ["tests/WeekDragTargetingTests.swift"],

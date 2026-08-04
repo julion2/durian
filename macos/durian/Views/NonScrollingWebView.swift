@@ -19,8 +19,12 @@ import WebKit
 /// transition.
 ///
 /// Activity Monitor pre-pooling: ~16k `WebKit:ProcessSuspension` events / 12h.
-/// Expected post-pooling: cuts to one process per pool, throttled by
-/// `suspendsActivityWhenWindowIsOccluded` when the window goes background.
+/// Expected post-pooling: one WebContent process per pool instead of one per
+/// card, so the suspend/resume churn scales with pools, not with the mailbox.
+///
+/// Occlusion throttling is NOT done here. macOS WKWebView exposes no public
+/// switch for it, and probing for a private selector would be a no-op at best
+/// and an App Store problem at worst.
 enum SharedWebKit {
     /// Process pool shared by every read-only email-rendering WebView
     /// (NonScrollingWebView). Lifetime = app process.
@@ -32,9 +36,13 @@ enum SharedWebKit {
     static let composePool = WKProcessPool()
 
     /// Ephemeral, in-memory data store shared across read-only WebViews.
-    /// Email HTML is CSP'd (`script-src 'none'`) so cookies/localStorage can
-    /// never be written. Sharing the HTTP cache means the same tracking
-    /// pixel / remote image across N cards is fetched once, not N times.
+    ///
+    /// The HTTP cache was already shared before pooling — every WebView used
+    /// `WKWebsiteDataStore.default()`. What changes here is persistence:
+    /// `.nonPersistent()` keeps nothing on disk, so remote images are refetched
+    /// after an app restart, and no cookie or cache artefact of a tracking
+    /// pixel outlives the process. Email HTML is CSP'd (`script-src 'none'`),
+    /// so cookies/localStorage could never be written from the content anyway.
     static let readOnlyDataStore: WKWebsiteDataStore = .nonPersistent()
 
     /// Build a WKWebViewConfiguration pre-wired with the shared read-only
@@ -52,16 +60,6 @@ enum SharedWebKit {
         return config
     }
 
-    /// Apply the runtime-only knobs that aren't part of WKWebViewConfiguration:
-    /// occlusion throttling, scroll passthrough flags, etc.
-    static func applyEnergyDefaults(to webView: WKWebView) {
-        // Throttle JS timers + CSS animations when the window is occluded
-        // (background, behind another window, etc.). Default is `false` —
-        // WebViews keep ticking layout/timer work even when invisible.
-        if webView.responds(to: NSSelectorFromString("setSuspendsActivityWhenWindowIsOccluded:")) {
-            webView.setValue(true, forKey: "suspendsActivityWhenWindowIsOccluded")
-        }
-    }
 }
 
 // MARK: - Custom WebView that passes scroll events to parent
@@ -118,7 +116,7 @@ struct NonScrollingWebView: NSViewRepresentable {
         // will ever consume.
         nsView.stopLoading()
     }
-    
+
     func updateNSView(_ webView: WKWebView, context: Context) {
         // Update parent reference for height binding
         context.coordinator.parent = self
@@ -204,6 +202,22 @@ struct NonScrollingWebView: NSViewRepresentable {
         var parent: NonScrollingWebView?
         var lastLoadedHTML: String?  // Track to prevent reload loops
         var loadedForEmailId: String?  // Track which email we loaded for (race condition prevention)
+
+        /// Reload after a WebContent process crash.
+        ///
+        /// This matters more with a shared pool than without one: before
+        /// pooling a renderer crash blanked exactly the card that caused it,
+        /// now every card sharing the pool goes blank at once. WebKit does not
+        /// reload by itself — the view just stays empty — so a crash without
+        /// this handler reads to the user as "the app lost my mail".
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            Log.warning("WEBVIEW", "WebContent process terminated, reloading card")
+            // lastLoadedHTML stays as it is: the reload restores exactly the
+            // content updateNSView believes is on screen, so its
+            // "only reload when the HTML changed" guard remains correct.
+            guard let html = lastLoadedHTML else { return }
+            webView.loadHTMLString(html, baseURL: nil)
+        }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             // Capture email ID at callback time to detect stale callbacks
