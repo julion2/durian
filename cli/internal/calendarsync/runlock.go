@@ -13,6 +13,7 @@ package calendarsync
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -42,7 +43,14 @@ func AcquireRunLock(accountDir string) (release func() error, ok bool, err error
 	}
 
 	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		lockFile.Close()
+		// Nothing is ever written through this descriptor — it only carries
+		// the advisory lock — so a Close failure here cannot lose data, but
+		// discarding it silently hides a descriptor leak and reads to static
+		// analysis like an unhandled write-handle close.
+		if closeErr := lockFile.Close(); closeErr != nil {
+			slog.Warn("Failed to close calendar run lock file", "module", "CALSYNC",
+				"path", lockFile.Name(), "err", closeErr)
+		}
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			return nil, false, nil
 		}
@@ -50,7 +58,10 @@ func AcquireRunLock(accountDir string) (release func() error, ok bool, err error
 	}
 
 	release = func() error {
-		syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN); err != nil {
+			slog.Warn("Failed to release calendar run lock", "module", "CALSYNC",
+				"path", lockFile.Name(), "err", err)
+		}
 		return lockFile.Close()
 	}
 	return release, true, nil
