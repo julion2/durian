@@ -129,6 +129,23 @@ func TestFolderFlagState_RoundTrip(t *testing.T) {
 		t.Errorf("after empty re-upsert: remote_ref = %q, synced_flags = %q; want preserved", got.RemoteRef, got.SyncedFlags)
 	}
 
+	// A re-delivered message with DIFFERENT non-empty server flags (a delta
+	// re-ingest after a server-side flag change) must also NOT overwrite the
+	// baseline — it is owned by the reconciliation, not by ingest. Clobbering it
+	// here corrupts the three-way merge and reverts the server change.
+	insert("tagged@example.com", "INBOX", "101", `\Seen`) // server now reports only \Seen
+	rows, err = db.GetFolderFlagState("work", "INBOX")
+	if err != nil {
+		t.Fatalf("get after non-empty re-ingest: %v", err)
+	}
+	byID = make(map[string]FolderFlagRow, len(rows))
+	for _, r := range rows {
+		byID[r.MessageID] = r
+	}
+	if got := byID["tagged@example.com"]; got.SyncedFlags != `\Seen,\Flagged` {
+		t.Errorf("after non-empty re-ingest: synced_flags = %q, want the original %q preserved", got.SyncedFlags, `\Seen,\Flagged`)
+	}
+
 	// SetSyncedFlags updates the baseline in place.
 	if err := db.SetSyncedFlags("tagged@example.com", "work", `\Seen`); err != nil {
 		t.Fatalf("set synced flags: %v", err)
