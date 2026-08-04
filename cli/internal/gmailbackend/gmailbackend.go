@@ -10,11 +10,11 @@
 // here without any additional consent.
 //
 // Cursor encoding: an opaque JSON token. While the initial full sync is still
-// paging it carries the messages.list pageToken; once paging completes it
-// carries the mailbox historyId, the resume point for incremental history sync.
-// An empty cursor starts a fresh full sync (safe — the store upserts by
-// Message-ID). Incremental history sync is not wired here yet; a historyId
-// cursor currently restarts a full sync.
+// paging it carries the messages.list pageToken plus a historyId snapshot taken
+// at the start of the sync; once paging completes it carries that snapshot as
+// the resume point for the incremental history sync (users.history.list). An
+// empty cursor starts a fresh full sync (safe — the store upserts by
+// Message-ID); an expired historyId (404) restarts one.
 package gmailbackend
 
 import (
@@ -269,11 +269,16 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 
 // MARK: - Cursor
 
-// gmailCursor is the opaque per-stream cursor: a pageToken mid initial sync, or
-// a historyId once the initial sync completed.
+// gmailCursor is the opaque per-stream cursor: during the initial sync it holds
+// the messages.list pageToken plus the start-of-sync historyId snapshot; once
+// complete it holds only the historyId resume point.
 type gmailCursor struct {
 	PageToken string `json:"p,omitempty"`
 	HistoryID string `json:"h,omitempty"`
+	// Snapshot is the mailbox historyId captured at the start of the initial
+	// full sync. It becomes the resume point when paging completes, so a change
+	// made mid-sync (which gets a higher historyId) is not missed.
+	Snapshot string `json:"s,omitempty"`
 }
 
 func decodeCursor(c backend.Cursor) gmailCursor {
@@ -323,19 +328,54 @@ type gmailMessage struct {
 	Raw          string   `json:"raw"`          // base64url RFC822
 }
 
-// FetchMessages lists messages and fetches each one's raw MIME. It implements
-// the initial (paged) full sync; incremental history sync lands separately. A
-// historyId cursor therefore restarts a full sync for now, which is safe: the
-// store upserts by (Message-ID, account).
+// FetchMessages returns the changes in the stream since cursor. With no
+// historyId yet it runs the initial (paged) full sync via messages.list; once
+// that completed the cursor carries a historyId and it runs the incremental
+// history sync via history.list. An expired historyId (404) restarts a full sync.
 func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backend.Cursor, limit int) (backend.FetchResult, error) {
-	var result backend.FetchResult
 	gc := decodeCursor(cursor)
 	if gc.HistoryID != "" {
-		slog.Debug("Gmail historyId cursor: restarting full sync (incremental not yet wired)", "module", "GMAILBACKEND")
-		gc = gmailCursor{}
+		res, err := b.historySync(ctx, folder, gc, limit)
+		if isNotFound(err) {
+			slog.Info("Gmail historyId expired, restarting full sync", "module", "GMAILBACKEND")
+			return b.initialList(ctx, folder, gmailCursor{}, limit)
+		}
+		return res, err
+	}
+	return b.initialList(ctx, folder, gc, limit)
+}
+
+// profileHistoryID returns the mailbox's current historyId (users.getProfile),
+// used to snapshot the start point of a full sync.
+func (b *Backend) profileHistoryID(ctx context.Context) (string, error) {
+	var p struct {
+		HistoryID string `json:"historyId"`
+	}
+	if err := b.doJSON(ctx, http.MethodGet, b.baseURL+"/users/me/profile", nil, &p); err != nil {
+		return "", err
+	}
+	return p.HistoryID, nil
+}
+
+// initialList runs the first full sync: messages.list paged with a pageToken,
+// each id fetched raw. A historyId snapshot taken at the very start becomes the
+// resume point once paging completes, so a change made mid-sync (which gets a
+// higher historyId) is caught by the first incremental round rather than lost —
+// capturing it from the fetched messages would miss changes whose id falls below
+// the last page's maximum.
+func (b *Backend) initialList(ctx context.Context, folder string, gc gmailCursor, limit int) (backend.FetchResult, error) {
+	var result backend.FetchResult
+
+	snapshot := gc.Snapshot
+	if snapshot == "" {
+		var err error
+		if snapshot, err = b.profileHistoryID(ctx); err != nil {
+			return result, fmt.Errorf("snapshot historyId: %w", err)
+		}
 	}
 
 	q := url.Values{}
+	q.Set("includeSpamTrash", "true") // Spam/Trash carry TRASH/SPAM labels -> trash/spam tags
 	if limit > 0 {
 		q.Set("maxResults", strconv.Itoa(limit))
 	}
@@ -347,33 +387,21 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 		return result, fmt.Errorf("list messages: %w", err)
 	}
 
-	var maxHistoryID uint64
-	for _, m := range page.Messages {
-		if err := ctx.Err(); err != nil {
-			return result, err
-		}
-		msg, err := b.fetchOne(ctx, folder, m.ID)
-		if err != nil {
-			slog.Warn("Failed to fetch message, skipping", "module", "GMAILBACKEND", "id", m.ID, "err", err)
-			continue
-		}
-		result.Messages = append(result.Messages, msg.message)
-		if msg.historyID > maxHistoryID {
-			maxHistoryID = msg.historyID
-		}
+	ids := make([]string, len(page.Messages))
+	for i, m := range page.Messages {
+		ids[i] = m.ID
 	}
+	msgs, err := b.fetchMany(ctx, folder, ids)
+	if err != nil {
+		return result, err
+	}
+	result.Messages = msgs
 
 	if page.NextPageToken != "" {
-		result.Cursor = encodeCursor(gmailCursor{PageToken: page.NextPageToken})
+		result.Cursor = encodeCursor(gmailCursor{PageToken: page.NextPageToken, Snapshot: snapshot})
 		result.HasMore = true
 	} else {
-		// Initial sync complete: the highest historyId seen is the resume point
-		// for the incremental history sync.
-		hid := ""
-		if maxHistoryID > 0 {
-			hid = strconv.FormatUint(maxHistoryID, 10)
-		}
-		result.Cursor = encodeCursor(gmailCursor{HistoryID: hid})
+		result.Cursor = encodeCursor(gmailCursor{HistoryID: snapshot})
 	}
 	return result, nil
 }
@@ -405,6 +433,167 @@ func (b *Backend) fetchOne(ctx context.Context, folder, id string) (fetched, err
 		},
 		historyID: hid,
 	}, nil
+}
+
+// fetchConcurrency bounds simultaneous message.get RAW downloads. Gmail caps a
+// user at ~250 quota units/sec and messages.get costs 5 (~50 msgs/sec), so this
+// is sized to saturate that ceiling — turning a serial full sync (minutes) into
+// a quota-bound one — while do() backs off on the 429s that steady state hits.
+const fetchConcurrency = 20
+
+// fetchMany downloads the raw MIME for each id concurrently, preserving order.
+// A 404 (message deleted since it was listed) is skipped; any other error fails
+// the whole call so the caller does not advance the cursor past a lost message.
+func (b *Backend) fetchMany(ctx context.Context, folder string, ids []string) ([]backend.Message, error) {
+	msgs := make([]backend.Message, len(ids))
+	errs := make([]error, len(ids))
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, fetchConcurrency)
+	for i := range ids {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return nil, ctx.Err()
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			m, err := b.fetchOne(ctx, folder, ids[i])
+			if err != nil {
+				if !isNotFound(err) {
+					errs[i] = err // own slot: no shared write, no mutex
+				}
+				return // 404 -> leave msgs[i] zero, filtered out below
+			}
+			msgs[i] = m.message
+		}(i)
+	}
+	wg.Wait()
+
+	for _, e := range errs {
+		if e != nil {
+			return nil, fmt.Errorf("fetch message: %w", e)
+		}
+	}
+	// Drop skipped (zero) entries in place, preserving order.
+	out := msgs[:0]
+	for _, m := range msgs {
+		if m.Ref.ID != "" {
+			out = append(out, m)
+		}
+	}
+	return out, nil
+}
+
+// gmailHistoryRef is a message reference inside a history record.
+type gmailHistoryRef struct {
+	Message struct {
+		ID string `json:"id"`
+	} `json:"message"`
+}
+
+// gmailHistoryList is one page of users.history.list.
+type gmailHistoryList struct {
+	History []struct {
+		MessagesAdded   []gmailHistoryRef `json:"messagesAdded"`
+		MessagesDeleted []gmailHistoryRef `json:"messagesDeleted"`
+		LabelsAdded     []gmailHistoryRef `json:"labelsAdded"`
+		LabelsRemoved   []gmailHistoryRef `json:"labelsRemoved"`
+	} `json:"history"`
+	NextPageToken string `json:"nextPageToken"`
+	HistoryID     string `json:"historyId"`
+}
+
+// historySync runs the incremental sync from gc.HistoryID via history.list. A
+// message that was added or whose labels changed is re-fetched so its current
+// flags/labels re-ingest; a deleted message becomes a Deletion. When both occur
+// in the same window the deletion wins.
+func (b *Backend) historySync(ctx context.Context, folder string, gc gmailCursor, limit int) (backend.FetchResult, error) {
+	var result backend.FetchResult
+	q := url.Values{}
+	q.Set("startHistoryId", gc.HistoryID)
+	// Bound the page: maxResults caps history RECORDS — a soft cap on bodies
+	// (most records carry one message), enough to honor the engine's per-call
+	// limit hint, with the remainder paged via nextPageToken.
+	if limit > 0 {
+		q.Set("maxResults", strconv.Itoa(limit))
+	}
+	if gc.PageToken != "" {
+		q.Set("pageToken", gc.PageToken)
+	}
+	for _, t := range []string{"messageAdded", "messageDeleted", "labelAdded", "labelRemoved"} {
+		q.Add("historyTypes", t)
+	}
+	var page gmailHistoryList
+	if err := b.doJSON(ctx, http.MethodGet, b.baseURL+"/users/me/history?"+q.Encode(), nil, &page); err != nil {
+		return result, err
+	}
+
+	// Collect changed (added or relabeled) and deleted ids, each in first-seen
+	// order so the output is deterministic.
+	var changedOrder, deletedOrder []string
+	changed := make(map[string]bool)
+	deleted := make(map[string]bool)
+	addTo := func(order *[]string, seen map[string]bool, id string) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		*order = append(*order, id)
+	}
+	for _, h := range page.History {
+		for _, a := range h.MessagesAdded {
+			addTo(&changedOrder, changed, a.Message.ID)
+		}
+		for _, la := range h.LabelsAdded {
+			addTo(&changedOrder, changed, la.Message.ID)
+		}
+		for _, lr := range h.LabelsRemoved {
+			addTo(&changedOrder, changed, lr.Message.ID)
+		}
+		for _, d := range h.MessagesDeleted {
+			addTo(&deletedOrder, deleted, d.Message.ID)
+		}
+	}
+
+	var toFetch []string
+	for _, id := range changedOrder {
+		if !deleted[id] { // a deletion wins over an add/relabel in the same window
+			toFetch = append(toFetch, id)
+		}
+	}
+	msgs, err := b.fetchMany(ctx, folder, toFetch)
+	if err != nil {
+		return result, err
+	}
+	result.Messages = msgs
+	for _, id := range deletedOrder {
+		result.Deleted = append(result.Deleted, backend.Deletion{Ref: backend.RemoteRef{Folder: folder, ID: id}})
+	}
+
+	if page.NextPageToken != "" {
+		result.Cursor = encodeCursor(gmailCursor{HistoryID: gc.HistoryID, PageToken: page.NextPageToken})
+		result.HasMore = true
+	} else {
+		// history.list echoes the latest historyId; persist it as the next resume
+		// point (fall back to the start id if the response omitted it).
+		next := page.HistoryID
+		if next == "" {
+			next = gc.HistoryID
+		}
+		result.Cursor = encodeCursor(gmailCursor{HistoryID: next})
+	}
+	return result, nil
+}
+
+// isNotFound reports a 404 statusError: a single message that was deleted, or a
+// history.list startHistoryId too old for Gmail to serve (must restart a sync).
+func isNotFound(err error) bool {
+	var se *statusError
+	return errors.As(err, &se) && se.status == http.StatusNotFound
 }
 
 // FetchBody streams the full RFC822 message for ref via messages.get?format=RAW.
