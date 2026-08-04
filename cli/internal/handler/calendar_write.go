@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -128,6 +129,11 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		ev.OwnerResponse = existing.OwnerResponse
 		ev.IsOnlineMeeting = existing.IsOnlineMeeting
 		ev.OnlineMeetingURL = existing.OnlineMeetingURL
+		// A meeting cancelled remotely stays cancelled. Dropping the flag
+		// would rewrite the file without STATUS:CANCELLED, which the content
+		// hash counts as a local edit — so the next sync would PATCH the
+		// cancelled event back to life against the provider.
+		ev.IsCancelled = existing.IsCancelled
 		if req.Attendees == nil {
 			ev.Attendees = existing.Attendees
 		}
@@ -137,7 +143,7 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 			http.Error(w, "failed to serialize event", http.StatusInternalServerError)
 			return
 		}
-		if writeErr := os.WriteFile(path, data, 0o600); writeErr != nil {
+		if writeErr := graphcalendar.WriteFileAtomic(path, data, 0o600); writeErr != nil {
 			slog.Error("Failed to write local event", "module", "API", "err", writeErr)
 			http.Error(w, "failed to write event", http.StatusInternalServerError)
 			return
@@ -172,10 +178,19 @@ func (h *Handler) CalendarDeleteEventHandler(w http.ResponseWriter, r *http.Requ
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	if err := os.Remove(path); err != nil {
+	// Move the file aside instead of unlinking it. The sync still reads the
+	// event as locally deleted (the backup does not end in .ics, so the local
+	// scan ignores it) and the remote deletion still waits for the interactive
+	// `durian calendar sync` confirmation — but a mis-keyed delete in the GUI
+	// no longer destroys an event that was never synced anywhere. Same rail as
+	// the sync engine's own overwrite and conflict paths: local data is never
+	// silently lost.
+	backup := fmt.Sprintf("%s.deleted-%d", path, time.Now().Unix())
+	if err := os.Rename(path, backup); err != nil {
 		slog.Error("Failed to delete local event", "module", "API", "err", err)
 		http.Error(w, "failed to delete event", http.StatusInternalServerError)
 		return
 	}
+	slog.Info("Deleted local event, kept a backup", "module", "API", "backup", backup)
 	writeJSON(w, map[string]any{"ok": true})
 }

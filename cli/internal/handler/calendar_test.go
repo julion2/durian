@@ -265,6 +265,7 @@ func TestCalendarPutUpdatePreservesMeetingFields(t *testing.T) {
 			Pattern: graphcalendar.RecurrencePattern{Type: "weekly", Interval: 1, DaysOfWeek: []string{"thursday"}},
 			Range:   graphcalendar.RecurrenceRange{Type: "noEnd", StartDate: "2026-08-06"},
 		},
+		IsCancelled: true,
 	})
 
 	body := `{"account":"work","calendar":"Calendar","uid":"evt-meeting","subject":"Weekly Sync (moved)","start":"2026-08-06T10:00:00Z","end":"2026-08-06T11:00:00Z"}`
@@ -295,6 +296,13 @@ func TestCalendarPutUpdatePreservesMeetingFields(t *testing.T) {
 	}
 	if e.MyResponse != "accepted" {
 		t.Errorf("my_response = %q, want the preserved RSVP", e.MyResponse)
+	}
+	// A cancellation must survive the edit: dropping STATUS:CANCELLED would
+	// register as a local content change and make the next sync patch the
+	// cancelled meeting back to life.
+	onDisk := readCalendarTestEvent(t, calDir, "evt-meeting")
+	if !onDisk.IsCancelled {
+		t.Error("IsCancelled dropped by the update merge")
 	}
 
 	// An explicit attendee list in the request replaces the existing one.
@@ -335,5 +343,52 @@ func TestCalendarHandlerErrors(t *testing.T) {
 		if code := getJSON(t, r, c.url, nil); code != c.want {
 			t.Errorf("GET %s = %d, want %d", c.url, code, c.want)
 		}
+	}
+}
+
+// readCalendarTestEvent parses the .ics the handler wrote, so a test can
+// assert on fields the JSON projection does not expose.
+func readCalendarTestEvent(t *testing.T, calDir, uid string) graphcalendar.Event {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(calDir, uid+".ics"))
+	if err != nil {
+		t.Fatalf("read %s.ics: %v", uid, err)
+	}
+	ev, err := graphcalendar.ICalToEvent(data, "me@example.com")
+	if err != nil {
+		t.Fatalf("parse %s.ics: %v", uid, err)
+	}
+	return ev
+}
+
+// TestCalendarDeleteKeepsBackup pins the recoverable delete: the event is gone
+// from the vdir (so the next sync propagates the deletion) but the bytes
+// survive as a non-.ics sibling the local scan ignores.
+func TestCalendarDeleteKeepsBackup(t *testing.T) {
+	r, calDir := newCalendarHandler(t)
+	writeCalendarTestEvent(t, calDir, graphcalendar.Event{
+		ICalUID: "evt-gone", Subject: "Draft idea",
+		Start: time.Date(2026, 8, 6, 9, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 8, 6, 10, 0, 0, 0, time.UTC),
+	})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("DELETE", "/api/v1/calendars/event?account=work&ref=evt-gone", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("DELETE status %d: %s", w.Code, w.Body.String())
+	}
+
+	if _, err := os.Stat(filepath.Join(calDir, "evt-gone.ics")); !os.IsNotExist(err) {
+		t.Errorf("the .ics still exists after delete (err=%v); the sync would not see the deletion", err)
+	}
+	backups, err := filepath.Glob(filepath.Join(calDir, "evt-gone.ics.deleted-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backups) != 1 {
+		t.Fatalf("backups = %v, want exactly one recoverable copy", backups)
+	}
+	if strings.HasSuffix(backups[0], ".ics") {
+		t.Error("the backup must not end in .ics, or the local scan would re-adopt it")
 	}
 }
