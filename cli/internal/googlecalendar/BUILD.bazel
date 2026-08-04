@@ -1,0 +1,28 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "googlecalendar",
+    srcs = [
+        "googlecalendar.go",
+        "write.go",
+    ],
+    importpath = "github.com/julion2/durian/cli/internal/googlecalendar",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "//cli/internal/calendar",
+        "//cli/internal/calendarsync",
+        "//cli/internal/config",
+        "//cli/internal/oauth",
+        "@com_github_teambition_rrule_go//:rrule-go",
+    ],
+)
+
+go_test(
+    name = "googlecalendar_test",
+    size = "small",
+    srcs = [
+        "googlecalendar_test.go",
+        "write_test.go",
+    ],
+    embed = [":googlecalendar"],
+)

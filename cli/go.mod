@@ -5,6 +5,7 @@ go 1.25.12
 require (
 	filippo.io/age v1.3.1
 	github.com/apple/pkl-go v0.13.2
+	github.com/emersion/go-ical v0.0.0-20250609112844-439c63cef608
 	github.com/emersion/go-imap v1.2.1
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/fatih/color v1.19.0
@@ -13,6 +14,7 @@ require (
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/rivo/uniseg v0.4.7
 	github.com/spf13/cobra v1.10.2
+	github.com/teambition/rrule-go v1.8.2
 	golang.org/x/net v0.55.0
 	golang.org/x/term v0.43.0
 	golang.org/x/text v0.39.0

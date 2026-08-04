@@ -45,6 +45,8 @@ struct DurianApp: App {
     @StateObject private var profileManager = ProfileManager.shared
     @StateObject private var accountManager = AccountManager.shared
     @StateObject private var settingsManager = SettingsManager.shared
+    @StateObject private var appRouter = AppRouter.shared
+    @StateObject private var calendarManager = CalendarManager.shared
     @State private var cliVersion: String = ""
 
     /// Override the macOS global appearance with the per-app
@@ -142,6 +144,54 @@ struct DurianApp: App {
                     }
                     .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
                 }
+            }
+
+            // Calendar Menu
+            CommandMenu("Calendar") {
+                Button(appRouter.mode == .calendar ? "Show Mail" : "Show Calendar") {
+                    appRouter.toggle()
+                }
+                .keyboardShortcut("c", modifiers: [.command, .option])
+
+                Button("Toggle Calendar Sidebar") {
+                    calendarManager.toggleSidebar()
+                }
+                .keyboardShortcut("s", modifiers: [.command, .option])
+
+                Button(action: {
+                    calendarManager.hideDeclined.toggle()
+                }) {
+                    HStack {
+                        if calendarManager.hideDeclined {
+                            Image(systemName: "checkmark")
+                        }
+                        Text("Hide Declined Events")
+                    }
+                }
+
+                Divider()
+
+                ForEach(CalendarViewMode.allCases) { mode in
+                    Button(action: {
+                        calendarManager.viewMode = mode
+                        appRouter.showCalendar()
+                    }) {
+                        HStack {
+                            if appRouter.mode == .calendar, calendarManager.viewMode == mode {
+                                Image(systemName: "checkmark")
+                            }
+                            Text(mode.title)
+                        }
+                    }
+                }
+
+                Divider()
+
+                Button("Today") { calendarManager.goToToday() }
+                Button("Previous Period") { calendarManager.step(-1) }
+                    .keyboardShortcut("[", modifiers: [.command, .option])
+                Button("Next Period") { calendarManager.step(1) }
+                    .keyboardShortcut("]", modifiers: [.command, .option])
             }
         }
 

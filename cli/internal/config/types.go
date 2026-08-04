@@ -1,10 +1,16 @@
 package config
 
+import (
+	"strings"
+	"time"
+)
+
 // Config represents the complete Durian configuration
 type Config struct {
 	Settings   SettingsConfig    `pkl:"settings" json:"settings"`
 	Sync       SyncConfig        `pkl:"sync" json:"sync"`
 	Contacts   ContactsConfig    `pkl:"contacts" json:"contacts"`
+	Calendar   CalendarConfig    `pkl:"calendar" json:"calendar"`
 	Signatures map[string]string `pkl:"signatures" json:"signatures"`
 	Accounts   []AccountConfig   `pkl:"accounts" json:"accounts"`
 }
@@ -48,20 +54,68 @@ type ContactsConfig struct {
 	DBPath string `pkl:"db_path" json:"db_path"` // Path to SQLite DB (default: ~/.local/share/durian/contacts.db)
 }
 
+// CalendarConfig contains global calendar export settings.
+type CalendarConfig struct {
+	VdirPath string `pkl:"vdir_path" json:"vdir_path"` // Base dir for exported vdir calendars (default: ~/.local/share/durian/calendars)
+	// Autosync enables the background download-only calendar sync in
+	// `durian serve`. It NEVER writes to the remote calendar — uploads,
+	// remote deletes, conflicts and RSVPs stay behind the interactive
+	// `durian calendar sync` confirmation gate. A pointer so an absent
+	// calendar block (configs that do not amend the schema get no Pkl
+	// defaults) resolves to the schema default true instead of false.
+	Autosync *bool `pkl:"autosync" json:"autosync"`
+	// AutosyncInterval is the autosync interval in seconds (Pkl default 600,
+	// schema minimum 60). Polling a calendar API harder than the 120 s mail
+	// fetch buys nothing and courts provider throttling. Use
+	// Config.CalendarAutosyncInterval for the resolved time.Duration.
+	AutosyncInterval int `pkl:"autosync_interval" json:"autosync_interval"`
+	// AutosyncUpload selects what the background autosync may push to the
+	// remote calendar: "none" (default, also for "" / absent block) keeps
+	// autosync strictly download-only; "safe" additionally auto-applies
+	// provably non-notifying local changes — creates/edits of attendee-less
+	// events. Remote deletes, conflicts, RSVPs and anything that could make
+	// the provider send email always wait for the interactive
+	// `durian calendar sync`. Use Config.CalendarAutosyncUploadSafe for the
+	// per-account resolution.
+	AutosyncUpload string `pkl:"autosync_upload" json:"autosync_upload"`
+	// Conflict is the GLOBAL two-way sync conflict policy ("remote"|"local"|
+	// "newer"), used when an account does not set its own. Empty resolves to
+	// the schema default "newer". Use Config.CalendarConflictPolicy.
+	Conflict string `pkl:"conflict" json:"conflict"`
+}
+
+// AccountCalendarConfig configures the vdir calendar export of one account.
+type AccountCalendarConfig struct {
+	Dir     string   `pkl:"dir" json:"dir"`         // Subdir name under the vdir base path (default: alias, else lowercased name)
+	Include []string `pkl:"include" json:"include"` // Calendar display names to export (empty = all)
+	// Conflict overrides the global calendar.conflict policy for this account
+	// when an event changed on both sides: "remote" keeps the provider version
+	// (the local file is backed up first), "local" keeps the local file,
+	// "newer" keeps the side modified last. Empty = use the global setting.
+	Conflict string `pkl:"conflict" json:"conflict"`
+	// Autosync overrides the global calendar.autosync toggle for this
+	// account (nil = use the global setting).
+	Autosync *bool `pkl:"autosync" json:"autosync"`
+	// AutosyncUpload overrides the global calendar.autosync_upload mode
+	// ("none" or "safe") for this account ("" = use the global setting).
+	AutosyncUpload string `pkl:"autosync_upload" json:"autosync_upload"`
+}
+
 // AccountConfig represents a single email account
 type AccountConfig struct {
-	Name             string       `pkl:"name" json:"name"`
-	DisplayName      string       `pkl:"display_name" json:"display_name"` // Full name for From header (e.g., "Julian Schenker")
-	Email            string       `pkl:"email" json:"email"`
-	AuthEmail        string       `pkl:"auth_email" json:"auth_email"` // Delegating user for shared mailbox OAuth (token owner)
-	Alias            string       `pkl:"alias" json:"alias"`           // Short alias for CLI (e.g., "work", "personal")
-	Default          bool         `pkl:"default" json:"default"`
-	DefaultSignature string       `pkl:"default_signature" json:"default_signature"`
-	Notifications    *bool        `pkl:"notifications" json:"notifications"` // Per-account notification override (nil = use global setting)
-	SMTP             SMTPConfig   `pkl:"smtp" json:"smtp"`
-	IMAP             IMAPConfig   `pkl:"imap" json:"imap"`
-	Auth             *AuthConfig  `pkl:"auth" json:"auth"`
-	OAuth            *OAuthConfig `pkl:"oauth" json:"oauth"`
+	Name             string                 `pkl:"name" json:"name"`
+	DisplayName      string                 `pkl:"display_name" json:"display_name"` // Full name for From header (e.g., "Julian Schenker")
+	Email            string                 `pkl:"email" json:"email"`
+	AuthEmail        string                 `pkl:"auth_email" json:"auth_email"` // Delegating user for shared mailbox OAuth (token owner)
+	Alias            string                 `pkl:"alias" json:"alias"`           // Short alias for CLI (e.g., "work", "personal")
+	Default          bool                   `pkl:"default" json:"default"`
+	DefaultSignature string                 `pkl:"default_signature" json:"default_signature"`
+	Notifications    *bool                  `pkl:"notifications" json:"notifications"` // Per-account notification override (nil = use global setting)
+	SMTP             SMTPConfig             `pkl:"smtp" json:"smtp"`
+	IMAP             IMAPConfig             `pkl:"imap" json:"imap"`
+	Auth             *AuthConfig            `pkl:"auth" json:"auth"`
+	OAuth            *OAuthConfig           `pkl:"oauth" json:"oauth"`
+	Calendar         *AccountCalendarConfig `pkl:"calendar" json:"calendar"` // Vdir calendar export settings (nil = defaults)
 	// SyncEngine selects the sync implementation for this account:
 	//   ""/"legacy" (default) — the classic IMAP syncer;
 	//   "engine"              — the provider-agnostic engine on the IMAP backend;
@@ -83,6 +137,84 @@ func (a *AccountConfig) UsesGraphBackend() bool {
 	return a.SyncEngine == "graph"
 }
 
+// CalendarDir returns the subdirectory name under the vdir base path for this
+// account's calendar export: the configured calendar dir if set, else the
+// account alias, else the lowercased account name.
+func (a *AccountConfig) CalendarDir() string {
+	if a.Calendar != nil && a.Calendar.Dir != "" {
+		return a.Calendar.Dir
+	}
+	if a.Alias != "" {
+		return a.Alias
+	}
+	return strings.ToLower(a.Name)
+}
+
+// CalendarInclude returns the list of calendar display names to export for
+// this account, or nil to export all calendars.
+func (a *AccountConfig) CalendarInclude() []string {
+	if a.Calendar == nil {
+		return nil
+	}
+	return a.Calendar.Include
+}
+
+// CalendarConflictPolicy resolves the two-way calendar sync conflict policy
+// for an account: the account override if set, else the global
+// calendar.conflict, else the schema default "newer".
+func (c *Config) CalendarConflictPolicy(a *AccountConfig) string {
+	if a != nil && a.Calendar != nil && a.Calendar.Conflict != "" {
+		return a.Calendar.Conflict
+	}
+	if c.Calendar.Conflict != "" {
+		return c.Calendar.Conflict
+	}
+	return "newer"
+}
+
+// CalendarAutosyncEnabled resolves the effective calendar autosync toggle for
+// an account: the per-account override when set, else the global
+// calendar.autosync setting, else the schema default (on).
+func (c *Config) CalendarAutosyncEnabled(a *AccountConfig) bool {
+	if a.Calendar != nil && a.Calendar.Autosync != nil {
+		return *a.Calendar.Autosync
+	}
+	if c.Calendar.Autosync != nil {
+		return *c.Calendar.Autosync
+	}
+	return true // mirrors the Pkl schema default: autosync on
+}
+
+// CalendarAutosyncUploadSafe resolves whether the background calendar
+// autosync may auto-apply the provably non-notifying subset of local changes
+// for this account: the per-account calendar.autosync_upload override when
+// set, else the global calendar.autosync_upload, else "none". Only the exact
+// value "safe" enables it — every other value (including absent) stays
+// download-only, the fail-safe default.
+func (c *Config) CalendarAutosyncUploadSafe(a *AccountConfig) bool {
+	mode := c.Calendar.AutosyncUpload
+	if a != nil && a.Calendar != nil && a.Calendar.AutosyncUpload != "" {
+		mode = a.Calendar.AutosyncUpload
+	}
+	return mode == "safe"
+}
+
+// calendarAutosyncDefaultInterval mirrors the Pkl schema default for
+// calendar.autosync_interval (600 s), used when the configured value is
+// missing or below the schema minimum of 60 s (e.g. a Go-constructed Config
+// that bypassed Pkl evaluation).
+const calendarAutosyncDefaultInterval = 600 * time.Second
+
+// CalendarAutosyncInterval returns the calendar autosync interval as a
+// duration, falling back to the 60-second default when the configured value
+// is below the schema minimum of 60 seconds.
+func (c *Config) CalendarAutosyncInterval() time.Duration {
+	if c.Calendar.AutosyncInterval < 60 {
+		return calendarAutosyncDefaultInterval
+	}
+	return time.Duration(c.Calendar.AutosyncInterval) * time.Second
+}
+
 // GetAuthEmail returns the email used for OAuth token lookup.
 // For shared mailboxes, this is the delegating user; otherwise the account email.
 func (a *AccountConfig) GetAuthEmail() string {
@@ -90,6 +222,15 @@ func (a *AccountConfig) GetAuthEmail() string {
 		return a.AuthEmail
 	}
 	return a.Email
+}
+
+// IsDelegatedMailbox reports whether this account authenticates as a different
+// user than its own address (a shared mailbox reached via a delegating token
+// owner). Its calendar endpoints resolve to the TOKEN OWNER's mailbox (/me),
+// so calendar-syncing it would just re-fetch the owner account's calendars
+// into a second directory — calendar autosync skips these.
+func (a *AccountConfig) IsDelegatedMailbox() bool {
+	return a.AuthEmail != "" && a.AuthEmail != a.Email
 }
 
 // SMTPConfig contains SMTP server settings.

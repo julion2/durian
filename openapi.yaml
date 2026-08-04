@@ -404,6 +404,190 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TagResponse'
+  /calendars:
+    get:
+      summary: List the calendars of an account (read-only, from the local vdir)
+      parameters:
+        - name: account
+          in: query
+          required: true
+          description: Account identifier (email, alias or name)
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The account's calendars
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalendarsResponse'
+        '400':
+          description: Missing account parameter
+        '404':
+          description: Account not found
+  /calendars/events:
+    get:
+      summary: List or search calendar events (read-only, from the local vdir)
+      description: >-
+        Without `q`, returns the events (recurring series expanded into
+        occurrences) overlapping [from, to), defaulting to the next 7 days.
+        With `q`, returns a full-text search across all events (the window is
+        ignored). Events carry only summary fields (no attendees/description).
+      parameters:
+        - name: account
+          in: query
+          required: true
+          description: Account identifier (email, alias or name)
+          schema:
+            type: string
+        - name: from
+          in: query
+          description: Window start (RFC3339, "2006-01-02 15:04", "2006-01-02", today, tomorrow)
+          schema:
+            type: string
+        - name: to
+          in: query
+          description: Window end (same formats as from)
+          schema:
+            type: string
+        - name: calendar
+          in: query
+          description: Restrict to a single calendar by display name
+          schema:
+            type: string
+        - name: q
+          in: query
+          description: Full-text query over subject, location, description and attendees
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The matching events
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalendarEventsResponse'
+        '400':
+          description: Missing account or invalid window
+        '404':
+          description: Account not found
+  /calendars/event:
+    get:
+      summary: Get one calendar event in detail (read-only, from the local vdir)
+      parameters:
+        - name: account
+          in: query
+          required: true
+          description: Account identifier (email, alias or name)
+          schema:
+            type: string
+        - name: ref
+          in: query
+          required: true
+          description: Event reference — iCalUID (exact or prefix) or a unique subject substring
+          schema:
+            type: string
+        - name: calendar
+          in: query
+          description: Restrict the lookup to a single calendar by display name
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The event (full detail)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalendarEventResponse'
+        '400':
+          description: Missing account or ref
+        '404':
+          description: Account or event not found (or ambiguous reference)
+    put:
+      summary: Create or update an event locally (applied to Outlook on next sync)
+      description: >-
+        Upserts a local .ics from the posted event — a new UID is generated when
+        absent (create), otherwise the existing file is overwritten (update).
+        Local-first: only the vdir is written; nothing is sent to Outlook until
+        the next `durian calendar sync`.
+
+        An all-day event is normalized to midnight-UTC day boundaries and its
+        end is snapped to at least start + 1 day (the shape Graph requires).
+        An update preserves the existing event's organizer, recurrence, RSVP
+        state, online-meeting link — and its attendees unless the request
+        carries an attendee list — and must target the calendar the event
+        already lives in (moving between calendars is rejected with 400).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CalendarEventWrite'
+      responses:
+        '200':
+          description: The written event
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalendarEventResponse'
+        '400':
+          description: Missing/invalid fields (account, calendar, start/end)
+        '404':
+          description: Account not found
+    delete:
+      summary: Delete an event locally (applied to Outlook on next sync)
+      parameters:
+        - name: account
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: ref
+          in: query
+          required: true
+          description: Event reference — iCalUID (exact or prefix) or a unique subject substring
+          schema:
+            type: string
+        - name: calendar
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deleted
+        '400':
+          description: Missing account or ref
+        '404':
+          description: Account or event not found
+  /calendars/rsvp:
+    post:
+      summary: Set the owner's RSVP on a meeting locally (sent on next sync)
+      description: >-
+        Sets the account owner's response (accept/tentative/decline) on a
+        meeting by rewriting the owner's ATTENDEE PARTSTAT in the local .ics.
+        Local-first: only the vdir is written — no provider call, no mail. The
+        organizer is notified on the next `durian calendar sync`, which
+        previews the reply before sending. Only works when the owner is an
+        attendee (not the organizer) of the meeting.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CalendarRsvpRequest'
+      responses:
+        '200':
+          description: The updated event (full detail)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalendarEventResponse'
+        '400':
+          description: >-
+            Missing account/ref, unknown response verb, owner is the organizer,
+            or owner is not an attendee of the event
+        '404':
+          description: Account or event not found (or ambiguous reference)
 
 components:
   schemas:
@@ -720,3 +904,180 @@ components:
           type: string
         content_id:
           type: string
+    Calendar:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Calendar display name
+        color:
+          type: string
+          description: Calendar color as "#RRGGBB" (omitted when none)
+        event_count:
+          type: integer
+          description: Number of master events stored locally
+      required: [name, event_count]
+    CalendarPerson:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+      required: [email]
+    CalendarAttendee:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+        type:
+          type: string
+          description: required | optional | resource
+        response:
+          type: string
+          description: Graph response (accepted, declined, tentativelyAccepted, none, ...)
+      required: [email]
+    CalendarEvent:
+      type: object
+      description: >-
+        One event or expanded occurrence. Summary fields are always present;
+        organizer, attendees and description are only included by the
+        single-event detail endpoint (/calendars/event).
+      properties:
+        calendar:
+          type: string
+          description: Display name of the containing calendar
+        uid:
+          type: string
+          description: iCalUID (shared across a recurring series)
+        subject:
+          type: string
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        all_day:
+          type: boolean
+        location:
+          type: string
+        my_response:
+          type: string
+          description: The account owner's RSVP (accepted, declined, tentative, organizer, none)
+        online_meeting:
+          type: boolean
+        online_meeting_url:
+          type: string
+        recurring:
+          type: boolean
+        organizer:
+          $ref: '#/components/schemas/CalendarPerson'
+        attendees:
+          type: array
+          items:
+            $ref: '#/components/schemas/CalendarAttendee'
+        description:
+          type: string
+      required: [calendar, uid, subject, start, end, all_day]
+    CalendarsResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
+        calendars:
+          type: array
+          items:
+            $ref: '#/components/schemas/Calendar'
+      required: [ok, calendars]
+    CalendarEventsResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/CalendarEvent'
+      required: [ok, events]
+    CalendarEventResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
+        event:
+          $ref: '#/components/schemas/CalendarEvent'
+      required: [ok, event]
+    CalendarEventWrite:
+      type: object
+      description: Body for PUT /calendars/event (create when uid is empty, else update).
+      properties:
+        account:
+          type: string
+        calendar:
+          type: string
+          description: Target calendar display name
+        uid:
+          type: string
+          description: Empty to create a new event; set to update an existing one
+        subject:
+          type: string
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        all_day:
+          type: boolean
+        location:
+          type: string
+        description:
+          type: string
+        attendees:
+          type: array
+          items:
+            type: string
+          default: []
+          description: >-
+            Attendee email addresses; each becomes a required attendee.
+            Honored on create only — local-first, the invitations are sent by
+            the next 'durian calendar sync' behind its notification gate. On
+            update an empty or absent list preserves the event's existing
+            attendees (attendee editing is not supported here).
+        request_online_meeting:
+          type: boolean
+          default: false
+          description: >-
+            Create the event with an online meeting (Teams for a Microsoft
+            account, Google Meet for a Google one). Honored on create only;
+            the provider attaches the meeting when the next
+            'durian calendar sync' uploads the event.
+      required: [account, calendar, subject, start, end]
+    CalendarRsvpRequest:
+      type: object
+      description: Body for POST /calendars/rsvp (local-first owner RSVP).
+      properties:
+        account:
+          type: string
+          description: Account identifier (email, alias or name)
+        calendar:
+          type: string
+          description: Restrict the event lookup to a single calendar by display name
+        ref:
+          type: string
+          description: Event reference — iCalUID (exact or prefix) or a unique subject substring
+        response:
+          type: string
+          description: >-
+            The owner's response — accept/decline/tentative or the Graph-style
+            accepted/declined/tentativelyAccepted (case-insensitive)
+      required: [account, ref, response]

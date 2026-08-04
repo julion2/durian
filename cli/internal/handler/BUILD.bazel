@@ -3,6 +3,8 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "handler",
     srcs = [
+        "calendar.go",
+        "calendar_write.go",
         "contacts.go",
         "drafts.go",
         "error_sanitize.go",
@@ -21,6 +23,7 @@ go_library(
     visibility = ["//cli:__subpackages__"],
     deps = [
         "//cli/internal/auth",
+        "//cli/internal/calendar",
         "//cli/internal/config",
         "//cli/internal/contacts",
         "//cli/internal/encoding",
@@ -32,6 +35,7 @@ go_library(
         "//cli/internal/store",
         "//cli/internal/tagsync",
         "@com_github_emersion_go_imap//:go-imap",
+        "@com_github_google_uuid//:uuid",
         "@com_github_gorilla_mux//:mux",
     ],
 )
@@ -40,6 +44,7 @@ go_test(
     name = "handler_test",
     size = "small",
     srcs = [
+        "calendar_test.go",
         "convert_thread_test.go",
         "drafts_test.go",
         "error_sanitize_test.go",
@@ -50,12 +55,13 @@ go_test(
     ],
     embed = [":handler"],
     deps = [
+        "//cli/internal/calendar",
+        "//cli/internal/config",
         "//cli/internal/contacts",
         "//cli/internal/dbcrypto",
         "//cli/internal/protocol",
         "//cli/internal/smtp",
         "//cli/internal/store",
-        "@com_github_emersion_go_imap//:go-imap",
         "@com_github_gorilla_mux//:mux",
     ],
 )

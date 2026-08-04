@@ -17,7 +17,7 @@ func Load(path string) (*Config, error) {
 	path = ExpandPath(path)
 
 	var cfg Config
-	if err := loadInto(path, &cfg); err != nil {
+	if err := cachedLoad(path, &cfg, func() error { return loadInto(path, &cfg) }); err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
@@ -55,6 +55,20 @@ func DefaultDataDir() string {
 		return ""
 	}
 	return filepath.Join(home, ".local", "share", "durian")
+}
+
+// CalendarBaseDir resolves the vdir base directory for calendars: the override
+// wins, then the configured Calendar.VdirPath, then the default data dir's
+// "calendars" subdir. Shared by the CLI calendar commands and the HTTP API so
+// both resolve the same location.
+func CalendarBaseDir(cfg *Config, override string) string {
+	if override != "" {
+		return override
+	}
+	if base := ExpandPath(cfg.Calendar.VdirPath); base != "" {
+		return base
+	}
+	return filepath.Join(DefaultDataDir(), "calendars")
 }
 
 // DefaultStateDir returns the durian state directory.

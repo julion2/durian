@@ -30,6 +30,10 @@ func init() {
 }
 
 func runValidate(cmd *cobra.Command, args []string) error {
+	// Validation must reflect the files on disk right now, so bypass the config
+	// cache and force a fresh Pkl evaluation of every file it loads.
+	os.Setenv(config.DisableCacheEnv, "1")
+
 	target := ""
 	if len(args) > 0 {
 		target = strings.ToLower(args[0])

@@ -36,6 +36,7 @@ struct ContentView: View {
     @ObservedObject private var syncManager = SyncManager.shared
     @ObservedObject private var networkMonitor = NetworkMonitor.shared
     @ObservedObject private var bannerManager = BannerManager.shared
+    @ObservedObject var appRouter = AppRouter.shared
     @State var selectedTagID: String? = "inbox"
     @State var cursorEmailId: String? = nil       // Highlighted email (cursor position)
     @State var markedEmails: Set<String> = []     // Marked emails (selection for batch ops)
@@ -55,18 +56,22 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            emailView
+            if appRouter.mode == .calendar {
+                CalendarView()
+            } else {
+                emailView
 
-            if showSearchPopup {
-                searchPopupOverlay
-            }
+                if showSearchPopup {
+                    searchPopupOverlay
+                }
 
-            if showTagPicker {
-                tagPickerOverlay
-            }
+                if showTagPicker {
+                    tagPickerOverlay
+                }
 
-            if showFolderPicker {
-                folderPickerOverlay
+                if showFolderPicker {
+                    folderPickerOverlay
+                }
             }
 
             // Banner Overlay (bottom-right toast)
@@ -93,6 +98,16 @@ struct ContentView: View {
             cursorEmailId = threadId
             markedEmails = [threadId]
             handleEmailSelection(threadId)
+        }
+        .onChange(of: appRouter.mode) { _, mode in
+            if mode == .calendar {
+                keymapHandler.engine.setContext(.calendar)
+                // Force: entering the calendar picks up background sync
+                // changes even when the window is still covered.
+                CalendarManager.shared.refresh(force: true)
+            } else {
+                keymapHandler.engine.setContext(.list)
+            }
         }
         .tint(profileManager.resolvedAccentColor)
     }
@@ -423,6 +438,7 @@ struct ContentView: View {
             }
             // Register all keymap handlers
             registerKeymapHandlers()
+            registerCalendarKeymapHandlers()
         }
         .onChange(of: selectedTagID) { _, tagId in
             if tagId != nil && tagId != accountManager.selectedFolder {

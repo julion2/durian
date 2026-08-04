@@ -16,6 +16,7 @@ genrule(
 go_library(
     name = "config",
     srcs = [
+        "cache.go",
         "config.go",
         "groups.go",
         "helpers.go",
@@ -42,6 +43,7 @@ go_test(
     name = "config_test",
     size = "small",
     srcs = [
+        "cache_test.go",
         "config_test.go",
         "groups_test.go",
         "validate_test.go",

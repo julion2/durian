@@ -174,6 +174,15 @@ func runServe(cmd *cobra.Command, args []string) {
 	r.HandleFunc("/api/v1/contacts", h.ListContactsHandler).Methods("GET")
 	r.Handle("/api/v1/events", eventHub).Methods("GET")
 
+	// Calendar routes (read-only, served from the local vdir). More specific
+	// paths first so /calendars does not shadow /calendars/events.
+	r.HandleFunc("/api/v1/calendars/events", h.CalendarEventsHandler).Methods("GET")
+	r.HandleFunc("/api/v1/calendars/event", h.CalendarEventHandler).Methods("GET")
+	r.HandleFunc("/api/v1/calendars/event", h.CalendarPutEventHandler).Methods("PUT")
+	r.HandleFunc("/api/v1/calendars/event", h.CalendarDeleteEventHandler).Methods("DELETE")
+	r.HandleFunc("/api/v1/calendars/rsvp", h.CalendarRsvpHandler).Methods("POST")
+	r.HandleFunc("/api/v1/calendars", h.CalendarsHandler).Methods("GET")
+
 	// Outbox routes
 	r.HandleFunc("/api/v1/outbox/send", h.EnqueueOutboxHandler).Methods("POST")
 	r.HandleFunc("/api/v1/outbox", h.ListOutboxHandler).Methods("GET")
@@ -236,6 +245,12 @@ func runServe(cmd *cobra.Command, args []string) {
 		// Start outbox background worker
 		outboxWorker := handler.NewOutboxWorker(emailDB, cfg, eventHub)
 		go outboxWorker.Start(watcherCtx)
+
+		// Start calendar autosync loops. These pull remote calendar changes
+		// into the local vdir; by default they NEVER write to the remote
+		// calendar, and even in safe upload mode they only push provably
+		// non-notifying, non-delete changes (see calendar_autosync.go).
+		startCalendarAutosync(watcherCtx, eventHub, cfg)
 	}
 
 	server := &http.Server{

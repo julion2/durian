@@ -1,4 +1,4 @@
-load("@rules_go//go:def.bzl", "go_binary", "go_library")
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
     name = "durian_lib",
@@ -6,6 +6,10 @@ go_library(
         "attachment.go",
         "auth.go",
         "auth_verify_graph.go",
+        "calendar.go",
+        "calendar_autosync.go",
+        "calendar_read.go",
+        "calendar_write.go",
         "completion.go",
         "contacts.go",
         "draft.go",
@@ -20,6 +24,7 @@ go_library(
         "send.go",
         "serve.go",
         "show.go",
+        "style.go",
         "sync.go",
         "sync_engine.go",
         "tag.go",
@@ -32,11 +37,15 @@ go_library(
         "//cli/internal/agekey",
         "//cli/internal/auth",
         "//cli/internal/backend",
+        "//cli/internal/calendar",
+        "//cli/internal/calendarsync",
         "//cli/internal/config",
         "//cli/internal/contacts",
         "//cli/internal/dbcrypto",
         "//cli/internal/draft",
+        "//cli/internal/googlecalendar",
         "//cli/internal/graphbackend",
+        "//cli/internal/graphcalendar",
         "//cli/internal/handler",
         "//cli/internal/imap",
         "//cli/internal/imapbackend",
@@ -51,11 +60,19 @@ go_library(
         "//cli/internal/tagsync",
         "@com_github_emersion_go_imap//:go-imap",
         "@com_github_fatih_color//:color",
+        "@com_github_google_uuid//:uuid",
         "@com_github_gorilla_mux//:mux",
         "@com_github_spf13_cobra//:cobra",
         "@com_github_spf13_cobra//doc",
         "@org_golang_x_term//:term",
     ],
+)
+
+go_test(
+    name = "durian_test",
+    size = "small",
+    srcs = ["calendar_test.go"],
+    embed = [":durian_lib"],
 )
 
 go_binary(
