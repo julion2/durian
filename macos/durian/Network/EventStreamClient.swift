@@ -146,7 +146,12 @@ class EventStreamClient: ObservableObject {
     // MARK: - Event Dispatch
 
     private func handleSSEEvent(type: String, data: String) {
-        Log.debug("EVENTS", "Raw SSE data: \(data.prefix(500))")
+        // Never log the payload. A new_mail frame carries subject, from and
+        // snippet, an outbox_update carries the recipients — dumping it here
+        // put exactly the content the redacted logs below avoid straight into
+        // the unified log. The grep gate cannot catch this line because the
+        // sensitive words live in the server's JSON, not in the source text.
+        Log.debug("EVENTS", "SSE event type=\(type) bytes=\(data.utf8.count)")
         guard let jsonData = data.data(using: .utf8) else { return }
 
         switch type {

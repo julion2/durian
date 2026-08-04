@@ -112,7 +112,9 @@ class AvatarManager: ObservableObject {
                 // Found contact! Use their email for avatar lookup
                 emailForGravatar = contact.email.lowercased()
                 domain = extractDomain(from: contact.email)
-                Log.debug("AVATAR", "Contacts lookup '\(cleanEmail)' → \(contact.email)")
+                // The addresses themselves stay out of the log — a
+                // correspondent list is exactly what ADR-0001 keeps out of it.
+                Log.debug("AVATAR", "Contacts lookup hit, domain=\(domain ?? "none")")
             } else {
                 // Fallback: guess domain from name (e.g., "Amazon.de" → "amazon.de")
                 domain = guessDomainFromName(cleanEmail)

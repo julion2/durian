@@ -3,6 +3,7 @@ package redact
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"log/slog"
 	"strings"
@@ -181,7 +182,7 @@ func TestIsSensitive(t *testing.T) {
 // TestHandle_SanitizesServerEchoInError asserts G2 of the encryption audit:
 // IMAP/SMTP server responses can echo mail content (Subject lines, quoted
 // headers) back in error text, and "err" is not a key-based redaction target.
-// A long server-echoed run must be base64'd out of the readable log.
+// A long server-echoed run must be redacted out of the readable log.
 func TestHandle_SanitizesServerEchoInError(t *testing.T) {
 	// A single long run — the shape of a raw server literal / quoted header.
 	leak := "X-Confidential-Subject:TopSecretMergerWithAcmeCorpQ4-boardroom-only-do-not-forward-2026"
@@ -196,8 +197,8 @@ func TestHandle_SanitizesServerEchoInError(t *testing.T) {
 		if strings.Contains(buf.String(), leak) {
 			t.Errorf("server-echoed run leaked via err value:\n%s", buf.String())
 		}
-		if !strings.Contains(buf.String(), "base64:") {
-			t.Errorf("expected base64 marker, got:\n%s", buf.String())
+		if !strings.Contains(buf.String(), "[redacted ") {
+			t.Errorf("expected redaction marker, got:\n%s", buf.String())
 		}
 	})
 
@@ -220,7 +221,43 @@ func TestHandle_PreservesShortErrors(t *testing.T) {
 	if !strings.Contains(buf.String(), "connection reset by peer") {
 		t.Errorf("short error was mangled:\n%s", buf.String())
 	}
-	if strings.Contains(buf.String(), "base64:") {
-		t.Errorf("short error should not be base64'd:\n%s", buf.String())
+	if strings.Contains(buf.String(), "[redacted ") {
+		t.Errorf("short error should not be redacted:\n%s", buf.String())
+	}
+}
+
+// TestSanitizeTextIsNotReversible is the point of the redaction: an earlier
+// version base64-encoded the over-long field, which looks like redaction but
+// hands the plaintext back to anyone with `base64 -d`. The marker must carry
+// no recoverable content.
+func TestSanitizeTextIsNotReversible(t *testing.T) {
+	secret := strings.Repeat("Quarterly-Results-CONFIDENTIAL-", 5) // > maxSafeRun
+	got := sanitizeText(secret)
+
+	if strings.Contains(got, "CONFIDENTIAL") {
+		t.Fatalf("plaintext survived redaction: %q", got)
+	}
+	if strings.Contains(got, base64.StdEncoding.EncodeToString([]byte(secret))) {
+		t.Fatalf("output carries a reversible encoding of the input: %q", got)
+	}
+	for _, dec := range []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+	} {
+		for _, field := range strings.Fields(got) {
+			if raw, err := dec(field); err == nil && strings.Contains(string(raw), "CONFIDENTIAL") {
+				t.Fatalf("a field decoded back to the plaintext: %q", field)
+			}
+		}
+	}
+
+	// Still useful: the same input redacts to the same marker, so repeated
+	// occurrences stay correlatable, and the length is preserved.
+	if sanitizeText(secret) != got {
+		t.Error("redaction is not deterministic; identical values must be correlatable")
+	}
+	if !strings.Contains(got, "155B") {
+		t.Errorf("byte length not reported, got %q", got)
 	}
 }

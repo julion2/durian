@@ -32,12 +32,25 @@ cd "$ROOT"
 # \.from / from= = sender address interpolation; draft\.(to|cc|bcc) =
 # recipient-list interpolation. Counts (draft.to.count) must be bound to a
 # local first so they never appear on a Log line — see EmailSendingManager.
-TOKENS='subject|snippet|\.body[^A-Za-z]|\.from|from=|draft\.(to|cc|bcc)'
+# \(...query = an interpolated search/filter expression; a notmuch query can
+# carry from:/subject: terms, so it is content-adjacent even when it happens
+# to be config-derived (annotate those with a reason).
+TOKENS='subject|snippet|\.body[^A-Za-z]|\.from|from=|draft\.(to|cc|bcc)|\\\(.*query'
 
+# What this gate CANNOT catch, by construction:
+#   - a value reached through a variable whose name carries no token
+#     (`Log.debug("EVENTS", "Raw SSE data: \(data)")` dumped subject, from and
+#     snippet for months without matching a single token here)
+#   - a Log call spanning several source lines
+# It is a tripwire for the obvious cases, not a proof of absence. Content
+# safety comes from not putting mail data into log calls in the first place;
+# this only makes the common mistake loud.
+#
 # Anchor the token match to the line CONTENT (after the `:lineno:` prefix
-# grep -rn prepends) so Swift filenames never false-positive.
+# grep -rn prepends) so Swift filenames never false-positive. Matching is
+# case-insensitive: Subject/Snippet/From must not slip through on casing.
 hits=$(grep -rnE 'Log\.(debug|info|warning|error)' macos/ \
-  | grep -E ":[0-9]+:.*($TOKENS)" \
+  | grep -iE ":[0-9]+:.*($TOKENS)" \
   | grep -vF 'encgrep:allow' \
   || true)
 

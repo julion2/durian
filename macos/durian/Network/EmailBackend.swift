@@ -284,7 +284,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
 
         currentFolder = name
         currentQuery = ProfileManager.shared.buildQuery(folderName: name)
-        Log.debug("BACKEND", "selectFolder: \(currentQuery)")
+        Log.debug("BACKEND", "selectFolder: \(currentQuery)") // encgrep:allow folder selector built from config, not a user search
 
         // Wrap search in a stored Task so the next selectFolder() can cancel it
         let task = Task { await search(currentQuery) }
@@ -515,7 +515,9 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         )
 
         if response?.ok == true {
-            Log.info("BACKEND", "Tagged \(query) with \(tags)")
+            // The query names threads, senders or subjects; the Go side
+            // dropped it from its own tag log in this PR for the same reason.
+            Log.info("BACKEND", "Tagged \(tags.count) tag(s)")
         } else {
             let msg = response?.error ?? "unknown error"
             Log.error("BACKEND", "Tag error: \(msg)")

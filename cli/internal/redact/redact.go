@@ -91,7 +91,7 @@ func redact(a slog.Attr) slog.Attr {
 	}
 	// Error values (and err.Error() logged as a string) may embed
 	// server-echoed mail content from IMAP/SMTP NO/BAD responses. Pass them
-	// through sanitizeText, which base64s over-long server runs while leaving
+	// through sanitizeText, which redacts over-long server runs while leaving
 	// short, readable diagnostics intact. See ADR-0001 §Logging audit.
 	if a.Value.Kind() == slog.KindAny {
 		if err, ok := a.Value.Any().(error); ok {
