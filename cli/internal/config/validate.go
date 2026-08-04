@@ -61,6 +61,20 @@ func ValidateConfig(cfg *Config) []ValidationError {
 		}
 	}
 
+	// Calendar autosync upload mode ("" = absent block = "none")
+	switch cfg.Calendar.AutosyncUpload {
+	case "", "none", "safe":
+	default:
+		add("calendar.autosync_upload", fmt.Sprintf("must be \"none\" or \"safe\", got %q", cfg.Calendar.AutosyncUpload))
+	}
+
+	// Global conflict policy ("" = absent block = the "newer" default)
+	switch cfg.Calendar.Conflict {
+	case "", "remote", "local", "newer":
+	default:
+		add("calendar.conflict", fmt.Sprintf("must be \"remote\", \"local\" or \"newer\", got %q", cfg.Calendar.Conflict))
+	}
+
 	if len(cfg.Accounts) == 0 {
 		warn("accounts", "no accounts configured")
 		return errs
@@ -149,6 +163,23 @@ func ValidateConfig(cfg *Config) []ValidationError {
 				if acct.OAuth.ClientSecret == "" {
 					add(prefix+".oauth.client_secret", "required for Google OAuth")
 				}
+			}
+		}
+
+		// Calendar sync (Microsoft Graph or Google Calendar)
+		if acct.Calendar != nil && (acct.OAuth == nil || (acct.OAuth.Provider != "microsoft" && acct.OAuth.Provider != "google")) {
+			warn(prefix+".calendar", "calendar sync only works for Microsoft and Google OAuth accounts; this block will be ignored")
+		}
+		if acct.Calendar != nil {
+			switch acct.Calendar.Conflict {
+			case "", "remote", "local", "newer":
+			default:
+				add(prefix+".calendar.conflict", fmt.Sprintf("must be \"remote\", \"local\" or \"newer\", got %q", acct.Calendar.Conflict))
+			}
+			switch acct.Calendar.AutosyncUpload {
+			case "", "none", "safe":
+			default:
+				add(prefix+".calendar.autosync_upload", fmt.Sprintf("must be \"none\" or \"safe\", got %q", acct.Calendar.AutosyncUpload))
 			}
 		}
 

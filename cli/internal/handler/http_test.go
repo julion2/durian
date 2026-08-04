@@ -31,6 +31,12 @@ func newTestRouter(h *Handler, hub *EventHub) *mux.Router {
 	if hub != nil {
 		r.Handle("/api/v1/events", hub).Methods("GET")
 	}
+	r.HandleFunc("/api/v1/calendars/events", h.CalendarEventsHandler).Methods("GET")
+	r.HandleFunc("/api/v1/calendars/event", h.CalendarEventHandler).Methods("GET")
+	r.HandleFunc("/api/v1/calendars/event", h.CalendarPutEventHandler).Methods("PUT")
+	r.HandleFunc("/api/v1/calendars/event", h.CalendarDeleteEventHandler).Methods("DELETE")
+	r.HandleFunc("/api/v1/calendars/rsvp", h.CalendarRsvpHandler).Methods("POST")
+	r.HandleFunc("/api/v1/calendars", h.CalendarsHandler).Methods("GET")
 	r.HandleFunc("/api/v1/outbox/send", h.EnqueueOutboxHandler).Methods("POST")
 	r.HandleFunc("/api/v1/outbox", h.ListOutboxHandler).Methods("GET")
 	r.HandleFunc("/api/v1/outbox/{id}", h.DeleteOutboxHandler).Methods("DELETE")

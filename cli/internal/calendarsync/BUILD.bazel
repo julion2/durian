@@ -1,0 +1,37 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "calendarsync",
+    srcs = [
+        "calendarsync.go",
+        "export.go",
+        "notify.go",
+        "runlock.go",
+        "state.go",
+        "twosync.go",
+    ],
+    importpath = "github.com/julion2/durian/cli/internal/calendarsync",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "//cli/internal/calendar",
+        "@com_github_google_uuid//:uuid",
+    ],
+)
+
+go_test(
+    name = "calendarsync_test",
+    size = "small",
+    srcs = [
+        "corechange_test.go",
+        "downloadonly_test.go",
+        "export_test.go",
+        "nonnotifying_test.go",
+        "provider_test.go",
+        "twosync_test.go",
+    ],
+    deps = [
+        ":calendarsync",
+        "//cli/internal/calendar",
+        "//cli/internal/graphcalendar",
+    ],
+)

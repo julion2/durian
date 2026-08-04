@@ -41,21 +41,30 @@ func LoadGroups(path string) (map[string]GroupEntry, error) {
 		return nil, nil
 	}
 
-	var raw groupsFileRaw
-	if err := loadInto(path, &raw); err != nil {
+	// The cache stores the final, normalized map[string]GroupEntry (concrete
+	// [][]string), not the raw interface{} members form — so the JSON round
+	// trip is lossless. Normalization runs inside the eval closure, on a miss.
+	var groups map[string]GroupEntry
+	err := cachedLoad(path, &groups, func() error {
+		var raw groupsFileRaw
+		if err := loadInto(path, &raw); err != nil {
+			return err
+		}
+		groups = make(map[string]GroupEntry, len(raw.Groups))
+		for name, entry := range raw.Groups {
+			members, err := normalizeMembers(entry.Members)
+			if err != nil {
+				return fmt.Errorf("groups.%s.members: %w", name, err)
+			}
+			groups[name] = GroupEntry{
+				Description: entry.Description,
+				Members:     members,
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, fmt.Errorf("failed to load groups: %w", err)
-	}
-
-	groups := make(map[string]GroupEntry, len(raw.Groups))
-	for name, entry := range raw.Groups {
-		members, err := normalizeMembers(entry.Members)
-		if err != nil {
-			return nil, fmt.Errorf("groups.%s.members: %w", name, err)
-		}
-		groups[name] = GroupEntry{
-			Description: entry.Description,
-			Members:     members,
-		}
 	}
 
 	return groups, nil

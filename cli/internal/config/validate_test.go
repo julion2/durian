@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- ValidateConfig ---
@@ -112,6 +113,242 @@ func TestValidateConfig_SyncEngineRejectsGmail(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected error rejecting sync_engine=engine for Google account, got errors: %v", errs)
+	}
+}
+
+func TestValidateConfig_CalendarConflictPolicy(t *testing.T) {
+	cfg := &Config{Accounts: []AccountConfig{{
+		Name: "Test", Email: "test@example.com",
+		OAuth:    &OAuthConfig{Provider: "microsoft"},
+		Calendar: &AccountCalendarConfig{Conflict: "merge"},
+	}}}
+	errs := ValidateConfig(cfg)
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Field, "calendar.conflict") && e.Severity == "error" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected error for invalid calendar conflict policy, got errors: %v", errs)
+	}
+
+	// Valid values (and empty) pass.
+	for _, valid := range []string{"", "remote", "local", "newer"} {
+		cfg.Accounts[0].Calendar.Conflict = valid
+		for _, e := range ValidateConfig(cfg) {
+			if strings.Contains(e.Field, "calendar.conflict") {
+				t.Errorf("unexpected error for conflict=%q: %s", valid, e)
+			}
+		}
+	}
+}
+
+func TestValidateConfig_CalendarProviderWarning(t *testing.T) {
+	base := func(oauth *OAuthConfig) *Config {
+		return &Config{Accounts: []AccountConfig{{
+			Name: "Test", Email: "test@example.com",
+			OAuth:    oauth,
+			Calendar: &AccountCalendarConfig{},
+		}}}
+	}
+	calendarWarned := func(cfg *Config) bool {
+		for _, e := range ValidateConfig(cfg) {
+			if e.Field == "accounts[0].calendar" && e.Severity == "warning" {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Microsoft and Google accounts support calendar sync: no warning.
+	if calendarWarned(base(&OAuthConfig{Provider: "microsoft"})) {
+		t.Error("microsoft account with calendar block: unexpected warning")
+	}
+	if calendarWarned(base(&OAuthConfig{Provider: "google", ClientID: "id", ClientSecret: "secret"})) {
+		t.Error("google account with calendar block: unexpected warning")
+	}
+
+	// No OAuth (password auth) or an unsupported provider: still warned.
+	if !calendarWarned(base(nil)) {
+		t.Error("account without oauth but with calendar block: expected warning")
+	}
+	if !calendarWarned(base(&OAuthConfig{Provider: "acme"})) {
+		t.Error("unsupported oauth provider with calendar block: expected warning")
+	}
+}
+
+func TestCalendarConflictPolicyResolution(t *testing.T) {
+	cfg := &Config{}
+	a := &AccountConfig{}
+
+	// Nothing set anywhere: the schema default "newer".
+	if got := cfg.CalendarConflictPolicy(a); got != "newer" {
+		t.Errorf("nothing set: policy = %q, want newer", got)
+	}
+	// Empty account calendar block: still the default.
+	a.Calendar = &AccountCalendarConfig{}
+	if got := cfg.CalendarConflictPolicy(a); got != "newer" {
+		t.Errorf("empty account block: policy = %q, want newer", got)
+	}
+	// Global override, no account override.
+	cfg.Calendar.Conflict = "remote"
+	if got := cfg.CalendarConflictPolicy(a); got != "remote" {
+		t.Errorf("global remote: policy = %q, want remote", got)
+	}
+	// Account override wins over global.
+	a.Calendar.Conflict = "local"
+	if got := cfg.CalendarConflictPolicy(a); got != "local" {
+		t.Errorf("account override: policy = %q, want local", got)
+	}
+}
+
+func TestIsDelegatedMailbox(t *testing.T) {
+	// Own mailbox: no auth_email, or auth_email == email.
+	if (&AccountConfig{Email: "me@example.com"}).IsDelegatedMailbox() {
+		t.Error("no auth_email: want not delegated")
+	}
+	if (&AccountConfig{Email: "me@example.com", AuthEmail: "me@example.com"}).IsDelegatedMailbox() {
+		t.Error("auth_email == email: want not delegated")
+	}
+	// Shared mailbox delegating to a different token owner.
+	if !(&AccountConfig{Email: "team@example.com", AuthEmail: "owner@example.com"}).IsDelegatedMailbox() {
+		t.Error("auth_email != email: want delegated")
+	}
+}
+
+func TestCalendarAutosyncResolution(t *testing.T) {
+	on, off := true, false
+	cfg := &Config{}
+	a := &AccountConfig{}
+
+	// Absent everywhere: the schema default (on) applies — configs that do
+	// not amend the Pkl schema carry no calendar block at all.
+	if !cfg.CalendarAutosyncEnabled(a) {
+		t.Error("no calendar config anywhere: want the default (enabled)")
+	}
+	cfg.Calendar.Autosync = &on
+	if !cfg.CalendarAutosyncEnabled(a) {
+		t.Error("global on, no account block: want enabled")
+	}
+	a.Calendar = &AccountCalendarConfig{}
+	if !cfg.CalendarAutosyncEnabled(a) {
+		t.Error("global on, account block without override: want enabled")
+	}
+	a.Calendar.Autosync = &off
+	if cfg.CalendarAutosyncEnabled(a) {
+		t.Error("account override false must win over global on")
+	}
+	cfg.Calendar.Autosync = &off
+	a.Calendar.Autosync = &on
+	if !cfg.CalendarAutosyncEnabled(a) {
+		t.Error("account override true must win over global off")
+	}
+	a.Calendar.Autosync = nil
+	if cfg.CalendarAutosyncEnabled(a) {
+		t.Error("global off, no override: want disabled")
+	}
+	cfg.Calendar.Autosync = nil
+	a.Calendar.Autosync = &off
+	if cfg.CalendarAutosyncEnabled(a) {
+		t.Error("global absent, account override false: want disabled")
+	}
+}
+
+func TestCalendarAutosyncUploadSafeResolution(t *testing.T) {
+	cfg := &Config{}
+	a := &AccountConfig{}
+
+	// Absent everywhere: download-only — the fail-safe default.
+	if cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("no autosync_upload anywhere: want download-only (not safe)")
+	}
+	cfg.Calendar.AutosyncUpload = "none"
+	if cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("global none: want download-only")
+	}
+	cfg.Calendar.AutosyncUpload = "safe"
+	if !cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("global safe, no account override: want safe")
+	}
+	a.Calendar = &AccountCalendarConfig{}
+	if !cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("global safe, account block without override: want safe")
+	}
+	a.Calendar.AutosyncUpload = "none"
+	if cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("account override none must win over global safe")
+	}
+	cfg.Calendar.AutosyncUpload = "none"
+	a.Calendar.AutosyncUpload = "safe"
+	if !cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("account override safe must win over global none")
+	}
+	cfg.Calendar.AutosyncUpload = ""
+	if !cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("global absent, account override safe: want safe")
+	}
+	// Any non-"safe" value (validation rejects it, but the resolver must
+	// still fail safe) means download-only.
+	a.Calendar.AutosyncUpload = "bogus"
+	if cfg.CalendarAutosyncUploadSafe(a) {
+		t.Error("unknown mode must resolve to download-only")
+	}
+}
+
+func TestValidateConfigCalendarAutosyncUpload(t *testing.T) {
+	base := func() *Config {
+		return &Config{Accounts: []AccountConfig{{
+			Name: "Test", Email: "test@example.com",
+			OAuth:    &OAuthConfig{Provider: "microsoft"},
+			Calendar: &AccountCalendarConfig{},
+		}}}
+	}
+
+	for _, valid := range []string{"", "none", "safe"} {
+		cfg := base()
+		cfg.Calendar.AutosyncUpload = valid
+		cfg.Accounts[0].Calendar.AutosyncUpload = valid
+		for _, e := range ValidateConfig(cfg) {
+			if strings.Contains(e.Field, "autosync_upload") {
+				t.Errorf("unexpected error for autosync_upload=%q: %s", valid, e)
+			}
+		}
+	}
+
+	cfg := base()
+	cfg.Calendar.AutosyncUpload = "always"
+	cfg.Accounts[0].Calendar.AutosyncUpload = "yes"
+	globalHit, accountHit := false, false
+	for _, e := range ValidateConfig(cfg) {
+		if e.Field == "calendar.autosync_upload" && e.Severity == "error" {
+			globalHit = true
+		}
+		if e.Field == "accounts[0].calendar.autosync_upload" && e.Severity == "error" {
+			accountHit = true
+		}
+	}
+	if !globalHit || !accountHit {
+		t.Errorf("invalid autosync_upload values not rejected: global=%v account=%v", globalHit, accountHit)
+	}
+}
+
+func TestCalendarAutosyncInterval(t *testing.T) {
+	cfg := &Config{}
+	if got := cfg.CalendarAutosyncInterval(); got != 600*time.Second {
+		t.Errorf("unset interval = %v, want the 600s default", got)
+	}
+	cfg.Calendar.AutosyncInterval = 300
+	if got := cfg.CalendarAutosyncInterval(); got != 300*time.Second {
+		t.Errorf("interval = %v, want 300s", got)
+	}
+	cfg.Calendar.AutosyncInterval = 60
+	if got := cfg.CalendarAutosyncInterval(); got != 60*time.Second {
+		t.Errorf("interval = %v, want 60s (schema minimum)", got)
+	}
+	cfg.Calendar.AutosyncInterval = 30
+	if got := cfg.CalendarAutosyncInterval(); got != 600*time.Second {
+		t.Errorf("below-minimum interval = %v, want the 600s default", got)
 	}
 }
 

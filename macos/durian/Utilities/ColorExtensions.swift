@@ -14,10 +14,19 @@ extension Color {
     init(hex: String) {
         let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
         var int: UInt64 = 0
-        Scanner(string: hex).scanHexInt64(&int)
+        // A non-hex string (e.g. a malformed vdir color file) must fall back
+        // instead of silently rendering black.
+        guard Scanner(string: hex).scanHexInt64(&int) else {
+            self.init(red: 0.6, green: 0.4, blue: 0.2)
+            return
+        }
         let r, g, b: Double
         switch hex.count {
-        case 6: // RGB (e.g. "FF5733")
+        case 3: // RGB (e.g. "F53" → "FF5533")
+            r = Double((int >> 8) & 0xF) / 15
+            g = Double((int >> 4) & 0xF) / 15
+            b = Double(int & 0xF) / 15
+        case 6: // RRGGBB (e.g. "FF5733")
             r = Double((int >> 16) & 0xFF) / 255
             g = Double((int >> 8) & 0xFF) / 255
             b = Double(int & 0xFF) / 255
@@ -25,6 +34,25 @@ extension Color {
             r = 0.6; g = 0.4; b = 0.2  // Fallback to brown-ish
         }
         self.init(red: r, green: g, blue: b)
+    }
+}
+
+// MARK: - Calendar Event Tints
+
+extension Color {
+    /// A soft wash of a calendar color for a timed event pill's fill. Meant
+    /// to be layered over an opaque surface (Color.Detail.cardBackground):
+    /// the low opacity keeps the hue recognizable over both the light and
+    /// dark surface while titles stay in the primary text color.
+    func eventTint(selected: Bool = false) -> Color {
+        opacity(selected ? 0.32 : 0.16)
+    }
+
+    /// The near-solid fill an all-day chip uses — strong enough to carry
+    /// white text, dialed back a step when unselected so a selected chip
+    /// reads a notch stronger.
+    func eventSolid(selected: Bool = false) -> Color {
+        opacity(selected ? 1.0 : 0.9)
     }
 }
 

@@ -41,6 +41,51 @@ class ContactsConfig {
   db_path: String?
 }
 
+class CalendarConfig {
+  /// Base directory for exported vdir calendars (khal/vdirsyncer layout:
+  /// <vdir_path>/<account-dir>/<calendar>/<event>.ics).
+  vdir_path: String = "~/.local/share/durian/calendars"
+  /// Background calendar sync in `durian serve`: remote changes are pulled
+  /// into the local vdir periodically. With the default autosync_upload
+  /// "none", it never writes to the remote calendar — uploads, remote
+  /// deletes, conflicts and RSVPs stay behind the interactive
+  /// `durian calendar sync` confirmation. Per-account override:
+  /// accounts[*].calendar.autosync.
+  autosync: Boolean = true
+  /// Autosync interval in seconds (minimum 60, default 600).
+  autosync_interval: Int(this >= 60) = 600
+  /// What autosync may push to the remote calendar: "none" (default) keeps
+  /// autosync strictly download-only; "safe" additionally auto-applies
+  /// provably non-notifying local changes — creates and edits of events
+  /// without attendees. Remote deletes, conflicts, RSVPs and anything that
+  /// could make the provider send email always wait for the interactive
+  /// `durian calendar sync`. Per-account override:
+  /// accounts[*].calendar.autosync_upload.
+  autosync_upload: "none"|"safe" = "none"
+  /// Two-way sync conflict policy when an event changed on both sides:
+  /// "newer" (default) keeps the side modified last, "remote" keeps the
+  /// remote version, "local" keeps the local file. The losing local file is
+  /// always backed up to <file>.conflict-<timestamp> first. Per-account
+  /// override: accounts[*].calendar.conflict.
+  conflict: "remote"|"local"|"newer" = "newer"
+}
+
+class AccountCalendarConfig {
+  /// Subdirectory name under vdir_path (default: account alias, else lowercased name).
+  dir: String?
+  /// Calendar display names to export (empty = all calendars).
+  include: Listing<String> = new {}
+  /// Per-account override of the global calendar.conflict policy
+  /// ("remote"|"local"|"newer"; null = use the global setting).
+  conflict: ("remote"|"local"|"newer")?
+  /// Per-account override of the global calendar.autosync toggle
+  /// (null = use the global setting).
+  autosync: Boolean?
+  /// Per-account override of the global calendar.autosync_upload mode
+  /// (null = use the global setting).
+  autosync_upload: ("none"|"safe")?
+}
+
 // ── Account ────────────────────────────────────────────────
 
 class SMTPConfig {
@@ -83,12 +128,20 @@ class AccountConfig {
   imap: IMAPConfig
   auth: AuthConfig?
   oauth: OAuthConfig?
+  /// Vdir calendar sync settings (Microsoft and Google accounts).
+  calendar: AccountCalendarConfig?
   /// Sync implementation: "legacy" (default) uses the classic IMAP syncer;
   /// "engine" uses the provider-agnostic engine on the IMAP backend; "graph"
   /// uses the engine on the Microsoft Graph backend (Microsoft accounts only).
   /// Not for Gmail.
   sync_engine: "legacy"|"engine"|"graph" = "legacy"
 }
+
+// ── Defaults ───────────────────────────────────────────────
+
+/// Default calendar export settings. Use in config.pkl:
+///   calendar: C.CalendarConfig = (C.calendar) { vdir_path = "~/calendars" }
+calendar: CalendarConfig = new {}
 
 // ── Provider Templates ─────────────────────────────────────
 

@@ -58,6 +58,10 @@ func Microsoft(tenant string) *Provider {
 		GraphScopes: []string{
 			"https://graph.microsoft.com/Mail.ReadWrite",
 			"https://graph.microsoft.com/Mail.Send",
+			// Calendar read/write for the two-way vdir sync (same
+			// graph.microsoft.com resource as Mail, so it rides the same Graph
+			// token). ReadWrite supersedes Read.
+			"https://graph.microsoft.com/Calendars.ReadWrite",
 		},
 		SASlMethod:      "XOAUTH2",
 		DefaultClientID: "d1969673-bd8a-4bf6-ad8f-f541879730a8",
@@ -72,6 +76,10 @@ func Google() *Provider {
 		TokenEndpoint:     "https://oauth2.googleapis.com/token",
 		Scopes: []string{
 			"https://mail.google.com/",
+			// Calendar read/write for the two-way calendar sync. Adding this
+			// means existing Google accounts must re-run 'durian auth login'
+			// once to mint a refresh token that carries the new scope.
+			"https://www.googleapis.com/auth/calendar",
 		},
 		SASlMethod: "OAUTHBEARER",
 		// No default credentials — users must configure their own Google OAuth app.

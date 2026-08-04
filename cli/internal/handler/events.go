@@ -33,6 +33,18 @@ type OutboxUpdateEvent struct {
 	To      string `json:"to,omitempty"`
 }
 
+// CalendarUpdatedEvent is broadcast over SSE after a background calendar
+// autosync changed anything (events downloaded or pruned locally, or —
+// in safe upload mode — non-notifying local changes pushed upstream), so the
+// GUI can refresh its calendar views. It carries only the account identifier
+// and counts — never event content.
+type CalendarUpdatedEvent struct {
+	Account    string `json:"account"`
+	Downloaded int    `json:"downloaded"`
+	Pruned     int    `json:"pruned"`
+	Uploaded   int    `json:"uploaded"`
+}
+
 // EventHub is a fan-out broadcaster for SSE events.
 // It implements http.Handler and serves as the /api/v1/events endpoint.
 type EventHub struct {
@@ -105,6 +117,29 @@ func (h *EventHub) BroadcastOutbox(event OutboxUpdateEvent) {
 		case ch <- msg:
 		default:
 			slog.Warn("Dropped outbox event for slow subscriber", "module", "EVENTS")
+		}
+	}
+}
+
+// BroadcastCalendar serialises a CalendarUpdatedEvent and sends it to all SSE
+// clients as a "calendar_updated" event.
+func (h *EventHub) BroadcastCalendar(event CalendarUpdatedEvent) {
+	data, err := json.Marshal(event)
+	if err != nil {
+		slog.Error("Failed to marshal calendar event", "module", "EVENTS", "err", err)
+		return
+	}
+
+	msg := fmt.Appendf(nil, "event: calendar_updated\ndata: %s\n\n", data)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for ch := range h.subscribers {
+		select {
+		case ch <- msg:
+		default:
+			slog.Warn("Dropped calendar event for slow subscriber", "module", "EVENTS")
 		}
 	}
 }

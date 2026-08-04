@@ -1,0 +1,28 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "graphcalendar",
+    srcs = [
+        "graphcalendar.go",
+        "write.go",
+    ],
+    importpath = "github.com/julion2/durian/cli/internal/graphcalendar",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "//cli/internal/calendar",
+        "//cli/internal/calendarsync",
+        "//cli/internal/config",
+        "//cli/internal/oauth",
+    ],
+)
+
+go_test(
+    name = "graphcalendar_test",
+    size = "small",
+    srcs = [
+        "fetch_master_test.go",
+        "graphcalendar_test.go",
+        "write_test.go",
+    ],
+    embed = [":graphcalendar"],
+)

@@ -119,6 +119,26 @@ class KeymapsManager: ObservableObject {
             KeymapEntry(action: "close_detail", key: "h", context: "thread"),
             KeymapEntry(action: "close_detail", key: "Escape", context: "thread"),
             KeymapEntry(action: "reply", key: "r", context: "thread"),
+            // Calendar: open from the list, then navigate within the calendar
+            KeymapEntry(action: "go_calendar", key: "gc", sequence: true),
+            KeymapEntry(action: "next_email", key: "j", supportsCount: true, context: "calendar"),
+            KeymapEntry(action: "prev_email", key: "k", supportsCount: true, context: "calendar"),
+            KeymapEntry(action: "first_email", key: "gg", sequence: true, context: "calendar"),
+            KeymapEntry(action: "last_email", key: "G", context: "calendar"),
+            KeymapEntry(action: "calendar_prev_period", key: "[", context: "calendar"),
+            KeymapEntry(action: "calendar_next_period", key: "]", context: "calendar"),
+            KeymapEntry(action: "calendar_prev_period", key: "h", context: "calendar"),
+            KeymapEntry(action: "calendar_next_period", key: "l", context: "calendar"),
+            KeymapEntry(action: "calendar_today", key: "t", context: "calendar"),
+            KeymapEntry(action: "calendar_edit", key: "i", context: "calendar"),
+            KeymapEntry(action: "calendar_new", key: "n", context: "calendar"),
+            KeymapEntry(action: "calendar_new", key: "o", context: "calendar"),
+            KeymapEntry(action: "calendar_new", key: "O", context: "calendar"),
+            KeymapEntry(action: "calendar_delete", key: "dd", sequence: true, context: "calendar"),
+            KeymapEntry(action: "calendar_toggle_sidebar", key: "s", context: "calendar"),
+            KeymapEntry(action: "calendar_toggle_declined", key: "D", context: "calendar"),
+            KeymapEntry(action: "close_detail", key: "q", context: "calendar"),
+            KeymapEntry(action: "close_detail", key: "Escape", context: "calendar"),
         ]
     }
 

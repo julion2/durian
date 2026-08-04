@@ -12,8 +12,17 @@ TEST_CONFIG="$3"
 PORT=19723
 TMPDIR=$(mktemp -d /tmp/durian-inttest-XXXXXX)
 export HOME="${HOME:-$TMPDIR}"
+# Point the calendar vdir (config.DefaultDataDir → XDG_DATA_HOME/durian) at the
+# temp dir and seed one calendar with one event for the read-only calendar API.
+export XDG_DATA_HOME="$TMPDIR/data"
 EMAIL_DB="$TMPDIR/email.db"
 CONTACTS_DB="$TMPDIR/contacts.db"
+CAL_DIR="$XDG_DATA_HOME/durian/calendars/test/Work"
+mkdir -p "$CAL_DIR"
+printf 'Work\n' > "$CAL_DIR/displayname"
+printf 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//durian//test//EN\r\nBEGIN:VEVENT\r\nUID:int-evt-1\r\nSUMMARY:Integration Meeting\r\nDTSTART:20260801T120000Z\r\nDTEND:20260801T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n' > "$CAL_DIR/int-evt-1.ics"
+# A meeting the owner (test@example.com) was invited to, for the RSVP endpoint.
+printf 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//durian//test//EN\r\nBEGIN:VEVENT\r\nUID:int-evt-rsvp\r\nSUMMARY:Invited Meeting\r\nDTSTART:20260802T120000Z\r\nDTEND:20260802T130000Z\r\nORGANIZER;CN=Boss:mailto:boss@example.com\r\nATTENDEE;CN=Boss;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:boss@example.com\r\nATTENDEE;CN=Me;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION:mailto:test@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n' > "$CAL_DIR/int-evt-rsvp.ics"
 FAILURES=0
 PASSED=0
 
@@ -244,6 +253,66 @@ assert_jq "GET /local-drafts empty after delete" "$RESP" 'length == 0'
 # ─────────────────────────────────────────────
 RESP=$(curl -sf "${AUTH[@]}" "$BASE/outbox")
 assert_jq "GET /outbox is array" "$RESP" 'type == "array"'
+
+# ─────────────────────────────────────────────
+# 11. Calendar (read-only, from the seeded vdir)
+# ─────────────────────────────────────────────
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/calendars?account=test")
+assert_jq "GET /calendars .ok is true" "$RESP" '.ok == true'
+assert_jq "GET /calendars .calendars is array" "$RESP" '.calendars | type == "array"'
+assert_jq "GET /calendars includes seeded Work" "$RESP" '[.calendars[].name] | index("Work") != null'
+assert_jq "GET /calendars Work.event_count is number" "$RESP" '.calendars[] | select(.name=="Work") | .event_count | type == "number"'
+assert_http_code "GET /calendars without account → 400" "$BASE/calendars" "GET" "400"
+assert_http_code "GET /calendars unknown account → 404" "$BASE/calendars?account=nope" "GET" "404"
+
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/calendars/events?account=test&from=2026-08-01&to=2026-08-10")
+assert_jq "GET /calendars/events .ok is true" "$RESP" '.ok == true'
+assert_jq "GET /calendars/events .events is array" "$RESP" '.events | type == "array"'
+assert_jq "GET /calendars/events finds seeded event" "$RESP" '[.events[].uid] | index("int-evt-1") != null'
+assert_jq "GET /calendars/events event.start is string" "$RESP" '.events[0].start | type == "string"'
+
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/calendars/event?account=test&ref=int-evt-1")
+assert_jq "GET /calendars/event .ok is true" "$RESP" '.ok == true'
+assert_jq "GET /calendars/event .event.uid matches" "$RESP" '.event.uid == "int-evt-1"'
+assert_jq "GET /calendars/event .event.subject is string" "$RESP" '.event.subject | type == "string"'
+assert_http_code "GET /calendars/event unknown ref → 404" "$BASE/calendars/event?account=test&ref=nope" "GET" "404"
+
+# PUT (create) → GET → DELETE round-trip (local-first write)
+RESP=$(curl -s "${AUTH[@]}" -X PUT "$BASE/calendars/event" -H "Content-Type: application/json" \
+  -d '{"account":"test","calendar":"Work","subject":"API Created","start":"2026-08-01T09:00:00Z","end":"2026-08-01T10:00:00Z","location":"Room 1"}')
+assert_jq "PUT /calendars/event .ok is true" "$RESP" '.ok == true'
+assert_jq "PUT /calendars/event returns a uid" "$RESP" '.event.uid | type == "string"'
+NEW_UID=$(echo "$RESP" | jq -r '.event.uid')
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/calendars/event?account=test&ref=$NEW_UID")
+assert_jq "GET created event has subject" "$RESP" '.event.subject == "API Created"'
+assert_jq "GET created event has location" "$RESP" '.event.location == "Room 1"'
+assert_http_code "DELETE /calendars/event → 200" "$BASE/calendars/event?account=test&ref=$NEW_UID" "DELETE" "200"
+assert_http_code "GET after DELETE → 404" "$BASE/calendars/event?account=test&ref=$NEW_UID" "GET" "404"
+assert_http_code "PUT missing calendar → 400" "$BASE/calendars/event" "PUT" "400" '{"account":"test","subject":"x","start":"2026-08-01T09:00:00Z","end":"2026-08-01T10:00:00Z"}'
+
+# RSVP round-trip (local-first): the owner's PARTSTAT is rewritten in the .ics,
+# nothing is sent — the GUI-style Graph verb must be accepted.
+RESP=$(curl -s "${AUTH[@]}" -X POST "$BASE/calendars/rsvp" -H "Content-Type: application/json" \
+  -d '{"account":"test","ref":"int-evt-rsvp","response":"accepted"}')
+assert_jq "POST /calendars/rsvp .ok is true" "$RESP" '.ok == true'
+assert_jq "POST /calendars/rsvp .event.my_response accepted" "$RESP" '.event.my_response == "accepted"'
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/calendars/event?account=test&ref=int-evt-rsvp")
+assert_jq "GET after RSVP .event.my_response accepted" "$RESP" '.event.my_response == "accepted"'
+assert_http_code "POST /calendars/rsvp bad verb → 400" "$BASE/calendars/rsvp" "POST" "400" \
+  '{"account":"test","ref":"int-evt-rsvp","response":"maybe"}'
+assert_http_code "POST /calendars/rsvp not an attendee → 400" "$BASE/calendars/rsvp" "POST" "400" \
+  '{"account":"test","ref":"int-evt-1","response":"accepted"}'
+assert_http_code "POST /calendars/rsvp unknown ref → 404" "$BASE/calendars/rsvp" "POST" "404" \
+  '{"account":"test","ref":"nope","response":"accepted"}'
+
+# All-day snap: a sub-day all-day event is normalized to a full midnight-UTC day
+RESP=$(curl -s "${AUTH[@]}" -X PUT "$BASE/calendars/event" -H "Content-Type: application/json" \
+  -d '{"account":"test","calendar":"Work","subject":"API All Day","all_day":true,"start":"2026-08-02T09:00:00Z","end":"2026-08-02T10:00:00Z"}')
+assert_jq "PUT all-day .ok is true" "$RESP" '.ok == true'
+assert_jq "PUT all-day start snapped to midnight" "$RESP" '.event.start | startswith("2026-08-02T00:00:00")'
+assert_jq "PUT all-day end snapped to next day" "$RESP" '.event.end | startswith("2026-08-03T00:00:00")'
+ALLDAY_UID=$(echo "$RESP" | jq -r '.event.uid')
+assert_http_code "DELETE all-day event → 200" "$BASE/calendars/event?account=test&ref=$ALLDAY_UID" "DELETE" "200"
 
 # ─────────────────────────────────────────────
 # Summary
