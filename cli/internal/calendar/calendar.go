@@ -49,6 +49,45 @@ type Event struct {
 	// Recurrence is the series definition of a seriesMaster event; nil for
 	// non-recurring events.
 	Recurrence *Recurrence
+	// OpaqueRecurrence marks an event the remote calendar reports as recurring
+	// with a rule durian could not map into Recurrence — so Recurrence is nil
+	// even though a series exists.
+	//
+	// Without the distinction "no recurrence" and "a recurrence we failed to
+	// read" look identical, and the upload path clears the series: a PATCH
+	// carrying recurrence [] (Google) or null (Graph) turns a weekly meeting
+	// into a single appointment on the server, with a matching etag and no
+	// rail to stop it. The flag makes the write paths omit the recurrence
+	// field entirely instead, leaving the rule they cannot express untouched.
+	// It round-trips through the .ics as X-DURIAN-OPAQUE-RECURRENCE so a local
+	// edit of the file cannot lose it.
+	OpaqueRecurrence bool
+
+	// Series exceptions (RFC 5545). A recurring series is ONE item — one
+	// iCalUID, one .ics file, one ItemStatus — made of the master definition
+	// plus the occurrences that deviate from it. Deviations come in two
+	// shapes, and both must round-trip or the local calendar keeps showing
+	// occurrences the server no longer has:
+	//
+	//   - a cancelled occurrence: the series still repeats, but this one date
+	//     is gone (EXDATE),
+	//   - a modified occurrence: this one date moved, was renamed, or got its
+	//     own attendees (a separate VEVENT carrying RECURRENCE-ID).
+
+	// RecurrenceID identifies a modified occurrence ("override"): the ORIGINAL
+	// start of the occurrence it replaces, NOT its new start. It stays the
+	// identity of the override even after the occurrence is moved, which is
+	// why it — and not Start — keys the override set. Zero on masters and on
+	// non-recurring events.
+	RecurrenceID time.Time
+	// ExceptionDates are the original starts of cancelled occurrences, sorted
+	// ascending. Only meaningful on a series master.
+	ExceptionDates []time.Time
+	// Overrides are the modified occurrences of this series master, each
+	// carrying its own RecurrenceID, sorted by it. An override never carries
+	// Overrides or ExceptionDates of its own — the nesting is exactly one
+	// level deep. Only meaningful on a series master.
+	Overrides []Event
 
 	// Meeting metadata (Stage 2: read/write). Attendees and the owner's RSVP
 	// are parsed on both read paths (Graph and local iCal) and — role-gated
@@ -181,6 +220,15 @@ func CoreContentHash(e Event, ownerEmail string) string {
 // EventContentHash and CoreContentHash; withResponses controls whether an
 // attendee entry carries the response ("email|type|response") or not
 // ("email|type").
+//
+// The series exceptions are part of the digest: cancelling or moving a single
+// occurrence changes NOTHING about the master's own fields, so without them a
+// remote exception would never register as a change and the local calendar
+// would keep rendering an occurrence the server has already dropped. Exception
+// dates contribute their sorted RFC3339 instants; each override contributes
+// its RecurrenceID plus its own recursive content hash. The recursion
+// terminates because exceptionsDigest strips Overrides/ExceptionDates before
+// recursing — an override never carries exceptions of its own.
 func contentHash(e Event, ownerEmail string, withResponses bool) string {
 	attendees := make([]string, 0, len(e.Attendees))
 	for _, a := range e.Attendees {
@@ -214,11 +262,45 @@ func contentHash(e Event, ownerEmail string, withResponses bool) string {
 		strconv.FormatBool(e.IsOnlineMeeting),
 		e.OnlineMeetingURL,
 		strconv.FormatBool(e.IsCancelled),
+		exceptionsDigest(e, ownerEmail, withResponses),
 	} {
 		h.Write([]byte(field))
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// exceptionsDigest serializes the series exceptions of e deterministically:
+// the sorted EXDATE instants, then one "recurrenceID|hash" entry per override
+// sorted by RecurrenceID. Each override is hashed with the SAME owner and
+// response policy as the master, so an override's attendee list follows the
+// core/full distinction consistently. Overrides and exception dates are
+// cleared on the recursive call, which both bounds the recursion at one level
+// and keeps an override's digest independent of its position in the series.
+// Returns "" for an event without exceptions, so non-recurring events keep
+// their previous digest and no baseline is invalidated by this field alone.
+func exceptionsDigest(e Event, ownerEmail string, withResponses bool) string {
+	if len(e.ExceptionDates) == 0 && len(e.Overrides) == 0 {
+		return ""
+	}
+
+	exdates := make([]string, 0, len(e.ExceptionDates))
+	for _, d := range e.ExceptionDates {
+		exdates = append(exdates, d.UTC().Format(time.RFC3339))
+	}
+	sort.Strings(exdates)
+
+	overrides := make([]string, 0, len(e.Overrides))
+	for _, o := range e.Overrides {
+		bare := o
+		bare.Overrides = nil
+		bare.ExceptionDates = nil
+		overrides = append(overrides,
+			o.RecurrenceID.UTC().Format(time.RFC3339)+"|"+contentHash(bare, ownerEmail, withResponses))
+	}
+	sort.Strings(overrides)
+
+	return strings.Join(exdates, ",") + "\x1e" + strings.Join(overrides, ",")
 }
 
 // RecurrenceJSON canonicalizes a Recurrence as its fixed-field JSON encoding

@@ -22,7 +22,9 @@ go_test(
     srcs = [
         "fetch_master_test.go",
         "graphcalendar_test.go",
+        "series_exceptions_test.go",
         "write_test.go",
     ],
     embed = [":graphcalendar"],
+    deps = ["//cli/internal/calendar"],
 )

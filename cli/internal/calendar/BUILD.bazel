@@ -27,6 +27,7 @@ go_test(
         "ical_roundtrip_test.go",
         "read_local_test.go",
         "rsvp_test.go",
+        "series_exceptions_test.go",
     ],
     embed = [":calendar"],
 )

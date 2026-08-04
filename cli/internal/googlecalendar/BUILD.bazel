@@ -22,7 +22,9 @@ go_test(
     size = "small",
     srcs = [
         "googlecalendar_test.go",
+        "series_exceptions_test.go",
         "write_test.go",
     ],
     embed = [":googlecalendar"],
+    deps = ["//cli/internal/calendar"],
 )
