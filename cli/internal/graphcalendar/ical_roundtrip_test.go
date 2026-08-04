@@ -578,3 +578,57 @@ func TestEventToICalAttendeePartStatMapping(t *testing.T) {
 		}
 	}
 }
+
+// TestICalRoundTripCancelled pins STATUS:CANCELLED in BOTH directions. The
+// write side existed from the start; the read side did not, which made the
+// flag write-only: anything that parsed a cancelled event and re-serialized it
+// (the GUI write handler, the RSVP path) dropped the cancellation, and the
+// next sync read that as a local edit and patched the cancelled meeting.
+func TestICalRoundTripCancelled(t *testing.T) {
+	src := Event{
+		ICalUID:     "evt-cancelled",
+		Subject:     "Cancelled Sync",
+		Start:       time.Date(2026, 8, 6, 9, 0, 0, 0, time.UTC),
+		End:         time.Date(2026, 8, 6, 10, 0, 0, 0, time.UTC),
+		IsCancelled: true,
+	}
+	data, err := EventToICal(src)
+	if err != nil {
+		t.Fatalf("EventToICal: %v", err)
+	}
+	if !strings.Contains(string(data), "STATUS:CANCELLED") {
+		t.Fatalf("serialized event lacks STATUS:CANCELLED:\n%s", data)
+	}
+
+	got, err := ICalToEvent(data, "me@example.com")
+	if err != nil {
+		t.Fatalf("ICalToEvent: %v", err)
+	}
+	if !got.IsCancelled {
+		t.Error("IsCancelled lost on parse; the flag must survive a round trip")
+	}
+
+	// A re-serialization of the parsed event keeps the marker, so a local
+	// rewrite is byte-stable and does not register as a content change.
+	again, err := EventToICal(got)
+	if err != nil {
+		t.Fatalf("EventToICal (2nd): %v", err)
+	}
+	if !strings.Contains(string(again), "STATUS:CANCELLED") {
+		t.Error("re-serialized event dropped STATUS:CANCELLED")
+	}
+
+	// An uncancelled event must not pick the flag up.
+	src.IsCancelled = false
+	plain, err := EventToICal(src)
+	if err != nil {
+		t.Fatalf("EventToICal (plain): %v", err)
+	}
+	back, err := ICalToEvent(plain, "me@example.com")
+	if err != nil {
+		t.Fatalf("ICalToEvent (plain): %v", err)
+	}
+	if back.IsCancelled {
+		t.Error("IsCancelled set for an event without STATUS:CANCELLED")
+	}
+}

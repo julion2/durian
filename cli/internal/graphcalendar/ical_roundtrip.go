@@ -341,6 +341,17 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 		}
 	}
 
+	// STATUS:CANCELLED round-trips: EventToICal writes it for a cancelled
+	// meeting, so the parse has to read it back. Without this the flag is
+	// write-only — every editor that re-serializes a parsed event (the GUI
+	// write handler, the RSVP path) silently drops the cancellation, which
+	// registers as a local content change and makes the next sync patch the
+	// cancelled meeting back to life.
+	isCancelled := false
+	if prop := ev.Props.Get(ical.PropStatus); prop != nil {
+		isCancelled = strings.EqualFold(strings.TrimSpace(prop.Value), string(ical.EventCancelled))
+	}
+
 	return Event{
 		ICalUID:      uid,
 		Subject:      subject,
@@ -358,6 +369,7 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 		IsOnlineMeeting:      onlineMeetingURL != "",
 		OnlineMeetingURL:     onlineMeetingURL,
 		RequestOnlineMeeting: requestOnlineMeeting,
+		IsCancelled:          isCancelled,
 	}, nil
 }
 
