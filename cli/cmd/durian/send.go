@@ -12,9 +12,10 @@ import (
 
 	"github.com/emersion/go-imap"
 
-	"github.com/julion2/durian/cli/internal/auth"
 	"github.com/julion2/durian/cli/internal/config"
 	imapClient "github.com/julion2/durian/cli/internal/imap"
+	"github.com/julion2/durian/cli/internal/mailsend"
+	"github.com/julion2/durian/cli/internal/sender"
 	"github.com/julion2/durian/cli/internal/smtp"
 	"github.com/spf13/cobra"
 )
@@ -171,7 +172,8 @@ func runSend(cmd *cobra.Command, args []string) error {
 		from = fmt.Sprintf("%s <%s>", account.DisplayName, account.Email)
 	}
 
-	msg := &smtp.Message{
+	msg := &mailsend.Message{
+		MessageID:  mailsend.GenerateMessageID(from),
 		From:       from,
 		To:         recipients,
 		CC:         ccRecipients,
@@ -190,7 +192,11 @@ func runSend(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		msg.Attachments = append(msg.Attachments, *att)
+		msg.Attachments = append(msg.Attachments, mailsend.Attachment{
+			Filename: att.Filename,
+			MIMEType: att.MIMEType,
+			Data:     att.Data,
+		})
 		totalAttachmentSize += int64(len(att.Data))
 		fmt.Fprintf(os.Stderr, "Attaching: %s (%s, %s)\n", att.Filename, att.MIMEType, config.FormatSize(int64(len(att.Data))))
 	}
@@ -209,17 +215,14 @@ func runSend(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Get authentication
-	smtpAuth, err := auth.GetSMTPAuth(account)
+	// Resolve the account's transport (SMTP today; Graph/Gmail slot in later).
+	mailSender, err := sender.For(account)
 	if err != nil {
 		return err
 	}
 
-	// Send
-	fmt.Fprintf(os.Stderr, "Connecting to %s:%d...\n", account.SMTP.Host, account.SMTP.Port)
-
-	client := smtp.NewClient(account.SMTP.Host, account.SMTP.Port, smtpAuth)
-	if err := client.Send(msg); err != nil {
+	fmt.Fprintf(os.Stderr, "Sending as %s...\n", account.Email)
+	if err := mailSender.Send(cmd.Context(), msg); err != nil {
 		return fmt.Errorf("failed to send email: %w", err)
 	}
 
@@ -232,7 +235,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	messageData, err := msg.Build()
+	messageData, err := smtp.FromMessage(msg).Build()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to build message for Sent folder: %v\n", err)
 		return nil

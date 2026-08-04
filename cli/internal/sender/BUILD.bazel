@@ -1,0 +1,15 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "sender",
+    srcs = ["sender.go"],
+    importpath = "github.com/julion2/durian/cli/internal/sender",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "//cli/internal/auth",
+        "//cli/internal/config",
+        "//cli/internal/graphbackend",
+        "//cli/internal/mailsend",
+        "//cli/internal/smtp",
+    ],
+)
