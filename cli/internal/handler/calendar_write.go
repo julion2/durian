@@ -127,34 +127,43 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		ev.Attendees = append(ev.Attendees, calendar.Attendee{Email: email, Type: "required"})
 	}
 
-	// Update path: the UID already exists in the vdir. Merge over the existing
-	// event so fields the write schema does not carry are never dropped, and
+	// Update path: the UID already exists in the vdir. Start from the STORED
+	// event and overwrite only what the write schema actually carries, then
 	// write back to the event's existing file (its name may predate the
 	// UID-derived scheme).
+	//
+	// The direction matters. Copying a hand-written list of fields onto the
+	// request would silently drop every field added to Event afterwards — and
+	// dropping one here is not cosmetic: the rewritten .ics differs from the
+	// stored one, which the content hash reads as a local edit, so the next
+	// sync PATCHes the loss up to the server. Losing the series exceptions
+	// resurrects cancelled occurrences and undoes moved ones; losing
+	// OpaqueRecurrence collapses a series into a single appointment. Starting
+	// from `existing` makes preservation the default and enumerates only what
+	// the client may change.
 	if path, existing, calName, resolveErr := calendar.ResolveLocalEvent(dir, owner, req.UID, ""); resolveErr == nil && existing.ICalUID == req.UID {
 		if !strings.EqualFold(calName, req.Calendar) {
 			http.Error(w, "event belongs to a different calendar; moving events between calendars is not supported", http.StatusBadRequest)
 			return
 		}
-		ev.Organizer = existing.Organizer
-		ev.Recurrence = existing.Recurrence
-		ev.OwnerResponse = existing.OwnerResponse
-		ev.IsOnlineMeeting = existing.IsOnlineMeeting
-		ev.OnlineMeetingURL = existing.OnlineMeetingURL
-		// A meeting cancelled remotely stays cancelled. Dropping the flag
-		// would rewrite the file without STATUS:CANCELLED, which the content
-		// hash counts as a local edit — so the next sync would PATCH the
-		// cancelled event back to life against the provider.
-		ev.IsCancelled = existing.IsCancelled
-		// The online-meeting request is a create-time flag: an update never
-		// sets it, and a still-pending marker (created locally, not yet
-		// synced) survives an edit so the first sync still picks it up.
-		ev.RequestOnlineMeeting = existing.RequestOnlineMeeting
-		if len(ev.Attendees) == 0 {
+		merged := existing
+		merged.Subject = ev.Subject
+		merged.Start = ev.Start
+		merged.End = ev.End
+		merged.AllDay = ev.AllDay
+		merged.Location = ev.Location
+		merged.Description = ev.Description
+		if len(ev.Attendees) > 0 {
 			// The GUI edit form sends an empty list (attendee editing is
 			// create-only for now); an empty list can never strip a meeting.
-			ev.Attendees = existing.Attendees
+			merged.Attendees = ev.Attendees
 		}
+		// request_online_meeting is a create-time flag: an update never sets
+		// it, and a still-pending marker (created locally, not yet synced)
+		// survives an edit so the first sync still picks it up. It is carried
+		// by `existing` and deliberately not overwritten here.
+		ev = merged
+
 		data, serErr := calendar.EventToICal(ev)
 		if serErr != nil {
 			slog.Error("Failed to serialize updated local event", "module", "API", "err", logSafe(serErr.Error()))

@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,9 +51,12 @@ const (
 	// events for two-way sync): eventSelect plus the full body, the recurrence
 	// definition, the event type, the changeKey etag, and the meeting
 	// metadata (attendees, organizer, the user's RSVP state, online-meeting
-	// join info, cancellation flags).
+	// join info, cancellation flags), plus seriesMasterId/originalStart, which
+	// tie a modified occurrence back to the series it deviates from and to the
+	// date it replaces.
 	masterEventSelect = "id,iCalUId,subject,body,bodyPreview,start,end,isAllDay,location,recurrence,type,changeKey,lastModifiedDateTime," +
-		"attendees,organizer,responseStatus,isOnlineMeeting,onlineMeeting,onlineMeetingUrl,isCancelled,isOrganizer"
+		"attendees,organizer,responseStatus,isOnlineMeeting,onlineMeeting,onlineMeetingUrl,isCancelled,isOrganizer," +
+		"seriesMasterId,originalStart"
 
 	// preferUTC asks Graph to return event start/end dateTimes in UTC, so
 	// parsing never has to interpret Windows timezone names.
@@ -417,7 +421,14 @@ type graphEvent struct {
 	Type                 string               `json:"type"`
 	ChangeKey            string               `json:"changeKey"`
 	LastModifiedDateTime string               `json:"lastModifiedDateTime"`
-	Attendees            []struct {
+	// SeriesMasterID is the id of the series an occurrence or exception
+	// belongs to; empty on singleInstance and seriesMaster events.
+	SeriesMasterID string `json:"seriesMasterId"`
+	// OriginalStart is the start the occurrence was scheduled for before it
+	// was modified — the RECURRENCE-ID equivalent. Unlike start it does not
+	// move with the exception, which is what makes it the stable key.
+	OriginalStart string `json:"originalStart"`
+	Attendees     []struct {
 		Type         string              `json:"type"`
 		Status       graphResponseStatus `json:"status"`
 		EmailAddress graphEmailAddress   `json:"emailAddress"`
@@ -550,14 +561,41 @@ func (c *Client) FetchInstances(ctx context.Context, calendarID string, from, to
 
 // FetchMasterEvents returns all master events of the calendar via the Graph
 // /events endpoint: singleInstance events and seriesMaster events carrying
-// their Recurrence definition. Expanded "occurrence" and "exception" entries
-// are skipped — the two-way sync engine works on series definitions, not
-// instances. The Prefer header (UTC dateTimes, immutable ids) is sent on
+// their Recurrence definition, each series master carrying its modified
+// occurrences. The Prefer header (UTC dateTimes, immutable ids) is sent on
 // every page (including @odata.nextLink follow-ups).
+//
+// An "exception" entry is a single occurrence that was changed — moved,
+// renamed, given its own attendees. It is not a separate item to the sync
+// engine but a deviation of its series, so it is folded into the master it
+// names via seriesMasterId, keyed by originalStart. Exceptions are collected
+// across ALL pages first, because /events gives no ordering guarantee that a
+// master precedes its own exceptions.
+//
+// A plain "occurrence" entry stays skipped: it is the rule's own output,
+// already reproduced by the local expansion, and storing it would duplicate
+// every date of every series.
+//
+// KNOWN GAP — cancelled occurrences. Deleting one date of a Graph series
+// removes it from /events entirely rather than leaving a tombstone, so a
+// cancellation cannot be observed on this endpoint and the local calendar
+// keeps rendering that date. Graph exposes the cancelled dates as the series
+// master's cancelledOccurrences collection, but that property is only reliably
+// documented on beta, and requesting an unsupported property in $select fails
+// the whole query with a 400 — which would break every calendar, not just
+// recurring ones. Closing this needs the endpoint verified against the live
+// v1.0 API first. Google has no such gap: it returns cancelled instances as
+// records.
 func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]calendar.Event, error) {
 	headers := map[string]string{"Prefer": preferMaster}
 
 	var events []calendar.Event
+	// byID indexes into events by the Graph master id the exceptions name. It
+	// stores positions, not pointers, so appending cannot leave a stale
+	// reference behind.
+	byID := make(map[string]int)
+	var exceptions []graphEvent
+
 	pageURL := fmt.Sprintf("%s/me/calendars/%s/events?$select=%s&$top=100",
 		c.baseURL, url.PathEscape(calendarID), masterEventSelect)
 	for pageURL != "" {
@@ -566,21 +604,73 @@ func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]ca
 			return nil, fmt.Errorf("failed to fetch master events for %s: %w", calendarID, err)
 		}
 		for _, ge := range page.Value {
-			if ge.Type != "singleInstance" && ge.Type != "seriesMaster" {
+			switch ge.Type {
+			case "singleInstance", "seriesMaster":
+				if ev, ok := eventFromGraph(ge); ok {
+					byID[ge.ID] = len(events)
+					events = append(events, ev)
+				}
+			case "exception":
+				exceptions = append(exceptions, ge)
+			default: // "occurrence" and anything unknown
 				slog.Debug("Skipping non-master event", "module", "GRAPHCAL",
 					"id", ge.ID, "type", ge.Type)
-				continue
-			}
-			if ev, ok := eventFromGraph(ge); ok {
-				events = append(events, ev)
 			}
 		}
 		pageURL = page.NextLink
 	}
 
+	attachExceptions(events, byID, exceptions)
+
 	slog.Debug("Fetched master events", "module", "GRAPHCAL",
-		"calendar", calendarID, "events", len(events))
+		"calendar", calendarID, "events", len(events), "exceptions", len(exceptions))
 	return events, nil
+}
+
+// attachExceptions folds the collected exception events into their series
+// masters as Overrides, keyed by originalStart and sorted by it — so the .ics
+// bytes, and with them the local file hash the sync engine diffs on, do not
+// depend on the order Graph happened to page them in.
+//
+// An exception whose master is absent is dropped with a warning: its series
+// lives in a calendar the include filter excluded, or was deleted while this
+// fetch was paging. Promoting it to a master of its own would upload a series
+// collapsed to that single occurrence.
+func attachExceptions(events []calendar.Event, byID map[string]int, exceptions []graphEvent) {
+	touched := make(map[int]bool)
+	for _, ge := range exceptions {
+		idx, ok := byID[ge.SeriesMasterID]
+		if !ok {
+			slog.Warn("Dropping series exception without a master", "module", "GRAPHCAL",
+				"id", ge.ID, "master", ge.SeriesMasterID)
+			continue
+		}
+		original, err := parseGraphDateTime(ge.OriginalStart)
+		if err != nil {
+			slog.Warn("Dropping series exception without a usable original start",
+				"module", "GRAPHCAL", "id", ge.ID, "value", ge.OriginalStart, "err", err)
+			continue
+		}
+		ev, ok := eventFromGraph(ge)
+		if !ok {
+			continue
+		}
+		ev.RecurrenceID = original
+		// An override is a deviation, never a series of its own.
+		ev.Recurrence = nil
+		ev.ExceptionDates = nil
+
+		master := &events[idx]
+		master.Overrides = append(master.Overrides, ev)
+		touched[idx] = true
+	}
+
+	for idx := range touched {
+		master := &events[idx]
+		sort.Slice(master.Overrides, func(i, j int) bool {
+			return master.Overrides[i].RecurrenceID.Before(master.Overrides[j].RecurrenceID)
+		})
+	}
 }
 
 // GetEvent returns one event by its Graph event id, requesting the same field
@@ -621,11 +711,23 @@ func ParseEventJSON(data []byte) (calendar.Event, bool) {
 	return eventFromGraph(ge)
 }
 
-// parseGraphDateTime parses a Graph event dateTime like
-// "2026-07-23T10:00:00.0000000" as UTC (the preferUTC header guarantees UTC).
-// Go's time.Parse accepts the fractional seconds even though the layout does
-// not mention them.
+// parseGraphDateTime parses a Graph event timestamp as UTC. Graph uses two
+// shapes here and both reach this function:
+//
+//   - dateTimeTimeZone.dateTime (start/end) is a bare local time,
+//     "2026-07-23T10:00:00.0000000", whose zone lives in a sibling field —
+//     preferUTC pins that to UTC.
+//   - a plain DateTimeOffset (originalStart) carries its offset inline,
+//     "2026-08-17T09:00:00Z".
+//
+// Reading the second with the first's layout does not degrade, it fails
+// outright ("extra text: Z"), so the offset form is tried first. Go's
+// time.Parse accepts the fractional seconds of the bare form even though the
+// layout does not mention them.
 func parseGraphDateTime(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC(), nil
+	}
 	t, err := time.ParseInLocation("2006-01-02T15:04:05", s, time.UTC)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to parse graph dateTime %q: %w", s, err)

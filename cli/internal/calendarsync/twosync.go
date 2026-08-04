@@ -767,8 +767,72 @@ func coreContentEqual(local, remote Event) bool {
 		normalizeText(local.Description) != normalizeText(remote.Description) {
 		return false
 	}
+	if !seriesExceptionsEqual(local, remote) {
+		return false
+	}
 	return recurrenceJSON(local.Recurrence, "") ==
 		recurrenceJSON(lossyRecurrence(remote.Recurrence, remote.Start), "")
+}
+
+// seriesExceptionsEqual reports whether two events cancel and move the same
+// occurrences.
+//
+// Without this, an owner editing the series exceptions in the .ics — adding an
+// EXDATE, deleting an override VEVENT — reads as "nothing of substance
+// changed": the planner classifies it as an owner-RSVP-only edit, rebaselines
+// the local hash and never uploads it. The local file would then differ from
+// the server forever, with no path back, which is the opposite of what
+// round-tripping the exceptions is for.
+//
+// Overrides are compared by the identity that survives a move (RecurrenceID)
+// plus their own core content, so moving an occurrence to a new time counts as
+// a change while a re-serialization of the same override does not.
+func seriesExceptionsEqual(local, remote Event) bool {
+	if len(local.ExceptionDates) != len(remote.ExceptionDates) ||
+		len(local.Overrides) != len(remote.Overrides) {
+		return false
+	}
+
+	localDates := sortedUnix(local.ExceptionDates)
+	remoteDates := sortedUnix(remote.ExceptionDates)
+	for i := range localDates {
+		if localDates[i] != remoteDates[i] {
+			return false
+		}
+	}
+
+	localOverrides := sortedByRecurrenceID(local.Overrides)
+	remoteOverrides := sortedByRecurrenceID(remote.Overrides)
+	for i := range localOverrides {
+		if !localOverrides[i].RecurrenceID.Equal(remoteOverrides[i].RecurrenceID) ||
+			!coreContentEqual(localOverrides[i], remoteOverrides[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// sortedUnix returns the instants as sorted Unix seconds, the same resolution
+// the expansion matches exceptions at.
+func sortedUnix(ts []time.Time) []int64 {
+	out := make([]int64, len(ts))
+	for i, t := range ts {
+		out[i] = t.UTC().Unix()
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// sortedByRecurrenceID returns a copy of the overrides ordered by the
+// occurrence they replace, so the comparison does not depend on provider or
+// file ordering.
+func sortedByRecurrenceID(overrides []Event) []Event {
+	out := make([]Event, len(overrides))
+	copy(out, overrides)
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].RecurrenceID.Before(out[j].RecurrenceID)
+	})
+	return out
 }
 
 // lossyRecurrence passes a Graph recurrence through the RRULE round-trip
