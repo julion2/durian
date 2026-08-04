@@ -628,20 +628,85 @@ func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
 		// Gmail auto-saves a Sent copy, so Durian must not append its own.
 		ServerSideSent: true,
+		// history.list reports label changes (including UNREAD/STARRED), so a
+		// server-side flag change surfaces in the incremental stream — the engine
+		// reconciles flags from it (via FetchFlags) instead of polling every message.
+		FlagChangesInDelta: true,
 	}
 }
 
 func (b *Backend) Close() error { return nil }
 
-// MARK: - Not yet implemented (write path lands with engine routing)
+// MARK: - Flags
 
-func (b *Backend) ApplyFlags(_ context.Context, _ backend.RemoteRef, _, _ backend.Flags) error {
-	return errNotImplemented
+// ApplyFlags maps neutral flag changes to Gmail label modifications: Seen is the
+// absence of UNREAD, Flagged is STARRED. Gmail cannot represent Answered or the
+// $Completed keyword — and a local "replied" tag DOES yield Answered=true, so the
+// engine wiring MUST scope a Gmail account's three-way flag merge to the flags
+// Gmail supports (Seen, Flagged). Otherwise the baseline advances past a flag
+// Gmail never stores, and the next sync "downloads" it away, silently removing
+// the tag. Here we apply only what Gmail can represent.
+func (b *Backend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, remove backend.Flags) error {
+	var addLabels, removeLabels []string
+	if add.Seen {
+		removeLabels = append(removeLabels, labelUnread)
+	}
+	if remove.Seen {
+		addLabels = append(addLabels, labelUnread)
+	}
+	if add.Flagged {
+		addLabels = append(addLabels, labelStarred)
+	}
+	if remove.Flagged {
+		removeLabels = append(removeLabels, labelStarred)
+	}
+	if len(addLabels) == 0 && len(removeLabels) == 0 {
+		return nil
+	}
+
+	body := make(map[string][]string, 2)
+	if len(addLabels) > 0 {
+		body["addLabelIds"] = addLabels
+	}
+	if len(removeLabels) > 0 {
+		body["removeLabelIds"] = removeLabels
+	}
+	if err := b.doJSON(ctx, http.MethodPost,
+		b.baseURL+"/users/me/messages/"+url.PathEscape(ref.ID)+"/modify", body, nil); err != nil {
+		return fmt.Errorf("modify labels for %s: %w", ref.ID, err)
+	}
+	slog.Debug("Applied flags", "module", "GMAILBACKEND", "id", ref.ID, "add", addLabels, "remove", removeLabels) // encgrep:allow logs Gmail reserved label names (UNREAD/STARRED), not message content
+	return nil
 }
 
-func (b *Backend) FetchFlags(_ context.Context, _ string, _ []backend.RemoteRef) (map[string]backend.Flags, error) {
-	return nil, errNotImplemented
+// FetchFlags returns current flag state per message from its labels. Gmail has
+// no batch get, but FetchFlags is only called for the delta-scoped candidate set
+// (FlagChangesInDelta), so per-message minimal gets are cheap. A message that
+// cannot be resolved is simply absent from the map.
+func (b *Backend) FetchFlags(ctx context.Context, _ string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
+	out := make(map[string]backend.Flags, len(refs))
+	for _, ref := range refs {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		var gm struct {
+			LabelIDs []string `json:"labelIds"`
+		}
+		if err := b.doJSON(ctx, http.MethodGet,
+			b.baseURL+"/users/me/messages/"+url.PathEscape(ref.ID)+"?format=minimal", nil, &gm); err != nil {
+			if isNotFound(err) {
+				continue // message gone; leaving it out of the map is correct
+			}
+			// A systemic error (auth/quota/5xx) must fail the pass, not silently
+			// report an incomplete flag set as success.
+			return nil, fmt.Errorf("fetch labels for %s: %w", ref.ID, err)
+		}
+		out[ref.ID] = flagsFromLabels(gm.LabelIDs)
+	}
+	return out, nil
 }
+
+// MARK: - Not yet implemented (move/append/send/watch land with engine routing)
 
 func (b *Backend) Move(_ context.Context, _ backend.RemoteRef, _ string) (backend.RemoteRef, error) {
 	return backend.RemoteRef{}, errNotImplemented

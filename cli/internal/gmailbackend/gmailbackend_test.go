@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
 )
 
@@ -270,12 +271,79 @@ func TestFlagsAndTagLabels(t *testing.T) {
 	}
 }
 
+func TestApplyFlags(t *testing.T) {
+	var body map[string][]string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/users/me/messages/m1/modify", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("modify method = %s, want POST", r.Method)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	// Mark seen and flagged: Seen -> remove UNREAD, Flagged -> add STARRED.
+	if err := b.ApplyFlags(context.Background(), backend.RemoteRef{ID: "m1"},
+		backend.Flags{Seen: true, Flagged: true}, backend.Flags{}); err != nil {
+		t.Fatalf("ApplyFlags: %v", err)
+	}
+	if len(body["removeLabelIds"]) != 1 || body["removeLabelIds"][0] != "UNREAD" {
+		t.Errorf("removeLabelIds = %v, want [UNREAD]", body["removeLabelIds"])
+	}
+	if len(body["addLabelIds"]) != 1 || body["addLabelIds"][0] != "STARRED" {
+		t.Errorf("addLabelIds = %v, want [STARRED]", body["addLabelIds"])
+	}
+}
+
+func TestFetchFlags(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/users/me/messages/m1", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("format"); got != "minimal" {
+			t.Errorf("format = %q, want minimal", got)
+		}
+		writeJSON(t, w, map[string]any{"labelIds": []string{"INBOX", "UNREAD"}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	flags, err := b.FetchFlags(context.Background(), allMailStream, []backend.RemoteRef{{Folder: allMailStream, ID: "m1"}})
+	if err != nil {
+		t.Fatalf("FetchFlags: %v", err)
+	}
+	if f, ok := flags["m1"]; !ok || f.Seen {
+		t.Errorf("flags[m1] = %+v (ok=%v), want present with Seen=false (UNREAD)", f, ok)
+	}
+}
+
+func TestFetchFlagsFailsOnSystemicError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/users/me/messages/m1", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"code":403,"message":"insufficient permissions"}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	// A systemic 403 (not a 404) must fail the pass rather than silently
+	// reporting an incomplete flag set as success.
+	if _, err := b.FetchFlags(context.Background(), allMailStream, []backend.RemoteRef{{ID: "m1"}}); err == nil {
+		t.Error("systemic error must fail FetchFlags, not be skipped")
+	}
+}
+
 func TestWriteMethodsNotImplemented(t *testing.T) {
 	b := newTestBackend(t, httptest.NewServer(http.NewServeMux()))
 	if err := b.Send(context.Background(), nil); err == nil {
 		t.Error("Send should report not-implemented")
 	}
-	if _, err := b.FetchFlags(context.Background(), "ALL", nil); err == nil {
-		t.Error("FetchFlags should report not-implemented")
+	if _, err := b.Move(context.Background(), backend.RemoteRef{ID: "m1"}, "Archive"); err == nil {
+		t.Error("Move should report not-implemented")
 	}
 }
