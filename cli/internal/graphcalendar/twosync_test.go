@@ -746,6 +746,106 @@ func TestSyncDeleteRemote404IsSuccess(t *testing.T) {
 	}
 }
 
+// TestSyncUnparseableLocalFileIsNotADeletion pins the rule that a corrupt
+// .ics must never be read as "the user deleted this event". Without the guard
+// the file is invisible to the scan, the item looks locally deleted, and the
+// sync cancels the remote meeting — mailing every attendee.
+func TestSyncUnparseableLocalFileIsNotADeletion(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{masterEvent("g1", "uid-1", "Standup", "ck1")}
+	h.sync(SyncOptions{})
+
+	// Corrupt the tracked file in place, as an unsupported TZID or a truncated
+	// write would.
+	if err := os.WriteFile(h.icsPath("uid-1"), []byte("BEGIN:VCALENDAR\nnot an ical"), 0o600); err != nil {
+		t.Fatalf("corrupt local ics: %v", err)
+	}
+
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{}) {
+		t.Fatalf("stats = %+v, want no actions at all", stats)
+	}
+	if len(h.deletedIDs) != 0 {
+		t.Errorf("deletedIDs = %v, want none: an unreadable file is not a deletion", h.deletedIDs)
+	}
+	if h.mutations != 0 {
+		t.Errorf("mutations = %d, want 0 remote writes", h.mutations)
+	}
+	if _, ok := h.status.Items["uid-1"]; !ok {
+		t.Error("status entry dropped: the item must stay tracked so a repaired file re-plans normally")
+	}
+}
+
+// TestSyncUnparseableFileDoesNotBlockOtherEvents keeps the guard narrow: one
+// bad file suppresses deletions, not the whole calendar.
+func TestSyncUnparseableFileDoesNotBlockOtherEvents(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{masterEvent("g1", "uid-1", "Standup", "ck1")}
+	h.sync(SyncOptions{})
+
+	if err := os.WriteFile(h.icsPath("uid-1"), []byte("garbage"), 0o600); err != nil {
+		t.Fatalf("corrupt local ics: %v", err)
+	}
+	h.events = append(h.events, masterEvent("g2", "uid-2", "Retro", "ck2"))
+
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{Downloaded: 1}) {
+		t.Fatalf("stats = %+v, want the new remote event downloaded", stats)
+	}
+	if _, err := os.Stat(h.icsPath("uid-2")); err != nil {
+		t.Errorf("uid-2 not written: %v", err)
+	}
+}
+
+// TestSyncFirstSightBacksUpLocalFile covers the untracked pair whose sides
+// differ: remote wins, but the local file may hold edits made before the first
+// sync ever ran, so it must survive as a backup.
+func TestSyncFirstSightBacksUpLocalFile(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{masterEvent("g1", "uid-1", "Standup", "ck1")}
+	path := h.writeLocal("uid-1", "Standup (my local notes)")
+	local, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read local ics: %v", err)
+	}
+
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{Downloaded: 1}) {
+		t.Fatalf("stats = %+v, want Downloaded=1", stats)
+	}
+
+	backups := h.conflictBackups(path)
+	if len(backups) != 1 {
+		t.Fatalf("backups = %v, want exactly one .conflict-* backup", backups)
+	}
+	saved, err := os.ReadFile(backups[0])
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(saved) != string(local) {
+		t.Error("backup does not hold the original local bytes")
+	}
+	if h.mutations != 0 {
+		t.Errorf("mutations = %d, want 0: first sight never writes to the remote", h.mutations)
+	}
+}
+
+// TestSyncFirstSightIdenticalKeepsNoBackup guards the other side: an adopted
+// pair is not a data-loss risk and must not litter the vdir with backups.
+func TestSyncFirstSightIdenticalKeepsNoBackup(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{masterEvent("g1", "uid-1", "Standup", "ck1")}
+	h.sync(SyncOptions{})
+
+	// A second sync over the now-identical pair, with tracking forgotten.
+	h.status = CalendarStatus{Items: map[string]ItemStatus{}}
+	h.sync(SyncOptions{})
+
+	if backups := h.conflictBackups(h.icsPath("uid-1")); len(backups) != 0 {
+		t.Errorf("backups = %v, want none for an adopted pair", backups)
+	}
+}
+
 // MARK: - Conflicts
 
 func TestSyncConflictRemotePolicy(t *testing.T) {
@@ -920,7 +1020,7 @@ func TestScanLocalItemsSkipsBadFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	items, err := scanLocalItems(h.calDir, testOwnerEmail)
+	items, _, err := scanLocalItems(h.calDir, testOwnerEmail)
 	if err != nil {
 		t.Fatalf("scanLocalItems: %v", err)
 	}

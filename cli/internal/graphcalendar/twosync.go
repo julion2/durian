@@ -23,7 +23,8 @@
 //	not tracked, remote only            -> DownloadNew
 //	not tracked, local only             -> UploadCreate
 //	not tracked, both present, equal    -> Adopt (record status, no write)
-//	not tracked, both present, differ   -> DownloadUpdate (remote wins on first sight)
+//	not tracked, both present, differ   -> DownloadUpdate (remote wins on first
+//	  sight; the local file is backed up first)
 //	tracked, only remote changed        -> DownloadUpdate
 //	tracked, only local changed         -> UploadUpdate
 //	tracked, both changed               -> Conflict
@@ -60,7 +61,17 @@
 // first-sync convergence choice: when an untracked UID exists on both sides
 // with differing content there is no baseline to diff against, so the local
 // file is overwritten with the remote rendering and the pair is tracked from
-// there.
+// there. Because that local file may hold edits made before the first sync
+// ever ran, it is moved to <file>.conflict-<unixts> first — first sight loses
+// no local data, it only stops preferring it.
+//
+// Unreadable local files: a tracked .ics that fails to parse is missing from
+// the local scan, which is byte-for-byte the same signal as the user deleting
+// it — and "locally deleted" routes to a remote delete, which cancels an
+// owned meeting and mails every attendee. So while ANY file in a calendar dir
+// is unreadable, no item in that calendar is classified as locally deleted;
+// those UIDs are skipped and re-planned once the file parses again. Every
+// other action (downloads, uploads, RSVPs) keeps working.
 //
 // Scheduling safety rails (a bug here emails real people):
 //
@@ -202,6 +213,13 @@ type Action struct {
 	// RsvpCall is set (otherwise the action just rebaselines the status).
 	Rsvp     OwnerResp
 	RsvpCall bool
+
+	// BackupLocal asks Apply to move the existing local file aside to
+	// <file>.conflict-<ts> before writing the remote version over it. Set for
+	// the first-sight overwrite, where the local file may hold edits that were
+	// never uploaded and that no baseline can reconstruct — the same guarantee
+	// applyConflict gives on remote-wins.
+	BackupLocal bool
 
 	// Summary is a short human-readable description ("subject" date) for the
 	// command's plan listing.
@@ -366,9 +384,13 @@ func Plan(ctx context.Context, c *Client, cal Calendar, calDir string, status Ca
 		remote[ev.ICalUID] = ev
 	}
 
-	local, err := scanLocalItems(calDir, c.owner)
+	local, unreadable, err := scanLocalItems(calDir, c.owner)
 	if err != nil {
 		return plan, err
+	}
+	if len(unreadable) > 0 {
+		slog.Warn("Local calendar dir has unreadable .ics files, suppressing local-deletion actions",
+			"module", "GRAPHCAL", "calendar", cal.Name, "files", len(unreadable), "paths", unreadable)
 	}
 
 	for _, uid := range unionUIDs(remote, local, status.Items) {
@@ -380,6 +402,19 @@ func Plan(ctx context.Context, c *Client, cal Calendar, calDir string, status Ca
 		localChanged := localHas && (!tracked || st.LocalHash != li.hash)
 		remoteDeleted := tracked && !remoteHas
 		localDeleted := tracked && !localHas
+
+		// A tracked file that failed to parse is missing from `local`, which
+		// is indistinguishable from the user deleting it — and a local
+		// deletion routes to ActionDeleteRemote, which for an owned meeting
+		// cancels it and mails every attendee. A corrupt (or merely
+		// unsupported) .ics must never do that, so while any file in this
+		// directory is unreadable, no item is classified as locally deleted:
+		// it is skipped entirely and re-planned once the file parses again.
+		if localDeleted && len(unreadable) > 0 {
+			slog.Warn("Not treating a missing local event as deleted: unreadable files present",
+				"module", "GRAPHCAL", "calendar", cal.Name, "uid", uid)
+			continue
+		}
 
 		a := Action{UID: uid, GraphID: st.GraphID, Prior: st, Tracked: tracked}
 		if remoteHas {
@@ -421,7 +456,11 @@ func Plan(ctx context.Context, c *Client, cal Calendar, calDir string, status Ca
 			if hashBytes(data) == li.hash {
 				a.Kind = ActionAdopt
 			} else {
+				// The sides differ and there is no baseline to tell which one
+				// moved, so the local file may carry never-uploaded edits.
+				// Remote wins, but the local version is kept as a backup.
 				a.Kind = ActionDownloadUpdate
+				a.BackupLocal = true
 			}
 
 		case remoteHas && localHas:
@@ -723,6 +762,13 @@ func Apply(ctx context.Context, c *Client, plan CalendarPlan, status *CalendarSt
 		case ActionDownloadNew, ActionDownloadUpdate:
 			slog.Info("Downloading remote event", "module", "GRAPHCAL",
 				"calendar", plan.Calendar.Name, "uid", a.UID, "kind", a.Kind)
+			if a.BackupLocal && a.LocalExists {
+				if _, err = backupLocalFile(a.LocalPath); err != nil {
+					break
+				}
+				slog.Warn("First sight: remote wins, local file backed up", "module", "GRAPHCAL",
+					"calendar", plan.Calendar.Name, "uid", a.UID)
+			}
 			if err = writeRemoteEvent(plan.Dir, a.LocalPath, a.UID, a.Remote, status, c.owner); err == nil {
 				stats.Downloaded++
 			}
@@ -1094,9 +1140,9 @@ func applyConflict(ctx context.Context, c *Client, plan CalendarPlan, a Action, 
 
 	// Remote wins.
 	if a.LocalExists {
-		backupPath := fmt.Sprintf("%s.conflict-%d", a.LocalPath, time.Now().Unix())
-		if err := os.Rename(a.LocalPath, backupPath); err != nil {
-			return false, fmt.Errorf("failed to back up conflicting file %s: %w", a.LocalPath, err)
+		backupPath, err := backupLocalFile(a.LocalPath)
+		if err != nil {
+			return false, err
 		}
 		slog.Warn("Conflict: remote wins, local file backed up", "module", "GRAPHCAL",
 			"calendar", plan.Calendar.Name, "uid", a.UID, "backup", backupPath)
@@ -1132,6 +1178,18 @@ func writeCalendarMeta(calDir string, cal Calendar) error {
 	return nil
 }
 
+// backupLocalFile moves path aside to <path>.conflict-<unixts> and returns the
+// backup path. Local data the sync is about to overwrite is never discarded
+// outright: the backup does not end in .ics, so the next scan ignores it and
+// the user can diff or restore it by hand.
+func backupLocalFile(path string) (string, error) {
+	backupPath := fmt.Sprintf("%s.conflict-%d", path, time.Now().Unix())
+	if err := os.Rename(path, backupPath); err != nil {
+		return "", fmt.Errorf("failed to back up local file %s: %w", path, err)
+	}
+	return backupPath, nil
+}
+
 // scanLocalItems enumerates the *.ics files of calDir keyed by their parsed
 // iCalendar UID, with the SHA-256 of the raw file bytes as identity (plus the
 // parsed event and file mtime for uploads and conflict resolution). A missing
@@ -1141,13 +1199,19 @@ func writeCalendarMeta(calDir string, cal Calendar) error {
 // Conflict backups (<file>.conflict-<ts>) do not end in .ics and are ignored.
 // owner is the account email, threaded into ICalToEvent so the owner's RSVP
 // is recognized in the parsed events.
-func scanLocalItems(calDir, owner string) (map[string]localItem, error) {
+//
+// The second return value lists the files that were skipped because they
+// could not be parsed into an identifiable event. They are indistinguishable
+// from deletions in the map alone, and "deleted" is a destructive
+// classification, so Plan needs to know they exist — see the localDeleted
+// guard there.
+func scanLocalItems(calDir, owner string) (map[string]localItem, []string, error) {
 	entries, err := os.ReadDir(calDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return map[string]localItem{}, nil
+			return map[string]localItem{}, nil, nil
 		}
-		return nil, fmt.Errorf("failed to read calendar dir %s: %w", calDir, err)
+		return nil, nil, fmt.Errorf("failed to read calendar dir %s: %w", calDir, err)
 	}
 
 	// Collect .ics entries in directory order; dedup happens after parsing so
@@ -1174,6 +1238,9 @@ func scanLocalItems(calDir, owner string) (map[string]localItem, error) {
 		item    localItem
 		ok      bool
 		readErr error
+		// unreadable is the path of a file that exists but yielded no usable
+		// event (parse failure, or no UID to key it by).
+		unreadable string
 	}
 	results := make([]parseResult, len(jobs))
 	workers := runtime.NumCPU()
@@ -1201,10 +1268,12 @@ func scanLocalItems(calDir, owner string) (map[string]localItem, error) {
 					if err != nil {
 						slog.Warn("Skipping unparseable local .ics", "module", "GRAPHCAL",
 							"path", jobs[i].path, "err", err)
+						results[i] = parseResult{unreadable: jobs[i].path}
 						continue
 					}
 					if ev.ICalUID == "" {
 						slog.Warn("Skipping local .ics without UID", "module", "GRAPHCAL", "path", jobs[i].path)
+						results[i] = parseResult{unreadable: jobs[i].path}
 						continue
 					}
 					results[i] = parseResult{item: localItem{path: jobs[i].path, hash: hashBytes(data), event: ev, mtime: jobs[i].mtime}, ok: true}
@@ -1215,10 +1284,14 @@ func scanLocalItems(calDir, owner string) (map[string]localItem, error) {
 	}
 
 	items := make(map[string]localItem)
+	var unreadable []string
 	for i := range results {
 		switch {
 		case results[i].readErr != nil:
-			return nil, results[i].readErr
+			return nil, nil, results[i].readErr
+		case results[i].unreadable != "":
+			unreadable = append(unreadable, results[i].unreadable)
+			continue
 		case !results[i].ok:
 			continue
 		}
@@ -1230,7 +1303,7 @@ func scanLocalItems(calDir, owner string) (map[string]localItem, error) {
 		}
 		items[it.event.ICalUID] = it
 	}
-	return items, nil
+	return items, unreadable, nil
 }
 
 // unionUIDs returns the sorted union of the UIDs of all three maps, so the

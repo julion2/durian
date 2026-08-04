@@ -52,7 +52,7 @@ func ReadCalendars(accountDir, owner string) ([]LocalCalendar, error) {
 			continue
 		}
 		calDir := filepath.Join(accountDir, entry.Name())
-		items, err := scanLocalItems(calDir, owner)
+		items, _, err := scanLocalItems(calDir, owner)
 		if err != nil {
 			return nil, err
 		}
@@ -197,7 +197,7 @@ func ResolveLocalEvent(accountDir, owner, ref, calFilter string) (path string, e
 		if calFilter != "" && !strings.EqualFold(calName, calFilter) {
 			continue
 		}
-		items, err := scanLocalItems(calDir, owner)
+		items, _, err := scanLocalItems(calDir, owner)
 		if err != nil {
 			return "", Event{}, "", err
 		}
