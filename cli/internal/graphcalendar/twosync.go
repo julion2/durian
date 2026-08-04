@@ -877,8 +877,8 @@ func writeRemoteEvent(calDir, path, uid string, ev Event, status *CalendarStatus
 	if err != nil {
 		return fmt.Errorf("failed to serialize remote event %s: %w", uid, err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return fmt.Errorf("failed to write %s: %w", path, err)
+	if err := WriteFileAtomic(path, data, 0o600); err != nil {
+		return err
 	}
 	status.Items[uid] = ItemStatus{
 		GraphID:       ev.ID,
@@ -1167,11 +1167,11 @@ func writeCalendarMeta(calDir string, cal Calendar) error {
 	if err := os.MkdirAll(calDir, 0o700); err != nil {
 		return fmt.Errorf("failed to create calendar dir %s: %w", calDir, err)
 	}
-	if err := os.WriteFile(filepath.Join(calDir, "displayname"), []byte(cal.Name+"\n"), 0o600); err != nil {
+	if err := WriteFileAtomic(filepath.Join(calDir, "displayname"), []byte(cal.Name+"\n"), 0o600); err != nil {
 		return fmt.Errorf("failed to write displayname for %s: %w", cal.Name, err)
 	}
 	if cal.HexColor != "" {
-		if err := os.WriteFile(filepath.Join(calDir, "color"), []byte(cal.HexColor+"\n"), 0o600); err != nil {
+		if err := WriteFileAtomic(filepath.Join(calDir, "color"), []byte(cal.HexColor+"\n"), 0o600); err != nil {
 			return fmt.Errorf("failed to write color for %s: %w", cal.Name, err)
 		}
 	}

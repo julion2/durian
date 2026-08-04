@@ -50,11 +50,11 @@ func Export(ctx context.Context, c *Client, outDir string, from, to time.Time, i
 		if err := os.MkdirAll(calDir, 0o700); err != nil {
 			return stats, fmt.Errorf("failed to create calendar dir %s: %w", calDir, err)
 		}
-		if err := os.WriteFile(filepath.Join(calDir, "displayname"), []byte(cal.Name+"\n"), 0o600); err != nil {
+		if err := WriteFileAtomic(filepath.Join(calDir, "displayname"), []byte(cal.Name+"\n"), 0o600); err != nil {
 			return stats, fmt.Errorf("failed to write displayname for %s: %w", cal.Name, err)
 		}
 		if cal.HexColor != "" {
-			if err := os.WriteFile(filepath.Join(calDir, "color"), []byte(cal.HexColor+"\n"), 0o600); err != nil {
+			if err := WriteFileAtomic(filepath.Join(calDir, "color"), []byte(cal.HexColor+"\n"), 0o600); err != nil {
 				return stats, fmt.Errorf("failed to write color for %s: %w", cal.Name, err)
 			}
 		}
@@ -67,7 +67,7 @@ func Export(ctx context.Context, c *Client, outDir string, from, to time.Time, i
 			// The per-occurrence Graph event id (not the iCalUID, which is
 			// shared across a recurring series) keeps filenames unique.
 			path := filepath.Join(calDir, sanitizeName(e.ID)+".ics")
-			if err := os.WriteFile(path, []byte(EventToICS(e, prodID)), 0o600); err != nil {
+			if err := WriteFileAtomic(path, []byte(EventToICS(e, prodID)), 0o600); err != nil {
 				return stats, fmt.Errorf("failed to write %s: %w", path, err)
 			}
 			stats.Events++
@@ -96,6 +96,46 @@ func calendarIncluded(name string, include []string) bool {
 		}
 	}
 	return false
+}
+
+// WriteFileAtomic writes data to path via a temporary sibling and a rename,
+// so a reader never observes a half-written file.
+//
+// The vdir is a shared surface: the GUI reads it through the HTTP API, the
+// sync engine rewrites it in the background, and khal or vdirsyncer may walk
+// it at any moment. A plain os.WriteFile truncates first and fills after, so
+// every write opens a window in which a concurrent reader parses a truncated
+// .ics — which the planner cannot distinguish from a corrupt file. rename(2)
+// is atomic within a directory, so the file is either the old content or the
+// new one.
+//
+// The temp file is created in the same directory (a rename across filesystems
+// would fail) and carries the ".ics-tmp" suffix rather than ".ics", so the
+// local scan ignores it even if a crash leaves one behind.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.ics-tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeded
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to write %s: %w", tmpName, err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to chmod %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close %s: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("failed to rename %s to %s: %w", tmpName, path, err)
+	}
+	return nil
 }
 
 // sanitizeName makes a calendar name or event id safe as a single filesystem

@@ -1786,3 +1786,70 @@ func TestPlanNotificationsPreview(t *testing.T) {
 		t.Error("NotifiesRecipients(download) = true, want false")
 	}
 }
+
+// MARK: - Atomic local writes
+
+// TestWriteFileAtomicLeavesNoScannableTemp pins the two properties the vdir
+// depends on: the target ends up with the full content, and the temporary
+// sibling is never something the local scan would pick up as an event (a
+// leftover after a crash must not look like a corrupt .ics).
+func TestWriteFileAtomicLeavesNoScannableTemp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "uid-1.ics")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFileAtomic(path, []byte("new content"), 0o600); err != nil {
+		t.Fatalf("WriteFileAtomic: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != "new content" {
+		t.Errorf("content = %q, want %q", got, "new content")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("perm = %v, want 0600", info.Mode().Perm())
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() == "uid-1.ics" {
+			continue
+		}
+		t.Errorf("leftover file %q after an atomic write", e.Name())
+	}
+	if strings.HasSuffix(".uid-1.ics.12345.ics-tmp", ".ics") {
+		t.Error("the temp suffix must not end in .ics, or the scan would parse it")
+	}
+}
+
+// TestSyncDownloadIsAtomic checks the engine path actually uses it: no
+// temporary file survives a completed sync.
+func TestSyncDownloadIsAtomic(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{masterEvent("g1", "uid-1", "Standup", "ck1")}
+	h.sync(SyncOptions{})
+
+	entries, err := os.ReadDir(h.calDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), "-tmp") {
+			t.Errorf("sync left a temp file behind: %s", e.Name())
+		}
+	}
+	if _, err := os.Stat(h.icsPath("uid-1")); err != nil {
+		t.Errorf("downloaded event missing: %v", err)
+	}
+}

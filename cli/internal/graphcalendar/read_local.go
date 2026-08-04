@@ -337,8 +337,8 @@ func WriteLocalEvent(accountDir, calendarName string, e Event) (string, error) {
 		return "", fmt.Errorf("failed to serialize new event: %w", err)
 	}
 	path := filepath.Join(dir, sanitizeName(e.ICalUID)+".ics")
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return "", fmt.Errorf("failed to write %s: %w", path, err)
+	if err := WriteFileAtomic(path, data, 0o600); err != nil {
+		return "", err
 	}
 	return path, nil
 }
