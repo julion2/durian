@@ -117,24 +117,31 @@ func (f *FileStateStore) path() string {
 	return filepath.Join(f.dir, ".durian-calsync-state.json")
 }
 
-// acquireLock takes an exclusive flock on <path>.lock, retrying with backoff
-// for up to 5 seconds (same pattern as syncengine.FileCursorStore) so two
-// concurrent syncs cannot interleave read-modify-write cycles.
+// acquireLock takes an exclusive flock guarding the state file.
 func (f *FileStateStore) acquireLock() (*os.File, error) {
-	if err := os.MkdirAll(f.dir, 0o700); err != nil {
+	return acquireFileLock(f.dir, f.path())
+}
+
+// acquireFileLock takes an exclusive flock on <path>.lock, retrying with
+// backoff for up to 5 seconds (same pattern as syncengine.FileCursorStore) so
+// two concurrent syncs cannot interleave read-modify-write cycles. dir is
+// created if missing. Shared by the state and mirror stores, which sit side by
+// side in the vdir and are locked independently.
+func acquireFileLock(dir, path string) (*os.File, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create vdir dir: %w", err)
 	}
 
-	lockFile, err := os.OpenFile(f.path()+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	lockFile, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open calendar state lock file: %w", err)
+		return nil, fmt.Errorf("failed to open calendar lock file: %w", err)
 	}
 
 	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
 		return lockFile, nil
 	}
 
-	slog.Debug("Calendar state lock busy, waiting", "module", "CALSYNC", "dir", f.dir)
+	slog.Debug("Calendar lock busy, waiting", "module", "CALSYNC", "path", path)
 	deadline := time.Now().Add(5 * time.Second)
 	delay := 250 * time.Millisecond
 	for time.Now().Before(deadline) {
@@ -148,7 +155,7 @@ func (f *FileStateStore) acquireLock() (*os.File, error) {
 	}
 
 	closeLockFile(lockFile)
-	return nil, fmt.Errorf("calendar state lock timeout for %s", f.dir)
+	return nil, fmt.Errorf("calendar lock timeout for %s", path)
 }
 
 // releaseLock unlocks and closes the lock file.

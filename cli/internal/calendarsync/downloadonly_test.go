@@ -134,7 +134,7 @@ func TestApplyFilteredPlanNeverWritesRemote(t *testing.T) {
 	fresh := remoteEvent("g-fresh", "uid-fresh", "Fresh remote event")
 	f.events = []Event{plain, edit, confRemote, meet, fresh}
 
-	plans, err := calendarsync.PlanAll(ctx, f, accountDir, nil, state)
+	plans, err := calendarsync.PlanAll(ctx, f, accountDir, nil, state, nil)
 	if err != nil {
 		t.Fatalf("PlanAll: %v", err)
 	}

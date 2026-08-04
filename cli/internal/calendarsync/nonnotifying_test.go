@@ -204,7 +204,7 @@ func TestApplySafeFilteredPlanNeverNotifies(t *testing.T) {
 	confRemote.Subject = "Planning (remote edit)"
 	f.events = []Event{solo, edit, del, confRemote, meetDel, meet}
 
-	plans, err := calendarsync.PlanAll(ctx, f, accountDir, nil, state)
+	plans, err := calendarsync.PlanAll(ctx, f, accountDir, nil, state, nil)
 	if err != nil {
 		t.Fatalf("PlanAll: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestAddFirstAttendeeReportsInviteInPreview(t *testing.T) {
 	withAtt.Attendees = []Attendee{{Name: "Alice", Email: "alice@example.com", Type: "required", Response: "none"}}
 	writeLocalICS(t, filepath.Join(accountDir, "Work"), withAtt)
 
-	plans, err := calendarsync.PlanAll(ctx, f, accountDir, nil, state)
+	plans, err := calendarsync.PlanAll(ctx, f, accountDir, nil, state, nil)
 	if err != nil {
 		t.Fatalf("PlanAll: %v", err)
 	}
