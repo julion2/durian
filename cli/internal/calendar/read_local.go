@@ -94,6 +94,10 @@ func readMetaFile(calDir, name, fallback string) string {
 // expanded via its RRULE. Every occurrence preserves the master's duration
 // (End = Start + (e.End - e.Start)) and copies all other fields (subject,
 // location, attendees, ...) from the master — only Start/End shift.
+//
+// The RRULE describes the series as it was DEFINED; the exceptions describe
+// what actually happened to it. So the raw expansion is only an intermediate
+// result — applySeriesExceptions turns it into the real occurrence list.
 func ExpandOccurrences(e Event, from, to time.Time) []Event {
 	if e.Recurrence == nil {
 		if overlaps(e.Start, e.End, from, to) {
@@ -123,7 +127,7 @@ func ExpandOccurrences(e Event, from, to time.Time) []Event {
 	}
 
 	duration := e.End.Sub(e.Start)
-	var out []Event
+	var raw []Event
 	// Between matches occurrence STARTS only, so it would miss an occurrence
 	// that begins before `from` yet is still running inside the window. Widen
 	// the lower bound by one occurrence duration to catch it; the overlap test
@@ -136,13 +140,76 @@ func ExpandOccurrences(e Event, from, to time.Time) []Event {
 			continue
 		}
 		occ := e
+		// An occurrence is not a series: it carries neither the exception list
+		// nor the overrides of its master, only the date it happens on.
+		occ.ExceptionDates = nil
+		occ.Overrides = nil
 		occ.Start = start.UTC()
 		occ.End = start.UTC().Add(duration)
 		if !overlaps(occ.Start, occ.End, from, to) {
 			continue
 		}
+		raw = append(raw, occ)
+	}
+	return applySeriesExceptions(e, raw, from, to)
+}
+
+// applySeriesExceptions folds a master's series exceptions into the raw
+// occurrences its RRULE produced for [from, to), returning what the series
+// ACTUALLY looks like in that window.
+//
+// raw holds one Event per date the rule generated; each already overlaps the
+// window, and each carries its rule-generated Start — which is exactly the
+// RECURRENCE-ID an exception would refer to. master.ExceptionDates lists the
+// cancelled dates and master.Overrides the modified ones, every override
+// keyed by the ORIGINAL start it replaces (RecurrenceID), not by where it
+// ended up.
+func applySeriesExceptions(master Event, raw []Event, from, to time.Time) []Event {
+	if len(master.ExceptionDates) == 0 && len(master.Overrides) == 0 {
+		return raw
+	}
+
+	cancelled := make(map[int64]bool, len(master.ExceptionDates))
+	for _, d := range master.ExceptionDates {
+		cancelled[d.UTC().Unix()] = true
+	}
+	overridden := make(map[int64]Event, len(master.Overrides))
+	for _, o := range master.Overrides {
+		overridden[o.RecurrenceID.UTC().Unix()] = o
+	}
+
+	// raw decides only which UNMODIFIED occurrences survive. A cancelled date
+	// is gone; a modified one is skipped here on purpose, because the override
+	// that replaces it is emitted from master.Overrides below instead.
+	var out []Event
+	for _, occ := range raw {
+		key := occ.Start.UTC().Unix()
+		if cancelled[key] {
+			continue
+		}
+		if _, modified := overridden[key]; modified {
+			continue
+		}
 		out = append(out, occ)
 	}
+
+	// Overrides are placed by where they ACTUALLY happen, never by the date
+	// they replace. Driving this loop from master.Overrides instead of from
+	// raw is what makes both directions of a moved occurrence work: one moved
+	// OUT of the window fails the overlap test and vanishes, and one moved IN
+	// from outside is still emitted even though the rule produced no
+	// occurrence for it inside [from, to) to hang it on.
+	for _, o := range master.Overrides {
+		if cancelled[o.RecurrenceID.UTC().Unix()] {
+			continue
+		}
+		if !overlaps(o.Start, o.End, from, to) {
+			continue
+		}
+		out = append(out, o)
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Start.Before(out[j].Start) })
 	return out
 }
 
