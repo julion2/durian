@@ -179,8 +179,8 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 }
 
 // UpdateBody updates the body text and HTML for a message (lazy body fetch).
-// Writes both the plaintext columns (FTS5 still indexes body_text until
-// step 7) and the encrypted *_ct columns introduced in v11.
+// Writes only the encrypted body_text_ct / body_html_ct columns; the blind
+// FTS index (body_tok) is refreshed in the same transaction below.
 func (d *DB) UpdateBody(messageID, bodyText, bodyHTML string) error {
 	bodyTextCT, err := d.encryptBody(bodyText)
 	if err != nil {

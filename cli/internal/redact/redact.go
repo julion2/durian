@@ -89,5 +89,22 @@ func redact(a slog.Attr) slog.Attr {
 	if _, sensitive := sensitiveSlogKeySet[a.Key]; sensitive {
 		return slog.String(a.Key, Placeholder)
 	}
+	// Error values (and err.Error() logged as a string) may embed
+	// server-echoed mail content from IMAP/SMTP NO/BAD responses. Pass them
+	// through sanitizeText, which redacts over-long server runs while leaving
+	// short, readable diagnostics intact. See ADR-0001 §Logging audit.
+	if a.Value.Kind() == slog.KindAny {
+		if err, ok := a.Value.Any().(error); ok {
+			if s := sanitizeText(err.Error()); s != err.Error() {
+				return slog.String(a.Key, s)
+			}
+			return a
+		}
+	}
+	if _, isErrKey := errorAttrKeys[a.Key]; isErrKey && a.Value.Kind() == slog.KindString {
+		if s := sanitizeText(a.Value.String()); s != a.Value.String() {
+			return slog.String(a.Key, s)
+		}
+	}
 	return a
 }

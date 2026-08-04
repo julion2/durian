@@ -412,7 +412,7 @@ class SyncManager: ObservableObject {
     private func handleNewMailEvent(_ event: NewMailEvent) {
         Log.info("NOTIFY", "SSE event: account=\(event.account) total_new=\(event.total_new) messages=\(event.messages.count)")
         for (i, msg) in event.messages.enumerated() {
-            Log.debug("NOTIFY", "  [\(i)] thread=\(msg.thread_id) from=\(msg.from) subject=\(msg.subject)")
+            Log.debug("NOTIFY", "  [\(i)] thread=\(msg.thread_id)")
         }
 
         // Debounced reload — multiple accounts fire SSE events within seconds
@@ -455,7 +455,7 @@ class SyncManager: ObservableObject {
                 content.userInfo = ["threadId": msg.thread_id]
 
                 let identifier = "newmail-\(msg.thread_id)"
-                Log.info("NOTIFY", "Posting notification: id=\(identifier) thread=\(msg.thread_id) from=\(msg.from) subject=\(msg.subject)")
+                Log.info("NOTIFY", "Posting notification: id=\(identifier) thread=\(msg.thread_id)")
                 let request = UNNotificationRequest(
                     identifier: identifier,
                     content: content,

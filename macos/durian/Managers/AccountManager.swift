@@ -87,7 +87,7 @@ class AccountManager: ObservableObject {
             let folderQuery = ProfileManager.shared.buildQuery(folderName: folder.displayName)
             let unreadQuery = "(\(folderQuery)) AND tag:unread"
             let count = await backend.searchCount(query: unreadQuery)
-            Log.debug("COUNTS", "\(folder.name): \(count) unread (query: \(unreadQuery))")
+            Log.debug("COUNTS", "\(folder.name): \(count) unread (query: \(unreadQuery))") // encgrep:allow folder filter built from config, never a user search
             if count > 0 {
                 counts[folder.name] = count
             }

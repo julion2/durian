@@ -187,7 +187,7 @@ class ProfileManager: ObservableObject {
         let pathQuery = pathFilters.joined(separator: " OR ")
 
         let query = "(\(baseQuery)) AND (\(pathQuery))"
-        Log.debug("PROFILE", "Built query: \(query)")
+        Log.debug("PROFILE", "Built query: \(query)") // encgrep:allow assembled from profiles.pkl, not from mail content
         return query
     }
 }
