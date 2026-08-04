@@ -1,13 +1,21 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/spf13/cobra"
 	"os"
 	"path/filepath"
 
+	"github.com/spf13/cobra"
+
+	"github.com/julion2/durian/cli/internal/backend"
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/graphbackend"
 	"github.com/julion2/durian/cli/internal/imap"
+	"github.com/julion2/durian/cli/internal/imapbackend"
+	"github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/store"
 )
 
@@ -75,22 +83,40 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("part %d not found", attachSavePart)
 	}
 
-	// Get message IMAP metadata
 	msg, err := emailDB.GetByMessageID(messageID)
 	if err != nil || msg == nil {
 		return fmt.Errorf("message not found in store")
 	}
-	if msg.UID == 0 || msg.Account == "" || msg.Mailbox == "" {
-		return fmt.Errorf("message missing IMAP metadata (try syncing first)")
-	}
-
-	// Find account config
-	account, err := cfg.GetAccountByName(msg.Account)
+	account, err := cfg.GetAccountByIdentifier(msg.Account)
 	if err != nil {
 		return fmt.Errorf("account %q not found in config", msg.Account)
 	}
 
-	// Connect to IMAP and fetch
+	safeFilename := filepath.Base(att.Filename)
+	if safeFilename == "" || safeFilename == "." {
+		safeFilename = "attachment"
+	}
+	outPath := filepath.Join(attachOutput, safeFilename)
+
+	// Backend-neutral path for engine/Graph-synced messages, which carry a
+	// provider handle (remote_ref) rather than an IMAP UID: fetch the raw body
+	// through the account's backend and slice out the part.
+	if msg.RemoteRef != "" {
+		data, err := fetchAttachmentPartViaBackend(cmd.Context(), account, msg, att.PartID)
+		if err != nil {
+			return fmt.Errorf("download failed: %w", err)
+		}
+		if err := os.WriteFile(outPath, data, 0o644); err != nil {
+			return fmt.Errorf("write file: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(len(data)))
+		return nil
+	}
+
+	// Legacy IMAP path (fetch BODY[section] by UID).
+	if msg.UID == 0 || msg.Mailbox == "" {
+		return fmt.Errorf("message missing IMAP metadata (try syncing first)")
+	}
 	client := imap.NewClient(account)
 	if err := client.Connect(); err != nil {
 		return err
@@ -102,30 +128,41 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 	if _, err := client.SelectMailbox(msg.Mailbox); err != nil {
 		return err
 	}
-
-	safeFilename := filepath.Base(att.Filename)
-	if safeFilename == "" || safeFilename == "." {
-		safeFilename = "attachment"
-	}
-	outPath := filepath.Join(attachOutput, safeFilename)
 	f, err := os.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
 	}
 	defer f.Close()
-
 	if err := client.FetchDecodedAttachment(msg.UID, att.Filename, att.PartID, f); err != nil {
 		os.Remove(outPath)
 		return fmt.Errorf("download failed: %w", err)
 	}
-
-	fi, statErr := f.Stat()
-	var size int64
-	if statErr == nil {
-		size = fi.Size()
-	}
-	fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(int(size)))
+	fi, _ := f.Stat()
+	fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(int(fi.Size())))
 	return nil
+}
+
+// fetchAttachmentPartViaBackend fetches msg's raw body through the account's
+// backend and returns the requested attachment part's decoded bytes.
+func fetchAttachmentPartViaBackend(ctx context.Context, account *config.AccountConfig, msg *store.Message, partID int) ([]byte, error) {
+	var b backend.Backend
+	var err error
+	if account.UsesGraphBackend() {
+		b, err = graphbackend.New(account)
+	} else {
+		b, err = imapbackend.New(account)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer b.Close()
+	var buf bytes.Buffer
+	ref := backend.RemoteRef{Folder: msg.Mailbox, ID: msg.RemoteRef}
+	if err := b.FetchBody(ctx, ref, &buf); err != nil {
+		return nil, fmt.Errorf("fetch body: %w", err)
+	}
+	data, _, err := mail.ExtractAttachmentPart(buf.Bytes(), partID)
+	return data, err
 }
 
 func formatSize(bytes int) string {
