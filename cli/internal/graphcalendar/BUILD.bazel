@@ -23,6 +23,7 @@ go_test(
         "fetch_master_test.go",
         "graphcalendar_test.go",
         "series_exceptions_test.go",
+        "throttle_test.go",
         "write_test.go",
     ],
     embed = [":graphcalendar"],
