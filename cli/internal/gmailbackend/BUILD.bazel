@@ -18,6 +18,7 @@ go_test(
     srcs = ["gmailbackend_test.go"],
     embed = [":gmailbackend"],
     deps = [
+        "//cli/internal/backend",
         "//cli/internal/config",
     ],
 )
