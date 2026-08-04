@@ -4,10 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,10 +14,11 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/gorilla/mux"
 
-	"github.com/julion2/durian/cli/internal/auth"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/encoding"
 	imapClient "github.com/julion2/durian/cli/internal/imap"
+	"github.com/julion2/durian/cli/internal/mailsend"
+	"github.com/julion2/durian/cli/internal/sender"
 	"github.com/julion2/durian/cli/internal/smtp"
 	"github.com/julion2/durian/cli/internal/store"
 )
@@ -211,23 +210,14 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 		return
 	}
 
-	// Get SMTP auth
-	smtpAuth, err := auth.GetSMTPAuth(account)
-	if err != nil {
-		slog.Error("Auth failed for outbox item", "module", "OUTBOX", "id", item.ID, "err", err)
-		safeMsg := "auth: " + sanitizeOutboxError(err)
-		w.store.MarkAttempted(item.ID, safeMsg)
-		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
-		return
-	}
-
-	// Build smtp.Message
+	// Build the provider-neutral outgoing message. The Message-ID is fixed here
+	// so the sent mail, the local Sent row and any Sent-folder copy share it.
 	from := account.Email
 	if account.DisplayName != "" {
 		from = fmt.Sprintf("%s <%s>", account.DisplayName, account.Email)
 	}
-
-	msg := &smtp.Message{
+	msg := &mailsend.Message{
+		MessageID:  mailsend.GenerateMessageID(from),
 		From:       from,
 		To:         draft.To,
 		CC:         draft.CC,
@@ -251,35 +241,43 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 			w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
 			return
 		}
-		msg.Attachments = append(msg.Attachments, smtp.Attachment{
+		msg.Attachments = append(msg.Attachments, mailsend.Attachment{
 			Filename: att.Filename,
-			Data:     data,
 			MIMEType: att.MIMEType,
+			Data:     data,
 		})
 	}
 
-	// Send via SMTP
+	// Resolve the account's transport (SMTP today; Graph/Gmail slot in later).
+	mailSender, err := sender.For(account)
+	if err != nil {
+		// Transport setup resolves keychain credentials, so sanitize before the
+		// log sink: never let a raw error from that path reach a logging call.
+		safeMsg := "auth: " + sanitizeOutboxError(err)
+		slog.Error("Sender setup failed for outbox item", "module", "OUTBOX", "id", item.ID, "err", safeMsg)
+		w.store.MarkAttempted(item.ID, safeMsg)
+		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
 	slog.Info("Sending outbox item", "module", "OUTBOX", "id", item.ID, "to", draft.To) // encgrep:allow recipient list is intentionally plaintext per ADR-0001 §3 (from/to/cc stay unencrypted for thread routing)
-	client := smtp.NewClient(account.SMTP.Host, account.SMTP.Port, smtpAuth)
-	if err := client.Send(msg); err != nil {
-		// Distinguish network errors (offline/timeout) from SMTP errors (server rejected)
-		if isNetworkError(err) {
-			// Network error — don't count as an attempt, will retry silently
+	if err := mailSender.Send(ctx, msg); err != nil {
+		// The Kind decides retry policy; sanitize before DB/SSE so a
+		// server-echoed 5xx body never reaches the GUI.
+		safeMsg := sanitizeOutboxError(err)
+		switch mailsend.Classify(err) {
+		case mailsend.KindNetwork:
+			// Offline/timeout — don't count as an attempt, retry silently.
 			slog.Warn("Network error, will retry later", "module", "OUTBOX", "id", item.ID, "err", err)
 			return
-		}
-
-		smtpErr := smtp.ParseSMTPError(err)
-		slog.Error("SMTP send failed", "module", "OUTBOX", "id", item.ID, "err", err)
-
-		// ADR-0001 audit medium: sanitize before DB-persist + SSE so
-		// the server-supplied response body (Gmail/O365 echo To: /
-		// Subject: fragments in 5xx) never reaches the GUI.
-		safeMsg := sanitizeOutboxError(err)
-		if smtpErr != nil && smtpErr.IsPermanent() {
-			// 5xx permanent error — poison immediately
+		case mailsend.KindPermanent:
+			slog.Error("Send failed permanently", "module", "OUTBOX", "id", item.ID, "err", err)
 			w.store.PoisonOutboxItem(item.ID, safeMsg)
-		} else {
+		default:
+			slog.Error("Send failed", "module", "OUTBOX", "id", item.ID, "err", err)
 			w.store.MarkAttempted(item.ID, safeMsg)
 		}
 		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
@@ -290,13 +288,12 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 	slog.Info("Outbox item sent successfully", "module", "OUTBOX", "id", item.ID)
 	w.store.DeleteOutboxItem(item.ID)
 
-	// Save to local SQLite store so Sent folder shows the email immediately
-	// (without waiting for next IMAP sync).
+	// Save to local store so the Sent view shows the mail immediately.
 	w.saveToLocalStore(account, msg, &draft)
 
 	w.broadcastStatus(item.ID, "sent", "", draft.Subject, strings.Join(draft.To, ", "))
 
-	// Append to IMAP Sent folder (best-effort, same logic as send.go)
+	// Append to IMAP Sent folder (best-effort; providers that auto-save skip it).
 	w.appendToSent(account, msg)
 }
 
@@ -323,8 +320,8 @@ func (w *OutboxWorker) findAccount(from string) *config.AccountConfig {
 // saveToLocalStore inserts the sent email into SQLite so the GUI can show it
 // immediately without waiting for the next IMAP sync. Best-effort: errors are
 // logged but do not affect the send result.
-func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *smtp.Message, draft *OutboxDraft) {
-	messageID := strings.Trim(msg.GeneratedMessageID, "<>")
+func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mailsend.Message, draft *OutboxDraft) {
+	messageID := strings.Trim(msg.MessageID, "<>")
 	if messageID == "" {
 		slog.Warn("No Message-ID available, skipping local store insert", "module", "OUTBOX")
 		return
@@ -366,13 +363,13 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *smtp
 }
 
 // appendToSent saves a copy to the IMAP Sent folder (skip for providers that auto-save).
-func (w *OutboxWorker) appendToSent(account *config.AccountConfig, msg *smtp.Message) {
+func (w *OutboxWorker) appendToSent(account *config.AccountConfig, msg *mailsend.Message) {
 	if account.OAuth != nil && (account.OAuth.Provider == "google" || account.OAuth.Provider == "microsoft") {
 		slog.Debug("Skipping Sent append", "module", "OUTBOX", "provider", account.OAuth.Provider) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
 
-	messageData, err := msg.Build()
+	messageData, err := smtp.FromMessage(msg).Build()
 	if err != nil {
 		slog.Warn("Failed to build message for Sent folder", "module", "OUTBOX", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
@@ -403,21 +400,6 @@ func (w *OutboxWorker) appendToSent(account *config.AccountConfig, msg *smtp.Mes
 	}
 
 	slog.Info("Saved to Sent folder", "module", "OUTBOX", "mailbox", sentMailbox) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-}
-
-// isNetworkError returns true if the error is a connection/DNS/timeout failure
-// (i.e. we never reached the SMTP server). These should not count as send attempts.
-func isNetworkError(err error) bool {
-	// net.Error covers dial timeouts, connection refused, DNS failures
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return true
-	}
-	// Also catch wrapped connection errors from smtp.Client.Send
-	msg := err.Error()
-	return strings.Contains(msg, "failed to connect") ||
-		strings.Contains(msg, "no such host") ||
-		strings.Contains(msg, "network is unreachable")
 }
 
 // broadcastStatus sends an outbox_update SSE event.
