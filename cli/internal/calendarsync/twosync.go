@@ -471,6 +471,7 @@ func PlanAll(ctx context.Context, p CalendarProvider, accountDir string, include
 	}
 
 	var plans []CalendarPlan
+	visited := make(map[string]bool, len(calendars))
 	for _, cal := range calendars {
 		if !calendarIncluded(cal.Name, include) {
 			slog.Debug("Skipping calendar not in include list", "module", "CALSYNC",
@@ -483,11 +484,29 @@ func PlanAll(ctx context.Context, p CalendarProvider, accountDir string, include
 		if err != nil {
 			return nil, fmt.Errorf("failed to read calendar %s: %w", cal.Name, err)
 		}
+		visited[cal.ID] = true
 		plan, err := planWithRemote(p, cal, calDir, state.Calendars[cal.ID], remote)
 		if err != nil {
 			return nil, fmt.Errorf("failed to plan calendar %s: %w", cal.Name, err)
 		}
 		plans = append(plans, plan)
+	}
+
+	// Drop mirror entries for calendars this run did not touch — deleted
+	// remotely, or taken out of the include filter. Unlike the sync state,
+	// which keeps only hashes and ids, the mirror holds whole events; keeping
+	// them would grow the file without bound and retain calendar contents the
+	// user has already stopped syncing. Safe only because every calendar was
+	// read successfully: an error above returns before this point, so a
+	// transient API failure can never wipe the cursors.
+	if mirror != nil {
+		for id := range mirror.Calendars {
+			if !visited[id] {
+				slog.Debug("Dropping mirror for a calendar no longer synced", "module", "CALSYNC",
+					"calendar", id)
+				delete(mirror.Calendars, id)
+			}
+		}
 	}
 	return plans, nil
 }
@@ -512,6 +531,17 @@ func fetchRemote(ctx context.Context, p CalendarProvider, cal Calendar, mirror *
 	if cursor != "" && entry.ParamFingerprint != dp.DeltaParamFingerprint() {
 		slog.Info("Calendar query changed, starting a full sync", "module", "CALSYNC",
 			"calendar", cal.Name, "was", entry.ParamFingerprint, "now", dp.DeltaParamFingerprint())
+		cursor = ""
+	}
+	if cursor != "" && !entry.UpdatedAt.IsZero() &&
+		time.Since(entry.UpdatedAt) > mirrorMaxAge {
+		// Nothing ever re-reads the mirror against reality while the cursor
+		// lives, so a fold that went wrong stays wrong forever. The full read
+		// this forces is the only thing that repairs a mirror the provider is
+		// perfectly happy to keep feeding — cheap once a week, and the only
+		// backstop for the merge mistakes a review does not catch.
+		slog.Info("Calendar mirror is stale, reconciling with a full sync", "module", "CALSYNC",
+			"calendar", cal.Name, "age", time.Since(entry.UpdatedAt).Truncate(time.Hour))
 		cursor = ""
 	}
 

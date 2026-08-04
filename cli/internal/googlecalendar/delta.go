@@ -212,6 +212,19 @@ func isSyncTokenExpired(err error) bool {
 	if !errors.As(err, &se) {
 		return false
 	}
-	return se.status == http.StatusGone ||
-		strings.Contains(se.body, "fullSyncRequired")
+	// The STATUS is what decides. Matching the reason string on its own would
+	// swallow a 400 whose message happens to mention the sync token — exactly
+	// the client bug this must not hide, and one that would then trigger a
+	// silent full download on every single run instead of failing once.
+	if se.status != http.StatusGone {
+		return false
+	}
+	// A 410 can also mean the calendar itself is gone. Retrying that as a full
+	// round fails again and reports the real error, so the reason is only used
+	// to keep the log honest, not to gate the recovery.
+	if !strings.Contains(se.body, "fullSyncRequired") {
+		slog.Debug("Got 410 without fullSyncRequired, retrying as a full round anyway",
+			"module", "GOOGLECAL", "body", se.body)
+	}
+	return true
 }
