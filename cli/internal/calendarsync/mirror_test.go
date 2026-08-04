@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/calendar"
 )
 
 func at(t *testing.T, s string) time.Time {
@@ -176,16 +178,23 @@ func TestApplyDeltaIgnoresOccurrenceChangeWithoutMaster(t *testing.T) {
 func TestApplyDeltaKeepsExceptionsAChangedMasterDidNotRepeat(t *testing.T) {
 	knownCancel := at(t, "2026-08-10T09:00:00Z")
 	knownMove := at(t, "2026-08-17T09:00:00Z")
+	// The rule stays the same across the rename — that is what makes the
+	// remembered exceptions still meaningful.
+	weekly := &Recurrence{
+		Pattern: calendar.RecurrencePattern{Type: "weekly", Interval: 1, DaysOfWeek: []string{"monday"}},
+		Range:   calendar.RecurrenceRange{Type: "noEnd", StartDate: "2026-08-03"},
+	}
 	entry := mirrorWith(Event{
-		ID: "id-series", ICalUID: "uid-series", Subject: "Standup",
+		ID: "id-series", ICalUID: "uid-series", Subject: "Standup", Recurrence: weekly,
 		ExceptionDates: []time.Time{knownCancel},
 		Overrides:      []Event{{RecurrenceID: knownMove, Subject: "moved"}},
 	})
 
 	remote := entry.applyDelta(DeltaResult{
 		// The renamed master arrives with no exceptions at all.
-		ChangedMasters: []Event{{ID: "id-series", ICalUID: "uid-series", Subject: "Daily sync"}},
-		Cursor:         "c1",
+		ChangedMasters: []Event{{ID: "id-series", ICalUID: "uid-series",
+			Subject: "Daily sync", Recurrence: weekly}},
+		Cursor: "c1",
 	}, "Work")
 
 	master := remote["uid-series"]
@@ -203,14 +212,18 @@ func TestApplyDeltaKeepsExceptionsAChangedMasterDidNotRepeat(t *testing.T) {
 // Newer information about a specific date wins over what the mirror held.
 func TestApplyDeltaPrefersFreshExceptionsOverCarriedOver(t *testing.T) {
 	recID := at(t, "2026-08-17T09:00:00Z")
+	weekly := &Recurrence{
+		Pattern: calendar.RecurrencePattern{Type: "weekly", Interval: 1, DaysOfWeek: []string{"monday"}},
+		Range:   calendar.RecurrenceRange{Type: "noEnd", StartDate: "2026-08-03"},
+	}
 	entry := mirrorWith(Event{
-		ID: "id-series", ICalUID: "uid-series",
+		ID: "id-series", ICalUID: "uid-series", Recurrence: weekly,
 		Overrides: []Event{{RecurrenceID: recID, Subject: "old move"}},
 	})
 
 	remote := entry.applyDelta(DeltaResult{
 		ChangedMasters: []Event{{
-			ID: "id-series", ICalUID: "uid-series",
+			ID: "id-series", ICalUID: "uid-series", Recurrence: weekly,
 			Overrides: []Event{{RecurrenceID: recID, Subject: "new move"}},
 		}},
 		Cursor: "c1",
@@ -327,5 +340,147 @@ func TestMirrorStoreCorruptFileIsEmpty(t *testing.T) {
 	}
 	if len(mirror.Calendars) != 0 {
 		t.Errorf("mirror = %+v, want empty", mirror.Calendars)
+	}
+}
+
+// MARK: - Identity invariants
+
+// A round that removes an event and recreates it under the SAME iCalUID — a
+// re-invitation gets a fresh provider id — must leave the new event standing.
+// Deleting through the stale index drops a calendar entry that exists, and
+// since the round is consumed the feed never mentions it again: the local copy
+// is pruned and stays gone.
+func TestApplyDeltaRemovalDoesNotDropARecreatedEvent(t *testing.T) {
+	entry := mirrorWith(Event{ID: "id-old", ICalUID: "uid-shared", Subject: "Invite"})
+
+	remote := entry.applyDelta(DeltaResult{
+		ChangedMasters: []Event{{ID: "id-new", ICalUID: "uid-shared", Subject: "Invite (resent)"}},
+		RemovedIDs:     []string{"id-old"},
+		Cursor:         "c1",
+	}, "Work")
+
+	ev, present := remote["uid-shared"]
+	if !present {
+		t.Fatal("the recreated event was deleted through the stale index")
+	}
+	if ev.ID != "id-new" || ev.Subject != "Invite (resent)" {
+		t.Errorf("event = %+v, want the recreated one", ev)
+	}
+}
+
+// A master that keeps its provider id but changes its iCalUID must not leave
+// the old entry behind: the mirror would report one remote event twice, and
+// tidying up the duplicate locally plans a remote delete against the id of the
+// event that still exists.
+func TestApplyDeltaMasterChangingUIDLeavesNoOrphan(t *testing.T) {
+	entry := mirrorWith(Event{ID: "id-a", ICalUID: "uid-old", Subject: "Sprint review"})
+
+	remote := entry.applyDelta(DeltaResult{
+		ChangedMasters: []Event{{ID: "id-a", ICalUID: "uid-new", Subject: "Sprint review"}},
+		Cursor:         "c1",
+	}, "Work")
+
+	if len(remote) != 1 {
+		t.Fatalf("remote set = %+v, want exactly one entry for one remote event", remote)
+	}
+	if _, orphan := remote["uid-old"]; orphan {
+		t.Error("the old UID still resolves; the event is mirrored twice")
+	}
+
+	// And the stale id must no longer be able to delete the live entry.
+	remote = entry.applyDelta(DeltaResult{RemovedIDs: []string{"id-a"}, Cursor: "c2"}, "Work")
+	if len(remote) != 0 {
+		t.Errorf("remote set = %+v, want the event removed by its current id", remote)
+	}
+}
+
+// An event the provider reports without a UID cannot stay mirrored under a UID
+// it no longer claims.
+func TestApplyDeltaDropsMirroredEventThatLostItsUID(t *testing.T) {
+	entry := mirrorWith(Event{ID: "id-a", ICalUID: "uid-a", Subject: "A"})
+
+	remote := entry.applyDelta(DeltaResult{
+		ChangedMasters: []Event{{ID: "id-a", ICalUID: ""}},
+		Cursor:         "c1",
+	}, "Work")
+
+	if len(remote) != 0 {
+		t.Errorf("remote set = %+v, want the stale entry dropped", remote)
+	}
+}
+
+// Exceptions name dates the RULE produces. When the rule changes — or the
+// series becomes a plain appointment — the remembered dates refer to
+// occurrences that no longer exist.
+func TestApplyDeltaDropsExceptionsWhenTheRuleChanges(t *testing.T) {
+	weekly := &Recurrence{
+		Pattern: calendar.RecurrencePattern{Type: "weekly", Interval: 1, DaysOfWeek: []string{"monday"}},
+		Range:   calendar.RecurrenceRange{Type: "noEnd", StartDate: "2026-08-03"},
+	}
+	monthly := &Recurrence{
+		Pattern: calendar.RecurrencePattern{Type: "absoluteMonthly", Interval: 1, DayOfMonth: 3},
+		Range:   calendar.RecurrenceRange{Type: "noEnd", StartDate: "2026-08-03"},
+	}
+	seed := func() CalendarMirror {
+		return mirrorWith(Event{
+			ID: "id-series", ICalUID: "uid-series", Recurrence: weekly,
+			ExceptionDates: []time.Time{at(t, "2026-08-10T09:00:00Z")},
+			Overrides:      []Event{{RecurrenceID: at(t, "2026-08-17T09:00:00Z"), Subject: "moved"}},
+		})
+	}
+
+	t.Run("rule replaced", func(t *testing.T) {
+		entry := seed()
+		remote := entry.applyDelta(DeltaResult{
+			ChangedMasters: []Event{{ID: "id-series", ICalUID: "uid-series", Recurrence: monthly}},
+			Cursor:         "c1",
+		}, "Work")
+		m := remote["uid-series"]
+		if len(m.ExceptionDates) != 0 || len(m.Overrides) != 0 {
+			t.Errorf("exceptions survived a rule change: %v / %+v", m.ExceptionDates, m.Overrides)
+		}
+	})
+
+	t.Run("series became a single appointment", func(t *testing.T) {
+		entry := seed()
+		remote := entry.applyDelta(DeltaResult{
+			ChangedMasters: []Event{{ID: "id-series", ICalUID: "uid-series"}},
+			Cursor:         "c1",
+		}, "Work")
+		m := remote["uid-series"]
+		if len(m.ExceptionDates) != 0 || len(m.Overrides) != 0 {
+			t.Errorf("exceptions survived the series ending: %v / %+v", m.ExceptionDates, m.Overrides)
+		}
+	})
+
+	t.Run("same rule keeps them", func(t *testing.T) {
+		entry := seed()
+		remote := entry.applyDelta(DeltaResult{
+			ChangedMasters: []Event{{ID: "id-series", ICalUID: "uid-series",
+				Recurrence: weekly, Subject: "Renamed"}},
+			Cursor: "c1",
+		}, "Work")
+		m := remote["uid-series"]
+		if len(m.ExceptionDates) != 1 || len(m.Overrides) != 1 {
+			t.Errorf("exceptions lost on an unrelated edit: %v / %+v", m.ExceptionDates, m.Overrides)
+		}
+	})
+}
+
+// A reset rebuilds the event set, so leaving the previous cursor beside it
+// would let the next run resume from a token minted against data that is gone.
+func TestApplyDeltaResetWithoutTokenClearsTheCursor(t *testing.T) {
+	entry := mirrorWith(Event{ID: "id-a", ICalUID: "uid-a"})
+	entry.Cursor = "stale"
+	entry.ParamFingerprint = "fp/1"
+
+	entry.applyDelta(DeltaResult{
+		ChangedMasters: []Event{{ID: "id-b", ICalUID: "uid-b"}},
+		Cursor:         "",
+		Reset:          true,
+	}, "Work")
+
+	if entry.Cursor != "" {
+		t.Errorf("cursor = %q, want it cleared alongside the rebuilt event set", entry.Cursor)
 	}
 }

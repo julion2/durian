@@ -28,6 +28,11 @@ import (
 	"time"
 )
 
+// mirrorMaxAge is how long a calendar may be tracked incrementally before the
+// engine reconciles it with a full read, regardless of how healthy the cursor
+// looks. See the staleness check in fetchRemote for why this exists.
+const mirrorMaxAge = 7 * 24 * time.Hour
+
 // CalendarMirror is the last known remote state of one calendar.
 type CalendarMirror struct {
 	// Cursor is the provider's opaque resume token (a Graph deltaLink, a
@@ -144,6 +149,14 @@ func (m *CalendarMirror) applyDelta(d DeltaResult, calendarName string) map[stri
 
 	// Index by provider event id so removals and occurrence changes, which
 	// name events by id rather than by UID, can find their target.
+	//
+	// The invariant this index has to keep is m.Events[byID[id]].ID == id.
+	// It is not automatic: the UID and the provider id are two independent
+	// identities, and either can be re-pointed at the other. Every mutation
+	// below therefore goes through upsert/remove, which maintain both maps
+	// together. The full read rebuilt its map every round and healed such a
+	// mismatch by construction; the mirror survives across runs, so a broken
+	// entry here stays broken until something forces a full resync.
 	byID := make(map[string]string, len(m.Events))
 	for uid, ev := range m.Events {
 		byID[ev.ID] = uid
@@ -151,8 +164,11 @@ func (m *CalendarMirror) applyDelta(d DeltaResult, calendarName string) map[stri
 
 	for _, ev := range d.ChangedMasters {
 		if ev.ICalUID == "" {
-			slog.Warn("Ignoring remote event without iCalUID", "module", "CALSYNC",
+			// Not just skippable: if this id is already mirrored under some
+			// UID, that entry is now stale and must not keep answering for it.
+			slog.Warn("Dropping remote event without iCalUID", "module", "CALSYNC",
 				"calendar", calendarName, "id", ev.ID)
+			m.remove(byID, ev.ID)
 			continue
 		}
 		// A changed master arrives with the exceptions the round delivered.
@@ -162,14 +178,13 @@ func (m *CalendarMirror) applyDelta(d DeltaResult, calendarName string) map[stri
 		if prev, known := m.Events[ev.ICalUID]; known {
 			ev = carryOverExceptions(prev, ev)
 		}
-		m.Events[ev.ICalUID] = ev
-		byID[ev.ID] = ev.ICalUID
+		m.upsert(byID, ev)
 	}
 
 	for _, oc := range d.ChangedOverrides {
 		uid, known := byID[oc.MasterID]
 		if !known {
-			slog.Warn("Ignoring occurrence change without a known master", "module", "CALSYNC",
+			slog.Debug("Ignoring occurrence change without a known master", "module", "CALSYNC",
 				"calendar", calendarName, "master", oc.MasterID)
 			continue
 		}
@@ -179,17 +194,15 @@ func (m *CalendarMirror) applyDelta(d DeltaResult, calendarName string) map[stri
 	}
 
 	for _, id := range d.RemovedIDs {
-		uid, known := byID[id]
-		if !known {
-			// Already absent — a delete for something never mirrored, or a
-			// replay of a round already folded in. Both are no-ops.
-			continue
-		}
-		delete(m.Events, uid)
-		delete(byID, id)
+		m.remove(byID, id)
 	}
 
-	if d.Cursor != "" {
+	// The cursor is taken over only for a round that settled — but a reset
+	// round replaces the event set, so leaving the previous cursor next to a
+	// freshly rebuilt set would let the next run resume from a token minted
+	// against data that no longer exists. A reset therefore always writes the
+	// cursor it produced, including an empty one.
+	if d.Cursor != "" || d.Reset {
 		m.Cursor = d.Cursor
 		m.ParamFingerprint = d.ParamFingerprint
 	}
@@ -202,6 +215,50 @@ func (m *CalendarMirror) applyDelta(d DeltaResult, calendarName string) map[stri
 	return out
 }
 
+// upsert stores ev under its UID and keeps byID in step.
+//
+// The subtle case is a remote event that keeps its provider id but changes its
+// iCalUID — a re-invitation, or a series recreated from an .ics import. Storing
+// the new UID alone would leave the old entry behind, and the mirror would then
+// report the same remote event twice: the planner downloads a second .ics for
+// it, and if the user tidies up by deleting the first, the deletion is planned
+// as ActionDeleteRemote against the id of the event that still exists — which
+// for a meeting cancels it and mails every attendee.
+func (m *CalendarMirror) upsert(byID map[string]string, ev Event) {
+	if prevUID, known := byID[ev.ID]; known && prevUID != ev.ICalUID {
+		delete(m.Events, prevUID)
+	}
+	// The reverse collision: some OTHER id already occupies this UID. The
+	// entry is about to be overwritten, so its id must stop resolving here.
+	if prev, known := m.Events[ev.ICalUID]; known && prev.ID != ev.ID {
+		delete(byID, prev.ID)
+	}
+	m.Events[ev.ICalUID] = ev
+	byID[ev.ID] = ev.ICalUID
+}
+
+// remove deletes the event with the given provider id, if the mirror still
+// holds THAT event under the UID the index names.
+//
+// The identity check is what makes a round that deletes an event and recreates
+// it under the same UID survivable: the removal names the old id, the index
+// still maps it to that UID, but the entry stored there is already the new
+// event. Deleting blindly would drop a calendar entry that exists — and since
+// the round is consumed, the change feed never mentions it again, so the local
+// copy would be pruned and stay gone.
+func (m *CalendarMirror) remove(byID map[string]string, id string) {
+	uid, known := byID[id]
+	if !known {
+		// A delete for something never mirrored, or a replay of a round
+		// already folded in. Both are no-ops.
+		return
+	}
+	delete(byID, id)
+	if ev, present := m.Events[uid]; present && ev.ID == id {
+		delete(m.Events, uid)
+	}
+}
+
 // carryOverExceptions returns next with the exceptions of prev restored for
 // occurrences next does not mention.
 //
@@ -212,6 +269,18 @@ func (m *CalendarMirror) applyDelta(d DeltaResult, calendarName string) map[stri
 // next rename. Exceptions next DOES carry win, because they are the newer
 // information about those specific dates.
 func carryOverExceptions(prev, next Event) Event {
+	// An exception names a date the RULE produces. If the rule changed — or
+	// the series became a plain appointment — the remembered dates refer to
+	// occurrences that no longer exist, and carrying them over would leave
+	// EXDATEs and RECURRENCE-ID components stranded on an event whose rule
+	// never generates them. The local expansion then renders a meeting at a
+	// time the server does not have, and because the mirror is what the
+	// planner treats as remote truth, both sides converge on it.
+	if next.Recurrence == nil ||
+		recurrenceJSON(prev.Recurrence, prev.ID) != recurrenceJSON(next.Recurrence, next.ID) {
+		return next
+	}
+
 	seen := make(map[int64]bool, len(next.ExceptionDates)+len(next.Overrides))
 	for _, d := range next.ExceptionDates {
 		seen[d.UTC().Unix()] = true
