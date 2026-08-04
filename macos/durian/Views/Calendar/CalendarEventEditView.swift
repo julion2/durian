@@ -80,18 +80,13 @@ struct CalendarEventEditView: View {
                     .fill(selectedCalendarColor)
                     .frame(width: 10, height: 10)
                 if !calendars.isEmpty && draft.isNew {
-                    Picker("", selection: $draft.calendar) {
+                    Picker("", selection: calendarSelection) {
                         ForEach(calendars) { calendar in
-                            Text(calendar.name).tag(calendar.name)
+                            Text(calendar.name).tag(calendar.visibilityKey)
                         }
                     }
                     .pickerStyle(.menu)
                     .labelsHidden()
-                    .onChange(of: draft.calendar) { _, name in
-                        if let match = calendars.first(where: { $0.name == name }) {
-                            draft.account = match.account
-                        }
-                    }
                 } else {
                     // Moving an existing event between calendars would need a
                     // remote delete + re-invite; the API rejects it, so only
@@ -184,8 +179,27 @@ struct CalendarEventEditView: View {
     }
 
     /// The draft calendar's color, used as a small accent dot.
+    /// Selection over the (account, calendar) identity rather than the bare
+    /// name. Two accounts commonly each own a calendar called "Calendar", and
+    /// resolving by name alone silently filed new events under whichever
+    /// account happened to come first.
+    private var calendarSelection: Binding<String> {
+        Binding(
+            get: { CalendarInfo.key(account: draft.account, name: draft.calendar) },
+            set: { key in
+                guard let match = calendars.first(where: { $0.visibilityKey == key }) else { return }
+                draft.calendar = match.name
+                draft.account = match.account
+            }
+        )
+    }
+
+    private var selectedCalendar: CalendarInfo? {
+        calendars.first { $0.visibilityKey == CalendarInfo.key(account: draft.account, name: draft.calendar) }
+    }
+
     private var selectedCalendarColor: Color {
-        calendars.first { $0.name == draft.calendar }?.color ?? .secondary
+        selectedCalendar?.color ?? .secondary
     }
 
     private var dateComponents: DatePickerComponents {
