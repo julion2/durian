@@ -448,6 +448,11 @@ type FolderFlagRow struct {
 	RemoteRef   string
 	SyncedFlags string
 	Tags        []string
+	// IsSeen / IsFlagged are the server flag state stored at last ingest, used to
+	// seed an empty synced_flags baseline (a legacy-migrated row) from the server
+	// side rather than guessing from local tags.
+	IsSeen    bool
+	IsFlagged bool
 }
 
 // GetFolderFlagState returns the flag-sync state for every message in the
@@ -479,7 +484,7 @@ func (d *DB) GetFolderFlagState(account, mailbox string) ([]FolderFlagRow, error
 	// with no tags still needs a row so the three-way sees its empty
 	// local state. ORDER BY m.id groups a message's tag rows together.
 	rows, err := d.db.Query(`
-		SELECT m.message_id, m.remote_ref, m.synced_flags, IFNULL(t.tag, '')
+		SELECT m.message_id, m.remote_ref, m.synced_flags, m.is_seen, m.is_flagged, IFNULL(t.tag, '')
 		FROM messages m
 		LEFT JOIN tags t ON t.message_id = m.id
 		WHERE m.mailbox_id = ? AND m.account_id = ? AND m.remote_ref != ''
@@ -492,7 +497,8 @@ func (d *DB) GetFolderFlagState(account, mailbox string) ([]FolderFlagRow, error
 	result := []FolderFlagRow{}
 	for rows.Next() {
 		var msgID, remoteRef, syncedFlags, tag string
-		if err := rows.Scan(&msgID, &remoteRef, &syncedFlags, &tag); err != nil {
+		var isSeen, isFlagged bool
+		if err := rows.Scan(&msgID, &remoteRef, &syncedFlags, &isSeen, &isFlagged, &tag); err != nil {
 			return nil, fmt.Errorf("scan folder flag row: %w", err)
 		}
 		if n := len(result); n == 0 || result[n-1].MessageID != msgID {
@@ -500,6 +506,8 @@ func (d *DB) GetFolderFlagState(account, mailbox string) ([]FolderFlagRow, error
 				MessageID:   msgID,
 				RemoteRef:   remoteRef,
 				SyncedFlags: syncedFlags,
+				IsSeen:      isSeen,
+				IsFlagged:   isFlagged,
 			})
 		}
 		if tag != "" {

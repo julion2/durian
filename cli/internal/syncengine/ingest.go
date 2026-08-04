@@ -222,6 +222,18 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		return "", false, fmt.Errorf("insert message: %w", err)
 	}
 
+	// Fast path for a message already in the store on a label backend (the
+	// common case of a legacy->engine migration re-ingesting the whole mailbox):
+	// its attachments, headers and filter-rule tags were applied on first ingest
+	// and its content is unchanged, so only the labels need re-mirroring. Skip
+	// the heavy re-processing — that is what makes the transition sync fast.
+	if !created && opts.LabelsAsTags {
+		if err := reconcileLabels(db, messageID, opts.Account, msg.Labels); err != nil {
+			return "", false, fmt.Errorf("reconcile labels: %w", err)
+		}
+		return messageID, created, nil
+	}
+
 	// Clear old attachments on upsert, then re-insert
 	_ = db.DeleteAttachmentsByMessageDBID(storeMsg.ID)
 	for i, att := range content.Attachments {

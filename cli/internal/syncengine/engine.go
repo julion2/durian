@@ -63,6 +63,10 @@ type Options struct {
 	// with the legacy --no-flags). Messages still get their flag-derived tags
 	// at ingest time; only the three-way upload/download pass is disabled.
 	NoFlags bool
+	// OnProgress, if set, is called after each fetched page with the running
+	// count of messages ingested this run — for a live progress line during a
+	// large full sync. Must be safe to call from the sync goroutine.
+	OnProgress func(count int)
 }
 
 // Result aggregates the outcome of one Engine.Sync run.
@@ -330,6 +334,12 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		}
 
 		fetched += len(res.Messages)
+		if e.opts.OnProgress != nil {
+			// Total processed, not just new: a legacy->engine migration re-ingests
+			// existing messages (counted as deduplicated), which would otherwise
+			// leave the progress stuck at 0.
+			e.opts.OnProgress(result.New + result.Deduplicated)
+		}
 
 		if !res.HasMore {
 			return deltaFlags, nil
@@ -399,11 +409,45 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 	// ref set shrinks. A non-delta backend has no change feed, so it polls all.
 	useDelta := b.Capabilities().FlagChangesInDelta
 	refs := make([]backend.RemoteRef, 0, len(rows))
-	for _, row := range rows {
+	seeded := 0
+	for i := range rows {
+		row := rows[i]
+		// A legacy-migrated row carries no flag baseline (the legacy syncer kept
+		// it in its own state file; the engine upsert deliberately never writes
+		// synced_flags). An empty baseline parses to "unread/unflagged", so a read
+		// or flagged migrated message looks locally changed and becomes a false
+		// upload candidate — turning the first engine sync of a whole migrated
+		// mailbox into one FetchFlags request per message. Seed the baseline from
+		// the stored server flags (adopting server state, like the legacy
+		// first-sync branch). Only seed a NON-empty state: an empty seed is a
+		// no-op, and skipping it would swallow a genuine local read/flag change
+		// on a message whose baseline is legitimately empty. After seeding, fall
+		// through to the normal candidate check against the seeded baseline.
+		if row.SyncedFlags == "" {
+			seededBaseline := joinFlags(imap.FlagState{Seen: row.IsSeen, Flagged: row.IsFlagged})
+			if seededBaseline != "" {
+				if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, seededBaseline); err != nil {
+					// Don't process this row with an unpersisted baseline: the
+					// candidate check and the merge below must agree, and the
+					// merge re-reads rows[i]. Skip; the next sync retries.
+					result.Errors = append(result.Errors, fmt.Errorf("seed flag baseline for %s: %w", row.MessageID, err))
+					continue
+				}
+				// Update BOTH the local copy (for the candidate check just below)
+				// and the backing slice element (so the merge loop, which re-ranges
+				// rows, reads the seeded baseline instead of the empty original).
+				row.SyncedFlags = seededBaseline
+				rows[i].SyncedFlags = seededBaseline
+				seeded++
+			}
+		}
 		if useDelta && !e.flagCandidate(row, deltaFlags, upload) {
 			continue
 		}
 		refs = append(refs, backend.RemoteRef{Folder: folder.Name, ID: row.RemoteRef})
+	}
+	if seeded > 0 {
+		slog.Info("Seeded flag baselines for migrated messages", "module", "SYNCENGINE", "folder", folder.Name, "count", seeded) // encgrep:allow folder name + count are operational metadata, not content
 	}
 	if len(refs) == 0 {
 		return
