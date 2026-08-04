@@ -102,6 +102,9 @@ type fakeBackend struct {
 	applyFlagsCalls []applyFlagsCall
 	// moveCalls records Backend.Move invocations (folder-move upload pass).
 	moveCalls []moveCall
+	// caps is returned by Capabilities(); zero value matches the default IMAP-like
+	// backend. Tests set FlagChangesInDelta to exercise the delta flag path.
+	caps backend.Capabilities
 }
 
 type moveCall struct {
@@ -168,7 +171,7 @@ func (f *fakeBackend) Send(ctx context.Context, msg []byte) error { return nil }
 
 func (f *fakeBackend) Watch(ctx context.Context, folder string, onChange func()) error { return nil }
 
-func (f *fakeBackend) Capabilities() backend.Capabilities { return backend.Capabilities{} }
+func (f *fakeBackend) Capabilities() backend.Capabilities { return f.caps }
 
 func (f *fakeBackend) Close() error { return nil }
 
@@ -782,6 +785,97 @@ func TestEngineFlagUpload(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no folder flag row for flagup@example.com")
+	}
+}
+
+// TestEngineNewVsDeduplicated proves the run counts a genuinely new message as
+// New but a re-delivered one (same Message-ID, e.g. a delta flag change) as
+// Deduplicated — so "new" reflects arrivals, not re-syncs.
+func TestEngineNewVsDeduplicated(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}}
+	msg := backend.Message{
+		MessageID: "dedup@example.com",
+		Ref:       backend.RemoteRef{Folder: "INBOX", ID: "701"},
+		Raw:       rawMessage("dedup@example.com", "a@example.com", testAccount, "hi", "body"),
+		Flags:     backend.Flags{Seen: false},
+	}
+	scripts := map[string][]backend.FetchResult{
+		"INBOX": {
+			{Messages: []backend.Message{msg}, Cursor: backend.Cursor("c1")},
+			{Messages: []backend.Message{msg}, Cursor: backend.Cursor("c2")}, // re-delivery
+		},
+	}
+	fake := newFakeBackend(folders, scripts)
+	engine := newTestEngine(db, newMemCursorStore())
+
+	r1, err := engine.Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if r1.New != 1 || r1.Deduplicated != 0 {
+		t.Errorf("first sync: New=%d Deduplicated=%d, want 1/0", r1.New, r1.Deduplicated)
+	}
+
+	r2, err := engine.Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if r2.New != 0 || r2.Deduplicated != 1 {
+		t.Errorf("second sync: New=%d Deduplicated=%d, want 0/1 (a re-delivery is not new)", r2.New, r2.Deduplicated)
+	}
+}
+
+// TestEngineFlagPassScopedToDelta proves a delta backend fetches flags only for
+// messages that changed — surfaced in the delta or dirty locally — instead of
+// polling the whole folder. That scoping is the sync-speed win.
+func TestEngineFlagPassScopedToDelta(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}}
+	scripts := map[string][]backend.FetchResult{
+		"INBOX": {{
+			Messages: []backend.Message{
+				{MessageID: "d601@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "601"},
+					Raw: rawMessage("d601@example.com", "a@example.com", testAccount, "one", "b1"), Flags: backend.Flags{Seen: false}},
+				{MessageID: "d602@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "602"},
+					Raw: rawMessage("d602@example.com", "a@example.com", testAccount, "two", "b2"), Flags: backend.Flags{Seen: false}},
+			},
+			Cursor: backend.Cursor("d-c1"),
+		}},
+	}
+	fake := newFakeBackend(folders, scripts)
+	fake.caps.FlagChangesInDelta = true
+	engine := newTestEngine(db, newMemCursorStore())
+
+	if _, err := engine.Sync(context.Background(), fake); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	// Discard first-sync fetches: both messages are new, hence delta candidates.
+	fake.fetchFlagsCalls = nil
+
+	// The user marks 602 read locally; 601 is untouched and absent from the next
+	// delta (the second FetchMessages reports no changes).
+	if err := db.ModifyTagsByMessageIDAndAccount("d602@example.com", testAccount, nil, []string{"unread"}); err != nil {
+		t.Fatalf("mark 602 read: %v", err)
+	}
+	fake.flagsByRef["602"] = backend.Flags{Seen: false} // server still unread
+
+	if _, err := engine.Sync(context.Background(), fake); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	// Exactly one flag fetch, for 602 only — 601 (unchanged, not in the delta)
+	// is never polled. A full-folder poll would have fetched both.
+	if len(fake.fetchFlagsCalls) != 1 {
+		t.Fatalf("FetchFlags calls = %d, want 1 (scoped to changes)", len(fake.fetchFlagsCalls))
+	}
+	got := fake.fetchFlagsCalls[0].refs
+	if len(got) != 1 || got[0].ID != "602" {
+		t.Errorf("FetchFlags refs = %+v, want only [602] (whole-folder poll eliminated)", got)
+	}
+	// The local read change was still uploaded.
+	if len(fake.applyFlagsCalls) != 1 || fake.applyFlagsCalls[0].ref.ID != "602" || !fake.applyFlagsCalls[0].add.Seen {
+		t.Errorf("ApplyFlags = %+v, want one Seen upload for 602", fake.applyFlagsCalls)
 	}
 }
 

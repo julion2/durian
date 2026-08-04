@@ -117,24 +117,42 @@ type AccountConfig struct {
 	OAuth            *OAuthConfig           `pkl:"oauth" json:"oauth"`
 	Calendar         *AccountCalendarConfig `pkl:"calendar" json:"calendar"` // Vdir calendar export settings (nil = defaults)
 	// SyncEngine selects the sync implementation for this account:
-	//   ""/"legacy" (default) — the classic IMAP syncer;
-	//   "engine"              — the provider-agnostic engine on the IMAP backend;
-	//   "graph"               — the engine on the Microsoft Graph backend.
-	// Not supported for Google accounts (the engine has no X-GM-LABELS path);
-	// "graph" additionally requires a Microsoft account.
+	//   "engine" — the provider-agnostic engine on the IMAP backend;
+	//   "graph"  — the engine on the Microsoft Graph backend;
+	//   "legacy" — the classic IMAP syncer.
+	// When unset, Microsoft accounts default to "graph" and everything else to
+	// "legacy" (see EffectiveSyncEngine). Not supported for Google accounts (the
+	// engine has no X-GM-LABELS path); "graph" additionally requires a Microsoft
+	// account.
 	SyncEngine string `pkl:"sync_engine" json:"sync_engine"`
+}
+
+// EffectiveSyncEngine resolves the sync engine for this account, applying the
+// default when sync_engine is unset: Microsoft accounts (including shared/
+// delegated mailboxes) sync via Graph, all others via the legacy IMAP syncer.
+// Microsoft accounts may not opt into an IMAP path — validation rejects
+// "legacy"/"engine" for them (see ValidateConfig).
+func (a *AccountConfig) EffectiveSyncEngine() string {
+	if a.SyncEngine != "" {
+		return a.SyncEngine
+	}
+	if a.OAuth != nil && a.OAuth.Provider == "microsoft" {
+		return "graph"
+	}
+	return "legacy"
 }
 
 // UsesSyncEngine reports whether this account should sync via the new
 // provider-agnostic engine (on either backend) instead of the legacy IMAP syncer.
 func (a *AccountConfig) UsesSyncEngine() bool {
-	return a.SyncEngine == "engine" || a.SyncEngine == "graph"
+	e := a.EffectiveSyncEngine()
+	return e == "engine" || e == "graph"
 }
 
 // UsesGraphBackend reports whether the engine should drive the Microsoft Graph
 // backend rather than the IMAP backend for this account.
 func (a *AccountConfig) UsesGraphBackend() bool {
-	return a.SyncEngine == "graph"
+	return a.EffectiveSyncEngine() == "graph"
 }
 
 // CalendarDir returns the subdirectory name under the vdir base path for this

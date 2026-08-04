@@ -7,6 +7,35 @@ import (
 	"time"
 )
 
+// --- EffectiveSyncEngine ---
+
+func TestEffectiveSyncEngine(t *testing.T) {
+	ms := &OAuthConfig{Provider: "microsoft"}
+	google := &OAuthConfig{Provider: "google"}
+	cases := []struct {
+		name string
+		acct AccountConfig
+		want string
+	}{
+		{"microsoft unset defaults to graph", AccountConfig{Email: "me@x.com", OAuth: ms}, "graph"},
+		{"explicit legacy overrides microsoft default", AccountConfig{OAuth: ms, SyncEngine: "legacy"}, "legacy"},
+		{"explicit engine overrides microsoft default", AccountConfig{OAuth: ms, SyncEngine: "engine"}, "engine"},
+		{"delegated microsoft mailbox also defaults to graph", AccountConfig{Email: "shared@x.com", AuthEmail: "me@x.com", OAuth: ms}, "graph"},
+		{"google unset stays legacy", AccountConfig{OAuth: google}, "legacy"},
+		{"no oauth unset stays legacy", AccountConfig{}, "legacy"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.acct.EffectiveSyncEngine(); got != c.want {
+				t.Errorf("EffectiveSyncEngine() = %q, want %q", got, c.want)
+			}
+			if c.acct.UsesGraphBackend() != (c.want == "graph") {
+				t.Errorf("UsesGraphBackend() disagrees with effective engine %q", c.want)
+			}
+		})
+	}
+}
+
 // --- ValidateConfig ---
 
 func TestValidateConfig_ValidMinimal(t *testing.T) {
@@ -113,6 +142,25 @@ func TestValidateConfig_SyncEngineRejectsGmail(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected error rejecting sync_engine=engine for Google account, got errors: %v", errs)
+	}
+}
+
+func TestValidateConfig_SyncEngineRejectsIMAPForMicrosoft(t *testing.T) {
+	for _, engine := range []string{"legacy", "engine"} {
+		cfg := &Config{Accounts: []AccountConfig{{
+			Name: "Test", Email: "me@example.com",
+			OAuth:      &OAuthConfig{Provider: "microsoft"},
+			SyncEngine: engine,
+		}}}
+		found := false
+		for _, e := range ValidateConfig(cfg) {
+			if strings.Contains(e.Field, "sync_engine") && strings.Contains(e.Message, "Graph") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected error rejecting sync_engine=%q for a Microsoft account", engine)
+		}
 	}
 }
 

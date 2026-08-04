@@ -130,10 +130,11 @@ class AccountConfig {
   oauth: OAuthConfig?
   /// Vdir calendar sync settings (Microsoft and Google accounts).
   calendar: AccountCalendarConfig?
-  /// Sync implementation: "legacy" (default) uses the classic IMAP syncer;
-  /// "engine" uses the provider-agnostic engine on the IMAP backend; "graph"
-  /// uses the engine on the Microsoft Graph backend (Microsoft accounts only).
-  /// Not for Gmail.
+  /// Sync implementation: "legacy" (default for IMAP accounts) uses the classic
+  /// IMAP syncer; "engine" uses the provider-agnostic engine on the IMAP
+  /// backend; "graph" uses the engine on the Microsoft Graph backend. The
+  /// microsoft365 template sets "graph" — Microsoft accounts require it, "legacy"
+  /// and "engine" are rejected for them. Not for Gmail.
   sync_engine: "legacy"|"engine"|"graph" = "legacy"
 }
 
@@ -146,10 +147,13 @@ calendar: CalendarConfig = new {}
 // ── Provider Templates ─────────────────────────────────────
 
 /// Microsoft 365 account (OAuth). Use: (C.microsoft365) { name = ...; email = ...; alias = ... }
+/// Microsoft accounts sync (and send) via the Graph backend; the IMAP path is
+/// not supported for them.
 microsoft365: AccountConfig = new {
   smtp { host = "smtp.office365.com"; port = 587; auth = "oauth2" }
   imap { host = "outlook.office365.com"; port = 993; auth = "oauth2" }
   oauth { provider = "microsoft" }
+  sync_engine = "graph"
 }
 
 /// Microsoft 365 shared mailbox. Use: (C.microsoft365Shared) { name = ...; email = ...; auth_email = ...; alias = ... }

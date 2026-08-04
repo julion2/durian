@@ -64,8 +64,11 @@ type Options struct {
 type Result struct {
 	// Folders is the number of folders processed.
 	Folders int
-	// New is the number of messages ingested (new or updated).
+	// New is the number of genuinely new messages ingested this run.
 	New int
+	// Deduplicated is the number of messages that already existed locally and
+	// were updated in place (e.g. re-delivered by a delta after a flag change).
+	Deduplicated int
 	// Deleted is the number of server-side deletions applied locally.
 	Deleted int
 	// Moved is the number of local archive/delete actions uploaded to the
@@ -125,15 +128,18 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 		// re-fetching the server's copy, which would re-add role tags like
 		// "inbox" to messages the user archived but that haven't moved on the
 		// server yet, defeating the upload we're about to do.
+		var deltaFlags map[string]backend.Flags
 		if e.opts.Mode != UploadOnly {
-			if err := e.syncFolder(ctx, b, folder, result); err != nil {
+			df, err := e.syncFolder(ctx, b, folder, result)
+			if err != nil {
 				slog.Warn("Folder sync failed, continuing", "module", "SYNCENGINE",
 					"account", e.opts.Account, "folder", folder.Name, "err", err)
 				result.Errors = append(result.Errors, fmt.Errorf("folder %s: %w", folder.Name, err))
 				continue
 			}
+			deltaFlags = df
 		}
-		e.reconcileFolderFlags(ctx, b, folder, result)
+		e.reconcileFolderFlags(ctx, b, folder, deltaFlags, result)
 	}
 
 	// Upload local archive/delete actions (INBOX messages that lost the "inbox"
@@ -162,11 +168,17 @@ func (e *Engine) folderSelected(folder backend.Folder) bool {
 // syncFolder pages through one folder's changes until the backend reports no
 // more, persisting the cursor after every successfully processed batch so a
 // crash mid-folder resumes where it left off.
-func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backend.Folder, result *Result) error {
+func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backend.Folder, result *Result) (map[string]backend.Flags, error) {
 	cursor, err := e.opts.Cursors.Get(e.opts.Account, folder.Name)
 	if err != nil {
-		return fmt.Errorf("load cursor: %w", err)
+		return nil, fmt.Errorf("load cursor: %w", err)
 	}
+
+	// deltaFlags records the server flags carried by messages that appeared in
+	// this run's delta, keyed by RemoteRef.ID. For a backend whose delta reports
+	// flag changes, this is the complete set of server-side flag changes, so the
+	// flag pass reconciles from it instead of polling every message.
+	deltaFlags := make(map[string]backend.Flags)
 
 	// sessionRefs maps RemoteRef.ID -> Message-ID for messages ingested in THIS
 	// run of this folder. It is only a fallback: the backend resolves most
@@ -180,25 +192,28 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 	fetched := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("canceled: %w", err)
+			return nil, fmt.Errorf("canceled: %w", err)
 		}
 
 		res, err := b.FetchMessages(ctx, folder.Name, cursor, e.opts.BatchLimit)
 		if err != nil {
-			return fmt.Errorf("fetch messages: %w", err)
+			return nil, fmt.Errorf("fetch messages: %w", err)
 		}
 
 		for _, msg := range res.Messages {
 			if err := ctx.Err(); err != nil {
-				return fmt.Errorf("canceled: %w", err)
+				return nil, fmt.Errorf("canceled: %w", err)
 			}
+			// Record the server flags the delta carried, whether or not the
+			// message is new: a re-appearing message signals a server flag change.
+			deltaFlags[msg.Ref.ID] = msg.Flags
 			if e.opts.DryRun {
 				slog.Debug("[dry-run] Would ingest message", "module", "SYNCENGINE",
 					"folder", folder.Name, "ref", msg.Ref.ID, "message_id", msg.MessageID)
 				result.New++
 				continue
 			}
-			messageID, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, e.opts.Ingest)
+			messageID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, e.opts.Ingest)
 			if err != nil {
 				slog.Warn("Ingest failed", "module", "SYNCENGINE",
 					"folder", folder.Name, "ref", msg.Ref.ID, "err", err)
@@ -206,7 +221,13 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				continue
 			}
 			sessionRefs[msg.Ref.ID] = messageID
-			result.New++
+			// A re-delivered message (e.g. a flag change surfaced by the delta)
+			// is an update, not a new arrival — count the two separately.
+			if created {
+				result.New++
+			} else {
+				result.Deduplicated++
+			}
 		}
 
 		for _, del := range res.Deleted {
@@ -220,14 +241,14 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		// the next real sync).
 		if !e.opts.DryRun {
 			if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, res.Cursor); err != nil {
-				return fmt.Errorf("persist cursor: %w", err)
+				return nil, fmt.Errorf("persist cursor: %w", err)
 			}
 		}
 
 		fetched += len(res.Messages)
 
 		if !res.HasMore {
-			return nil
+			return deltaFlags, nil
 		}
 		// Stop at the per-folder cap (newest-first), so a first sync of a large
 		// folder does not page its entire history — parity with the legacy
@@ -235,12 +256,12 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		if e.opts.MaxPerFolder > 0 && fetched >= e.opts.MaxPerFolder {
 			slog.Debug("Reached per-folder message cap, stopping", "module", "SYNCENGINE", // encgrep:allow folder name and cap counts are operational sync metadata, not message content
 				"folder", folder.Name, "cap", e.opts.MaxPerFolder, "fetched", fetched)
-			return nil
+			return deltaFlags, nil
 		}
 		// Defensive guard: a backend that reports HasMore without changing
 		// anything would loop forever; bail out instead.
 		if len(res.Messages) == 0 && len(res.Deleted) == 0 && bytes.Equal(cursor, res.Cursor) {
-			return fmt.Errorf("backend reported HasMore without progress (cursor unchanged, no changes)")
+			return nil, fmt.Errorf("backend reported HasMore without progress (cursor unchanged, no changes)")
 		}
 		cursor = res.Cursor
 	}
@@ -266,7 +287,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 // New messages ingested this run already carry their flag tags and baseline,
 // so the pass no-ops for them. The pass is skipped entirely in DryRun: it
 // would otherwise write to the server, tags and baselines.
-func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, folder backend.Folder, result *Result) {
+func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, folder backend.Folder, deltaFlags map[string]backend.Flags, result *Result) {
 	if e.opts.NoFlags || e.opts.DryRun {
 		return
 	}
@@ -286,9 +307,22 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 		return
 	}
 
+	// Choose which messages to fetch server flags for. A delta backend already
+	// told us which messages changed server-side (they reappear in the delta),
+	// so only those — plus any the user changed locally — are candidates; polling
+	// every message was O(mailbox) and dominated a sync. FetchFlags stays the
+	// source of truth, keeping the three-way merge below byte-identical; only the
+	// ref set shrinks. A non-delta backend has no change feed, so it polls all.
+	useDelta := b.Capabilities().FlagChangesInDelta
 	refs := make([]backend.RemoteRef, 0, len(rows))
 	for _, row := range rows {
+		if useDelta && !e.flagCandidate(row, deltaFlags, upload) {
+			continue
+		}
 		refs = append(refs, backend.RemoteRef{Folder: folder.Name, ID: row.RemoteRef})
+	}
+	if len(refs) == 0 {
+		return
 	}
 
 	server, err := b.FetchFlags(ctx, folder.Name, refs)
@@ -303,7 +337,7 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 	for _, row := range rows {
 		serverFlags, ok := server[row.RemoteRef]
 		if !ok {
-			continue // Not on the server (anymore); the deletion path owns removals.
+			continue // Not fetched (no candidate change) or not on the server.
 		}
 
 		local := imap.FlagStateFromTags(row.Tags)
@@ -362,6 +396,22 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 
 	slog.Debug("Flag pass complete", "module", "SYNCENGINE",
 		"folder", folder.Name, "uploaded", uploaded, "downloaded", downloaded)
+}
+
+// flagCandidate reports whether a delta backend still needs this row's server
+// flags fetched: the message either changed server-side (it is in the delta's
+// change set) or the user changed its flags locally (an upload is pending).
+// Rows that are neither can be skipped, shrinking the flag fetch to O(changes).
+func (e *Engine) flagCandidate(row store.FolderFlagRow, deltaFlags map[string]backend.Flags, upload bool) bool {
+	if _, changedRemotely := deltaFlags[row.RemoteRef]; changedRemotely {
+		return true
+	}
+	if !upload {
+		return false
+	}
+	local := imap.FlagStateFromTags(row.Tags)
+	baseline := imap.FlagStateFromIMAP(splitFlags(row.SyncedFlags))
+	return imap.NeedsUpload(local, baseline)
 }
 
 // splitFlags splits a comma-joined IMAP flag string (the store's synced_flags

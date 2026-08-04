@@ -85,6 +85,7 @@ func syncOneWithEngine(ctx context.Context, account *config.AccountConfig, optio
 		return result
 	}
 	result.TotalNew = res.New
+	result.TotalDeduplicated = res.Deduplicated
 	result.TotalDeleted = res.Deleted
 	result.TotalMoved = res.Moved
 	if len(res.Errors) > 0 {

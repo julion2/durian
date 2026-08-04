@@ -124,6 +124,11 @@ type Capabilities struct {
 	NativeMove bool
 	// PushWatch reports real push/delta notifications rather than poll-only.
 	PushWatch bool
+	// FlagChangesInDelta reports that FetchMessages already surfaces server-side
+	// flag/read-state changes (a message reappears in the delta with its new
+	// flags). The engine then reconciles flags from the delta stream instead of
+	// polling every message's flags each sync, which is O(changes) not O(mailbox).
+	FlagChangesInDelta bool
 }
 
 // Backend is a provider-agnostic mail source. Implementations translate between
