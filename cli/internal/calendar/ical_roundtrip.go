@@ -111,16 +111,26 @@ func EventToICal(e Event) ([]byte, error) {
 	// sync engine diffs on — do not depend on provider ordering.
 	for _, o := range sortedOverrides(e.Overrides) {
 		if o.RecurrenceID.IsZero() {
+			// Log only the uid, never the user-controlled subject: it is enough
+			// to identify the dropped override and keeps untrusted text out of
+			// the log (CodeQL go/log-injection).
 			slog.Warn("Dropping series override without recurrence id", "module", "CALENDAR",
-				"uid", uid, "subject", o.Subject)
+				"uid", uid)
 			continue
 		}
 		comp, err := eventComponent(o, uid)
 		if err != nil {
 			return nil, err
 		}
+		// The value type follows the MASTER's DTSTART, not the override's:
+		// RECURRENCE-ID names a date the master's rule produced, so it has to
+		// be expressed the way that rule expresses its dates (RFC 5545
+		// 3.8.4.4). Taking it from the override would truncate the time of a
+		// timed occurrence that was turned into an all-day one — the key would
+		// come back as midnight, match no occurrence, and leave the series
+		// rendering both the original and the override.
 		recID := ical.NewProp(ical.PropRecurrenceID)
-		if o.AllDay {
+		if e.AllDay {
 			recID.SetValueType(ical.ValueDate)
 			recID.Value = o.RecurrenceID.UTC().Format("20060102")
 		} else {
@@ -368,8 +378,9 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 		return Event{}, err
 	}
 	for _, prop := range master.Props.Values(ical.PropExceptionDates) {
+		loc := propLocation(&prop, event.ICalUID)
 		for _, instant := range strings.Split(prop.Value, ",") {
-			t, err := parseICalInstant(strings.TrimSpace(instant))
+			t, err := parseICalInstantIn(strings.TrimSpace(instant), loc)
 			if err != nil {
 				slog.Warn("Ignoring unparseable EXDATE", "module", "CALENDAR",
 					"uid", event.ICalUID, "value", instant, "err", err)
@@ -384,7 +395,7 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 			return Event{}, err
 		}
 		prop := comp.Props.Get(ical.PropRecurrenceID)
-		recID, err := parseICalInstant(strings.TrimSpace(prop.Value))
+		recID, err := parseICalInstantIn(strings.TrimSpace(prop.Value), propLocation(prop, event.ICalUID))
 		if err != nil {
 			slog.Warn("Ignoring override with unparseable RECURRENCE-ID", "module", "CALENDAR",
 				"uid", event.ICalUID, "value", prop.Value, "err", err)
@@ -398,6 +409,30 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 	return event, nil
 }
 
+// propLocation resolves the TZID parameter of an EXDATE/RECURRENCE-ID property
+// to a location, falling back to UTC when the property names no zone or names
+// one this system does not know.
+//
+// durian writes these properties in UTC, but the vdir is a shared surface: a
+// file written by khal or another CalDAV client states the zone the series
+// lives in and a floating local time next to it. Reading "20260817T090000"
+// as UTC then places the exception a whole offset away from the occurrence it
+// cancels — the cancellation silently misses, and on the next upload the
+// wrong date is cancelled on the server instead.
+func propLocation(prop *ical.Prop, uid string) *time.Location {
+	tzid := prop.Params.Get(ical.ParamTimezoneID)
+	if tzid == "" {
+		return time.UTC
+	}
+	loc, err := time.LoadLocation(tzid)
+	if err != nil {
+		slog.Warn("Unknown TZID, reading the value as UTC", "module", "CALENDAR",
+			"uid", uid, "tzid", tzid, "err", err)
+		return time.UTC
+	}
+	return loc
+}
+
 // parseICalInstant parses an EXDATE/RECURRENCE-ID value in either the DATE
 // ("20260817") or the UTC DATE-TIME ("20260817T090000Z") form. A local
 // DATE-TIME without the trailing Z is read as UTC, matching how every other
@@ -409,14 +444,20 @@ func parseICalInstant(s string) (time.Time, error) {
 // parseICalInstantIn is parseICalInstant with an explicit location for the
 // floating (no trailing Z) DATE-TIME form, so a TZID-qualified value can be
 // resolved in the zone its property named.
+//
+// The DATE form is deliberately NOT resolved in loc. RFC 5545 3.2.19 forbids
+// TZID on a DATE value, and honoring it anyway would shift an all-day
+// exception onto the previous day for every zone east of UTC — the key would
+// then match no occurrence at all.
 func parseICalInstantIn(s string, loc *time.Location) (time.Time, error) {
 	if t, err := time.ParseInLocation("20060102T150405Z", s, time.UTC); err == nil {
 		return t.UTC(), nil
 	}
-	for _, layout := range []string{"20060102T150405", "20060102"} {
-		if t, err := time.ParseInLocation(layout, s, loc); err == nil {
-			return t.UTC(), nil
-		}
+	if t, err := time.ParseInLocation("20060102T150405", s, loc); err == nil {
+		return t.UTC(), nil
+	}
+	if t, err := time.ParseInLocation("20060102", s, time.UTC); err == nil {
+		return t.UTC(), nil
 	}
 	return time.Time{}, fmt.Errorf("unrecognized iCalendar instant %q", s)
 }

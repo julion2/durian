@@ -609,7 +609,7 @@ func TestRecurrenceRoundTrip(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			lines := recurrenceToGoogle(&tc.rec, nil, "evt-rt")
+			lines := recurrenceToGoogle(&tc.rec, nil, false, "evt-rt")
 			if len(lines) != 1 || lines[0] != tc.wantLine {
 				t.Fatalf("recurrenceToGoogle = %v, want [%s]", lines, tc.wantLine)
 			}
@@ -628,11 +628,11 @@ func TestRecurrenceRoundTrip(t *testing.T) {
 
 	// nil and unmappable recurrences serialize to the empty list (clears the
 	// series on PATCH).
-	if got := recurrenceToGoogle(nil, nil, "evt-rt"); !reflect.DeepEqual(got, []string{}) {
+	if got := recurrenceToGoogle(nil, nil, false, "evt-rt"); !reflect.DeepEqual(got, []string{}) {
 		t.Errorf("recurrenceToGoogle(nil) = %v, want []", got)
 	}
 	bad := &calendar.Recurrence{Pattern: calendar.RecurrencePattern{Type: "lunar"}}
-	if got := recurrenceToGoogle(bad, nil, "evt-rt"); !reflect.DeepEqual(got, []string{}) {
+	if got := recurrenceToGoogle(bad, nil, false, "evt-rt"); !reflect.DeepEqual(got, []string{}) {
 		t.Errorf("recurrenceToGoogle(unmappable) = %v, want []", got)
 	}
 }

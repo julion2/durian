@@ -600,22 +600,47 @@ func recurrenceFromGoogle(lines []string, start time.Time, id string) (rec *cale
 		switch {
 		case strings.HasPrefix(line, "RRULE"):
 			if rruleLine != "" {
-				slog.Warn("Ignoring additional RRULE line", "module", "GOOGLECAL", "id", id)
+				// A second RRULE is a rule component durian cannot express, like
+				// the EXDATE/default branches below: keep the series opaque so the
+				// write path leaves the multi-rule recurrence alone instead of
+				// PATCHing it down to the first rule only.
+				slog.Warn("Keeping series with multiple RRULE lines opaque", "module", "GOOGLECAL", "id", id)
+				opaque = true
 				continue
 			}
 			rruleLine = line
 		case strings.HasPrefix(line, "EXDATE"):
 			dates, err := calendar.ParseExDateLine(line)
 			if err != nil {
-				slog.Warn("Ignoring unparseable EXDATE line", "module", "GOOGLECAL",
+				// The cancellations on this line are now unknown. Uploading a
+				// recurrence rebuilt without them would revive the cancelled
+				// occurrences on the server — and for a meeting they would
+				// reappear in every attendee's calendar.
+				slog.Warn("Keeping series with an unreadable EXDATE line opaque", "module", "GOOGLECAL",
 					"id", id, "line", line, "err", err)
+				opaque = true
 				continue
 			}
 			exDates = append(exDates, dates...)
 		default:
-			slog.Warn("Ignoring unsupported recurrence line", "module", "GOOGLECAL",
+			// RDATE, EXRULE and anything else the neutral model cannot hold.
+			// Unlike a missing RRULE this is not "no recurrence": the rule
+			// exists and durian just cannot express all of it, so the upload
+			// must not rewrite the recurrence from the part it understood.
+			slog.Warn("Keeping series with an unsupported recurrence line opaque", "module", "GOOGLECAL",
 				"id", id, "line", line)
+			opaque = true
 		}
+	}
+	// Sort + dedup at the source so every read path (attachInstances, the
+	// iCalendar writer, exceptionsDigest) sees the ExceptionDates contract —
+	// ascending, no duplicates — regardless of the order the API returned the
+	// EXDATE lines or whether the master later received a cancelled instance.
+	exDates = sortedUniqueTimes(exDates)
+	if opaque {
+		// A rule component was lost. Report whatever was parsed for display,
+		// but never let the write paths reconstruct the recurrence from it.
+		return nil, exDates, true
 	}
 	if rruleLine == "" {
 		// Genuinely no rule: not opaque, just not a series.
@@ -638,6 +663,26 @@ func recurrenceFromGoogle(lines []string, start time.Time, id string) (rec *cale
 		return nil, exDates, true
 	}
 	return rec, exDates, false
+}
+
+// sortedUniqueTimes returns ts sorted ascending with duplicate instants removed.
+// ExceptionDates must satisfy that contract on every read path so the .ics bytes
+// (and the LocalHash / exceptionsDigest the sync engine diffs on) do not depend
+// on API line order, and a date present both as an EXDATE line and as a
+// cancelled instance yields a single EXDATE.
+func sortedUniqueTimes(ts []time.Time) []time.Time {
+	if len(ts) < 2 {
+		return ts
+	}
+	out := append([]time.Time(nil), ts...)
+	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
+	uniq := out[:1]
+	for _, t := range out[1:] {
+		if !t.Equal(uniq[len(uniq)-1]) {
+			uniq = append(uniq, t)
+		}
+	}
+	return uniq
 }
 
 // attendeeTypeFromGoogle maps the optional/resource flags onto the neutral
@@ -786,9 +831,10 @@ func (c *Client) attachInstances(events []calendar.Event, byID map[string]int, i
 
 	for idx := range touched {
 		master := &events[idx]
-		sort.Slice(master.ExceptionDates, func(i, j int) bool {
-			return master.ExceptionDates[i].Before(master.ExceptionDates[j])
-		})
+		// Re-sort + dedup: cancelled instances just appended to ExceptionDates
+		// (which recurrenceFromGoogle already sorted from the EXDATE lines) may
+		// duplicate a date that was both an EXDATE line and a cancelled instance.
+		master.ExceptionDates = sortedUniqueTimes(master.ExceptionDates)
 		sort.Slice(master.Overrides, func(i, j int) bool {
 			return master.Overrides[i].RecurrenceID.Before(master.Overrides[j].RecurrenceID)
 		})

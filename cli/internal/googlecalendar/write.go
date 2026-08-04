@@ -112,7 +112,7 @@ func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
 		slog.Warn("Omitting recurrence from upload: remote rule is not representable",
 			"module", "GOOGLECAL", "id", ev.ID, "uid", ev.ICalUID)
 	} else {
-		body["recurrence"] = recurrenceToGoogle(ev.Recurrence, ev.ExceptionDates, ev.ID)
+		body["recurrence"] = recurrenceToGoogle(ev.Recurrence, ev.ExceptionDates, ev.AllDay, ev.ID)
 	}
 	if includeAttendees {
 		body["attendees"] = attendeesToGoogle(ev.Attendees)
@@ -134,7 +134,7 @@ func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
 // warning (mirroring the read path, which would have parsed it to nil too).
 // Callers must not reach here for an event whose remote rule durian failed to
 // parse — see eventToGoogleBody, which omits the field entirely in that case.
-func recurrenceToGoogle(rec *calendar.Recurrence, exDates []time.Time, id string) []string {
+func recurrenceToGoogle(rec *calendar.Recurrence, exDates []time.Time, allDay bool, id string) []string {
 	if rec == nil {
 		return []string{}
 	}
@@ -147,7 +147,14 @@ func recurrenceToGoogle(rec *calendar.Recurrence, exDates []time.Time, id string
 
 	lines := []string{"RRULE:" + opt.RRuleString()}
 	for _, d := range exDates {
-		lines = append(lines, "EXDATE:"+d.UTC().Format("20060102T150405Z"))
+		// An all-day series takes date-valued EXDATEs; a UTC DATE-TIME EXDATE
+		// would not line up with the series' midnight-local occurrences and
+		// Google would keep the "cancelled" instance.
+		if allDay {
+			lines = append(lines, "EXDATE;VALUE=DATE:"+d.UTC().Format("20060102"))
+		} else {
+			lines = append(lines, "EXDATE:"+d.UTC().Format("20060102T150405Z"))
+		}
 	}
 	return lines
 }

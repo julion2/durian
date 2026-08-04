@@ -185,3 +185,39 @@ func TestEventToGoogleOmitsOpaqueRecurrence(t *testing.T) {
 		t.Error("body omits the recurrence key for a normal event")
 	}
 }
+
+// A recurrence line durian cannot hold must make the whole series opaque. The
+// upload rebuilds the recurrence from the parts it understood, so a dropped
+// EXDATE revives a cancelled occurrence on the server — and for a meeting it
+// reappears in every attendee's calendar.
+func TestRecurrenceFromGoogleMarksLostRecurrenceLinesOpaque(t *testing.T) {
+	start := time.Date(2026, 8, 3, 9, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name  string
+		lines []string
+	}{
+		{"unreadable EXDATE", []string{"RRULE:FREQ=WEEKLY;BYDAY=MO", "EXDATE:not-a-date"}},
+		{"RDATE", []string{"RRULE:FREQ=WEEKLY;BYDAY=MO", "RDATE:20260901T090000Z"}},
+		{"EXRULE", []string{"RRULE:FREQ=WEEKLY;BYDAY=MO", "EXRULE:FREQ=MONTHLY"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, _, opaque := recurrenceFromGoogle(tc.lines, start, "evt-x")
+			if !opaque {
+				t.Error("series was not marked opaque; the next upload would drop the line")
+			}
+			if rec != nil {
+				t.Errorf("recurrence = %+v, want nil so no write path can rebuild it", rec)
+			}
+		})
+	}
+
+	// A clean series must stay writable.
+	rec, exDates, opaque := recurrenceFromGoogle(
+		[]string{"RRULE:FREQ=WEEKLY;BYDAY=MO", "EXDATE:20260810T090000Z"}, start, "evt-x")
+	if opaque || rec == nil || len(exDates) != 1 {
+		t.Errorf("clean series = (rec=%v, exDates=%v, opaque=%v), want it fully parsed",
+			rec, exDates, opaque)
+	}
+}

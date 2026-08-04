@@ -711,11 +711,23 @@ func ParseEventJSON(data []byte) (calendar.Event, bool) {
 	return eventFromGraph(ge)
 }
 
-// parseGraphDateTime parses a Graph event dateTime like
-// "2026-07-23T10:00:00.0000000" as UTC (the preferUTC header guarantees UTC).
-// Go's time.Parse accepts the fractional seconds even though the layout does
-// not mention them.
+// parseGraphDateTime parses a Graph event timestamp as UTC. Graph uses two
+// shapes here and both reach this function:
+//
+//   - dateTimeTimeZone.dateTime (start/end) is a bare local time,
+//     "2026-07-23T10:00:00.0000000", whose zone lives in a sibling field —
+//     preferUTC pins that to UTC.
+//   - a plain DateTimeOffset (originalStart) carries its offset inline,
+//     "2026-08-17T09:00:00Z".
+//
+// Reading the second with the first's layout does not degrade, it fails
+// outright ("extra text: Z"), so the offset form is tried first. Go's
+// time.Parse accepts the fractional seconds of the bare form even though the
+// layout does not mention them.
 func parseGraphDateTime(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC(), nil
+	}
 	t, err := time.ParseInLocation("2006-01-02T15:04:05", s, time.UTC)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to parse graph dateTime %q: %w", s, err)

@@ -248,8 +248,7 @@ func contentHash(e Event, ownerEmail string, withResponses bool) string {
 		organizerEmail = e.Organizer.Email
 	}
 
-	h := sha256.New()
-	for _, field := range []string{
+	fields := []string{
 		e.Subject,
 		e.Start.UTC().Format(time.RFC3339),
 		e.End.UTC().Format(time.RFC3339),
@@ -262,8 +261,29 @@ func contentHash(e Event, ownerEmail string, withResponses bool) string {
 		strconv.FormatBool(e.IsOnlineMeeting),
 		e.OnlineMeetingURL,
 		strconv.FormatBool(e.IsCancelled),
-		exceptionsDigest(e, ownerEmail, withResponses),
-	} {
+	}
+	// The exceptions field is APPENDED ONLY WHEN THERE ARE ANY, and that
+	// condition is load-bearing rather than an optimization.
+	//
+	// Every field contributes its bytes plus a NUL terminator, so an
+	// unconditional empty field would still add a NUL and move the digest of
+	// every event in every calendar. The first sync after such a change reads
+	// as "remote changed" everywhere: an event with a pending local edit is
+	// then classified CONFLICT instead of UPLOAD, and under the default
+	// remote-wins policy that edit is rolled back rather than sent. Appending
+	// only for events that actually carry exceptions keeps every other
+	// baseline byte-identical, so the upgrade is a no-op for them.
+	//
+	// This stays injective: exceptionsDigest never returns "" for an event
+	// with exceptions, and its first byte is either a digit (RFC3339) or the
+	// \x1e separator — neither can be confused with the NUL-terminated
+	// IsCancelled boolean that precedes it.
+	if digest := exceptionsDigest(e, ownerEmail, withResponses); digest != "" {
+		fields = append(fields, digest)
+	}
+
+	h := sha256.New()
+	for _, field := range fields {
 		h.Write([]byte(field))
 		h.Write([]byte{0})
 	}
@@ -277,8 +297,10 @@ func contentHash(e Event, ownerEmail string, withResponses bool) string {
 // core/full distinction consistently. Overrides and exception dates are
 // cleared on the recursive call, which both bounds the recursion at one level
 // and keeps an override's digest independent of its position in the series.
-// Returns "" for an event without exceptions, so non-recurring events keep
-// their previous digest and no baseline is invalidated by this field alone.
+//
+// Returns "" for an event without exceptions. contentHash relies on that to
+// skip the field entirely for such events — see the note there on why a
+// present-but-empty field would still move every baseline.
 func exceptionsDigest(e Event, ownerEmail string, withResponses bool) string {
 	if len(e.ExceptionDates) == 0 && len(e.Overrides) == 0 {
 		return ""
