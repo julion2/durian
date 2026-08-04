@@ -76,6 +76,10 @@ type Backend struct {
 	// baseURL is the Graph API root without trailing slash. Defaults to
 	// defaultBaseURL; tests point it at an httptest.Server.
 	baseURL string
+	// mailbox is the URL segment identifying which mailbox to operate on:
+	// "/me" for the token owner's own mailbox, or "/users/{address}" for a
+	// shared/delegated mailbox accessed with the delegating user's token.
+	mailbox string
 	// tokenFn returns a valid Graph bearer token. Defaults to the cached
 	// oauth.GetGraphToken path (cachedGraphToken); tests override it.
 	tokenFn func(ctx context.Context) (string, error)
@@ -96,6 +100,13 @@ func New(account *config.AccountConfig) (*Backend, error) {
 		return nil, fmt.Errorf("graph backend requires a Microsoft OAuth account, got %s", account.Email)
 	}
 
+	// A delegated/shared mailbox is reached at /users/{address} with the
+	// delegating user's token; the token owner's own mailbox uses /me.
+	mailbox := "/me"
+	if account.IsDelegatedMailbox() {
+		mailbox = "/users/" + account.Email
+	}
+
 	b := &Backend{
 		account:      account,
 		clientID:     account.OAuth.ClientID,
@@ -103,6 +114,7 @@ func New(account *config.AccountConfig) (*Backend, error) {
 		tenant:       account.OAuth.Tenant,
 		httpClient:   &http.Client{Timeout: 60 * time.Second},
 		baseURL:      defaultBaseURL,
+		mailbox:      mailbox,
 	}
 	b.tokenFn = b.cachedGraphToken
 	return b, nil
@@ -329,7 +341,7 @@ func (b *Backend) FetchFolders(ctx context.Context) ([]backend.Folder, error) {
 	}
 
 	var folders []backend.Folder
-	pageURL := b.baseURL + "/me/mailFolders?$top=100&$select=id,displayName"
+	pageURL := b.baseURL + b.mailbox + "/mailFolders?$top=100&$select=id,displayName"
 	for pageURL != "" {
 		var page folderPage
 		if err := b.doJSON(ctx, http.MethodGet, pageURL, nil, &page); err != nil {
@@ -357,7 +369,7 @@ func (b *Backend) wellKnownRoleIDs(ctx context.Context) (map[string]backend.Role
 	roleByID := make(map[string]backend.Role, len(wellKnownRoles))
 	for _, m := range wellKnownRoles {
 		var folder graphFolder
-		reqURL := fmt.Sprintf("%s/me/mailFolders/%s?$select=id", b.baseURL, m.wellKnown)
+		reqURL := fmt.Sprintf("%s%s/mailFolders/%s?$select=id", b.baseURL, b.mailbox, m.wellKnown)
 		if err := b.doJSON(ctx, http.MethodGet, reqURL, nil, &folder); err != nil {
 			var se *statusError
 			if errors.As(err, &se) && se.status == http.StatusNotFound {
@@ -410,8 +422,8 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 	_ = limit // Soft hint only: Graph fixes the delta page size server-side.
 	var result backend.FetchResult
 
-	freshURL := fmt.Sprintf("%s/me/mailFolders/%s/messages/delta?$select=%s",
-		b.baseURL, url.PathEscape(folder), deltaSelect)
+	freshURL := fmt.Sprintf("%s%s/mailFolders/%s/messages/delta?$select=%s",
+		b.baseURL, b.mailbox, url.PathEscape(folder), deltaSelect)
 	pageURL := string(cursor)
 	if pageURL == "" {
 		pageURL = freshURL
@@ -434,11 +446,14 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 		}
 	}
 
+	// Split deletions (handled inline) from content items, whose raw MIME we
+	// fetch concurrently below — one serial $value roundtrip per message was the
+	// dominant cost of a sync.
+	var content []deltaItem
 	for _, item := range page.Value {
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-
 		if len(item.Removed) > 0 {
 			// A removed delta entry usually carries only the id; MessageID may
 			// therefore be empty and the engine falls back to same-run tracking.
@@ -448,24 +463,9 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 			})
 			continue
 		}
-
-		var raw bytes.Buffer
-		rawURL := b.baseURL + "/me/messages/" + url.PathEscape(item.ID) + "/$value"
-		if err := b.doRaw(ctx, rawURL, &raw); err != nil {
-			slog.Warn("Failed to fetch raw MIME, skipping message", "module", "GRAPHBACKEND",
-				"folder", folder, "id", item.ID, "err", err)
-			continue
-		}
-
-		result.Messages = append(result.Messages, backend.Message{
-			MessageID:    trimAngles(item.InternetMessageID),
-			Ref:          backend.RemoteRef{Folder: folder, ID: item.ID},
-			Raw:          raw.Bytes(),
-			Flags:        flagsFromGraph(item.IsRead, item.Flag),
-			Labels:       item.Categories,
-			InternalDate: parseGraphTime(item.ReceivedDateTime),
-		})
+		content = append(content, item)
 	}
+	result.Messages = b.fetchBodies(ctx, folder, content)
 
 	if page.NextLink != "" {
 		result.Cursor = backend.Cursor(page.NextLink)
@@ -479,11 +479,77 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 	return result, nil
 }
 
+// fetchConcurrency bounds the number of simultaneous $value downloads per delta
+// page: enough to hide per-request latency, low enough to stay under Graph's
+// per-app throttle ceiling (do() still backs off on a 429).
+const fetchConcurrency = 6
+
+// fetchBodies downloads the raw MIME for each content item concurrently and
+// returns the successfully fetched messages. A per-message fetch failure skips
+// only that message (logged), never the whole page.
+func (b *Backend) fetchBodies(ctx context.Context, folder string, items []deltaItem) []backend.Message {
+	msgs := make([]backend.Message, len(items)) // indexed by item; failures stay zero
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, fetchConcurrency)
+	for i := range items {
+		// Acquire a slot, or bail out early if the sync was cancelled.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return filterFetched(msgs)
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			msg, err := b.fetchOne(ctx, folder, items[i])
+			if err != nil {
+				slog.Warn("Failed to fetch raw MIME, skipping message", "module", "GRAPHBACKEND",
+					"folder", folder, "id", items[i].ID, "err", err)
+				return
+			}
+			msgs[i] = msg // own slot: no shared write, no mutex needed
+		}(i)
+	}
+	wg.Wait()
+	return filterFetched(msgs)
+}
+
+// filterFetched drops skipped (zero) entries in place, preserving order.
+func filterFetched(msgs []backend.Message) []backend.Message {
+	out := msgs[:0]
+	for _, m := range msgs {
+		if m.Ref.ID != "" {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// fetchOne downloads the raw MIME for a single delta item and builds its Message.
+func (b *Backend) fetchOne(ctx context.Context, folder string, item deltaItem) (backend.Message, error) {
+	var raw bytes.Buffer
+	rawURL := b.baseURL + b.mailbox + "/messages/" + url.PathEscape(item.ID) + "/$value"
+	if err := b.doRaw(ctx, rawURL, &raw); err != nil {
+		return backend.Message{}, err
+	}
+	return backend.Message{
+		MessageID:    trimAngles(item.InternetMessageID),
+		Ref:          backend.RemoteRef{Folder: folder, ID: item.ID},
+		Raw:          raw.Bytes(),
+		Flags:        flagsFromGraph(item.IsRead, item.Flag),
+		Labels:       item.Categories,
+		InternalDate: parseGraphTime(item.ReceivedDateTime),
+	}, nil
+}
+
 // FetchBody streams the full RFC822 message for ref to w via the $value
 // endpoint. Graph message ids are mailbox-global, so ref.Folder is not needed
 // for the lookup.
 func (b *Backend) FetchBody(ctx context.Context, ref backend.RemoteRef, w io.Writer) error {
-	reqURL := b.baseURL + "/me/messages/" + url.PathEscape(ref.ID) + "/$value"
+	reqURL := b.baseURL + b.mailbox + "/messages/" + url.PathEscape(ref.ID) + "/$value"
 	if err := b.doRaw(ctx, reqURL, w); err != nil {
 		return fmt.Errorf("failed to fetch body for %s in %s: %w", ref.ID, ref.Folder, err)
 	}
@@ -496,7 +562,8 @@ func (b *Backend) FetchBody(ctx context.Context, ref backend.RemoteRef, w io.Wri
 const batchLimit = 20
 
 // batchRequest is one sub-request of a Graph $batch call. URL is a
-// Graph-relative path (starting with /me/...), not a full URL.
+// Graph-relative path (starting with the mailbox segment, e.g. /me/...), not a
+// full URL.
 type batchRequest struct {
 	ID     string `json:"id"`
 	Method string `json:"method"`
@@ -537,7 +604,7 @@ func (b *Backend) FetchFlags(ctx context.Context, folder string, refs []backend.
 			requests[i] = batchRequest{
 				ID:     requestID,
 				Method: http.MethodGet,
-				URL:    "/me/messages/" + url.PathEscape(ref.ID) + "?$select=id,isRead,flag",
+				URL:    b.mailbox + "/messages/" + url.PathEscape(ref.ID) + "?$select=id,isRead,flag",
 			}
 			refIDByRequestID[requestID] = ref.ID
 		}
@@ -607,7 +674,7 @@ func (b *Backend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, re
 		return nil
 	}
 
-	reqURL := b.baseURL + "/me/messages/" + url.PathEscape(ref.ID)
+	reqURL := b.baseURL + b.mailbox + "/messages/" + url.PathEscape(ref.ID)
 	if err := b.doJSON(ctx, http.MethodPatch, reqURL, body, nil); err != nil {
 		return fmt.Errorf("failed to apply flags to %s in %s: %w", ref.ID, ref.Folder, err)
 	}
@@ -624,7 +691,7 @@ func (b *Backend) Move(ctx context.Context, ref backend.RemoteRef, destFolder st
 	var moved struct {
 		ID string `json:"id"`
 	}
-	reqURL := b.baseURL + "/me/messages/" + url.PathEscape(ref.ID) + "/move"
+	reqURL := b.baseURL + b.mailbox + "/messages/" + url.PathEscape(ref.ID) + "/move"
 	if err := b.doJSON(ctx, http.MethodPost, reqURL,
 		map[string]string{"destinationId": destFolder}, &moved); err != nil {
 		return backend.RemoteRef{}, fmt.Errorf("failed to move %s to %s: %w", ref.ID, destFolder, err)
@@ -666,9 +733,10 @@ func (b *Backend) Watch(ctx context.Context, _ string, _ func()) error {
 // watcher lands) there is no push notification support.
 func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
-		ServerSideSent: true,
-		NativeMove:     true,
-		PushWatch:      false,
+		ServerSideSent:     true,
+		NativeMove:         true,
+		PushWatch:          false,
+		FlagChangesInDelta: true,
 	}
 }
 

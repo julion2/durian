@@ -55,13 +55,19 @@ func Microsoft(tenant string) *Provider {
 		// re-consent covers both resources; minted into a separate Graph token
 		// via GetGraphToken. The IMAP/SMTP refresh path never sees these (mixing
 		// resources in one token request is rejected by Azure, AADSTS70011).
+		//
+		// The .Shared variants are supersets that cover the user's own mailbox
+		// AND shared/delegated mailboxes reached at /users/{address}. Without
+		// them a shared-mailbox request returns 403 ErrorAccessDenied even when
+		// the app registration grants the permission — the token only carries
+		// the scopes actually requested here.
 		GraphScopes: []string{
-			"https://graph.microsoft.com/Mail.ReadWrite",
-			"https://graph.microsoft.com/Mail.Send",
+			"https://graph.microsoft.com/Mail.ReadWrite.Shared",
+			"https://graph.microsoft.com/Mail.Send.Shared",
 			// Calendar read/write for the two-way vdir sync (same
 			// graph.microsoft.com resource as Mail, so it rides the same Graph
-			// token). ReadWrite supersedes Read.
-			"https://graph.microsoft.com/Calendars.ReadWrite",
+			// token). ReadWrite supersedes Read; .Shared covers shared calendars.
+			"https://graph.microsoft.com/Calendars.ReadWrite.Shared",
 		},
 		SASlMethod:      "XOAUTH2",
 		DefaultClientID: "d1969673-bd8a-4bf6-ad8f-f541879730a8",

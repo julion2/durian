@@ -140,12 +140,14 @@ func (o IngestOptions) headerSet() []string {
 // through this engine would tag All Mail messages with folder-role tags
 // instead of their labels.
 //
-// Returns the canonical Message-ID under which the message was stored, so the
-// engine can track RemoteRef->MessageID for deletions and flag updates.
-func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.Role, opts IngestOptions) (string, error) {
+// Returns the canonical Message-ID under which the message was stored (so the
+// engine can track RemoteRef->MessageID for deletions and flag updates) and
+// whether the row was newly created — false when the message already existed and
+// was updated in place, e.g. re-delivered by a delta because a flag changed.
+func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.Role, opts IngestOptions) (string, bool, error) {
 	parsed, err := mail.ReadMessage(bytes.NewReader(msg.Raw))
 	if err != nil {
-		return "", fmt.Errorf("parse message: %w", err)
+		return "", false, fmt.Errorf("parse message: %w", err)
 	}
 
 	content := parser.Parse(parsed)
@@ -162,6 +164,15 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		slog.Warn("Message has no Message-ID, using synthetic ID", "module", "SYNCENGINE",
 			"ref", msg.Ref.ID, "folder", folderName, "synthetic_id", messageID)
 	}
+
+	// A genuinely new message vs. an update of one already stored (a delta
+	// re-delivers a message when its flags change): the caller reports the two
+	// separately so "new" counts arrivals, not re-syncs.
+	existed, err := db.MessageExistsForAccount(messageID, opts.Account)
+	if err != nil {
+		return "", false, fmt.Errorf("check message existence: %w", err)
+	}
+	created := !existed
 
 	var dateUnix int64
 	if t, err := mail.ParseDate(content.Date); err == nil {
@@ -207,7 +218,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	}
 
 	if err := db.InsertMessage(storeMsg); err != nil {
-		return "", fmt.Errorf("insert message: %w", err)
+		return "", false, fmt.Errorf("insert message: %w", err)
 	}
 
 	// Clear old attachments on upsert, then re-insert
@@ -226,7 +237,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 			Disposition: att.Disposition,
 			ContentID:   att.ContentID,
 		}); err != nil {
-			return "", fmt.Errorf("insert attachment %d: %w", i, err)
+			return "", false, fmt.Errorf("insert attachment %d: %w", i, err)
 		}
 	}
 
@@ -243,7 +254,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	if mapping := tagMappingForRole(role); mapping != nil {
 		for _, tag := range mapping.addTags {
 			if err := db.AddTag(storeMsg.ID, tag); err != nil {
-				return "", fmt.Errorf("add folder tag %q: %w", tag, err)
+				return "", false, fmt.Errorf("add folder tag %q: %w", tag, err)
 			}
 		}
 	}
@@ -255,22 +266,22 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	flagAdd, _ := flagState.ToTagOps()
 	for _, tag := range flagAdd {
 		if err := db.AddTag(storeMsg.ID, tag); err != nil {
-			return "", fmt.Errorf("add flag tag %q: %w", tag, err)
+			return "", false, fmt.Errorf("add flag tag %q: %w", tag, err)
 		}
 	}
 
 	// Eagerly detect calendar content
 	if bytes.Contains(msg.Raw, []byte("text/calendar")) {
 		if err := db.AddTag(storeMsg.ID, "cal"); err != nil {
-			return "", fmt.Errorf("add cal tag: %w", err)
+			return "", false, fmt.Errorf("add cal tag: %w", err)
 		}
 	}
 
 	if err := applyFilterRules(db, storeMsg, content, parsed, opts); err != nil {
-		return "", err
+		return "", false, err
 	}
 
-	return messageID, nil
+	return messageID, created, nil
 }
 
 // applyFilterRules evaluates the user's filter rules against the freshly

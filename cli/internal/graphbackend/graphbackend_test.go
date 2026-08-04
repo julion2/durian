@@ -172,6 +172,86 @@ func TestFetchMessagesRecoversFromExpiredToken(t *testing.T) {
 	}
 }
 
+func TestMailboxRouting(t *testing.T) {
+	own, err := New(&config.AccountConfig{
+		Email: "me@example.com",
+		OAuth: &config.OAuthConfig{Provider: "microsoft"},
+	})
+	if err != nil {
+		t.Fatalf("New(own): %v", err)
+	}
+	if own.mailbox != "/me" {
+		t.Errorf("own mailbox = %q, want /me", own.mailbox)
+	}
+
+	// A shared mailbox (Email) accessed with a delegating user's token (AuthEmail)
+	// must route to /users/{address}, not /me (which would sync the token owner).
+	shared, err := New(&config.AccountConfig{
+		Email:     "shared@example.com",
+		AuthEmail: "me@example.com",
+		OAuth:     &config.OAuthConfig{Provider: "microsoft"},
+	})
+	if err != nil {
+		t.Fatalf("New(shared): %v", err)
+	}
+	if shared.mailbox != "/users/shared@example.com" {
+		t.Errorf("delegated mailbox = %q, want /users/shared@example.com", shared.mailbox)
+	}
+}
+
+func TestFetchMessagesConcurrentBodiesBounded(t *testing.T) {
+	const n = 15
+	var inFlight, maxInFlight int32
+	var srv *httptest.Server
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/mailFolders/f/messages/delta", func(w http.ResponseWriter, _ *http.Request) {
+		items := make([]map[string]any, 0, n)
+		for i := 0; i < n; i++ {
+			items = append(items, map[string]any{
+				"id":                fmt.Sprintf("m%d", i),
+				"internetMessageId": fmt.Sprintf("<m%d@example.com>", i),
+				"receivedDateTime":  "2026-07-01T10:00:00Z",
+			})
+		}
+		writeJSON(t, w, map[string]any{"value": items, "@odata.deltaLink": srv.URL + "/done"})
+	})
+	mux.HandleFunc("/v1.0/me/messages/", func(w http.ResponseWriter, r *http.Request) {
+		cur := atomic.AddInt32(&inFlight, 1)
+		for { // record the high-water mark of simultaneous fetches
+			old := atomic.LoadInt32(&maxInFlight)
+			if cur <= old || atomic.CompareAndSwapInt32(&maxInFlight, old, cur) {
+				break
+			}
+		}
+		time.Sleep(3 * time.Millisecond) // widen the overlap window
+		atomic.AddInt32(&inFlight, -1)
+
+		if strings.Contains(r.URL.Path, "/m7/") { // one message fails to fetch
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte("Subject: hi\r\n\r\nbody"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	result, err := b.FetchMessages(context.Background(), "f", nil, 50)
+	if err != nil {
+		t.Fatalf("FetchMessages: %v", err)
+	}
+	if len(result.Messages) != n-1 {
+		t.Errorf("got %d messages, want %d (failed fetch not skipped?)", len(result.Messages), n-1)
+	}
+	if maxInFlight > fetchConcurrency {
+		t.Errorf("max in-flight %d exceeded bound %d", maxInFlight, fetchConcurrency)
+	}
+	if maxInFlight < 2 {
+		t.Errorf("max in-flight %d — bodies fetched serially, not concurrently", maxInFlight)
+	}
+}
+
 func TestFetchMessagesDelta(t *testing.T) {
 	const rawMIME = "Message-ID: <abc@example.com>\r\nSubject: Hi\r\n\r\nBody\r\n"
 
