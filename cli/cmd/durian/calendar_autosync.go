@@ -52,7 +52,7 @@ func startCalendarAutosync(ctx context.Context, hub *handler.EventHub, cfg *conf
 		// /me calendars are already synced by the owner account — running it
 		// here would just duplicate them into a second directory.
 		if account.IsDelegatedMailbox() {
-			slog.Debug("Calendar autosync skipped for delegated mailbox", "module", "CALSYNC",
+			slog.Debug("Calendar autosync skipped for delegated mailbox", "module", "CALSYNC", // encgrep:allow static message text, no content
 				"account", account.GetAliasOrName()) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			continue
 		}
