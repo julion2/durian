@@ -211,23 +211,34 @@ func (a *AccountConfig) EffectiveSyncEngine() string {
 	if a.SyncEngine != "" {
 		return a.SyncEngine
 	}
-	if a.OAuth != nil && a.OAuth.Provider == "microsoft" {
-		return "graph"
+	if a.OAuth != nil {
+		switch a.OAuth.Provider {
+		case "microsoft":
+			return "graph"
+		case "google":
+			return "gmail"
+		}
 	}
 	return "legacy"
 }
 
 // UsesSyncEngine reports whether this account should sync via the new
-// provider-agnostic engine (on either backend) instead of the legacy IMAP syncer.
+// provider-agnostic engine (on any backend) instead of the legacy IMAP syncer.
 func (a *AccountConfig) UsesSyncEngine() bool {
 	e := a.EffectiveSyncEngine()
-	return e == "engine" || e == "graph"
+	return e == "engine" || e == "graph" || e == "gmail"
 }
 
 // UsesGraphBackend reports whether the engine should drive the Microsoft Graph
 // backend rather than the IMAP backend for this account.
 func (a *AccountConfig) UsesGraphBackend() bool {
 	return a.EffectiveSyncEngine() == "graph"
+}
+
+// UsesGmailBackend reports whether the engine should drive the Gmail REST
+// backend rather than the IMAP backend for this account.
+func (a *AccountConfig) UsesGmailBackend() bool {
+	return a.EffectiveSyncEngine() == "gmail"
 }
 
 // CalendarDir returns the subdirectory name under the vdir base path for this

@@ -43,6 +43,7 @@ go_library(
         "//cli/internal/contacts",
         "//cli/internal/dbcrypto",
         "//cli/internal/draft",
+        "//cli/internal/gmailbackend",
         "//cli/internal/googlecalendar",
         "//cli/internal/graphbackend",
         "//cli/internal/graphcalendar",

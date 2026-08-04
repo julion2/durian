@@ -98,6 +98,10 @@ type IngestOptions struct {
 	// IndexedHeaders are user-added MIME header names indexed on top of the
 	// builtin set (config.pkl sync.indexed_headers).
 	IndexedHeaders []string
+	// LabelsAsTags mirrors backend.Capabilities.LabelsAreTags: when set, the
+	// message's Labels are reconciled onto its tags (add/remove against the
+	// stored baseline) instead of applying folder-role tags.
+	LabelsAsTags bool
 }
 
 // headerSet returns the deduped, case-insensitive union of the builtin header
@@ -128,17 +132,14 @@ func (o IngestOptions) headerSet() []string {
 }
 
 // Ingest parses a raw message fetched from a backend and writes it to the
-// SQLite store: message row, attachments, indexed headers, folder-role tags,
-// flag tags, cal tag, and filter rules. It is a provider-neutral port of the
-// legacy (*imap.Syncer).storeInsertMessage and must stay behavior-identical
-// to it, with one deliberate exception:
+// SQLite store: message row, attachments, indexed headers, tags (folder-role or
+// mirrored labels), flag tags, cal tag, and filter rules. It is a
+// provider-neutral port of the legacy (*imap.Syncer).storeInsertMessage.
 //
-// SCOPE NOTE: this ingest omits the Gmail X-GM-LABELS branch (isGmailAllMail /
-// gmailLabelsToTags). Gmail accounts stay on the legacy imap.Syncer, where All
-// Mail label sync is authoritative; the engine path targets Microsoft Graph
-// and generic IMAP, where folder-role mapping is authoritative. Routing Gmail
-// through this engine would tag All Mail messages with folder-role tags
-// instead of their labels.
+// Tag source depends on the backend: a label backend (Gmail, opts.LabelsAsTags)
+// mirrors the message's labels to tags via reconcileLabels; every other backend
+// applies the folder-role SPECIAL-USE mapping. A Google account may still opt
+// back to the legacy imap.Syncer with sync_engine="legacy".
 //
 // Returns the canonical Message-ID under which the message was stored (so the
 // engine can track RemoteRef->MessageID for deletions and flag updates) and
@@ -249,9 +250,14 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		}
 	}
 
-	// Folder-role tags (legacy: SPECIAL-USE tag mapping; see scope note above
-	// for why there is no Gmail label branch here).
-	if mapping := tagMappingForRole(role); mapping != nil {
+	// Tags from the source's organization: a label backend (Gmail) mirrors the
+	// message's labels to tags (add + remove against the baseline); everything
+	// else applies the folder-role SPECIAL-USE tag mapping.
+	if opts.LabelsAsTags {
+		if err := reconcileLabels(db, messageID, opts.Account, msg.Labels); err != nil {
+			return "", false, fmt.Errorf("reconcile labels: %w", err)
+		}
+	} else if mapping := tagMappingForRole(role); mapping != nil {
 		for _, tag := range mapping.addTags {
 			if err := db.AddTag(storeMsg.ID, tag); err != nil {
 				return "", false, fmt.Errorf("add folder tag %q: %w", tag, err)
@@ -282,6 +288,47 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	}
 
 	return messageID, created, nil
+}
+
+// reconcileLabels mirrors a message's labels (already resolved to Durian tag
+// names) onto its tags using the stored baseline: it adds labels new since last
+// sync and removes labels the server dropped, leaving Durian-local tags (rules,
+// flags) untouched. The current set becomes the new baseline. Runs for both new
+// and re-ingested messages (a new message has an empty baseline, so all its
+// labels are added).
+func reconcileLabels(db *store.DB, messageID, account string, labels []string) error {
+	baselineStr, err := db.GetSyncedLabels(messageID, account)
+	if err != nil {
+		return fmt.Errorf("get label baseline: %w", err)
+	}
+	baseline := splitFlags(baselineStr) // comma-split; "" -> nil
+
+	inLabels := make(map[string]bool, len(labels))
+	for _, t := range labels {
+		inLabels[t] = true
+	}
+	inBaseline := make(map[string]bool, len(baseline))
+	for _, t := range baseline {
+		inBaseline[t] = true
+	}
+
+	var add, remove []string
+	for _, t := range labels {
+		if !inBaseline[t] {
+			add = append(add, t)
+		}
+	}
+	for _, t := range baseline {
+		if !inLabels[t] {
+			remove = append(remove, t)
+		}
+	}
+	if len(add) > 0 || len(remove) > 0 {
+		if err := db.ModifyTagsByMessageIDAndAccount(messageID, account, add, remove); err != nil {
+			return fmt.Errorf("reconcile label tags: %w", err)
+		}
+	}
+	return db.SetSyncedLabels(messageID, account, strings.Join(labels, ","))
 }
 
 // applyFilterRules evaluates the user's filter rules against the freshly

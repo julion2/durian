@@ -754,6 +754,9 @@ func (b *Backend) Capabilities() backend.Capabilities {
 		// server-side flag change surfaces in the incremental stream — the engine
 		// reconciles flags from it (via FetchFlags) instead of polling every message.
 		FlagChangesInDelta: true,
+		// Message.Labels carries each message's Gmail labels as tag names; the
+		// engine mirrors them to tags instead of folder-role mapping.
+		LabelsAreTags: true,
 	}
 }
 

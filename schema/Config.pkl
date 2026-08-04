@@ -159,10 +159,11 @@ class AccountConfig {
   calendar: AccountCalendarConfig?
   /// Sync implementation: "legacy" (default for IMAP accounts) uses the classic
   /// IMAP syncer; "engine" uses the provider-agnostic engine on the IMAP
-  /// backend; "graph" uses the engine on the Microsoft Graph backend. The
-  /// microsoft365 template sets "graph" — Microsoft accounts require it, "legacy"
-  /// and "engine" are rejected for them. Not for Gmail.
-  sync_engine: "legacy"|"engine"|"graph" = "legacy"
+  /// backend; "graph" uses the Microsoft Graph backend; "gmail" uses the Gmail
+  /// REST backend (labels become tags). The microsoft365 template sets "graph"
+  /// and the gmail template sets "gmail"; for those providers the IMAP paths are
+  /// rejected. "graph" requires Microsoft, "gmail" requires Google.
+  sync_engine: "legacy"|"engine"|"graph"|"gmail" = "legacy"
 }
 
 // ── Defaults ───────────────────────────────────────────────
@@ -189,8 +190,11 @@ microsoft365Shared: AccountConfig = (microsoft365) {
 }
 
 /// Gmail account (OAuth). Use: (C.gmail) { name = ...; email = ...; alias = ...; oauth { client_id = ...; client_secret = ... } }
+/// Gmail accounts sync via the Gmail REST backend (labels become tags); set
+/// sync_engine = "legacy" to fall back to the classic IMAP syncer.
 gmail: AccountConfig = new {
   smtp { host = "smtp.gmail.com"; port = 587; auth = "oauth2" }
   imap { host = "imap.gmail.com"; port = 993; auth = "oauth2" }
   oauth { provider = "google" }
+  sync_engine = "gmail"
 }

@@ -21,7 +21,8 @@ func TestEffectiveSyncEngine(t *testing.T) {
 		{"explicit legacy overrides microsoft default", AccountConfig{OAuth: ms, SyncEngine: "legacy"}, "legacy"},
 		{"explicit engine overrides microsoft default", AccountConfig{OAuth: ms, SyncEngine: "engine"}, "engine"},
 		{"delegated microsoft mailbox also defaults to graph", AccountConfig{Email: "shared@x.com", AuthEmail: "me@x.com", OAuth: ms}, "graph"},
-		{"google unset stays legacy", AccountConfig{OAuth: google}, "legacy"},
+		{"google unset defaults to gmail", AccountConfig{OAuth: google}, "gmail"},
+		{"explicit legacy overrides gmail default", AccountConfig{OAuth: google, SyncEngine: "legacy"}, "legacy"},
 		{"no oauth unset stays legacy", AccountConfig{}, "legacy"},
 	}
 	for _, c := range cases {
