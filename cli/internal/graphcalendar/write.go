@@ -195,9 +195,13 @@ func (c *Client) UpdateEvent(ctx context.Context, calendarID, eventID string, sp
 // (event absent remotely) is reached either way. etag, when non-empty, is
 // sent as an If-Match header (see UpdateEvent); a 412 surfaces as
 // calendarsync.ErrPrecondition, which the engine skips and re-plans.
-// calendarID is unused: Graph event ids are mailbox-global.
-func (c *Client) DeleteEvent(ctx context.Context, calendarID, eventID, etag string) error {
-	_ = calendarID
+// calendarID is unused: Graph event ids are mailbox-global. notify is unused
+// too: Graph decides for itself whether to mail the attendees — deleting a
+// meeting the owner organizes always cancels it for everyone, and there is no
+// wire flag to opt out. The engine still states its intent so the Google
+// provider, which does need to be told, gets it.
+func (c *Client) DeleteEvent(ctx context.Context, calendarID, eventID, etag string, notify bool) error {
+	_, _ = calendarID, notify
 	reqURL := c.baseURL + "/me/events/" + url.PathEscape(eventID)
 	headers := map[string]string{"Prefer": preferMaster}
 	if etag != "" {

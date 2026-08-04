@@ -172,11 +172,17 @@ func responseToGoogle(s string) string {
 	}
 }
 
-// sendUpdatesParam maps the engine's attendee gate onto the sendUpdates query
-// parameter: attendee-carrying writes notify everyone, attendee-less writes
-// notify no one.
-func sendUpdatesParam(includeAttendees bool) string {
-	if includeAttendees {
+// sendUpdatesParam maps the engine's notification intent onto the sendUpdates
+// query parameter. Google's default is "none", so silence is what an omitted
+// parameter buys — every notifying write has to say so explicitly.
+//
+// This deliberately does NOT key off the attendee gate. Uploading the attendee
+// list and telling the attendees are separate decisions (see the notification
+// policy note in calendarsync): a PATCH that moves a meeting by an hour
+// changes no attendee, and gating on the attendee list would have Google
+// deliver nothing while the plan preview promised an update mail.
+func sendUpdatesParam(notify bool) string {
+	if notify {
 		return "all"
 	}
 	return "none"
@@ -242,7 +248,7 @@ func (c *Client) CreateEvent(ctx context.Context, calendarID string, ev calendar
 	}
 
 	q := url.Values{}
-	q.Set("sendUpdates", sendUpdatesParam(opts.IncludeAttendees))
+	q.Set("sendUpdates", sendUpdatesParam(opts.NotifyAttendees))
 	if opts.RequestOnlineMeeting {
 		q.Set("conferenceDataVersion", "1")
 		body["conferenceData"] = map[string]any{
@@ -289,7 +295,7 @@ func (c *Client) UpdateEvent(ctx context.Context, calendarID, eventID string, sp
 	}
 
 	q := url.Values{}
-	q.Set("sendUpdates", sendUpdatesParam(spec.IncludeAttendees))
+	q.Set("sendUpdates", sendUpdatesParam(spec.NotifyAttendees))
 	reqURL := c.baseURL + "/calendars/" + url.PathEscape(calendarID) +
 		"/events/" + url.PathEscape(eventID) + "?" + q.Encode()
 	var headers map[string]string
@@ -311,9 +317,11 @@ func (c *Client) UpdateEvent(ctx context.Context, calendarID, eventID string, sp
 // an already-deleted event. etag, when non-empty, is sent as an If-Match
 // header (see UpdateEvent); a 412 surfaces as calendarsync.ErrPrecondition,
 // which the engine skips and re-plans.
-func (c *Client) DeleteEvent(ctx context.Context, calendarID, eventID, etag string) error {
+func (c *Client) DeleteEvent(ctx context.Context, calendarID, eventID, etag string, notify bool) error {
+	q := url.Values{}
+	q.Set("sendUpdates", sendUpdatesParam(notify))
 	reqURL := c.baseURL + "/calendars/" + url.PathEscape(calendarID) +
-		"/events/" + url.PathEscape(eventID)
+		"/events/" + url.PathEscape(eventID) + "?" + q.Encode()
 	var headers map[string]string
 	if etag != "" {
 		headers = map[string]string{"If-Match": etag}

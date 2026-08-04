@@ -917,17 +917,58 @@ func writeRemoteEvent(calDir, path, uid string, ev Event, status *CalendarStatus
 // the rewritten bytes) both come from the read-back, making the next sync a
 // clean no-op. If the read-back fails, the create response is hashed instead
 // — a slightly worse baseline, but never a failed sync.
+// notifyAttendees is the provider-neutral notification policy: it reports
+// whether the remote write for this action should make the provider send mail
+// to the event's attendees (invitation on create, change notice on update,
+// cancellation on delete).
+//
+// This is the single place that decision is made. Graph ignores the answer and
+// notifies by its own rules; Google obeys it literally, so a wrong answer here
+// is the difference between attendees learning a meeting moved and them
+// showing up at the old time. It must also agree with what PlanNotifications
+// promised the user in the confirmation preview — the preview and the wire
+// must never disagree.
+//
+// Available inputs on the action:
+//
+//	a.OwnerIsOrganizer — whether the account owner organizes this event
+//	                     (already role-gated: false for meetings the owner
+//	                     merely attends, where attendee changes are never
+//	                     pushed and a deletion is routed as a decline instead)
+//	a.Recipients       — the number of attendees other than the owner
+//	a.RemoteExists     — whether a remote side exists for this action
+//	a.LocalEvent       — the local event content (a.LocalEvent.Attendees)
+//	a.Remote           — the remote event content (a.Remote.Attendees)
+func notifyAttendees(a Action) bool {
+	// One predicate for create, update and delete, matching notificationFor's
+	// create/update condition exactly. Delete looks stricter there
+	// (a.RemoteExists && len(a.Remote.Attendees) > 0), but those terms are
+	// implied: Recipients is counted from the REMOTE attendees whenever a
+	// remote side exists, and when it does not, the delete 404s and sends
+	// nothing regardless of the flag.
+	//
+	// Both terms are load-bearing. OwnerIsOrganizer keeps the engine from
+	// mailing on a foreign organizer's behalf — a meeting the owner merely
+	// attends never takes this path, it is routed to an RSVP whose own
+	// sendResponse flag decides. Recipients > 0 is what the autosync
+	// safe-upload gate rests on: an attendee-less appointment scores zero, so
+	// "provably non-notifying" stays provable.
+	return a.OwnerIsOrganizer && a.Recipients > 0
+}
+
 func createFromLocal(ctx context.Context, p CalendarProvider, plan CalendarPlan, a Action, status *CalendarStatus) error {
 	// Role gate: attendees (= invitations) go out only when the owner is the
 	// organizer of this event. A file carrying a foreign ORGANIZER never
 	// invites on that person's behalf.
 	includeAttendees := a.OwnerIsOrganizer && len(a.LocalEvent.Attendees) > 0
+	notify := notifyAttendees(a)
 	slog.Info("Creating remote event from local file", "module", "CALSYNC",
 		"calendar", plan.Calendar.Name, "uid", a.UID, "path", a.LocalPath,
-		"invites", includeAttendees, "recipients", a.Recipients)
+		"invites", includeAttendees, "notify", notify, "recipients", a.Recipients)
 
 	opts := CreateOptions{
 		IncludeAttendees: includeAttendees,
+		NotifyAttendees:  notify,
 		// One-shot online-meeting marker: honored on create only. The
 		// post-create rewrite below drops the marker from the local file.
 		RequestOnlineMeeting: a.LocalEvent.RequestOnlineMeeting,
@@ -1006,15 +1047,17 @@ func patchFromLocal(ctx context.Context, p CalendarProvider, plan CalendarPlan, 
 	if a.RemoteExists {
 		etag = a.Remote.ETag
 	}
+	notify := notifyAttendees(a)
 	spec := UpdateSpec{
 		Event:            a.LocalEvent,
 		IncludeAttendees: attendeesChanged,
+		NotifyAttendees:  notify,
 		AttendeesOnly:    attendeesChanged && !coreChanged,
 		ETag:             etag,
 	}
 	slog.Info("Updating remote event from local edit", "module", "CALSYNC",
 		"calendar", plan.Calendar.Name, "uid", a.UID, "remoteID", a.RemoteID, "path", a.LocalPath,
-		"attendeesChanged", attendeesChanged, "recipients", a.Recipients)
+		"attendeesChanged", attendeesChanged, "notify", notify, "recipients", a.Recipients)
 
 	if err := p.UpdateEvent(ctx, plan.Calendar.ID, a.RemoteID, spec); err != nil {
 		return fmt.Errorf("failed to update remote event for %s: %w", a.UID, err)
@@ -1065,10 +1108,11 @@ func removeRemoteEvent(ctx context.Context, p CalendarProvider, plan CalendarPla
 	if a.RemoteExists {
 		etag = a.Remote.ETag
 	}
+	notify := notifyAttendees(a)
 	slog.Info("Deleting remote event (local file deleted)", "module", "CALSYNC",
 		"calendar", plan.Calendar.Name, "uid", a.UID, "remoteID", a.RemoteID,
-		"cancelsMeeting", a.OwnerIsOrganizer && a.Recipients > 0, "recipients", a.Recipients)
-	if err := p.DeleteEvent(ctx, plan.Calendar.ID, a.RemoteID, etag); err != nil {
+		"cancelsMeeting", notify, "recipients", a.Recipients)
+	if err := p.DeleteEvent(ctx, plan.Calendar.ID, a.RemoteID, etag, notify); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			slog.Info("Remote event already gone on delete", "module", "CALSYNC", "id", a.RemoteID)
 			return nil

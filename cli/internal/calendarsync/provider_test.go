@@ -34,11 +34,12 @@ type fakeProvider struct {
 	updateErr   error
 	updateSpecs map[string]calendarsync.UpdateSpec
 
-	// deleteErr, when set, fails every DeleteEvent; deleted ids and their
-	// etags are recorded.
-	deleteErr   error
-	deletes     []string
-	deleteETags map[string]string
+	// deleteErr, when set, fails every DeleteEvent; deleted ids, their etags
+	// and the notification intent the engine passed are recorded.
+	deleteErr    error
+	deletes      []string
+	deleteETags  map[string]string
+	deleteNotify map[string]bool
 
 	// responds records RespondToEvent calls (event id -> response).
 	responds map[string]calendarsync.OwnerResp
@@ -77,12 +78,14 @@ func (f *fakeProvider) UpdateEvent(_ context.Context, _, eventID string, spec ca
 	return f.updateErr
 }
 
-func (f *fakeProvider) DeleteEvent(_ context.Context, _, eventID, etag string) error {
+func (f *fakeProvider) DeleteEvent(_ context.Context, _, eventID, etag string, notify bool) error {
 	if f.deleteETags == nil {
 		f.deleteETags = map[string]string{}
+		f.deleteNotify = map[string]bool{}
 	}
 	f.deletes = append(f.deletes, eventID)
 	f.deleteETags[eventID] = etag
+	f.deleteNotify[eventID] = notify
 	return f.deleteErr
 }
 
@@ -245,5 +248,108 @@ func TestSeamDeleteNotFoundIsSuccess(t *testing.T) {
 	}
 	if _, ok := status.Items["uid-1"]; ok {
 		t.Error("status entry must be dropped after the folded delete")
+	}
+}
+
+// MARK: - Notification intent across the seam
+
+// ownedMeeting is remoteEvent plus the owner as organizer and one other
+// attendee — the shape every notifying write needs.
+func ownedMeeting(id, uid, subject string) Event {
+	ev := remoteEvent(id, uid, subject)
+	ev.Organizer = &Person{Email: testOwnerEmail}
+	// Type must be set as both real providers set it: the attendee baseline
+	// hashes "email|type", so an empty type here would survive the iCal
+	// round-trip as "required" and fake an attendee change on every edit.
+	ev.Attendees = []Attendee{
+		{Email: testOwnerEmail, Type: "required", Response: "accepted"},
+		{Email: "guest@example.com", Type: "required", Response: "needsAction"},
+	}
+	return ev
+}
+
+// TestSeamRescheduleStatesNotifyIntent is the regression for the leak that
+// made Google silent: the notification used to be derived from the attendee
+// upload gate, so moving a meeting — which changes no attendee — told the
+// provider not to notify, and the guests never learned it moved. Graph hides
+// this (it notifies on its own), Google does not.
+func TestSeamRescheduleStatesNotifyIntent(t *testing.T) {
+	f := &fakeProvider{events: []Event{ownedMeeting("g1", "uid-1", "Standup")}}
+	dir := t.TempDir()
+	status := CalendarStatus{Items: map[string]ItemStatus{}}
+	if stats := syncFake(t, f, dir, &status); stats != (SyncStats{Downloaded: 1}) {
+		t.Fatalf("seed stats = %+v, want Downloaded=1 only", stats)
+	}
+
+	// Move the meeting an hour later by editing the downloaded file, so the
+	// attendee set is byte-identical to what the sync last saw.
+	path := filepath.Join(dir, "uid-1.ics")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read downloaded ics: %v", err)
+	}
+	ev, err := ICalToEvent(data, testOwnerEmail)
+	if err != nil {
+		t.Fatalf("parse downloaded ics: %v", err)
+	}
+	ev.Start = ev.Start.Add(time.Hour)
+	ev.End = ev.End.Add(time.Hour)
+	writeLocalICS(t, dir, ev)
+
+	if stats := syncFake(t, f, dir, &status); stats != (SyncStats{Uploaded: 1}) {
+		t.Fatalf("stats = %+v, want Uploaded=1 only", stats)
+	}
+	spec, ok := f.updateSpecs["g1"]
+	if !ok {
+		t.Fatal("UpdateEvent was not called for g1")
+	}
+	if !spec.NotifyAttendees {
+		t.Error("a reschedule of an owned meeting must state NotifyAttendees, or Google stays silent")
+	}
+	if spec.IncludeAttendees {
+		t.Error("the attendee set did not change; it must not be uploaded")
+	}
+}
+
+// TestSeamCancelStatesNotifyIntent covers the delete side: the organizer's
+// delete cancels the meeting for everyone, so the cancellation mail must be
+// asked for explicitly.
+func TestSeamCancelStatesNotifyIntent(t *testing.T) {
+	f := &fakeProvider{events: []Event{ownedMeeting("g1", "uid-1", "Standup")}}
+	dir := t.TempDir()
+	status := CalendarStatus{Items: map[string]ItemStatus{}}
+	if stats := syncFake(t, f, dir, &status); stats != (SyncStats{Downloaded: 1}) {
+		t.Fatalf("seed stats = %+v, want Downloaded=1 only", stats)
+	}
+	if err := os.Remove(filepath.Join(dir, "uid-1.ics")); err != nil {
+		t.Fatal(err)
+	}
+
+	if stats := syncFake(t, f, dir, &status); stats != (SyncStats{DeletedRemote: 1}) {
+		t.Fatalf("stats = %+v, want DeletedRemote=1 only", stats)
+	}
+	if !f.deleteNotify["g1"] {
+		t.Error("cancelling an owned meeting must state notify, or the guests are never told")
+	}
+}
+
+// TestSeamPlainAppointmentIsSilent is the other half: an attendee-less
+// appointment notifies nobody. The autosync safe-upload gate depends on this
+// staying false.
+func TestSeamPlainAppointmentIsSilent(t *testing.T) {
+	f := &fakeProvider{events: []Event{remoteEvent("g1", "uid-1", "Focus time")}}
+	dir := t.TempDir()
+	status := CalendarStatus{Items: map[string]ItemStatus{}}
+	if stats := syncFake(t, f, dir, &status); stats != (SyncStats{Downloaded: 1}) {
+		t.Fatalf("seed stats = %+v, want Downloaded=1 only", stats)
+	}
+
+	edited := remoteEvent("", "uid-1", "Focus time (moved)")
+	writeLocalICS(t, dir, edited)
+	if stats := syncFake(t, f, dir, &status); stats != (SyncStats{Uploaded: 1}) {
+		t.Fatalf("stats = %+v, want Uploaded=1 only", stats)
+	}
+	if f.updateSpecs["g1"].NotifyAttendees {
+		t.Error("an attendee-less appointment must never notify")
 	}
 }

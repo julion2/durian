@@ -46,14 +46,34 @@ type Calendar struct {
 	HexColor string
 }
 
+// Notification policy across the seam
+//
+// "Upload the attendee list" and "tell the attendees about it" are two
+// different decisions, and providers disagree about whether they are coupled:
+//
+//   - Graph decides on its own. Any write to an event the owner organizes
+//     with attendees mails them; the client cannot ask for silence, and does
+//     not have to ask for mail either.
+//   - Google decides from the sendUpdates query parameter, defaulting to
+//     "none". Silence is what you get unless you ask.
+//
+// So the engine states its intent explicitly — CreateOptions/UpdateSpec carry
+// NotifyAttendees, and DeleteEvent takes a notify argument — and each provider
+// maps it onto its own model (Graph: ignore, and document that it does).
+// Deriving the notification from IncludeAttendees instead would be silently
+// wrong on Google for every write that changes the time or subject without
+// touching the attendee set: nobody would be told the meeting moved.
+
 // CreateOptions tunes one provider CreateEvent call. The engine computes
 // every field; the provider serializes them into its wire format.
 type CreateOptions struct {
-	// IncludeAttendees uploads the event's attendee list — which makes the
-	// provider send invitations. The engine sets it only for meetings the
-	// account owner organizes (role gate); providers must not add attendees
-	// on their own.
+	// IncludeAttendees uploads the event's attendee list. The engine sets it
+	// only for meetings the account owner organizes (role gate); providers
+	// must not add attendees on their own.
 	IncludeAttendees bool
+	// NotifyAttendees asks the provider to send invitations for this create.
+	// See the notification policy note above.
+	NotifyAttendees bool
 	// RequestOnlineMeeting asks the provider to attach an online meeting
 	// (e.g. Teams) to the created event — the local one-shot marker.
 	RequestOnlineMeeting bool
@@ -72,9 +92,12 @@ type UpdateSpec struct {
 	// IncludeAttendees uploads the attendee list (role-gated by the engine,
 	// see CreateOptions.IncludeAttendees).
 	IncludeAttendees bool
+	// NotifyAttendees asks the provider to tell the attendees about this
+	// update. See the notification policy note above.
+	NotifyAttendees bool
 	// AttendeesOnly restricts the update to the attendee set: the engine sets
 	// it when ONLY the attendees changed, so the provider can send a scoped
-	// patch that notifies just the added/removed attendees.
+	// patch that reaches just the added/removed attendees.
 	AttendeesOnly bool
 	// ETag is the remote etag read at planning time, sent as the write
 	// precondition; a mismatch must surface as ErrPrecondition.
@@ -107,8 +130,10 @@ type CalendarProvider interface {
 	// spec.ETag (ErrPrecondition on mismatch).
 	UpdateEvent(ctx context.Context, calendarID, eventID string, spec UpdateSpec) error
 	// DeleteEvent deletes an event, conditional on etag when non-empty
-	// (ErrPrecondition on mismatch, ErrNotFound when already gone).
-	DeleteEvent(ctx context.Context, calendarID, eventID, etag string) error
+	// (ErrPrecondition on mismatch, ErrNotFound when already gone). With
+	// notify the attendees receive the cancellation; see the notification
+	// policy note above.
+	DeleteEvent(ctx context.Context, calendarID, eventID, etag string, notify bool) error
 	// RespondToEvent records the owner's RSVP for a meeting; with
 	// sendResponse the organizer is notified (comment included when
 	// non-empty). resp must be Accepted, Declined or Tentative.

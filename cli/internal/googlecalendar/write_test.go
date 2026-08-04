@@ -109,6 +109,7 @@ func TestCreateEventOrganizedMeeting(t *testing.T) {
 	created, err := testClient(srv).CreateEvent(context.Background(), "cal-primary", testMeetingEvent(),
 		calendarsync.CreateOptions{
 			IncludeAttendees:     true,
+			NotifyAttendees:      true,
 			RequestOnlineMeeting: true,
 			IdempotencyKey:       "550E8400-E29B-41D4-A716-446655440000",
 		})
@@ -308,6 +309,7 @@ func TestUpdateEventAttendeesOnly(t *testing.T) {
 	err := testClient(srv).UpdateEvent(context.Background(), "cal-primary", "evt-1", calendarsync.UpdateSpec{
 		Event:            testMeetingEvent(),
 		IncludeAttendees: true,
+		NotifyAttendees:  true,
 		AttendeesOnly:    true,
 	})
 	if err != nil {
@@ -359,7 +361,7 @@ func TestDeleteEvent(t *testing.T) {
 	srv, captured := captureServer(t, []int{http.StatusNoContent}, []string{""})
 	defer srv.Close()
 
-	if err := testClient(srv).DeleteEvent(context.Background(), "cal-primary", "evt-1", `"etag-1"`); err != nil {
+	if err := testClient(srv).DeleteEvent(context.Background(), "cal-primary", "evt-1", `"etag-1"`, true); err != nil {
 		t.Fatalf("DeleteEvent: %v", err)
 	}
 	req := (*captured)[0]
@@ -368,6 +370,50 @@ func TestDeleteEvent(t *testing.T) {
 	}
 	if got := req.header.Get("If-Match"); got != `"etag-1"` {
 		t.Errorf("If-Match = %q", got)
+	}
+}
+
+// TestDeleteEventNotifiesAttendees pins the cancellation mail. Google's
+// sendUpdates defaults to "none", so an organizer's delete that omits the
+// parameter removes the meeting from everyone's calendar without telling a
+// soul — while the CLI preview announces a cancellation mail.
+func TestDeleteEventNotifiesAttendees(t *testing.T) {
+	cases := []struct {
+		notify bool
+		want   string
+	}{
+		{true, "all"},
+		{false, "none"},
+	}
+	for _, tc := range cases {
+		srv, captured := captureServer(t, []int{http.StatusNoContent}, []string{""})
+		if err := testClient(srv).DeleteEvent(context.Background(), "cal-primary", "evt-1", "", tc.notify); err != nil {
+			t.Fatalf("DeleteEvent(notify=%v): %v", tc.notify, err)
+		}
+		if got := (*captured)[0].query.Get("sendUpdates"); got != tc.want {
+			t.Errorf("DeleteEvent(notify=%v) sendUpdates = %q, want %q", tc.notify, got, tc.want)
+		}
+		srv.Close()
+	}
+}
+
+// TestUpdateEventNotifiesWithoutAttendeeChange covers a reschedule: the
+// attendee set is untouched, so gating the notification on the attendee
+// upload would send sendUpdates=none and nobody would learn the meeting moved.
+func TestUpdateEventNotifiesWithoutAttendeeChange(t *testing.T) {
+	srv, captured := captureServer(t, []int{http.StatusOK}, []string{`{"etag": "\"etag-2\""}`})
+	defer srv.Close()
+
+	err := testClient(srv).UpdateEvent(context.Background(), "cal-primary", "evt-1", calendarsync.UpdateSpec{
+		Event:            testMeetingEvent(),
+		IncludeAttendees: false,
+		NotifyAttendees:  true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateEvent: %v", err)
+	}
+	if got := (*captured)[0].query.Get("sendUpdates"); got != "all" {
+		t.Errorf("sendUpdates = %q, want \"all\" for a reschedule that changes no attendee", got)
 	}
 }
 
@@ -386,7 +432,7 @@ func TestDeleteEventSentinels(t *testing.T) {
 			srv, _ := captureServer(t, []int{tc.status}, []string{`{"error": {}}`})
 			defer srv.Close()
 
-			err := testClient(srv).DeleteEvent(context.Background(), "cal-primary", "evt-1", `"etag-1"`)
+			err := testClient(srv).DeleteEvent(context.Background(), "cal-primary", "evt-1", `"etag-1"`, true)
 			if !errors.Is(err, tc.want) {
 				t.Errorf("DeleteEvent(%d) = %v, want %v sentinel", tc.status, err, tc.want)
 			}
