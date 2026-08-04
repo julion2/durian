@@ -270,6 +270,17 @@ func newStatusError(resp *http.Response) error {
 	return &statusError{status: resp.StatusCode, body: strings.TrimSpace(string(snippet))}
 }
 
+// isSyncStateExpired reports whether err is a Graph 410 SyncStateNotFound — the
+// signal that a delta token has aged out and the delta must be restarted from
+// scratch rather than resumed.
+func isSyncStateExpired(err error) bool {
+	var se *statusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	return se.status == http.StatusGone && strings.Contains(se.body, "SyncStateNotFound")
+}
+
 // drainClose drains (bounded) and closes a response body so the underlying
 // connection can be reused.
 func drainClose(resp *http.Response) {
@@ -399,15 +410,28 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 	_ = limit // Soft hint only: Graph fixes the delta page size server-side.
 	var result backend.FetchResult
 
+	freshURL := fmt.Sprintf("%s/me/mailFolders/%s/messages/delta?$select=%s",
+		b.baseURL, url.PathEscape(folder), deltaSelect)
 	pageURL := string(cursor)
 	if pageURL == "" {
-		pageURL = fmt.Sprintf("%s/me/mailFolders/%s/messages/delta?$select=%s",
-			b.baseURL, url.PathEscape(folder), deltaSelect)
+		pageURL = freshURL
 	}
 
 	var page deltaPage
 	if err := b.doJSON(ctx, http.MethodGet, pageURL, nil, &page); err != nil {
-		return result, fmt.Errorf("failed to fetch delta page for %s: %w", folder, err)
+		// An expired delta token returns 410 SyncStateNotFound; Graph's contract
+		// is to discard it and restart the delta from scratch. Retry once from a
+		// fresh delta URL so the folder resyncs (upsert dedups, so it is safe)
+		// instead of the whole account sync aborting.
+		if pageURL != freshURL && isSyncStateExpired(err) {
+			slog.Info("Graph delta token expired, restarting full delta for folder", "module", "GRAPHBACKEND", "folder", folder) // encgrep:allow folder name is operational sync metadata, not message content
+			page = deltaPage{}
+			if err := b.doJSON(ctx, http.MethodGet, freshURL, nil, &page); err != nil {
+				return result, fmt.Errorf("failed to restart delta for %s: %w", folder, err)
+			}
+		} else {
+			return result, fmt.Errorf("failed to fetch delta page for %s: %w", folder, err)
+		}
 	}
 
 	for _, item := range page.Value {
