@@ -68,6 +68,7 @@ const (
 var (
 	Sync              = calendarsync.Sync
 	Plan              = calendarsync.Plan
+	Apply             = calendarsync.Apply
 	PlanNotifications = calendarsync.PlanNotifications
 	NewFileStateStore = calendarsync.NewFileStateStore
 
@@ -2043,5 +2044,83 @@ func TestSyncDownloadIsAtomic(t *testing.T) {
 	}
 	if _, err := os.Stat(h.icsPath("uid-1")); err != nil {
 		t.Errorf("downloaded event missing: %v", err)
+	}
+}
+
+// MARK: - Local-side write precondition
+
+// TestSyncSkipsDownloadWhenLocalChangedSincePlanning is the autosync race:
+// Plan sees a remote update and decides to overwrite the local file, the user
+// edits exactly that event through the GUI before Apply runs, and the download
+// lands on top of the fresh edit. The tracked path has no backup, so the edit
+// would be gone.
+func TestSyncSkipsDownloadWhenLocalChangedSincePlanning(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{masterEvent("g1", "uid-1", "Standup", "ck1")}
+	h.sync(SyncOptions{})
+
+	// The remote moved on, so the plan wants a download-update.
+	h.events = []map[string]any{masterEvent("g1", "uid-1", "Standup (remote edit)", "ck2")}
+	plan, err := Plan(context.Background(), h.client, Calendar{ID: "cal1", Name: "Work"}, h.calDir, h.status)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if len(plan.Actions) != 1 || plan.Actions[0].Kind != ActionDownloadUpdate {
+		t.Fatalf("actions = %+v, want a single download-update", plan.Actions)
+	}
+
+	// Between Plan and Apply the user edits the same event locally.
+	local := "BEGIN:VCALENDAR\nlocal edit that must survive\n"
+	if err := os.WriteFile(h.icsPath("uid-1"), []byte(local), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := Apply(context.Background(), h.client, plan, &h.status, SyncOptions{})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if stats != (SyncStats{Skipped: 1}) {
+		t.Fatalf("stats = %+v, want Skipped=1 (never clobber a fresh local edit)", stats)
+	}
+	got, err := os.ReadFile(h.icsPath("uid-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != local {
+		t.Errorf("local file was overwritten:\n%s", got)
+	}
+}
+
+// TestSyncSkipsPruneWhenLocalChangedSincePlanning covers the other destructive
+// local path: a remotely deleted event whose local file was just edited must
+// not be removed under the user's hands.
+func TestSyncSkipsPruneWhenLocalChangedSincePlanning(t *testing.T) {
+	h := newSyncHarness(t)
+	h.events = []map[string]any{masterEvent("g1", "uid-1", "Standup", "ck1")}
+	h.sync(SyncOptions{})
+
+	h.events = nil
+	plan, err := Plan(context.Background(), h.client, Calendar{ID: "cal1", Name: "Work"}, h.calDir, h.status)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if len(plan.Actions) != 1 || plan.Actions[0].Kind != ActionPruneLocal {
+		t.Fatalf("actions = %+v, want a single prune-local", plan.Actions)
+	}
+
+	local := "BEGIN:VCALENDAR\nedited while the plan was pending\n"
+	if err := os.WriteFile(h.icsPath("uid-1"), []byte(local), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := Apply(context.Background(), h.client, plan, &h.status, SyncOptions{})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if stats != (SyncStats{Skipped: 1}) {
+		t.Fatalf("stats = %+v, want Skipped=1", stats)
+	}
+	if _, err := os.Stat(h.icsPath("uid-1")); err != nil {
+		t.Errorf("local file pruned despite the pending edit: %v", err)
 	}
 }

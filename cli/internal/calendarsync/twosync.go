@@ -84,6 +84,11 @@
 //     ErrPrecondition (remote changed since planning) skips that action —
 //     counted in Stats.Skipped — and the next run re-plans from fresh state
 //     instead of clobbering.
+//   - The same guard runs on the LOCAL side: before overwriting or pruning a
+//     local .ics, Apply re-hashes it and skips when it no longer matches what
+//     Plan read. Plan and Apply are separated by the confirmation prompt and,
+//     under autosync, by a network round trip — long enough for the GUI write
+//     handler, khal or an editor to rewrite the file.
 //   - Attendees are only uploaded for meetings the OWNER organizes (role
 //     gate); for meetings the owner merely attends, attendee changes are
 //     never pushed and a local deletion is routed as a decline.
@@ -896,6 +901,9 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 		case ActionDownloadNew, ActionDownloadUpdate:
 			slog.Info("Downloading remote event", "module", "CALSYNC",
 				"calendar", plan.Calendar.Name, "uid", a.UID, "kind", a.Kind)
+			if err = checkLocalUnchanged(a); err != nil {
+				break
+			}
 			if err = downloadRemoteEvent(plan, a, status, p.Owner()); err == nil {
 				stats.Downloaded++
 			}
@@ -919,6 +927,9 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 		case ActionPruneLocal:
 			slog.Info("Pruning local event deleted remotely", "module", "CALSYNC",
 				"calendar", plan.Calendar.Name, "uid", a.UID, "path", a.LocalPath)
+			if err = checkLocalUnchanged(a); err != nil {
+				break
+			}
 			if rmErr := os.Remove(a.LocalPath); rmErr != nil {
 				err = fmt.Errorf("failed to prune %s: %w", a.LocalPath, rmErr)
 			} else {
@@ -976,6 +987,13 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 		}
 		if err != nil {
 			switch {
+			case errors.Is(err, errLocalStale):
+				// The local file was rewritten between planning and this
+				// write (a GUI edit, khal, an editor). Never clobber it:
+				// skip and re-plan next run, the local-side mirror of R2.
+				slog.Warn("Local file changed since planning, skipping action", "module", "CALSYNC",
+					"calendar", plan.Calendar.Name, "uid", a.UID, "kind", a.Kind)
+				stats.Skipped++
 			case errors.Is(err, ErrPrecondition):
 				// The remote event changed between planning and this write:
 				// never clobber — skip and let the next run re-plan from
@@ -1403,6 +1421,41 @@ func writeCalendarMeta(calDir string, cal Calendar) error {
 		if err := WriteFileAtomic(filepath.Join(calDir, "color"), []byte(cal.HexColor+"\n"), 0o600); err != nil {
 			return fmt.Errorf("failed to write color for %s: %w", cal.Name, err)
 		}
+	}
+	return nil
+}
+
+// errLocalStale marks a local file that changed on disk between Plan and
+// Apply. It is the local-side twin of ErrPrecondition: the same rail, other
+// direction. Apply skips the action and the next run re-plans from what the
+// file actually holds now.
+var errLocalStale = errors.New("local file changed since planning")
+
+// checkLocalUnchanged verifies that the local file still holds the bytes the
+// plan was built from, and returns errLocalStale when it does not.
+//
+// Plan and Apply are separated by the confirmation prompt and, under autosync,
+// by however long the network takes. The GUI write handler, khal, vdirsyncer
+// or a text editor can all rewrite an .ics in that window. Without this check
+// a download-update overwrites the fresh edit with the remote rendering and a
+// prune deletes it outright — in both cases silently, because the engine
+// believes it is acting on the file it read during planning.
+//
+// A missing file is not an error: the deletion is exactly what the next plan
+// should observe, and the caller (prune) wanted it gone anyway.
+func checkLocalUnchanged(a Action) error {
+	if !a.LocalExists || a.LocalPath == "" {
+		return nil
+	}
+	cur, err := os.ReadFile(a.LocalPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to re-read %s: %w", a.LocalPath, err)
+	}
+	if hashBytes(cur) != a.LocalHash {
+		return fmt.Errorf("%w: %s", errLocalStale, a.LocalPath)
 	}
 	return nil
 }
