@@ -52,8 +52,8 @@ class CalendarConfig {
   /// `durian calendar sync` confirmation. Per-account override:
   /// accounts[*].calendar.autosync.
   autosync: Boolean = true
-  /// Autosync interval in seconds (minimum 60, default 60).
-  autosync_interval: Int(this >= 60) = 60
+  /// Autosync interval in seconds (minimum 60, default 600).
+  autosync_interval: Int(this >= 60) = 600
   /// What autosync may push to the remote calendar: "none" (default) keeps
   /// autosync strictly download-only; "safe" additionally auto-applies
   /// provably non-notifying local changes — creates and edits of events

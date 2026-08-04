@@ -64,9 +64,10 @@ type CalendarConfig struct {
 	// calendar block (configs that do not amend the schema get no Pkl
 	// defaults) resolves to the schema default true instead of false.
 	Autosync *bool `pkl:"autosync" json:"autosync"`
-	// AutosyncInterval is the autosync interval in seconds (Pkl default 60,
-	// schema minimum 60). Use Config.CalendarAutosyncInterval for the
-	// resolved time.Duration.
+	// AutosyncInterval is the autosync interval in seconds (Pkl default 600,
+	// schema minimum 60). Polling a calendar API harder than the 120 s mail
+	// fetch buys nothing and courts provider throttling. Use
+	// Config.CalendarAutosyncInterval for the resolved time.Duration.
 	AutosyncInterval int `pkl:"autosync_interval" json:"autosync_interval"`
 	// AutosyncUpload selects what the background autosync may push to the
 	// remote calendar: "none" (default, also for "" / absent block) keeps
@@ -199,10 +200,10 @@ func (c *Config) CalendarAutosyncUploadSafe(a *AccountConfig) bool {
 }
 
 // calendarAutosyncDefaultInterval mirrors the Pkl schema default for
-// calendar.autosync_interval (60 s), used when the configured value is
+// calendar.autosync_interval (600 s), used when the configured value is
 // missing or below the schema minimum of 60 s (e.g. a Go-constructed Config
 // that bypassed Pkl evaluation).
-const calendarAutosyncDefaultInterval = 60 * time.Second
+const calendarAutosyncDefaultInterval = 600 * time.Second
 
 // CalendarAutosyncInterval returns the calendar autosync interval as a
 // duration, falling back to the 60-second default when the configured value

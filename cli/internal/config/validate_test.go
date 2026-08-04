@@ -335,8 +335,8 @@ func TestValidateConfigCalendarAutosyncUpload(t *testing.T) {
 
 func TestCalendarAutosyncInterval(t *testing.T) {
 	cfg := &Config{}
-	if got := cfg.CalendarAutosyncInterval(); got != 60*time.Second {
-		t.Errorf("unset interval = %v, want the 60s default", got)
+	if got := cfg.CalendarAutosyncInterval(); got != 600*time.Second {
+		t.Errorf("unset interval = %v, want the 600s default", got)
 	}
 	cfg.Calendar.AutosyncInterval = 300
 	if got := cfg.CalendarAutosyncInterval(); got != 300*time.Second {
@@ -347,8 +347,8 @@ func TestCalendarAutosyncInterval(t *testing.T) {
 		t.Errorf("interval = %v, want 60s (schema minimum)", got)
 	}
 	cfg.Calendar.AutosyncInterval = 30
-	if got := cfg.CalendarAutosyncInterval(); got != 60*time.Second {
-		t.Errorf("below-minimum interval = %v, want the 60s default", got)
+	if got := cfg.CalendarAutosyncInterval(); got != 600*time.Second {
+		t.Errorf("below-minimum interval = %v, want the 600s default", got)
 	}
 }
 

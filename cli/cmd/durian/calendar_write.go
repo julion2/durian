@@ -219,7 +219,7 @@ func runCalendarRsvp(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to serialize event: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := calendar.WriteFileAtomic(path, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write %s: %w", path, err)
 	}
 

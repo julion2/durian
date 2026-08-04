@@ -67,8 +67,9 @@ deleted remotely), and local changes are pushed to the remote calendar
 (create new events, update edited ones, delete remotely what was deleted
 locally).
 Conflicts — events changed on both sides — are resolved per the account's
-calendar conflict policy ("remote" by default; a conflicting local file is
-always backed up to <file>.conflict-<timestamp> first).
+calendar conflict policy ("newer" by default — the side modified last wins;
+a conflicting local file is always backed up to <file>.conflict-<timestamp>
+first).
 
 Meetings are fully supported: creating an event with ATTENDEE lines sends
 invitations, organizer edits send updates, deleting an organizer meeting
