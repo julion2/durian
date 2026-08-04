@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -202,7 +203,18 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load calendar sync state: %w", err)
 	}
 
-	plans, err := calendarsync.PlanAll(cmd.Context(), client, accountDir, account.CalendarInclude(), state)
+	// The mirror holds the last known remote state and the download cursors.
+	// It is filled in by PlanAll and persisted only once the plan has been
+	// applied — every early return below (dry run, declined gate) therefore
+	// leaves the cursor where it was, so the next run sees the same changes
+	// again instead of skipping them.
+	mirrorStore := calendarsync.NewFileMirrorStore(accountDir)
+	mirror, err := mirrorStore.Load()
+	if err != nil {
+		return fmt.Errorf("failed to load calendar mirror: %w", err)
+	}
+
+	plans, err := calendarsync.PlanAll(cmd.Context(), client, accountDir, account.CalendarInclude(), state, mirror)
 	if err != nil {
 		if client.IsAuthError(err) {
 			return fmt.Errorf("calendar sync failed — calendar access may not be granted, run 'durian auth login %s' to consent: %w",
@@ -262,6 +274,14 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 			return errors.Join(applyErr, saveErr)
 		}
 		return saveErr
+	}
+	// The mirror follows the state, and for the same reason: the actions that
+	// did NOT get applied left no baseline behind, so the next run replans
+	// them against this same mirror. A mirror that failed to save is not worth
+	// failing the sync over — it only costs one full download next time.
+	if saveErr := mirrorStore.Save(mirror); saveErr != nil {
+		slog.Warn("Failed to save calendar mirror, next sync reads in full", "module", "CALENDAR",
+			"account", account.GetAliasOrName(), "err", saveErr) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	}
 	if applyErr != nil {
 		if client.IsAuthError(applyErr) {

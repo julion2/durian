@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "calendarsync.go",
         "export.go",
+        "mirror.go",
         "notify.go",
         "runlock.go",
         "state.go",
@@ -23,14 +24,16 @@ go_test(
     size = "small",
     srcs = [
         "corechange_test.go",
+        "deltaplan_test.go",
         "downloadonly_test.go",
         "export_test.go",
+        "mirror_test.go",
         "nonnotifying_test.go",
         "provider_test.go",
         "twosync_test.go",
     ],
+    embed = [":calendarsync"],
     deps = [
-        ":calendarsync",
         "//cli/internal/calendar",
         "//cli/internal/graphcalendar",
     ],
