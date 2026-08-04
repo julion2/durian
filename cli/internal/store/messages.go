@@ -144,9 +144,12 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 			mailbox_id = CASE WHEN excluded.mailbox_id IS NOT NULL
 			                 THEN excluded.mailbox_id ELSE messages.mailbox_id END,
 			remote_ref = CASE WHEN excluded.remote_ref != ''
-			                 THEN excluded.remote_ref ELSE messages.remote_ref END,
-			synced_flags = CASE WHEN excluded.synced_flags != ''
-			                 THEN excluded.synced_flags ELSE messages.synced_flags END
+			                 THEN excluded.remote_ref ELSE messages.remote_ref END
+			-- synced_flags is deliberately NOT updated on conflict: it is the
+			-- flag-sync baseline, set once at insert and thereafter owned by the
+			-- reconciliation (SetSyncedFlags). Overwriting it when a delta
+			-- re-delivers a message after a server-side flag change would corrupt
+			-- the three-way merge and revert that change.
 		RETURNING id`,
 		msg.MessageID, threadID, msg.InReplyTo, msg.Refs, subjectCT,
 		msg.FromAddr, msg.ToAddrs, msg.CCAddrs,
