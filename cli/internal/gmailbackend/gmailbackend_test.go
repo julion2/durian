@@ -47,6 +47,21 @@ func registerProfile(t *testing.T, mux *http.ServeMux, historyID string) {
 	})
 }
 
+// registerLabels serves a users.labels.list response so FetchMessages can
+// resolve label ids to tag names: INBOX -> inbox (system), Label_5 -> newsletter
+// (user), UNREAD/STARRED -> no tag (flags).
+func registerLabels(t *testing.T, mux *http.ServeMux) {
+	mux.HandleFunc("/users/me/labels", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]any{
+			"labels": []map[string]string{
+				{"id": "INBOX", "name": "INBOX", "type": "system"},
+				{"id": "UNREAD", "name": "UNREAD", "type": "system"},
+				{"id": "STARRED", "name": "STARRED", "type": "system"},
+				{"id": "Label_5", "name": "Newsletter", "type": "user"},
+			},
+		})
+	})
+}
 func TestNewRejectsNonGoogle(t *testing.T) {
 	if _, err := New(&config.AccountConfig{Email: "a@b.c"}); err == nil {
 		t.Error("New() accepted an account without OAuth")
@@ -64,6 +79,7 @@ func TestFetchMessagesListAndRaw(t *testing.T) {
 
 	mux := http.NewServeMux()
 	registerProfile(t, mux, "999")
+	registerLabels(t, mux)
 	mux.HandleFunc("/users/me/messages", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Query().Get("includeSpamTrash"); got != "true" {
 			t.Errorf("includeSpamTrash = %q, want true", got)
@@ -111,9 +127,9 @@ func TestFetchMessagesListAndRaw(t *testing.T) {
 	if msg.Flags.Seen || msg.Flags.Flagged {
 		t.Errorf("flags = %+v, want Seen=false Flagged=false", msg.Flags)
 	}
-	// Reserved flag labels are stripped; the rest become tag labels.
-	if len(msg.Labels) != 2 || msg.Labels[0] != "INBOX" || msg.Labels[1] != "Label_5" {
-		t.Errorf("labels = %v, want [INBOX Label_5] (UNREAD stripped to a flag)", msg.Labels)
+	// Label ids resolve to tag names; UNREAD is stripped to a flag.
+	if len(msg.Labels) != 2 || msg.Labels[0] != "inbox" || msg.Labels[1] != "newsletter" {
+		t.Errorf("labels = %v, want [inbox newsletter] (INBOX->inbox, Label_5->newsletter, UNREAD->flag)", msg.Labels)
 	}
 	if msg.InternalDate.UnixMilli() != 1710000000000 {
 		t.Errorf("internalDate = %v, want 1710000000000 ms", msg.InternalDate.UnixMilli())
@@ -134,6 +150,7 @@ func TestFetchMessagesListAndRaw(t *testing.T) {
 func TestFetchMessagesPaginates(t *testing.T) {
 	mux := http.NewServeMux()
 	registerProfile(t, mux, "999")
+	registerLabels(t, mux)
 	mux.HandleFunc("/users/me/messages", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(t, w, map[string]any{
 			"messages":      []map[string]string{},
@@ -190,6 +207,7 @@ func rawMsgResp(id, raw string, labels []string) map[string]any {
 
 func TestHistorySyncChangesAndDeletes(t *testing.T) {
 	mux := http.NewServeMux()
+	registerLabels(t, mux)
 	mux.HandleFunc("/users/me/history", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Query().Get("startHistoryId"); got != "100" {
 			t.Errorf("startHistoryId = %q, want 100", got)
@@ -221,8 +239,8 @@ func TestHistorySyncChangesAndDeletes(t *testing.T) {
 	if len(result.Messages) != 2 || result.Messages[0].Ref.ID != "m2" || result.Messages[1].Ref.ID != "m3" {
 		t.Fatalf("messages = %+v, want [m2 m3]", result.Messages)
 	}
-	if !result.Messages[1].Flags.Flagged || len(result.Messages[1].Labels) != 1 || result.Messages[1].Labels[0] != "INBOX" {
-		t.Errorf("m3 = flags %+v labels %v, want Flagged (STARRED) + labels [INBOX]", result.Messages[1].Flags, result.Messages[1].Labels)
+	if !result.Messages[1].Flags.Flagged || len(result.Messages[1].Labels) != 1 || result.Messages[1].Labels[0] != "inbox" {
+		t.Errorf("m3 = flags %+v labels %v, want Flagged (STARRED) + labels [inbox]", result.Messages[1].Flags, result.Messages[1].Labels)
 	}
 	if len(result.Deleted) != 1 || result.Deleted[0].Ref.ID != "m4" {
 		t.Errorf("deleted = %+v, want [m4]", result.Deleted)
@@ -238,6 +256,7 @@ func TestHistorySyncChangesAndDeletes(t *testing.T) {
 func TestHistoryExpiredRestartsFullSync(t *testing.T) {
 	mux := http.NewServeMux()
 	registerProfile(t, mux, "999")
+	registerLabels(t, mux)
 	mux.HandleFunc("/users/me/history", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"error":{"code":404,"message":"historyId not found"}}`))
@@ -262,13 +281,38 @@ func TestHistoryExpiredRestartsFullSync(t *testing.T) {
 	}
 }
 
-func TestFlagsAndTagLabels(t *testing.T) {
+func TestFlagsAndLabelMapping(t *testing.T) {
 	f := flagsFromLabels([]string{"INBOX", "STARRED"})
 	if !f.Seen || !f.Flagged {
 		t.Errorf("flags = %+v, want Seen=true (no UNREAD) Flagged=true (STARRED)", f)
 	}
-	if got := tagLabels([]string{"UNREAD", "STARRED"}); got != nil {
-		t.Errorf("tagLabels = %v, want nil (only reserved flag labels)", got)
+	// System label -> canonical tag; user label -> lowercased display name;
+	// reserved flag labels and unmapped system labels -> no tag.
+	cases := []struct {
+		l    gmailLabel
+		want string
+	}{
+		{gmailLabel{ID: "INBOX", Name: "INBOX", Type: "system"}, "inbox"},
+		{gmailLabel{ID: "IMPORTANT", Name: "IMPORTANT", Type: "system"}, "important"},
+		{gmailLabel{ID: "CHAT", Name: "CHAT", Type: "system"}, ""},
+		{gmailLabel{ID: "UNREAD", Name: "UNREAD", Type: "system"}, ""},
+		{gmailLabel{ID: "Label_9", Name: "Work/Projects", Type: "user"}, "work/projects"},
+		{gmailLabel{ID: "Label_7", Name: "Work Stuff", Type: "user"}, "work-stuff"}, // spaces -> dashes, IMAP parity
+	}
+	for _, c := range cases {
+		if got := labelToTag(c.l); got != c.want {
+			t.Errorf("labelToTag(%+v) = %q, want %q", c.l, got, c.want)
+		}
+	}
+}
+
+func TestResolveLabelsDedupesAndSkipsUnmapped(t *testing.T) {
+	b := &Backend{labels: map[string]string{"INBOX": "inbox", "Label_X": "inbox"}}
+	// Two ids map to the same tag (a user "Inbox" label vs system INBOX); an
+	// unmapped id is dropped.
+	got := b.resolveLabels([]string{"INBOX", "Label_X", "UNKNOWN"})
+	if len(got) != 1 || got[0] != "inbox" {
+		t.Errorf("resolveLabels = %v, want [inbox] (deduped, unmapped skipped)", got)
 	}
 }
 
