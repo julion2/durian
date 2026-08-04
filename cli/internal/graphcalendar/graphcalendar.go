@@ -75,6 +75,14 @@ const (
 	// maxThrottleBackoff caps the exponential part of the throttle backoff.
 	maxThrottleBackoff = 32 * time.Second
 
+	// maxBackoffShift bounds the exponential shift. 2^5 s already reaches
+	// maxThrottleBackoff, and anything past 2^33 s overflows time.Duration.
+	maxBackoffShift = 5
+
+	// maxRetryAfter bounds how long a server may make this process wait before
+	// the request is failed instead. See clampRetryAfter.
+	maxRetryAfter = 2 * time.Minute
+
 	// jitterSpan is the random amount added on top of the exponential backoff,
 	// so concurrently throttled requests do not all retry at the same instant.
 	jitterSpan = time.Second
@@ -320,19 +328,29 @@ func throttleDelay(resp *http.Response, attempt int) time.Duration {
 // backoffWithJitter is truncated exponential backoff: min(2^n seconds, cap)
 // plus up to a second of jitter.
 //
-// Graph limits Outlook to four CONCURRENT requests per mailbox, so a throttled
-// sync has several requests in flight that were all rejected at once. Without
-// jitter they would retry in lockstep and immediately breach the concurrency
-// limit again.
+// durian issues these requests sequentially, so the collisions to avoid are
+// not within one sync: serve runs one autosync goroutine per account, and a
+// tenant-wide throttle rejects them at the same moment. A fixed 2^n would make
+// them retry in lockstep and rebuild the burst.
 func backoffWithJitter(attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
+	}
+	// Clamp the SHIFT, not the result. time.Duration is int64 nanoseconds, so
+	// 1<<34 seconds already exceeds its range and wraps to a negative value —
+	// which sails past a "> maxThrottleBackoff" check and makes the caller
+	// sleep for nothing, turning the backoff into a hot retry loop.
+	if attempt > maxBackoffShift {
+		attempt = maxBackoffShift
 	}
 	base := time.Duration(1<<attempt) * time.Second
 	if base > maxThrottleBackoff {
 		base = maxThrottleBackoff
 	}
-	return base + time.Duration(rand.Int64N(int64(jitterSpan)))
+	if jitterSpan <= 0 {
+		return base
+	}
+	return base + rand.N(jitterSpan)
 }
 
 // retryAfter parses the Retry-After header in BOTH forms RFC 9110 allows: a
@@ -349,15 +367,33 @@ func retryAfter(resp *http.Response) (time.Duration, bool) {
 		return 0, false
 	}
 	if secs, err := strconv.Atoi(s); err == nil && secs >= 0 {
-		return time.Duration(secs) * time.Second, true
+		return clampRetryAfter(time.Duration(secs)*time.Second, s), true
 	}
 	if t, err := http.ParseTime(s); err == nil {
 		if d := time.Until(t); d > 0 {
-			return d, true
+			return clampRetryAfter(d, s), true
 		}
 		return 0, true
 	}
 	return 0, false
+}
+
+// clampRetryAfter bounds what the server may make this process wait.
+//
+// Honoring an hour-long Retry-After literally is worse than useless: the
+// manual sync has no deadline of its own, so it would block that long holding
+// the run lock — which also stalls the background loop — while its "backing
+// off" message is invisible at the default log level. The background loop
+// would merely hit its own timeout and report a context error instead of a
+// throttle. Waiting the cap and letting the request fail surfaces the problem
+// in seconds and leaves the retry to the next run.
+func clampRetryAfter(d time.Duration, header string) time.Duration {
+	if d <= maxRetryAfter {
+		return d
+	}
+	slog.Warn("Retry-After exceeds the cap, waiting the cap instead", "module", "GRAPHCAL",
+		"retryAfter", header, "cap", maxRetryAfter)
+	return maxRetryAfter
 }
 
 // newStatusError builds a statusError including a snippet of the error body.
