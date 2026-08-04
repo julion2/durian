@@ -365,3 +365,139 @@ func TestParseExDateLineRejectsGarbage(t *testing.T) {
 		}
 	}
 }
+
+// MARK: - Hash migration
+
+// The exceptions field must not exist in the digest input of an event that has
+// none. Every field contributes a NUL terminator, so an unconditional empty
+// field would move the hash of EVERY event in every calendar — and the first
+// sync after that reads as "remote changed" everywhere, which turns a pending
+// local edit into a CONFLICT that the default policy rolls back instead of
+// uploading.
+//
+// The constants below are the digests as they were before series exceptions
+// existed. They are golden on purpose: only a deliberate, migration-aware
+// change may update them.
+func TestContentHashUnchangedForEventsWithoutExceptions(t *testing.T) {
+	e := Event{
+		ICalUID:     "plain-uid",
+		Subject:     "Lunch",
+		Location:    "Canteen",
+		Description: "with the team",
+		Start:       mustTime(t, "2026-08-03T12:00:00Z"),
+		End:         mustTime(t, "2026-08-03T13:00:00Z"),
+		Attendees: []Attendee{
+			{Email: "a@example.com", Type: "required", Response: "accepted"},
+		},
+		Organizer: &Person{Email: "owner@example.com"},
+	}
+
+	const (
+		wantFull = "a82e6a0e9f927c7e7f5b213285b28aae10c6610072edc9ef1572bff7161b7d4c"
+		wantCore = "661fb5a3b9be92d927d5c44670310123a09699661236786354059ee278459f05"
+	)
+	if got := EventContentHash(e, "owner@example.com"); got != wantFull {
+		t.Errorf("EventContentHash = %q, want %q — a changed digest re-baselines every\n"+
+			"tracked event on upgrade; update the golden only with a migration story", got, wantFull)
+	}
+	if got := CoreContentHash(e, "owner@example.com"); got != wantCore {
+		t.Errorf("CoreContentHash = %q, want %q", got, wantCore)
+	}
+}
+
+// A recurring series with no exceptions is still an exception-less event.
+func TestContentHashUnchangedForSeriesWithoutExceptions(t *testing.T) {
+	master := weeklyMaster(t)
+	bare := master
+	bare.ExceptionDates = nil
+	bare.Overrides = nil
+
+	empty := master
+	empty.ExceptionDates = []time.Time{}
+	empty.Overrides = []Event{}
+
+	if EventContentHash(bare, "") != EventContentHash(empty, "") {
+		t.Error("an empty exception list hashes differently from no list at all")
+	}
+}
+
+// MARK: - Value types and time zones
+
+// RECURRENCE-ID states a date the MASTER's rule produced, so it must use the
+// master's value type. Taking it from the override truncates the time when a
+// timed occurrence is turned into an all-day one, and the key then matches no
+// occurrence at all.
+func TestRecurrenceIDFollowsTheMastersValueType(t *testing.T) {
+	master := weeklyMaster(t) // timed, 09:00-10:00
+	master.Overrides = []Event{{
+		ICalUID:      "series-uid",
+		Subject:      "Standup (all day now)",
+		AllDay:       true,
+		RecurrenceID: mustTime(t, "2026-08-17T09:00:00Z"),
+		Start:        mustTime(t, "2026-08-17T00:00:00Z"),
+		End:          mustTime(t, "2026-08-18T00:00:00Z"),
+	}}
+
+	data, err := EventToICal(master)
+	if err != nil {
+		t.Fatalf("EventToICal: %v", err)
+	}
+	if strings.Contains(string(data), "RECURRENCE-ID;VALUE=DATE:") {
+		t.Errorf("RECURRENCE-ID was written as a DATE for a timed series:\n%s", data)
+	}
+
+	back, err := ICalToEvent(data, "")
+	if err != nil {
+		t.Fatalf("ICalToEvent: %v", err)
+	}
+	if len(back.Overrides) != 1 {
+		t.Fatalf("overrides = %+v", back.Overrides)
+	}
+	if !back.Overrides[0].RecurrenceID.Equal(mustTime(t, "2026-08-17T09:00:00Z")) {
+		t.Errorf("recurrence id = %s, want the original 09:00 instant preserved",
+			back.Overrides[0].RecurrenceID)
+	}
+}
+
+// The vdir is shared with khal and other CalDAV clients, which state the zone
+// and a floating local time. Reading that as UTC places the exception a whole
+// offset away from the occurrence it cancels.
+func TestICalToEventHonorsTZIDOnExceptions(t *testing.T) {
+	doc := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n" +
+		"BEGIN:VEVENT\r\nUID:series-uid\r\nDTSTAMP:20260801T000000Z\r\n" +
+		"DTSTART:20260803T070000Z\r\nDTEND:20260803T080000Z\r\n" +
+		"RRULE:FREQ=WEEKLY;BYDAY=MO\r\n" +
+		"EXDATE;TZID=Europe/Zurich:20260810T090000\r\n" +
+		"END:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\nUID:series-uid\r\nDTSTAMP:20260801T000000Z\r\n" +
+		"RECURRENCE-ID;TZID=Europe/Zurich:20260817T090000\r\n" +
+		"DTSTART:20260818T120000Z\r\nDTEND:20260818T130000Z\r\n" +
+		"END:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	back, err := ICalToEvent([]byte(doc), "")
+	if err != nil {
+		t.Fatalf("ICalToEvent: %v", err)
+	}
+	// Zurich is UTC+2 in August, so 09:00 local is 07:00 UTC.
+	if len(back.ExceptionDates) != 1 ||
+		!back.ExceptionDates[0].Equal(mustTime(t, "2026-08-10T07:00:00Z")) {
+		t.Errorf("exception dates = %v, want [2026-08-10T07:00:00Z]", back.ExceptionDates)
+	}
+	if len(back.Overrides) != 1 ||
+		!back.Overrides[0].RecurrenceID.Equal(mustTime(t, "2026-08-17T07:00:00Z")) {
+		t.Errorf("override recurrence id = %v, want 2026-08-17T07:00:00Z",
+			back.Overrides[0].RecurrenceID)
+	}
+}
+
+// RFC 5545 forbids TZID on a DATE value. Honoring it anyway shifts an all-day
+// exception onto the previous day for every zone east of UTC.
+func TestParseExDateLineIgnoresTZIDOnDateValues(t *testing.T) {
+	got, err := ParseExDateLine("EXDATE;TZID=Europe/Zurich;VALUE=DATE:20260817")
+	if err != nil {
+		t.Fatalf("ParseExDateLine: %v", err)
+	}
+	if len(got) != 1 || !got[0].Equal(mustTime(t, "2026-08-17T00:00:00Z")) {
+		t.Errorf("got %v, want [2026-08-17T00:00:00Z] — a DATE must not be shifted by TZID", got)
+	}
+}

@@ -607,15 +607,30 @@ func recurrenceFromGoogle(lines []string, start time.Time, id string) (rec *cale
 		case strings.HasPrefix(line, "EXDATE"):
 			dates, err := calendar.ParseExDateLine(line)
 			if err != nil {
-				slog.Warn("Ignoring unparseable EXDATE line", "module", "GOOGLECAL",
+				// The cancellations on this line are now unknown. Uploading a
+				// recurrence rebuilt without them would revive the cancelled
+				// occurrences on the server — and for a meeting they would
+				// reappear in every attendee's calendar.
+				slog.Warn("Keeping series with an unreadable EXDATE line opaque", "module", "GOOGLECAL",
 					"id", id, "line", line, "err", err)
+				opaque = true
 				continue
 			}
 			exDates = append(exDates, dates...)
 		default:
-			slog.Warn("Ignoring unsupported recurrence line", "module", "GOOGLECAL",
+			// RDATE, EXRULE and anything else the neutral model cannot hold.
+			// Unlike a missing RRULE this is not "no recurrence": the rule
+			// exists and durian just cannot express all of it, so the upload
+			// must not rewrite the recurrence from the part it understood.
+			slog.Warn("Keeping series with an unsupported recurrence line opaque", "module", "GOOGLECAL",
 				"id", id, "line", line)
+			opaque = true
 		}
+	}
+	if opaque {
+		// A rule component was lost. Report whatever was parsed for display,
+		// but never let the write paths reconstruct the recurrence from it.
+		return nil, exDates, true
 	}
 	if rruleLine == "" {
 		// Genuinely no rule: not opaque, just not a series.

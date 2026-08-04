@@ -27,7 +27,7 @@ const seriesWithExceptionPage = `{
 			"location": {"displayName": "Room 2"},
 			"type": "exception",
 			"seriesMasterId": "evt-series",
-			"originalStart": "2026-08-17T09:00:00.0000000",
+			"originalStart": "2026-08-17T09:00:00Z",
 			"changeKey": "ck-exc",
 			"lastModifiedDateTime": "2026-08-01T09:00:00Z"
 		},
@@ -39,7 +39,7 @@ const seriesWithExceptionPage = `{
 			"end": {"dateTime": "2026-08-24T10:00:00.0000000", "timeZone": "UTC"},
 			"type": "occurrence",
 			"seriesMasterId": "evt-series",
-			"originalStart": "2026-08-24T09:00:00.0000000",
+			"originalStart": "2026-08-24T09:00:00+02:00",
 			"changeKey": "ck-occ",
 			"lastModifiedDateTime": "2026-08-01T09:00:00Z"
 		},
@@ -126,7 +126,7 @@ func TestFetchMasterEventsDropsOrphanExceptions(t *testing.T) {
 				"end": {"dateTime": "2026-08-17T10:00:00.0000000", "timeZone": "UTC"},
 				"type": "exception",
 				"seriesMasterId": "evt-gone",
-				"originalStart": "2026-08-17T09:00:00.0000000",
+				"originalStart": "2026-08-17T09:00:00Z",
 				"changeKey": "ck-orphan",
 				"lastModifiedDateTime": "2026-08-01T09:00:00Z"
 			}
@@ -169,5 +169,37 @@ func TestEventToGraphBodyOmitsOpaqueRecurrence(t *testing.T) {
 	if rec, present := body["recurrence"]; !present || rec != nil {
 		t.Errorf("body recurrence = (%v, present=%v), want an explicit nil that clears the series",
 			rec, present)
+	}
+}
+
+// originalStart is a DateTimeOffset and arrives with its offset inline, unlike
+// start/end which are bare local times with the zone in a sibling field. The
+// bare layout does not degrade on the offset form, it fails outright — which
+// silently dropped every exception Graph reported.
+func TestParseGraphDateTimeAcceptsBothWireShapes(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		want  time.Time
+	}{
+		{"offset form, Z", "2026-08-17T09:00:00Z",
+			time.Date(2026, 8, 17, 9, 0, 0, 0, time.UTC)},
+		{"offset form, numeric", "2026-08-17T09:00:00+02:00",
+			time.Date(2026, 8, 17, 7, 0, 0, 0, time.UTC)},
+		{"bare local form", "2026-08-17T09:00:00.0000000",
+			time.Date(2026, 8, 17, 9, 0, 0, 0, time.UTC)},
+		{"bare local form, no fraction", "2026-08-17T09:00:00",
+			time.Date(2026, 8, 17, 9, 0, 0, 0, time.UTC)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseGraphDateTime(tc.value)
+			if err != nil {
+				t.Fatalf("parseGraphDateTime(%q): %v", tc.value, err)
+			}
+			if !got.Equal(tc.want) {
+				t.Errorf("got %s, want %s", got.UTC(), tc.want)
+			}
+		})
 	}
 }
