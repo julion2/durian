@@ -409,3 +409,56 @@ func TestIsAuthError(t *testing.T) {
 		}
 	}
 }
+
+// TestDoRequestRetriesRateLimit403 pins the throttle path that IsAuthError
+// already knows about but the retry switch used to miss: Google returns 403
+// (not 429) for per-user rate limiting, which is transient. Falling through to
+// the error path failed the whole sync on a condition that clears by waiting.
+func TestDoRequestRetriesRateLimit403(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"evt-1"}`))
+	}))
+	defer srv.Close()
+
+	var out map[string]any
+	if err := testClient(srv).doJSON(context.Background(), srv.URL+"/x", nil, &out); err != nil {
+		t.Fatalf("doJSON after a 403 throttle: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want 2 (one throttled, one retried)", calls)
+	}
+}
+
+// TestDoRequestDoesNotRetryPermission403 keeps the retry narrow: a genuine
+// permission failure must surface immediately, not after three backoffs.
+func TestDoRequestDoesNotRetryPermission403(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"errors":[{"reason":"insufficientPermissions"}]}}`))
+	}))
+	defer srv.Close()
+
+	var out map[string]any
+	err := testClient(srv).doJSON(context.Background(), srv.URL+"/x", nil, &out)
+	if err == nil {
+		t.Fatal("doJSON succeeded on a permission 403")
+	}
+	if !IsAuthError(err) {
+		t.Errorf("IsAuthError = false for a permission 403: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1 (no retry)", calls)
+	}
+}

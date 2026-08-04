@@ -178,11 +178,21 @@ func IsAuthError(err error) bool {
 		case http.StatusUnauthorized:
 			return true
 		case http.StatusForbidden:
-			return !strings.Contains(se.body, "ateLimitExceeded") &&
-				!strings.Contains(se.body, "quotaExceeded")
+			return !isRateLimited(se)
 		}
 	}
 	return false
+}
+
+// isRateLimited reports whether a 403 is Google's throttle response rather
+// than a permission problem. Google returns 429 for some quota breaches and
+// 403 with a rateLimitExceeded / userRateLimitExceeded / quotaExceeded reason
+// for others; both are transient and must be retried, not surfaced as an auth
+// failure or a hard error.
+func isRateLimited(se *statusError) bool {
+	return se.status == http.StatusForbidden &&
+		(strings.Contains(se.body, "ateLimitExceeded") ||
+			strings.Contains(se.body, "quotaExceeded"))
 }
 
 // doJSON executes one authenticated Calendar API GET and decodes the JSON
@@ -213,6 +223,8 @@ func (c *Client) doRequest(ctx context.Context, method, reqURL string, extraHead
 	const (
 		maxThrottleRetries = 3
 		transientBackoff   = 2 * time.Second
+		// A 403 throttle carries no Retry-After, so it gets a fixed backoff.
+		throttleBackoff = 2 * time.Second
 	)
 
 	throttleRetries := 0
@@ -252,6 +264,26 @@ func (c *Client) doRequest(ctx context.Context, method, reqURL string, extraHead
 			slog.Warn("Google Calendar throttled request, backing off", "module", "GOOGLECAL",
 				"retry", throttleRetries, "delay", delay)
 			if err := sleepCtx(ctx, delay); err != nil {
+				return err
+			}
+		case resp.StatusCode == http.StatusForbidden && throttleRetries < maxThrottleRetries:
+			// A 403 is usually a permission problem, but Google also uses it
+			// for per-user rate limiting. Classify from the reason string
+			// before deciding: throttles back off like a 429, everything else
+			// falls through to the error path unretried.
+			se := newStatusError(resp)
+			drainClose(resp)
+			var rateLimited bool
+			if serr, ok := se.(*statusError); ok {
+				rateLimited = isRateLimited(serr)
+			}
+			if !rateLimited {
+				return se
+			}
+			throttleRetries++
+			slog.Warn("Google Calendar rate-limited request (403), backing off", "module", "GOOGLECAL",
+				"retry", throttleRetries, "delay", throttleBackoff)
+			if err := sleepCtx(ctx, throttleBackoff); err != nil {
 				return err
 			}
 		case (resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout) && !transientRetried:
