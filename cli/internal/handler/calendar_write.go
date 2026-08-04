@@ -241,7 +241,11 @@ func (h *Handler) CalendarRsvpHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to serialize event", http.StatusInternalServerError)
 		return
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	// Atomic like every other write into the vdir: the sync engine scans this
+	// directory concurrently, and a truncated .ics is indistinguishable from a
+	// corrupt one — which suppresses local-deletion planning for the whole
+	// calendar until the next run.
+	if err := calendar.WriteFileAtomic(path, data, 0o600); err != nil {
 		slog.Error("Failed to write local event", "module", "API", "err", err)
 		http.Error(w, "failed to write event", http.StatusInternalServerError)
 		return

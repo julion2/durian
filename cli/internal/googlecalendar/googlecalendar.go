@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"sort"
@@ -45,6 +46,15 @@ const (
 	// tokenExpiryBuffer refreshes the cached access token this long before its
 	// actual expiry, so a request never starts with an about-to-expire token.
 	tokenExpiryBuffer = 5 * time.Minute
+
+	// maxThrottleBackoff caps the exponential part of the throttle backoff, per
+	// Google's documented usage-limit guidance.
+	maxThrottleBackoff = 32 * time.Second
+
+	// jitterSpan is the random amount added on top of the exponential backoff
+	// (Google documents up to one second), so concurrently throttled requests
+	// do not all retry at the same instant.
+	jitterSpan = time.Second
 )
 
 // Client is a minimal Google Calendar client: the read paths of the two-way
@@ -224,8 +234,6 @@ func (c *Client) doRequest(ctx context.Context, method, reqURL string, extraHead
 	const (
 		maxThrottleRetries = 3
 		transientBackoff   = 2 * time.Second
-		// A 403 throttle carries no Retry-After, so it gets a fixed backoff.
-		throttleBackoff = 2 * time.Second
 	)
 
 	throttleRetries := 0
@@ -260,7 +268,7 @@ func (c *Client) doRequest(ctx context.Context, method, reqURL string, extraHead
 		switch {
 		case resp.StatusCode == http.StatusTooManyRequests && throttleRetries < maxThrottleRetries:
 			throttleRetries++
-			delay := retryAfter(resp)
+			delay := throttleDelay(resp, throttleRetries)
 			drainClose(resp)
 			slog.Warn("Google Calendar throttled request, backing off", "module", "GOOGLECAL",
 				"retry", throttleRetries, "delay", delay)
@@ -282,9 +290,12 @@ func (c *Client) doRequest(ctx context.Context, method, reqURL string, extraHead
 				return se
 			}
 			throttleRetries++
+			// A 403 throttle carries no Retry-After, so this is the pure
+			// backoff case.
+			delay := backoffWithJitter(throttleRetries)
 			slog.Warn("Google Calendar rate-limited request (403), backing off", "module", "GOOGLECAL",
-				"retry", throttleRetries, "delay", throttleBackoff)
-			if err := sleepCtx(ctx, throttleBackoff); err != nil {
+				"retry", throttleRetries, "delay", delay)
+			if err := sleepCtx(ctx, delay); err != nil {
 				return err
 			}
 		case (resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout) && !transientRetried:
@@ -311,15 +322,57 @@ func (c *Client) doRequest(ctx context.Context, method, reqURL string, extraHead
 	}
 }
 
-// retryAfter parses the Retry-After header (delay-seconds form) of a 429
-// response, defaulting to one second when absent or unparseable.
-func retryAfter(resp *http.Response) time.Duration {
-	if s := resp.Header.Get("Retry-After"); s != "" {
-		if secs, err := strconv.Atoi(s); err == nil && secs >= 0 {
-			return time.Duration(secs) * time.Second
-		}
+// throttleDelay returns how long to wait before retrying a throttled request:
+// the server's own Retry-After when it sent one, otherwise Google's documented
+// truncated exponential backoff with jitter. attempt counts from 1.
+func throttleDelay(resp *http.Response, attempt int) time.Duration {
+	if d, ok := retryAfter(resp); ok {
+		return d
 	}
-	return time.Second
+	return backoffWithJitter(attempt)
+}
+
+// backoffWithJitter implements the backoff Google documents for its usage
+// limits: min(2^n seconds, cap) plus up to a second of jitter.
+//
+// The jitter is not decoration. Every calendar of an account is synced from
+// the same loop, so a plain 2^n lines all of them up on the identical retry
+// instant and reproduces the very burst that caused the throttle — the retries
+// then collide again, and again, at exactly the same moments.
+func backoffWithJitter(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	base := time.Duration(1<<attempt) * time.Second
+	if base > maxThrottleBackoff {
+		base = maxThrottleBackoff
+	}
+	return base + time.Duration(rand.Int64N(int64(jitterSpan)))
+}
+
+// retryAfter parses the Retry-After header in BOTH forms RFC 9110 allows: a
+// delay in seconds, and an HTTP-date. Reading only the numeric form silently
+// falls back to a fixed one-second wait against a server that answered with a
+// date — which retries far too early and earns another throttle.
+//
+// A date already in the past yields zero: the server named an instant that has
+// come, so the request may go out immediately. The bool distinguishes "no
+// usable header" from "wait exactly nothing".
+func retryAfter(resp *http.Response) (time.Duration, bool) {
+	s := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if s == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(s); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(s); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d, true
+		}
+		return 0, true
+	}
+	return 0, false
 }
 
 // newStatusError builds a statusError including a snippet of the error body.

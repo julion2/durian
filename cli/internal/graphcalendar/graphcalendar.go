@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"sort"
@@ -70,6 +71,13 @@ const (
 	// tokenExpiryBuffer refreshes the cached Graph token this long before its
 	// actual expiry, so a request never starts with an about-to-expire token.
 	tokenExpiryBuffer = 5 * time.Minute
+
+	// maxThrottleBackoff caps the exponential part of the throttle backoff.
+	maxThrottleBackoff = 32 * time.Second
+
+	// jitterSpan is the random amount added on top of the exponential backoff,
+	// so concurrently throttled requests do not all retry at the same instant.
+	jitterSpan = time.Second
 )
 
 // Client is a minimal Microsoft Graph calendar client: read paths for the
@@ -264,7 +272,7 @@ func (c *Client) doRequest(ctx context.Context, method, reqURL string, extraHead
 		switch {
 		case resp.StatusCode == http.StatusTooManyRequests && throttleRetries < maxThrottleRetries:
 			throttleRetries++
-			delay := retryAfter(resp)
+			delay := throttleDelay(resp, throttleRetries)
 			drainClose(resp)
 			slog.Warn("Graph throttled request, backing off", "module", "GRAPHCAL",
 				"retry", throttleRetries, "delay", delay)
@@ -295,15 +303,61 @@ func (c *Client) doRequest(ctx context.Context, method, reqURL string, extraHead
 	}
 }
 
-// retryAfter parses the Retry-After header (delay-seconds form) of a 429
-// response, defaulting to one second when absent or unparseable.
-func retryAfter(resp *http.Response) time.Duration {
-	if s := resp.Header.Get("Retry-After"); s != "" {
-		if secs, err := strconv.Atoi(s); err == nil && secs >= 0 {
-			return time.Duration(secs) * time.Second
-		}
+// throttleDelay returns how long to wait before retrying a throttled request:
+// the server's own Retry-After when it sent one, otherwise exponential backoff
+// with jitter. attempt counts from 1.
+//
+// Graph documents that a 429 practically always carries Retry-After and that
+// retrying sooner counts against the same limit, so honoring the header is the
+// primary path; the backoff is the fallback for the responses that omit it.
+func throttleDelay(resp *http.Response, attempt int) time.Duration {
+	if d, ok := retryAfter(resp); ok {
+		return d
 	}
-	return time.Second
+	return backoffWithJitter(attempt)
+}
+
+// backoffWithJitter is truncated exponential backoff: min(2^n seconds, cap)
+// plus up to a second of jitter.
+//
+// Graph limits Outlook to four CONCURRENT requests per mailbox, so a throttled
+// sync has several requests in flight that were all rejected at once. Without
+// jitter they would retry in lockstep and immediately breach the concurrency
+// limit again.
+func backoffWithJitter(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	base := time.Duration(1<<attempt) * time.Second
+	if base > maxThrottleBackoff {
+		base = maxThrottleBackoff
+	}
+	return base + time.Duration(rand.Int64N(int64(jitterSpan)))
+}
+
+// retryAfter parses the Retry-After header in BOTH forms RFC 9110 allows: a
+// delay in seconds, and an HTTP-date. Reading only the numeric form silently
+// falls back to a fixed one-second wait against a server that answered with a
+// date — which retries far too early and earns another throttle.
+//
+// A date already in the past yields zero: the server named an instant that has
+// come, so the request may go out immediately. The bool distinguishes "no
+// usable header" from "wait exactly nothing".
+func retryAfter(resp *http.Response) (time.Duration, bool) {
+	s := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if s == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(s); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(s); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d, true
+		}
+		return 0, true
+	}
+	return 0, false
 }
 
 // newStatusError builds a statusError including a snippet of the error body.
