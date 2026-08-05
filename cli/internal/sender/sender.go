@@ -6,17 +6,21 @@ package sender
 import (
 	"github.com/julion2/durian/cli/internal/auth"
 	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/gmailbackend"
 	"github.com/julion2/durian/cli/internal/graphbackend"
 	"github.com/julion2/durian/cli/internal/mailsend"
 	"github.com/julion2/durian/cli/internal/smtp"
 )
 
 // For returns the Sender that delivers mail for the given account: Microsoft
-// Graph for Graph-backed accounts, SMTP otherwise. Gmail slots in here too once
-// it lands.
+// Graph for Graph-backed accounts, the Gmail API for Gmail accounts, SMTP
+// otherwise.
 func For(account *config.AccountConfig) (mailsend.Sender, error) {
-	if account.UsesGraphBackend() {
+	switch {
+	case account.UsesGraphBackend():
 		return graphbackend.NewSender(account)
+	case account.UsesGmailBackend():
+		return gmailbackend.NewSender(account)
 	}
 	smtpAuth, err := auth.GetSMTPAuth(account)
 	if err != nil {
