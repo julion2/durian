@@ -1057,6 +1057,21 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 25 {
+		// Drop stale "[imap]/<folder>" tags: an old legacy-syncer version tagged
+		// messages with their raw IMAP folder path. No current code writes them,
+		// and on a label backend (Gmail) they linger after migration because they
+		// are not Gmail labels (so the label reconciliation never removes them).
+		// The role tags (sent, inbox, ...) already cover their meaning. LIKE '['
+		// is a literal in SQLite (only % and _ are wildcards).
+		if _, err := d.db.Exec("DELETE FROM tags WHERE tag LIKE '[imap]/%'"); err != nil {
+			return fmt.Errorf("migrate v24→v25 drop legacy imap tags: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 25 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v24→v25 bump: %w", err)
+		}
+	}
+
 	return nil
 }
 
