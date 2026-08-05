@@ -394,3 +394,79 @@ func TestWriteMethodsNotImplemented(t *testing.T) {
 		t.Errorf("Move err = %v, want errNotImplemented", err)
 	}
 }
+
+func TestApplyLabelsResolvesTagsToLabelIDs(t *testing.T) {
+	var body map[string][]string
+	mux := http.NewServeMux()
+	registerLabels(t, mux)
+	mux.HandleFunc("/users/me/messages/m1/modify", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("modify method = %s, want POST", r.Method)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	// Add the "newsletter" user label, remove "inbox"; "todo" is not a Gmail
+	// label and must be dropped from the request.
+	if err := b.ApplyLabels(context.Background(), backend.RemoteRef{ID: "m1"},
+		[]string{"newsletter", "todo"}, []string{"inbox"}); err != nil {
+		t.Fatalf("ApplyLabels: %v", err)
+	}
+	if len(body["addLabelIds"]) != 1 || body["addLabelIds"][0] != "Label_5" {
+		t.Errorf("addLabelIds = %v, want [Label_5]", body["addLabelIds"])
+	}
+	if len(body["removeLabelIds"]) != 1 || body["removeLabelIds"][0] != "INBOX" {
+		t.Errorf("removeLabelIds = %v, want [INBOX]", body["removeLabelIds"])
+	}
+}
+
+func TestApplyLabelsNoActionableTagsSkipsCall(t *testing.T) {
+	mux := http.NewServeMux()
+	registerLabels(t, mux)
+	called := false
+	mux.HandleFunc("/users/me/messages/m1/modify", func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	// Only a Durian-local tag changed — nothing resolves to a Gmail label.
+	if err := b.ApplyLabels(context.Background(), backend.RemoteRef{ID: "m1"},
+		[]string{"todo"}, nil); err != nil {
+		t.Fatalf("ApplyLabels: %v", err)
+	}
+	if called {
+		t.Error("modify must not be called when no tag maps to a Gmail label")
+	}
+}
+
+func TestLabelTagsVocabulary(t *testing.T) {
+	mux := http.NewServeMux()
+	registerLabels(t, mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	tags, err := b.LabelTags(context.Background())
+	if err != nil {
+		t.Fatalf("LabelTags: %v", err)
+	}
+	got := map[string]bool{}
+	for _, tag := range tags {
+		got[tag] = true
+	}
+	if !got["inbox"] || !got["newsletter"] {
+		t.Errorf("vocabulary = %v, want to include inbox + newsletter", tags)
+	}
+	if got["unread"] || got["starred"] {
+		t.Errorf("vocabulary must exclude flag labels (UNREAD/STARRED), got %v", tags)
+	}
+}

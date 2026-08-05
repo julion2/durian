@@ -105,9 +105,20 @@ type fakeBackend struct {
 	moveCalls []moveCall
 	// moveErr, when set, is returned by every Move instead of succeeding.
 	moveErr error
+	// labelVocab is what LabelTags reports; labelCalls records ApplyLabels
+	// invocations (label-upload pass). Both are the LabelWriter side used by the
+	// Gmail-style label-upload tests. Empty vocab makes the pass a no-op.
+	labelVocab []string
+	labelCalls []labelCall
 	// caps is returned by Capabilities(); zero value matches the default IMAP-like
 	// backend. Tests set FlagChangesInDelta to exercise the delta flag path.
 	caps backend.Capabilities
+}
+
+type labelCall struct {
+	ref    backend.RemoteRef
+	add    []string
+	remove []string
 }
 
 type moveCall struct {
@@ -159,6 +170,13 @@ func (f *fakeBackend) FetchFlags(ctx context.Context, folder string, refs []back
 		}
 	}
 	return result, nil
+}
+
+func (f *fakeBackend) LabelTags(ctx context.Context) ([]string, error) { return f.labelVocab, nil }
+
+func (f *fakeBackend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, remove []string) error {
+	f.labelCalls = append(f.labelCalls, labelCall{ref: ref, add: add, remove: remove})
+	return nil
 }
 
 func (f *fakeBackend) Move(ctx context.Context, ref backend.RemoteRef, destFolder string) (backend.RemoteRef, error) {
@@ -1263,5 +1281,219 @@ func TestFileCursorStoreRoundTrip(t *testing.T) {
 	}
 	if unknown != nil {
 		t.Errorf("unknown folder cursor = %q, want nil", unknown)
+	}
+}
+
+// sameSet reports whether got and want hold the same elements (order-agnostic).
+func sameSet(got, want []string) bool {
+	g := append([]string(nil), got...)
+	w := append([]string(nil), want...)
+	slices.Sort(g)
+	slices.Sort(w)
+	return slices.Equal(g, w)
+}
+
+func TestDiffLabels(t *testing.T) {
+	vocab := map[string]bool{"inbox": true, "important": true, "trash": true, "project-x": true}
+	tests := []struct {
+		name                          string
+		tags, baseline                []string
+		wantAdd, wantRemove, wantBase []string
+	}{
+		{
+			name: "archive drops inbox label",
+			tags: []string{"work"}, baseline: []string{"inbox"},
+			wantAdd: nil, wantRemove: []string{"inbox"}, wantBase: nil, // "work" not in vocab
+		},
+		{
+			name: "add a user label",
+			tags: []string{"inbox", "project-x"}, baseline: []string{"inbox"},
+			wantAdd: []string{"project-x"}, wantRemove: nil, wantBase: []string{"inbox", "project-x"},
+		},
+		{
+			name: "local non-vocab tag is never pushed",
+			tags: []string{"inbox", "ephemeral"}, baseline: []string{"inbox"},
+			wantAdd: nil, wantRemove: nil, wantBase: []string{"inbox"},
+		},
+		{
+			name: "delete adds trash, drops inbox",
+			tags: []string{"trash"}, baseline: []string{"inbox"},
+			wantAdd: []string{"trash"}, wantRemove: []string{"inbox"}, wantBase: []string{"trash"},
+		},
+		{
+			name: "no change is a no-op",
+			tags: []string{"inbox"}, baseline: []string{"inbox"},
+			wantAdd: nil, wantRemove: nil, wantBase: []string{"inbox"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			add, remove, base := diffLabels(tt.tags, tt.baseline, vocab)
+			if !sameSet(add, tt.wantAdd) {
+				t.Errorf("added = %v, want %v", add, tt.wantAdd)
+			}
+			if !sameSet(remove, tt.wantRemove) {
+				t.Errorf("removed = %v, want %v", remove, tt.wantRemove)
+			}
+			if !sameSet(base, tt.wantBase) {
+				t.Errorf("newBaseline = %v, want %v", base, tt.wantBase)
+			}
+		})
+	}
+}
+
+// TestEngineUploadsLabelChanges proves the label-upload pass turns local tag
+// edits on a LabelsAreTags backend into ApplyLabels calls and resets the
+// baseline to server truth, while never pushing a Durian-local tag.
+func TestEngineUploadsLabelChanges(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{{Name: "ALL", Role: backend.RoleAll, Selectable: true}}
+	scripts := map[string][]backend.FetchResult{
+		"ALL": {{
+			Messages: []backend.Message{{
+				MessageID: "lbl@example.com",
+				Ref:       backend.RemoteRef{Folder: "ALL", ID: "701"},
+				Raw:       rawMessage("lbl@example.com", "a@example.com", testAccount, "hi", "body"),
+				Labels:    []string{"inbox"},
+			}},
+			Cursor: backend.Cursor("c1"),
+		}},
+	}
+	fake := newFakeBackend(folders, scripts)
+	fake.caps.LabelsAreTags = true
+	fake.labelVocab = []string{"inbox", "important", "trash"}
+	cursors := newMemCursorStore()
+
+	// First sync ingests the message with the "inbox" label as its baseline.
+	if _, err := newTestEngine(db, cursors).Sync(context.Background(), fake); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// GUI actions: archive (drop inbox), add a real label (important), and add a
+	// Durian-local tag (todo) that is NOT in the vocabulary.
+	if err := db.ModifyTagsByMessageIDAndAccount("lbl@example.com", testAccount,
+		[]string{"important", "todo"}, []string{"inbox"}); err != nil {
+		t.Fatalf("edit tags: %v", err)
+	}
+
+	res, err := newTestEngine(db, cursors).Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if res.Moved != 1 {
+		t.Errorf("Result.Moved = %d, want 1", res.Moved)
+	}
+	if len(fake.labelCalls) != 1 {
+		t.Fatalf("labelCalls = %d, want 1: %+v", len(fake.labelCalls), fake.labelCalls)
+	}
+	call := fake.labelCalls[0]
+	if call.ref.ID != "701" {
+		t.Errorf("ApplyLabels ref = %q, want 701", call.ref.ID)
+	}
+	if !sameSet(call.add, []string{"important"}) {
+		t.Errorf("ApplyLabels add = %v, want [important] (todo must not be pushed)", call.add)
+	}
+	if !sameSet(call.remove, []string{"inbox"}) {
+		t.Errorf("ApplyLabels remove = %v, want [inbox]", call.remove)
+	}
+
+	// Baseline is reset to server truth (vocabulary tags only): important, not todo.
+	base, err := db.GetSyncedLabels("lbl@example.com", testAccount)
+	if err != nil {
+		t.Fatalf("get baseline: %v", err)
+	}
+	if !sameSet(strings.Split(base, ","), []string{"important"}) {
+		t.Errorf("baseline = %q, want [important]", base)
+	}
+}
+
+// TestEngineSeedsEmptyLabelBaseline proves a migrated row (label tags present,
+// empty synced_labels) is seeded from its current tags WITHOUT any ApplyLabels
+// upload — the fix for the label-upload storm where every migrated message
+// re-added labels the server already had.
+func TestEngineSeedsEmptyLabelBaseline(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{{Name: "ALL", Role: backend.RoleAll, Selectable: true}}
+	scripts := map[string][]backend.FetchResult{
+		"ALL": {{
+			Messages: []backend.Message{{
+				MessageID: "mig@example.com",
+				Ref:       backend.RemoteRef{Folder: "ALL", ID: "801"},
+				Raw:       rawMessage("mig@example.com", "a@example.com", testAccount, "hi", "body"),
+				Labels:    []string{"inbox", "important"},
+			}},
+			Cursor: backend.Cursor("c1"),
+		}},
+	}
+	fake := newFakeBackend(folders, scripts)
+	fake.caps.LabelsAreTags = true
+	fake.labelVocab = []string{"inbox", "important"}
+	cursors := newMemCursorStore()
+
+	// Ingest (sets baseline), then simulate a migrated row by clearing it.
+	if _, err := newTestEngine(db, cursors).Sync(context.Background(), fake); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if err := db.SetSyncedLabels("mig@example.com", testAccount, ""); err != nil {
+		t.Fatalf("clear baseline: %v", err)
+	}
+
+	// Next sync: uploadLabelChanges must SEED, not upload.
+	if _, err := newTestEngine(db, cursors).Sync(context.Background(), fake); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if len(fake.labelCalls) != 0 {
+		t.Errorf("expected no ApplyLabels calls (seed only), got %+v", fake.labelCalls)
+	}
+	base, err := db.GetSyncedLabels("mig@example.com", testAccount)
+	if err != nil {
+		t.Fatalf("get baseline: %v", err)
+	}
+	if !sameSet(strings.Split(base, ","), []string{"inbox", "important"}) {
+		t.Errorf("seeded baseline = %q, want [inbox important]", base)
+	}
+}
+
+// TestEngineAnsweredFlagNoPingPong proves the fix for the replied/Answered
+// ping-pong: on a backend that can't persist \Answered (Capabilities
+// .AnsweredUnsupported, e.g. Gmail), a local "replied" tag must survive repeated
+// syncs. Without the serverState.Answered = baseline mask, the third sync's
+// download branch strips it (server reports un-answered, baseline says answered).
+func TestEngineAnsweredFlagNoPingPong(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{{Name: "ALL", Role: backend.RoleAll, Selectable: true}}
+	scripts := map[string][]backend.FetchResult{
+		"ALL": {{
+			Messages: []backend.Message{{
+				MessageID: "rep@example.com",
+				Ref:       backend.RemoteRef{Folder: "ALL", ID: "901"},
+				Raw:       rawMessage("rep@example.com", "a@example.com", testAccount, "hi", "body"),
+				Flags:     backend.Flags{Seen: true},
+			}},
+			Cursor: backend.Cursor("c1"),
+		}},
+	}
+	fake := newFakeBackend(folders, scripts)
+	fake.caps.AnsweredUnsupported = true
+	// The server reports the message as seen but never answered (no \Answered).
+	fake.flagsByRef["901"] = backend.Flags{Seen: true}
+	cursors := newMemCursorStore()
+
+	if _, err := newTestEngine(db, cursors).Sync(context.Background(), fake); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	// The user replies -> "replied" tag added locally.
+	if err := db.ModifyTagsByMessageIDAndAccount("rep@example.com", testAccount, []string{"replied"}, nil); err != nil {
+		t.Fatalf("add replied: %v", err)
+	}
+
+	// Repeated syncs must not strip the replied tag.
+	for i := 1; i <= 3; i++ {
+		if _, err := newTestEngine(db, cursors).Sync(context.Background(), fake); err != nil {
+			t.Fatalf("sync %d: %v", i, err)
+		}
+		if !slices.Contains(mustTags(t, db, "rep@example.com"), "replied") {
+			t.Fatalf("replied tag stripped on sync %d (Answered ping-pong)", i)
+		}
 	}
 }
