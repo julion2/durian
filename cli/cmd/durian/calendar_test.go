@@ -125,3 +125,51 @@ func TestRecurrenceSummary(t *testing.T) {
 		t.Error("recurrenceSummary: want empty for non-recurring event")
 	}
 }
+
+// MARK: - Multi-account read targets
+
+func TestContributingAccountsDerivesFromTheResult(t *testing.T) {
+	cals := []calendar.LocalCalendar{
+		{Name: "Calendar", Account: "h"},
+		{Name: "Ich bin weg", Account: "h"},
+		{Name: "Privat", Account: "local"},
+		{Name: "Ohne Account"}, // an account-less read (ReadCalendars path)
+	}
+	got := contributingAccounts(cals)
+	if len(got) != 2 || got[0] != "h" || got[1] != "local" {
+		t.Errorf("contributingAccounts = %v, want [h local] in first-seen order", got)
+	}
+}
+
+// The label must describe what is SHOWN. With no --account the request covers
+// every configured account, but most have no calendar vdir at all — reporting
+// that count would describe the query instead of the answer.
+func TestTargetLabel(t *testing.T) {
+	if got := targetLabel([]string{"h"}); got != "h" {
+		t.Errorf("single account label = %q, want the account itself", got)
+	}
+	if got := targetLabel([]string{"h", "gm", "local"}); got != "3 accounts" {
+		t.Errorf("multi label = %q, want a count", got)
+	}
+}
+
+// Two accounts can each have a calendar named "Calendar", so the account is
+// prefixed — but only when more than one is in play, to keep the far more
+// common single-account output unchanged.
+func TestCalendarLabelPrefixesOnlyWhenAmbiguous(t *testing.T) {
+	cal := calendar.LocalCalendar{Name: "Calendar", Account: "h"}
+
+	if got := calendarLabel(cal, false); !strings.HasSuffix(got, "Calendar") || strings.Contains(got, "h/") {
+		t.Errorf("single-account label = %q, want no account prefix", got)
+	}
+	if got := calendarLabel(cal, true); !strings.HasSuffix(got, "h/Calendar") {
+		t.Errorf("multi-account label = %q, want the account prefixed", got)
+	}
+
+	// A calendar with no account (the plain ReadCalendars path) is never
+	// prefixed with an empty segment.
+	plain := calendar.LocalCalendar{Name: "Calendar"}
+	if got := calendarLabel(plain, true); strings.Contains(got, "/") {
+		t.Errorf("account-less label = %q, want no prefix", got)
+	}
+}

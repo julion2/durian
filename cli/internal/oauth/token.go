@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -213,6 +214,34 @@ func GetValidToken(email, clientID, clientSecret, tenant string) (*Token, error)
 	return newToken, nil
 }
 
+// graphTokenBuffer is how long before expiry a cached Graph token is treated as
+// stale, so a token never expires mid-request.
+const graphTokenBuffer = 5 * time.Minute
+
+// graphGate serialises Graph token acquisition for one auth identity and caches
+// the result until it nears expiry.
+type graphGate struct {
+	mu    sync.Mutex
+	token *Token
+}
+
+var (
+	graphGatesMu sync.Mutex
+	graphGates   = map[string]*graphGate{}
+)
+
+// graphGateFor returns the gate for an auth email, creating it on first use.
+func graphGateFor(email string) *graphGate {
+	graphGatesMu.Lock()
+	defer graphGatesMu.Unlock()
+	g, ok := graphGates[email]
+	if !ok {
+		g = &graphGate{}
+		graphGates[email] = g
+	}
+	return g
+}
+
 // GetGraphToken mints a Microsoft Graph access token for the account from the
 // stored refresh token, which must have been consented for the provider's
 // GraphScopes (a one-time re-consent via `durian auth login`). Azure issues one
@@ -224,7 +253,25 @@ func GetValidToken(email, clientID, clientSecret, tenant string) (*Token, error)
 // — both resources keep working from one shared, always-current refresh token.
 // The returned Graph token is NOT stored as the primary token; callers should
 // cache it in memory until it expires.
+//
+// Calls are serialised and cached per auth email, because several accounts can
+// legitimately share one identity — a user's own mailbox plus the shared
+// mailboxes they have access to all authenticate as that user. Without this,
+// syncing them concurrently would redeem the same refresh token in parallel;
+// since Azure rotates the refresh token on every use, the racing redemptions
+// invalidate each other's rotated token and fight over the single keychain
+// item that holds it.
 func GetGraphToken(email, clientID, clientSecret, tenant string) (*Token, error) {
+	gate := graphGateFor(email)
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+
+	// A cached token serves every account sharing this identity, so N accounts
+	// cost one refresh per token lifetime instead of N per sync pass.
+	if gate.token != nil && !gate.token.IsExpiredWithBuffer(graphTokenBuffer) {
+		return gate.token, nil
+	}
+
 	stored, err := LoadToken(email)
 	if err != nil {
 		return nil, err
@@ -254,5 +301,6 @@ func GetGraphToken(email, clientID, clientSecret, tenant string) (*Token, error)
 		}
 	}
 
+	gate.token = graphToken
 	return graphToken, nil
 }

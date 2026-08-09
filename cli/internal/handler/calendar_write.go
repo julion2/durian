@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/julion2/durian/cli/internal/calendar"
+	"github.com/julion2/durian/cli/internal/config"
 )
 
 // Local-first calendar write endpoints. They only edit the on-disk vdir (create
@@ -40,6 +42,26 @@ type calendarEventWrite struct {
 	RequestOnlineMeeting bool     `json:"request_online_meeting"`
 }
 
+// refuseReadOnly reports whether the named calendar is configured read-only
+// and, if so, writes the HTTP error.
+//
+// WriteEventIn guards the create path, but an update, an RSVP and a delete all
+// write the .ics file directly — a read-only calendar has to be refused at
+// each of them, or "durian never edits this folder" would hold for exactly one
+// of the four operations.
+func refuseReadOnly(w http.ResponseWriter, cols []calendar.Collection, name string) bool {
+	for _, col := range cols {
+		// Match on the RESOLVED name: Collection.Name is empty for the
+		// collections discovered under an account directory, so comparing it
+		// directly would silently never match.
+		if col.ReadOnly && strings.EqualFold(calendar.CollectionName(col), name) {
+			http.Error(w, "calendar is read-only", http.StatusForbidden)
+			return true
+		}
+	}
+	return false
+}
+
 // CalendarPutEventHandler upserts a local .ics from the posted event, generating
 // a UID when absent (create) or overwriting the existing file for a known UID
 // (update). Writes the vdir only.
@@ -63,12 +85,19 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
-	dir, owner, ok := h.resolveCalendarAccount(w, req.Account)
+	cols, ok := h.resolveCalendarCollections(w, req.Account)
 	if !ok {
 		return
 	}
 	if req.Calendar == "" {
 		http.Error(w, "missing required 'calendar'", http.StatusBadRequest)
+		return
+	}
+	// A local calendar never reaches a provider, so attendees / online meetings
+	// would silently go nowhere. Reject them rather than accept an invite that
+	// can never be sent.
+	if req.Account == config.LocalCalendarAccount && (len(req.Attendees) > 0 || req.RequestOnlineMeeting) {
+		http.Error(w, "local calendars cannot have attendees or online meetings (they do not sync to a provider)", http.StatusBadRequest)
 		return
 	}
 	start, err := time.Parse(time.RFC3339, req.Start)
@@ -141,9 +170,15 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 	// OpaqueRecurrence collapses a series into a single appointment. Starting
 	// from `existing` makes preservation the default and enumerates only what
 	// the client may change.
-	if path, existing, calName, resolveErr := calendar.ResolveLocalEvent(dir, owner, req.UID, ""); resolveErr == nil && existing.ICalUID == req.UID {
+	if path, existing, calName, resolveErr := calendar.ResolveEventIn(cols, req.UID, ""); resolveErr == nil && existing.ICalUID == req.UID {
 		if !strings.EqualFold(calName, req.Calendar) {
 			http.Error(w, "event belongs to a different calendar; moving events between calendars is not supported", http.StatusBadRequest)
+			return
+		}
+		// A read-only calendar must refuse an update too (WriteEventIn only
+		// guards create), or "durian never edits this folder" would hold for
+		// create but not update.
+		if refuseReadOnly(w, cols, calName) {
 			return
 		}
 		merged := existing
@@ -179,9 +214,13 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if _, err := calendar.WriteLocalEvent(dir, req.Calendar, ev); err != nil {
+	if _, err := calendar.WriteEventIn(cols, req.Calendar, ev); err != nil {
 		slog.Error("Failed to write local event", "module", "API", "err", logSafe(err.Error()))
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		status := http.StatusBadRequest
+		if errors.Is(err, calendar.ErrReadOnly) {
+			status = http.StatusForbidden
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "event": calendar.ToCalendarEvent(req.Calendar, ev, true)})
@@ -207,7 +246,7 @@ func (h *Handler) CalendarRsvpHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
-	dir, owner, ok := h.resolveCalendarAccount(w, req.Account)
+	cols, ok := h.resolveCalendarCollections(w, req.Account)
 	if !ok {
 		return
 	}
@@ -220,13 +259,17 @@ func (h *Handler) CalendarRsvpHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	path, event, calName, err := calendar.ResolveLocalEvent(dir, owner, req.Ref, req.Calendar)
+	path, event, calName, err := calendar.ResolveEventIn(cols, req.Ref, req.Calendar)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	if refuseReadOnly(w, cols, calName) {
+		return
+	}
 	// Same rail as the CLI `calendar rsvp`: an organizer does not RSVP to
 	// their own meeting.
+	owner := calendar.CollectionOwner(cols, calName)
 	if event.OwnerResponse == calendar.OwnerRespOrganizer || calendar.OwnerIsOrganizer(event, owner) {
 		http.Error(w, "cannot RSVP: you are the organizer of this event", http.StatusBadRequest)
 		return
@@ -257,7 +300,7 @@ func (h *Handler) CalendarRsvpHandler(w http.ResponseWriter, r *http.Request) {
 // propagated to Outlook on the next sync.
 func (h *Handler) CalendarDeleteEventHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	dir, owner, ok := h.resolveCalendarAccount(w, q.Get("account"))
+	cols, ok := h.resolveCalendarCollections(w, q.Get("account"))
 	if !ok {
 		return
 	}
@@ -266,9 +309,12 @@ func (h *Handler) CalendarDeleteEventHandler(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "missing required 'ref' query parameter", http.StatusBadRequest)
 		return
 	}
-	path, _, _, err := calendar.ResolveLocalEvent(dir, owner, ref, q.Get("calendar"))
+	path, _, calName, err := calendar.ResolveEventIn(cols, ref, q.Get("calendar"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if refuseReadOnly(w, cols, calName) {
 		return
 	}
 	// Move the file aside instead of unlinking it. The sync still reads the

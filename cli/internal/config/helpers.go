@@ -363,3 +363,17 @@ func (c *Config) GetAccountsWithIMAP() []*AccountConfig {
 	}
 	return accounts
 }
+
+// GetGraphAccounts returns all accounts that sync through the Microsoft Graph
+// backend. These are exactly the accounts the IMAP IDLE watcher must skip, so
+// the daemon drives them with the polling engine watcher instead. IMAP config
+// is irrelevant here: a Graph account needs no IMAP host at all.
+func (c *Config) GetGraphAccounts() []*AccountConfig {
+	var accounts []*AccountConfig
+	for i := range c.Accounts {
+		if c.Accounts[i].UsesGraphBackend() {
+			accounts = append(accounts, &c.Accounts[i])
+		}
+	}
+	return accounts
+}

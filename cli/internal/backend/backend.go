@@ -9,6 +9,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 )
@@ -50,6 +51,15 @@ type RemoteRef struct {
 	Folder string
 	ID     string
 }
+
+// ErrRefGone reports that a RemoteRef no longer resolves to a message on the
+// server: it was moved, deleted or expunged by another client since the ref was
+// stored. Backends wrap it around the provider's own error (Graph 404
+// ErrorItemNotFound, IMAP UID no longer present) so callers can distinguish
+// "this handle is permanently dead, reconcile locally" from a transient
+// failure worth retrying. Retrying an ErrRefGone operation can never succeed —
+// providers that renumber on move (Graph) never resurrect an old id.
+var ErrRefGone = errors.New("remote ref no longer exists on server")
 
 // Cursor is an opaque, per-folder incremental-sync token, owned and interpreted
 // solely by the Backend that issued it. The sync engine persists it verbatim
@@ -156,7 +166,8 @@ type Backend interface {
 	// reports server state (and applies changes via ApplyFlags).
 	FetchFlags(ctx context.Context, folder string, refs []RemoteRef) (map[string]Flags, error)
 
-	// Move relocates ref into destFolder, returning its new handle.
+	// Move relocates ref into destFolder, returning its new handle. Returns an
+	// error wrapping ErrRefGone when ref no longer exists on the server.
 	Move(ctx context.Context, ref RemoteRef, destFolder string) (RemoteRef, error)
 
 	// Append stores msg into folder with the given flags (drafts, sent copies).

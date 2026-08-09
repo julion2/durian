@@ -3,6 +3,7 @@ package graphbackend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -583,6 +584,36 @@ func TestMove(t *testing.T) {
 	want := backend.RemoteRef{Folder: "id-archive", ID: "new-id"}
 	if moved != want {
 		t.Errorf("Move() = %+v, want %+v (Graph reassigns the id on move)", moved, want)
+	}
+}
+
+// TestMoveGoneRef proves a 404 from the move endpoint surfaces as
+// backend.ErrRefGone: the source id died (moved or deleted by another client)
+// and no retry can bring it back, so the engine must reconcile rather than
+// keep failing the sync.
+func TestMoveGoneRef(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/messages/dead-id/move", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		writeJSON(t, w, map[string]any{"error": map[string]any{
+			"code":    "ErrorItemNotFound",
+			"message": "The specified object was not found in the store.",
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	ref := backend.RemoteRef{Folder: "id-inbox", ID: "dead-id"}
+	_, err := b.Move(context.Background(), ref, "id-archive")
+	if err == nil {
+		t.Fatal("Move() succeeded, want error")
+	}
+	if !errors.Is(err, backend.ErrRefGone) {
+		t.Errorf("Move() error = %v, want one wrapping backend.ErrRefGone", err)
+	}
+	if !strings.Contains(err.Error(), "ErrorItemNotFound") {
+		t.Errorf("Move() error = %v, want the Graph error body preserved", err)
 	}
 }
 

@@ -24,6 +24,7 @@ go_test(
     size = "small",
     srcs = [
         "calendar_test.go",
+        "collections_test.go",
         "ical_roundtrip_test.go",
         "read_local_test.go",
         "rsvp_test.go",

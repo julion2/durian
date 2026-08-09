@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/julion2/durian/cli/internal/calendar"
+	"github.com/julion2/durian/cli/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -101,10 +102,11 @@ func init() {
 }
 
 func runCalendarNew(cmd *cobra.Command, args []string) error {
-	accountDir, _, account, err := resolveVdirAccount(args[0])
+	cols, err := resolveVdirCollections(args[0])
 	if err != nil {
 		return err
 	}
+	label := args[0]
 	if calNewCalendar == "" || calNewSubject == "" || calNewStart == "" {
 		return fmt.Errorf("--calendar, --subject and --start are required")
 	}
@@ -151,14 +153,14 @@ func runCalendarNew(cmd *cobra.Command, args []string) error {
 		RequestOnlineMeeting: calNewTeams,
 	}
 
-	path, err := calendar.WriteLocalEvent(accountDir, calNewCalendar, event)
+	path, err := calendar.WriteEventIn(cols, calNewCalendar, event)
 	if err != nil {
 		return err
 	}
 
 	fmt.Println(okLine("Created %q in %q", calNewSubject, calNewCalendar))
 	fmt.Fprintf(os.Stderr, "  %s\n", styDim(path))
-	printSyncReminder(account.GetAliasOrName(), len(attendees) > 0 || calNewTeams)
+	printSyncReminder(label, len(attendees) > 0 || calNewTeams)
 	return nil
 }
 
@@ -193,20 +195,22 @@ func eventEnd(start time.Time, allDay bool, now time.Time) (time.Time, error) {
 }
 
 func runCalendarRsvp(cmd *cobra.Command, args []string) error {
-	accountDir, owner, account, err := resolveVdirAccount(args[0])
+	cols, err := resolveVdirCollections(args[0])
 	if err != nil {
 		return err
 	}
+	label := args[0]
 	ref := args[1]
 	response, err := calendar.ParseRSVPVerb(args[2])
 	if err != nil {
 		return err
 	}
 
-	path, event, calName, err := calendar.ResolveLocalEvent(accountDir, owner, ref, calRsvpCalendar)
+	path, event, calName, err := calendar.ResolveEventIn(cols, ref, calRsvpCalendar)
 	if err != nil {
 		return err
 	}
+	owner := calendar.CollectionOwner(cols, calName)
 
 	if isOwnerOrganizer(event, owner) {
 		return fmt.Errorf("cannot RSVP to %q — you are the organizer", orDash(event.Subject))
@@ -224,7 +228,7 @@ func runCalendarRsvp(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Println(okLine("RSVP %q set to %q in %q", orDash(event.Subject), rsvpVerbLabel(response), calName))
-	printSyncReminder(account.GetAliasOrName(), true)
+	printSyncReminder(label, true)
 	return nil
 }
 
@@ -248,13 +252,14 @@ func isOwnerOrganizer(e calendar.Event, owner string) bool {
 }
 
 func runCalendarDelete(cmd *cobra.Command, args []string) error {
-	accountDir, owner, account, err := resolveVdirAccount(args[0])
+	cols, err := resolveVdirCollections(args[0])
 	if err != nil {
 		return err
 	}
+	label := args[0]
 	ref := args[1]
 
-	path, event, calName, err := calendar.ResolveLocalEvent(accountDir, owner, ref, calDeleteCalendar)
+	path, event, calName, err := calendar.ResolveEventIn(cols, ref, calDeleteCalendar)
 	if err != nil {
 		return err
 	}
@@ -271,7 +276,7 @@ func runCalendarDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Println(okLine("Deleted %q from %q locally", orDash(event.Subject), calName))
-	printSyncReminder(account.GetAliasOrName(), len(event.Attendees) > 0)
+	printSyncReminder(label, len(event.Attendees) > 0)
 	return nil
 }
 
@@ -291,6 +296,12 @@ func confirmPrompt(msg string) bool {
 // printSyncReminder tells the user how to apply the local change, warning when
 // applying it will send mail to attendees.
 func printSyncReminder(account string, mayNotify bool) {
+	// A local calendar has no remote side to apply anything to: the write is
+	// already the whole story, and pointing at a sync command that refuses
+	// this identifier would be worse than saying nothing.
+	if strings.EqualFold(account, config.LocalCalendarAccount) {
+		return
+	}
 	msg := fmt.Sprintf("Run 'durian calendar sync %s' to apply.", account)
 	if mayNotify {
 		msg += " It will preview any attendee notifications before sending."

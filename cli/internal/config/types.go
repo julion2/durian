@@ -82,6 +82,81 @@ type CalendarConfig struct {
 	// "newer"), used when an account does not set its own. Empty resolves to
 	// the schema default "newer". Use Config.CalendarConflictPolicy.
 	Conflict string `pkl:"conflict" json:"conflict"`
+	// Local lists the calendars that exist only on disk. They belong to no
+	// account and no provider, which is what keeps them out of the sync
+	// engine: it plans only the calendars a provider reports, so a directory
+	// no provider knows about is never uploaded and never pruned.
+	Local []LocalCalendarConfig `pkl:"local_calendars" json:"local_calendars"`
+}
+
+// LocalCalendarConfig is one calendar that lives only on disk: a directory of
+// .ics files in the vdir collection layout, with no remote counterpart.
+type LocalCalendarConfig struct {
+	// Name is the display name and the identifier used with --calendar.
+	Name string `pkl:"name" json:"name"`
+	// Path is the directory holding the .ics files. It may be anywhere —
+	// pointing it at an existing khal or vdirsyncer collection is the point.
+	// Use LocalCalendarPath for the expanded form.
+	Path string `pkl:"path" json:"path"`
+	// Color is a "#RRGGBB" display color, or "" to fall back to the
+	// collection's own color meta file.
+	Color string `pkl:"color" json:"color"`
+	// ReadOnly refuses every write to this calendar, so a folder another tool
+	// owns can be displayed without durian ever editing it.
+	ReadOnly bool `pkl:"read_only" json:"read_only"`
+}
+
+// LocalCalendarAccount is the reserved account identifier under which the
+// local calendars are addressed. It is not a real account: it has no
+// credentials, no provider and no sync state, and `durian calendar sync`
+// rejects it.
+const LocalCalendarAccount = "local"
+
+// LocalCalendars returns the configured local calendars with their paths
+// expanded. Entries without a name or path are dropped — a nameless calendar
+// cannot be addressed and a pathless one has nothing to show.
+func (c *Config) LocalCalendars() []LocalCalendarConfig {
+	out := make([]LocalCalendarConfig, 0, len(c.Calendar.Local))
+	for _, lc := range c.Calendar.Local {
+		name := strings.TrimSpace(lc.Name)
+		if name == "" || strings.TrimSpace(lc.Path) == "" {
+			continue
+		}
+		// Names address the calendar, so a duplicate would make one of them
+		// unreachable and the resolution order arbitrary. Keep the first. Match
+		// with EqualFold — exactly how FindLocalCalendar looks them up — so a
+		// Unicode name whose ToLower differs but folds equal can't slip past
+		// dedup and then shadow the earlier entry at lookup time.
+		if containsFoldName(out, name) {
+			continue
+		}
+		lc.Name = name
+		lc.Path = ExpandPath(lc.Path)
+		out = append(out, lc)
+	}
+	return out
+}
+
+// containsFoldName reports whether any calendar in cals has a name equal to want
+// under Unicode case folding (the same comparison FindLocalCalendar uses).
+func containsFoldName(cals []LocalCalendarConfig, want string) bool {
+	for _, lc := range cals {
+		if strings.EqualFold(lc.Name, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// FindLocalCalendar returns the local calendar with the given display name
+// (case-insensitive).
+func (c *Config) FindLocalCalendar(name string) (LocalCalendarConfig, bool) {
+	for _, lc := range c.LocalCalendars() {
+		if strings.EqualFold(lc.Name, name) {
+			return lc, true
+		}
+	}
+	return LocalCalendarConfig{}, false
 }
 
 // AccountCalendarConfig configures the vdir calendar export of one account.

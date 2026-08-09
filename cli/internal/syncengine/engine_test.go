@@ -3,6 +3,7 @@ package syncengine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -102,6 +103,8 @@ type fakeBackend struct {
 	applyFlagsCalls []applyFlagsCall
 	// moveCalls records Backend.Move invocations (folder-move upload pass).
 	moveCalls []moveCall
+	// moveErr, when set, is returned by every Move instead of succeeding.
+	moveErr error
 	// caps is returned by Capabilities(); zero value matches the default IMAP-like
 	// backend. Tests set FlagChangesInDelta to exercise the delta flag path.
 	caps backend.Capabilities
@@ -160,6 +163,9 @@ func (f *fakeBackend) FetchFlags(ctx context.Context, folder string, refs []back
 
 func (f *fakeBackend) Move(ctx context.Context, ref backend.RemoteRef, destFolder string) (backend.RemoteRef, error) {
 	f.moveCalls = append(f.moveCalls, moveCall{ref: ref, dest: destFolder})
+	if f.moveErr != nil {
+		return backend.RemoteRef{}, f.moveErr
+	}
 	return backend.RemoteRef{Folder: destFolder, ID: ref.ID}, nil
 }
 
@@ -187,6 +193,132 @@ func newTestEngine(db *store.DB, cursors CursorStore) *Engine {
 		Account: testAccount,
 		Ingest:  IngestOptions{Account: testAccount},
 	})
+}
+
+// TestEngineFolderFilterMatchesRole proves a caller-supplied "INBOX" selects
+// the inbox on a provider that names folders by opaque id and displays them in
+// the mailbox's own language (a German Microsoft Graph tenant), and that a
+// filter matching nothing fails loudly instead of reporting an empty success.
+func TestEngineFolderFilterMatchesRole(t *testing.T) {
+	db := newTestDB(t)
+	// Shaped like a real Graph mailbox: ids for names, localized displays.
+	folders := []backend.Folder{
+		{Name: "AQMkAGQ3-inbox", Display: "Posteingang", Role: backend.RoleInbox, Selectable: true},
+		{Name: "AQMkAGQ3-sent", Display: "Gesendete Elemente", Role: backend.RoleSent, Selectable: true},
+	}
+	scripts := map[string][]backend.FetchResult{
+		"AQMkAGQ3-inbox": {{
+			Messages: []backend.Message{{
+				MessageID: "neu@example.com",
+				Ref:       backend.RemoteRef{Folder: "AQMkAGQ3-inbox", ID: "1"},
+				Raw:       rawMessage("neu@example.com", "b@example.com", testAccount, "Neu", "body"),
+			}},
+			Cursor: backend.Cursor("c1"),
+		}},
+	}
+	fake := newFakeBackend(folders, scripts)
+
+	engine := New(Options{
+		Store: db, Cursors: newMemCursorStore(), Account: testAccount,
+		Folders: []string{"INBOX"},
+		Ingest:  IngestOptions{Account: testAccount},
+	})
+	res, err := engine.Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("sync with INBOX filter: %v", err)
+	}
+	if res.Folders != 1 {
+		t.Errorf("Folders = %d, want 1 (INBOX must match the inbox role)", res.Folders)
+	}
+	if res.New != 1 {
+		t.Errorf("New = %d, want 1", res.New)
+	}
+
+	// A filter that matches nothing is a caller bug, not a quiet success.
+	engine = New(Options{
+		Store: db, Cursors: newMemCursorStore(), Account: testAccount,
+		Folders: []string{"Nonexistent"},
+		Ingest:  IngestOptions{Account: testAccount},
+	})
+	if _, err := engine.Sync(context.Background(), fake); err == nil {
+		t.Error("sync with a filter matching no folder returned nil error")
+	}
+}
+
+// TestEngineReportsNewInboxArrivals proves the engine reports which messages
+// are genuinely new in an inbox-role folder — the provider-neutral basis for
+// new-mail notifications — and that arrivals elsewhere do not qualify.
+func TestEngineReportsNewInboxArrivals(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{
+		{Name: "INBOX", Display: "Inbox", Role: backend.RoleInbox, Selectable: true},
+		{Name: "Sent", Display: "Sent", Role: backend.RoleSent, Selectable: true},
+	}
+	scripts := map[string][]backend.FetchResult{
+		"INBOX": {{
+			Messages: []backend.Message{{
+				MessageID: "arrived@example.com",
+				Ref:       backend.RemoteRef{Folder: "INBOX", ID: "1"},
+				Raw:       rawMessage("arrived@example.com", "b@example.com", testAccount, "Hello", "body"),
+			}},
+			Cursor: backend.Cursor("c1"),
+		}},
+		"Sent": {{
+			Messages: []backend.Message{{
+				MessageID: "iwrote@example.com",
+				Ref:       backend.RemoteRef{Folder: "Sent", ID: "2"},
+				Raw:       rawMessage("iwrote@example.com", testAccount, "c@example.com", "My reply", "body"),
+			}},
+			Cursor: backend.Cursor("c1"),
+		}},
+	}
+	fake := newFakeBackend(folders, scripts)
+	cursors := newMemCursorStore()
+
+	res, err := newTestEngine(db, cursors).Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if got, want := res.NewMessageIDs, []string{"arrived@example.com"}; !slices.Equal(got, want) {
+		t.Errorf("NewMessageIDs = %v, want %v (only inbox arrivals notify)", got, want)
+	}
+
+	// Second sync: nothing new, so nothing to notify about — a re-delivered
+	// message must not be announced as an arrival a second time.
+	res, err = newTestEngine(db, cursors).Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if len(res.NewMessageIDs) != 0 {
+		t.Errorf("NewMessageIDs = %v on a no-change sync, want none", res.NewMessageIDs)
+	}
+}
+
+// TestIsRetryableStoreError pins which ingest failures may hold a folder's
+// cursor back. Getting this wrong is costly in both directions: treating a
+// permanent failure as retryable re-downloads the folder forever without
+// progressing, and treating write contention as permanent drops the message.
+func TestIsRetryableStoreError(t *testing.T) {
+	retryable := []string{
+		"insert message: resolve mailbox: insert mailbox: database is locked (5) (SQLITE_BUSY)",
+		"insert message: database is locked (517)",
+		"database table is locked",
+	}
+	for _, msg := range retryable {
+		if !isRetryableStoreError(errors.New(msg)) {
+			t.Errorf("isRetryableStoreError(%q) = false, want true", msg)
+		}
+	}
+	permanent := []string{
+		"insert message: UNIQUE constraint failed: messages.message_id",
+		"parse message: malformed MIME header",
+		"encrypt subject: key unavailable",
+	}
+	for _, msg := range permanent {
+		if isRetryableStoreError(errors.New(msg)) {
+			t.Errorf("isRetryableStoreError(%q) = true, want false (would block the folder forever)", msg)
+		}
+	}
 }
 
 // mustTags fetches the tags for a Message-ID or fails the test.
@@ -279,6 +411,69 @@ func TestEngineUploadsFolderMoves(t *testing.T) {
 	// The archived message's row now points at Archive (not deleted locally).
 	if arch, _ := db.GetByMessageID("arch@example.com"); arch == nil || arch.Mailbox != "Archive" {
 		t.Errorf("archived message should have mailbox Archive")
+	}
+}
+
+// TestEngineFolderMoveGoneRefReconciles proves the dead-ref path: when the
+// server no longer knows the message's handle (Graph renumbers on move, so a
+// message archived from another client leaves a permanently dead id behind),
+// the move is not a sync error, and the local row is reconciled so the same
+// doomed move is not retried on every subsequent sync.
+func TestEngineFolderMoveGoneRefReconciles(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{
+		{Name: "INBOX", Display: "Inbox", Role: backend.RoleInbox, Selectable: true},
+		{Name: "Archive", Display: "Archive", Role: backend.RoleArchive, Selectable: true},
+	}
+	scripts := map[string][]backend.FetchResult{
+		"INBOX": {{
+			Messages: []backend.Message{{
+				MessageID: "gone@example.com",
+				Ref:       backend.RemoteRef{Folder: "INBOX", ID: "stale-id"},
+				Raw:       rawMessage("gone@example.com", "b@example.com", testAccount, "Gone", "body"),
+			}},
+			Cursor: backend.Cursor("c1"),
+		}},
+	}
+	fake := newFakeBackend(folders, scripts)
+	cursors := newMemCursorStore()
+
+	if _, err := newTestEngine(db, cursors).Sync(context.Background(), fake); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if err := db.ModifyTagsByMessageIDAndAccount("gone@example.com", testAccount, nil, []string{"inbox"}); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+
+	// The server says the handle is dead — as Graph does with 404
+	// ErrorItemNotFound after the message moved elsewhere.
+	fake.moveErr = fmt.Errorf("failed to move stale-id: %w", backend.ErrRefGone)
+
+	res, err := newTestEngine(db, cursors).Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if len(res.Errors) != 0 {
+		t.Errorf("Result.Errors = %v, want none (a gone ref is not a sync failure)", res.Errors)
+	}
+	if len(fake.moveCalls) != 1 {
+		t.Fatalf("moveCalls = %d, want 1", len(fake.moveCalls))
+	}
+	// Row survives — the message still exists on the server, just elsewhere.
+	row, _ := db.GetByMessageID("gone@example.com")
+	if row == nil {
+		t.Fatalf("row deleted; a gone ref must not lose the message locally")
+	}
+	if row.Mailbox != "Archive" {
+		t.Errorf("mailbox = %q, want Archive (reconciled to the intended destination)", row.Mailbox)
+	}
+
+	// Third sync: the row is out of INBOX, so the dead move is never retried.
+	if _, err := newTestEngine(db, cursors).Sync(context.Background(), fake); err != nil {
+		t.Fatalf("third sync: %v", err)
+	}
+	if len(fake.moveCalls) != 1 {
+		t.Errorf("moveCalls = %d after third sync, want 1 (dead move must not repeat)", len(fake.moveCalls))
 	}
 }
 

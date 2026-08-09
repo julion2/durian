@@ -34,6 +34,28 @@ settings: C.SettingsConfig = new {
 //   conflict = "newer"         // Both-sides edit: "newer" (default) keeps the
 //                              // last-modified side, "remote", or "local"
 //                              // (the losing local file is always backed up)
+//
+//   // Calendars that live only on disk: each entry is one folder of .ics
+//   // files. They belong to no account and no provider, so the sync engine
+//   // never touches them — nothing is uploaded, nothing is pruned, and no
+//   // invitation can be sent for an event in them. Point an entry at an
+//   // existing khal or vdirsyncer collection to show it as-is. Addressed as
+//   // the reserved account "local": `durian calendar list local`.
+//   // Note the explicit `new C.LocalCalendar`: a bare `new { ... }` inside a
+//   // typed Listing evaluates to Dynamic and Pkl rejects it.
+//   local_calendars = new Listing {
+//     new C.LocalCalendar {
+//       name = "Privat"                // Display name, and the --calendar value
+//       path = "~/Kalender/privat"     // Created on first write if missing
+//       color = "#8ab4f8"              // Optional; else the collection's own
+//                                      // `color` meta file
+//     }
+//     new C.LocalCalendar {
+//       name = "Verein"
+//       path = "~/Nextcloud/verein-cal"
+//       read_only = true               // Never written by durian
+//     }
+//   }
 // }
 
 sync: C.SyncConfig = new {

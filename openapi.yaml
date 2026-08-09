@@ -411,7 +411,10 @@ paths:
         - name: account
           in: query
           required: true
-          description: Account identifier (email, alias or name)
+          description: >-
+            Account identifier (email, alias or name), or the reserved value
+            `local` for the calendars configured under `calendar.local_calendars`.
+            Those exist only on disk, belong to no provider and are never synced.
           schema:
             type: string
       responses:
@@ -437,7 +440,10 @@ paths:
         - name: account
           in: query
           required: true
-          description: Account identifier (email, alias or name)
+          description: >-
+            Account identifier (email, alias or name), or the reserved value
+            `local` for the calendars configured under `calendar.local_calendars`.
+            Those exist only on disk, belong to no provider and are never synced.
           schema:
             type: string
         - name: from
@@ -478,7 +484,10 @@ paths:
         - name: account
           in: query
           required: true
-          description: Account identifier (email, alias or name)
+          description: >-
+            Account identifier (email, alias or name), or the reserved value
+            `local` for the calendars configured under `calendar.local_calendars`.
+            Those exist only on disk, belong to no provider and are never synced.
           schema:
             type: string
         - name: ref
@@ -1068,7 +1077,10 @@ components:
       properties:
         account:
           type: string
-          description: Account identifier (email, alias or name)
+          description: >-
+            Account identifier (email, alias or name), or the reserved value
+            `local` for the calendars configured under `calendar.local_calendars`.
+            Those exist only on disk, belong to no provider and are never synced.
         calendar:
           type: string
           description: Restrict the event lookup to a single calendar by display name
