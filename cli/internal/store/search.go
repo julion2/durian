@@ -15,7 +15,7 @@ import (
 // over the post-decrypt-filtered candidate set so HMAC collisions in
 // the index don't inflate the count and feed a chosen-plaintext oracle.
 func (d *DB) SearchCount(query string) (int, error) {
-	where, params, terms, err := d.parseQueryWithTerms(query)
+	where, params, node, terms, err := d.parseQueryWithTerms(query)
 	if err != nil {
 		return 0, fmt.Errorf("parse query: %w", err)
 	}
@@ -34,7 +34,7 @@ func (d *DB) SearchCount(query string) (int, error) {
 		return count, nil
 	}
 
-	threadIDs, err := d.filteredThreadIDs(where, params, terms)
+	threadIDs, err := d.filteredThreadIDs(where, params, node)
 	if err != nil {
 		return 0, err
 	}
@@ -45,7 +45,7 @@ func (d *DB) SearchCount(query string) (int, error) {
 // post-decrypt filter for the given SQL WHERE + FTS terms. Used by
 // both Search and SearchCount so the two endpoints can't diverge on
 // what "matches" means.
-func (d *DB) filteredThreadIDs(where string, params []any, terms []ftsTerm) ([]string, error) {
+func (d *DB) filteredThreadIDs(where string, params []any, node exprNode) ([]string, error) {
 	q := "SELECT m.id, m.thread_id FROM messages m"
 	if where != "" {
 		q += " WHERE " + where
@@ -76,7 +76,7 @@ func (d *DB) filteredThreadIDs(where string, params []any, terms []ftsTerm) ([]s
 	for i, p := range candidates {
 		ids[i] = p.id
 	}
-	surviving, err := d.postDecryptFilter(ids, terms)
+	surviving, err := d.postDecryptFilter(ids, node)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +104,7 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 		limit = 50
 	}
 
-	where, params, terms, err := d.parseQueryWithTerms(query)
+	where, params, node, terms, err := d.parseQueryWithTerms(query)
 	if err != nil {
 		return nil, fmt.Errorf("parse query: %w", err)
 	}
@@ -119,7 +119,7 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 	// fts_token sub-key one bit at a time.
 	var threadFilter string
 	if len(terms) > 0 {
-		threadIDs, err := d.filteredThreadIDs(where, params, terms)
+		threadIDs, err := d.filteredThreadIDs(where, params, node)
 		if err != nil {
 			return nil, err
 		}
@@ -725,24 +725,24 @@ func (d *DB) parseQuery(query string) (where string, params []interface{}, err e
 // FTS5 MATCH wasn't satisfied by an HMAC truncation collision. If the
 // query has no blind-FTS terms, terms is nil and callers can take the
 // pure-SQL fast path.
-func (d *DB) parseQueryWithTerms(query string) (where string, params []interface{}, terms []ftsTerm, err error) {
+func (d *DB) parseQueryWithTerms(query string) (where string, params []interface{}, node exprNode, terms []ftsTerm, err error) {
 	if len(query) > MaxQueryLen {
-		return "", nil, nil, ErrQueryTooLong
+		return "", nil, nil, nil, ErrQueryTooLong
 	}
 	tokens := lex(query)
-	node, err := parse(tokens)
+	node, err = parse(tokens)
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, nil, err
 	}
 	if _, ok := node.(*starExpr); ok {
-		return "", nil, nil, nil
+		return "", nil, node, nil, nil
 	}
 	where, params, err = d.exprToSQL(node)
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, nil, err
 	}
 	terms = extractFTSTerms(node)
-	return where, params, terms, nil
+	return where, params, node, terms, nil
 }
 
 // fieldToSQL converts a field expression into a SQL clause. Method on
