@@ -93,7 +93,10 @@ struct CalendarRsvpWrite: Encodable {
 @MainActor
 final class CalendarBackend {
     private let decoder = JSONDecoder()
-    private let baseURL = URL(string: "http://localhost:9723/api/v1")!
+    // Resolved from AppServer like every other backend, never hardcoded: the
+    // port is scoped by bundle id (9724 for Nightly), so a literal 9723 points
+    // the Nightly build at a server that is not there.
+    private let baseURL = AppServer.apiBaseURL
 
     /// The account's calendars (name, color, event count).
     func listCalendars(account: String) async -> [CalendarWire] {
