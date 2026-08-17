@@ -18,12 +18,13 @@ use_repo(swift_deps, "swift_package", "swiftpkg_pkl_swift")
 
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
 
-# Pin Go to a patched stdlib. 1.25.12 fixes GO-2026-5856 (crypto/tls
-# Encrypted Client Hello privacy leak), follow-on to 1.25.11 (GO-2026-5039
-# net/textproto) and the 1.25.10 net/mail DoS bump. Without an explicit
-# version, rules_go falls back to its bundled default which lags behind.
-# from_file uses the `go` directive in cli/go.mod as the floor.
-go_sdk.download(version = "1.25.12")
+# Pin Go to a patched stdlib. 1.25.13 fixes GO-2026-6218 (net/url), GO-2026-6090
+# (crypto/tls), GO-2026-6089 / GO-2026-5026 (net/http) and GO-2026-5972
+# (encoding/asn1); follow-on to 1.25.12 (GO-2026-5856 crypto/tls ECH leak) and
+# 1.25.11 (GO-2026-5039 net/textproto). Without an explicit version, rules_go
+# falls back to its bundled default which lags behind. Keep in lockstep with the
+# `go` directive in cli/go.mod (govulncheck installs that version in CI).
+go_sdk.download(version = "1.25.13")
 
 go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
 go_deps.from_file(go_mod = "//cli:go.mod")
