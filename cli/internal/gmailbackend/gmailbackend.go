@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -71,6 +72,9 @@ type Backend struct {
 
 	mu          sync.Mutex
 	cachedToken *oauth.Token
+	// labels maps Gmail label ids to Durian tag names (system labels via a fixed
+	// table, user labels to their display name), reloaded each FetchMessages call.
+	labels map[string]string
 }
 
 // Compile-time check that Backend satisfies the interface.
@@ -333,6 +337,9 @@ type gmailMessage struct {
 // that completed the cursor carries a historyId and it runs the incremental
 // history sync via history.list. An expired historyId (404) restarts a full sync.
 func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backend.Cursor, limit int) (backend.FetchResult, error) {
+	if err := b.loadLabels(ctx); err != nil {
+		return backend.FetchResult{}, fmt.Errorf("load labels: %w", err)
+	}
 	gc := decodeCursor(cursor)
 	if gc.HistoryID != "" {
 		res, err := b.historySync(ctx, folder, gc, limit)
@@ -428,7 +435,7 @@ func (b *Backend) fetchOne(ctx context.Context, folder, id string) (fetched, err
 			Ref:          backend.RemoteRef{Folder: folder, ID: gm.ID},
 			Raw:          raw,
 			Flags:        flagsFromLabels(gm.LabelIDs),
-			Labels:       tagLabels(gm.LabelIDs),
+			Labels:       b.resolveLabels(gm.LabelIDs),
 			InternalDate: parseInternalDate(gm.InternalDate),
 		},
 		historyID: hid,
@@ -628,19 +635,93 @@ func flagsFromLabels(labels []string) backend.Flags {
 	return f
 }
 
-// tagLabels returns the labels that should become tags — every label except the
-// reserved flag labels, which flagsFromLabels already carries. Resolving Gmail's
-// opaque user-label ids to their display names is left to the engine mapping.
-func tagLabels(labels []string) []string {
-	out := make([]string, 0, len(labels))
-	for _, l := range labels {
-		if l == labelUnread || l == labelStarred {
-			continue
-		}
-		out = append(out, l)
+// systemLabelTags maps Gmail's reserved system labels to Durian's canonical
+// tags (IMPORTANT -> important mirrors the legacy IMAP \Important mapping).
+// Labels not listed are intentionally not tagged: STARRED/UNREAD are flags, and
+// CATEGORY_* / CHAT would only add noise.
+var systemLabelTags = map[string]string{
+	"INBOX":     "inbox",
+	"SENT":      "sent",
+	"DRAFT":     "draft",
+	"TRASH":     "trash",
+	"SPAM":      "spam",
+	"IMPORTANT": "important",
+}
+
+// gmailLabel is one entry of users.labels.list.
+type gmailLabel struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"` // "system" or "user"
+}
+
+// labelToTag maps one Gmail label to a Durian tag name, or "" when it should not
+// become a tag. System labels use the fixed table; user labels use their display
+// name via sanitizeTag (a nested "Parent/Child" keeps its slash).
+func labelToTag(l gmailLabel) string {
+	if l.ID == labelUnread || l.ID == labelStarred {
+		return ""
 	}
-	if len(out) == 0 {
-		return nil
+	if l.Type == "system" {
+		return systemLabelTags[l.ID]
+	}
+	return sanitizeTag(l.Name)
+}
+
+// sanitizeTag normalizes a user label name to a tag: lowercased, trimmed, with
+// inner spaces collapsed to dashes (parity with the IMAP label path, so the same
+// label yields the same tag on either backend).
+func sanitizeTag(name string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(name)), " ", "-")
+}
+
+// loadLabels (re)builds the label-id -> tag-name map from users.labels.list. It
+// runs once per FetchMessages call so newly created labels resolve on the next
+// sync rather than only after a restart.
+func (b *Backend) loadLabels(ctx context.Context) error {
+	var resp struct {
+		Labels []gmailLabel `json:"labels"`
+	}
+	if err := b.doJSON(ctx, http.MethodGet, b.baseURL+"/users/me/labels", nil, &resp); err != nil {
+		b.mu.Lock()
+		haveCache := b.labels != nil
+		b.mu.Unlock()
+		if haveCache {
+			// Labels change rarely, so reuse the last map rather than failing the
+			// whole sync on a momentary labels.list outage.
+			slog.Warn("labels.list failed, reusing cached labels", "module", "GMAILBACKEND", "err", err)
+			return nil
+		}
+		return err
+	}
+	m := make(map[string]string, len(resp.Labels))
+	for _, l := range resp.Labels {
+		if tag := labelToTag(l); tag != "" {
+			m[l.ID] = tag
+		}
+	}
+	b.mu.Lock()
+	b.labels = m
+	b.mu.Unlock()
+	return nil
+}
+
+// resolveLabels turns a message's label ids into Durian tag names, dropping the
+// reserved flag labels (carried as flags) and any id with no tag mapping.
+func (b *Backend) resolveLabels(ids []string) []string {
+	b.mu.Lock()
+	cache := b.labels
+	b.mu.Unlock()
+
+	var out []string
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		name, ok := cache[id]
+		if !ok || seen[name] {
+			continue // unmapped id, or a duplicate tag (e.g. a user "Inbox" label)
+		}
+		seen[name] = true
+		out = append(out, name)
 	}
 	return out
 }
