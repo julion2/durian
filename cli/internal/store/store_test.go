@@ -46,8 +46,8 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 24 {
-		t.Errorf("version = %d, want 24", version)
+	if version != 25 {
+		t.Errorf("version = %d, want 25", version)
 	}
 }
 
@@ -383,13 +383,14 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	}
 	db := sd.db
 
-	// Schema version must be 10 (v9 mailbox/account migration, v10 subject_ct).
+	// Schema version must be at the latest migration (v25: drop stale [imap]/
+	// folder tags) after Init runs every migration forward from a fresh DB.
 	var version int
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 24 {
-		t.Fatalf("version = %d, want 24", version)
+	if version != 25 {
+		t.Fatalf("version = %d, want 25", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).
