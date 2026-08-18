@@ -50,6 +50,29 @@ func TestInsertAndGetMessage(t *testing.T) {
 	}
 }
 
+func TestSyncedLabelsRoundTrip(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	msg := &Message{MessageID: "lbl@example.com", Subject: "x", Date: now, CreatedAt: now, Mailbox: "ALL", Account: "work"}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// A fresh message has an empty label baseline.
+	if got, err := db.GetSyncedLabels("lbl@example.com", "work"); err != nil || got != "" {
+		t.Fatalf("initial synced_labels = %q err=%v, want empty", got, err)
+	}
+	if err := db.SetSyncedLabels("lbl@example.com", "work", "inbox,newsletter"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if got, err := db.GetSyncedLabels("lbl@example.com", "work"); err != nil || got != "inbox,newsletter" {
+		t.Errorf("synced_labels = %q err=%v, want inbox,newsletter", got, err)
+	}
+	// Unknown message errors on set.
+	if err := db.SetSyncedLabels("nope@example.com", "work", "x"); err == nil {
+		t.Error("SetSyncedLabels for unknown message should error")
+	}
+}
+
 func TestFolderFlagState_RoundTrip(t *testing.T) {
 	db := newTestDB(t)
 	now := time.Now().Unix()

@@ -986,6 +986,74 @@ func TestEngineFlagUpload(t *testing.T) {
 // TestEngineNewVsDeduplicated proves the run counts a genuinely new message as
 // New but a re-delivered one (same Message-ID, e.g. a delta flag change) as
 // Deduplicated — so "new" reflects arrivals, not re-syncs.
+func TestEngineLabelsAsTags(t *testing.T) {
+	db := newTestDB(t)
+	// A RoleInbox folder proves the folder-role "inbox" mapping is skipped when
+	// labels are authoritative.
+	folders := []backend.Folder{{Name: "ALL", Role: backend.RoleInbox, Selectable: true}}
+	deliver := func(labels []string, cursor string) backend.FetchResult {
+		return backend.FetchResult{
+			Messages: []backend.Message{{
+				MessageID: "lbl@example.com",
+				Ref:       backend.RemoteRef{Folder: "ALL", ID: "701"},
+				Raw:       rawMessage("lbl@example.com", "a@example.com", testAccount, "hi", "body"),
+				Labels:    labels,
+			}},
+			Cursor: backend.Cursor(cursor),
+		}
+	}
+	scripts := map[string][]backend.FetchResult{
+		"ALL": {
+			deliver([]string{"newsletter"}, "c1"),
+			deliver([]string{"important"}, "c2"), // newsletter dropped, important added
+		},
+	}
+	fake := newFakeBackend(folders, scripts)
+	fake.caps.LabelsAreTags = true
+	engine := newTestEngine(db, newMemCursorStore())
+
+	has := func(want string) bool {
+		rows, err := db.GetFolderFlagState(testAccount, "ALL")
+		if err != nil {
+			t.Fatalf("flag state: %v", err)
+		}
+		for _, r := range rows {
+			if r.MessageID == "lbl@example.com" {
+				for _, tag := range r.Tags {
+					if tag == want {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	if _, err := engine.Sync(context.Background(), fake); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if !has("newsletter") || has("inbox") {
+		t.Errorf("after first sync: want newsletter tag, no inbox (folder-role skipped)")
+	}
+	// A local rule tag the user/rules added must survive label reconciliation.
+	if err := db.ModifyTagsByMessageIDAndAccount("lbl@example.com", testAccount, []string{"todo"}, nil); err != nil {
+		t.Fatalf("add local tag: %v", err)
+	}
+
+	if _, err := engine.Sync(context.Background(), fake); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if has("newsletter") {
+		t.Error("newsletter tag should be removed when its label was dropped")
+	}
+	if !has("important") {
+		t.Error("important tag should be added from the new label")
+	}
+	if !has("todo") {
+		t.Error("local rule tag 'todo' must survive label reconciliation")
+	}
+}
+
 func TestEngineNewVsDeduplicated(t *testing.T) {
 	db := newTestDB(t)
 	folders := []backend.Folder{{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}}

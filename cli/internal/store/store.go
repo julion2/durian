@@ -1033,6 +1033,30 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 24 {
+		// synced_labels is the last-synced label baseline (comma-joined Durian
+		// tag names) for a label-backed account (Gmail). It lets the label
+		// three-way merge remove tags for labels the server dropped while
+		// leaving Durian-local (rule/flag) tags intact — the tag analogue of
+		// synced_flags.
+		// Idempotent column-add via PRAGMA table_info (same as v21→v22): SQLite
+		// implicitly commits before DDL, so an add that succeeded before a failed
+		// version bump would otherwise leave the DB at v23 with the column present
+		// and wedge every retry on the duplicate-column error.
+		has, err := hasColumn(d.db, "messages", "synced_labels")
+		if err != nil {
+			return fmt.Errorf("migrate v23→v24 inspect synced_labels: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN synced_labels TEXT NOT NULL DEFAULT ''"); err != nil {
+				return fmt.Errorf("migrate v23→v24 add synced_labels: %w", err)
+			}
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 24 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v23→v24 bump: %w", err)
+		}
+	}
+
 	return nil
 }
 

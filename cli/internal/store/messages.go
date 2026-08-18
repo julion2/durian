@@ -534,6 +534,48 @@ func (d *DB) SetSyncedFlags(messageID, account, syncedFlags string) error {
 	return nil
 }
 
+// GetSyncedLabels returns the last-synced label baseline (comma-joined tag
+// names) for a message, or "" when the message is unknown — used by the label
+// three-way to tell which of a message's tags were Gmail-mirrored last sync.
+func (d *DB) GetSyncedLabels(messageID, account string) (string, error) {
+	var labels string
+	err := d.db.QueryRow(
+		`SELECT synced_labels FROM messages
+		 WHERE message_id = ? AND account_id = (SELECT id FROM accounts WHERE name = ?)`,
+		messageID, account).Scan(&labels)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get synced labels: %w", err)
+	}
+	return labels, nil
+}
+
+// SetSyncedLabels updates the last-synced label baseline for a message
+// identified by message_id and account. An unknown account or message errors.
+func (d *DB) SetSyncedLabels(messageID, account, syncedLabels string) error {
+	var accountID int64
+	err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("message not found: %s (account %s)", messageID, account)
+	}
+	if err != nil {
+		return fmt.Errorf("lookup account id: %w", err)
+	}
+	result, err := d.db.Exec(
+		"UPDATE messages SET synced_labels = ? WHERE message_id = ? AND account_id = ?",
+		syncedLabels, messageID, accountID)
+	if err != nil {
+		return fmt.Errorf("set synced labels: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("message not found: %s (account %s)", messageID, account)
+	}
+	return nil
+}
+
 // GetMessageIDByRemoteRef returns the Message-ID of the message in the given
 // account+mailbox whose remote_ref matches, or "" if none. Used to resolve a
 // backend deletion that carries only the provider handle (e.g. a Graph delta

@@ -8,6 +8,7 @@ import (
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/gmailbackend"
 	"github.com/julion2/durian/cli/internal/graphbackend"
 	"github.com/julion2/durian/cli/internal/imap"
 	"github.com/julion2/durian/cli/internal/imapbackend"
@@ -46,10 +47,14 @@ func syncOneWithEngine(ctx context.Context, account *config.AccountConfig, optio
 		cursors syncengine.CursorStore
 		err     error
 	)
-	if account.UsesGraphBackend() {
+	switch {
+	case account.UsesGraphBackend():
 		b, err = graphbackend.New(account)
 		cursors = syncengine.NewFileCursorStoreWithSuffix(account.AccountIdentifier(), "-graph")
-	} else {
+	case account.UsesGmailBackend():
+		b, err = gmailbackend.New(account)
+		cursors = syncengine.NewFileCursorStoreWithSuffix(account.AccountIdentifier(), "-gmail")
+	default:
 		b, err = imapbackend.New(account)
 		cursors = syncengine.NewFileCursorStore(account.AccountIdentifier())
 	}

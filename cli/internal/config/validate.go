@@ -185,15 +185,20 @@ func ValidateConfig(cfg *Config) []ValidationError {
 
 		// Sync engine selection
 		switch acct.SyncEngine {
-		case "", "legacy", "engine", "graph":
+		case "", "legacy", "engine", "graph", "gmail":
 		default:
-			add(prefix+".sync_engine", fmt.Sprintf("must be \"legacy\", \"engine\", or \"graph\", got %q", acct.SyncEngine))
+			add(prefix+".sync_engine", fmt.Sprintf("must be \"legacy\", \"engine\", \"graph\", or \"gmail\", got %q", acct.SyncEngine))
 		}
-		if acct.UsesSyncEngine() && acct.OAuth != nil && acct.OAuth.Provider == "google" {
-			add(prefix+".sync_engine", "the engine path does not support Gmail (X-GM-LABELS); use \"legacy\" for Google accounts")
+		// The IMAP-backend engine has no X-GM-LABELS path, so a Google account
+		// must use "gmail" (the Gmail REST backend) or "legacy", not "engine".
+		if acct.SyncEngine == "engine" && acct.OAuth != nil && acct.OAuth.Provider == "google" {
+			add(prefix+".sync_engine", "the IMAP engine has no Gmail label path; use \"gmail\" or \"legacy\" for Google accounts")
 		}
 		if acct.SyncEngine == "graph" && (acct.OAuth == nil || acct.OAuth.Provider != "microsoft") {
 			add(prefix+".sync_engine", "\"graph\" requires a Microsoft OAuth account")
+		}
+		if acct.SyncEngine == "gmail" && (acct.OAuth == nil || acct.OAuth.Provider != "google") {
+			add(prefix+".sync_engine", "\"gmail\" requires a Google OAuth account")
 		}
 		if acct.OAuth != nil && acct.OAuth.Provider == "microsoft" &&
 			(acct.SyncEngine == "legacy" || acct.SyncEngine == "engine") {

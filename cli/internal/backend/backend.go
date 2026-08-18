@@ -139,6 +139,11 @@ type Capabilities struct {
 	// flags). The engine then reconciles flags from the delta stream instead of
 	// polling every message's flags each sync, which is O(changes) not O(mailbox).
 	FlagChangesInDelta bool
+	// LabelsAreTags reports that Message.Labels is the authoritative tag set for
+	// each message (Gmail), so the engine mirrors those labels to Durian tags —
+	// adding new ones and removing labels the server dropped — instead of the
+	// folder-role tag mapping. Durian-local tags (rules, flags) are left intact.
+	LabelsAreTags bool
 }
 
 // Backend is a provider-agnostic mail source. Implementations translate between

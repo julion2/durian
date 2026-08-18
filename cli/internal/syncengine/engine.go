@@ -117,6 +117,10 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 		return nil, fmt.Errorf("syncengine: Options.Cursors is required")
 	}
 
+	// A label backend (Gmail) mirrors Message.Labels to tags instead of using the
+	// folder-role mapping; carry the capability into ingest.
+	e.opts.Ingest.LabelsAsTags = b.Capabilities().LabelsAreTags
+
 	folders, err := b.FetchFolders(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("fetch folders: %w", err)
