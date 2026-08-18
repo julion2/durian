@@ -75,10 +75,15 @@ type Backend struct {
 	// labels maps Gmail label ids to Durian tag names (system labels via a fixed
 	// table, user labels to their display name), reloaded each FetchMessages call.
 	labels map[string]string
+	// tagToID is the inverse of labels (Durian tag -> Gmail label id), for the
+	// label-upload path. System labels win a tag collision so removing "inbox"
+	// targets Gmail's INBOX, not a user label that happens to sanitize the same.
+	tagToID map[string]string
 }
 
 // Compile-time check that Backend satisfies the interface.
 var _ backend.Backend = (*Backend)(nil)
+var _ backend.LabelWriter = (*Backend)(nil)
 
 // New creates a Gmail backend for the given Google OAuth account. The token is
 // fetched lazily on first use, so construction never touches the network.
@@ -695,13 +700,22 @@ func (b *Backend) loadLabels(ctx context.Context) error {
 		return err
 	}
 	m := make(map[string]string, len(resp.Labels))
+	rev := make(map[string]string, len(resp.Labels))
 	for _, l := range resp.Labels {
-		if tag := labelToTag(l); tag != "" {
-			m[l.ID] = tag
+		tag := labelToTag(l)
+		if tag == "" {
+			continue
+		}
+		m[l.ID] = tag
+		// Prefer the system label id on a tag collision (a user label named e.g.
+		// "Inbox" sanitizes to "inbox" too) so uploads target the reserved label.
+		if _, exists := rev[tag]; !exists || l.Type == "system" {
+			rev[tag] = l.ID
 		}
 	}
 	b.mu.Lock()
 	b.labels = m
+	b.tagToID = rev
 	b.mu.Unlock()
 	return nil
 }
@@ -757,6 +771,9 @@ func (b *Backend) Capabilities() backend.Capabilities {
 		// Message.Labels carries each message's Gmail labels as tag names; the
 		// engine mirrors them to tags instead of folder-role mapping.
 		LabelsAreTags: true,
+		// Gmail has no \Answered label, so the engine must not let a local
+		// "replied" tag drive the flag three-way (it would ping-pong every sync).
+		AnsweredUnsupported: true,
 	}
 }
 
@@ -833,8 +850,89 @@ func (b *Backend) FetchFlags(ctx context.Context, _ string, refs []backend.Remot
 
 // MARK: - Not yet implemented (move/append/send/watch land with engine routing)
 
+// Move is unused for Gmail: it is folderless, so the engine drives archive and
+// delete through the label-upload path (ApplyLabels), not folder relocation.
 func (b *Backend) Move(_ context.Context, _ backend.RemoteRef, _ string) (backend.RemoteRef, error) {
 	return backend.RemoteRef{}, errNotImplemented
+}
+
+// ensureLabels loads the label map on demand (an UploadOnly sync never calls
+// FetchMessages, which is what normally populates it).
+func (b *Backend) ensureLabels(ctx context.Context) error {
+	b.mu.Lock()
+	loaded := b.labels != nil
+	b.mu.Unlock()
+	if loaded {
+		return nil
+	}
+	return b.loadLabels(ctx)
+}
+
+// LabelTags returns the tags that map to real Gmail labels (system + user), so
+// the engine can distinguish an uploadable label change from a Durian-local
+// tag. Implements backend.LabelWriter.
+func (b *Backend) LabelTags(ctx context.Context) ([]string, error) {
+	if err := b.ensureLabels(ctx); err != nil {
+		return nil, fmt.Errorf("load labels: %w", err)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	tags := make([]string, 0, len(b.tagToID))
+	for tag := range b.tagToID {
+		tags = append(tags, tag)
+	}
+	return tags, nil
+}
+
+// ApplyLabels applies local tag changes to a Gmail message as one label
+// modification: add/remove tags are resolved to Gmail label ids (system labels
+// via the fixed table, user labels by display name) and tags with no label —
+// Durian-local tags the caller may include — are skipped. Removing "inbox"
+// archives; the engine adds a "trash" tag to delete. Implements
+// backend.LabelWriter.
+func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, remove []string) error {
+	if err := b.ensureLabels(ctx); err != nil {
+		return fmt.Errorf("load labels: %w", err)
+	}
+	b.mu.Lock()
+	rev := b.tagToID
+	b.mu.Unlock()
+
+	addIDs := resolveTagIDs(rev, add)
+	removeIDs := resolveTagIDs(rev, remove)
+	if len(addIDs) == 0 && len(removeIDs) == 0 {
+		return nil // nothing Gmail-actionable (e.g. only Durian-local tags changed)
+	}
+
+	body := make(map[string][]string, 2)
+	if len(addIDs) > 0 {
+		body["addLabelIds"] = addIDs
+	}
+	if len(removeIDs) > 0 {
+		body["removeLabelIds"] = removeIDs
+	}
+	if err := b.doJSON(ctx, http.MethodPost,
+		b.baseURL+"/users/me/messages/"+url.PathEscape(ref.ID)+"/modify", body, nil); err != nil {
+		return fmt.Errorf("modify labels for %s: %w", ref.ID, err)
+	}
+	slog.Debug("Applied labels", "module", "GMAILBACKEND", "id", ref.ID, "add", addIDs, "remove", removeIDs) // encgrep:allow logs Gmail label ids, not message content
+	return nil
+}
+
+// resolveTagIDs maps tags to their Gmail label ids via rev, dropping unmapped
+// tags and de-duplicating ids (two tags could resolve to one label).
+func resolveTagIDs(rev map[string]string, tags []string) []string {
+	var ids []string
+	seen := make(map[string]bool, len(tags))
+	for _, t := range tags {
+		id, ok := rev[t]
+		if !ok || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func (b *Backend) Append(_ context.Context, _ string, _ backend.Flags, _ []byte) (backend.RemoteRef, error) {

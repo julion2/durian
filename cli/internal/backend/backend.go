@@ -144,6 +144,14 @@ type Capabilities struct {
 	// adding new ones and removing labels the server dropped — instead of the
 	// folder-role tag mapping. Durian-local tags (rules, flags) are left intact.
 	LabelsAreTags bool
+	// AnsweredUnsupported reports that the backend cannot persist the \Answered
+	// flag (Gmail has no answered label). The engine then excludes Answered from
+	// the three-way flag merge for this backend: a local "replied" tag would
+	// otherwise be uploaded (silently dropped by the provider), recorded in the
+	// baseline, then removed on the next sync when the server reports the message
+	// as un-answered — a ping-pong that flips the tag every sync. Default false
+	// keeps the full merge for IMAP/Graph, which do round-trip \Answered.
+	AnsweredUnsupported bool
 }
 
 // Backend is a provider-agnostic mail source. Implementations translate between
@@ -189,4 +197,23 @@ type Backend interface {
 
 	// Close releases the backend's resources.
 	Close() error
+}
+
+// LabelWriter is an optional capability of a LabelsAreTags backend: it uploads
+// local tag changes as label modifications. The engine type-asserts for it and
+// runs the label-upload pass only when both the assertion and the LabelsAreTags
+// capability hold, so folder-based backends need not implement it.
+type LabelWriter interface {
+	// LabelTags returns the vocabulary of tags that correspond to real server
+	// labels (system + user), so the engine can tell an uploadable label change
+	// from a Durian-local tag (rule tags, "ephemeral", ...) that must not leak
+	// to the provider.
+	LabelTags(ctx context.Context) ([]string, error)
+
+	// ApplyLabels resolves each add/remove tag to its server label and applies
+	// the change to ref in one call. Tags with no server label are skipped; a
+	// call that resolves to no change is a no-op. The engine resets its baseline
+	// to the deterministic (local tags ∩ LabelTags) set itself, so ApplyLabels
+	// returns only an error.
+	ApplyLabels(ctx context.Context, ref RemoteRef, add, remove []string) error
 }

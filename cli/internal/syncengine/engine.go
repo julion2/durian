@@ -178,7 +178,12 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 
 	// Upload local archive/delete actions (INBOX messages that lost the "inbox"
 	// tag) to the server. Runs after downloads so it sees the freshest folders.
+	// Folder backends move between mailboxes; a LabelsAreTags backend (Gmail) has
+	// no folders, so the label-upload pass handles the same archive/delete intent
+	// (and arbitrary label changes) by pushing label diffs instead. Each self-
+	// gates, so exactly one does work for a given backend.
 	e.uploadFolderMoves(ctx, b, folders, result)
+	e.uploadLabelChanges(ctx, b, result)
 
 	slog.Info("Sync complete", "module", "SYNCENGINE", "account", e.opts.Account, // encgrep:allow account identifier (config name) and counts, not an encrypted column
 		"folders", result.Folders, "new", result.New, "deleted", result.Deleted,
@@ -408,6 +413,7 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 	// source of truth, keeping the three-way merge below byte-identical; only the
 	// ref set shrinks. A non-delta backend has no change feed, so it polls all.
 	useDelta := b.Capabilities().FlagChangesInDelta
+	answeredUnsupported := b.Capabilities().AnsweredUnsupported
 	refs := make([]backend.RemoteRef, 0, len(rows))
 	seeded := 0
 	for i := range rows {
@@ -474,6 +480,16 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 		// against it (not one the upload branch may have just advanced),
 		// mirroring the legacy three-way's conflict detection.
 		baseline := imap.FlagStateFromIMAP(splitFlags(row.SyncedFlags))
+
+		if answeredUnsupported {
+			// The backend can't persist \Answered (Gmail has no answered label),
+			// so pin the server's Answered to the baseline. This keeps Answered
+			// from ever driving a download that would strip a local "replied" tag.
+			// The upload branch still advances the baseline's Answered from local
+			// (the provider silently ignores the flag), so a replied message stays
+			// answered instead of ping-ponging every sync.
+			serverState.Answered = baseline.Answered
+		}
 
 		// Local changed vs the baseline: push the local-vs-server diff so the
 		// server converges on local. DiffFlags only ever emits the user flags
@@ -718,6 +734,134 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 		slog.Info("Moved message out of inbox", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			"message_id", r.MessageID, "dest", dest)
 	}
+}
+
+// uploadLabelChanges is the label-native counterpart to uploadFolderMoves for a
+// LabelsAreTags backend (Gmail): rather than relocating messages between
+// folders, it pushes each message's local tag changes as label add/removes.
+// Archiving (dropping the "inbox" tag) becomes a label removal; deleting adds
+// the "trash" tag, which maps to Gmail's TRASH. It runs only when the backend
+// implements backend.LabelWriter and reports LabelsAreTags, so folder backends
+// are untouched. Skipped in DownloadOnly mode and dry-run-safe.
+//
+// The new baseline is deterministic — the message's local tags intersected with
+// the label vocabulary — so Durian-local tags (rule tags, "ephemeral", ...) are
+// never pushed and never enter the baseline, keeping it exactly the server's
+// label truth for the next download reconcile.
+func (e *Engine) uploadLabelChanges(ctx context.Context, b backend.Backend, result *Result) {
+	if e.opts.Mode == DownloadOnly {
+		return
+	}
+	lw, ok := b.(backend.LabelWriter)
+	if !ok || !b.Capabilities().LabelsAreTags {
+		return
+	}
+
+	vocabList, err := lw.LabelTags(ctx)
+	if err != nil {
+		slog.Warn("Label upload: load label vocabulary failed", "module", "SYNCENGINE",
+			"account", e.opts.Account, "err", err)
+		return
+	}
+	vocab := make(map[string]bool, len(vocabList))
+	for _, t := range vocabList {
+		vocab[t] = true
+	}
+
+	rows, err := e.opts.Store.GetLabelState(e.opts.Account)
+	if err != nil {
+		slog.Warn("Label upload: load label state failed", "module", "SYNCENGINE",
+			"account", e.opts.Account, "err", err)
+		return
+	}
+
+	seeded := 0
+	for _, r := range rows {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		// A row with no label baseline (synced_labels defaulted to '' — e.g. a
+		// message the legacy syncer ingested before the engine recorded label
+		// baselines) would make EVERY current label tag look like a brand-new
+		// local addition, firing a redundant messages.modify per message to
+		// re-add labels the server already has. Seed the baseline from the
+		// current server-derived label tags and skip the upload: those tags
+		// already reflect what we last downloaded, so there is nothing local to
+		// push. Mirrors the flag-baseline seeding in reconcileFolderFlags. A
+		// genuine local change is picked up next sync against the seeded baseline.
+		if r.SyncedLabels == "" {
+			_, _, seedBaseline := diffLabels(r.Tags, nil, vocab)
+			if len(seedBaseline) > 0 {
+				if err := e.opts.Store.SetSyncedLabels(r.MessageID, e.opts.Account, strings.Join(seedBaseline, ",")); err != nil {
+					result.Errors = append(result.Errors, fmt.Errorf("seed label baseline for %s: %w", r.MessageID, err))
+				}
+				seeded++
+			}
+			continue
+		}
+		added, removed, newBaseline := diffLabels(r.Tags, splitFlags(r.SyncedLabels), vocab)
+		if len(added) == 0 && len(removed) == 0 {
+			continue
+		}
+		if e.opts.DryRun {
+			slog.Debug("[dry-run] Would upload label change", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+				"message_id", r.MessageID, "add", added, "remove", removed)
+			result.Moved++
+			continue
+		}
+		ref := backend.RemoteRef{ID: r.RemoteRef}
+		if err := lw.ApplyLabels(ctx, ref, added, removed); err != nil {
+			slog.Warn("Label upload failed", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+				"message_id", r.MessageID, "err", err)
+			result.Errors = append(result.Errors, fmt.Errorf("apply labels %s: %w", r.MessageID, err))
+			continue
+		}
+		// Persist the baseline only after the server accepted the change, so a
+		// failed upload is retried next sync instead of being silently dropped.
+		if err := e.opts.Store.SetSyncedLabels(r.MessageID, e.opts.Account, strings.Join(newBaseline, ",")); err != nil {
+			slog.Warn("Label upload: update baseline failed", "module", "SYNCENGINE",
+				"message_id", r.MessageID, "err", err)
+		}
+		result.Moved++
+		slog.Info("Uploaded label change", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+			"message_id", r.MessageID, "add", added, "remove", removed)
+	}
+	if seeded > 0 {
+		slog.Info("Seeded label baselines for migrated messages", "module", "SYNCENGINE",
+			"account", e.opts.Account, "count", seeded) // encgrep:allow account identifier (config name) + count, not content
+	}
+}
+
+// diffLabels computes the label add/remove sets and the new baseline for one
+// message. newBaseline is the local tags restricted to the label vocabulary —
+// the exact labels the message should carry on the server. added is the
+// vocabulary tags gained since the baseline; removed is the baseline tags no
+// longer present locally (the baseline is already vocabulary-only, so no vocab
+// check is needed there).
+func diffLabels(tags, baseline []string, vocab map[string]bool) (added, removed, newBaseline []string) {
+	inBaseline := make(map[string]bool, len(baseline))
+	for _, t := range baseline {
+		inBaseline[t] = true
+	}
+	inTags := make(map[string]bool, len(tags))
+	for _, t := range tags {
+		inTags[t] = true
+	}
+	for _, t := range tags {
+		if !vocab[t] {
+			continue // Durian-local tag — never a Gmail label, never uploaded
+		}
+		newBaseline = append(newBaseline, t)
+		if !inBaseline[t] {
+			added = append(added, t)
+		}
+	}
+	for _, t := range baseline {
+		if !inTags[t] {
+			removed = append(removed, t)
+		}
+	}
+	return added, removed, newBaseline
 }
 
 // moveDestination decides where an INBOX message that lost the "inbox" tag

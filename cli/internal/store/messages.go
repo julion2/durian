@@ -584,6 +584,62 @@ func (d *DB) SetSyncedLabels(messageID, account, syncedLabels string) error {
 	return nil
 }
 
+// LabelStateRow is one message's label-upload state: its durable Message-ID,
+// the provider ref to modify, the last-synced label baseline, and the current
+// local tags. Used by the label three-way upload (Gmail).
+type LabelStateRow struct {
+	MessageID    string
+	RemoteRef    string
+	SyncedLabels string
+	Tags         []string
+}
+
+// GetLabelState returns the label-upload state for every message in the account
+// that has a non-empty remote_ref, across all mailboxes (a label backend like
+// Gmail keeps every message in one synthetic "All Mail" stream, so this is not
+// scoped to a folder). Unknown account returns an empty slice without error.
+func (d *DB) GetLabelState(account string) ([]LabelStateRow, error) {
+	var accountID int64
+	if err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID); err != nil {
+		if err == sql.ErrNoRows {
+			return []LabelStateRow{}, nil
+		}
+		return nil, fmt.Errorf("lookup account id: %w", err)
+	}
+
+	// LEFT JOIN so a message with no tags still yields a row (its empty local
+	// state matters to the three-way). ORDER BY m.id groups a message's tags.
+	rows, err := d.db.Query(`
+		SELECT m.message_id, m.remote_ref, m.synced_labels, IFNULL(t.tag, '')
+		FROM messages m
+		LEFT JOIN tags t ON t.message_id = m.id
+		WHERE m.account_id = ? AND m.remote_ref != ''
+		ORDER BY m.id`, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("get label state: %w", err)
+	}
+	defer rows.Close()
+
+	result := []LabelStateRow{}
+	for rows.Next() {
+		var msgID, remoteRef, syncedLabels, tag string
+		if err := rows.Scan(&msgID, &remoteRef, &syncedLabels, &tag); err != nil {
+			return nil, fmt.Errorf("scan label state row: %w", err)
+		}
+		if n := len(result); n == 0 || result[n-1].MessageID != msgID {
+			result = append(result, LabelStateRow{
+				MessageID:    msgID,
+				RemoteRef:    remoteRef,
+				SyncedLabels: syncedLabels,
+			})
+		}
+		if tag != "" {
+			result[len(result)-1].Tags = append(result[len(result)-1].Tags, tag)
+		}
+	}
+	return result, rows.Err()
+}
+
 // GetMessageIDByRemoteRef returns the Message-ID of the message in the given
 // account+mailbox whose remote_ref matches, or "" if none. Used to resolve a
 // backend deletion that carries only the provider handle (e.g. a Graph delta
