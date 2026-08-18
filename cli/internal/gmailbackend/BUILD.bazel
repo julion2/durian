@@ -2,23 +2,32 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "gmailbackend",
-    srcs = ["gmailbackend.go"],
+    srcs = [
+        "gmailbackend.go",
+        "sender.go",
+    ],
     importpath = "github.com/julion2/durian/cli/internal/gmailbackend",
     visibility = ["//cli:__subpackages__"],
     deps = [
         "//cli/internal/backend",
         "//cli/internal/config",
+        "//cli/internal/mailsend",
         "//cli/internal/oauth",
+        "//cli/internal/smtp",
     ],
 )
 
 go_test(
     name = "gmailbackend_test",
     size = "small",
-    srcs = ["gmailbackend_test.go"],
+    srcs = [
+        "gmailbackend_test.go",
+        "sender_test.go",
+    ],
     embed = [":gmailbackend"],
     deps = [
         "//cli/internal/backend",
         "//cli/internal/config",
+        "//cli/internal/mailsend",
     ],
 )

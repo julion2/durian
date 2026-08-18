@@ -8,6 +8,7 @@ go_library(
     deps = [
         "//cli/internal/auth",
         "//cli/internal/config",
+        "//cli/internal/gmailbackend",
         "//cli/internal/graphbackend",
         "//cli/internal/mailsend",
         "//cli/internal/smtp",
