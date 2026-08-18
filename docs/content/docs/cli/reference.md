@@ -31,6 +31,11 @@ durian sync --dry-run                # report what would happen, write nothing
 
 Bidirectional by default — local tag changes are uploaded as IMAP flags / folder moves, and server-side flag changes are pulled down. The first sync of a large mailbox can take a few minutes; subsequent syncs are incremental.
 
+The backend is chosen per account: **Microsoft** accounts sync over Microsoft
+Graph, **Google** accounts over the Gmail REST API (labels become tags), and
+everything else over IMAP. The command and flags are identical regardless — see
+[Sync engine](../../configuration/config/#sync-engine).
+
 The GUI runs `durian serve`, which keeps a long-lived IDLE connection open per account — explicit `durian sync` is mainly useful for cron jobs or troubleshooting.
 
 ## search — query the local store
@@ -117,6 +122,29 @@ durian rules apply --dry-run          # preview changes without writing
 
 Rules normally run automatically on incoming mail during sync. `apply` is for backfilling — e.g. after editing `rules.pkl` you may want to re-tag your existing inbox.
 
+## calendar — read and sync calendars
+
+```bash
+durian calendar list                     # events across all accounts (next 7 days)
+durian calendar list work --today        # one account, today only
+durian calendar list --calendar "Team"   # filter to one calendar by display name
+durian calendar search "standup"         # match by subject
+durian calendar show standup             # full detail (event by subject or UID)
+durian calendar new work --calendar "Calendar" -s "Lunch" --start "2026-08-01 12:00" --duration 1h
+durian calendar rsvp work standup accept # accept / decline / tentative
+durian calendar delete work standup --yes
+durian calendar sync work                # two-way sync for the account, with a preview + confirm
+durian calendar export work --out ./ics
+```
+
+The positional argument to `new` / `rsvp` / `delete` / `sync` / `export` is the
+**account** (alias); events are addressed by subject or UID prefix. Reads and
+edits are **local-first** — `list`, `search`, `show`, `new`, `rsvp`, and
+`delete` all work offline against a local vdir of `.ics` files. Only `sync`,
+`export`, and the background autosync in `durian serve` touch the provider, and
+`sync` previews every outgoing invitation before it sends. Full walkthrough:
+[Calendar](../calendar/) and [Calendar Sync](../calendar-sync/).
+
 ## validate — check config
 
 ```bash
@@ -137,7 +165,11 @@ durian auth login personal            # interactive (password or OAuth)
 durian auth status                    # all accounts + token state
 durian auth refresh personal          # force OAuth token refresh
 durian auth logout personal           # remove from keychain
+durian auth verify-graph work         # Microsoft only: mint a Graph token + list folders
 ```
+
+`verify-graph` is the quickest way to confirm a Microsoft account is consented
+for the Graph scopes after `auth login` — a `403` means a re-consent is needed.
 
 Credentials live in the macOS Keychain — see [OAuth setup](../auth/oauth/) and [Password setup](../auth/password/).
 

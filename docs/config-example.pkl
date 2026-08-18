@@ -121,9 +121,9 @@ accounts: Listing<C.AccountConfig> = new {
     // Optional: single-tenant Azure app registration (default "common").
     // oauth { tenant = "your-tenant-id" }
 
-    // Optional: sync via Microsoft Graph instead of the legacy IMAP syncer
-    // (Microsoft accounts only; default "legacy").
-    // sync_engine = "graph"
+    // Microsoft accounts sync over Microsoft Graph. The C.microsoft365 preset
+    // already sets sync_engine = "graph" for you, and "legacy"/"engine" (IMAP)
+    // are rejected for Microsoft — so you never set this by hand here.
 
     // Optional: per-account calendar sync settings (Microsoft and Google
     // OAuth accounts). All keys are optional; the block itself is too —
@@ -159,6 +159,9 @@ accounts: Listing<C.AccountConfig> = new {
       client_id = "your-google-client-id"         // Required, see https://julion2.github.io/durian/docs/auth/oauth/
       client_secret = "your-google-client-secret"  // Required, see https://julion2.github.io/durian/docs/auth/oauth/
     }
+    // Google accounts sync over the Gmail REST API by default (labels become
+    // tags); the C.gmail preset sets sync_engine = "gmail". Enable the Gmail API
+    // once in your Cloud project. To fall back to IMAP: sync_engine = "legacy".
     // Then run: durian auth login gmail
   }
 }

@@ -18,6 +18,15 @@ toc: false
 
 OAuth tokens and passwords are stored in **macOS Keychain** or **libsecret** (Linux), never on disk in plaintext.
 
+Refreshes are concurrency-safe. Azure rotates the refresh token on every use, and
+one identity can back several accounts (your own mailbox plus shared mailboxes),
+so Microsoft Graph tokens are minted through a per-identity gate that serializes
+the refresh and caches the short-lived access token — concurrent syncs can't
+invalidate each other's rotated token or race on the keychain item. The keychain
+write itself is an atomic update-in-place (`security add-generic-password -U`),
+which closes the old delete-then-add window that could surface a spurious "item
+already exists".
+
 ## Data at rest
 
 Sensitive columns in `email.db` and `contacts.db` are **encrypted by Durian** using AES-256-GCM with per-purpose sub-keys derived from a 32-byte master via HKDF-SHA256. See [ADR-0001](docs/developers/design/0001-mail-content-encryption-at-rest/) for the full design.

@@ -34,18 +34,22 @@ Durian is a terminal-first email client with a SwiftUI GUI on macOS and a Qt6 GU
                           via `durian tagsync push/pull`)
 ```
 
-**One backend, many frontends.** The Go CLI is the only component that talks IMAP/SMTP and owns the SQLite store. Both GUIs are thin HTTP clients to `localhost:9723` — they never touch the DB directly.
+**One backend, many frontends.** The Go CLI is the only component that talks to the mail providers (IMAP/SMTP, Microsoft Graph, Gmail API) and owns the SQLite store. Both GUIs are thin HTTP clients to `localhost:9723` — they never touch the DB directly.
 
 ## Directory layout
 
 | Path | Purpose |
 |---|---|
 | `cli/cmd/durian/` | CLI commands (`sync`, `serve`, `auth`, `search`, `send`, `validate`, `contacts`, …) |
-| `cli/internal/handler/` | HTTP API handlers + IMAP IDLE watcher + SSE event hub |
-| `cli/internal/imap/` | IMAP sync logic (mailbox discovery, flag sync, message insertion, Gmail label handling) |
+| `cli/internal/handler/` | HTTP API handlers + IMAP IDLE watcher (`watcher.go`) + Graph poll watcher (`enginewatcher.go`) + SSE event hub |
+| `cli/internal/backend/` | The provider-neutral `Backend` seam: interface, `Capabilities`, `LabelWriter`, neutral `Message`/`Folder`/`Flags`/`Cursor` types |
+| `cli/internal/imapbackend/`, `graphbackend/`, `gmailbackend/` | The three `Backend` implementations (IMAP, Microsoft Graph, Gmail REST) |
+| `cli/internal/syncengine/` | Provider-neutral sync engine: cursor-paged fetch, ingest, three-way flag merge, folder-move + label upload |
+| `cli/internal/imap/` | Legacy IMAP syncer (`sync_engine = "legacy"`) + the low-level IMAP client that `imapbackend` reuses |
 | `cli/internal/store/` | SQLite schema, FTS5 search, tags, attachments, local drafts, outbox |
-| `cli/internal/config/` | Pkl parsing + `durian validate` |
-| `cli/internal/oauth/` | OAuth flows (Google, Microsoft) |
+| `cli/internal/config/` | Pkl parsing + `durian validate`; `EffectiveSyncEngine` backend routing |
+| `cli/internal/oauth/` | OAuth flows (Google, Microsoft); separate Graph-token minting with per-identity caching |
+| `cli/internal/calendar/`, `calendarsync/`, `graphcalendar/`, `googlecalendar/` | Calendar: vdir model, two-way sync engine + `CalendarProvider` seam, and its two provider clients |
 | `cli/internal/smtp/`, `draft/`, `sanitize/`, `contacts/` | Supporting packages |
 | `macos/durian/` | Swift GUI: `Managers/` (state), `Views/` (SwiftUI), `Models/`, `Network/EmailBackend.swift`, `Keymaps/` (vim engine) |
 | `linux/` | Qt6/QML GUI (read-only MVP) |
@@ -90,7 +94,7 @@ Integration tests in `integration/integration_test.sh` exercise the contract end
 
 ## Storage model
 
-One SQLite file at `~/.local/share/durian/email.db` (or `$XDG_DATA_HOME/durian/email.db`). Schema version is bumped on every ADR-0001 migration step; current floor is v22.
+One SQLite file at `~/.local/share/durian/email.db` (or `$XDG_DATA_HOME/durian/email.db`). Schema version is bumped on every migration step (encryption, then the sync-engine `synced_flags`/`synced_labels` baselines); current version is v25.
 
 - `messages` — one row per email. Plaintext columns: `message_id`, `thread_id`, `in_reply_to`, `refs`, `from_addr`, `to_addrs`, `cc_addrs`, `date`, `created_at`, `size`, `uid`, `account_id` + `mailbox_id` (FKs), `is_seen` / `is_flagged` / `is_deleted` booleans. Encrypted BLOBs: `subject_ct`, `body_text_ct`, `body_html_ct`, `flags_other_ct` (non-canonical IMAP flags).
 - `tags` — tag join table, one row per (message_id, tag).
@@ -115,19 +119,106 @@ Search uses notmuch-style query syntax (`tag:inbox AND from:boss@example.com`) p
 
 ## Sync model
 
-Per account, `durian serve` runs an IDLE loop in `handler/watcher.go`:
+Durian talks to three kinds of mail provider through **one neutral seam**. An
+account's `sync_engine` (resolved by `AccountConfig.EffectiveSyncEngine`) picks
+the path:
 
-1. On startup, run a full sync via `imap.Syncer` (`cli/internal/imap/sync.go` and helpers in `sync_mailbox.go`, `sync_flags.go`, `sync_discovery.go`, `sync_store.go`).
-2. Enter IMAP IDLE on the INBOX.
-3. On IDLE wake (new mail event) or on explicit `TriggerSync` signal (e.g. user tagged something), break IDLE and run an incremental sync.
-4. Broadcast `new_mail` events via the EventHub so the GUI can refresh.
-5. On connection loss, reconnect with exponential backoff.
+| `sync_engine` | Provider | Path |
+|---|---|---|
+| `legacy` (default for IMAP) | any IMAP | the classic `imap.Syncer` + IDLE watcher |
+| `graph` (default + required for Microsoft) | Microsoft 365 | `graphbackend` + `syncengine` + poll watcher |
+| `gmail` (default for Google) | Gmail | `gmailbackend` + `syncengine`, synced on demand |
+| `engine` | generic IMAP | `imapbackend` + `syncengine` (opt-in) |
 
-**Deduplication**: before downloading new UIDs, `dedupUnsyncedUIDs` fetches envelopes and checks whether each Message-ID already exists in the store (from another folder). Existing messages get their folder tags updated instead of being re-downloaded. See `cli/internal/imap/sync_mailbox.go`.
+### The Backend seam
 
-**Gmail**: labels come via `X-GM-LABELS`, not folders. The Gmail code path syncs only `All Mail`, `Spam`, and `Trash` — regular folders are virtual. Label → tag mapping lives in `sync_discovery.go` (`gmailLabelsToTags`).
+`cli/internal/backend/backend.go` defines the `Backend` interface every provider
+implements — `FetchFolders`, `FetchMessages` (cursor-paged incremental),
+`FetchBody`, `ApplyFlags`/`FetchFlags`, `Move`, `Append`, `Send`, `Watch`,
+`Capabilities`, `Close`. The engine addresses messages by their durable
+`(Message-ID, account)` key; a `RemoteRef` (folder + provider id) is a transient
+handle, never a store key.
 
-**Flag sync**: bidirectional. Local tag changes are uploaded to IMAP (mapped to the corresponding flag or folder move), and server-side flag changes are pulled down. See `cli/internal/imap/sync_flags.go`.
+A `Capabilities` struct lets the engine adapt to provider quirks without
+branching on provider names: `ServerSideSent` (provider auto-saves Sent),
+`NativeMove`, `PushWatch`, `FlagChangesInDelta` (the delta already carries flag
+changes, so the flag pass is O(changes)), `LabelsAreTags` (Gmail — `Message.Labels`
+is the authoritative tag set), and `AnsweredUnsupported` (Gmail can't persist
+`\Answered`, so it's excluded from the merge to stop per-sync ping-pong). A
+label-native backend also implements the optional `LabelWriter` interface
+(`LabelTags`, `ApplyLabels`).
+
+The three implementations: **`imapbackend`** wraps the existing `cli/internal/imap`
+client; **`graphbackend`** speaks Microsoft Graph (`/me` or `/users/{email}` for
+shared mailboxes, cursor = Graph delta URL, native `/move`); **`gmailbackend`**
+speaks the Gmail REST API (no folders — one "All Mail" stream, labels-as-tags,
+cursor = `history.list` historyId). Graph and Gmail send via a dedicated
+`sender.go` in each package.
+
+### The engine
+
+`cli/internal/syncengine/engine.go` drives any `Backend`: discover folders,
+cursor-page `FetchMessages` until drained (persisting the cursor only after a
+fully-ingested batch), `Ingest` each message (row + attachments + indexed
+headers + tags — folder-role mapping, or `reconcileLabels` for label backends),
+handle deletions, run a **three-way flag merge** (local tags vs server flags vs
+the `synced_flags` baseline — local wins Seen/Flagged/Answered, server wins
+Deleted/Completed), then upload local intents: `uploadFolderMoves` (an INBOX
+message that lost its `inbox` tag is `Move`d to Archive/Trash) and
+`uploadLabelChanges` (per-message tag diffs via `ApplyLabels` for Gmail). It
+emits `Result.NewMessageIDs` for provider-neutral new-mail notification, instead
+of the legacy path's IMAP-UIDNEXT diffing.
+
+### Watchers in `durian serve`
+
+- **IMAP IDLE** (`handler/watcher.go`, `WatcherManager`) — one long-lived IDLE
+  connection per legacy account; wakes on new mail or a `TriggerSync` signal.
+  Graph accounts are skipped here.
+- **Graph poll** (`handler/enginewatcher.go`) — Graph has no usable desktop push,
+  so each Graph account gets two polling loops (a fast inbox pass, a slow
+  full-mailbox pass) funneled through one per-account mutex. Cadence adapts to
+  whether an SSE client is attached (inbox 30 s active / 2 m idle; full 5 m / 15 m),
+  with backoff and jitter.
+
+Gmail-engine accounts are not polled by a resident watcher on this path — they
+sync through `durian sync` (invoked manually or by the GUI's periodic sync).
+
+### Routing and validation
+
+`EffectiveSyncEngine` defaults Microsoft OAuth to `graph`, Google OAuth to
+`gmail`, and everything else to `legacy` (the provider presets set the value
+explicitly). `durian validate` rejects the impossible combinations: `graph` on a
+non-Microsoft account, `gmail` on a non-Google account, and `legacy`/`engine` on
+a Microsoft account (Microsoft must use Graph). Each backend namespaces its
+cursor file (`-graph`, `-gmail`, unsuffixed for IMAP) so switching engines can't
+feed one backend another's incompatible cursor — it just forces a fresh full
+resync, which is safe because the store upserts by Message-ID.
+
+## Calendar
+
+Calendar is a second provider-neutral subsystem, deliberately **separate** from
+the mail Backend seam. Events live in a local **vdir** — a directory of `.ics`
+files, one per master event (`<vdir>/<account-dir>/<calendar>/<uid>.ics`) —
+modelled in `cli/internal/calendar/` (the neutral `Event`, RRULE ⇄ model
+round-trip, atomic writes, content hashing).
+
+`cli/internal/calendarsync/` is the two-way sync engine. It defines its own
+`CalendarProvider` seam (`ListCalendars`, `FetchMasterEvents`, `CreateEvent`,
+`UpdateEvent`, `DeleteEvent`, `RespondToEvent`, plus an optional
+`DeltaCalendarProvider` for incremental fetch) with two clients:
+`cli/internal/graphcalendar/` (Microsoft) and `cli/internal/googlecalendar/`
+(Google). `calendar.go`'s `newCalendarProvider` switches on the OAuth provider.
+
+The model is **local-first**: all reads and edits touch only the vdir. The
+engine's `Plan` → preview → `Apply` pipeline (`twosync.go`) is the only thing
+that reaches a provider or sends mail, and it prints every outgoing invitation
+before applying. A conflict policy (`newer`/`remote`/`local`) resolves
+both-sides edits, always backing up the losing local file first. `durian serve`
+runs an autosync loop (`calendar_autosync.go`): download-only by default, or
+two-way under `autosync_upload = "safe"` (uploading only non-notifying changes) —
+but it can never send mail or delete a remote event on its own. See
+[ADR-0002](design/0002-calendar-two-way-sync-and-recurrence/)
+for the design and the recurrence handling.
 
 ## Optional tag sync
 
@@ -156,7 +247,7 @@ Three languages (Go, Swift, C++/Qt), two platforms, one binary cache, reproducib
 ## Where to look next
 
 - **Adding a new API endpoint**: `cli/internal/handler/` + matching entry in `cli/cmd/durian/serve.go` route list + `openapi.yaml`.
-- **Changing the sync logic**: `cli/internal/imap/sync_mailbox.go` is the main loop; `sync_flags.go` handles flag/tag propagation.
+- **Changing the sync logic**: `cli/internal/syncengine/engine.go` for the neutral engine (Graph/Gmail/opt-in IMAP); `cli/internal/imap/sync_mailbox.go` + `sync_flags.go` for the legacy IMAP path. Adding a provider = a new `backend.Backend` implementation.
 - **Adding a GUI feature**: start in the appropriate Swift Manager (`macos/durian/Managers/`), wire it to views.
 - **Adding a CLI command**: `cli/cmd/durian/` — each command is a Cobra subcommand.
 - **Onboarding end users**: [Getting Started](../../getting-started/).

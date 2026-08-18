@@ -1,8 +1,6 @@
 ---
 title: Authentication
 weight: 5
-sidebar:
-  open: true
 ---
 
 Durian supports two authentication methods:
