@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/julion2/durian/cli/internal/backend"
@@ -65,16 +67,52 @@ func syncOneWithEngine(ctx context.Context, account *config.AccountConfig, optio
 	}
 	defer b.Close()
 
+	// A live progress line with a heartbeat spinner (unless --quiet): the spinner
+	// ticks on a timer even while a page is still downloading, so a slow page
+	// never looks frozen — a moving spinner with a static count means "alive but
+	// throttled", a frozen spinner means the process is stuck. stderr keeps
+	// stdout clean for --json.
+	var (
+		onProgress  func(int)
+		synced      atomic.Int64
+		progDone    chan struct{}
+		progStopped chan struct{}
+	)
+	if !syncQuiet {
+		onProgress = func(n int) { synced.Store(int64(n)) }
+		progDone = make(chan struct{})
+		progStopped = make(chan struct{})
+		go func() {
+			defer close(progStopped)
+			spin := []rune{'|', '/', '-', '\\'}
+			t := time.NewTicker(400 * time.Millisecond)
+			defer t.Stop()
+			for i := 0; ; i++ {
+				select {
+				case <-progDone:
+					return
+				case <-t.C:
+					fmt.Fprintf(os.Stderr, "\r%-55s",
+						fmt.Sprintf("%s: %d messages synced %c", account.AccountIdentifier(), synced.Load(), spin[i%len(spin)]))
+				}
+			}
+		}()
+	}
+
 	engine := syncengine.New(syncengine.Options{
-		Store:        options.Store,
-		Cursors:      cursors,
-		Account:      account.AccountIdentifier(),
-		BatchLimit:   account.GetIMAPBatchSize(),
-		MaxPerFolder: account.GetIMAPMaxMessages(),
+		Store:      options.Store,
+		Cursors:    cursors,
+		Account:    account.AccountIdentifier(),
+		BatchLimit: account.GetIMAPBatchSize(),
+		// Raw max_messages: 0 = unlimited (the gmail template sets it for a full
+		// offline mailbox), a positive value caps the first sync. The legacy
+		// syncer keeps its own GetIMAPMaxMessages 5000 default.
+		MaxPerFolder: account.IMAP.MaxMessages,
 		Mode:         engineMode(options.Mode),
 		Folders:      options.Mailboxes,
 		DryRun:       options.DryRun,
 		NoFlags:      options.NoFlags,
+		OnProgress:   onProgress,
 		Ingest: syncengine.IngestOptions{
 			Account:        account.AccountIdentifier(),
 			FilterRules:    options.FilterRules,
@@ -84,6 +122,12 @@ func syncOneWithEngine(ctx context.Context, account *config.AccountConfig, optio
 	})
 
 	res, err := engine.Sync(ctx, b)
+	if progDone != nil {
+		close(progDone)
+		<-progStopped // wait for the renderer to exit so it can't overwrite the final line
+		// Clear the spinner and print the final count.
+		fmt.Fprintf(os.Stderr, "\r%-55s\n", fmt.Sprintf("%s: %d messages synced", account.AccountIdentifier(), synced.Load()))
+	}
 	result.Duration = time.Since(start)
 	if err != nil {
 		result.Error = err

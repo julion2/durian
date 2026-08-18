@@ -194,7 +194,9 @@ microsoft365Shared: AccountConfig = (microsoft365) {
 /// sync_engine = "legacy" to fall back to the classic IMAP syncer.
 gmail: AccountConfig = new {
   smtp { host = "smtp.gmail.com"; port = 587; auth = "oauth2" }
-  imap { host = "imap.gmail.com"; port = 993; auth = "oauth2" }
+  // max_messages = 0 syncs the whole mailbox (local-first, full offline); the
+  // Gmail backend paginates through everything. Set a positive cap to limit it.
+  imap { host = "imap.gmail.com"; port = 993; auth = "oauth2"; max_messages = 0 }
   oauth { provider = "google" }
   sync_engine = "gmail"
 }

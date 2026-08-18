@@ -1054,6 +1054,53 @@ func TestEngineLabelsAsTags(t *testing.T) {
 	}
 }
 
+func TestEngineSeedsMigratedFlagBaseline(t *testing.T) {
+	db := newTestDB(t)
+	// A legacy-migrated read message: is_seen=true (via the \Seen flag) but no
+	// synced_flags baseline yet — the shape that made the whole mailbox a false
+	// flag-fetch candidate.
+	if err := db.InsertMessage(&store.Message{
+		MessageID: "mig@example.com", Subject: "x", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: testAccount, RemoteRef: "r1",
+		Flags: `\Seen`, SyncedFlags: "", FetchedBody: true,
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	folders := []backend.Folder{{Name: "ALL", Role: backend.RoleInbox, Selectable: true}}
+	fake := newFakeBackend(folders, nil) // no messages to fetch this run
+	fake.caps.FlagChangesInDelta = true  // a delta backend, like Gmail
+	engine := newTestEngine(db, newMemCursorStore())
+
+	if _, err := engine.Sync(context.Background(), fake); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	// The read message must be seeded, not fetched: no FetchFlags request for it.
+	for _, c := range fake.fetchFlagsCalls {
+		for _, r := range c.refs {
+			if r.ID == "r1" {
+				t.Error("migrated read message should be baseline-seeded, not a FetchFlags candidate")
+			}
+		}
+	}
+	// Its baseline is now the stored server flag state.
+	for _, r := range mustFlagRows(t, db) {
+		if r.MessageID == "mig@example.com" && r.SyncedFlags != `\Seen` {
+			t.Errorf("synced_flags = %q, want \\Seen (seeded from the server flags)", r.SyncedFlags)
+		}
+	}
+}
+
+func mustFlagRows(t *testing.T, db *store.DB) []store.FolderFlagRow {
+	t.Helper()
+	rows, err := db.GetFolderFlagState(testAccount, "ALL")
+	if err != nil {
+		t.Fatalf("flag state: %v", err)
+	}
+	return rows
+}
+
 func TestEngineNewVsDeduplicated(t *testing.T) {
 	db := newTestDB(t)
 	folders := []backend.Folder{{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}}
