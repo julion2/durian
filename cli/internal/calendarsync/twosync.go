@@ -450,16 +450,28 @@ func (o SyncOptions) conflictPolicy() string {
 // MARK: - Planning
 
 // PlanAll builds the plan for every calendar of the account passing the
-// include filter (same semantics as Export), without mutating anything.
-// Calendar directories live at accountDir/<sanitized calendar name>.
-func PlanAll(ctx context.Context, p CalendarProvider, accountDir string, include []string, state *SyncState) ([]CalendarPlan, error) {
+// include filter (same semantics as Export), without mutating anything local
+// or remote. Calendar directories live at accountDir/<sanitized calendar
+// name>.
+//
+// mirror carries the last known remote state and the download cursors. It is
+// updated IN MEMORY here and must be persisted by the caller only after the
+// plan has been applied: a cursor written before its changes were applied
+// would declare them seen and lose them. Passing nil disables the incremental
+// path entirely and re-reads every calendar in full, which is what the
+// dry-run/preview callers want.
+func PlanAll(ctx context.Context, p CalendarProvider, accountDir string, include []string, state *SyncState, mirror *RemoteMirror) ([]CalendarPlan, error) {
 	calendars, err := p.ListCalendars(ctx)
 	if err != nil {
 		return nil, err
 	}
 	state.normalize()
+	if mirror != nil {
+		mirror.normalize()
+	}
 
 	var plans []CalendarPlan
+	visited := make(map[string]bool, len(calendars))
 	for _, cal := range calendars {
 		if !calendarIncluded(cal.Name, include) {
 			slog.Debug("Skipping calendar not in include list", "module", "CALSYNC",
@@ -467,25 +479,97 @@ func PlanAll(ctx context.Context, p CalendarProvider, accountDir string, include
 			continue
 		}
 		calDir := filepath.Join(accountDir, sanitizeName(cal.Name))
-		plan, err := Plan(ctx, p, cal, calDir, state.Calendars[cal.ID])
+
+		remote, err := fetchRemote(ctx, p, cal, mirror)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read calendar %s: %w", cal.Name, err)
+		}
+		visited[cal.ID] = true
+		plan, err := planWithRemote(p, cal, calDir, state.Calendars[cal.ID], remote)
 		if err != nil {
 			return nil, fmt.Errorf("failed to plan calendar %s: %w", cal.Name, err)
 		}
 		plans = append(plans, plan)
 	}
+
+	// Drop mirror entries for calendars this run did not touch — deleted
+	// remotely, or taken out of the include filter. Unlike the sync state,
+	// which keeps only hashes and ids, the mirror holds whole events; keeping
+	// them would grow the file without bound and retain calendar contents the
+	// user has already stopped syncing. Safe only because every calendar was
+	// read successfully: an error above returns before this point, so a
+	// transient API failure can never wipe the cursors.
+	if mirror != nil {
+		for id := range mirror.Calendars {
+			if !visited[id] {
+				slog.Debug("Dropping mirror for a calendar no longer synced", "module", "CALSYNC",
+					"calendar", id)
+				delete(mirror.Calendars, id)
+			}
+		}
+	}
 	return plans, nil
 }
 
-// Plan classifies every UID of one calendar into an Action per the decision
-// matrix in the file header, without mutating status, local files or the
-// remote calendar. status is read-only here.
-func Plan(ctx context.Context, p CalendarProvider, cal Calendar, calDir string, status CalendarStatus) (CalendarPlan, error) {
-	plan := CalendarPlan{Calendar: cal, Dir: calDir}
-	owner := p.Owner()
+// fetchRemote returns the complete remote event set of one calendar, keyed by
+// UID, using the provider's change feed when that is possible and a full read
+// otherwise.
+//
+// The incremental path needs three things to line up: a provider that offers a
+// feed, a mirror to fold the changes into, and a cursor whose query shape
+// still matches the one the provider would use now. Any of them missing means
+// a full round — which is not a failure but the normal way a sync starts, and
+// the same round that seeds the cursor for every later one.
+func fetchRemote(ctx context.Context, p CalendarProvider, cal Calendar, mirror *RemoteMirror) (map[string]Event, error) {
+	dp, canDelta := p.(DeltaCalendarProvider)
+	if !canDelta || mirror == nil {
+		return fetchRemoteFull(ctx, p, cal)
+	}
 
+	entry := mirror.Calendars[cal.ID]
+	cursor := entry.Cursor
+	if cursor != "" && entry.ParamFingerprint != dp.DeltaParamFingerprint() {
+		slog.Info("Calendar query changed, starting a full sync", "module", "CALSYNC",
+			"calendar", cal.Name, "was", entry.ParamFingerprint, "now", dp.DeltaParamFingerprint())
+		cursor = ""
+	}
+	if cursor != "" && !entry.UpdatedAt.IsZero() &&
+		time.Since(entry.UpdatedAt) > mirrorMaxAge {
+		// Nothing ever re-reads the mirror against reality while the cursor
+		// lives, so a fold that went wrong stays wrong forever. The full read
+		// this forces is the only thing that repairs a mirror the provider is
+		// perfectly happy to keep feeding — cheap once a week, and the only
+		// backstop for the merge mistakes a review does not catch.
+		slog.Info("Calendar mirror is stale, reconciling with a full sync", "module", "CALSYNC",
+			"calendar", cal.Name, "age", time.Since(entry.UpdatedAt).Truncate(time.Hour))
+		cursor = ""
+	}
+
+	result, err := dp.FetchMasterEventsDelta(ctx, cal.ID, cursor)
+	if err != nil {
+		return nil, err
+	}
+	if result.Reset && cursor != "" {
+		slog.Info("Calendar cursor no longer usable, resynced in full", "module", "CALSYNC",
+			"calendar", cal.Name)
+	}
+
+	remote := entry.applyDelta(result, cal.Name)
+	mirror.Calendars[cal.ID] = entry
+
+	slog.Debug("Folded calendar changes into the mirror", "module", "CALSYNC",
+		"calendar", cal.Name, "changed", len(result.ChangedMasters),
+		"occurrences", len(result.ChangedOverrides), "removed", len(result.RemovedIDs),
+		"total", len(remote))
+	return remote, nil
+}
+
+// fetchRemoteFull reads the whole calendar through the plain provider seam and
+// keys it by UID.
+func fetchRemoteFull(ctx context.Context, p CalendarProvider, cal Calendar) (map[string]Event, error) {
 	remoteEvents, err := p.FetchMasterEvents(ctx, cal.ID)
 	if err != nil {
-		return plan, err
+		return nil, err
 	}
 	remote := make(map[string]Event, len(remoteEvents))
 	for _, ev := range remoteEvents {
@@ -501,6 +585,27 @@ func Plan(ctx context.Context, p CalendarProvider, cal Calendar, calDir string, 
 		}
 		remote[ev.ICalUID] = ev
 	}
+	return remote, nil
+}
+
+// Plan classifies every UID of one calendar into an Action per the decision
+// matrix in the file header, without mutating status, local files or the
+// remote calendar. status is read-only here. It always reads the calendar in
+// full; PlanAll is the incremental entry point.
+func Plan(ctx context.Context, p CalendarProvider, cal Calendar, calDir string, status CalendarStatus) (CalendarPlan, error) {
+	remote, err := fetchRemoteFull(ctx, p, cal)
+	if err != nil {
+		return CalendarPlan{Calendar: cal, Dir: calDir}, err
+	}
+	return planWithRemote(p, cal, calDir, status, remote)
+}
+
+// planWithRemote is the decision matrix itself, over an already-resolved
+// remote event set — the one part that must behave identically whether the set
+// came from a full read or from a change feed folded into the mirror.
+func planWithRemote(p CalendarProvider, cal Calendar, calDir string, status CalendarStatus, remote map[string]Event) (CalendarPlan, error) {
+	plan := CalendarPlan{Calendar: cal, Dir: calDir}
+	owner := p.Owner()
 
 	local, unreadable, err := scanLocalItems(calDir, owner)
 	if err != nil {
@@ -938,9 +1043,11 @@ func ApplyAll(ctx context.Context, p CalendarProvider, state *SyncState, plans [
 // WITHOUT any confirmation gate. The CLI command uses PlanAll/ApplyAll with a
 // prompt in between instead; this convenience wrapper is for callers that
 // have already decided (e.g. tests, or automation running with --yes
-// semantics).
+// semantics). It always reads the calendars in full — a caller that wants the
+// incremental path drives PlanAll/ApplyAll itself, because only it can decide
+// when the cursor is safe to persist.
 func SyncAll(ctx context.Context, p CalendarProvider, accountDir string, include []string, state *SyncState, opts SyncOptions) (SyncStats, error) {
-	plans, err := PlanAll(ctx, p, accountDir, include, state)
+	plans, err := PlanAll(ctx, p, accountDir, include, state, nil)
 	if err != nil {
 		return SyncStats{}, err
 	}

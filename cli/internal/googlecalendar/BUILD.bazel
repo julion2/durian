@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "googlecalendar",
     srcs = [
+        "delta.go",
         "googlecalendar.go",
         "write.go",
     ],
@@ -21,10 +22,14 @@ go_test(
     name = "googlecalendar_test",
     size = "small",
     srcs = [
+        "delta_test.go",
         "googlecalendar_test.go",
         "series_exceptions_test.go",
         "write_test.go",
     ],
     embed = [":googlecalendar"],
-    deps = ["//cli/internal/calendar"],
+    deps = [
+        "//cli/internal/calendar",
+        "//cli/internal/calendarsync",
+    ],
 )

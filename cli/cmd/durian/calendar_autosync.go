@@ -162,7 +162,19 @@ func calendarAutosyncOnce(ctx context.Context, hub *handler.EventHub, account *c
 		return
 	}
 
-	plans, err := calendarsync.PlanAll(runCtx, provider, accountDir, account.CalendarInclude(), state)
+	// The mirror carries the download cursors, so the background loop reads
+	// only what changed instead of re-reading every calendar every tick. It is
+	// saved after ApplyAll, never before: an advanced cursor whose changes were
+	// not applied would drop them silently.
+	mirrorStore := calendarsync.NewFileMirrorStore(accountDir)
+	mirror, err := mirrorStore.Load()
+	if err != nil {
+		slog.Warn("Calendar autosync failed to load mirror", "module", "CALSYNC",
+			"account", account.GetAliasOrName(), "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+		return
+	}
+
+	plans, err := calendarsync.PlanAll(runCtx, provider, accountDir, account.CalendarInclude(), state, mirror)
 	if err != nil {
 		logCalendarAutosyncError(provider, account, "planning", err, authHintLogged)
 		return
@@ -206,6 +218,14 @@ func calendarAutosyncOnce(ctx context.Context, hub *handler.EventHub, account *c
 	// must not be misread as local edits on the next run.
 	if saveErr := store.Save(state); saveErr != nil {
 		slog.Warn("Calendar autosync failed to save state", "module", "CALSYNC",
+			"account", account.GetAliasOrName(), "err", saveErr) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+	}
+	// Recording the mirror is safe even though the deferred actions were never
+	// applied: those are LOCAL changes waiting for the confirmation gate, and
+	// they are replanned from the local files against the unchanged baseline.
+	// The cursor only ever speaks about the remote side.
+	if saveErr := mirrorStore.Save(mirror); saveErr != nil {
+		slog.Warn("Calendar autosync failed to save mirror, next run reads in full", "module", "CALSYNC",
 			"account", account.GetAliasOrName(), "err", saveErr) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	}
 	if applyErr != nil {
