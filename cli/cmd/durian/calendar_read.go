@@ -20,50 +20,62 @@ import (
 // occurrences via calendar.ExpandOccurrences.
 
 var calendarListCmd = &cobra.Command{
-	Use:   "list <account>",
+	Use:   "list [account...]",
 	Short: "List upcoming calendar events (from the local vdir)",
-	Long: `List events from the locally synced calendars of a Microsoft account.
+	Long: `List events from the locally synced calendars.
+
+With no account given it covers EVERY configured account plus the local-only
+calendars; name accounts (as arguments or with --account) to narrow it down.
 
 Reads only the local vdir (run 'durian calendar sync' first to populate it), so
 it works offline. Recurring events are expanded into their occurrences within
 the selected window (the next 7 days by default).`,
-	Example: `  durian calendar list work
-  durian calendar list work --today
-  durian calendar list work --from 2026-08-01 --to 2026-08-31
-  durian calendar list work --calendar "Team" --json`,
-	Args:              cobra.ExactArgs(1),
+	Example: `  durian calendar list
+  durian calendar list work
+  durian calendar list --account work --account local --today
+  durian calendar list --from 2026-08-01 --to 2026-08-31
+  durian calendar list --calendar "Team" --json`,
+	Args:              cobra.ArbitraryArgs,
 	ValidArgsFunction: completeAccounts,
 	RunE:              runCalendarList,
 }
 
 var calendarSearchCmd = &cobra.Command{
-	Use:   "search <account> <query>",
+	Use:   "search <query>",
 	Short: "Search calendar events by text (from the local vdir)",
-	Long: `Search all locally synced events of a Microsoft account for a text query,
-matching the subject, location, description and attendee addresses
-(case-insensitive). Reads only the local vdir; works offline.`,
-	Example: `  durian calendar search work standup
-  durian calendar search work "design review" --calendar "Team"`,
-	Args:              cobra.MinimumNArgs(2),
-	ValidArgsFunction: completeAccounts,
-	RunE:              runCalendarSearch,
+	Long: `Search the locally synced events for a text query, matching the subject,
+location, description and attendee addresses (case-insensitive).
+
+Covers EVERY configured account plus the local-only calendars unless --account
+narrows it. Reads only the local vdir; works offline.`,
+	Example: `  durian calendar search standup
+  durian calendar search "design review" --account work --calendar "Team"`,
+	Args: cobra.MinimumNArgs(1),
+	// No ValidArgsFunction: the positional arg is the free-text <query>, not an
+	// account. Account completion stays on the --account flag (completeAccounts).
+	RunE: runCalendarSearch,
 }
 
 var calendarShowCmd = &cobra.Command{
-	Use:   "show <account> <event>",
+	Use:   "show <event>",
 	Short: "Show one calendar event in detail (from the local vdir)",
 	Long: `Show the full detail of a single event: time, location, organizer,
 attendees with their RSVP status, description, online-meeting link and
 recurrence. The event is matched by iCalUID (exact or prefix) or by a unique
-substring of its subject.`,
-	Example: `  durian calendar show work standup
-  durian calendar show work 1A2B3C --calendar "Team"`,
-	Args:              cobra.MinimumNArgs(2),
-	ValidArgsFunction: completeAccounts,
-	RunE:              runCalendarShow,
+substring of its subject, across every configured account plus the local-only
+calendars unless --account narrows it.`,
+	Example: `  durian calendar show standup
+  durian calendar show 1A2B3C --account work --calendar "Team"`,
+	Args: cobra.ExactArgs(1),
+	RunE: runCalendarShow,
 }
 
 var (
+	// calAccounts narrows the read commands to specific accounts. Empty means
+	// every configured account plus the local-only calendars, which is what
+	// someone asking "what is on my calendar" almost always means.
+	calAccounts []string
+
 	calListCalendar string
 	calListToday    bool
 	calListWeek     bool
@@ -86,6 +98,11 @@ func init() {
 	calendarListCmd.Flags().StringVar(&calListTo, "to", "", "Window end (date or date-time)")
 
 	calendarSearchCmd.Flags().StringVar(&calSearchCalendar, "calendar", "", "Only this calendar (by display name)")
+	for _, c := range []*cobra.Command{calendarListCmd, calendarSearchCmd, calendarShowCmd} {
+		c.Flags().StringArrayVar(&calAccounts, "account", nil,
+			"Only this account (repeatable; default: every account plus the local calendars)")
+		_ = c.RegisterFlagCompletionFunc("account", completeAccounts)
+	}
 	calendarShowCmd.Flags().StringVar(&calShowCalendar, "calendar", "", "Only this calendar (by display name)")
 }
 
@@ -104,6 +121,141 @@ func resolveVdirAccount(identifier string) (accountDir, owner string, account *c
 	return accountDir, account.GetAuthEmail(), account, nil
 }
 
+// resolveVdirCollections resolves one identifier to the calendar collections it
+// names.
+//
+// The reserved identifier "local" selects the calendars configured under
+// calendar.local_calendars, which belong to no account. They get no owner:
+// nothing in them is ever sent anywhere, so there is no RSVP of the account
+// holder to recognize.
+func resolveVdirCollections(identifier string) ([]calendar.Collection, error) {
+	cfg := GetConfig()
+	if cfg == nil {
+		return nil, fmt.Errorf("no configuration loaded")
+	}
+	if strings.EqualFold(identifier, config.LocalCalendarAccount) {
+		return localCalendarCollections(cfg), nil
+	}
+
+	accountDir, owner, account, err := resolveVdirAccount(identifier)
+	if err != nil {
+		return nil, err
+	}
+	return calendar.CollectionsUnderFor(accountDir, account.GetAliasOrName(), owner)
+}
+
+// localCalendarCollections projects the configured local calendars onto the
+// neutral collection type.
+func localCalendarCollections(cfg *config.Config) []calendar.Collection {
+	local := cfg.LocalCalendars()
+	cols := make([]calendar.Collection, 0, len(local))
+	for _, lc := range local {
+		cols = append(cols, calendar.Collection{
+			Dir:      lc.Path,
+			Name:     lc.Name,
+			HexColor: lc.Color,
+			ReadOnly: lc.ReadOnly,
+			Account:  config.LocalCalendarAccount,
+		})
+	}
+	return cols
+}
+
+// calendarTargets resolves the accounts a read command should cover: the ones
+// named as arguments or via --account, or — when neither is given — every
+// configured account plus the local calendars.
+//
+// Reading everything by default is the point: someone asking what is on their
+// calendar means all of it, and the previous mandatory account turned the most
+// common question into the most typing. Narrowing stays available, it is just
+// no longer the only option.
+func calendarTargets(named []string) (cols []calendar.Collection, accounts []string, err error) {
+	cfg := GetConfig()
+	if cfg == nil {
+		return nil, nil, fmt.Errorf("no configuration loaded")
+	}
+
+	wanted := append(append([]string{}, named...), calAccounts...)
+	if len(wanted) == 0 {
+		for i := range cfg.Accounts {
+			wanted = append(wanted, cfg.Accounts[i].GetAliasOrName())
+		}
+		// Only when some are configured — otherwise "local" would be reported
+		// as an account that yielded nothing.
+		if len(cfg.LocalCalendars()) > 0 {
+			wanted = append(wanted, config.LocalCalendarAccount)
+		}
+		if len(wanted) == 0 {
+			return nil, nil, fmt.Errorf("no accounts and no local calendars configured")
+		}
+	}
+
+	seen := make(map[string]bool, len(wanted))
+	for _, id := range wanted {
+		if seen[strings.ToLower(id)] {
+			continue
+		}
+		seen[strings.ToLower(id)] = true
+		got, err := resolveVdirCollections(id)
+		if err != nil {
+			return nil, nil, err
+		}
+		cols = append(cols, got...)
+		accounts = append(accounts, id)
+	}
+	return cols, accounts, nil
+}
+
+// contributingAccounts lists the accounts that actually produced a calendar,
+// in first-seen order.
+//
+// This is deliberately derived from the RESULT, not from what was asked for:
+// with no --account the request covers every configured account, but most of
+// them have no calendar vdir at all. Saying "12 accounts" when two of them have
+// calendars describes the query rather than the answer — and it would prefix
+// every row with an account name that distinguishes nothing.
+func contributingAccounts(calendars []calendar.LocalCalendar) []string {
+	seen := make(map[string]bool, len(calendars))
+	var out []string
+	for _, cal := range calendars {
+		if cal.Account == "" || seen[cal.Account] {
+			continue
+		}
+		seen[cal.Account] = true
+		out = append(out, cal.Account)
+	}
+	return out
+}
+
+// targetLabel renders the contributing account set for a header line.
+func targetLabel(accounts []string) string {
+	if len(accounts) == 1 {
+		return accounts[0]
+	}
+	return fmt.Sprintf("%d accounts", len(accounts))
+}
+
+// warnMisconfiguredCollections prints the vdir-base diagnosis for any
+// configured calendar that turned up empty because its path points one level
+// too high. Printed to stderr so it never pollutes --json output.
+func warnMisconfiguredCollections(cols []calendar.Collection, calendars []calendar.LocalCalendar) {
+	for _, bad := range calendar.InspectCollections(cols, calendars) {
+		fmt.Fprintf(os.Stderr, "%s %s\n", styWarn("warning:"), bad.Hint())
+	}
+}
+
+// calendarLabel renders the calendar cell of a row. When the listing spans more
+// than one account, two accounts can each have a calendar called "Calendar" —
+// so the account is prefixed, and only then, to keep the common single-account
+// output unchanged.
+func calendarLabel(cal calendar.LocalCalendar, multiAccount bool) string {
+	name := cal.Name
+	if multiAccount && cal.Account != "" {
+		name = cal.Account + "/" + name
+	}
+	return calSwatch(cal.HexColor, name)
+}
+
 // occurrence pairs an expanded event with its calendar for sorting/printing.
 type occurrence struct {
 	cal   calendar.LocalCalendar
@@ -111,7 +263,7 @@ type occurrence struct {
 }
 
 func runCalendarList(cmd *cobra.Command, args []string) error {
-	accountDir, owner, account, err := resolveVdirAccount(args[0])
+	cols, _, err := calendarTargets(args)
 	if err != nil {
 		return err
 	}
@@ -121,10 +273,13 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	calendars, err := calendar.ReadCalendars(accountDir, owner)
+	calendars, err := calendar.ReadCollections(cols)
 	if err != nil {
 		return fmt.Errorf("failed to read local calendars: %w", err)
 	}
+	warnMisconfiguredCollections(cols, calendars)
+	accounts := contributingAccounts(calendars)
+	label := targetLabel(accounts)
 
 	var occs []occurrence
 	for _, cal := range calendars {
@@ -151,8 +306,7 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 
 	if len(occs) == 0 {
 		if len(calendars) == 0 {
-			fmt.Printf("No local calendars for %s yet. Run 'durian calendar sync %s' first.\n",
-				account.GetAliasOrName(), account.GetAliasOrName())
+			fmt.Printf("No local calendars for %s yet. Run 'durian calendar sync <account>' first.\n", label) // encgrep:allow account label (config name/alias), a user-facing CLI message — not an encrypted column
 		} else {
 			fmt.Println("No events in the selected window.")
 		}
@@ -160,7 +314,7 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "%s — %s to %s (%d event(s))\n",
-		styHeader("Calendar "+account.GetAliasOrName()),
+		styHeader("Calendar "+label),
 		from.Format("2006-01-02"), to.Format("2006-01-02"), len(occs))
 
 	// Colored cells must not go through text/tabwriter (it counts the ANSI
@@ -180,7 +334,7 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 			"  " + eventTimeCol(o.event),
 			styAccent(truncate(orDash(o.event.Subject), 50)),
 			styDim(truncate(o.event.Location, 24)),
-			calSwatch(o.cal.HexColor, o.cal.Name) + eventMarkers(o.event),
+			calendarLabel(o.cal, len(accounts) > 1) + eventMarkers(o.event),
 		})
 	}
 	printColumns(os.Stdout, rows)
@@ -237,16 +391,18 @@ func orDash(s string) string {
 }
 
 func runCalendarSearch(cmd *cobra.Command, args []string) error {
-	accountDir, owner, _, err := resolveVdirAccount(args[0])
+	cols, _, err := calendarTargets(nil)
 	if err != nil {
 		return err
 	}
-	query := strings.ToLower(strings.Join(args[1:], " "))
+	query := strings.ToLower(strings.Join(args, " "))
 
-	calendars, err := calendar.ReadCalendars(accountDir, owner)
+	calendars, err := calendar.ReadCollections(cols)
 	if err != nil {
 		return fmt.Errorf("failed to read local calendars: %w", err)
 	}
+	warnMisconfiguredCollections(cols, calendars)
+	multiAccount := len(contributingAccounts(calendars)) > 1
 
 	var matches []occurrence
 	for _, cal := range calendars {
@@ -283,7 +439,7 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 		rows = append(rows, []string{
 			o.event.Start.Format("2006-01-02 15:04"),
 			styAccent(truncate(orDash(o.event.Subject), 50)),
-			calSwatch(o.cal.HexColor, o.cal.Name),
+			calendarLabel(o.cal, multiAccount),
 		})
 	}
 	printColumns(os.Stdout, rows)
@@ -291,14 +447,19 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 }
 
 func runCalendarShow(cmd *cobra.Command, args []string) error {
-	accountDir, owner, _, err := resolveVdirAccount(args[0])
+	cols, _, err := calendarTargets(nil)
 	if err != nil {
 		return err
 	}
-	ref := strings.Join(args[1:], " ")
+	ref := strings.Join(args, " ")
 
-	_, e, calName, err := calendar.ResolveLocalEvent(accountDir, owner, ref, calShowCalendar)
+	_, e, calName, err := calendar.ResolveEventIn(cols, ref, calShowCalendar)
 	if err != nil {
+		// A miss may simply mean a configured calendar points one level too
+		// high and contributed nothing to search through.
+		if calendars, readErr := calendar.ReadCollections(cols); readErr == nil {
+			warnMisconfiguredCollections(cols, calendars)
+		}
 		return err
 	}
 

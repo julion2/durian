@@ -77,6 +77,14 @@ class SyncManager: ObservableObject {
     private var fullSyncTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
+    /// When the last full sync completed, persisted so the wall-clock schedule
+    /// survives app restarts as well as timer restarts. Without this the full
+    /// sync is only ever as reliable as an uninterrupted multi-hour timer.
+    private var lastFullSyncAt: Date? {
+        get { UserDefaults.standard.object(forKey: "lastFullSyncAt") as? Date }
+        set { UserDefaults.standard.set(newValue, forKey: "lastFullSyncAt") }
+    }
+
     private init() {
         // Initial path resolution, will be refreshed in runDurianSync if needed
         durianPath = FileManager.default.resolveDurianPath() ?? ""
@@ -199,6 +207,22 @@ class SyncManager: ObservableObject {
 
         let interval = SettingsManager.shared.fullSyncInterval
         Log.debug("SYNC", "Starting full sync timer with interval \(interval)s (\(interval/3600)h)")
+
+        // A repeating Timer counts from the moment it is scheduled and never
+        // fires immediately — and restartTimers() reschedules on every network
+        // transition. With a multi-hour interval, a laptop that flaps Wi-Fi or
+        // sleeps more often than that would never run a full sync at all. So
+        // schedule against wall-clock time: if one is already overdue, run it
+        // now rather than waiting out another full interval.
+        if let last = lastFullSyncAt, Date().timeIntervalSince(last) < interval {
+            Log.debug("SYNC", "Full sync not due yet (last \(Int(Date().timeIntervalSince(last)))s ago)")
+        } else {
+            Log.info("SYNC", "Full sync overdue, running now")
+            Task { @MainActor in
+                guard !self.syncLock, NetworkMonitor.shared.isConnected else { return }
+                await self.fullSync()
+            }
+        }
 
         fullSyncTimer?.invalidate()
         fullSyncTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
@@ -341,6 +365,7 @@ class SyncManager: ObservableObject {
         if success {
             Log.info("SYNC", "Full sync completed successfully")
             recordSyncSuccess()
+            lastFullSyncAt = Date()
 
             // Reload before updating lastSyncTime (notification recency filter)
             await reloadEmailList()
@@ -428,16 +453,15 @@ class SyncManager: ObservableObject {
         reloadDebounceTask = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
 
-        // Notifications
-        guard SettingsManager.shared.settings.notificationsEnabled else {
-            Log.debug("NOTIFY", "Notifications disabled globally, skipping")
-            return
-        }
-        // Per-account notification filter
-        if let account = ConfigManager.shared.getAccounts().first(where: { $0.email == event.account }),
-           let notify = account.notifications, !notify
-        {
-            Log.debug("NOTIFY", "Notifications disabled for account \(event.account), skipping")
+        // Notifications: the global setting is only the default. An account
+        // that states its own preference wins in both directions — so a user
+        // who wants silence everywhere except one important mailbox sets
+        // notifications_enabled = false globally and notifications = true on
+        // that account. Checking the global first would make that impossible.
+        let account = ConfigManager.shared.getAccounts().first { $0.email == event.account }
+        let shouldNotify = account?.notifications ?? SettingsManager.shared.settings.notificationsEnabled
+        guard shouldNotify else {
+            Log.debug("NOTIFY", "Notifications disabled for \(event.account), skipping")
             return
         }
         guard !event.messages.isEmpty else { return }

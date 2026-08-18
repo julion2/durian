@@ -975,3 +975,42 @@ func containsSubstring(s, substr string) bool {
 	}
 	return false
 }
+
+// MARK: - Local calendars
+
+func TestLocalCalendars(t *testing.T) {
+	cfg := &Config{Calendar: CalendarConfig{Local: []LocalCalendarConfig{
+		{Name: "Privat", Path: "~/Kalender/privat", Color: "#8ab4f8"},
+		{Name: "  Verein  ", Path: "/tmp/verein", ReadOnly: true},
+		{Name: "", Path: "/tmp/nameless"},   // dropped: cannot be addressed
+		{Name: "Ohne Pfad", Path: ""},       // dropped: nothing to show
+		{Name: "privat", Path: "/tmp/dupe"}, // dropped: name already taken
+	}}}
+
+	got := cfg.LocalCalendars()
+	if len(got) != 2 {
+		t.Fatalf("got %d calendars, want 2: %+v", len(got), got)
+	}
+	if got[0].Name != "Privat" || got[0].Path == "~/Kalender/privat" {
+		t.Errorf("first = %+v, want the path expanded", got[0])
+	}
+	if got[1].Name != "Verein" || !got[1].ReadOnly {
+		t.Errorf("second = %+v, want the name trimmed and read_only kept", got[1])
+	}
+
+	// Lookup is case-insensitive, and a duplicate name never shadows the first.
+	lc, ok := cfg.FindLocalCalendar("PRIVAT")
+	if !ok || lc.Path == "/tmp/dupe" {
+		t.Errorf("FindLocalCalendar = (%+v, %v), want the first Privat entry", lc, ok)
+	}
+	if _, ok := cfg.FindLocalCalendar("gibt es nicht"); ok {
+		t.Error("FindLocalCalendar invented a calendar")
+	}
+}
+
+func TestLocalCalendarsEmptyByDefault(t *testing.T) {
+	cfg := &Config{}
+	if got := cfg.LocalCalendars(); len(got) != 0 {
+		t.Errorf("got %+v, want none configured", got)
+	}
+}

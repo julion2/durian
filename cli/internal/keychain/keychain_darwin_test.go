@@ -210,13 +210,13 @@ func TestGetOrCreateKey_ReturnsExisting(t *testing.T) {
 }
 
 func TestGetOrCreateKey_GeneratesWhenMissing(t *testing.T) {
-	// SetPassword unconditionally calls DeletePassword first, then add. So a
-	// fresh-key path is: find (NotFound) → delete (NotFound, treated as ok)
-	// → add (ok). Three invocations.
+	// SetPassword adds with -U (update in place) rather than deleting first,
+	// which would race a concurrent writer. So the fresh-key path is:
+	// find (NotFound) → add (ok). Two invocations, and scriptCommands fails
+	// the test if a third one appears.
 	scriptCommands(t, []scriptedResponse{
 		{mode: "exit44"},  // find-generic-password → not found
-		{mode: "exit44"},  // delete-generic-password → not found (ok)
-		{mode: "success"}, // add-generic-password → stored
+		{mode: "success"}, // add-generic-password -U → stored
 	})
 	defer restoreCommandRunner()
 

@@ -10,6 +10,7 @@
 package calendar
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -21,6 +22,11 @@ import (
 	"github.com/teambition/rrule-go"
 )
 
+// ErrReadOnly is wrapped by write operations that target a read-only calendar
+// collection, so the HTTP layer can map it to 403 Forbidden rather than a
+// generic 400.
+var ErrReadOnly = errors.New("calendar is read-only")
+
 // LocalCalendar is one calendar directory of the vdir, with its display name,
 // color (from the displayname/color meta files) and the master events parsed
 // from its .ics files.
@@ -29,15 +35,46 @@ type LocalCalendar struct {
 	HexColor string
 	Dir      string
 	Events   []Event
+	// Account is the identifier the calendar belongs to ("local" for a
+	// configured local calendar), so a listing spanning several accounts can
+	// tell two identically named calendars apart.
+	Account string
 }
 
-// ReadCalendars enumerates every calendar directory under accountDir and parses
-// the events of each from disk — entirely offline. The calendar name comes from
-// the "displayname" meta file (falling back to the directory name) and the
-// color from the "color" file. owner is the account email, threaded into the
-// parse so the owner's own RSVP is recognized. A missing accountDir yields an
-// empty slice (nothing synced yet), not an error.
-func ReadCalendars(accountDir, owner string) ([]LocalCalendar, error) {
+// Collection names one calendar collection directory before its events are
+// read. It is what lets a set of calendars come from somewhere other than the
+// subdirectories of one account dir — a configured local calendar points at an
+// arbitrary path and carries its own display metadata.
+type Collection struct {
+	// Dir is the directory holding the .ics files.
+	Dir string
+	// Name overrides the display name; empty falls back to the "displayname"
+	// meta file and then to the directory name.
+	Name string
+	// HexColor overrides the color; empty falls back to the "color" meta file.
+	HexColor string
+	// ReadOnly marks a collection durian must never write to.
+	ReadOnly bool
+	// Owner is the account email whose own RSVP is recognized while parsing
+	// this collection's events. It belongs to the collection rather than to
+	// the read call because one read can span several accounts, and the wrong
+	// owner would read another person's PARTSTAT as the user's own.
+	Owner string
+	// Account is the identifier this collection belongs to, carried so output
+	// covering several accounts can say which one an event came from.
+	Account string
+}
+
+// CollectionsUnder enumerates the calendar collections of a vdir account
+// directory: one per subdirectory, display metadata taken from the meta files.
+// A missing dir yields no collections (nothing synced yet), not an error.
+func CollectionsUnder(accountDir string) ([]Collection, error) {
+	return CollectionsUnderFor(accountDir, "", "")
+}
+
+// CollectionsUnderFor is CollectionsUnder with the owning account attached to
+// every collection it produces.
+func CollectionsUnderFor(accountDir, account, owner string) ([]Collection, error) {
 	entries, err := os.ReadDir(accountDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -46,13 +83,42 @@ func ReadCalendars(accountDir, owner string) ([]LocalCalendar, error) {
 		return nil, fmt.Errorf("failed to read calendar dir %s: %w", accountDir, err)
 	}
 
-	var calendars []LocalCalendar
+	var cols []Collection
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		calDir := filepath.Join(accountDir, entry.Name())
-		items, _, err := ScanLocalItems(calDir, owner)
+		cols = append(cols, Collection{
+			Dir:     filepath.Join(accountDir, entry.Name()),
+			Account: account,
+			Owner:   owner,
+		})
+	}
+	return cols, nil
+}
+
+// ReadCalendars enumerates every calendar directory under accountDir and parses
+// the events of each from disk — entirely offline. See ReadCollections.
+func ReadCalendars(accountDir, owner string) ([]LocalCalendar, error) {
+	cols, err := CollectionsUnderFor(accountDir, "", owner)
+	if err != nil {
+		return nil, err
+	}
+	return ReadCollections(cols)
+}
+
+// ReadCollections parses the events of the given collections from disk —
+// entirely offline. The display name comes from the collection when it states
+// one, else from the "displayname" meta file, else from the directory name;
+// the color likewise falls back to the "color" file. Each collection carries
+// its own Owner, so a read spanning several accounts recognizes each one's own
+// RSVP. A collection whose directory does not exist yet contributes an empty calendar
+// rather than an error — a configured local calendar is allowed to be created
+// on first write.
+func ReadCollections(cols []Collection) ([]LocalCalendar, error) {
+	var calendars []LocalCalendar
+	for _, col := range cols {
+		items, _, err := ScanLocalItems(col.Dir, col.Owner)
 		if err != nil {
 			return nil, err
 		}
@@ -63,14 +129,30 @@ func ReadCalendars(accountDir, owner string) ([]LocalCalendar, error) {
 		sort.Slice(events, func(i, j int) bool { return events[i].Start.Before(events[j].Start) })
 
 		calendars = append(calendars, LocalCalendar{
-			Name:     readMetaFile(calDir, "displayname", entry.Name()),
-			HexColor: readMetaFile(calDir, "color", ""),
-			Dir:      calDir,
+			Name:     firstNonEmpty(col.Name, readMetaFile(col.Dir, "displayname", filepath.Base(col.Dir))),
+			HexColor: firstNonEmpty(col.HexColor, readMetaFile(col.Dir, "color", "")),
+			Dir:      col.Dir,
 			Events:   events,
+			Account:  col.Account,
 		})
 	}
-	sort.Slice(calendars, func(i, j int) bool { return calendars[i].Name < calendars[j].Name })
+	sort.Slice(calendars, func(i, j int) bool {
+		if calendars[i].Account != calendars[j].Account {
+			return calendars[i].Account < calendars[j].Account
+		}
+		return calendars[i].Name < calendars[j].Name
+	})
 	return calendars, nil
+}
+
+// firstNonEmpty returns the first non-empty argument, or "".
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // readMetaFile reads a single-line vdir meta file (displayname/color),
@@ -228,23 +310,29 @@ func overlaps(start, end, from, to time.Time) bool {
 // callers can rewrite/remove it), the parsed event and the calendar name.
 // Ambiguous or absent matches are errors that name the candidates.
 func ResolveLocalEvent(accountDir, owner, ref, calFilter string) (path string, ev Event, calendar string, err error) {
-	entries, err := os.ReadDir(accountDir)
+	cols, err := CollectionsUnder(accountDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return "", Event{}, "", fmt.Errorf("no local calendars yet — run 'durian calendar sync' first")
-		}
-		return "", Event{}, "", fmt.Errorf("failed to read calendar dir %s: %w", accountDir, err)
+		return "", Event{}, "", err
 	}
+	if len(cols) == 0 {
+		return "", Event{}, "", fmt.Errorf("no local calendars yet — run 'durian calendar sync' first")
+	}
+	for i := range cols {
+		cols[i].Owner = owner
+	}
+	return ResolveEventIn(cols, ref, calFilter)
+}
 
+// ResolveEventIn is ResolveLocalEvent over an explicit collection set, so a
+// caller whose calendars do not live under one account directory — the
+// configured local calendars — resolves references the same way.
+func ResolveEventIn(cols []Collection, ref, calFilter string) (path string, ev Event, calendar string, err error) {
 	// Fast path: an exact UID whose file follows the "<uid>.ics" naming scheme
 	// (every synced or `new`-created event does) — read just that one file
 	// instead of parsing the whole vdir.
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		calDir := filepath.Join(accountDir, entry.Name())
-		calName := readMetaFile(calDir, "displayname", entry.Name())
+	for _, col := range cols {
+		calDir := col.Dir
+		calName := collectionName(col)
 		if calFilter != "" && !strings.EqualFold(calName, calFilter) {
 			continue
 		}
@@ -253,7 +341,7 @@ func ResolveLocalEvent(accountDir, owner, ref, calFilter string) (path string, e
 		if readErr != nil {
 			continue
 		}
-		if e, parseErr := ICalToEvent(data, owner); parseErr == nil && e.ICalUID == ref {
+		if e, parseErr := ICalToEvent(data, col.Owner); parseErr == nil && e.ICalUID == ref {
 			return p, e, calName, nil
 		}
 	}
@@ -265,16 +353,13 @@ func ResolveLocalEvent(accountDir, owner, ref, calFilter string) (path string, e
 	}
 	var exact, prefix, subject []match
 	lowerRef := strings.ToLower(ref)
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		calDir := filepath.Join(accountDir, entry.Name())
-		calName := readMetaFile(calDir, "displayname", entry.Name())
+	for _, col := range cols {
+		calDir := col.Dir
+		calName := collectionName(col)
 		if calFilter != "" && !strings.EqualFold(calName, calFilter) {
 			continue
 		}
-		items, _, err := ScanLocalItems(calDir, owner)
+		items, _, err := ScanLocalItems(calDir, col.Owner)
 		if err != nil {
 			return "", Event{}, "", err
 		}
@@ -389,24 +474,41 @@ func EventMatchesQuery(e Event, lowerQuery string) bool {
 // file, so this errors listing the available calendars instead. The filename is
 // derived from the event's iCalUID.
 func WriteLocalEvent(accountDir, calendarName string, e Event) (string, error) {
-	calendars, err := ReadCalendars(accountDir, "")
+	cols, err := CollectionsUnder(accountDir)
 	if err != nil {
 		return "", err
 	}
-	var dir string
+	return WriteEventIn(cols, calendarName, e)
+}
+
+// WriteEventIn is WriteLocalEvent over an explicit collection set. Unlike the
+// account path it CREATES the collection directory when it is missing: a
+// configured local calendar is a path the user named, not one a sync produced,
+// so the first write is what brings it into existence. A read-only collection
+// is refused.
+func WriteEventIn(cols []Collection, calendarName string, e Event) (string, error) {
+	var target *Collection
 	var names []string
-	for _, cal := range calendars {
-		names = append(names, cal.Name)
-		if strings.EqualFold(cal.Name, calendarName) {
-			dir = cal.Dir
+	for i := range cols {
+		name := collectionName(cols[i])
+		names = append(names, name)
+		if strings.EqualFold(name, calendarName) {
+			target = &cols[i]
 			break
 		}
 	}
-	if dir == "" {
+	if target == nil {
 		if len(names) == 0 {
 			return "", fmt.Errorf("no local calendars yet — run 'durian calendar sync' first")
 		}
 		return "", fmt.Errorf("calendar %q not found; available: %s", calendarName, strings.Join(names, ", "))
+	}
+	if target.ReadOnly {
+		return "", fmt.Errorf("calendar %q is read-only: %w", calendarName, ErrReadOnly)
+	}
+	dir := target.Dir
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("failed to create calendar dir %s: %w", dir, err)
 	}
 
 	data, err := EventToICal(e)
@@ -418,4 +520,170 @@ func WriteLocalEvent(accountDir, calendarName string, e Event) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+// CollectionName is the display name of a collection: what it states, else its
+// "displayname" meta file, else the directory name. Callers that match a
+// collection by name must use this rather than Collection.Name, which is empty
+// for collections discovered under an account directory.
+func CollectionName(col Collection) string {
+	return collectionName(col)
+}
+
+// CollectionOwner is the account email of the collection with the given display
+// name — whose own RSVP the event parse recognizes. Empty when no collection
+// matches, and for a local calendar, which has no account holder to speak for.
+func CollectionOwner(cols []Collection, name string) string {
+	for _, col := range cols {
+		if strings.EqualFold(CollectionName(col), name) {
+			return col.Owner
+		}
+	}
+	return ""
+}
+
+// collectionName is the display name of a collection: what it states, else
+// its "displayname" meta file, else the directory name.
+func collectionName(col Collection) string {
+	if col.Name != "" {
+		return col.Name
+	}
+	return readMetaFile(col.Dir, "displayname", filepath.Base(col.Dir))
+}
+
+// MisconfiguredCollection is a configured calendar whose path does not point at
+// a collection of .ics files, together with the paths that do.
+//
+// Both shapes it catches produce the same useless symptom — an empty calendar
+// with nothing to explain it — and both are easy to reach: durian's own account
+// layout is a vdir base, so pointing one level too high is natural, and
+// correcting it by appending the collection name to an already-corrected path
+// is how the opposite happens.
+type MisconfiguredCollection struct {
+	Collection Collection
+	// Missing reports that the directory does not exist at all, as opposed to
+	// existing but holding only sub-collections.
+	Missing bool
+	// SubCollections are the paths that do contain .ics files: the collections
+	// below a vdir base, or — for a missing path — what its nearest existing
+	// ancestor offers.
+	SubCollections []string
+}
+
+// Hint renders the diagnosis as a multi-line message naming the corrected path.
+func (m MisconfiguredCollection) Hint() string {
+	name := CollectionName(m.Collection)
+	var b strings.Builder
+	if m.Missing {
+		fmt.Fprintf(&b, "calendar %q points at %s, which does not exist.", name, m.Collection.Dir)
+	} else {
+		fmt.Fprintf(&b, "calendar %q (%s) contains no .ics files but %d calendar collection",
+			name, m.Collection.Dir, len(m.SubCollections))
+		if len(m.SubCollections) != 1 {
+			b.WriteString("s")
+		}
+		b.WriteString(".")
+	}
+
+	b.WriteString("\n  Point the entry at ")
+	if len(m.SubCollections) == 1 {
+		fmt.Fprintf(&b, "this instead:\n    path = %q", m.SubCollections[0])
+	} else {
+		b.WriteString("one of these instead:")
+		for _, sub := range m.SubCollections {
+			fmt.Fprintf(&b, "\n    path = %q", sub)
+		}
+	}
+	return b.String()
+}
+
+// InspectCollections reports the configured calendars whose path cannot hold
+// the events they were expected to.
+//
+// Only collections that yielded no events are examined, so a working calendar
+// never pays for the check and never trips it. A missing directory is reported
+// ONLY when its nearest existing ancestor offers somewhere better to point:
+// creating a calendar at a path that does not exist yet is legitimate — the
+// first write creates it — and warning about that would nag rather than help.
+func InspectCollections(cols []Collection, calendars []LocalCalendar) []MisconfiguredCollection {
+	empty := make(map[string]bool, len(calendars))
+	for _, cal := range calendars {
+		if len(cal.Events) == 0 {
+			empty[cal.Dir] = true
+		}
+	}
+
+	var out []MisconfiguredCollection
+	for _, col := range cols {
+		if !empty[col.Dir] {
+			continue
+		}
+		if _, err := os.Stat(col.Dir); err != nil {
+			if subs := nearbyCollections(col.Dir); len(subs) > 0 {
+				out = append(out, MisconfiguredCollection{
+					Collection: col, Missing: true, SubCollections: subs,
+				})
+			}
+			continue
+		}
+		if subs := subCollectionsOf(col.Dir); len(subs) > 0 {
+			out = append(out, MisconfiguredCollection{Collection: col, SubCollections: subs})
+		}
+	}
+	return out
+}
+
+// nearbyCollections suggests where a missing path probably meant to point.
+//
+// It reports the nearest existing ancestor ONLY when that ancestor is itself a
+// collection — which is precisely what a doubled path segment looks like, and
+// nothing else does. Suggesting the ancestor's sibling collections instead
+// would flag the perfectly ordinary case of adding a new calendar next to an
+// existing one, which is the difference between a warning worth reading and
+// one worth silencing.
+func nearbyCollections(dir string) []string {
+	for cur := filepath.Dir(dir); cur != "" && cur != "/" && cur != "."; cur = filepath.Dir(cur) {
+		if _, err := os.Stat(cur); err != nil {
+			continue
+		}
+		if hasICS(cur) {
+			return []string{cur}
+		}
+		return nil
+	}
+	return nil
+}
+
+// hasICS reports whether dir directly contains at least one .ics file.
+func hasICS(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".ics") {
+			return true
+		}
+	}
+	return false
+}
+
+// subCollectionsOf returns the direct subdirectories of dir that contain at
+// least one .ics file, sorted.
+func subCollectionsOf(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if sub := filepath.Join(dir, entry.Name()); hasICS(sub) {
+			out = append(out, sub)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

@@ -31,10 +31,14 @@ func GetPassword(service, account string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-// SetPassword stores a password in the macOS Keychain
+// SetPassword stores a password in the macOS Keychain.
+//
+// -U makes add-generic-password update an existing item in place. Deleting
+// first would open a window in which a concurrent writer recreates the item
+// between the delete and the add, and the add then fails with "the specified
+// item already exists" — which is exactly what happens when several accounts
+// share one identity and rotate its refresh token at the same time.
 func SetPassword(service, account, password string) error {
-	_ = DeletePassword(service, account)
-
 	cmd := commandRunner("security", "add-generic-password",
 		"-s", service,
 		"-a", account,

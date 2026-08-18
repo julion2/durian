@@ -586,3 +586,145 @@ func TestLogSafeStripsControlCharacters(t *testing.T) {
 		}
 	}
 }
+
+// MARK: - Local calendars
+
+// newLocalCalendarHandler builds a Handler whose config declares two local
+// calendars in unrelated directories — one writable, one read-only — with no
+// account owning them.
+func newLocalCalendarHandler(t *testing.T) (http.Handler, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	privat := filepath.Join(root, "somewhere", "privat")
+	verein := filepath.Join(root, "elsewhere", "verein")
+	for _, d := range []string{privat, verein} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCalendarTestEvent(t, privat, calendar.Event{
+		ICalUID: "evt-dentist", Subject: "Zahnarzt",
+		Start: time.Date(2026, 8, 3, 9, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 8, 3, 10, 0, 0, 0, time.UTC),
+	})
+	writeCalendarTestEvent(t, verein, calendar.Event{
+		ICalUID: "evt-meeting", Subject: "Mitgliederversammlung",
+		Start: time.Date(2026, 8, 4, 19, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 8, 4, 21, 0, 0, 0, time.UTC),
+	})
+
+	cfg := &config.Config{
+		Calendar: config.CalendarConfig{
+			VdirPath: filepath.Join(root, "vdir"),
+			Local: []config.LocalCalendarConfig{
+				{Name: "Privat", Path: privat, Color: "#8ab4f8"},
+				{Name: "Verein", Path: verein, ReadOnly: true},
+			},
+		},
+		Accounts: []config.AccountConfig{{Name: "Work", Email: "me@example.com", Alias: "work"}},
+	}
+	h := New(nil, nil)
+	h.SetConfig(cfg)
+	return newTestRouter(h, nil), privat, verein
+}
+
+func TestCalendarsHandlerServesLocalCalendars(t *testing.T) {
+	r, _, _ := newLocalCalendarHandler(t)
+
+	var resp struct {
+		Calendars []calendar.CalendarDTO `json:"calendars"`
+	}
+	if code := getJSON(t, r, "/api/v1/calendars?account=local", &resp); code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if len(resp.Calendars) != 2 {
+		t.Fatalf("calendars = %+v, want both local ones", resp.Calendars)
+	}
+	if resp.Calendars[0].Name != "Privat" || resp.Calendars[0].Color != "#8ab4f8" {
+		t.Errorf("first = %+v, want the configured name and color", resp.Calendars[0])
+	}
+	if resp.Calendars[0].EventCount != 1 {
+		t.Errorf("event count = %d, want 1", resp.Calendars[0].EventCount)
+	}
+}
+
+func TestCalendarEventsHandlerServesLocalEvents(t *testing.T) {
+	r, _, _ := newLocalCalendarHandler(t)
+
+	var resp struct {
+		Events []calendar.CalendarEvent `json:"events"`
+	}
+	code := getJSON(t, r,
+		"/api/v1/calendars/events?account=local&from=2026-08-01T00:00:00Z&to=2026-08-10T00:00:00Z", &resp)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if len(resp.Events) != 2 {
+		t.Fatalf("events = %+v, want both local events", resp.Events)
+	}
+	if resp.Events[0].Subject != "Zahnarzt" {
+		t.Errorf("first event = %q, want the earlier one", resp.Events[0].Subject)
+	}
+}
+
+// A read-only calendar exists so another tool can own the folder. Every write
+// endpoint must refuse it — a guard on only some of them would make the
+// promise hold by accident.
+func TestLocalReadOnlyCalendarRefusesEveryWrite(t *testing.T) {
+	r, _, verein := newLocalCalendarHandler(t)
+
+	put := `{"account":"local","calendar":"Verein","subject":"Neu",` +
+		`"start":"2026-08-05T10:00:00Z","end":"2026-08-05T11:00:00Z"}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(put))
+	r.ServeHTTP(w, req)
+	if w.Code == http.StatusOK {
+		t.Error("PUT created an event in a read-only calendar")
+	}
+
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("DELETE",
+		"/api/v1/calendars/event?account=local&ref=evt-meeting&calendar=Verein", nil))
+	if w.Code != http.StatusForbidden {
+		t.Errorf("DELETE status = %d, want 403", w.Code)
+	}
+
+	// The event is still there, untouched.
+	if _, err := os.Stat(filepath.Join(verein, "evt-meeting.ics")); err != nil {
+		t.Errorf("the read-only event was removed: %v", err)
+	}
+}
+
+func TestLocalWritableCalendarAcceptsAWrite(t *testing.T) {
+	r, privat, _ := newLocalCalendarHandler(t)
+
+	body := `{"account":"local","calendar":"Privat","subject":"Neuer Termin",` +
+		`"start":"2026-08-06T10:00:00Z","end":"2026-08-06T11:00:00Z"}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+
+	entries, err := os.ReadDir(privat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ics int
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".ics") {
+			ics++
+		}
+	}
+	if ics != 2 {
+		t.Errorf("got %d .ics files, want the seeded one plus the new one", ics)
+	}
+}
+
+// An unknown identifier must still 404 — "local" is reserved, not a catch-all.
+func TestUnknownCalendarAccountStill404s(t *testing.T) {
+	r, _, _ := newLocalCalendarHandler(t)
+	if code := getJSON(t, r, "/api/v1/calendars?account=nope", nil); code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", code)
+	}
+}

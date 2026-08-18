@@ -68,6 +68,33 @@ class CalendarConfig {
   /// always backed up to <file>.conflict-<timestamp> first. Per-account
   /// override: accounts[*].calendar.conflict.
   conflict: "remote"|"local"|"newer" = "newer"
+  /// Calendars that exist only on disk. Each entry points at one directory
+  /// of .ics files — a vdir collection, so an existing khal or vdirsyncer
+  /// folder can be listed here as-is.
+  ///
+  /// They belong to no account and no provider, so the sync engine never
+  /// sees them: nothing is uploaded, nothing is pruned, and no invitation
+  /// can ever be sent for an event in them. Addressed as the reserved
+  /// account "local" (`durian calendar list local`).
+  ///
+  /// Named local_calendars because `local` is a Pkl keyword. Entries must be
+  /// written as `new C.LocalCalendar { ... }` — a bare `new { ... }` inside a
+  /// typed Listing evaluates to Dynamic and is rejected.
+  local_calendars: Listing<LocalCalendar> = new Listing {}
+}
+
+class LocalCalendar {
+  /// Display name, and how the calendar is addressed with --calendar.
+  /// Must be unique across the local calendars.
+  name: String(!isEmpty)
+  /// Directory holding the .ics files. Created on first write if missing.
+  path: String(!isEmpty)
+  /// "#RRGGBB" display color; falls back to the collection's `color` meta
+  /// file, then to no color.
+  color: String?
+  /// Refuse every write to this calendar — for a folder another tool owns,
+  /// so durian can show it without ever editing it.
+  read_only: Boolean = false
 }
 
 class AccountCalendarConfig {

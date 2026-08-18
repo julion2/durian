@@ -687,6 +687,12 @@ func (b *Backend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, re
 // Move relocates ref into destFolder via Graph's native atomic move. Graph
 // assigns the moved message a new id, so the returned RemoteRef carries the id
 // from the move response, not ref.ID.
+//
+// A 404 means the source id is dead — the message was moved or deleted by
+// another client since the last delta, and Graph renumbers on move, so the old
+// id will never resolve again. That is reported as backend.ErrRefGone rather
+// than a plain failure, so the engine can reconcile locally instead of
+// retrying the same doomed move on every sync.
 func (b *Backend) Move(ctx context.Context, ref backend.RemoteRef, destFolder string) (backend.RemoteRef, error) {
 	var moved struct {
 		ID string `json:"id"`
@@ -694,6 +700,11 @@ func (b *Backend) Move(ctx context.Context, ref backend.RemoteRef, destFolder st
 	reqURL := b.baseURL + b.mailbox + "/messages/" + url.PathEscape(ref.ID) + "/move"
 	if err := b.doJSON(ctx, http.MethodPost, reqURL,
 		map[string]string{"destinationId": destFolder}, &moved); err != nil {
+		var se *statusError
+		if errors.As(err, &se) && se.status == http.StatusNotFound {
+			return backend.RemoteRef{}, fmt.Errorf("failed to move %s to %s: %w: %w",
+				ref.ID, destFolder, backend.ErrRefGone, err)
+		}
 		return backend.RemoteRef{}, fmt.Errorf("failed to move %s to %s: %w", ref.ID, destFolder, err)
 	}
 	if moved.ID == "" {
@@ -720,17 +731,25 @@ func (b *Backend) Send(_ context.Context, _ []byte) error {
 
 // MARK: - Watch / Capabilities / Close
 
-// Watch is a no-op watcher for now: it blocks until ctx is done and never
-// signals a change, so the sync engine falls back to its normal poll cadence.
-// A real delta-poll (or webhook) watcher arrives in part 2.
+// Watch never signals: Microsoft Graph has no push transport a local desktop
+// client can receive. Change notifications are delivered only to a webhook
+// (which needs a public HTTPS endpoint), Azure Event Hubs or Event Grid, and
+// the endpoint-less socket transport Graph does offer is scoped to
+// driveItem/list resources, not mail.
+//
+// So this blocks until ctx is done and reports PushWatch: false, which is the
+// honest answer rather than a placeholder. Callers that see PushWatch: false
+// are expected to drive the account on a cadence instead (handler.EngineWatcher
+// does exactly that, running the delta-based sync engine every 30s on the
+// inbox). Revisit if Graph ever extends socket subscriptions to messages.
 func (b *Backend) Watch(ctx context.Context, _ string, _ func()) error {
 	<-ctx.Done()
 	return ctx.Err()
 }
 
 // Capabilities reports Graph backend behavior: M365 auto-saves sent mail
-// server-side, moves are native atomic operations, and (until the part-2
-// watcher lands) there is no push notification support.
+// server-side, moves are native atomic operations, and there is no push
+// notification support (see Watch — none exists for mail on this transport).
 func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
 		ServerSideSent:     true,

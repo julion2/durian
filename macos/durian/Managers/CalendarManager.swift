@@ -137,9 +137,18 @@ final class CalendarManager: ObservableObject {
     /// scoped by the active mail profile — it queries every configured account
     /// so the calendar always appears regardless of which mail profile is
     /// selected. Accounts without a calendar vdir simply return nothing.
+    ///
+    /// The reserved `local` identifier is always included: it serves the
+    /// local-only calendars from `calendar.local_calendars`, which belong to no
+    /// account and would otherwise have no identifier to be fetched under. It
+    /// costs nothing when none are configured — the endpoint answers with an
+    /// empty list, exactly like an account that has no vdir yet.
     private var accountIdentifiers: [String] {
-        ConfigManager.shared.getAccounts().map { $0.email }
+        ConfigManager.shared.getAccounts().map { $0.email } + [Self.localCalendarAccount]
     }
+
+    /// Mirrors config.LocalCalendarAccount on the Go side.
+    private static let localCalendarAccount = "local"
 
     // MARK: - Loading
 

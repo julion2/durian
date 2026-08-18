@@ -62,7 +62,12 @@ func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
 
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
-		"PRAGMA busy_timeout=5000",
+		// Long enough to outlast a competing writer's whole sync batch: the
+		// daemon's watchers and a `durian sync` process write to this file
+		// from different processes, where SetMaxOpenConns(1) gives no
+		// protection. A busy write here fails a message ingest, so waiting is
+		// always better than erroring.
+		"PRAGMA busy_timeout=30000",
 		"PRAGMA foreign_keys=ON",
 		"PRAGMA synchronous=NORMAL",
 		// ADR-0001 step 8: overwrite freed pages with zeros on DELETE /

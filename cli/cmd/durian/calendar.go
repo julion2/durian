@@ -129,6 +129,9 @@ func runCalendarExport(cmd *cobra.Command, args []string) error {
 		return errors.New("no configuration loaded")
 	}
 
+	if err := rejectLocalCalendarAccount(args[0]); err != nil {
+		return err
+	}
 	account, err := cfg.GetAccountByIdentifier(args[0])
 	if err != nil {
 		return fmt.Errorf("account not found: %s\nAvailable accounts: %s", args[0], cfg.ListAccountIdentifiers())
@@ -164,10 +167,28 @@ func runCalendarExport(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// rejectLocalCalendarAccount refuses the reserved local-calendar identifier for
+// the commands that talk to a provider.
+//
+// Local calendars have no provider and no remote side at all. Falling through
+// to the account lookup would answer "account not found", which names the
+// symptom and hides the reason — the identifier is valid, it just has nothing
+// to sync from.
+func rejectLocalCalendarAccount(identifier string) error {
+	if strings.EqualFold(identifier, config.LocalCalendarAccount) {
+		return fmt.Errorf("%q holds local-only calendars — they have no provider to sync or export from",
+			config.LocalCalendarAccount)
+	}
+	return nil
+}
+
 func runCalendarSync(cmd *cobra.Command, args []string) error {
 	cfg := GetConfig()
 	if cfg == nil {
 		return errors.New("no configuration loaded")
+	}
+	if err := rejectLocalCalendarAccount(args[0]); err != nil {
+		return err
 	}
 
 	account, err := cfg.GetAccountByIdentifier(args[0])

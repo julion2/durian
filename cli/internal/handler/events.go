@@ -68,6 +68,16 @@ func (h *EventHub) Subscribe() chan []byte {
 	return ch
 }
 
+// HasClients reports whether any SSE client is currently connected. The GUI
+// holds this stream open for its entire lifetime, so it doubles as the
+// daemon's "is anyone watching?" signal — used to pick a fast or a battery-
+// friendly sync cadence without the daemon knowing anything about windows.
+func (h *EventHub) HasClients() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.subscribers) > 0
+}
+
 // Unsubscribe removes a client channel and closes it.
 func (h *EventHub) Unsubscribe(ch chan []byte) {
 	h.mu.Lock()

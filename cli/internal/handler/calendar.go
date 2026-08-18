@@ -41,18 +41,74 @@ func (h *Handler) resolveCalendarAccount(w http.ResponseWriter, account string) 
 	return dir, acct.GetAuthEmail(), true
 }
 
+// resolveCalendarCollections maps the ?account= parameter to the calendar
+// collections it addresses, plus the owner email used to recognize the owner's
+// own RSVP. On any problem it writes the HTTP error and returns ok=false.
+//
+// The reserved identifier "local" resolves to the calendars configured under
+// calendar.local instead of an account directory. They have no owner: nobody
+// is invited to an event that never leaves the disk, so there is no RSVP to
+// recognize.
+func (h *Handler) resolveCalendarCollections(w http.ResponseWriter, account string) (cols []calendar.Collection, ok bool) {
+	if h.cfg == nil {
+		http.Error(w, "config not loaded", http.StatusServiceUnavailable)
+		return nil, false
+	}
+	if account == "" {
+		http.Error(w, "missing required 'account' query parameter", http.StatusBadRequest)
+		return nil, false
+	}
+	if strings.EqualFold(account, config.LocalCalendarAccount) {
+		return localCollections(h.cfg), true
+	}
+
+	dir, owner, ok := h.resolveCalendarAccount(w, account)
+	if !ok {
+		return nil, false
+	}
+	cols, err := calendar.CollectionsUnderFor(dir, account, owner)
+	if err != nil {
+		slog.Error("Failed to enumerate local calendars", "module", "API", "err", logSafe(err.Error()))
+		http.Error(w, "failed to read calendars", http.StatusInternalServerError)
+		return nil, false
+	}
+	return cols, true
+}
+
+// localCollections projects the configured local calendars onto the neutral
+// collection type.
+func localCollections(cfg *config.Config) []calendar.Collection {
+	local := cfg.LocalCalendars()
+	cols := make([]calendar.Collection, 0, len(local))
+	for _, lc := range local {
+		cols = append(cols, calendar.Collection{
+			Dir:      lc.Path,
+			Name:     lc.Name,
+			HexColor: lc.Color,
+			ReadOnly: lc.ReadOnly,
+			Account:  config.LocalCalendarAccount,
+		})
+	}
+	return cols
+}
+
 // CalendarsHandler serves GET /api/v1/calendars?account= — the account's
 // calendars with their color and event count.
 func (h *Handler) CalendarsHandler(w http.ResponseWriter, r *http.Request) {
-	dir, owner, ok := h.resolveCalendarAccount(w, r.URL.Query().Get("account"))
+	cols, ok := h.resolveCalendarCollections(w, r.URL.Query().Get("account"))
 	if !ok {
 		return
 	}
-	calendars, err := calendar.ReadCalendars(dir, owner)
+	calendars, err := calendar.ReadCollections(cols)
 	if err != nil {
 		slog.Error("Failed to read local calendars", "module", "API", "err", err)
 		http.Error(w, "failed to read calendars", http.StatusInternalServerError)
 		return
+	}
+	for _, bad := range calendar.InspectCollections(cols, calendars) {
+		slog.Warn("Local calendar path points at a vdir base, not a collection",
+			"module", "API", "calendar", calendar.CollectionName(bad.Collection),
+			"path", bad.Collection.Dir, "collections", bad.SubCollections)
 	}
 	out := make([]calendar.CalendarDTO, 0, len(calendars))
 	for _, c := range calendars {
@@ -67,13 +123,13 @@ func (h *Handler) CalendarsHandler(w http.ResponseWriter, r *http.Request) {
 // full-text search across all events (the window is ignored).
 func (h *Handler) CalendarEventsHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	dir, owner, ok := h.resolveCalendarAccount(w, q.Get("account"))
+	cols, ok := h.resolveCalendarCollections(w, q.Get("account"))
 	if !ok {
 		return
 	}
 	calFilter := q.Get("calendar")
 
-	calendars, err := calendar.ReadCalendars(dir, owner)
+	calendars, err := calendar.ReadCollections(cols)
 	if err != nil {
 		slog.Error("Failed to read local calendars", "module", "API", "err", err)
 		http.Error(w, "failed to read calendars", http.StatusInternalServerError)
@@ -119,7 +175,7 @@ func (h *Handler) CalendarEventsHandler(w http.ResponseWriter, r *http.Request) 
 // substring; the full (detail) event is returned, or 404 when none/ambiguous.
 func (h *Handler) CalendarEventHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	dir, owner, ok := h.resolveCalendarAccount(w, q.Get("account"))
+	cols, ok := h.resolveCalendarCollections(w, q.Get("account"))
 	if !ok {
 		return
 	}
@@ -128,7 +184,7 @@ func (h *Handler) CalendarEventHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing required 'ref' query parameter", http.StatusBadRequest)
 		return
 	}
-	_, e, calName, err := calendar.ResolveLocalEvent(dir, owner, ref, q.Get("calendar"))
+	_, e, calName, err := calendar.ResolveEventIn(cols, ref, q.Get("calendar"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return

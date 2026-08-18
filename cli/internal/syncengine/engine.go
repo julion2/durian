@@ -3,6 +3,7 @@ package syncengine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -47,9 +48,13 @@ type Options struct {
 	Mode Mode
 	// Ingest configures message ingestion (rules, groups, indexed headers).
 	Ingest IngestOptions
-	// Folders optionally restricts the sync to these folders (matched against
-	// backend Folder.Name or Folder.Display); empty means all folders that
-	// FetchFolders reports.
+	// Folders optionally restricts the sync to these folders; empty means all
+	// folders that FetchFolders reports. Each entry is matched against the
+	// backend's Folder.Name, its Folder.Display, and its special-use Role — so
+	// the provider-neutral "INBOX" selects an IMAP mailbox named INBOX and a
+	// Graph folder whose id is opaque and whose display name is localized
+	// ("Posteingang"). A filter that selects no folder at all is an error, not
+	// an empty success.
 	Folders []string
 	// DryRun logs what would happen without writing to the store or advancing
 	// cursors.
@@ -77,6 +82,13 @@ type Result struct {
 	// Errors collects per-folder and per-message errors; the sync continues
 	// past them (like the legacy syncer continues past a failed mailbox).
 	Errors []error
+	// NewMessageIDs are the Message-IDs of genuinely new arrivals in inbox-role
+	// folders, in ingest order. Only inbox-role folders contribute: a message
+	// appearing in Sent or Archive is not an arrival the user wants to hear
+	// about. Callers use this to raise new-mail notifications, which is why it
+	// is provider-neutral state on the engine rather than something derived
+	// from IMAP UIDNEXT. Empty in dry-run.
+	NewMessageIDs []string
 }
 
 // Engine drives a backend.Backend: folder discovery, cursor-paged incremental
@@ -142,6 +154,20 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 		e.reconcileFolderFlags(ctx, b, folder, deltaFlags, result)
 	}
 
+	// An explicit folder filter that selected nothing is a caller bug (a typo, or
+	// a name that does not exist on this provider), not a healthy quiet sync.
+	// Reporting success here is indistinguishable from "nothing changed", which
+	// is how a mailbox filter that matched no Graph folder hid behind a
+	// twice-a-minute "sync completed successfully" for days.
+	if len(e.opts.Folders) > 0 && result.Folders == 0 {
+		available := make([]string, 0, len(folders))
+		for _, f := range folders {
+			available = append(available, f.Display)
+		}
+		return result, fmt.Errorf("folder filter %v matched no folder on account %s (available: %s)",
+			e.opts.Folders, e.opts.Account, strings.Join(available, ", "))
+	}
+
 	// Upload local archive/delete actions (INBOX messages that lost the "inbox"
 	// tag) to the server. Runs after downloads so it sees the freshest folders.
 	e.uploadFolderMoves(ctx, b, folders, result)
@@ -152,13 +178,41 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 	return result, nil
 }
 
+// isRetryableStoreError reports whether a failed ingest is worth retrying on
+// the next pass. SQLite reports write contention as "database is locked" —
+// which happens because the daemon's watchers and a `durian sync` process write
+// this file from separate processes, where the driver's single-connection
+// setting offers no protection. Those succeed on a retry; a malformed message
+// or a constraint violation never will, so everything else is treated as
+// permanent and skipped rather than blocking the folder's cursor.
+func isRetryableStoreError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "database table is locked") ||
+		strings.Contains(msg, "SQLITE_BUSY")
+}
+
 // folderSelected reports whether the folder passes the Options.Folders filter.
+//
+// A filter entry matches the provider's own folder identifier, its (possibly
+// localized) display name, or its special-use role. The role match is what
+// makes a caller-supplied "INBOX" portable: IMAP names the mailbox INBOX, but
+// Graph identifies folders by opaque id and displays them in the mailbox's
+// language, so neither of the first two matches on a German M365 tenant.
 func (e *Engine) folderSelected(folder backend.Folder) bool {
 	if len(e.opts.Folders) == 0 {
 		return true
 	}
 	for _, want := range e.opts.Folders {
 		if strings.EqualFold(want, folder.Name) || strings.EqualFold(want, folder.Display) {
+			return true
+		}
+		// "INBOX" is the historical spelling of the inbox role; every other
+		// role matches under its own name ("archive", "sent", ...).
+		if folder.Role != backend.RoleNone && strings.EqualFold(want, string(folder.Role)) {
+			return true
+		}
+		if folder.Role == backend.RoleInbox && strings.EqualFold(want, "INBOX") {
 			return true
 		}
 	}
@@ -190,6 +244,9 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 
 	// fetched counts messages pulled this run, to enforce MaxPerFolder.
 	fetched := 0
+	// ingestFailed marks that at least one message in the current batch could
+	// not be stored, which makes this batch's cursor unsafe to persist.
+	ingestFailed := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("canceled: %w", err)
@@ -218,6 +275,13 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				slog.Warn("Ingest failed", "module", "SYNCENGINE",
 					"folder", folder.Name, "ref", msg.Ref.ID, "err", err)
 				result.Errors = append(result.Errors, fmt.Errorf("ingest %s/%s: %w", folder.Name, msg.Ref.ID, err))
+				// Only a retryable failure may hold the cursor back. A message
+				// that cannot be stored for a permanent reason would fail
+				// identically forever, and holding the cursor for it re-downloads
+				// the whole folder on every run without ever making progress.
+				if isRetryableStoreError(err) {
+					ingestFailed = true
+				}
 				continue
 			}
 			sessionRefs[msg.Ref.ID] = messageID
@@ -225,6 +289,12 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 			// is an update, not a new arrival — count the two separately.
 			if created {
 				result.New++
+				// Only inbox arrivals are worth notifying about; a message
+				// ingested into Sent is the user's own, and Archive/Junk are
+				// not events they asked to be interrupted for.
+				if folder.Role == backend.RoleInbox {
+					result.NewMessageIDs = append(result.NewMessageIDs, messageID)
+				}
 			} else {
 				result.Deduplicated++
 			}
@@ -234,6 +304,16 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 			if e.handleDeleted(folder, del, sessionRefs, result) {
 				result.Deleted++
 			}
+		}
+
+		// A delta cursor is a promise that everything before it is stored. If
+		// any message in this batch failed to ingest (a locked database, a
+		// malformed body), advancing past it would drop that message for good:
+		// the next delta starts after it and the server never mentions it
+		// again. Stop the folder here instead and let the next pass refetch
+		// the same batch — ingest is idempotent, so replaying it is free.
+		if ingestFailed {
+			return nil, fmt.Errorf("cursor held back: a message in this batch could not be stored yet")
 		}
 
 		// Persist the cursor only after the batch was fully processed, and
@@ -552,6 +632,31 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 		}
 		ref := backend.RemoteRef{Folder: inbox.Name, ID: r.RemoteRef}
 		if _, err := b.Move(ctx, ref, dest); err != nil {
+			if errors.Is(err, backend.ErrRefGone) {
+				// The message already left INBOX on the server (archived from
+				// another client, or moved by an earlier run that then failed to
+				// record the new mailbox). Retrying can never succeed — the ref
+				// is permanently dead — and the row stays in the inbox folder
+				// state, so without local reconciliation this same doomed move
+				// is reattempted, and fails the sync, on every single run.
+				//
+				// Reconcile optimistically: point the row at dest, the mailbox
+				// the local tags already asked for. That is where the message
+				// most likely is (another client archiving it is the common
+				// cause), and it is the one option that both breaks the retry
+				// loop and keeps the message — deleting the row would lose a
+				// message that is still sitting on the server. If the guess is
+				// wrong, the next delta on the real folder re-ingests the row
+				// and overwrites both mailbox and remote_ref, which stays stale
+				// here (UpdateMailbox only resets the UID).
+				slog.Info("Folder-move upload: message already gone from inbox", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+					"message_id", r.MessageID, "dest", dest)
+				if err := e.opts.Store.UpdateMailbox(r.MessageID, e.opts.Account, dest, 0); err != nil {
+					slog.Warn("Folder-move upload: reconcile gone message failed", "module", "SYNCENGINE", // encgrep:allow static message text only; message_id is plaintext and err carries no encrypted column
+						"message_id", r.MessageID, "err", err)
+				}
+				continue
+			}
 			slog.Warn("Folder-move upload failed", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 				"message_id", r.MessageID, "dest", dest, "err", err)
 			result.Errors = append(result.Errors, fmt.Errorf("move %s: %w", r.MessageID, err))

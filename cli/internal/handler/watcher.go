@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/mail"
 	"strings"
 	"sync"
 	"time"
@@ -442,34 +441,15 @@ func (w *WatcherManager) syncAndNotify(account *config.AccountConfig, client *im
 	}
 
 	// Look up each new message in the SQLite store for thread/subject/from/body
-	messages := make([]NewMailInfo, 0, len(envelopes))
+	messageIDs := make([]string, 0, len(envelopes))
 	for uid, messageID := range envelopes {
 		if messageID == "" {
 			continue
 		}
 		w.log.Debug("UID to Message-ID mapping", "account", account.Email, "uid", uid, "message_id", messageID) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-		msg, err := w.store.GetByMessageID(messageID)
-		if err != nil {
-			w.log.Error("Store lookup failed", "account", account.Email, "message_id", messageID, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-			continue
-		}
-		if msg == nil {
-			w.log.Debug("Message not yet in store", "account", account.Email, "message_id", messageID) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-			continue
-		}
-		from := msg.FromAddr
-		if addr, err := mail.ParseAddress(msg.FromAddr); err == nil && addr.Name != "" {
-			from = addr.Name
-		}
-		messages = append(messages, NewMailInfo{
-			ThreadID: msg.ThreadID,
-			Subject:  msg.Subject,
-			From:     from,
-			Snippet:  cleanSnippet(msg.BodyText, 150),
-		})
-		// ADR-0001 §6 redaction: thread/id observability without leaking from/subject.
-		w.log.Info("New mail", "account", account.Email, "thread", msg.ThreadID) // encgrep:allow account.Email plaintext per ADR-0001 §3
+		messageIDs = append(messageIDs, messageID)
 	}
+	messages := newMailInfos(w.store, account.Email, messageIDs)
 
 	w.log.Info("Broadcasting new messages", "account", account.Email, "count", len(messages)) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	w.hub.Broadcast(NewMailEvent{

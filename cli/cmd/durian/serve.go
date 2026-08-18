@@ -236,13 +236,12 @@ func runServe(cmd *cobra.Command, args []string) {
 		// The IDLE watcher runs the legacy IMAP syncer. For Graph-backend
 		// accounts that would ingest into IMAP-named mailboxes in parallel with
 		// the Graph sync's Graph-id-named mailboxes, splitting the store into two
-		// incompatible views of the same account. Exclude Graph accounts here —
-		// they sync via the engine (durian sync) only, until a Graph push-watcher
-		// lands to give them real-time updates natively.
+		// incompatible views of the same account. Those accounts are driven by
+		// the EngineWatcher below instead, which runs the sync engine on a
+		// cadence — Graph has no push transport a local client can receive.
 		var watched []*config.AccountConfig
 		for _, a := range cfg.GetAccountsWithIMAP() {
 			if a.UsesGraphBackend() {
-				slog.Info("Skipping IMAP watcher for Graph-backend account", "module", "SERVE", "account", a.AccountIdentifier()) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 				continue
 			}
 			watched = append(watched, a)
@@ -255,6 +254,14 @@ func runServe(cmd *cobra.Command, args []string) {
 			h.SetSyncTrigger(watcher)
 			go watcher.Start(watcherCtx, watched)
 			slog.Info("Started IDLE watchers", "module", "SERVE", "accounts", len(watched)) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+		}
+
+		// Engine-backed accounts (Microsoft Graph) get the polling watcher.
+		// Without it nothing in the daemon syncs them at all: mail only moved
+		// when the user ran `durian sync` by hand.
+		if engineAccounts := cfg.GetGraphAccounts(); len(engineAccounts) > 0 {
+			engineWatcher := handler.NewEngineWatcher(eventHub, emailDB, rules, groups, cfg.Sync.IndexedHeaders)
+			go engineWatcher.Start(watcherCtx, engineAccounts)
 		}
 
 		// Start outbox background worker
