@@ -85,23 +85,24 @@ type haystacks struct {
 // alone), the filter is a no-op and returns candidateIDs unchanged
 // — there is no collision-via-search-count oracle to plug because the
 // blind-FTS index wasn't consulted.
-func (d *DB) postDecryptFilter(candidateIDs []int64, terms []ftsTerm) ([]int64, error) {
-	if len(terms) == 0 || len(candidateIDs) == 0 {
+func (d *DB) postDecryptFilter(candidateIDs []int64, node exprNode) ([]int64, error) {
+	if node == nil || len(candidateIDs) == 0 || len(extractFTSTerms(node)) == 0 {
 		return candidateIDs, nil
 	}
 	hs, err := d.postDecryptFetch(candidateIDs)
 	if err != nil {
 		return nil, fmt.Errorf("post-decrypt fetch: %w", err)
 	}
-	lower := cases.Lower(language.Und)
-	needles := make([]ftsTerm, len(terms))
-	for i, t := range terms {
-		needles[i] = ftsTerm{
-			value:  lower.String(t.value),
-			phrase: t.phrase,
-			scope:  t.scope,
-		}
+	// Per-candidate truth for each non-FTS leaf (tag:/from:/date:/...). Without
+	// it, evalFTS would assume those branches match, and an `OR` with a non-FTS
+	// branch (e.g. `from:alice OR hawaii`) would keep a message that only
+	// entered through a blind-index collision for the FTS term — re-opening the
+	// search-count oracle the recheck exists to close.
+	leafSets, err := d.sqlLeafSets(node, candidateIDs)
+	if err != nil {
+		return nil, err
 	}
+	lower := cases.Lower(language.Und)
 	surviving := candidateIDs[:0]
 	for _, id := range candidateIDs {
 		hay, ok := hs[id]
@@ -111,29 +112,114 @@ func (d *DB) postDecryptFilter(candidateIDs []int64, terms []ftsTerm) ([]int64, 
 			// false positive that the attacker can use as a signal.
 			continue
 		}
-		if matchesAllTerms(hay, needles) {
+		if evalFTS(node, hay, id, lower, leafSets) {
 			surviving = append(surviving, id)
 		}
 	}
 	return surviving, nil
 }
 
-// matchesAllTerms checks every term against the message's haystacks.
-// All terms must match (AND semantics, mirroring FTS5's default).
-func matchesAllTerms(hay haystacks, terms []ftsTerm) bool {
-	for _, t := range terms {
-		var target string
-		switch t.scope {
-		case ftsScopeSubject:
-			target = hay.subjectLower
-		default:
-			target = hay.subjectLower + "\x00" + hay.bodyLower
+// sqlLeafSets computes, for every non-FTS field leaf in the query, the subset of
+// candidateIDs that genuinely satisfy that leaf's SQL predicate — reusing
+// fieldToSQL so the recheck can't drift from the candidate query's semantics.
+// evalFTS consults these instead of assuming a non-FTS branch matched. Returns
+// nil when the query has no non-FTS leaves (a pure-FTS query needs none).
+func (d *DB) sqlLeafSets(node exprNode, ids []int64) (map[*fieldExpr]map[int64]bool, error) {
+	var leaves []*fieldExpr
+	collectSQLLeaves(node, &leaves)
+	if len(leaves) == 0 {
+		return nil, nil
+	}
+	idPH := make([]string, len(ids))
+	idArgs := make([]any, len(ids))
+	for i, id := range ids {
+		idPH[i] = "?"
+		idArgs[i] = id
+	}
+	idIn := "m.id IN (" + strings.Join(idPH, ",") + ")"
+
+	sets := make(map[*fieldExpr]map[int64]bool, len(leaves))
+	for _, leaf := range leaves {
+		where, params, err := d.fieldToSQL(leaf)
+		if err != nil {
+			return nil, fmt.Errorf("sql leaf recheck (%s): %w", leaf.field, err)
 		}
-		if !termMatchesHay(t, target) {
-			return false
+		args := append(append([]any{}, idArgs...), params...)
+		rows, err := d.db.Query("SELECT m.id FROM messages m WHERE "+idIn+" AND ("+where+")", args...)
+		if err != nil {
+			return nil, fmt.Errorf("sql leaf recheck (%s): %w", leaf.field, err)
+		}
+		set := make(map[int64]bool)
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan sql leaf id: %w", err)
+			}
+			set[id] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterate sql leaf ids: %w", err)
+		}
+		sets[leaf] = set
+	}
+	return sets, nil
+}
+
+// collectSQLLeaves gathers every field leaf that is enforced in SQL rather than
+// through the blind-FTS index (i.e. not subject:). bare/subject FTS leaves and
+// star are handled by evalFTS directly.
+func collectSQLLeaves(node exprNode, out *[]*fieldExpr) {
+	switch n := node.(type) {
+	case *binaryExpr:
+		collectSQLLeaves(n.left, out)
+		collectSQLLeaves(n.right, out)
+	case *notExpr:
+		collectSQLLeaves(n.child, out)
+	case *fieldExpr:
+		if n.field != "subject" {
+			*out = append(*out, n)
 		}
 	}
-	return true
+}
+
+// evalFTS re-evaluates a query's blind-FTS conditions against one decrypted
+// message, mirroring the boolean structure the SQL WHERE clause used. This is
+// what keeps the collision recheck honest for positive FTS terms WITHOUT
+// collapsing OR into AND — the earlier "every extracted term must match" list
+// silently turned `a OR b` into `a AND b`, shrinking (not growing) the result
+// set with each added OR branch.
+//
+//   - FTS leaves (bare, subject:) are substring-checked against the plaintext.
+//   - Non-FTS field leaves (tag:, from:, to:, date:, path:, has:, ...) use their
+//     real per-candidate SQL truth from leafSets, NOT a blanket true — otherwise
+//     an `OR` with a non-FTS branch would mask a blind-index collision in the
+//     FTS branch and leak it through SearchCount.
+//   - NOT subtrees are negated over the real evaluation of their child, so a
+//     `hawaii OR NOT tag:x` cannot keep a collision candidate that actually has
+//     tag x.
+func evalFTS(node exprNode, hay haystacks, id int64, lower cases.Caser, leafSets map[*fieldExpr]map[int64]bool) bool {
+	switch n := node.(type) {
+	case *binaryExpr:
+		if n.op == "OR" {
+			return evalFTS(n.left, hay, id, lower, leafSets) || evalFTS(n.right, hay, id, lower, leafSets)
+		}
+		return evalFTS(n.left, hay, id, lower, leafSets) && evalFTS(n.right, hay, id, lower, leafSets)
+	case *notExpr:
+		return !evalFTS(n.child, hay, id, lower, leafSets)
+	case *bareExpr:
+		t := ftsTerm{value: lower.String(n.value), phrase: n.phrase, scope: ftsScopeBare}
+		return termMatchesHay(t, hay.subjectLower+"\x00"+hay.bodyLower)
+	case *fieldExpr:
+		if n.field == "subject" {
+			t := ftsTerm{value: lower.String(n.value), phrase: n.phrase, scope: ftsScopeSubject}
+			return termMatchesHay(t, hay.subjectLower)
+		}
+		return leafSets[n][id]
+	default: // starExpr matches every row
+		return true
+	}
 }
 
 // termMatchesHay checks one term against one haystack. Phrase queries

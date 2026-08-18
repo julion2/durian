@@ -702,3 +702,63 @@ func TestGetThreadTags_AccountScoped(t *testing.T) {
 		t.Errorf("gmail tags = %v, want [inbox]", gmail)
 	}
 }
+
+// TestSearch_OR_FTS guards the post-decrypt recheck against collapsing OR into
+// AND. Unlike TestSearch_OR (which uses from: fields that skip the FTS recheck),
+// these are bare/subject FTS terms that flow through postDecryptFilter — the
+// path where "every extracted term must match" turned `a OR b` into `a AND b`,
+// making an OR return FEWER hits than either side alone.
+func TestSearch_OR_FTS(t *testing.T) {
+	db := seedSearchDB(t)
+	single := func(q string, want int) {
+		t.Helper()
+		res, err := db.Search(q, 50)
+		if err != nil {
+			t.Fatalf("search %q: %v", q, err)
+		}
+		if len(res) != want {
+			t.Errorf("search %q: got %d results, want %d", q, len(res), want)
+		}
+	}
+	// Each bare term matches a different single message's body.
+	single("hawaii", 1)  // s5
+	single("project", 1) // s2 (thread {s2,s3})
+	// The bug: OR returned the intersection (0), fewer than either term alone.
+	single("hawaii OR project", 2)
+	// A third OR branch must grow, not shrink, the set (january → s1 subject).
+	single("hawaii OR project OR january", 3)
+	// AND must still intersect (regression guard): only s4 has both in its body.
+	single("invoice AND weekly", 1)
+	// Subject-scoped OR flows through the recheck too.
+	single("subject:invoice OR subject:vacation", 2)
+}
+
+// TestPostDecryptFilterORMixedDropsCollision guards the blind-FTS collision
+// recheck for a mixed SQL/FTS OR query. `from:alice OR hawaii` must NOT keep a
+// message that entered the candidate set only through a blind-index collision
+// on "hawaii" while being neither from alice nor really containing "hawaii".
+// Before the fix, evalFTS treated the from:alice branch as true for every
+// candidate, so the OR kept the collision and SearchCount leaked it.
+func TestPostDecryptFilterORMixedDropsCollision(t *testing.T) {
+	db := seedSearchDB(t)
+	_, _, node, _, err := db.parseQueryWithTerms("from:alice OR hawaii")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	alice, err := db.GetByMessageID("s5@x") // from alice, body mentions Hawaii
+	if err != nil || alice == nil {
+		t.Fatalf("load s5: %v", err)
+	}
+	bob, err := db.GetByMessageID("s2@x") // from bob, no "hawaii" — the simulated collision
+	if err != nil || bob == nil {
+		t.Fatalf("load s2: %v", err)
+	}
+
+	got, err := db.postDecryptFilter([]int64{alice.ID, bob.ID}, node)
+	if err != nil {
+		t.Fatalf("postDecryptFilter: %v", err)
+	}
+	if len(got) != 1 || got[0] != alice.ID {
+		t.Errorf("kept a collision candidate: got %v, want [%d] (bob is neither from alice nor contains hawaii)", got, alice.ID)
+	}
+}
