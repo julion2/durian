@@ -78,6 +78,62 @@ new { name = "Spam";           match = "header:x-spam-status:Yes";              
 
 The built-in seven cover ~90% of inbox-zero patterns; user additions handle the long tail without code changes. After editing the config, `durian sync --backfill-headers` re-fetches headers for existing messages so old mails match the new rules. New mails pick up the change automatically on the next sync.
 
+## calendar
+
+Optional. Calendar sync mirrors Microsoft Outlook and Google Calendar OAuth
+accounts to a local vdir of `.ics` files (see [Calendar](../../cli/calendar/)).
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `vdir_path` | String | `~/.local/share/durian/calendars` | Layout `<vdir_path>/<account-dir>/<calendar>/<event>.ics`; `$XDG_DATA_HOME`-aware; override per run with `--out`. |
+| `autosync` | Bool | `true` | Background sync in `durian serve`. With `autosync_upload = "none"` it is strictly **download-only**. |
+| `autosync_interval` | Int (s) | `600` | Minimum 60; a value below 60 falls back to 600. |
+| `autosync_upload` | `"none"` \| `"safe"` | `"none"` | `"safe"` auto-applies only attendee-less creates/edits; remote deletes, conflicts, and RSVPs always wait for an interactive `durian calendar sync`. |
+| `conflict` | `"newer"` \| `"remote"` \| `"local"` | `"newer"` | Both-sides-edit policy; a losing local file is backed up to `<file>.conflict-<timestamp>`. |
+| `local_calendars` | `Listing<C.LocalCalendar>` | empty | On-disk-only calendars (below). |
+
+`conflict`, `autosync`, and `autosync_upload` resolve as: per-account override →
+global `calendar.*` → schema default. A calendar block only applies to Microsoft
+and Google OAuth accounts; delegated/shared mailboxes are skipped by autosync.
+
+### local_calendars
+
+Calendars that live only on disk — never uploaded, pruned, or the source of an
+invitation. `durian calendar list local` shows them.
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | String (required) | Non-empty, unique case-insensitively; also the `--calendar` value. |
+| `path` | String (required) | A directory of `.ics` files (a vdir *collection*, not a base); `~` expanded; created on first write. |
+| `color` | String? | `#RRGGBB`; falls back to the collection's `color` meta file. |
+| `read_only` | Bool (default false) | Refuses `new`, `rsvp`, `delete`. |
+
+{{< callout type="warning" >}}
+Each entry must be `new C.LocalCalendar { ... }` — a bare `new { ... }` inside a
+typed `Listing` evaluates to `Dynamic` and Pkl rejects it. The key is
+`local_calendars` (not `local`) because `local` is a Pkl keyword.
+{{< /callout >}}
+
+```pkl
+calendar = (C.calendar) {
+  vdir_path = "~/.local/share/durian/calendars"
+  autosync = true
+  autosync_upload = "none"
+  conflict = "newer"
+  local_calendars {
+    new C.LocalCalendar { name = "Privat"; path = "~/calendars/privat"; color = "#8E44AD" }
+    new C.LocalCalendar { name = "Feiertage"; path = "~/calendars/holidays"; read_only = true }
+  }
+}
+```
+
+### Per-account calendar
+
+An account may carry its own `calendar { dir, include, conflict, autosync,
+autosync_upload }`: `dir` (subdirectory under `vdir_path`; default the alias,
+else the lowercased name), `include` (calendar display names to export; empty =
+all), and the three overrides above.
+
 ## accounts
 
 A `Listing<AccountConfig>`. Each entry can be a literal `new { ... }` (password auth) or amend a provider preset (`(C.gmail) { ... }`, `(C.microsoft365) { ... }`).
@@ -94,6 +150,32 @@ A `Listing<AccountConfig>`. Each entry can be a literal `new { ... }` (password 
 | `smtp` | `{ host, port, auth }` |
 | `imap` | `{ host, port, auth, max_messages }` |
 | `auth` | `{ username }` for password, or `oauth { client_id, client_secret }` for Google |
+| `sync_engine` | Which sync path this account uses — see [Sync engine](#sync-engine) |
+| `calendar` | Per-account calendar overrides — see [calendar](#calendar) |
+
+### Sync engine
+
+`sync_engine` selects how an account syncs. It resolves per account
+(`EffectiveSyncEngine`): unset defaults to `graph` for Microsoft OAuth, `gmail`
+for Google OAuth, and `legacy` for everything else — so the `C.microsoft365` and
+`C.gmail` presets already pick the right one and you rarely set it by hand.
+
+| Value | Backend | Providers |
+|---|---|---|
+| `legacy` | The classic IMAP syncer | Any IMAP account, including Gmail (opt back with `sync_engine = "legacy"`) |
+| `engine` | Provider-neutral engine on the IMAP backend | Generic IMAP only |
+| `graph` | Provider-neutral engine on Microsoft Graph | Microsoft only — **required** for Microsoft |
+| `gmail` | Provider-neutral engine on the Gmail REST API | Google only — the default for Gmail |
+
+The `gmail` engine syncs over the Gmail API instead of IMAP: it maps Gmail
+**labels to tags**, downloads full message bodies for offline use, and syncs
+incrementally via the history API. It needs the Gmail API enabled once in your
+Google Cloud project — see [OAuth setup](../../auth/oauth/). `durian validate`
+rejects: a value outside the four above; `graph` without a Microsoft OAuth
+account; `gmail` without a Google OAuth account; and `legacy`/`engine` on a
+Microsoft account (Microsoft must use Graph). Changing `sync_engine` triggers a
+fresh full resync (the per-backend cursors are incompatible) but is safe — the
+store upserts by Message-ID.
 
 ### Provider presets
 

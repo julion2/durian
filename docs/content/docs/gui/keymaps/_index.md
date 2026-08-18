@@ -1,14 +1,12 @@
 ---
 title: Keymaps
 weight: 5
-sidebar:
-  open: true
 ---
 
 Durian uses vim-style key bindings throughout the GUI. The key sequence
 engine supports **chord sequences** (e.g. `gi`, `gs`, `ga`), **counts**
 (`3j`, `5n`), and **modal contexts** — bindings can be scoped to "list",
-"thread", "search", "tag picker", or "compose normal", and the same key
+"thread", "search", "tag picker", "calendar", or "compose normal", and the same key
 can do different things in each.
 
 Customize via `~/.config/durian/keymaps.pkl`. Run `durian validate keymaps`
@@ -121,6 +119,31 @@ See [Vim compose](vim-compose/) for the full reference. One handy default:
 |---|---|
 | `jk` (in insert mode) | Exit to normal mode |
 
+## Calendar
+
+Active in the calendar (enter it with `gc` from the list, or `Cmd+Opt+C`).
+`j` / `k` move the event cursor; the rest mirror the mail-list verbs where it
+makes sense (`i` edit, `dd` delete, `n` new).
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Next / previous event (`3j` for ↓3) |
+| `gg` / `G` | First / last event |
+| `]` / `l` | Next period (week, month, or year — by the active view) |
+| `[` / `h` | Previous period |
+| `t` | Jump to today |
+| `n` / `o` / `O` | New event |
+| `i` | Edit the selected event |
+| `dd` | Delete the selected event |
+| `s` | Toggle the calendar sidebar |
+| `D` | Toggle hide-declined |
+| `q` / `Esc` | Back to mail |
+
+Switching views (Agenda / Week / Month / Year) and stepping periods also live in
+the **Calendar** menu: `Cmd+Opt+C` show/hide, `Cmd+Opt+S` sidebar, `Cmd+Opt+[`
+and `Cmd+Opt+]` previous / next period. Editing in the Week grid (drag to move or
+resize) is documented in [Calendar](../calendar/#editing-in-the-week-grid).
+
 ## Custom keymaps
 
 Override any binding in `~/.config/durian/keymaps.pkl`. The same `key` +
@@ -177,6 +200,11 @@ The actions available in `keymaps.pkl` (full list also in
 | `select_next` / `select_prev` | Within popups (search, tag picker) |
 | `exit_insert` | Compose insert → normal mode |
 | `reload_inbox` | Trigger a sync + reload |
+| `go_calendar` | Enter the calendar (bound to `gc` in the list) |
+| `calendar_prev_period` / `calendar_next_period` | Step the calendar window |
+| `calendar_today` | Jump to today |
+| `calendar_new` / `calendar_edit` / `calendar_delete` | Event create / edit / delete |
+| `calendar_toggle_sidebar` / `calendar_toggle_declined` | Calendar view toggles |
 
 All actions accept `supports_count = true` if they're motion-style and
 benefit from a numeric prefix (e.g. `5j`, `3n`).

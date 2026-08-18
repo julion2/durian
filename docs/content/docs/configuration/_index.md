@@ -1,8 +1,6 @@
 ---
 title: Configuration
 weight: 4
-sidebar:
-  open: true
 ---
 
 Durian is configured entirely through [Apple Pkl](https://pkl-lang.org) files in `~/.config/durian/` (or `$XDG_CONFIG_HOME/durian/`). Pkl is typed and validated — schema errors fail fast with a line number.

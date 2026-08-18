@@ -1,8 +1,6 @@
 ---
 title: CLI
 weight: 2
-sidebar:
-  open: true
 ---
 
 The terminal client and engine. `durian` handles IMAP sync, SMTP send, the
@@ -15,6 +13,8 @@ subcommand has `--help`, ships a man page, and supports tab completion.
 
 {{< cards >}}
   {{< card link="reference" title="Reference" subtitle="Every subcommand with practical examples." >}}
+  {{< card link="calendar" title="Calendar" subtitle="Read and edit Outlook/Google calendars offline in a local vdir." >}}
+  {{< card link="calendar-sync" title="Calendar Sync" subtitle="Two-way sync with a notification preview before anything emails." >}}
   {{< card link="completion" title="Shell Completion" subtitle="Tab-complete account names in zsh, bash, fish, carapace." >}}
 {{< /cards >}}
 
