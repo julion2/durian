@@ -104,7 +104,15 @@ func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
 		"description": ev.Description,
 		"start":       start,
 		"end":         end,
-		"recurrence":  recurrenceToGoogle(ev.Recurrence, ev.ID),
+	}
+	// An opaque recurrence is one durian read but could not express. Sending
+	// the key at all would clear it — an empty list REPLACES the rule — so the
+	// field is omitted and Google keeps the series it already has.
+	if ev.OpaqueRecurrence {
+		slog.Warn("Omitting recurrence from upload: remote rule is not representable",
+			"module", "GOOGLECAL", "id", ev.ID, "uid", ev.ICalUID)
+	} else {
+		body["recurrence"] = recurrenceToGoogle(ev.Recurrence, ev.ExceptionDates, ev.AllDay, ev.ID)
 	}
 	if includeAttendees {
 		body["attendees"] = attendeesToGoogle(ev.Attendees)
@@ -112,14 +120,21 @@ func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
 	return body
 }
 
-// recurrenceToGoogle renders the neutral Recurrence as the Calendar API
+// recurrenceToGoogle renders the neutral series definition as the Calendar API
 // recurrence line list: a single RRULE line built via the shared rrule-go
 // bridge (RRULE only — Google forbids a DTSTART line, the event start carries
-// it). A nil recurrence yields an empty list, which clears the series on
-// PATCH; a recurrence outside the supported mapping is dropped the same way,
-// with a warning (mirroring the read path, which would have parsed it to nil
-// too).
-func recurrenceToGoogle(rec *calendar.Recurrence, id string) []string {
+// it), followed by one EXDATE line per cancelled occurrence.
+//
+// The exception dates are written as UTC instants, matching how durian stores
+// every timestamp; Google accepts a bare UTC EXDATE against a series whose
+// RRULE it resolved in another zone.
+//
+// A nil recurrence yields an empty list, which clears the series on PATCH; a
+// recurrence outside the supported mapping is dropped the same way, with a
+// warning (mirroring the read path, which would have parsed it to nil too).
+// Callers must not reach here for an event whose remote rule durian failed to
+// parse — see eventToGoogleBody, which omits the field entirely in that case.
+func recurrenceToGoogle(rec *calendar.Recurrence, exDates []time.Time, allDay bool, id string) []string {
 	if rec == nil {
 		return []string{}
 	}
@@ -129,7 +144,19 @@ func recurrenceToGoogle(rec *calendar.Recurrence, id string) []string {
 			"id", id, "pattern", rec.Pattern.Type, "err", err)
 		return []string{}
 	}
-	return []string{"RRULE:" + opt.RRuleString()}
+
+	lines := []string{"RRULE:" + opt.RRuleString()}
+	for _, d := range exDates {
+		// An all-day series takes date-valued EXDATEs; a UTC DATE-TIME EXDATE
+		// would not line up with the series' midnight-local occurrences and
+		// Google would keep the "cancelled" instance.
+		if allDay {
+			lines = append(lines, "EXDATE;VALUE=DATE:"+d.UTC().Format("20060102"))
+		} else {
+			lines = append(lines, "EXDATE:"+d.UTC().Format("20060102T150405Z"))
+		}
+	}
+	return lines
 }
 
 // attendeesToGoogle renders the attendee list as Calendar API attendee

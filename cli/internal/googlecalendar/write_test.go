@@ -609,24 +609,30 @@ func TestRecurrenceRoundTrip(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			lines := recurrenceToGoogle(&tc.rec, "evt-rt")
+			lines := recurrenceToGoogle(&tc.rec, nil, false, "evt-rt")
 			if len(lines) != 1 || lines[0] != tc.wantLine {
 				t.Fatalf("recurrenceToGoogle = %v, want [%s]", lines, tc.wantLine)
 			}
-			back := recurrenceFromGoogle(lines, start, "evt-rt")
+			back, exDates, opaque := recurrenceFromGoogle(lines, start, "evt-rt")
 			if !reflect.DeepEqual(back, &tc.rec) {
 				t.Errorf("round trip = %+v, want %+v", back, &tc.rec)
+			}
+			if len(exDates) != 0 {
+				t.Errorf("round trip produced exception dates %v, want none", exDates)
+			}
+			if opaque {
+				t.Error("round trip marked a mappable rule opaque")
 			}
 		})
 	}
 
 	// nil and unmappable recurrences serialize to the empty list (clears the
 	// series on PATCH).
-	if got := recurrenceToGoogle(nil, "evt-rt"); !reflect.DeepEqual(got, []string{}) {
+	if got := recurrenceToGoogle(nil, nil, false, "evt-rt"); !reflect.DeepEqual(got, []string{}) {
 		t.Errorf("recurrenceToGoogle(nil) = %v, want []", got)
 	}
 	bad := &calendar.Recurrence{Pattern: calendar.RecurrencePattern{Type: "lunar"}}
-	if got := recurrenceToGoogle(bad, "evt-rt"); !reflect.DeepEqual(got, []string{}) {
+	if got := recurrenceToGoogle(bad, nil, false, "evt-rt"); !reflect.DeepEqual(got, []string{}) {
 		t.Errorf("recurrenceToGoogle(unmappable) = %v, want []", got)
 	}
 }

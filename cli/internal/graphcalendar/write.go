@@ -101,9 +101,17 @@ func EventToGraphBody(e calendar.Event, includeAttendees bool) map[string]any {
 		"isAllDay": e.AllDay,
 		"location": map[string]string{"displayName": e.Location},
 	}
-	if e.Recurrence != nil {
+	switch {
+	case e.OpaqueRecurrence:
+		// The remote series has a rule durian could not read back. Sending
+		// recurrence: null would DELETE that rule and collapse the series into
+		// a single appointment — with a matching changeKey, so no precondition
+		// rail would catch it. Omitting the key leaves the rule alone.
+		slog.Warn("Omitting recurrence from upload: remote rule is not representable",
+			"module", "GRAPHCAL", "id", e.ID, "uid", e.ICalUID)
+	case e.Recurrence != nil:
 		body["recurrence"] = e.Recurrence
-	} else {
+	default:
 		body["recurrence"] = nil
 	}
 	if includeAttendees {

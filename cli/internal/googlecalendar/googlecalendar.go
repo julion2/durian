@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -432,10 +433,16 @@ type googleEvent struct {
 	Updated     string         `json:"updated"`
 	// Recurrence holds the raw RRULE/EXDATE/RDATE lines of a series master.
 	Recurrence []string `json:"recurrence"`
-	// RecurringEventID marks expanded or detached instances of a series.
-	RecurringEventID string           `json:"recurringEventId"`
-	Attendees        []googleAttendee `json:"attendees"`
-	Organizer        *googlePerson    `json:"organizer"`
+	// RecurringEventID marks expanded or detached instances of a series: the
+	// id of the series master they belong to.
+	RecurringEventID string `json:"recurringEventId"`
+	// OriginalStartTime is the start the instance was SCHEDULED for by the
+	// rule, which stays its identity within the series even after it was
+	// moved — the RECURRENCE-ID equivalent. Only set on instances. Cancelled
+	// instances carry it while carrying no start/end at all.
+	OriginalStartTime googleDateTime   `json:"originalStartTime"`
+	Attendees         []googleAttendee `json:"attendees"`
+	Organizer         *googlePerson    `json:"organizer"`
 	// HangoutLink is the legacy join-link field, used as fallback when
 	// conferenceData carries no video entry point.
 	HangoutLink    string `json:"hangoutLink"`
@@ -512,19 +519,23 @@ func (c *Client) eventFromGoogle(g googleEvent) (calendar.Event, bool) {
 		eventType = "occurrence"
 	}
 
+	recurrence, exDates, opaqueRecurrence := recurrenceFromGoogle(g.Recurrence, start, g.ID)
+
 	return calendar.Event{
-		ID:           g.ID,
-		ICalUID:      g.ICalUID,
-		Subject:      g.Summary,
-		Location:     g.Location,
-		Description:  g.Description,
-		Start:        start,
-		End:          end,
-		AllDay:       allDay,
-		LastModified: parseGoogleTimestamp(g.Updated),
-		ETag:         g.ETag,
-		Type:         eventType,
-		Recurrence:   recurrenceFromGoogle(g.Recurrence, start, g.ID),
+		ID:               g.ID,
+		ICalUID:          g.ICalUID,
+		Subject:          g.Summary,
+		Location:         g.Location,
+		Description:      g.Description,
+		Start:            start,
+		End:              end,
+		AllDay:           allDay,
+		LastModified:     parseGoogleTimestamp(g.Updated),
+		ETag:             g.ETag,
+		Type:             eventType,
+		Recurrence:       recurrence,
+		ExceptionDates:   exDates,
+		OpaqueRecurrence: opaqueRecurrence,
 
 		Attendees:        attendees,
 		Organizer:        organizer,
@@ -573,41 +584,105 @@ func parseGoogleTimestamp(s string) time.Time {
 }
 
 // recurrenceFromGoogle bridges the raw recurrence lines of a series master
-// into the neutral Recurrence: the RRULE line is parsed via rrule-go and
-// mapped through calendar.ROptionToRecurrence (start provides the range start
-// date). EXDATE/RDATE exception lines and RRULEs outside the supported
-// mapping are logged and dropped — the series then syncs without them.
-func recurrenceFromGoogle(lines []string, start time.Time, id string) *calendar.Recurrence {
+// into the neutral model: the RRULE line is parsed via rrule-go and mapped
+// through calendar.ROptionToRecurrence (start provides the range start date),
+// and every EXDATE line contributes the cancelled occurrences.
+//
+// EXDATE is part of the series definition, not a detail of it: dropping those
+// lines leaves a rule that still produces occurrences the calendar no longer
+// has, and the local expansion renders meetings that were cancelled months
+// ago. RDATE (extra dates outside the rule) has no place in the neutral
+// Recurrence yet and is still logged and dropped; unlike EXDATE it fails
+// safe — a missing RDATE hides an event rather than inventing one.
+func recurrenceFromGoogle(lines []string, start time.Time, id string) (rec *calendar.Recurrence, exDates []time.Time, opaque bool) {
 	var rruleLine string
 	for _, line := range lines {
-		if strings.HasPrefix(line, "RRULE") {
+		switch {
+		case strings.HasPrefix(line, "RRULE"):
 			if rruleLine != "" {
-				slog.Warn("Ignoring additional RRULE line", "module", "GOOGLECAL", "id", id)
+				// A second RRULE is a rule component durian cannot express, like
+				// the EXDATE/default branches below: keep the series opaque so the
+				// write path leaves the multi-rule recurrence alone instead of
+				// PATCHing it down to the first rule only.
+				slog.Warn("Keeping series with multiple RRULE lines opaque", "module", "GOOGLECAL", "id", id)
+				opaque = true
 				continue
 			}
 			rruleLine = line
-			continue
+		case strings.HasPrefix(line, "EXDATE"):
+			dates, err := calendar.ParseExDateLine(line)
+			if err != nil {
+				// The cancellations on this line are now unknown. Uploading a
+				// recurrence rebuilt without them would revive the cancelled
+				// occurrences on the server — and for a meeting they would
+				// reappear in every attendee's calendar.
+				slog.Warn("Keeping series with an unreadable EXDATE line opaque", "module", "GOOGLECAL",
+					"id", id, "line", line, "err", err)
+				opaque = true
+				continue
+			}
+			exDates = append(exDates, dates...)
+		default:
+			// RDATE, EXRULE and anything else the neutral model cannot hold.
+			// Unlike a missing RRULE this is not "no recurrence": the rule
+			// exists and durian just cannot express all of it, so the upload
+			// must not rewrite the recurrence from the part it understood.
+			slog.Warn("Keeping series with an unsupported recurrence line opaque", "module", "GOOGLECAL",
+				"id", id, "line", line)
+			opaque = true
 		}
-		// EXDATE/RDATE exception dates are out of scope for now.
-		slog.Warn("Ignoring unsupported recurrence line", "module", "GOOGLECAL",
-			"id", id, "line", line)
+	}
+	// Sort + dedup at the source so every read path (attachInstances, the
+	// iCalendar writer, exceptionsDigest) sees the ExceptionDates contract —
+	// ascending, no duplicates — regardless of the order the API returned the
+	// EXDATE lines or whether the master later received a cancelled instance.
+	exDates = sortedUniqueTimes(exDates)
+	if opaque {
+		// A rule component was lost. Report whatever was parsed for display,
+		// but never let the write paths reconstruct the recurrence from it.
+		return nil, exDates, true
 	}
 	if rruleLine == "" {
-		return nil
+		// Genuinely no rule: not opaque, just not a series.
+		return nil, exDates, false
 	}
+
+	// From here on a rule EXISTS. Every failure below means durian cannot
+	// express it, not that the event is non-recurring — so the event is marked
+	// opaque and the write paths leave its recurrence alone.
 
 	// StrToROption strips the "RRULE:" prefix itself and parses UNTIL in UTC.
 	opt, err := rrule.StrToROption(rruleLine)
 	if err != nil {
-		slog.Warn("Ignoring unparseable RRULE", "module", "GOOGLECAL", "id", id, "err", err)
-		return nil
+		slog.Warn("Keeping unparseable RRULE opaque", "module", "GOOGLECAL", "id", id, "err", err)
+		return nil, exDates, true
 	}
-	rec, err := calendar.ROptionToRecurrence(opt, start)
+	rec, err = calendar.ROptionToRecurrence(opt, start)
 	if err != nil {
-		slog.Warn("Ignoring unmappable RRULE", "module", "GOOGLECAL", "id", id, "err", err)
-		return nil
+		slog.Warn("Keeping unmappable RRULE opaque", "module", "GOOGLECAL", "id", id, "err", err)
+		return nil, exDates, true
 	}
-	return rec
+	return rec, exDates, false
+}
+
+// sortedUniqueTimes returns ts sorted ascending with duplicate instants removed.
+// ExceptionDates must satisfy that contract on every read path so the .ics bytes
+// (and the LocalHash / exceptionsDigest the sync engine diffs on) do not depend
+// on API line order, and a date present both as an EXDATE line and as a
+// cancelled instance yields a single EXDATE.
+func sortedUniqueTimes(ts []time.Time) []time.Time {
+	if len(ts) < 2 {
+		return ts
+	}
+	out := append([]time.Time(nil), ts...)
+	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
+	uniq := out[:1]
+	for _, t := range out[1:] {
+		if !t.Equal(uniq[len(uniq)-1]) {
+			uniq = append(uniq, t)
+		}
+	}
+	return uniq
 }
 
 // attendeeTypeFromGoogle maps the optional/resource flags onto the neutral
@@ -648,29 +723,52 @@ type eventsPage struct {
 }
 
 // FetchMasterEvents returns all master events of the calendar (single events
-// and series masters carrying their recurrence definition) via the events
-// list with singleEvents=false. Cancelled tombstones and detached instances
-// (items with recurringEventId) are skipped — the two-way sync engine works
-// on series definitions, not instances.
+// and series masters carrying their recurrence definition) via the events list
+// with singleEvents=false, each series master carrying its exceptions.
+//
+// An instance — an item with a recurringEventId — is not a separate item to
+// the sync engine but a deviation of the series it points at, so instances are
+// folded into their master: a cancelled one becomes an ExceptionDate, a
+// modified one an Override. They are collected across ALL pages before being
+// attached, because the API gives no ordering guarantee that a master precedes
+// its own instances.
+//
+// showDeleted=true is requested explicitly rather than relying on the default:
+// with singleEvents=false the API returns cancelled instances either way, but
+// the parameter set of this query is the one an incremental syncToken will be
+// bound to, so it has to state everything it wants up front. A cancelled
+// MASTER stays skipped — the engine detects that deletion by the master's
+// absence from the returned set.
 func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]calendar.Event, error) {
 	base := c.baseURL + "/calendars/" + url.PathEscape(calendarID) + "/events"
 	q := url.Values{}
 	q.Set("maxResults", strconv.Itoa(pageSize))
 	q.Set("singleEvents", "false")
+	q.Set("showDeleted", "true")
 
 	var events []calendar.Event
+	// byID indexes into events by the Google master id the instances point at.
+	// It stores positions, not pointers, so appending to events cannot leave a
+	// stale reference behind.
+	byID := make(map[string]int)
+	var instances []googleEvent
+
 	for {
 		var page eventsPage
 		if err := c.doJSON(ctx, base+"?"+q.Encode(), nil, &page); err != nil {
 			return nil, fmt.Errorf("failed to fetch master events for %s: %w", calendarID, err)
 		}
 		for _, g := range page.Items {
-			if g.Status == "cancelled" || g.RecurringEventID != "" {
-				slog.Debug("Skipping non-master event", "module", "GOOGLECAL",
-					"id", g.ID, "status", g.Status)
+			if g.RecurringEventID != "" {
+				instances = append(instances, g)
+				continue
+			}
+			if g.Status == "cancelled" {
+				slog.Debug("Skipping cancelled master", "module", "GOOGLECAL", "id", g.ID)
 				continue
 			}
 			if ev, ok := c.eventFromGoogle(g); ok {
+				byID[g.ID] = len(events)
 				events = append(events, ev)
 			}
 		}
@@ -680,9 +778,67 @@ func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]ca
 		q.Set("pageToken", page.NextPageToken)
 	}
 
+	c.attachInstances(events, byID, instances)
+
 	slog.Debug("Fetched master events", "module", "GOOGLECAL",
-		"calendar", calendarID, "events", len(events))
+		"calendar", calendarID, "events", len(events), "instances", len(instances))
 	return events, nil
+}
+
+// attachInstances folds the collected series instances into their masters:
+// cancelled ones extend ExceptionDates, modified ones become Overrides keyed
+// by their originalStartTime. Both lists end up sorted so the .ics bytes — and
+// with them the local file hash the sync engine diffs on — do not depend on
+// the order the API happened to page the instances in.
+//
+// An instance whose master is not in the set is dropped with a warning: that
+// happens when the master lies in a calendar the include filter excluded, or
+// when it was deleted while this fetch was paging. Either way there is nothing
+// to attach it to, and inventing a master from an instance would upload a
+// series that shrinks to that single occurrence.
+func (c *Client) attachInstances(events []calendar.Event, byID map[string]int, instances []googleEvent) {
+	touched := make(map[int]bool)
+	for _, g := range instances {
+		idx, ok := byID[g.RecurringEventID]
+		if !ok {
+			slog.Warn("Dropping series instance without a master", "module", "GOOGLECAL",
+				"id", g.ID, "master", g.RecurringEventID)
+			continue
+		}
+		original, _, err := parseGoogleTime(g.OriginalStartTime)
+		if err != nil {
+			slog.Warn("Dropping series instance without a usable original start",
+				"module", "GOOGLECAL", "id", g.ID, "err", err)
+			continue
+		}
+		master := &events[idx]
+		touched[idx] = true
+
+		if g.Status == "cancelled" {
+			master.ExceptionDates = append(master.ExceptionDates, original)
+			continue
+		}
+		ev, ok := c.eventFromGoogle(g)
+		if !ok {
+			continue
+		}
+		ev.RecurrenceID = original
+		// An override is a deviation, never a series of its own.
+		ev.Recurrence = nil
+		ev.ExceptionDates = nil
+		master.Overrides = append(master.Overrides, ev)
+	}
+
+	for idx := range touched {
+		master := &events[idx]
+		// Re-sort + dedup: cancelled instances just appended to ExceptionDates
+		// (which recurrenceFromGoogle already sorted from the EXDATE lines) may
+		// duplicate a date that was both an EXDATE line and a cancelled instance.
+		master.ExceptionDates = sortedUniqueTimes(master.ExceptionDates)
+		sort.Slice(master.Overrides, func(i, j int) bool {
+			return master.Overrides[i].RecurrenceID.Before(master.Overrides[j].RecurrenceID)
+		})
+	}
 }
 
 // FetchInstances returns the concrete event instances within [from, to) via

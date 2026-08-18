@@ -47,6 +47,12 @@ const propTeamsMeetingURL = "X-MICROSOFT-SKYPETEAMSMEETINGURL"
 // drops it and the next sync is a no-op.
 const propCreateTeamsMeeting = "X-DURIAN-CREATE-TEAMS-MEETING"
 
+// propOpaqueRecurrence marks an event whose remote recurrence rule durian
+// could not map (see Event.OpaqueRecurrence). It has to survive the .ics
+// round-trip: the upload path reads it back off the local file, and without it
+// a user editing that file would silently clear the series remotely.
+const propOpaqueRecurrence = "X-DURIAN-OPAQUE-RECURRENCE"
+
 // GraphDateFormat is the "YYYY-MM-DD" layout of Graph recurrenceRange dates.
 const GraphDateFormat = "2006-01-02"
 
@@ -73,6 +79,96 @@ func EventToICal(e Event) ([]byte, error) {
 	if uid == "" {
 		uid = e.ID
 	}
+
+	master, err := eventComponent(e, uid)
+	if err != nil {
+		return nil, err
+	}
+	// A cancelled occurrence is a date the RRULE still produces but the series
+	// no longer has. One EXDATE line per instant (rather than one comma-joined
+	// line) keeps the output stable under reordering and is what go-ical's own
+	// rule-set reader expects.
+	for _, d := range sortedTimes(e.ExceptionDates) {
+		exdate := ical.NewProp(ical.PropExceptionDates)
+		if e.AllDay {
+			exdate.SetValueType(ical.ValueDate)
+			exdate.Value = d.UTC().Format("20060102")
+		} else {
+			exdate.SetValueType(ical.ValueDateTime)
+			exdate.Value = d.UTC().Format("20060102T150405Z")
+		}
+		master.Props.Add(exdate)
+	}
+
+	cal := ical.NewCalendar()
+	cal.Props.SetText(ical.PropProductID, icalProdID)
+	cal.Props.SetText(ical.PropVersion, "2.0")
+	cal.Children = append(cal.Children, master.Component)
+
+	// Modified occurrences follow the master as sibling VEVENTs sharing its
+	// UID, each pinned to the occurrence it replaces by RECURRENCE-ID. Order
+	// is by RecurrenceID so the file bytes — and therefore the LocalHash the
+	// sync engine diffs on — do not depend on provider ordering.
+	for _, o := range sortedOverrides(e.Overrides) {
+		if o.RecurrenceID.IsZero() {
+			// Log only the uid, never the user-controlled subject: it is enough
+			// to identify the dropped override and keeps untrusted text out of
+			// the log (CodeQL go/log-injection).
+			slog.Warn("Dropping series override without recurrence id", "module", "CALENDAR",
+				"uid", uid)
+			continue
+		}
+		comp, err := eventComponent(o, uid)
+		if err != nil {
+			return nil, err
+		}
+		// The value type follows the MASTER's DTSTART, not the override's:
+		// RECURRENCE-ID names a date the master's rule produced, so it has to
+		// be expressed the way that rule expresses its dates (RFC 5545
+		// 3.8.4.4). Taking it from the override would truncate the time of a
+		// timed occurrence that was turned into an all-day one — the key would
+		// come back as midnight, match no occurrence, and leave the series
+		// rendering both the original and the override.
+		recID := ical.NewProp(ical.PropRecurrenceID)
+		if e.AllDay {
+			recID.SetValueType(ical.ValueDate)
+			recID.Value = o.RecurrenceID.UTC().Format("20060102")
+		} else {
+			recID.SetValueType(ical.ValueDateTime)
+			recID.Value = o.RecurrenceID.UTC().Format("20060102T150405Z")
+		}
+		comp.Props.Set(recID)
+		cal.Children = append(cal.Children, comp.Component)
+	}
+
+	var buf bytes.Buffer
+	if err := ical.NewEncoder(&buf).Encode(cal); err != nil {
+		return nil, fmt.Errorf("failed to encode event %s as iCal: %w", e.ID, err)
+	}
+	return buf.Bytes(), nil
+}
+
+// sortedTimes returns a copy of ts sorted ascending.
+func sortedTimes(ts []time.Time) []time.Time {
+	out := make([]time.Time, len(ts))
+	copy(out, ts)
+	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
+	return out
+}
+
+// sortedOverrides returns a copy of overrides sorted by RecurrenceID.
+func sortedOverrides(overrides []Event) []Event {
+	out := make([]Event, len(overrides))
+	copy(out, overrides)
+	sort.Slice(out, func(i, j int) bool { return out[i].RecurrenceID.Before(out[j].RecurrenceID) })
+	return out
+}
+
+// eventComponent renders one Event as a VEVENT under the given UID — the body
+// shared by the series master and each of its overrides. It writes everything
+// except the series-level EXDATE lines and the override-level RECURRENCE-ID,
+// which EventToICal adds around it.
+func eventComponent(e Event, uid string) (*ical.Event, error) {
 	stamp := e.LastModified
 	if stamp.IsZero() {
 		stamp = time.Now()
@@ -100,11 +196,18 @@ func EventToICal(e Event) ([]byte, error) {
 		ev.Props.SetDateTime(ical.PropDateTimeStart, e.Start.UTC())
 		ev.Props.SetDateTime(ical.PropDateTimeEnd, e.End.UTC())
 	}
+	// A recurrence that cannot be rendered as an RRULE leaves the file without
+	// one, and a file without an RRULE parses back as "not a series" — which
+	// on the next upload would clear the series remotely. Carry the marker so
+	// the write paths know the difference between "no rule" and "a rule this
+	// document could not hold".
+	opaque := e.OpaqueRecurrence
 	if e.Recurrence != nil {
 		opt, err := RecurrenceToROption(*e.Recurrence)
 		if err != nil {
-			slog.Warn("Dropping unmappable recurrence from ICS", "module", "GRAPHCAL",
-				"id", e.ID, "pattern", e.Recurrence.Pattern.Type, "err", err)
+			slog.Warn("Recurrence not representable as RRULE, marking event opaque",
+				"module", "CALENDAR", "id", e.ID, "pattern", e.Recurrence.Pattern.Type, "err", err)
+			opaque = true
 		} else {
 			ev.Props.SetRecurrenceRule(opt)
 		}
@@ -142,20 +245,16 @@ func EventToICal(e Event) ([]byte, error) {
 		marker.Value = "TRUE"
 		ev.Props.Set(marker)
 	}
+	if opaque {
+		marker := ical.NewProp(propOpaqueRecurrence)
+		marker.Value = "TRUE"
+		ev.Props.Set(marker)
+	}
 	if e.IsCancelled {
 		ev.Props.SetText(ical.PropStatus, string(ical.EventCancelled))
 	}
 
-	cal := ical.NewCalendar()
-	cal.Props.SetText(ical.PropProductID, icalProdID)
-	cal.Props.SetText(ical.PropVersion, "2.0")
-	cal.Children = append(cal.Children, ev.Component)
-
-	var buf bytes.Buffer
-	if err := ical.NewEncoder(&buf).Encode(cal); err != nil {
-		return nil, fmt.Errorf("failed to encode event %s as iCal: %w", e.ID, err)
-	}
-	return buf.Bytes(), nil
+	return ev, nil
 }
 
 // NormalizeText collapses CR/CRLF to LF; go-ical escapes LF itself but would
@@ -222,12 +321,20 @@ func AttendeePartStat(response string) string {
 
 // MARK: - Parse
 
-// ICalToEvent parses a VCALENDAR containing a single VEVENT (the inverse of
-// EventToICal) into an Event. A VALUE=DATE DTSTART marks the event all-day;
-// all times are interpreted in UTC. An RRULE is mapped back into a Graph
-// Recurrence; an RRULE outside the supported mapping leaves Recurrence nil
-// with a warning. ID/ETag/Type are not part of the iCal representation
-// and stay empty.
+// ICalToEvent parses a VCALENDAR (the inverse of EventToICal) into an Event. A
+// VALUE=DATE DTSTART marks the event all-day; all times are interpreted in
+// UTC. An RRULE is mapped back into a Graph Recurrence; an RRULE outside the
+// supported mapping leaves Recurrence nil with a warning. ID/ETag/Type are not
+// part of the iCal representation and stay empty.
+//
+// A recurring series is one document with several VEVENTs sharing the UID: the
+// master (no RECURRENCE-ID) plus one per modified occurrence. The master's
+// EXDATE lines become ExceptionDates, the RECURRENCE-ID siblings become
+// Overrides — so the whole series stays a single Event, a single .ics file and
+// a single ItemStatus. A document with only overrides and no master is
+// rejected: without the master there is no series definition to hang them on,
+// and treating the first override as the master would silently rewrite the
+// series to that one occurrence on the next upload.
 //
 // Meeting metadata is parsed back: every ATTENDEE line becomes an Attendee
 // (name from CN, type from ROLE, response from PARTSTAT — lossy where Graph
@@ -249,11 +356,196 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 	if len(events) == 0 {
 		return Event{}, fmt.Errorf("failed to parse iCal: no VEVENT found")
 	}
-	if len(events) > 1 {
-		return Event{}, fmt.Errorf("failed to parse iCal: expected one VEVENT, got %d", len(events))
-	}
-	ev := events[0]
 
+	var master *ical.Event
+	var overrideComps []*ical.Event
+	for i := range events {
+		if events[i].Props.Get(ical.PropRecurrenceID) != nil {
+			overrideComps = append(overrideComps, &events[i])
+			continue
+		}
+		if master != nil {
+			return Event{}, fmt.Errorf("failed to parse iCal: expected one VEVENT without RECURRENCE-ID, got several")
+		}
+		master = &events[i]
+	}
+	if master == nil {
+		return Event{}, fmt.Errorf("failed to parse iCal: %d VEVENT(s), all with RECURRENCE-ID, no series master", len(events))
+	}
+
+	event, err := eventFromComponent(master, accountEmail)
+	if err != nil {
+		return Event{}, err
+	}
+	for _, prop := range master.Props.Values(ical.PropExceptionDates) {
+		loc := propLocation(&prop, event.ICalUID)
+		for _, instant := range strings.Split(prop.Value, ",") {
+			t, err := parseICalInstantIn(strings.TrimSpace(instant), loc)
+			if err != nil {
+				slog.Warn("Ignoring unparseable EXDATE", "module", "CALENDAR",
+					"uid", event.ICalUID, "value", instant, "err", err)
+				continue
+			}
+			event.ExceptionDates = append(event.ExceptionDates, t)
+		}
+	}
+	for _, comp := range overrideComps {
+		override, err := eventFromComponent(comp, accountEmail)
+		if err != nil {
+			return Event{}, err
+		}
+		prop := comp.Props.Get(ical.PropRecurrenceID)
+		recID, err := parseICalInstantIn(strings.TrimSpace(prop.Value), propLocation(prop, event.ICalUID))
+		if err != nil {
+			slog.Warn("Ignoring override with unparseable RECURRENCE-ID", "module", "CALENDAR",
+				"uid", event.ICalUID, "value", prop.Value, "err", err)
+			continue
+		}
+		override.RecurrenceID = recID
+		event.Overrides = append(event.Overrides, override)
+	}
+	event.ExceptionDates = sortedTimes(event.ExceptionDates)
+	event.Overrides = sortedOverrides(event.Overrides)
+	return event, nil
+}
+
+// propLocation resolves the TZID parameter of an EXDATE/RECURRENCE-ID property
+// to a location, falling back to UTC when the property names no zone or names
+// one this system does not know.
+//
+// durian writes these properties in UTC, but the vdir is a shared surface: a
+// file written by khal or another CalDAV client states the zone the series
+// lives in and a floating local time next to it. Reading "20260817T090000"
+// as UTC then places the exception a whole offset away from the occurrence it
+// cancels — the cancellation silently misses, and on the next upload the
+// wrong date is cancelled on the server instead.
+func propLocation(prop *ical.Prop, uid string) *time.Location {
+	tzid := prop.Params.Get(ical.ParamTimezoneID)
+	if tzid == "" {
+		return time.UTC
+	}
+	loc, err := time.LoadLocation(tzid)
+	if err != nil {
+		slog.Warn("Unknown TZID, reading the value as UTC", "module", "CALENDAR",
+			"uid", uid, "tzid", tzid, "err", err)
+		return time.UTC
+	}
+	return loc
+}
+
+// parseICalInstant parses an EXDATE/RECURRENCE-ID value in either the DATE
+// ("20260817") or the UTC DATE-TIME ("20260817T090000Z") form. A local
+// DATE-TIME without the trailing Z is read as UTC, matching how every other
+// timestamp in this package is interpreted.
+func parseICalInstant(s string) (time.Time, error) {
+	return parseICalInstantIn(s, time.UTC)
+}
+
+// parseICalInstantIn is parseICalInstant with an explicit location for the
+// floating (no trailing Z) DATE-TIME form, so a TZID-qualified value can be
+// resolved in the zone its property named.
+//
+// The DATE form is deliberately NOT resolved in loc. RFC 5545 3.2.19 forbids
+// TZID on a DATE value, and honoring it anyway would shift an all-day
+// exception onto the previous day for every zone east of UTC — the key would
+// then match no occurrence at all.
+func parseICalInstantIn(s string, loc *time.Location) (time.Time, error) {
+	if t, err := time.ParseInLocation("20060102T150405Z", s, time.UTC); err == nil {
+		return t.UTC(), nil
+	}
+	if t, err := time.ParseInLocation("20060102T150405", s, loc); err == nil {
+		return t.UTC(), nil
+	}
+	if t, err := time.ParseInLocation("20060102", s, time.UTC); err == nil {
+		return t.UTC(), nil
+	}
+	return time.Time{}, fmt.Errorf("unrecognized iCalendar instant %q", s)
+}
+
+// ParseExDateLine parses a raw EXDATE content line as the Google Calendar API
+// hands it out in an event's recurrence array — "EXDATE;TZID=Europe/Zurich:
+// 20260817T090000", "EXDATE;VALUE=DATE:20260817" or a comma-separated list of
+// either — into the UTC instants it names.
+//
+// The TZID parameter is honored because Google emits the exception dates in
+// the series' own zone while the rest of durian's model is UTC: reading
+// "20260817T090000" as UTC would place the exception an offset away from the
+// occurrence it is meant to cancel, and the cancellation would silently miss.
+// An unknown zone falls back to UTC with a warning rather than dropping the
+// line — a mistimed exception is recoverable, a lost one is not.
+func ParseExDateLine(line string) ([]time.Time, error) {
+	_, params, value, ok := splitContentLine(line)
+	if !ok {
+		return nil, fmt.Errorf("malformed EXDATE line %q", line)
+	}
+
+	loc := time.UTC
+	if tzid := params["TZID"]; tzid != "" {
+		if l, err := time.LoadLocation(tzid); err == nil {
+			loc = l
+		} else {
+			slog.Warn("Unknown EXDATE TZID, reading the value as UTC", "module", "CALENDAR",
+				"tzid", tzid, "err", err)
+		}
+	}
+
+	var out []time.Time
+	for _, raw := range strings.Split(value, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		t, err := parseICalInstantIn(raw, loc)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("EXDATE line %q names no date", line)
+	}
+	return out, nil
+}
+
+// splitContentLine splits an iCalendar content line into its property name,
+// its parameters (upper-cased keys, unquoted values) and its value. It cuts at
+// the FIRST colon that is not inside a quoted parameter value, since a quoted
+// parameter may legally contain one.
+func splitContentLine(line string) (name string, params map[string]string, value string, ok bool) {
+	inQuotes := false
+	colon := -1
+	for i, r := range line {
+		switch {
+		case r == '"':
+			inQuotes = !inQuotes
+		case r == ':' && !inQuotes:
+			colon = i
+		}
+		if colon >= 0 {
+			break
+		}
+	}
+	if colon < 0 {
+		return "", nil, "", false
+	}
+
+	head, value := line[:colon], line[colon+1:]
+	parts := strings.Split(head, ";")
+	params = make(map[string]string, len(parts)-1)
+	for _, p := range parts[1:] {
+		key, val, found := strings.Cut(p, "=")
+		if !found {
+			continue
+		}
+		params[strings.ToUpper(strings.TrimSpace(key))] = strings.Trim(strings.TrimSpace(val), `"`)
+	}
+	return strings.ToUpper(strings.TrimSpace(parts[0])), params, value, true
+}
+
+// eventFromComponent parses one VEVENT into an Event — the body shared by the
+// series master and each override. Series-level EXDATE and the override-level
+// RECURRENCE-ID are handled by ICalToEvent around it.
+func eventFromComponent(ev *ical.Event, accountEmail string) (Event, error) {
 	uid, err := ev.Props.Text(ical.PropUID)
 	if err != nil {
 		return Event{}, fmt.Errorf("failed to parse iCal UID: %w", err)
@@ -336,6 +628,11 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 		strings.EqualFold(strings.TrimSpace(prop.Value), "TRUE") {
 		requestOnlineMeeting = true
 	}
+	opaqueRecurrence := false
+	if prop := ev.Props.Get(propOpaqueRecurrence); prop != nil &&
+		strings.EqualFold(strings.TrimSpace(prop.Value), "TRUE") {
+		opaqueRecurrence = true
+	}
 
 	// Online-meeting join link, DISPLAY-ONLY: recovered from URL (falling back
 	// to the Teams X-prop) purely so list/show can surface it. It never affects
@@ -377,6 +674,7 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 		LastModified: lastModified.UTC(),
 		Recurrence:   recurrence,
 
+		OpaqueRecurrence:     opaqueRecurrence,
 		Attendees:            attendees,
 		Organizer:            organizer,
 		OwnerResponse:        ownerResponse,
