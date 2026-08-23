@@ -11,6 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+          cache: true
+          cache-dependency-path: cli/go.sum
+
       - name: Install pkl
         run: |
           curl -sL https://github.com/apple/pkl/releases/download/0.31.1/pkl-linux-amd64 -o /usr/local/bin/pkl

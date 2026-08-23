@@ -112,6 +112,89 @@ func TestEventEndAllDaySnap(t *testing.T) {
 	}
 }
 
+func TestApplyCalendarModifyPatchesOnlyExplicitFields(t *testing.T) {
+	start := time.Date(2026, 8, 24, 9, 0, 0, 0, time.UTC)
+	recurrence := &calendar.Recurrence{Pattern: calendar.RecurrencePattern{Type: "weekly", Interval: 1}}
+	event := calendar.Event{
+		ICalUID: "uid-1", Subject: "Standup", Location: "Room 1", Description: "Keep me",
+		Start: start, End: start.Add(45 * time.Minute), Recurrence: recurrence,
+		Attendees: []calendar.Attendee{{Email: "a@example.com", Type: "required"}},
+	}
+
+	got, err := applyCalendarModify(event, calendarModifyOptions{
+		start: "2026-08-25 14:00", startSet: true,
+	}, start)
+	if err != nil {
+		t.Fatalf("applyCalendarModify: %v", err)
+	}
+	if got.Subject != event.Subject || got.Location != event.Location || got.Description != event.Description {
+		t.Errorf("omitted text fields changed: %+v", got)
+	}
+	if got.End.Sub(got.Start) != 45*time.Minute {
+		t.Errorf("duration = %v, want 45m", got.End.Sub(got.Start))
+	}
+	if got.Recurrence != recurrence || len(got.Attendees) != 1 {
+		t.Error("recurrence or attendees were not preserved")
+	}
+}
+
+func TestApplyCalendarModifySupportsDurationAndClearingText(t *testing.T) {
+	start := time.Date(2026, 8, 24, 9, 0, 0, 0, time.UTC)
+	event := calendar.Event{Subject: "Standup", Location: "Room 1", Description: "Notes",
+		Start: start, End: start.Add(time.Hour)}
+	got, err := applyCalendarModify(event, calendarModifyOptions{
+		duration: "30m", durationSet: true, locationSet: true, descriptionSet: true,
+	}, start)
+	if err != nil {
+		t.Fatalf("applyCalendarModify: %v", err)
+	}
+	if got.End.Sub(got.Start) != 30*time.Minute || got.Location != "" || got.Description != "" {
+		t.Errorf("modified event = %+v", got)
+	}
+}
+
+func TestApplyCalendarModifyPreservesAllDaySpan(t *testing.T) {
+	start := time.Date(2026, 8, 24, 0, 0, 0, 0, time.UTC)
+	event := calendar.Event{Start: start, End: start.AddDate(0, 0, 3), AllDay: true}
+	got, err := applyCalendarModify(event, calendarModifyOptions{
+		start: "2026-09-01", startSet: true,
+	}, start)
+	if err != nil {
+		t.Fatalf("applyCalendarModify: %v", err)
+	}
+	if want := got.Start.AddDate(0, 0, 3); !got.End.Equal(want) {
+		t.Errorf("end = %v, want %v (three-day span)", got.End, want)
+	}
+}
+
+func TestApplyCalendarModifyValidatesPatch(t *testing.T) {
+	start := time.Date(2026, 8, 24, 0, 0, 0, 0, time.UTC)
+	event := calendar.Event{Start: start, End: start.AddDate(0, 0, 1), AllDay: true}
+	if _, err := applyCalendarModify(event, calendarModifyOptions{}, start); err == nil {
+		t.Error("empty patch: want error")
+	}
+	if _, err := applyCalendarModify(event, calendarModifyOptions{
+		allDaySet: true, allDay: false,
+	}, start); err == nil {
+		t.Error("all-day conversion without explicit times: want error")
+	}
+	if _, err := applyCalendarModify(event, calendarModifyOptions{
+		endSet: true, end: "2026-08-25", durationSet: true, duration: "1h",
+	}, start); err == nil {
+		t.Error("end plus duration: want error")
+	}
+	if _, err := applyCalendarModify(event, calendarModifyOptions{
+		startSet: true, start: "invalid",
+	}, start); err == nil || !strings.Contains(err.Error(), "parse --start") {
+		t.Errorf("invalid start error = %v, want --start context", err)
+	}
+	if _, err := applyCalendarModify(event, calendarModifyOptions{
+		endSet: true, end: "invalid",
+	}, start); err == nil || !strings.Contains(err.Error(), "parse --end") {
+		t.Errorf("invalid end error = %v, want --end context", err)
+	}
+}
+
 func TestRecurrenceSummary(t *testing.T) {
 	e := calendar.Event{Recurrence: &calendar.Recurrence{
 		Pattern: calendar.RecurrencePattern{Type: "weekly", Interval: 2, DaysOfWeek: []string{"monday", "wednesday"}},

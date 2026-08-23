@@ -13,7 +13,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Local-first calendar write commands (new / rsvp / delete). None of them talk
+// Local-first calendar write commands (new / modify / rsvp / delete). None of them talk
 // to Graph: they create, edit or remove a local .ics file in the vdir. The
 // change reaches Outlook only on the next `durian calendar sync`, which shows
 // its notification preview and confirmation gate first — so no write command
@@ -32,6 +32,22 @@ Microsoft account, Google Meet for a Google account).`,
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: completeAccounts,
 	RunE:              runCalendarNew,
+}
+
+var calendarModifyCmd = &cobra.Command{
+	Use:     "modify <account> <event>",
+	Aliases: []string{"edit"},
+	Short:   "Modify a calendar event locally (pushed on next sync)",
+	Long: `Patch an existing local event. Only flags you provide are changed; every
+other field, including attendees and recurrence, is preserved. Nothing is sent
+now — the update is uploaded on the next 'durian calendar sync', behind its
+notification preview when the event has attendees.`,
+	Example: `  durian calendar modify work standup --start "2026-08-25 09:00" --duration 30m
+  durian calendar modify work 1A2B3C --subject "Planning" --location "Room 2"
+  durian calendar modify work 1A2B3C --description ""`,
+	Args:              cobra.ExactArgs(2),
+	ValidArgsFunction: completeAccounts,
+	RunE:              runCalendarModify,
 }
 
 var calendarRsvpCmd = &cobra.Command{
@@ -73,13 +89,22 @@ var (
 	calNewAttendees   []string
 	calNewTeams       bool
 
+	calModifyCalendar    string
+	calModifySubject     string
+	calModifyStart       string
+	calModifyEnd         string
+	calModifyDuration    string
+	calModifyAllDay      bool
+	calModifyLocation    string
+	calModifyDescription string
+
 	calRsvpCalendar   string
 	calDeleteCalendar string
 	calDeleteYes      bool
 )
 
 func init() {
-	calendarCmd.AddCommand(calendarNewCmd, calendarRsvpCmd, calendarDeleteCmd)
+	calendarCmd.AddCommand(calendarNewCmd, calendarModifyCmd, calendarRsvpCmd, calendarDeleteCmd)
 
 	calendarNewCmd.Flags().StringVar(&calNewCalendar, "calendar", "", "Target calendar (by display name; required)")
 	calendarNewCmd.Flags().StringVarP(&calNewSubject, "subject", "s", "", "Event subject (required)")
@@ -95,6 +120,15 @@ func init() {
 	// Provider-neutral rename; keep the old Microsoft-flavored flag working.
 	calendarNewCmd.Flags().BoolVar(&calNewTeams, "teams", false, "")
 	_ = calendarNewCmd.Flags().MarkDeprecated("teams", "use --online-meeting")
+
+	calendarModifyCmd.Flags().StringVar(&calModifyCalendar, "calendar", "", "Only this calendar (by display name)")
+	calendarModifyCmd.Flags().StringVarP(&calModifySubject, "subject", "s", "", "Replace the event subject")
+	calendarModifyCmd.Flags().StringVar(&calModifyStart, "start", "", "Replace start (same formats as calendar new)")
+	calendarModifyCmd.Flags().StringVar(&calModifyEnd, "end", "", "Replace end (same formats as calendar new)")
+	calendarModifyCmd.Flags().StringVar(&calModifyDuration, "duration", "", "Replace duration instead of --end (e.g. 30m, 1h30m)")
+	calendarModifyCmd.Flags().BoolVar(&calModifyAllDay, "all-day", false, "Set all-day state (use --all-day=false to clear)")
+	calendarModifyCmd.Flags().StringVar(&calModifyLocation, "location", "", "Replace location (empty clears it)")
+	calendarModifyCmd.Flags().StringVar(&calModifyDescription, "description", "", "Replace description (empty clears it)")
 
 	calendarRsvpCmd.Flags().StringVar(&calRsvpCalendar, "calendar", "", "Only this calendar (by display name)")
 	calendarDeleteCmd.Flags().StringVar(&calDeleteCalendar, "calendar", "", "Only this calendar (by display name)")
@@ -162,6 +196,135 @@ func runCalendarNew(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "  %s\n", styDim(path))
 	printSyncReminder(label, len(attendees) > 0 || calNewTeams)
 	return nil
+}
+
+type calendarModifyOptions struct {
+	subject, start, end, duration, location, description string
+	allDay                                               bool
+	subjectSet, startSet, endSet, durationSet            bool
+	allDaySet, locationSet, descriptionSet               bool
+}
+
+func runCalendarModify(cmd *cobra.Command, args []string) error {
+	cols, err := resolveVdirCollections(args[0])
+	if err != nil {
+		return fmt.Errorf("resolve calendar collections: %w", err)
+	}
+	path, event, calName, err := calendar.ResolveEventIn(cols, args[1], calModifyCalendar)
+	if err != nil {
+		return fmt.Errorf("resolve event: %w", err)
+	}
+	for _, col := range cols {
+		if col.ReadOnly && strings.EqualFold(calendar.CollectionName(col), calName) {
+			return fmt.Errorf("calendar %q is read-only: %w", calName, calendar.ErrReadOnly)
+		}
+	}
+
+	opts := calendarModifyOptions{
+		subject: calModifySubject, start: calModifyStart, end: calModifyEnd,
+		duration: calModifyDuration, allDay: calModifyAllDay,
+		location: calModifyLocation, description: calModifyDescription,
+		subjectSet: cmd.Flags().Changed("subject"), startSet: cmd.Flags().Changed("start"),
+		endSet: cmd.Flags().Changed("end"), durationSet: cmd.Flags().Changed("duration"),
+		allDaySet: cmd.Flags().Changed("all-day"), locationSet: cmd.Flags().Changed("location"),
+		descriptionSet: cmd.Flags().Changed("description"),
+	}
+	updated, err := applyCalendarModify(event, opts, time.Now())
+	if err != nil {
+		return fmt.Errorf("modify event: %w", err)
+	}
+	data, err := calendar.EventToICal(updated)
+	if err != nil {
+		return fmt.Errorf("failed to serialize event: %w", err)
+	}
+	if err := calendar.WriteFileAtomic(path, data, 0o600); err != nil {
+		return fmt.Errorf("failed to write %s: %w", path, err)
+	}
+
+	fmt.Println(okLine("Modified %q in %q locally", orDash(updated.Subject), calName))
+	owner := calendar.CollectionOwner(cols, calName)
+	printSyncReminder(args[0], len(updated.Attendees) > 0 && isOwnerOrganizer(updated, owner))
+	return nil
+}
+
+// applyCalendarModify is the pure patch operation behind the CLI command.
+// Keeping it independent of Cobra and the filesystem pins the important rule:
+// omitted flags preserve the complete parsed Event, including recurrence and
+// meeting metadata.
+func applyCalendarModify(event calendar.Event, opts calendarModifyOptions,
+	now time.Time) (calendar.Event, error) {
+	if !opts.subjectSet && !opts.startSet && !opts.endSet && !opts.durationSet &&
+		!opts.allDaySet && !opts.locationSet && !opts.descriptionSet {
+		return event, fmt.Errorf("provide at least one field to modify")
+	}
+	if opts.endSet && opts.durationSet {
+		return event, fmt.Errorf("use either --end or --duration, not both")
+	}
+
+	originalStart, originalEnd, originalAllDay := event.Start, event.End, event.AllDay
+	if opts.subjectSet {
+		event.Subject = opts.subject
+	}
+	if opts.locationSet {
+		event.Location = opts.location
+	}
+	if opts.descriptionSet {
+		event.Description = opts.description
+	}
+	if opts.startSet {
+		start, _, err := calendar.ParseWhen(opts.start, now)
+		if err != nil {
+			return event, fmt.Errorf("parse --start: %w", err)
+		}
+		event.Start = start
+	}
+	if opts.allDaySet {
+		event.AllDay = opts.allDay
+	}
+	if originalAllDay && !event.AllDay && (!opts.startSet || (!opts.endSet && !opts.durationSet)) {
+		return event, fmt.Errorf("clearing --all-day requires --start and either --end or --duration")
+	}
+
+	switch {
+	case opts.endSet:
+		end, _, err := calendar.ParseWhen(opts.end, now)
+		if err != nil {
+			return event, fmt.Errorf("parse --end: %w", err)
+		}
+		event.End = end
+	case opts.durationSet:
+		duration, err := time.ParseDuration(opts.duration)
+		if err != nil {
+			return event, fmt.Errorf("invalid --duration %q: %w", opts.duration, err)
+		}
+		if duration <= 0 {
+			return event, fmt.Errorf("--duration must be positive")
+		}
+		event.End = event.Start.Add(duration)
+	case event.AllDay && (opts.startSet || opts.allDaySet):
+		days := 1
+		if originalAllDay {
+			startDay := calendar.DateOnly(originalStart)
+			endDay := calendar.DateOnly(originalEnd)
+			days = max(1, int(endDay.Sub(startDay)/(24*time.Hour)))
+		}
+		event.End = event.Start.AddDate(0, 0, days)
+	case opts.startSet:
+		event.End = event.Start.Add(originalEnd.Sub(originalStart))
+	}
+
+	if event.AllDay {
+		event.Start = calendar.DateOnly(event.Start)
+		event.End = calendar.DateOnly(event.End)
+		if !event.End.After(event.Start) {
+			event.End = event.Start.AddDate(0, 0, 1)
+		}
+	}
+	if !event.End.After(event.Start) {
+		return event, fmt.Errorf("end %s is not after start %s",
+			event.End.Format(time.RFC3339), event.Start.Format(time.RFC3339))
+	}
+	return event, nil
 }
 
 // eventEnd computes the end time from --end/--duration, or a default (1h for a
