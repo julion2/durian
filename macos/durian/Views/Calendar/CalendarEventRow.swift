@@ -10,6 +10,18 @@
 
 import SwiftUI
 
+/// Visible bounds for each rendered event. CalendarView resolves the selected
+/// anchor in its own coordinate space so the peek can stay beside its source.
+struct CalendarEventAnchorPreferenceKey: PreferenceKey {
+    static let defaultValue: [EventID: Anchor<CGRect>] = [:]
+
+    static func reduce(value: inout [EventID: Anchor<CGRect>],
+                       nextValue: () -> [EventID: Anchor<CGRect>])
+    {
+        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
+    }
+}
+
 struct CalendarEventRow: View {
     let event: CalendarEvent
     let isSelected: Bool
@@ -17,50 +29,47 @@ struct CalendarEventRow: View {
     @ObservedObject private var manager = CalendarManager.shared
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            calendarDot
-                .frame(width: 9, height: 9)
-                .padding(.top, 4)
+        // Everything inherits the block's ink from the chrome; the secondary
+        // tiers step down by opacity rather than by a second color, so a row
+        // stays legible whatever hue its calendar has.
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(timeText)
+                .font(.system(size: 12, weight: .medium))
+                .monospacedDigit()
+                .opacity(0.65)
+                .frame(width: 52, alignment: .leading)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(event.displaySubject)
-                    .font(.headline)
+                    .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
-                    .strikethrough(isDeclined, color: .secondary)
-                    .foregroundStyle(subjectColor)
-                    .opacity(isTentative ? 0.8 : 1.0)
+                    .strikethrough(isDeclined)
 
                 if hasSubline {
                     HStack(spacing: 6) {
                         if let location = event.location, !location.isEmpty {
                             Text(location)
-                                .font(.caption)
                                 .lineLimit(1)
-                                .foregroundStyle(Color.Detail.textSecondary)
                         }
                         ForEach(markers, id: \.self) { marker in
                             Text(marker)
-                                .font(.caption2)
-                                .foregroundStyle(Color.Detail.textTertiary)
                         }
                     }
+                    .font(.system(size: 11))
+                    .opacity(0.65)
                 }
             }
 
             Spacer(minLength: 8)
-
-            Text(timeText)
-                .font(.caption)
-                .monospacedDigit()
-                .foregroundStyle(Color.Detail.textSecondary)
-                .padding(.top, 3)
         }
-        .padding(.vertical, 6)
+        // A declined event stays readable but clearly settled.
+        .opacity(isDeclined ? 0.5 : (isTentative ? 0.8 : 1.0))
+        .padding(.vertical, 7)
         .padding(.horizontal, 12)
-        .eventPill(calendarColor, variant: .timed, selected: isSelected, cornerRadius: 6)
+        .eventPill(calendarColor, selected: isSelected)
         .padding(.horizontal, 8)
         // The agenda list stacks rows with zero spacing; without this the
-        // tinted pills would touch and read as one slab.
+        // blocks would touch and read as one slab.
         .padding(.vertical, 1.5)
     }
 
@@ -70,28 +79,12 @@ struct CalendarEventRow: View {
         !(event.location ?? "").isEmpty || !markers.isEmpty
     }
 
-    /// A dashed ring for a tentative RSVP, a dimmed dot for a declined one,
-    /// otherwise a filled dot in the calendar's color.
-    @ViewBuilder
-    private var calendarDot: some View {
-        if isTentative {
-            Circle().strokeBorder(calendarColor, style: StrokeStyle(lineWidth: 2, dash: [2, 2]))
-        } else {
-            Circle().fill(isDeclined ? calendarColor.opacity(0.4) : calendarColor)
-        }
-    }
-
-    private var subjectColor: Color {
-        isDeclined ? .secondary : Color.Detail.textPrimary
-    }
-
     private var calendarColor: Color {
-        manager.calendars.first { $0.name == event.calendar }?.color ?? .secondary
+        manager.color(for: event)
     }
 
     private var timeText: String {
-        if event.allDay { return "all-day" }
-        return Self.timeFormatter.string(from: event.start)
+        event.allDay ? "All-day" : CalendarTimeFormat.time(event.start)
     }
 
     private var markers: [String] {
@@ -105,11 +98,50 @@ struct CalendarEventRow: View {
         }
         return out
     }
+}
 
-    private static let timeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.timeStyle = .short
-        f.dateStyle = .none
-        return f
-    }()
+// MARK: - Mouse interaction
+
+/// Shared desktop interaction for every concrete event surface: click selects,
+/// double-click modifies, and the context menu exposes the same non-visible
+/// actions for pointer users. Keeping this in one modifier prevents agenda,
+/// month, timed and all-day events from drifting into different workflows.
+private struct CalendarEventInteractionModifier: ViewModifier {
+    let event: CalendarEvent
+    @ObservedObject private var manager = CalendarManager.shared
+
+    func body(content: Content) -> some View {
+        content
+            .anchorPreference(key: CalendarEventAnchorPreferenceKey.self, value: .bounds) {
+                [event.id: $0]
+            }
+            .onTapGesture { manager.select(event) }
+            .highPriorityGesture(
+                TapGesture(count: 2).onEnded {
+                    manager.select(event)
+                    manager.beginEdit()
+                }
+            )
+            .contextMenu {
+                Button("Modify Event") {
+                    manager.select(event)
+                    manager.beginEdit()
+                }
+                Divider()
+                Button("Delete Event", role: .destructive) {
+                    manager.select(event)
+                    manager.deleteSelected()
+                }
+            }
+            .accessibilityAction(named: "Modify Event") {
+                manager.select(event)
+                manager.beginEdit()
+            }
+    }
+}
+
+extension View {
+    func calendarEventInteractions(_ event: CalendarEvent) -> some View {
+        modifier(CalendarEventInteractionModifier(event: event))
+    }
 }

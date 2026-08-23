@@ -21,11 +21,16 @@ struct CalendarMonthView: View {
             GeometryReader { geo in
                 let rows = weeks
                 let rowHeight = geo.size.height / CGFloat(max(rows.count, 1))
+                // Grouped ONCE per render and passed down: dayCell runs 42
+                // times per body, and rebuilding the grouping dictionary in
+                // each cell made one render cost 42 passes over all events.
+                let byDay = eventsByDay
                 VStack(spacing: 0) {
                     ForEach(rows.indices, id: \.self) { r in
                         HStack(spacing: 0) {
                             ForEach(rows[r], id: \.self) { day in
-                                dayCell(day).frame(height: rowHeight)
+                                dayCell(day, events: byDay[calendar.startOfDay(for: day)] ?? [])
+                                    .frame(height: rowHeight)
                             }
                         }
                     }
@@ -46,15 +51,11 @@ struct CalendarMonthView: View {
         .padding(.vertical, 6)
     }
 
-    private func dayCell(_ day: Date) -> some View {
+    private func dayCell(_ day: Date, events dayEvents: [CalendarEvent]) -> some View {
         let inMonth = calendar.isDate(day, equalTo: manager.anchorDate, toGranularity: .month)
-        let dayEvents = eventsByDay[calendar.startOfDay(for: day)] ?? []
         return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 4) {
                 DayNumberBadge(date: day)
-                if calendar.component(.day, from: day) == 1 {
-                    monthBoundaryLabel(day)
-                }
                 Spacer(minLength: 0)
             }
 
@@ -85,63 +86,48 @@ struct CalendarMonthView: View {
 
     private func monthChip(_ event: CalendarEvent) -> some View {
         let selected = manager.selectedEventID == event.id
-        let variant: EventPillChrome.Variant = event.allDay ? .allDay : .timed
-        // Show the start time right-aligned when the cell is wide enough for
-        // the full title plus the time; otherwise fall back to title only.
+        // Show the start time when the cell is wide enough for it plus the
+        // title; otherwise fall back to title only. An all-day event has no
+        // time to show, which is exactly what distinguishes it here — the
+        // fill no longer does.
         return ViewThatFits(in: .horizontal) {
-            chipLabel(event, variant: variant, withTime: !event.allDay)
-            chipLabel(event, variant: variant, withTime: false)
+            chipLabel(event, withTime: !event.allDay)
+            chipLabel(event, withTime: false)
         }
-        // The timed variant draws a 3pt accent bar on the leading edge; pad
-        // past it so the title doesn't touch the bar.
-        .padding(.leading, variant == .timed ? 7 : 5)
-        .padding(.trailing, 5)
+        .padding(.horizontal, 5)
         .padding(.vertical, 2)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .eventPill(color(for: event), variant: variant, selected: selected, cornerRadius: 4)
+        .eventPill(color(for: event), selected: selected, cornerRadius: 5)
         .contentShape(Rectangle())
-        .onTapGesture { manager.selectedEventID = event.id }
+        .calendarEventInteractions(event)
     }
 
     @ViewBuilder
-    private func chipLabel(_ event: CalendarEvent, variant: EventPillChrome.Variant,
-                           withTime: Bool) -> some View
-    {
+    private func chipLabel(_ event: CalendarEvent, withTime: Bool) -> some View {
         if withTime {
             HStack(spacing: 4) {
-                Text(event.displaySubject)
-                    .font(.system(size: 10, weight: .medium)).lineLimit(1)
+                Text(CalendarTimeFormat.compact(event.start))
+                    .font(.system(size: 10, weight: .medium))
+                    .opacity(0.6)
                     .fixedSize()
-                Spacer(minLength: 4)
-                Text(Self.timeFormatter.string(from: event.start))
-                    .font(.system(size: 9))
-                    .foregroundStyle(Color.Detail.textSecondary)
+                Text(event.displaySubject)
+                    .font(.system(size: 10, weight: .semibold)).lineLimit(1)
                     .fixedSize()
             }
         } else {
             Text(event.displaySubject)
-                .font(.system(size: 10, weight: .medium)).lineLimit(1)
+                .font(.system(size: 10, weight: .semibold)).lineLimit(1)
         }
     }
 
     // MARK: - Styling helpers
-
-    /// A compact inverted pill naming the month, shown on its first day so
-    /// month boundaries stay readable inside the continuous six-week grid.
-    private func monthBoundaryLabel(_ day: Date) -> some View {
-        Text(Self.monthAbbrevFormatter.string(from: day))
-            .font(.system(size: 9, weight: .semibold))
-            .foregroundStyle(Color.Detail.cardBackground)
-            .padding(.horizontal, 6).padding(.vertical, 2)
-            .background(Capsule().fill(Color.Detail.textPrimary))
-    }
 
     private func line(width: CGFloat?, height: CGFloat?) -> some View {
         Rectangle().fill(Color.Detail.border).frame(width: width, height: height)
     }
 
     private func color(for event: CalendarEvent) -> Color {
-        manager.calendars.first { $0.name == event.calendar }?.color ?? .secondary
+        manager.color(for: event)
     }
 
     // MARK: - Grid computation
@@ -170,15 +156,4 @@ struct CalendarMonthView: View {
         return Array(symbols[first...] + symbols[..<first])
     }
 
-    // MARK: - Formatters
-
-    /// Fixed 24h "HH:mm", matching the week grid: a locale AM/PM suffix would
-    /// eat most of a narrow month cell.
-    private static let timeFormatter: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
-    }()
-
-    private static let monthAbbrevFormatter: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = "MMM"; return f
-    }()
 }

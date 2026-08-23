@@ -13,26 +13,31 @@ struct CalendarYearView: View {
     private let calendar = Calendar.current
 
     var body: some View {
-        ScrollView {
+        // Computed ONCE per render and passed down: the year view holds ~370
+        // day cells, and deriving the marker inside each cell re-scanned the
+        // whole event list per cell.
+        let eventDays = daysWithEvents
+        return ScrollView {
             LazyVGrid(
                 columns: [GridItem(.adaptive(minimum: 170, maximum: 260), spacing: 20)],
                 spacing: 20
             ) {
                 ForEach(monthStarts, id: \.self) { monthStart in
-                    miniMonth(monthStart)
+                    miniMonth(monthStart, eventDays: eventDays)
                 }
             }
             .padding()
         }
     }
 
-    private func miniMonth(_ monthStart: Date) -> some View {
+    private func miniMonth(_ monthStart: Date, eventDays: Set<Date>) -> some View {
         let days = gridDays(monthStart)
         let isCurrentMonth = calendar.isDate(monthStart, equalTo: Date(), toGranularity: .month)
         return VStack(spacing: 4) {
             Text(Self.monthFormatter.string(from: monthStart))
                 .font(.caption).fontWeight(.semibold)
-                .foregroundStyle(isCurrentMonth ? Color.accentColor : Color.Detail.textPrimary)
+                .foregroundStyle(isCurrentMonth ? ProfileManager.shared.resolvedAccentColor
+                                                : Color.Detail.textPrimary)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 1), count: 7), spacing: 2) {
@@ -42,13 +47,13 @@ struct CalendarYearView: View {
                         .foregroundStyle(Color.Detail.textTertiary)
                 }
                 ForEach(days, id: \.self) { day in
-                    dayCell(day, monthStart: monthStart)
+                    dayCell(day, monthStart: monthStart, eventDays: eventDays)
                 }
             }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.Detail.cardBackground))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.Detail.border, lineWidth: 0.5))
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.Detail.cardBackground))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.Detail.border, lineWidth: 0.5))
         .contentShape(Rectangle())
         .onTapGesture {
             manager.anchorDate = monthStart
@@ -57,25 +62,13 @@ struct CalendarYearView: View {
     }
 
     @ViewBuilder
-    private func dayCell(_ day: Date, monthStart: Date) -> some View {
+    private func dayCell(_ day: Date, monthStart: Date, eventDays: Set<Date>) -> some View {
         if calendar.isDate(day, equalTo: monthStart, toGranularity: .month) {
-            let isToday = calendar.isDateInToday(day)
-            let hasEvents = !(eventsByDay[calendar.startOfDay(for: day)] ?? []).isEmpty
+            let hasEvents = eventDays.contains(calendar.startOfDay(for: day))
             VStack(spacing: 1) {
-                // A miniature of the shared DayNumberBadge: a filled accent
-                // circle with contrasting text marks today.
-                Text("\(calendar.component(.day, from: day))")
-                    .font(.system(size: 9))
-                    .fontWeight(isToday ? .semibold : .regular)
-                    .foregroundStyle(isToday ? Color.white : Color.Detail.textPrimary)
-                    .frame(width: 14, height: 14)
-                    .background {
-                        if isToday {
-                            Circle().fill(Color.accentColor)
-                        }
-                    }
+                DayNumberBadge(date: day, size: .mini)
                 Circle()
-                    .fill(hasEvents ? Color.accentColor : Color.clear)
+                    .fill(hasEvents ? ProfileManager.shared.resolvedAccentColor : Color.clear)
                     .frame(width: 3, height: 3)
             }
             .frame(height: 20)
@@ -100,8 +93,10 @@ struct CalendarYearView: View {
         return (0 ..< cells).compactMap { calendar.date(byAdding: .day, value: $0, to: gridStart) }
     }
 
-    private var eventsByDay: [Date: [CalendarEvent]] {
-        Dictionary(grouping: manager.events) { calendar.startOfDay(for: $0.start) }
+    /// The year overview only marks days, so a Set of start days is all it
+    /// needs — no per-day event arrays.
+    private var daysWithEvents: Set<Date> {
+        Set(manager.events.map { calendar.startOfDay(for: $0.start) })
     }
 
     private var weekdayInitials: [String] {
