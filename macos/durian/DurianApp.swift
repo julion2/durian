@@ -201,6 +201,15 @@ struct DurianApp: App {
 
                 Divider()
 
+                Button("Modify Event") {
+                    calendarManager.beginEdit()
+                }
+                .keyboardShortcut("e", modifiers: .command)
+                .disabled(appRouter.mode != .calendar || calendarManager.selectedEventID == nil
+                    || calendarManager.editingDraft != nil)
+
+                Divider()
+
                 Button("Today") { calendarManager.goToToday() }
                 Button("Previous Period") { calendarManager.step(-1) }
                     .keyboardShortcut("[", modifiers: [.command, .option])
