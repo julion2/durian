@@ -29,6 +29,13 @@ final class SequenceMatcherTests: XCTestCase {
             // Thread context (to verify context isolation)
             .init(action: "reply", key: "r", modifiers: [],
                   sequence: false, supportsCount: false, context: "thread"),
+            // Named keys and shifted punctuation
+            .init(action: "enter_thread", key: "Enter", modifiers: [],
+                  sequence: false, supportsCount: false, context: "list"),
+            .init(action: "calendar_command", key: ":", modifiers: [],
+                  sequence: false, supportsCount: false, context: "calendar"),
+            .init(action: "close_detail", key: "Escape", modifiers: [],
+                  sequence: false, supportsCount: false, context: "calendar"),
         ]
 
         KeymapsManager.shared.keymaps = KeymapConfig()
@@ -140,6 +147,34 @@ final class SequenceMatcherTests: XCTestCase {
         // "r" is NOT defined in .list context
         let result = SequenceMatcher.shared.match(buffer: "r", context: .list)
         XCTAssertEqual(result, .noMatch)
+    }
+
+    // MARK: - Shifted Punctuation
+
+    func testShiftedPunctuationMatches() {
+        // ":" arrives as the literal glyph regardless of layout
+        let result = SequenceMatcher.shared.match(buffer: ":", context: .calendar)
+        XCTAssertEqual(result, .match(action: .calendarCommand, count: 1))
+    }
+
+    // MARK: - Named Keys
+
+    func testEscapeBindingMatchesInContext() {
+        let result = SequenceMatcher.shared.match(buffer: "Escape", context: .calendar)
+        XCTAssertEqual(result, .match(action: .closeDetail, count: 1))
+    }
+
+    func testEnterBindingMatches() {
+        let result = SequenceMatcher.shared.match(buffer: "Enter", context: .list)
+        XCTAssertEqual(result, .match(action: .enterThread, count: 1))
+    }
+
+    func testNamedKeysDoNotCreatePrefixes() {
+        // "Escape"/"Enter" are single keystrokes — their spellings must not
+        // make plain letters hang as pending sequences
+        XCTAssertEqual(SequenceMatcher.shared.match(buffer: "E", context: .calendar), .noMatch)
+        XCTAssertEqual(SequenceMatcher.shared.match(buffer: "En", context: .list), .noMatch)
+        XCTAssertEqual(SequenceMatcher.shared.match(buffer: "Esc", context: .calendar), .noMatch)
     }
 
     // MARK: - supportsCount API

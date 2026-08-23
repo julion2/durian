@@ -14,6 +14,11 @@ class SequenceMatcher {
 
     static let shared = SequenceMatcher()
 
+    /// Key names that spell a single keystroke with several characters.
+    /// They must not seed prefix matching — otherwise a binding for
+    /// "Escape" would make a plain "E" wait as a partial sequence.
+    private static let namedKeys: Set<String> = ["Escape", "Enter", "Tab", "Down", "Up", "Left", "Right"]
+
     // MARK: - Dynamic Sequence Storage
 
     /// All defined key sequences (loaded from config), grouped by context
@@ -97,7 +102,7 @@ class SequenceMatcher {
 
             // Prefixes
             var prefixes: Set<String> = []
-            for (seq, _) in lookup where seq.count > 1 {
+            for (seq, _) in lookup where seq.count > 1 && !Self.namedKeys.contains(seq) {
                 for i in 1..<seq.count {
                     prefixes.insert(String(seq.prefix(i)))
                 }

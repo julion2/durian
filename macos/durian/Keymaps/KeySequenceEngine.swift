@@ -92,7 +92,7 @@ class KeySequenceEngine: ObservableObject {
     /// - Parameter event: The NSEvent key event
     /// - Returns: true if event was consumed, false to pass through
     func handleKeyEvent(_ event: NSEvent) -> Bool {
-        let key = event.charactersIgnoringModifiers ?? ""
+        var key = event.charactersIgnoringModifiers ?? ""
         let modifiers = getModifiers(from: event)
 
         // Skip if key is empty
@@ -105,6 +105,16 @@ class KeySequenceEngine: ObservableObject {
            event.keyCode == 56 || event.keyCode == 58 || event.keyCode == 59
         {
             return false
+        }
+
+        // Tab and Return reach us as control characters ("\t", "\r") that can
+        // never appear in a binding string; give them the names keymaps.pkl
+        // uses. Unbound named keys fall out of processKey as .noMatch and pass
+        // through, so focus traversal and default Return handling still work.
+        switch event.keyCode {
+        case 48: key = "Tab"
+        case 36, 76: key = "Enter" // Return and keypad Enter
+        default: break
         }
 
         // Escape always clears buffer, exits visual mode, and dispatches handler
@@ -128,8 +138,18 @@ class KeySequenceEngine: ObservableObject {
                 exitVisualMode()
             }
 
-            // Always dispatch exitVisualMode handler so it can close
-            // search popup, tag picker, detail view, etc.
+            // A context can bind Escape itself (close_detail in thread and
+            // calendar). That binding wins over the generic fallback so
+            // Escape follows the context's own close ladder.
+            if case .match(let action, _) = matcher.match(buffer: "Escape", context: activeContext),
+               let handler = actionHandlers[activeContext]?[action]
+            {
+                Task { await handler(1) }
+                return true
+            }
+
+            // Fallback for contexts without an Escape binding: the list exit
+            // handler closes search mode, detail view, etc.
             if let handler = actionHandlers[.list]?[.exitVisualMode] {
                 Task { await handler(1) }
             }

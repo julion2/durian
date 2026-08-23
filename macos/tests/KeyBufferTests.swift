@@ -134,4 +134,41 @@ final class KeyBufferTests: XCTestCase {
         buffer.append(event)
         XCTAssertEqual(buffer.asString, "G")
     }
+
+    // MARK: - KeyEvent Normalization
+
+    func testShiftedLetterNormalizesToUppercase() {
+        XCTAssertEqual(KeyEvent(key: "g", modifiers: [.shift]).normalized, "G")
+    }
+
+    func testShiftedPunctuationKeepsGlyph() {
+        // charactersIgnoringModifiers applies Shift, so the event already
+        // carries the final glyph (":" is Shift+; on US, Shift+. on German).
+        XCTAssertEqual(KeyEvent(key: ":", modifiers: [.shift]).normalized, ":")
+        XCTAssertEqual(KeyEvent(key: "!", modifiers: [.shift]).normalized, "!")
+        XCTAssertEqual(KeyEvent(key: "?", modifiers: [.shift]).normalized, "?")
+    }
+
+    func testPlainKeyNormalizesToLowercase() {
+        XCTAssertEqual(KeyEvent(key: "J", modifiers: []).normalized, "j")
+        XCTAssertEqual(KeyEvent(key: ":", modifiers: []).normalized, ":")
+    }
+
+    func testCmdComboKeepsModifierPrefix() {
+        XCTAssertEqual(KeyEvent(key: "R", modifiers: [.cmd]).normalized, "cmd+r")
+    }
+
+    func testCtrlComboKeepsModifierPrefix() {
+        XCTAssertEqual(KeyEvent(key: "d", modifiers: [.ctrl]).normalized, "ctrl+d")
+    }
+
+    func testMultiModifierComboIsSortedAndPrefixed() {
+        XCTAssertEqual(KeyEvent(key: "x", modifiers: [.shift, .cmd]).normalized, "cmd+shift+x")
+    }
+
+    func testNamedKeyKeepsExactSpelling() {
+        XCTAssertEqual(KeyEvent(key: "Tab", modifiers: []).normalized, "Tab")
+        XCTAssertEqual(KeyEvent(key: "Enter", modifiers: []).normalized, "Enter")
+        XCTAssertEqual(KeyEvent(key: "Escape", modifiers: []).normalized, "Escape")
+    }
 }
