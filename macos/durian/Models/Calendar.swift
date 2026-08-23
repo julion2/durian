@@ -41,6 +41,13 @@ struct CalendarInfo: Identifiable, Hashable {
         colorHex = wire.color
         eventCount = wire.event_count
     }
+
+    init(name: String, colorHex: String? = nil, eventCount: Int = 0, account: String = "") {
+        self.name = name
+        self.colorHex = colorHex
+        self.eventCount = eventCount
+        self.account = account
+    }
 }
 
 // MARK: - People
