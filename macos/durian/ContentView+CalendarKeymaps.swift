@@ -2,11 +2,20 @@
 //  ContentView+CalendarKeymaps.swift
 //  Durian
 //
-//  Vim-style bindings for the calendar. `gc` (from the mail list) opens the
-//  calendar; inside it, j/k move the event cursor, gg/G jump, [ / ] step the
-//  period, t goes to today, s toggles the sidebar, D toggles hiding declined
-//  events, and q/Esc return to mail. Registered once from
-//  ContentView.onAppear alongside registerKeymapHandlers().
+//  Vim-style bindings for the calendar. `gc` (from the mail list) opens it.
+//
+//    j/k    previous / next event        count-aware
+//    gg/G   first / last event
+//    h/l    ± a day                       count-aware
+//    H/L    ± a period (week/month/year), same as [ / ]
+//    t      now
+//    v      full detail        i  edit        n/o/O  new        dd  delete
+//    s      sidebar            D  hide declined                  q  back to mail
+//
+//  There is a time cursor underneath all of this, but it is not driven
+//  directly: j/k put it on the event they land on, h/l walk it a day at a
+//  time. It exists so that "create" has something to aim at — n and `:new`
+//  fill the slot under the cursor instead of an invented default hour.
 //
 
 import SwiftUI
@@ -19,7 +28,8 @@ extension ContentView {
             keymapHandler.engine.setContext(.calendar)
         }
 
-        // Event cursor navigation.
+        // j/k step from event to event; the time cursor follows the landing
+        // event so a create afterwards still lands where you are looking.
         keymapHandler.registerHandler(for: .nextEmail, context: .calendar) { count in
             CalendarManager.shared.moveSelection(by: max(1, count))
         }
@@ -33,6 +43,15 @@ extension ContentView {
             CalendarManager.shared.selectLast()
         }
 
+        // h/l move the cursor a day — the only motion that can land on empty
+        // space, which is what `n` and `:new` need to aim at.
+        keymapHandler.registerHandler(for: .calendarNextDay, context: .calendar) { count in
+            CalendarManager.shared.moveCursor(days: max(1, count))
+        }
+        keymapHandler.registerHandler(for: .calendarPrevDay, context: .calendar) { count in
+            CalendarManager.shared.moveCursor(days: -max(1, count))
+        }
+
         // Period navigation.
         keymapHandler.registerSimpleHandler(for: .calendarPrevPeriod, context: .calendar) {
             CalendarManager.shared.step(-1)
@@ -41,7 +60,7 @@ extension ContentView {
             CalendarManager.shared.step(1)
         }
         keymapHandler.registerSimpleHandler(for: .calendarToday, context: .calendar) {
-            CalendarManager.shared.goToToday()
+            CalendarManager.shared.cursorToNow()
         }
         keymapHandler.registerSimpleHandler(for: .calendarToggleSidebar, context: .calendar) {
             CalendarManager.shared.toggleSidebar()
@@ -61,8 +80,27 @@ extension ContentView {
             CalendarManager.shared.deleteSelected()
         }
 
-        // Leave the calendar.
+        // The command line.
+        keymapHandler.registerSimpleHandler(for: .calendarCommand, context: .calendar) {
+            CalendarManager.shared.openCommandLine()
+        }
+
+        // Full detail on demand.
+        keymapHandler.registerSimpleHandler(for: .calendarDetail, context: .calendar) {
+            guard CalendarManager.shared.selectedEventID != nil else { return }
+            CalendarManager.shared.detailExpanded.toggle()
+        }
+
+        // Leave: cancel edit back to peek, then close peek, then leave calendar.
         keymapHandler.registerSimpleHandler(for: .closeDetail, context: .calendar) { [self] in
+            if CalendarManager.shared.editingDraft != nil {
+                CalendarManager.shared.cancelEdit()
+                return
+            }
+            if CalendarManager.shared.detailExpanded {
+                CalendarManager.shared.detailExpanded = false
+                return
+            }
             appRouter.showMail()
             keymapHandler.engine.setContext(.list)
         }
