@@ -163,6 +163,13 @@ swift_test(
 )
 
 swift_test(
+    name = "calendar_command_test",
+    size = "small",
+    srcs = ["tests/CalendarCommandTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
     name = "calendar_visibility_test",
     size = "small",
     srcs = ["tests/CalendarVisibilityTests.swift"],
@@ -173,6 +180,13 @@ swift_test(
     name = "calendar_range_coverage_test",
     size = "small",
     srcs = ["tests/CalendarRangeCoverageTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
+    name = "calendar_color_index_test",
+    size = "small",
+    srcs = ["tests/CalendarColorIndexTests.swift"],
     deps = [":durian_testlib"],
 )
 

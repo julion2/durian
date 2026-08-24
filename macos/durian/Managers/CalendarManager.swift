@@ -10,6 +10,7 @@
 
 import Combine
 import Foundation
+import SwiftUI
 
 // MARK: - View mode
 
@@ -71,7 +72,45 @@ final class CalendarManager: ObservableObject {
     private var loadedRange: DateInterval?
     private var loadedAccounts: [String] = []
 
-    @Published var calendars: [CalendarInfo] = []
+    @Published var calendars: [CalendarInfo] = [] {
+        didSet {
+            rebuildColorIndex()
+            // The parse depends on the calendar list (`-a` resolution), so a
+            // list that changes mid-typing must re-resolve the preview.
+            if commandLineActive { refreshCommandPreview() }
+        }
+    }
+
+    /// Calendar color by (account, name) key, with a name-only fallback map —
+    /// rebuilt when `calendars` changes so views resolve an event's color with
+    /// a dictionary lookup instead of a linear scan per event per render (the
+    /// week/month grids do that lookup for every block on every render).
+    private var colorByCalendarKey: [String: Color] = [:]
+    private var colorByCalendarName: [String: Color] = [:]
+
+    private func rebuildColorIndex() {
+        colorByCalendarKey = [:]
+        colorByCalendarName = [:]
+        for calendar in calendars {
+            colorByCalendarKey[calendar.visibilityKey] = calendar.color
+            // First one wins on a name collision, matching the old scan's
+            // `first(where:)` behaviour for events that miss the exact key.
+            if colorByCalendarName[calendar.name] == nil {
+                colorByCalendarName[calendar.name] = calendar.color
+            }
+        }
+    }
+
+    /// The event's calendar color. Resolved per (account, name) — two accounts
+    /// commonly both own a calendar called "Calendar", and a name-only match
+    /// colored one account's events with the other's calendar color. The
+    /// name-only fallback only catches events whose account has no exact match
+    /// (e.g. a calendar list still loading).
+    func color(for event: CalendarEvent) -> Color {
+        colorByCalendarKey[CalendarInfo.key(account: event.account, name: event.calendar)]
+            ?? colorByCalendarName[event.calendar]
+            ?? .secondary
+    }
 
     /// Calendar names the user hid via the sidebar toggles. Persisted across
     /// launches; the visible `events` projection excludes their events (the
@@ -115,18 +154,151 @@ final class CalendarManager: ObservableObject {
     @Published private(set) var events: [CalendarEvent] = []
     @Published var selectedEventID: EventID? {
         didSet {
-            if selectedEventID != oldValue { loadDetail() }
+            if selectedEventID != oldValue {
+                loadDetail()
+                if commandLineActive { refreshCommandPreview() }
+            }
         }
     }
 
     /// The selected event with its full detail (attendees, organizer,
     /// description), fetched lazily — the list endpoint only returns summaries.
-    @Published var detailEvent: CalendarEvent?
+    @Published var detailEvent: CalendarEvent? {
+        didSet {
+            if commandLineActive { refreshCommandPreview() }
+        }
+    }
     @Published var isLoading = false
 
     @Published var viewMode: CalendarViewMode = .agenda
     @Published var anchorDate: Date = Date()
     @Published var searchQuery: String = ""
+
+    /// The keyboard's position in the grid — a wall-clock instant snapped to
+    /// the slot grid, distinct from the selected EVENT.
+    ///
+    /// A time grid needs two cursors. With only an event cursor there is no
+    /// way to point at empty space, which is why creating an event had to
+    /// invent a default time instead of using the one you were looking at.
+    /// `:new` and `beginCreate()` both take this as their implicit argument,
+    /// and Tab cycles the events that overlap it.
+    @Published var cursorDate: Date = CalendarManager.snapToSlot(Date()) {
+        didSet {
+            cachedEventsAtCursor = nil
+            // The cursor supplies the parse's implicit day/time, so a preview
+            // shown while the cursor moves must follow it.
+            if commandLineActive { refreshCommandPreview() }
+        }
+    }
+
+    /// Whether the full-detail card is up. Detail is on demand, not always
+    /// on: the echo line carries the headline facts continuously, and this is
+    /// the one keystroke that opens everything else.
+    @Published var detailExpanded = false
+
+    /// The `:` line. Open, it replaces the echo line — the same place vim
+    /// puts both.
+    @Published var commandLineActive = false
+    @Published var commandText = "" {
+        didSet { refreshCommandPreview() }
+    }
+
+    /// What the current command text would do. Parsed ONCE per input change
+    /// (keystroke / cursor move / calendar-list change) rather than on every
+    /// read: the command line AND each of the week grid's seven day columns
+    /// read it per render, and re-parsing per read multiplied the parser by
+    /// the column count. The preview and the commit read the same stored
+    /// parse, so they cannot disagree.
+    @Published private(set) var commandPreview: CalendarCommand = .none
+
+    private func refreshCommandPreview() {
+        commandPreview = commandLineActive
+            ? CalendarCommandParser.parse(commandText, cursor: cursorDate, calendars: calendars,
+                                          selectedEvent: detailEvent ?? selectedEvent)
+            : .none
+    }
+
+    func openCommandLine() {
+        commandLineActive = true
+        // Setting the text (re)parses via its didSet, now that the line is
+        // active — order matters.
+        commandText = ""
+    }
+
+    func closeCommandLine() {
+        commandLineActive = false
+        commandText = ""
+    }
+
+    /// Runs the typed command. An unparseable line stays open with its error
+    /// showing rather than being thrown away — retyping a whole command
+    /// because of one bad token is the thing that makes command lines feel
+    /// hostile.
+    func runCommand() {
+        switch commandPreview {
+        case .none, .invalid:
+            return
+        case .create(let start, let end, let title, let notes, let calendarKey):
+            guard let target = resolveCalendar(calendarKey) else {
+                BannerManager.shared.showWarning(
+                    title: "No calendars available",
+                    message: "Run 'durian calendar sync' first to sync your calendars."
+                )
+                closeCommandLine()
+                return
+            }
+            var draft = CalendarEventDraft(account: target.account, calendar: target.name,
+                                           start: start, end: end)
+            draft.subject = title
+            draft.description = notes ?? ""
+            cursorDate = Self.snapToSlot(start)
+            // `:new tomorrow …` / `:new friday …` can land outside the visible
+            // period — page to it, otherwise the event is created off-screen
+            // and appears to have gone nowhere.
+            pageToCursor()
+            commitDraft(draft)
+        case .modifySelected(let patch):
+            guard let event = detailEvent, event.id == selectedEventID else {
+                BannerManager.shared.showWarning(
+                    title: "Event details still loading",
+                    message: "Try the command again in a moment."
+                )
+                return
+            }
+            if event.recurring && event.seriesStart == nil {
+                BannerManager.shared.showWarning(
+                    title: "Event details still loading",
+                    message: "Try the command again in a moment."
+                )
+                return
+            }
+            var draft = CalendarEventDraft(from: event)
+            draft.start = patch.start
+            draft.end = patch.end
+            if let title = patch.title { draft.subject = title }
+            if let notes = patch.notes { draft.description = notes }
+            let wasPeeking = detailExpanded
+            commitDraft(draft, revealExisting: wasPeeking)
+        case .goToday:
+            cursorToNow()
+        case .setView(let mode):
+            setViewMode(mode)
+        case .editSelected:
+            beginEdit()
+        case .deleteSelected:
+            deleteSelected()
+        }
+        closeCommandLine()
+    }
+
+    /// The named calendar, or the busiest one — usually the primary, where the
+    /// alphabetically-first is usually something like "Birthdays".
+    private func resolveCalendar(_ key: String?) -> CalendarInfo? {
+        if let key, let match = calendars.first(where: { $0.visibilityKey == key }) {
+            return match
+        }
+        return calendars.max { $0.eventCount < $1.eventCount }
+    }
 
     var selectedEvent: CalendarEvent? {
         guard let id = selectedEventID else { return nil }
@@ -257,6 +429,9 @@ final class CalendarManager: ObservableObject {
     private func project(_ all: [CalendarEvent]) {
         events = Self.visibleEvents(all, window: visibleWindow, hidden: hiddenCalendars,
                                     hideDeclined: hideDeclined)
+        // The cursor stack is derived from `events`; every path that changes
+        // the projection comes through here.
+        cachedEventsAtCursor = nil
     }
 
     /// The single visibility filter behind the projection, extracted pure so
@@ -320,9 +495,11 @@ final class CalendarManager: ObservableObject {
 
     // MARK: - Sidebar state persistence
 
-    private static let hiddenCalendarsKey = "durian.calendar.hiddenCalendars"
-    private static let hideDeclinedKey = "durian.calendar.hideDeclined"
-    private static let sidebarVisibleKey = "durian.calendar.sidebarVisible"
+    // nonisolated: constants read by the nonisolated load/save helpers below
+    // (referencing a MainActor-isolated static there is an error in Swift 6).
+    private nonisolated static let hiddenCalendarsKey = "durian.calendar.hiddenCalendars"
+    private nonisolated static let hideDeclinedKey = "durian.calendar.hideDeclined"
+    private nonisolated static let sidebarVisibleKey = "durian.calendar.sidebarVisible"
 
     /// Load/save split out with an injectable UserDefaults so the round-trip
     /// is testable against a scratch suite.
@@ -367,16 +544,126 @@ final class CalendarManager: ObservableObject {
         refresh()
     }
 
-    /// Moves the cursor within the sorted event list (vim j/k).
+    /// j/k: the next/previous event in time order. The time cursor follows the
+    /// landing event, so anything created afterwards still appears where you
+    /// were just looking. Events that overlap sit next to each other in this
+    /// order, so j/k walks a stack without needing a second cursor for it.
     func moveSelection(by delta: Int) {
         guard !events.isEmpty else { return }
-        let current = events.firstIndex { $0.id == selectedEventID } ?? 0
+        guard let current = events.firstIndex(where: { $0.id == selectedEventID }) else {
+            // Nothing selected (e.g. right after a delete): j enters the list
+            // at the top, k at the bottom — treating "no selection" as index 0
+            // made the first j skip the first event.
+            select(delta >= 0 ? events[0] : events[events.count - 1])
+            return
+        }
         let next = min(max(current + delta, 0), events.count - 1)
-        selectedEventID = events[next].id
+        select(events[next])
     }
 
-    func selectFirst() { selectedEventID = events.first?.id }
-    func selectLast() { selectedEventID = events.last?.id }
+    func selectFirst() { if let first = events.first { select(first) } }
+    func selectLast() { if let last = events.last { select(last) } }
+
+    /// Selects an event and keeps the time cursor on the same object. Mouse and
+    /// keyboard selection share this path so the echo line and edit/delete
+    /// actions cannot refer to different events.
+    func select(_ event: CalendarEvent) {
+        selectedEventID = event.id
+        cursorDate = Self.snapToSlot(event.start)
+        pageToCursor()
+    }
+
+    // MARK: - Time cursor
+
+    nonisolated static let slotMinutes = 15
+
+    /// Rounds an instant down onto the slot grid.
+    nonisolated static func snapToSlot(_ date: Date) -> Date {
+        let cal = Calendar.current
+        var comps = cal.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+        comps.minute = ((comps.minute ?? 0) / slotMinutes) * slotMinutes
+        return cal.date(from: comps) ?? date
+    }
+
+    /// h/l: a whole day, keeping the time of day. This is the motion that can
+    /// land on empty space — which is exactly what makes the cursor usable as
+    /// the implicit argument to `:new` and `n`.
+    func moveCursor(days: Int) {
+        cursorDate = Calendar.current.date(byAdding: .day, value: days, to: cursorDate) ?? cursorDate
+        pageToCursor()
+        syncSelectionToCursor()
+    }
+
+    /// Puts the cursor on the current time and brings it into view.
+    func cursorToNow() {
+        cursorDate = Self.snapToSlot(Date())
+        anchorDate = cursorDate
+        refresh()
+        syncSelectionToCursor()
+    }
+
+    /// The period the current view actually shows, anchored on anchorDate.
+    /// This must match what the view renders, NOT the fetch window: paging
+    /// against the wrong period re-anchors (and refreshes) on cursor steps
+    /// that are still on screen. The agenda in particular shows 30 days from
+    /// the anchor day — paging it by the anchor's WEEK re-anchored on every
+    /// single day step past the first week, rebuilding the whole list each
+    /// time.
+    private func visiblePeriod() -> DateInterval? {
+        let cal = Calendar.current
+        switch viewMode {
+        case .agenda:
+            let start = cal.startOfDay(for: anchorDate)
+            guard let end = cal.date(byAdding: .day, value: 30, to: start) else { return nil }
+            return DateInterval(start: start, end: end)
+        case .week:
+            return cal.dateInterval(of: .weekOfYear, for: anchorDate)
+        case .month:
+            return cal.dateInterval(of: .month, for: anchorDate)
+        case .year:
+            return cal.dateInterval(of: .year, for: anchorDate)
+        }
+    }
+
+    /// Pages the visible period when the cursor walks off its edge — the
+    /// cursor leads, the view follows. Half-open containment: an instant
+    /// exactly on the period's end belongs to the NEXT period
+    /// (DateInterval.contains would call it inside).
+    private func pageToCursor() {
+        guard let visible = visiblePeriod(),
+              !(visible.start <= cursorDate && cursorDate < visible.end)
+        else { return }
+        anchorDate = cursorDate
+        refresh()
+    }
+
+    /// Backing cache for `eventsAtCursor`, invalidated on cursor moves and
+    /// projection changes. The echo line reads the stack several times per
+    /// body and the selection sync reads it on every h/l step — filtering and
+    /// sorting the full event list on each read did that work O(reads) times
+    /// per keystroke.
+    private var cachedEventsAtCursor: [CalendarEvent]?
+
+    /// The events the cursor instant falls inside, earliest first. All-day
+    /// events participate too: selecting one places the cursor at its start,
+    /// and the echo line must continue to describe that selection.
+    var eventsAtCursor: [CalendarEvent] {
+        if let cached = cachedEventsAtCursor { return cached }
+        let stack = events
+            .filter { $0.start <= cursorDate && cursorDate < $0.end }
+            .sorted { $0.start < $1.start }
+        cachedEventsAtCursor = stack
+        return stack
+    }
+
+    /// After a cursor-only move (h/l) the selection re-resolves onto whatever
+    /// the cursor now sits on, or onto nothing over free time — so `i`, `dd`
+    /// and `v` always act on the thing being looked at.
+    private func syncSelectionToCursor() {
+        let under = eventsAtCursor
+        if let current = selectedEventID, under.contains(where: { $0.id == current }) { return }
+        selectedEventID = under.first?.id
+    }
 
     /// RSVP to a meeting via the local-first write endpoint (POST
     /// /calendars/rsvp): only the owner's PARTSTAT in the local .ics changes —
@@ -408,7 +695,7 @@ final class CalendarManager: ObservableObject {
                 message: "Run 'durian calendar sync \(syncTarget)' (or wait for the next sync) to notify the organizer."
             )
             // Reconcile the store with the server and refetch the detail so
-            // the pane shows the new response.
+            // the card shows the new response.
             refresh(force: true)
             loadDetail()
         }
@@ -416,11 +703,12 @@ final class CalendarManager: ObservableObject {
 
     // MARK: - Editing (local-first writes)
 
-    /// The draft shown in the create/edit sheet; nil when no sheet is open.
+    /// The draft shown in the floating event card; nil while it is in peek mode
+    /// or closed.
     @Published var editingDraft: CalendarEventDraft?
 
-    /// Opens the edit sheet for the selected event (uses the full detail so the
-    /// description/attendees are available).
+    /// Transforms the floating peek into an editor for the selected event (uses
+    /// the full detail so the description/attendees are available).
     func beginEdit() {
         guard let event = detailEvent ?? selectedEvent else { return }
         if event.recurring && event.seriesStart == nil {
@@ -433,11 +721,12 @@ final class CalendarManager: ObservableObject {
             )
             return
         }
+        detailExpanded = true
         editingDraft = CalendarEventDraft(from: event)
     }
 
-    /// Opens the edit sheet for a new event, defaulting the time to `date` (or
-    /// the next hour on the anchor day) in the first calendar.
+    /// Opens the floating editor for a new event, defaulting to `date` (or the
+    /// time cursor) in the busiest calendar.
     func beginCreate(at date: Date? = nil) {
         // Default to the busiest calendar (usually the primary one) rather than
         // the alphabetically-first (e.g. "Birthdays").
@@ -449,24 +738,37 @@ final class CalendarManager: ObservableObject {
             return
         }
         let cal = Calendar.current
-        let start: Date
-        if let date {
-            start = date
-        } else {
-            let day = cal.dateComponents([.year, .month, .day], from: anchorDate)
-            var comps = cal.dateComponents([.hour], from: Date())
-            comps.year = day.year; comps.month = day.month; comps.day = day.day; comps.minute = 0
-            start = cal.date(from: comps) ?? Date()
-        }
+        // No explicit date means "where I am looking": the time cursor is the
+        // implicit argument, so a new event lands in the slot under it rather
+        // than at an invented default hour.
+        let start = date ?? cursorDate
         let end = cal.date(byAdding: .hour, value: 1, to: start) ?? start
+        detailExpanded = false
         editingDraft = CalendarEventDraft(account: calendar.account, calendar: calendar.name, start: start, end: end)
+    }
+
+    /// Escape/Cancel leaves an existing event in peek mode. Cancelling a new
+    /// event closes the card because there is no event to peek yet.
+    func cancelEdit() {
+        let returnsToPeek = editingDraft?.isNew == false
+        editingDraft = nil
+        detailExpanded = returnsToPeek
     }
 
     /// Persists a draft (create or update) via the local-first write API and
     /// refreshes.
-    func commitDraft(_ draft: CalendarEventDraft) {
+    func commitDraft(_ draft: CalendarEventDraft, revealExisting: Bool = true) {
         editingDraft = nil
+        detailExpanded = !draft.isNew && revealExisting
         applyDraftOptimistically(draft)
+        // The selected summary now carries the optimistic values. Drop any
+        // pre-edit detail so the peek cannot flash stale title/time/location;
+        // refetch the richer fields only AFTER the PUT, otherwise GET can race
+        // the write and restore the old values into the peek.
+        if !draft.isNew {
+            detailTask?.cancel()
+            detailEvent = nil
+        }
         Task { [weak self] in
             guard let self else { return }
             guard await backend.putEvent(draft.toWrite()) != nil else {
@@ -475,6 +777,7 @@ final class CalendarManager: ObservableObject {
                     message: "The write failed — make sure the durian CLI is up to date."
                 )
                 refresh(force: true)
+                if !draft.isNew { loadDetail() }
                 return
             }
             if draft.isNew && (!draft.attendees.isEmpty || draft.requestOnlineMeeting) {
@@ -493,6 +796,7 @@ final class CalendarManager: ObservableObject {
             // A local edit must reconcile against the server even when the
             // window is covered by a previous fetch.
             refresh(force: true)
+            if !draft.isNew { loadDetail() }
         }
     }
 
@@ -557,6 +861,8 @@ final class CalendarManager: ObservableObject {
         let uid = event.uid
         let calendar = event.calendar
         selectedEventID = nil
+        detailExpanded = false
+        editingDraft = nil
         // Optimistic: drop the event (for a series, this occurrence — the
         // refresh clears its siblings) so the UI reacts before the round-trip.
         store.remove(event.id)
