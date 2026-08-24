@@ -64,6 +64,10 @@ enum TokenFieldHelper {
 
         // Now get the current tokens and add the new one
         var currentTokens = (tokenField.objectValue as? [String]) ?? []
+        let email = EmailTokenHelper.cleanEmail(token)
+        guard !currentTokens.contains(where: {
+            EmailTokenHelper.cleanEmail($0).caseInsensitiveCompare(email) == .orderedSame
+        }) else { return }
         currentTokens.append(token)
         tokenField.objectValue = currentTokens as NSArray
 
@@ -81,8 +85,11 @@ enum TokenFieldHelper {
 
 struct TokenField: NSViewRepresentable {
     @Binding var tokens: [String]
-    var focusedField: FocusState<ComposeField?>.Binding
-    let fieldIdentifier: ComposeField
+    var focusedField: FocusState<ComposeField?>.Binding?
+    let fieldIdentifier: ComposeField?
+    var isValidToken: (String) -> Bool = { !$0.isEmpty }
+    var wrapsTokens = false
+    var accessibilityLabel: String? = nil
     var onCommit: (() -> Void)? = nil
 
     // Callbacks for custom autocomplete popup
@@ -103,15 +110,16 @@ struct TokenField: NSViewRepresentable {
         tokenField.drawsBackground = false
         tokenField.focusRingType = .none
         tokenField.font = .systemFont(ofSize: 14)
+        tokenField.setAccessibilityLabel(accessibilityLabel)
 
         // Token behavior
-        tokenField.tokenizingCharacterSet = CharacterSet(charactersIn: ";\n")
+        tokenField.tokenizingCharacterSet = CharacterSet(charactersIn: ",;\n")
         tokenField.tokenStyle = .rounded
 
         // Layout
-        tokenField.lineBreakMode = .byClipping
-        tokenField.cell?.isScrollable = true
-        tokenField.cell?.wraps = false
+        tokenField.lineBreakMode = wrapsTokens ? .byWordWrapping : .byClipping
+        tokenField.cell?.isScrollable = !wrapsTokens
+        tokenField.cell?.wraps = wrapsTokens
 
         // Set initial value
         tokenField.objectValue = tokens as NSArray
@@ -122,6 +130,9 @@ struct TokenField: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSTokenField, context: Context) {
+        context.coordinator.parent = self
+        nsView.setAccessibilityLabel(accessibilityLabel)
+
         // Update tokens if changed from outside
         let currentTokens = (nsView.objectValue as? [String]) ?? []
         if currentTokens != tokens {
@@ -129,6 +140,7 @@ struct TokenField: NSViewRepresentable {
         }
 
         // Handle focus
+        guard let focusedField, let fieldIdentifier else { return }
         let shouldBeFocused = focusedField.wrappedValue == fieldIdentifier
         let isFocused = nsView.window?.firstResponder == nsView.currentEditor()
 
@@ -168,8 +180,10 @@ struct TokenField: NSViewRepresentable {
         }
 
         func controlTextDidBeginEditing(_ notification: Notification) {
+            guard let focusedField = parent.focusedField,
+                  let fieldIdentifier = parent.fieldIdentifier else { return }
             DispatchQueue.main.async {
-                self.parent.focusedField.wrappedValue = self.parent.fieldIdentifier
+                focusedField.wrappedValue = fieldIdentifier
             }
         }
 
@@ -289,7 +303,12 @@ struct TokenField: NSViewRepresentable {
         func tokenField(_ tokenField: NSTokenField, representedObjectForEditing editingString: String) -> Any? {
             // Clean the email when creating a token
             let cleaned = EmailTokenHelper.cleanEmail(editingString)
-            return cleaned.isEmpty ? nil : cleaned
+            guard parent.isValidToken(cleaned) else { return nil }
+
+            let duplicate = ((tokenField.objectValue as? [String]) ?? []).contains {
+                EmailTokenHelper.cleanEmail($0).caseInsensitiveCompare(cleaned) == .orderedSame
+            }
+            return duplicate ? nil : cleaned
         }
 
         func tokenField(_ tokenField: NSTokenField, styleForRepresentedObject representedObject: Any) -> NSTokenField.TokenStyle {
