@@ -18,10 +18,9 @@ import (
 )
 
 // Local-first calendar write endpoints. They only edit the on-disk vdir (create
-// or overwrite a .ics, or remove one) — NOTHING is sent to Outlook here. The
-// change reaches the server on the next `durian calendar sync`, which runs the
-// Stage-2 engine with its notification preview and confirmation. So no API write
-// can email attendees on its own.
+// or overwrite a .ics, or remove one) — no provider call happens here. The GUI
+// follows an explicit user action with the event-scoped sync endpoint; the CLI
+// can still collect pending writes behind its account-wide preview.
 
 // calendarEventWrite is the PUT /calendars/event request body (snake_case).
 // Attendees is a plain email list (new entries become required attendees).
@@ -342,8 +341,8 @@ func (h *Handler) CalendarRsvpHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "event": calendar.ToCalendarEvent(calName, event, true)})
 }
 
-// CalendarDeleteEventHandler removes a local .ics by reference. The deletion is
-// propagated to Outlook on the next sync.
+// CalendarDeleteEventHandler removes a local .ics by reference. A caller may
+// follow it with targeted sync, or leave propagation to the next full sync.
 func (h *Handler) CalendarDeleteEventHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	cols, ok := h.resolveCalendarCollections(w, q.Get("account"))

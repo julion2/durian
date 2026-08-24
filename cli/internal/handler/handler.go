@@ -35,6 +35,7 @@ type Handler struct {
 	groups         map[string]config.GroupEntry // contact groups for query expansion
 	fetcher        AttachmentFetcher            // optional IMAP attachment fetcher
 	syncTrigger    SyncTrigger                  // optional sync trigger for tag changes
+	calendarSyncer CalendarEventSyncer          // optional targeted calendar sync
 	tagSync        *tagsync.Client              // optional remote tag sync client
 	tagSyncEnabled bool                         // true when tag sync is configured (enables journal)
 }
@@ -56,6 +57,11 @@ func (h *Handler) SetFetcher(f AttachmentFetcher) {
 // SetSyncTrigger sets the sync trigger for pushing tag changes to IMAP.
 func (h *Handler) SetSyncTrigger(s SyncTrigger) {
 	h.syncTrigger = s
+}
+
+// SetCalendarEventSyncer enables provider-backed, event-scoped calendar sync.
+func (h *Handler) SetCalendarEventSyncer(s CalendarEventSyncer) {
+	h.calendarSyncer = s
 }
 
 // SetTagSync sets the optional remote tag sync client.

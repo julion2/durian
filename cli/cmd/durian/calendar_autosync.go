@@ -48,11 +48,8 @@ func startCalendarAutosync(ctx context.Context, hub *handler.EventHub, cfg *conf
 		if account.OAuth == nil {
 			continue
 		}
-		// A shared/delegated mailbox authenticates as the token owner, whose
-		// /me calendars are already synced by the owner account — running it
-		// here would just duplicate them into a second directory.
-		if account.IsDelegatedMailbox() {
-			slog.Debug("Calendar autosync skipped for delegated mailbox", "module", "CALSYNC", // encgrep:allow static message text, no content
+		if !account.CalendarEnabled() {
+			slog.Debug("Calendar disabled for account", "module", "CALSYNC", // encgrep:allow static message text, no content
 				"account", account.GetAliasOrName()) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			continue
 		}
@@ -161,6 +158,16 @@ func calendarAutosyncOnce(ctx context.Context, hub *handler.EventHub, account *c
 			"account", account.GetAliasOrName(), "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
 	}
+	state, mailboxBackup, err := calendarsync.BindMailbox(accountDir, state, account.Email, account.IsDelegatedMailbox(), true)
+	if err != nil {
+		slog.Warn("Calendar autosync failed to bind vdir to mailbox", "module", "CALSYNC", // encgrep:allow static message text, no content
+			"account", account.GetAliasOrName(), "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+		return
+	}
+	if mailboxBackup != "" {
+		slog.Warn("Quarantined legacy calendar vdir before syncing delegated mailbox", "module", "CALSYNC", // encgrep:allow static message text, no content
+			"account", account.GetAliasOrName(), "backup", mailboxBackup) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+	}
 
 	// The mirror carries the download cursors, so the background loop reads
 	// only what changed instead of re-reading every calendar every tick. It is
@@ -234,9 +241,9 @@ func calendarAutosyncOnce(ctx context.Context, hub *handler.EventHub, account *c
 	}
 	*authHintLogged = false // a full clean cycle resets the auth-hint damper
 
-	if stats.Downloaded+stats.Pruned+stats.Uploaded > 0 {
+	if stats.Downloaded+stats.Pruned+stats.Archived+stats.Uploaded > 0 {
 		slog.Info("Calendar autosync updated calendars", "module", "CALSYNC",
-			"account", account.GetAliasOrName(), "downloaded", stats.Downloaded, "pruned", stats.Pruned, "uploaded", stats.Uploaded) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+			"account", account.GetAliasOrName(), "downloaded", stats.Downloaded, "pruned", stats.Pruned, "archived", stats.Archived, "uploaded", stats.Uploaded) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		hub.BroadcastCalendar(handler.CalendarUpdatedEvent{
 			Account:    account.GetAliasOrName(),
 			Downloaded: stats.Downloaded,

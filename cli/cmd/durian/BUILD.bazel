@@ -8,6 +8,7 @@ go_library(
         "auth_verify_graph.go",
         "calendar.go",
         "calendar_autosync.go",
+        "calendar_gui_sync.go",
         "calendar_read.go",
         "calendar_write.go",
         "completion.go",

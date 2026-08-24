@@ -21,6 +21,9 @@ import (
 // OAuth provider. Both backends satisfy calendarsync.CalendarProvider, so the
 // commands below are provider-agnostic once constructed.
 func newCalendarProvider(account *config.AccountConfig) (calendarsync.CalendarProvider, error) {
+	if !account.CalendarEnabled() {
+		return nil, fmt.Errorf("calendar is disabled for account %s", account.GetAliasOrName())
+	}
 	if account.OAuth == nil {
 		return nil, errors.New("calendar sync requires an OAuth account")
 	}
@@ -56,12 +59,12 @@ written as expanded occurrences, so no RRULEs appear in the output.`,
 }
 
 var calendarSyncCmd = &cobra.Command{
-	Use:   "sync <account>",
+	Use:   "sync [account]",
 	Short: "Two-way sync your calendars with a local vdir",
-	Long: `Synchronize the calendars of an account (Microsoft Outlook or Google
-Calendar) with a local vdir of .ics files (one directory per calendar, one
-file per master event, named by the event UID; recurring series are stored
-as their master with an RRULE).
+	Long: `Synchronize one account, or every enabled calendar-capable account
+when the account is omitted, with a local vdir of .ics files (one directory per
+calendar, one file per master event, named by the event UID; recurring series
+are stored as their master with an RRULE).
 
 Remote changes are applied locally (download new/updated events, prune events
 deleted remotely), and local changes are pushed to the remote calendar
@@ -80,12 +83,12 @@ response email with --silent-rsvp). An X-DURIAN-CREATE-TEAMS-MEETING:TRUE
 line requests an online meeting (Teams or Google Meet) on create.
 
 The sync first builds a plan and prints it, including a preview of every
-email the plan will cause the provider to send. If the plan contains remote
-changes (uploads, remote deletes, conflicts, RSVPs), it asks for confirmation
-before applying — declining aborts the entire run, local-only actions
-included, so "no" always means no changes anywhere. --yes skips the prompt;
---dry-run stops after printing the plan.`,
-	Args:              cobra.ExactArgs(1),
+email the plan will cause the provider to send. If the plan contains a local
+archive or remote changes (uploads, remote deletes, conflicts, RSVPs), it asks
+for confirmation before applying — declining aborts that account's run,
+local-only actions included, so "no" always means no changes for that account.
+--yes skips every prompt; --dry-run stops after printing each plan.`,
+	Args:              cobra.MaximumNArgs(1),
 	ValidArgsFunction: completeAccounts,
 	RunE:              runCalendarSync,
 }
@@ -187,14 +190,57 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 	if cfg == nil {
 		return errors.New("no configuration loaded")
 	}
-	if err := rejectLocalCalendarAccount(args[0]); err != nil {
+	accounts, err := calendarSyncTargets(cfg, args)
+	if err != nil {
 		return err
 	}
-
-	account, err := cfg.GetAccountByIdentifier(args[0])
-	if err != nil {
-		return fmt.Errorf("account not found: %s\nAvailable accounts: %s", args[0], cfg.ListAccountIdentifiers())
+	reader := bufio.NewReader(os.Stdin)
+	var syncErrs []error
+	for _, account := range accounts {
+		if len(accounts) > 1 {
+			fmt.Fprintf(os.Stderr, "\n== Syncing %s ==\n", account.GetAliasOrName())
+		}
+		if err := runCalendarSyncAccount(cmd, cfg, account, reader); err != nil {
+			syncErrs = append(syncErrs, fmt.Errorf("%s: %w", account.GetAliasOrName(), err))
+		}
 	}
+	return errors.Join(syncErrs...)
+}
+
+// calendarSyncTargets resolves the optional account argument. With no
+// argument, unsupported/password-only accounts are skipped: there is no
+// provider calendar to sync for them, while one such mail account should not
+// prevent all eligible accounts from running.
+func calendarSyncTargets(cfg *config.Config, args []string) ([]*config.AccountConfig, error) {
+	if len(args) == 1 {
+		if err := rejectLocalCalendarAccount(args[0]); err != nil {
+			return nil, err
+		}
+		account, err := cfg.GetAccountByIdentifier(args[0])
+		if err != nil {
+			return nil, fmt.Errorf("account not found: %s\nAvailable accounts: %s", args[0], cfg.ListAccountIdentifiers())
+		}
+		if !account.CalendarEnabled() {
+			return nil, fmt.Errorf("calendar is disabled for account %s", account.GetAliasOrName())
+		}
+		return []*config.AccountConfig{account}, nil
+	}
+
+	accounts := make([]*config.AccountConfig, 0, len(cfg.Accounts))
+	for i := range cfg.Accounts {
+		account := &cfg.Accounts[i]
+		if account.CalendarEnabled() && account.OAuth != nil &&
+			(account.OAuth.Provider == "microsoft" || account.OAuth.Provider == "google") {
+			accounts = append(accounts, account)
+		}
+	}
+	if len(accounts) == 0 {
+		return nil, errors.New("no calendar-capable OAuth accounts configured")
+	}
+	return accounts, nil
+}
+
+func runCalendarSyncAccount(cmd *cobra.Command, cfg *config.Config, account *config.AccountConfig, reader *bufio.Reader) error {
 	client, err := newCalendarProvider(account)
 	if err != nil {
 		return err
@@ -222,6 +268,16 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 	state, err := store.Load()
 	if err != nil {
 		return fmt.Errorf("failed to load calendar sync state: %w", err)
+	}
+	state, mailboxBackup, err := calendarsync.BindMailbox(accountDir, state, account.Email, account.IsDelegatedMailbox(), !calendarSyncDryRun)
+	if err != nil {
+		if errors.Is(err, calendarsync.ErrMailboxRebindNeeded) {
+			return fmt.Errorf("calendar sync must first quarantine the legacy vdir for %s; run once without --dry-run", account.GetAliasOrName())
+		}
+		return fmt.Errorf("failed to bind calendar vdir to mailbox: %w", err)
+	}
+	if mailboxBackup != "" {
+		fmt.Fprintf(os.Stderr, "Existing calendar vdir belonged to the OAuth user's mailbox; moved it to %s before syncing %s.\n", mailboxBackup, account.Email)
 	}
 
 	// The mirror holds the last known remote state and the download cursors.
@@ -274,11 +330,11 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Apply %d gated change(s) for %s (%d local archives, %d uploads, %d remote deletes, %d conflicts, %d RSVPs; %d notification message(s))? [y/N] ",
 			gatedCount, account.GetAliasOrName(), summary.archives, summary.uploadCreates+summary.uploadUpdates, summary.deleteRemotes,
 			summary.conflicts, summary.rsvps, len(notifications))
-		answer, readErr := bufio.NewReader(os.Stdin).ReadString('\n')
+		answer, readErr := reader.ReadString('\n')
 		answer = strings.ToLower(strings.TrimSpace(answer))
 		// A read error (closed/empty stdin, non-tty) counts as "no". Declining
 		// aborts the whole run — local-only downloads/prunes included — so the
-		// answer "no" always means "nothing changed anywhere".
+		// answer "no" always means "nothing changed for this account".
 		if readErr != nil || (answer != "y" && answer != "yes") {
 			fmt.Fprintln(os.Stderr, "aborted, no changes made")
 			return nil
@@ -312,9 +368,9 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("calendar sync failed: %w", applyErr)
 	}
 
-	fmt.Printf("Calendar sync for %s: %d downloaded, %d pruned, %d uploaded, %d deleted remotely, %d RSVP(s) sent, %d conflict(s) resolved (%s wins), %d skipped, %d failed (dir: %s)\n",
+	fmt.Printf("Calendar sync for %s: %d downloaded, %d pruned, %d archived, %d uploaded, %d deleted remotely, %d RSVP(s) sent, %d conflict(s) resolved (%s wins), %d skipped, %d failed (dir: %s)\n", // encgrep:allow user-facing CLI summary contains account alias and local directory, not encrypted content
 		account.GetAliasOrName(), stats.Downloaded, stats.Pruned,
-		stats.Uploaded, stats.DeletedRemote, stats.Rsvps, stats.Conflicts, policy,
+		stats.Archived, stats.Uploaded, stats.DeletedRemote, stats.Rsvps, stats.Conflicts, policy,
 		stats.Skipped, stats.Failed, accountDir)
 	if stats.Failed > 0 {
 		// Per-event failures did not abort the run (the remaining events

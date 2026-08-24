@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -9,13 +10,14 @@ import (
 	"time"
 
 	"github.com/julion2/durian/cli/internal/calendar"
+	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
 )
 
-// Read-only calendar endpoints. They serve the locally synced vdir (populated
-// by `durian calendar sync`) — no Microsoft Graph call, no token — projecting
-// events through the calendar package's snake_case DTOs (see openapi.yaml). Writes are
-// intentionally not exposed: the API can never trigger a sync or send mail.
+// Calendar read endpoints serve the locally synced vdir — no provider call or
+// token — projecting events through the calendar package's snake_case DTOs.
+// Writes remain local-first; calendar_sync.go separately exposes the explicit,
+// event-scoped provider action used by the GUI.
 
 // defaultCalendarWindow is the [today, today+7d) span used by the events
 // endpoint when no from/to is given.
@@ -23,22 +25,44 @@ const defaultCalendarWindow = 7 * 24 * time.Hour
 
 // resolveCalendarAccount maps the ?account= parameter to its local vdir dir and
 // owner email. On any problem it writes the HTTP error and returns ok=false.
-func (h *Handler) resolveCalendarAccount(w http.ResponseWriter, account string) (dir, owner string, ok bool) {
+func (h *Handler) resolveCalendarAccount(w http.ResponseWriter, account string) (dir, owner string, acct *config.AccountConfig, ok bool) {
 	if h.cfg == nil {
 		http.Error(w, "config not loaded", http.StatusServiceUnavailable)
-		return "", "", false
+		return "", "", nil, false
 	}
 	if account == "" {
 		http.Error(w, "missing required 'account' query parameter", http.StatusBadRequest)
-		return "", "", false
+		return "", "", nil, false
 	}
 	acct, err := h.cfg.GetAccountByIdentifier(account)
 	if err != nil {
 		http.Error(w, "account not found", http.StatusNotFound)
-		return "", "", false
+		return "", "", nil, false
+	}
+	if !acct.CalendarEnabled() {
+		http.Error(w, "calendar is disabled for this account", http.StatusConflict)
+		return "", "", nil, false
 	}
 	dir = filepath.Join(config.CalendarBaseDir(h.cfg, ""), acct.CalendarDir())
-	return dir, acct.GetAuthEmail(), true
+	state, err := calendarsync.NewFileStateStore(dir).LoadReadOnly()
+	if err != nil {
+		slog.Error("Failed to load calendar mailbox binding", "module", "API", "err", logSafe(err.Error())) // encgrep:allow error sanitized by logSafe
+		http.Error(w, "failed to read calendar state", http.StatusInternalServerError)
+		return "", "", nil, false
+	}
+	if _, _, err = calendarsync.BindMailbox(dir, state, acct.Email, acct.IsDelegatedMailbox(), false); err != nil {
+		if errors.Is(err, calendarsync.ErrMailboxRebindNeeded) {
+			// Old delegated-account vdirs contain the OAuth owner's /me
+			// calendars. Never expose those stale duplicates while the first
+			// mailbox-aware sync is still quarantining and replacing them.
+			http.Error(w, "calendar mailbox is waiting for its first sync", http.StatusConflict)
+			return "", "", nil, false
+		}
+		slog.Error("Failed to verify calendar mailbox binding", "module", "API", "err", logSafe(err.Error())) // encgrep:allow error sanitized by logSafe
+		http.Error(w, "failed to verify calendar state", http.StatusInternalServerError)
+		return "", "", nil, false
+	}
+	return dir, acct.Email, acct, true
 }
 
 // resolveCalendarCollections maps the ?account= parameter to the calendar
@@ -62,7 +86,7 @@ func (h *Handler) resolveCalendarCollections(w http.ResponseWriter, account stri
 		return localCollections(h.cfg), true
 	}
 
-	dir, owner, ok := h.resolveCalendarAccount(w, account)
+	dir, owner, acct, ok := h.resolveCalendarAccount(w, account)
 	if !ok {
 		return nil, false
 	}
@@ -71,6 +95,16 @@ func (h *Handler) resolveCalendarCollections(w http.ResponseWriter, account stri
 		slog.Error("Failed to enumerate local calendars", "module", "API", "err", logSafe(err.Error()))
 		http.Error(w, "failed to read calendars", http.StatusInternalServerError)
 		return nil, false
+	}
+	include := acct.CalendarInclude()
+	if len(include) > 0 {
+		filtered := cols[:0]
+		for _, col := range cols {
+			if calendar.CalendarIncluded(col.Name, include) {
+				filtered = append(filtered, col)
+			}
+		}
+		cols = filtered
 	}
 	return cols, true
 }

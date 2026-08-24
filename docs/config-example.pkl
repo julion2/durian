@@ -129,8 +129,9 @@ accounts: Listing<C.AccountConfig> = new {
     // OAuth accounts). All keys are optional; the block itself is too —
     // `durian calendar sync <alias>` works without it.
     // calendar {
+    //   enabled = false                // Disable calendar reads and sync for this account (default: true)
     //   dir = "work"                   // Subdir under calendar.vdir_path (default: account alias)
-    //   include { "Calendar"; "Team" } // Calendar display names to sync (default: all)
+    //   include { "Calendar"; "Team" } // Calendar names to export and sync (default: all)
     //   conflict = "remote"            // "remote" (default; local file backed up first), "local", or "newer"
     //   autosync = false               // Override the global calendar.autosync toggle
     //   autosync_upload = "safe"       // Override the global calendar.autosync_upload mode

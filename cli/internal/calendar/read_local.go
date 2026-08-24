@@ -90,6 +90,7 @@ func CollectionsUnderFor(accountDir, account, owner string) ([]Collection, error
 		}
 		cols = append(cols, Collection{
 			Dir:     filepath.Join(accountDir, entry.Name()),
+			Name:    readMetaFile(filepath.Join(accountDir, entry.Name()), "displayname", entry.Name()),
 			Account: account,
 			Owner:   owner,
 		})

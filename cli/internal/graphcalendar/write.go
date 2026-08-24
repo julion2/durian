@@ -150,7 +150,7 @@ func (c *Client) CreateEvent(ctx context.Context, calendarID string, ev calendar
 	if opts.IdempotencyKey != "" {
 		body["transactionId"] = opts.IdempotencyKey
 	}
-	reqURL := fmt.Sprintf("%s/me/calendars/%s/events", c.baseURL, url.PathEscape(calendarID))
+	reqURL := fmt.Sprintf("%s%s/calendars/%s/events", c.baseURL, c.mailboxPath(), url.PathEscape(calendarID))
 
 	var ge graphEvent
 	if err := c.doJSONBody(ctx, http.MethodPost, reqURL, map[string]string{"Prefer": preferMaster}, body, &ge); err != nil {
@@ -181,7 +181,7 @@ func (c *Client) UpdateEvent(ctx context.Context, calendarID, eventID string, sp
 		body = EventToGraphBody(spec.Event, spec.IncludeAttendees)
 	}
 
-	reqURL := c.baseURL + "/me/events/" + url.PathEscape(eventID)
+	reqURL := c.baseURL + c.mailboxPath() + "/events/" + url.PathEscape(eventID)
 	headers := map[string]string{"Prefer": preferMaster}
 	if spec.ETag != "" {
 		headers["If-Match"] = spec.ETag
@@ -210,7 +210,7 @@ func (c *Client) UpdateEvent(ctx context.Context, calendarID, eventID string, sp
 // provider, which does need to be told, gets it.
 func (c *Client) DeleteEvent(ctx context.Context, calendarID, eventID, etag string, notify bool) error {
 	_, _ = calendarID, notify
-	reqURL := c.baseURL + "/me/events/" + url.PathEscape(eventID)
+	reqURL := c.baseURL + c.mailboxPath() + "/events/" + url.PathEscape(eventID)
 	headers := map[string]string{"Prefer": preferMaster}
 	if etag != "" {
 		headers["If-Match"] = etag
@@ -245,7 +245,7 @@ func (c *Client) RespondToEvent(ctx context.Context, calendarID, eventID string,
 	default:
 		return fmt.Errorf("cannot send RSVP for owner response state %q", resp)
 	}
-	reqURL := fmt.Sprintf("%s/me/events/%s/%s", c.baseURL, url.PathEscape(eventID), verb)
+	reqURL := fmt.Sprintf("%s%s/events/%s/%s", c.baseURL, c.mailboxPath(), url.PathEscape(eventID), verb)
 
 	body := map[string]any{"comment": comment, "sendResponse": sendResponse}
 	if err := c.doJSONBody(ctx, http.MethodPost, reqURL, nil, body, nil); err != nil {

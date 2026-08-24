@@ -95,8 +95,9 @@ durian calendar show 1A2B3C --account work
 
 ## Editing locally (applied on the next sync)
 
-Each of these only writes a local `.ics`. Run `durian calendar sync <account>`
-afterwards to push the change to the provider (see
+Each of these only writes a local `.ics`. Afterwards, run
+`durian calendar sync <account>` for one account or `durian calendar sync` for
+all enabled calendar-capable accounts to push the changes to the provider (see
 [Calendar Sync](../calendar-sync/)).
 
 ```bash

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/julion2/durian/cli/internal/calendar"
+	"github.com/julion2/durian/cli/internal/config"
 )
 
 // testOwnerEmail is the mailbox owner of every test client.
@@ -27,6 +28,40 @@ func testClient(srv *httptest.Server) *Client {
 		tokenFn: func(context.Context) (string, error) {
 			return "test-token", nil
 		},
+	}
+}
+
+func TestMailboxRouting(t *testing.T) {
+	own, err := New(&config.AccountConfig{
+		Email: "me@example.com", OAuth: &config.OAuthConfig{Provider: "microsoft"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if own.mailboxPath() != "/me" || own.Owner() != "me@example.com" {
+		t.Errorf("own routing = %q owner=%q", own.mailboxPath(), own.Owner())
+	}
+
+	shared, err := New(&config.AccountConfig{
+		Email: "shared@example.com", AuthEmail: "me@example.com",
+		OAuth: &config.OAuthConfig{Provider: "microsoft"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shared.mailboxPath() != "/users/shared@example.com" || shared.Owner() != "shared@example.com" {
+		t.Errorf("shared routing = %q owner=%q", shared.mailboxPath(), shared.Owner())
+	}
+
+	escaped, err := New(&config.AccountConfig{
+		Email: "shared/room?#@example.com", AuthEmail: "me@example.com",
+		OAuth: &config.OAuthConfig{Provider: "microsoft"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if escaped.mailboxPath() != "/users/shared%2Froom%3F%23@example.com" {
+		t.Errorf("escaped shared routing = %q", escaped.mailboxPath())
 	}
 }
 

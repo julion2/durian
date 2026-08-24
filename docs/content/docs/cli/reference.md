@@ -134,17 +134,20 @@ durian calendar new work --calendar "Calendar" -s "Lunch" --start "2026-08-01 12
 durian calendar modify work standup --start "2026-08-01 12:30" --duration 30m
 durian calendar rsvp work standup accept # accept / decline / tentative
 durian calendar delete work standup --yes
+durian calendar sync                     # sync all enabled calendar-capable accounts
 durian calendar sync work                # two-way sync for the account, with a preview + confirm
 durian calendar export work --out ./ics
 ```
 
-The positional argument to `new` / `modify` / `rsvp` / `delete` / `sync` /
-`export` is the **account** (alias); events are addressed by subject or UID
-prefix. Reads and edits are **local-first** — `list`, `search`, `show`, `new`,
+The positional argument to `new` / `modify` / `rsvp` / `delete` / `export` is
+the **account** (alias); for `sync` it is optional and omitting it syncs every
+enabled calendar-capable account. Events are addressed by subject or UID prefix. Reads
+and edits are **local-first** — `list`, `search`, `show`, `new`,
 `modify`, `rsvp`, and `delete` all work offline against a local vdir of `.ics`
-files. Only `sync`, `export`, and the background autosync in `durian serve`
-touch the provider, and `sync` previews every outgoing invitation before it
-sends. Full walkthrough: [Calendar](../calendar/) and
+files. Among CLI commands, only `sync`, `export`, and the background autosync
+in `durian serve` touch the provider; the GUI can also target one explicitly
+changed event. `sync` previews every outgoing invitation before it sends. Full
+walkthrough: [Calendar](../calendar/) and
 [Calendar Sync](../calendar-sync/).
 
 ## validate — check config
@@ -248,10 +251,15 @@ Used by the GUI as a child process — you don't normally need to start this you
 `serve` binds to `127.0.0.1` only and enforces a per-session bearer token. On startup it prints a single machine-readable line to stdout:
 
 ```
-READY token=<hex> addr=127.0.0.1:9723
+READY token=<hex> addr=127.0.0.1:9723 api=1
 ```
 
-The macOS GUI captures this line from the child process's stdout pipe and includes the token as `Authorization: Bearer <hex>` on every request. Requests without a valid token get `401`. Requests from a non-loopback Host header get `403`.
+The macOS GUI captures this line from the child process's stdout pipe, verifies
+that the CLI advertises the API protocol it requires, and includes the token as
+`Authorization: Bearer <hex>` on every request. An old or incompatible CLI is
+rejected with an update instruction instead of serving a mismatched GUI.
+Requests without a valid token get `401`. Requests from a non-loopback Host
+header get `403`.
 
 **`--no-auth`** disables the bearer-token check (loopback host check is still enforced). Useful for experimental clients that don't implement the stdout-READY handshake — e.g. the Linux Qt GUI — and for ad-hoc `curl` testing. The READY line is still printed (with empty `token=`) so parsers don't break.
 

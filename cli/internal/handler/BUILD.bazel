@@ -4,6 +4,7 @@ go_library(
     name = "handler",
     srcs = [
         "calendar.go",
+        "calendar_sync.go",
         "calendar_write.go",
         "contacts.go",
         "drafts.go",
@@ -26,6 +27,7 @@ go_library(
         "//cli/internal/auth",
         "//cli/internal/backend",
         "//cli/internal/calendar",
+        "//cli/internal/calendarsync",
         "//cli/internal/config",
         "//cli/internal/contacts",
         "//cli/internal/encoding",
@@ -64,6 +66,7 @@ go_test(
     embed = [":handler"],
     deps = [
         "//cli/internal/calendar",
+        "//cli/internal/calendarsync",
         "//cli/internal/config",
         "//cli/internal/contacts",
         "//cli/internal/dbcrypto",

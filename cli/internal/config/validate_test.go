@@ -252,6 +252,26 @@ func TestCalendarConflictPolicyResolution(t *testing.T) {
 	}
 }
 
+func TestCalendarEnabledDefaultsTrueAndAllowsOptOut(t *testing.T) {
+	a := &AccountConfig{}
+	if !a.CalendarEnabled() {
+		t.Fatal("account without calendar block should be enabled")
+	}
+	a.Calendar = &AccountCalendarConfig{}
+	if !a.CalendarEnabled() {
+		t.Fatal("account without enabled field should be enabled")
+	}
+	enabled := true
+	a.Calendar.Enabled = &enabled
+	if !a.CalendarEnabled() {
+		t.Fatal("account with enabled=true should be enabled")
+	}
+	enabled = false
+	if a.CalendarEnabled() {
+		t.Fatal("account with enabled=false should be disabled")
+	}
+}
+
 func TestIsDelegatedMailbox(t *testing.T) {
 	// Own mailbox: no auth_email, or auth_email == email.
 	if (&AccountConfig{Email: "me@example.com"}).IsDelegatedMailbox() {

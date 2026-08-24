@@ -105,6 +105,11 @@ TOKEN=""
 if read -r -t 10 READY_LINE < "$READY_PIPE"; then
     echo "$READY_LINE"
     TOKEN=$(echo "$READY_LINE" | grep -o 'token=[^ ]*' | cut -d= -f2)
+    if [[ "$READY_LINE" == *" api=1" ]]; then
+        pass "READY advertises API protocol"
+    else
+        fail "READY missing API protocol"
+    fi
 fi
 rm -f "$READY_PIPE"
 
