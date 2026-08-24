@@ -90,4 +90,115 @@ final class ConfigTests: XCTestCase {
         let account = MailAccount(name: "Personal", email: "me@me.com")
         XCTAssertNil(account.defaultSignature)
     }
+
+    // MARK: - Config Loading Errors
+
+    func testParseFailureIsVisibleWhileAccountsRemainEmpty() throws {
+        let configURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try Data().write(to: configURL)
+        defer { try? FileManager.default.removeItem(at: configURL) }
+
+        var reportedMessage: String?
+        let manager = ConfigManager(
+            configURL: configURL,
+            evaluator: { _ in
+                throw NSError(
+                    domain: "ConfigTests",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "invalid syntax"]
+                )
+            },
+            parseErrorHandler: { reportedMessage = $0 }
+        )
+
+        XCTAssertEqual(manager.lastParseError, "invalid syntax")
+        XCTAssertTrue(manager.getAccounts().isEmpty)
+        XCTAssertEqual(
+            reportedMessage,
+            "Configuration failed to parse: invalid syntax. The bundled GUI schema may be out of date — run ./macos/install.sh to rebuild."
+        )
+    }
+
+    func testSuccessfulReloadClearsParseError() throws {
+        let configURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try Data().write(to: configURL)
+        defer { try? FileManager.default.removeItem(at: configURL) }
+
+        var shouldFail = true
+        let manager = ConfigManager(
+            configURL: configURL,
+            evaluator: { _ in
+                if shouldFail {
+                    throw NSError(
+                        domain: "ConfigTests",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "invalid syntax"]
+                    )
+                }
+                return AppConfig(accounts: [MailAccount(name: "Work", email: "work@example.com")])
+            },
+            parseErrorHandler: { _ in }
+        )
+        XCTAssertNotNil(manager.lastParseError)
+
+        shouldFail = false
+        manager.reloadConfig()
+
+        XCTAssertNil(manager.lastParseError)
+        XCTAssertEqual(manager.getAccounts().map(\.email), ["work@example.com"])
+    }
+
+    func testFailedReloadClearsPreviouslyLoadedConfig() throws {
+        let configURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try Data().write(to: configURL)
+        defer { try? FileManager.default.removeItem(at: configURL) }
+
+        var shouldFail = false
+        let manager = ConfigManager(
+            configURL: configURL,
+            evaluator: { _ in
+                if shouldFail {
+                    throw NSError(
+                        domain: "ConfigTests",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "invalid syntax"]
+                    )
+                }
+                return AppConfig(accounts: [MailAccount(name: "Work", email: "work@example.com")])
+            },
+            parseErrorHandler: { _ in }
+        )
+        XCTAssertEqual(manager.getAccounts().map(\.email), ["work@example.com"])
+
+        shouldFail = true
+        manager.reloadConfig()
+
+        XCTAssertEqual(manager.lastParseError, "invalid syntax")
+        XCTAssertTrue(manager.getAccounts().isEmpty)
+    }
+
+    func testMissingConfigOnReloadClearsPreviouslyLoadedConfig() throws {
+        let configURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try Data().write(to: configURL)
+        defer { try? FileManager.default.removeItem(at: configURL) }
+
+        let manager = ConfigManager(
+            configURL: configURL,
+            evaluator: { _ in
+                AppConfig(accounts: [MailAccount(name: "Work", email: "work@example.com")])
+            },
+            parseErrorHandler: { _ in }
+        )
+        XCTAssertEqual(manager.getAccounts().map(\.email), ["work@example.com"])
+
+        try FileManager.default.removeItem(at: configURL)
+        manager.reloadConfig()
+
+        XCTAssertNil(manager.lastParseError)
+        XCTAssertTrue(manager.getAccounts().isEmpty)
+    }
 }

@@ -123,12 +123,19 @@ struct AppConfig: Codable {
 class ConfigManager {
     static let shared = ConfigManager()
 
+    typealias ConfigEvaluator = (URL) throws -> AppConfig
+    typealias ParseErrorHandler = (String) -> Void
+
     // The config is accessed from many contexts (Views on MainActor, but also
     // background Tasks in AccountManager/DraftService). An NSLock guards the
     // stored value so concurrent reads/writes are race-free without forcing
     // @MainActor on every call site.
     private let lock = NSLock()
     private var _config: AppConfig?
+    private var _lastParseError: String?
+    private let configURL: URL
+    private let evaluator: ConfigEvaluator
+    private let parseErrorHandler: ParseErrorHandler
 
     private var config: AppConfig? {
         get {
@@ -143,12 +150,28 @@ class ConfigManager {
         }
     }
 
-    init() {
+    private func setLastParseError(_ error: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        _lastParseError = error
+    }
+
+    init(
+        configURL: URL = FileManager.default.durianConfigURL().appendingPathComponent("config.pkl"),
+        evaluator: @escaping ConfigEvaluator = { try PklEvaluator.evalSync(AppConfig.self, from: $0) },
+        parseErrorHandler: @escaping ParseErrorHandler = ConfigManager.showParseError
+    ) {
+        self.configURL = configURL
+        self.evaluator = evaluator
+        self.parseErrorHandler = parseErrorHandler
         loadConfigBlocking()
     }
 
     /// Test-only initializer: inject config directly, skip file loading
     init(config: AppConfig) {
+        configURL = FileManager.default.durianConfigURL().appendingPathComponent("config.pkl")
+        evaluator = { try PklEvaluator.evalSync(AppConfig.self, from: $0) }
+        parseErrorHandler = ConfigManager.showParseError
         _config = config
     }
 
@@ -156,26 +179,39 @@ class ConfigManager {
     /// Uses PklEvaluator.evalSync (Process + waitUntilExit) to avoid
     /// Swift Concurrency deadlocks from mixing Task.detached with semaphores.
     private func loadConfigBlocking() {
-        let configURL = getConfigURL()
-
         guard FileManager.default.fileExists(atPath: configURL.path) else {
+            config = nil
+            setLastParseError(nil)
             Log.warning("CONFIG", "Config not found at \(configURL.path)")
             return
         }
 
         do {
-            config = try PklEvaluator.evalSync(AppConfig.self, from: configURL)
+            config = try evaluator(configURL)
+            setLastParseError(nil)
             Log.info("CONFIG", "Loaded config from \(configURL.path)")
         } catch {
-            Log.error("CONFIG", "Failed to load config: \(error)")
+            config = nil
+            let detail = error.localizedDescription
+            setLastParseError(detail)
+            Log.error("CONFIG", "Failed to load config: \(detail)")
+            parseErrorHandler("Configuration failed to parse: \(detail). The bundled GUI schema may be out of date — run ./macos/install.sh to rebuild.")
         }
     }
 
-    private func getConfigURL() -> URL {
-        FileManager.default.durianConfigURL().appendingPathComponent("config.pkl")
+    private static func showParseError(_ message: String) {
+        Task { @MainActor in
+            BannerManager.shared.showCritical(title: "Configuration Error", message: message)
+        }
     }
 
     // MARK: - Public API
+
+    var lastParseError: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lastParseError
+    }
 
     func getAccounts() -> [MailAccount] {
         config?.accounts ?? []
