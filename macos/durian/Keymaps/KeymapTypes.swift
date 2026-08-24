@@ -88,6 +88,13 @@ enum KeymapAction: String, CaseIterable {
     case calendarDelete = "calendar_delete"
     case calendarToggleSidebar = "calendar_toggle_sidebar"
     case calendarToggleDeclined = "calendar_toggle_declined"
+    /// h/l: move the time cursor a day, keeping the time of day.
+    case calendarPrevDay = "calendar_prev_day"
+    case calendarNextDay = "calendar_next_day"
+    /// Opens the full-detail card for the event under the cursor.
+    case calendarDetail = "calendar_detail"
+    /// Opens the `:` command line.
+    case calendarCommand = "calendar_command"
 
     // Note: supportsCount is now defined in keymaps.pkl per-action
     // Use SequenceMatcher.shared.supportsCount(action) to check
@@ -107,15 +114,22 @@ struct KeyEvent: Equatable {
         self.timestamp = timestamp
     }
 
-    /// String representation for matching (e.g., "shift+g" or "j")
+    /// String representation for matching (e.g., "G", ":" or "ctrl+d")
     var normalized: String {
         if modifiers.isEmpty {
-            return key.lowercased()
+            // Lowercasing neutralizes Caps Lock for single characters; named
+            // keys ("Tab", "Enter") must keep their exact spelling to match
+            // binding strings.
+            return key.count > 1 ? key : key.lowercased()
         }
 
-        // Special case: Shift+letter becomes uppercase
-        if modifiers == [.shift] && key.count == 1 && key.first?.isLetter == true {
-            return key.uppercased()
+        // Shift alone: AppKit has already applied Shift to the character, so
+        // the key carries the final glyph on any layout ("G" for Shift+g,
+        // ":" for whatever key the layout puts colon on). Letters are
+        // uppercased explicitly so Caps Lock combinations still normalize to
+        // the uppercase binding form; everything else is the glyph itself.
+        if modifiers == [.shift] && key.count == 1 {
+            return key.first?.isLetter == true ? key.uppercased() : key
         }
 
         let modStr = modifiers.sorted(by: { $0.rawValue < $1.rawValue })

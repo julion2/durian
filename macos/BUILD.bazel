@@ -142,6 +142,13 @@ swift_test(
 )
 
 swift_test(
+    name = "key_sequence_engine_test",
+    size = "small",
+    srcs = ["tests/KeySequenceEngineTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
     name = "attachment_cache_manager_test",
     size = "small",
     srcs = ["tests/AttachmentCacheManagerTests.swift"],
