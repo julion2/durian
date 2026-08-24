@@ -33,6 +33,11 @@ var serveContactsDB string
 var serveNoAuth bool
 var serveExitWhenOrphaned bool
 
+// serveAPIProtocol is the local HTTP contract advertised in the READY
+// handshake. Increment when a GUI release needs an incompatible or newly
+// mandatory server capability.
+const serveAPIProtocol = 1
+
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start OpenAPI HTTP server (for GUI integration)",
@@ -183,6 +188,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	r.HandleFunc("/api/v1/calendars/event", h.CalendarPutEventHandler).Methods("PUT")
 	r.HandleFunc("/api/v1/calendars/event", h.CalendarDeleteEventHandler).Methods("DELETE")
 	r.HandleFunc("/api/v1/calendars/rsvp", h.CalendarRsvpHandler).Methods("POST")
+	r.HandleFunc("/api/v1/calendars/sync/event", h.CalendarSyncEventHandler).Methods("POST")
 	r.HandleFunc("/api/v1/calendars", h.CalendarsHandler).Methods("GET")
 
 	// Outbox routes
@@ -222,6 +228,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		slog.Warn("Could not load config", "module", "SERVE", "err", err)
 	} else {
 		h.SetConfig(cfg)
+		h.SetCalendarEventSyncer(guiCalendarSyncer{cfg: cfg})
 
 		// Optional: set up remote tag sync client
 		if cfg.Sync.TagSync != nil && cfg.Sync.TagSync.URL != "" && cfg.Sync.TagSync.APIKey != "" {
@@ -306,11 +313,12 @@ func runServe(cmd *cobra.Command, args []string) {
 		}
 	}()
 
-	// Machine-readable ready line — GUI parses this from stdout pipe
+	// Machine-readable ready line — GUI parses this from stdout pipe. The API
+	// protocol prevents a new GUI from silently talking to an incompatible CLI.
 	if serveNoAuth {
-		fmt.Printf("READY token= addr=%s\n", addr)
+		fmt.Printf("READY token= addr=%s api=%d\n", addr, serveAPIProtocol)
 	} else {
-		fmt.Printf("READY token=%s addr=%s\n", authToken, addr)
+		fmt.Printf("READY token=%s addr=%s api=%d\n", authToken, addr, serveAPIProtocol)
 	}
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

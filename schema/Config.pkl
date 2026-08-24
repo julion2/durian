@@ -98,9 +98,12 @@ class LocalCalendar {
 }
 
 class AccountCalendarConfig {
+  /// Whether this account participates in calendar reads and sync. Disable it
+  /// for mail-only accounts whose provider also exposes calendars.
+  enabled: Boolean = true
   /// Subdirectory name under vdir_path (default: account alias, else lowercased name).
   dir: String?
-  /// Calendar display names to export (empty = all calendars).
+  /// Calendar display names to export and sync (empty = all calendars).
   include: Listing<String> = new {}
   /// Per-account override of the global calendar.conflict policy
   /// ("remote"|"local"|"newer"; null = use the global setting).

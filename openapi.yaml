@@ -428,6 +428,10 @@ paths:
           description: Missing account parameter
         '404':
           description: Account not found
+        '409':
+          description: Calendar disabled or mailbox awaiting its first sync
+        '500':
+          description: Local calendar state could not be read
   /calendars/events:
     get:
       summary: List or search calendar events (read-only, from the local vdir)
@@ -477,6 +481,10 @@ paths:
           description: Missing account or invalid window
         '404':
           description: Account not found
+        '409':
+          description: Calendar disabled or mailbox awaiting its first sync
+        '500':
+          description: Local calendar data could not be read
   /calendars/event:
     get:
       summary: Get one calendar event in detail (read-only, from the local vdir)
@@ -512,13 +520,17 @@ paths:
           description: Missing account or ref
         '404':
           description: Account or event not found (or ambiguous reference)
+        '409':
+          description: Calendar disabled or mailbox awaiting its first sync
+        '500':
+          description: Local calendar data could not be read
     put:
-      summary: Create or update an event locally (applied to Outlook on next sync)
+      summary: Create or update an event locally
       description: >-
         Upserts a local .ics from the posted event — a new UID is generated when
         absent (create), otherwise the existing file is overwritten (update).
-        Local-first: only the vdir is written; nothing is sent to Outlook until
-        the next `durian calendar sync`.
+        Local-first: this operation only writes the vdir. A caller may follow it
+        with POST /calendars/sync/event after an explicit Save or Send action.
 
         An all-day event is normalized to midnight-UTC day boundaries and its
         end is snapped to at least start + 1 day (the shape Graph requires).
@@ -548,8 +560,12 @@ paths:
           description: Read-only calendar or attendee edit by a non-organizer
         '404':
           description: Account not found
+        '409':
+          description: Calendar disabled or mailbox awaiting its first sync
+        '500':
+          description: Local calendar data could not be read or written
     delete:
-      summary: Delete an event locally (applied to Outlook on next sync)
+      summary: Delete an event locally
       parameters:
         - name: account
           in: query
@@ -573,16 +589,20 @@ paths:
           description: Missing account or ref
         '404':
           description: Account or event not found
+        '409':
+          description: Calendar disabled or mailbox awaiting its first sync
+        '500':
+          description: Local calendar data could not be read or written
   /calendars/rsvp:
     post:
-      summary: Set the owner's RSVP on a meeting locally (sent on next sync)
+      summary: Set the owner's RSVP on a meeting locally
       description: >-
         Sets the account owner's response (accept/tentative/decline) on a
         meeting by rewriting the owner's ATTENDEE PARTSTAT in the local .ics.
-        Local-first: only the vdir is written — no provider call, no mail. The
-        organizer is notified on the next `durian calendar sync`, which
-        previews the reply before sending. Only works when the owner is an
-        attendee (not the organizer) of the meeting.
+        Local-first: only the vdir is written — no provider call, no mail. A
+        caller may follow it with POST /calendars/sync/event to send the
+        response. Only works when the owner is an attendee (not the organizer)
+        of the meeting.
       requestBody:
         required: true
         content:
@@ -602,6 +622,42 @@ paths:
             or owner is not an attendee of the event
         '404':
           description: Account or event not found (or ambiguous reference)
+        '409':
+          description: Calendar disabled or mailbox awaiting its first sync
+        '500':
+          description: Local calendar data could not be read or written
+  /calendars/sync/event:
+    post:
+      summary: Sync one explicitly changed event to its provider
+      description: >-
+        Plans the account but applies only the action for the named calendar
+        and event UID. Other pending events are never applied. A conflict on
+        the target event is refused with 409 and remains available to the
+        interactive CLI sync. Used after an explicit GUI Save, Send, RSVP or
+        Delete action.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CalendarEventSyncRequest'
+      responses:
+        '200':
+          description: Event synced, or already converged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalendarEventSyncResponse'
+        '400':
+          description: Missing account, calendar or UID, invalid operation, local account, or unsupported provider
+        '404':
+          description: Account not found
+        '409':
+          description: Calendar disabled, another sync is running, or the target event conflicts
+        '502':
+          description: Provider planning or apply failed
+        '503':
+          description: Calendar sync is unavailable
 
 components:
   schemas:
@@ -1065,8 +1121,9 @@ components:
             On update this list is applied only when replace_attendees is true;
             otherwise the existing set is preserved for compatibility with old
             clients. Existing meeting attendees can only be replaced by the
-            organizer. Local-first: invitations and attendee updates are sent
-            by the next 'durian calendar sync' behind its notification gate.
+            organizer. The GUI follows its explicit Send action with the
+            event-scoped sync endpoint; the account-wide CLI sync retains its
+            notification gate.
         replace_attendees:
           type: boolean
           default: false
@@ -1080,8 +1137,7 @@ components:
           description: >-
             Create the event with an online meeting (Teams for a Microsoft
             account, Google Meet for a Google one). Honored on create only;
-            the provider attaches the meeting when the next
-            'durian calendar sync' uploads the event.
+            the provider attaches the meeting when the event is next synced.
       required: [account, calendar, subject, start, end]
     CalendarRsvpRequest:
       type: object
@@ -1105,3 +1161,31 @@ components:
             The owner's response — accept/decline/tentative or the Graph-style
             accepted/declined/tentativelyAccepted (case-insensitive)
       required: [account, ref, response]
+    CalendarEventSyncRequest:
+      type: object
+      description: Body for POST /calendars/sync/event.
+      properties:
+        account:
+          type: string
+          description: Provider-backed account identifier (email, alias or name)
+        calendar:
+          type: string
+          description: Exact calendar display name
+        uid:
+          type: string
+          description: Exact iCalendar UID of the event to sync
+        operation:
+          type: string
+          enum: [save, rsvp, delete]
+          description: User action whose matching planner action may be applied
+      required: [account, calendar, uid, operation]
+    CalendarEventSyncResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        applied:
+          type: boolean
+          description: True when this request applied a provider action; false when the event was already converged.
+      required: [ok, applied]

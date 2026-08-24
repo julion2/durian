@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,8 +13,23 @@ import (
 	"time"
 
 	"github.com/julion2/durian/cli/internal/calendar"
+	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
 )
+
+type fakeCalendarEventSyncer struct {
+	account   string
+	calendar  string
+	uid       string
+	operation string
+	err       error
+	applied   bool
+}
+
+func (f *fakeCalendarEventSyncer) SyncCalendarEvent(_ context.Context, account, calendar, uid, operation string) (bool, error) {
+	f.account, f.calendar, f.uid, f.operation = account, calendar, uid, operation
+	return f.applied, f.err
+}
 
 // newCalendarHandler builds a Handler whose config points at a temp vdir seeded
 // with two events in one "Calendar" of account alias "work" (owner
@@ -28,6 +45,13 @@ func newCalendarHandler(t *testing.T) (http.Handler, string) {
 	if err := os.WriteFile(filepath.Join(calDir, "displayname"), []byte("Calendar\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	excludedDir := filepath.Join(base, "work", "Excluded")
+	if err := os.MkdirAll(excludedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(excludedDir, "displayname"), []byte("Excluded\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	writeCalendarTestEvent(t, calDir, calendar.Event{
 		ICalUID: "evt-lunch", Subject: "Team Lunch",
 		Start: time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC),
@@ -41,7 +65,10 @@ func newCalendarHandler(t *testing.T) (http.Handler, string) {
 
 	cfg := &config.Config{
 		Calendar: config.CalendarConfig{VdirPath: base},
-		Accounts: []config.AccountConfig{{Name: "Work", Email: "me@example.com", Alias: "work"}},
+		Accounts: []config.AccountConfig{{
+			Name: "Work", Email: "me@example.com", Alias: "work",
+			Calendar: &config.AccountCalendarConfig{Include: []string{"Calendar"}},
+		}},
 	}
 	h := New(nil, nil)
 	h.SetConfig(cfg)
@@ -86,6 +113,46 @@ func TestCalendarsHandler(t *testing.T) {
 	}
 	if resp.Calendars[0].Name != "Calendar" || resp.Calendars[0].EventCount != 2 {
 		t.Errorf("calendar = %+v, want Calendar/2", resp.Calendars[0])
+	}
+}
+
+func TestCalendarsHandlerRejectsDisabledAccount(t *testing.T) {
+	disabled := false
+	h := New(nil, nil)
+	h.SetConfig(&config.Config{Accounts: []config.AccountConfig{{
+		Name: "Work", Email: "me@example.com", Alias: "work",
+		Calendar: &config.AccountCalendarConfig{Enabled: &disabled},
+	}}})
+	r := newTestRouter(h, nil)
+
+	if code := getJSON(t, r, "/api/v1/calendars?account=work", nil); code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", code, http.StatusConflict)
+	}
+}
+
+func TestCalendarsHandlerRejectsLegacyDelegatedMailboxVdir(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "shared")
+	state := &calendarsync.SyncState{
+		Calendars: map[string]calendarsync.CalendarStatus{
+			"owners-calendar": {Items: map[string]calendarsync.ItemStatus{}},
+		},
+	}
+	if err := calendarsync.NewFileStateStore(dir).Save(state); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		Calendar: config.CalendarConfig{VdirPath: base},
+		Accounts: []config.AccountConfig{{
+			Name: "Shared", Email: "shared@example.com", AuthEmail: "owner@example.com", Alias: "shared",
+		}},
+	}
+	h := New(nil, nil)
+	h.SetConfig(cfg)
+	r := newTestRouter(h, nil)
+
+	if code := getJSON(t, r, "/api/v1/calendars?account=shared", nil); code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", code, http.StatusConflict)
 	}
 }
 
@@ -186,6 +253,70 @@ func TestCalendarPutGetDeleteRoundTrip(t *testing.T) {
 	}
 	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref="+uid, nil); code != http.StatusNotFound {
 		t.Errorf("GET after DELETE = %d, want 404", code)
+	}
+}
+
+func TestCalendarSyncEventHandler(t *testing.T) {
+	h := New(nil, nil)
+	fake := &fakeCalendarEventSyncer{applied: true}
+	h.SetCalendarEventSyncer(fake)
+	r := newTestRouter(h, nil)
+
+	w := httptest.NewRecorder()
+	body := `{"account":"work","calendar":"Calendar","uid":"evt-lunch","operation":"save"}`
+	r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/calendars/sync/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST status %d: %s", w.Code, w.Body.String())
+	}
+	if fake.account != "work" || fake.calendar != "Calendar" || fake.uid != "evt-lunch" || fake.operation != "save" {
+		t.Fatalf("sync args = %q, %q, %q, %q", fake.account, fake.calendar, fake.uid, fake.operation)
+	}
+	if !strings.Contains(w.Body.String(), `"applied":true`) {
+		t.Fatalf("response = %s, want applied=true", w.Body.String())
+	}
+}
+
+func TestCalendarSyncEventHandlerReportsAlreadyConverged(t *testing.T) {
+	h := New(nil, nil)
+	h.SetCalendarEventSyncer(&fakeCalendarEventSyncer{})
+	r := newTestRouter(h, nil)
+	w := httptest.NewRecorder()
+	body := `{"account":"work","calendar":"Calendar","uid":"evt-lunch","operation":"save"}`
+	r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/calendars/sync/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"applied":false`) {
+		t.Fatalf("response = %d %s, want applied=false", w.Code, w.Body.String())
+	}
+}
+
+func TestCalendarSyncEventHandlerErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   string
+		syncer *fakeCalendarEventSyncer
+		want   int
+	}{
+		{name: "invalid", body: `{}`, syncer: &fakeCalendarEventSyncer{}, want: http.StatusBadRequest},
+		{name: "operation", body: `{"account":"work","calendar":"Calendar","uid":"u","operation":"launch"}`, syncer: &fakeCalendarEventSyncer{}, want: http.StatusBadRequest},
+		{name: "unavailable", body: `{"account":"work","calendar":"Calendar","uid":"u","operation":"save"}`, want: http.StatusServiceUnavailable},
+		{name: "busy", body: `{"account":"work","calendar":"Calendar","uid":"u","operation":"save"}`, syncer: &fakeCalendarEventSyncer{err: ErrCalendarSyncBusy}, want: http.StatusConflict},
+		{name: "not found", body: `{"account":"work","calendar":"Calendar","uid":"u","operation":"save"}`, syncer: &fakeCalendarEventSyncer{err: ErrCalendarSyncNotFound}, want: http.StatusNotFound},
+		{name: "disabled", body: `{"account":"work","calendar":"Calendar","uid":"u","operation":"save"}`, syncer: &fakeCalendarEventSyncer{err: ErrCalendarSyncDisabled}, want: http.StatusConflict},
+		{name: "conflict", body: `{"account":"work","calendar":"Calendar","uid":"u","operation":"save"}`, syncer: &fakeCalendarEventSyncer{err: ErrCalendarSyncConflict}, want: http.StatusConflict},
+		{name: "provider", body: `{"account":"work","calendar":"Calendar","uid":"u","operation":"save"}`, syncer: &fakeCalendarEventSyncer{err: errors.New("provider failed")}, want: http.StatusBadGateway},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New(nil, nil)
+			if tt.syncer != nil {
+				h.SetCalendarEventSyncer(tt.syncer)
+			}
+			r := newTestRouter(h, nil)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/calendars/sync/event", strings.NewReader(tt.body)))
+			if w.Code != tt.want {
+				t.Fatalf("status = %d, want %d: %s", w.Code, tt.want, w.Body.String())
+			}
+		})
 	}
 }
 
@@ -431,8 +562,8 @@ func TestCalendarPutPlainAppointmentCanGainFirstAttendee(t *testing.T) {
 
 func TestCalendarPutCreateWithAttendeesAndOnlineMeeting(t *testing.T) {
 	// A GUI create can carry an attendee email list and an online-meeting
-	// request. Both land in the local .ics only — the invitations and the
-	// online meeting are requested on the next `durian calendar sync`.
+	// request. Both land in the local .ics before the caller chooses whether
+	// to follow up through targeted provider sync.
 	r, calDir := newCalendarHandler(t)
 	body := `{"account":"work","calendar":"Calendar","subject":"Kickoff",` +
 		`"start":"2026-08-10T09:00:00Z","end":"2026-08-10T10:00:00Z",` +

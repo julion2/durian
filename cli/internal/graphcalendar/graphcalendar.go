@@ -98,10 +98,13 @@ type Client struct {
 	clientSecret string
 	tenant       string
 
-	// owner is the mailbox owner's email address (the account auth email),
+	// owner is the mailbox owner's email address (the account email),
 	// used to recognize the owner's own attendee entry and to role-gate
 	// attendee uploads. Tests set it directly.
 	owner string
+	// mailbox is "/me" for the token owner's mailbox, or
+	// "/users/{address}" for a delegated/shared mailbox.
+	mailbox string
 
 	httpClient *http.Client
 	// baseURL is the Graph API root without trailing slash. Defaults to
@@ -124,12 +127,17 @@ func New(account *config.AccountConfig) (*Client, error) {
 		return nil, fmt.Errorf("calendar export requires a Microsoft OAuth account, got %s", account.Email)
 	}
 
+	mailbox := "/me"
+	if account.IsDelegatedMailbox() {
+		mailbox = "/users/" + url.PathEscape(account.Email)
+	}
 	c := &Client{
 		account:      account,
 		clientID:     account.OAuth.ClientID,
 		clientSecret: account.OAuth.ClientSecret,
 		tenant:       account.OAuth.Tenant,
-		owner:        account.GetAuthEmail(),
+		owner:        account.Email,
+		mailbox:      mailbox,
 		httpClient:   &http.Client{Timeout: 60 * time.Second},
 		baseURL:      defaultBaseURL,
 	}
@@ -157,6 +165,13 @@ func NewWithToken(owner, baseURL, token string, httpClient *http.Client) *Client
 // Owner returns the mailbox owner's email address (the account auth email).
 func (c *Client) Owner() string {
 	return c.owner
+}
+
+func (c *Client) mailboxPath() string {
+	if c.mailbox == "" {
+		return "/me"
+	}
+	return c.mailbox
 }
 
 // IsAuthError implements the provider seam by delegating to the package-level
@@ -444,7 +459,7 @@ type calendarPage struct {
 // ListCalendars returns all calendars of the account, following pagination.
 func (c *Client) ListCalendars(ctx context.Context) ([]Calendar, error) {
 	var calendars []Calendar
-	pageURL := c.baseURL + "/me/calendars?$select=id,name,hexColor"
+	pageURL := c.baseURL + c.mailboxPath() + "/calendars?$select=id,name,hexColor"
 	for pageURL != "" {
 		var page calendarPage
 		if err := c.doJSON(ctx, pageURL, nil, &page); err != nil {
@@ -620,8 +635,8 @@ func (c *Client) FetchEvents(ctx context.Context, calendarID string, from, to ti
 	headers := map[string]string{"Prefer": preferUTC}
 
 	var events []calendar.Event
-	pageURL := fmt.Sprintf("%s/me/calendars/%s/calendarView?startDateTime=%s&endDateTime=%s&$select=%s&$top=100",
-		c.baseURL, url.PathEscape(calendarID),
+	pageURL := fmt.Sprintf("%s%s/calendars/%s/calendarView?startDateTime=%s&endDateTime=%s&$select=%s&$top=100",
+		c.baseURL, c.mailboxPath(), url.PathEscape(calendarID),
 		url.QueryEscape(from.UTC().Format(time.RFC3339)),
 		url.QueryEscape(to.UTC().Format(time.RFC3339)),
 		eventSelect)
@@ -686,8 +701,8 @@ func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]ca
 	byID := make(map[string]int)
 	var exceptions []graphEvent
 
-	pageURL := fmt.Sprintf("%s/me/calendars/%s/events?$select=%s&$top=100",
-		c.baseURL, url.PathEscape(calendarID), masterEventSelect)
+	pageURL := fmt.Sprintf("%s%s/calendars/%s/events?$select=%s&$top=100",
+		c.baseURL, c.mailboxPath(), url.PathEscape(calendarID), masterEventSelect)
 	for pageURL != "" {
 		var page eventPage
 		if err := c.doJSON(ctx, pageURL, headers, &page); err != nil {
@@ -774,8 +789,8 @@ func attachExceptions(events []calendar.Event, byID map[string]int, exceptions [
 // calendarID is unused: Graph event ids are mailbox-global.
 func (c *Client) GetEvent(ctx context.Context, calendarID, eventID string) (calendar.Event, error) {
 	_ = calendarID
-	reqURL := fmt.Sprintf("%s/me/events/%s?$select=%s",
-		c.baseURL, url.PathEscape(eventID), masterEventSelect)
+	reqURL := fmt.Sprintf("%s%s/events/%s?$select=%s",
+		c.baseURL, c.mailboxPath(), url.PathEscape(eventID), masterEventSelect)
 
 	var ge graphEvent
 	if err := c.doJSON(ctx, reqURL, map[string]string{"Prefer": preferMaster}, &ge); err != nil {

@@ -93,8 +93,10 @@ accounts to a local vdir of `.ics` files (see [Calendar](../../cli/calendar/)).
 | `local_calendars` | `Listing<C.LocalCalendar>` | empty | On-disk-only calendars (below). |
 
 `conflict`, `autosync`, and `autosync_upload` resolve as: per-account override →
-global `calendar.*` → schema default. A calendar block only applies to Microsoft
-and Google OAuth accounts; delegated/shared mailboxes are skipped by autosync.
+global `calendar.*` → schema default. Set `accounts[].calendar.enabled = false`
+for a mail-only account: it is omitted from calendar reads, GUI loading, manual
+and background sync. A calendar block only applies to Microsoft and Google OAuth
+accounts.
 
 ### local_calendars
 
@@ -129,10 +131,12 @@ calendar = (C.calendar) {
 
 ### Per-account calendar
 
-An account may carry its own `calendar { dir, include, conflict, autosync,
-autosync_upload }`: `dir` (subdirectory under `vdir_path`; default the alias,
-else the lowercased name), `include` (calendar display names to export; empty =
-all), and the three overrides above.
+An account may carry its own `calendar { enabled, dir, include, conflict,
+autosync, autosync_upload }`: `enabled` controls whether the account participates
+in calendar reads and sync at all (default `true`), `dir` is the subdirectory
+under `vdir_path` (default the alias, else the lowercased name), `include`
+selects calendar display names for export and sync (empty = all), and the three
+overrides above.
 
 ## accounts
 

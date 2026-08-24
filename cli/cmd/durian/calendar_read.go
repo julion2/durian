@@ -117,8 +117,11 @@ func resolveVdirAccount(identifier string) (accountDir, owner string, account *c
 	if err != nil {
 		return "", "", nil, fmt.Errorf("account not found: %s\nAvailable accounts: %s", identifier, cfg.ListAccountIdentifiers())
 	}
+	if !account.CalendarEnabled() {
+		return "", "", nil, fmt.Errorf("calendar is disabled for account %s", account.GetAliasOrName())
+	}
 	accountDir = filepath.Join(config.CalendarBaseDir(cfg, ""), account.CalendarDir())
-	return accountDir, account.GetAuthEmail(), account, nil
+	return accountDir, account.Email, account, nil
 }
 
 // resolveVdirCollections resolves one identifier to the calendar collections it
@@ -163,7 +166,7 @@ func localCalendarCollections(cfg *config.Config) []calendar.Collection {
 
 // calendarTargets resolves the accounts a read command should cover: the ones
 // named as arguments or via --account, or — when neither is given — every
-// configured account plus the local calendars.
+// calendar-enabled account plus the local calendars.
 //
 // Reading everything by default is the point: someone asking what is on their
 // calendar means all of it, and the previous mandatory account turned the most
@@ -178,7 +181,9 @@ func calendarTargets(named []string) (cols []calendar.Collection, accounts []str
 	wanted := append(append([]string{}, named...), calAccounts...)
 	if len(wanted) == 0 {
 		for i := range cfg.Accounts {
-			wanted = append(wanted, cfg.Accounts[i].GetAliasOrName())
+			if cfg.Accounts[i].CalendarEnabled() {
+				wanted = append(wanted, cfg.Accounts[i].GetAliasOrName())
+			}
 		}
 		// Only when some are configured — otherwise "local" would be reported
 		// as an account that yielded nothing.

@@ -16,13 +16,20 @@ never writes back.
 ## Plan, preview, confirm
 
 ```bash
-durian calendar sync <account> [--dry-run] [--yes] [--silent-rsvp] [--out DIR]
+durian calendar sync [account] [--dry-run] [--yes] [--silent-rsvp] [--out DIR]
 ```
+
+Omit `account` to sync every configured Microsoft and Google OAuth account in
+configuration order, except accounts with `calendar.enabled = false`. Each
+account gets its own plan, notification preview and confirmation, so declining
+one does not prevent the remaining accounts from being reviewed. Pass an
+account alias to sync only that account; `--yes` approves every account in an
+all-account run.
 
 A sync runs in three visible steps:
 
 1. **Plan.** Durian builds the full plan and prints the counts — downloads,
-   prunes, uploads, updates, remote deletes, conflicts, RSVPs — *without
+   prunes, local archives, uploads, updates, remote deletes, conflicts, RSVPs — *without
    touching anything yet*.
 2. **Notification preview.** It lists every email the plan will send, one line
    each, then a total:
@@ -34,10 +41,10 @@ A sync runs in three visible steps:
    ```
 
    or `No emails will be sent.` The preview mirrors exactly what apply does.
-3. **Confirm.** If the plan has remote changes, Durian asks
-   `Apply N change(s) to Outlook ...? [y/N]`. **Declining aborts the entire run —
-   including the local downloads and prunes.** A non-tty or closed stdin counts
-   as "no".
+3. **Confirm.** If the plan has remote changes or must archive a locally edited
+   event whose remote calendar disappeared, Durian asks before applying.
+   **Declining aborts the entire run — including local downloads and prunes.**
+   A non-tty or closed stdin counts as "no".
 
 Flags: `--dry-run` plans and previews but applies nothing and saves no state;
 `--yes` skips the confirmation; `--silent-rsvp` records an RSVP locally without
@@ -46,7 +53,7 @@ emailing the organizer; `--out DIR` writes to a different vdir root.
 A completed run prints, for example:
 
 ```
-Calendar sync for Work: 4 downloaded, 1 pruned, 2 uploaded, 0 deleted remotely,
+Calendar sync for Work: 4 downloaded, 1 pruned, 0 archived, 2 uploaded, 0 deleted remotely,
 1 RSVP(s) sent, 1 conflict(s) resolved (newer wins), 0 skipped, 0 failed
 ```
 
@@ -79,9 +86,9 @@ value below 60 falls back to 600), with a 3-minute per-cycle timeout.
   remote delete, every conflict, every RSVP, and any notifying upload still wait
   for an interactive `durian calendar sync`.
 
-Delegated and shared mailboxes are skipped by autosync (their `/me` resolves to
-the token owner, not the mailbox). When anything changed, the GUI receives a
-`calendar_updated` event over its SSE stream.
+Delegated and shared Microsoft mailboxes sync through their mailbox-scoped
+`/users/{address}` endpoint rather than the token owner's `/me`. When anything
+changed, the GUI receives a `calendar_updated` event over its SSE stream.
 
 ## Conflicts and `.conflict` backups
 

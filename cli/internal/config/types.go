@@ -159,10 +159,13 @@ func (c *Config) FindLocalCalendar(name string) (LocalCalendarConfig, bool) {
 	return LocalCalendarConfig{}, false
 }
 
-// AccountCalendarConfig configures the vdir calendar export of one account.
+// AccountCalendarConfig configures the vdir calendar features of one account.
 type AccountCalendarConfig struct {
+	// Enabled controls whether this account participates in calendar reads and
+	// sync. Nil mirrors the schema/default behavior: enabled.
+	Enabled *bool    `pkl:"enabled" json:"enabled"`
 	Dir     string   `pkl:"dir" json:"dir"`         // Subdir name under the vdir base path (default: alias, else lowercased name)
-	Include []string `pkl:"include" json:"include"` // Calendar display names to export (empty = all)
+	Include []string `pkl:"include" json:"include"` // Calendar display names to export and sync (empty = all)
 	// Conflict overrides the global calendar.conflict policy for this account
 	// when an event changed on both sides: "remote" keeps the provider version
 	// (the local file is backed up first), "local" keeps the local file,
@@ -254,13 +257,20 @@ func (a *AccountConfig) CalendarDir() string {
 	return strings.ToLower(a.Name)
 }
 
-// CalendarInclude returns the list of calendar display names to export for
-// this account, or nil to export all calendars.
+// CalendarInclude returns the calendar display names included in export and
+// two-way sync for this account, or nil to include all calendars.
 func (a *AccountConfig) CalendarInclude() []string {
 	if a.Calendar == nil {
 		return nil
 	}
 	return a.Calendar.Include
+}
+
+// CalendarEnabled reports whether this account participates in calendar reads
+// and sync. Accounts remain enabled when the block or field is absent for
+// backwards compatibility with configs written before the switch existed.
+func (a *AccountConfig) CalendarEnabled() bool {
+	return a.Calendar == nil || a.Calendar.Enabled == nil || *a.Calendar.Enabled
 }
 
 // CalendarConflictPolicy resolves the two-way calendar sync conflict policy
@@ -330,9 +340,7 @@ func (a *AccountConfig) GetAuthEmail() string {
 
 // IsDelegatedMailbox reports whether this account authenticates as a different
 // user than its own address (a shared mailbox reached via a delegating token
-// owner). Its calendar endpoints resolve to the TOKEN OWNER's mailbox (/me),
-// so calendar-syncing it would just re-fetch the owner account's calendars
-// into a second directory — calendar autosync skips these.
+// owner).
 func (a *AccountConfig) IsDelegatedMailbox() bool {
 	return a.AuthEmail != "" && a.AuthEmail != a.Email
 }

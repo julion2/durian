@@ -7,6 +7,7 @@ import (
 
 	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/julion2/durian/cli/internal/calendarsync"
+	"github.com/julion2/durian/cli/internal/config"
 )
 
 // ParseRSVPVerb/SetOwnerResponse moved to cli/internal/calendar (rsvp_test.go
@@ -21,6 +22,86 @@ func TestParseHexColor(t *testing.T) {
 	}
 	if _, _, _, ok := parseHexColor(""); ok {
 		t.Error("parseHexColor(empty): want ok=false")
+	}
+}
+
+func TestGUIOperationAllowsOnlyMatchingPlannerActions(t *testing.T) {
+	tests := []struct {
+		operation string
+		kind      calendarsync.ActionKind
+		want      bool
+	}{
+		{"save", calendarsync.ActionUploadCreate, true},
+		{"save", calendarsync.ActionUploadUpdate, true},
+		{"save", calendarsync.ActionAdopt, true},
+		{"save", calendarsync.ActionDownloadUpdate, false},
+		{"save", calendarsync.ActionConflict, false},
+		{"rsvp", calendarsync.ActionRsvp, true},
+		{"rsvp", calendarsync.ActionUploadUpdate, false},
+		{"delete", calendarsync.ActionDeleteRemote, true},
+		{"delete", calendarsync.ActionDropStatus, true},
+		{"delete", calendarsync.ActionDownloadNew, false},
+		{"unknown", calendarsync.ActionUploadCreate, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.operation+"/"+string(tt.kind), func(t *testing.T) {
+			if got := guiOperationAllows(tt.operation, calendarsync.Action{Kind: tt.kind}); got != tt.want {
+				t.Fatalf("guiOperationAllows(%q, %q) = %v, want %v", tt.operation, tt.kind, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCalendarSyncTargetsAllEligibleAccounts(t *testing.T) {
+	disabled := false
+	cfg := &config.Config{Accounts: []config.AccountConfig{
+		{Name: "Password only", Alias: "imap"},
+		{Name: "Microsoft", Alias: "work", OAuth: &config.OAuthConfig{Provider: "microsoft"}},
+		{Name: "Unsupported", Alias: "other", OAuth: &config.OAuthConfig{Provider: "other"}},
+		{Name: "Google", Alias: "personal", OAuth: &config.OAuthConfig{Provider: "google"}},
+		{Name: "Disabled", Alias: "disabled", OAuth: &config.OAuthConfig{Provider: "microsoft"}, Calendar: &config.AccountCalendarConfig{Enabled: &disabled}},
+	}}
+
+	got, err := calendarSyncTargets(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Alias != "work" || got[1].Alias != "personal" {
+		t.Fatalf("targets = %+v, want [work personal]", got)
+	}
+}
+
+func TestCalendarSyncTargetsRejectsExplicitDisabledAccount(t *testing.T) {
+	disabled := false
+	cfg := &config.Config{Accounts: []config.AccountConfig{{
+		Name: "Work", Alias: "work", OAuth: &config.OAuthConfig{Provider: "microsoft"},
+		Calendar: &config.AccountCalendarConfig{Enabled: &disabled},
+	}}}
+
+	if _, err := calendarSyncTargets(cfg, []string{"work"}); err == nil || !strings.Contains(err.Error(), "calendar is disabled") {
+		t.Fatalf("calendarSyncTargets error = %v, want calendar is disabled", err)
+	}
+}
+
+func TestCalendarSyncTargetsExplicitAccount(t *testing.T) {
+	cfg := &config.Config{Accounts: []config.AccountConfig{
+		{Name: "Work", Alias: "work", OAuth: &config.OAuthConfig{Provider: "microsoft"}},
+		{Name: "Personal", Alias: "personal", OAuth: &config.OAuthConfig{Provider: "google"}},
+	}}
+
+	got, err := calendarSyncTargets(cfg, []string{"personal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Alias != "personal" {
+		t.Fatalf("targets = %+v, want [personal]", got)
+	}
+}
+
+func TestCalendarSyncTargetsRequiresEligibleAccount(t *testing.T) {
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "Password only"}}}
+	if _, err := calendarSyncTargets(cfg, nil); err == nil {
+		t.Fatal("calendarSyncTargets = nil error, want no eligible accounts error")
 	}
 }
 
