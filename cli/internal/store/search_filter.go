@@ -38,8 +38,9 @@ const (
 // extractFTSTerms walks the parsed AST and returns every term that
 // flowed through the blind-FTS5 index (i.e. would benefit from a
 // post-decrypt recheck). Other field expressions (tag:, path:, date:,
-// from:, to:, cc:, has:) are SQL-side filters with no HMAC-collision
-// exposure and are skipped. NOT-wrapped subtrees are also skipped:
+// from:, to:, cc:, has:) are skipped here; typed attachment terms are tracked
+// separately because they require decryption for a different reason.
+// NOT-wrapped subtrees are also skipped:
 // a NOT can hide-then-reveal but cannot confirm a token match, so
 // the recheck has nothing to verify for negative branches.
 func extractFTSTerms(node exprNode) []ftsTerm {
@@ -76,26 +77,75 @@ type haystacks struct {
 	bodyLower    string // body_text + " " + body_html (HTML tags retained — they're stripped by tokenizer, so a tag-name match is still a real word match)
 }
 
+func isTypedAttachmentField(field *fieldExpr) bool {
+	return field.field == "has" && strings.HasPrefix(strings.ToLower(field.value), "attachment:")
+}
+
+func hasTypedAttachmentFilter(node exprNode) bool {
+	switch n := node.(type) {
+	case *binaryExpr:
+		return hasTypedAttachmentFilter(n.left) || hasTypedAttachmentFilter(n.right)
+	case *notExpr:
+		return hasTypedAttachmentFilter(n.child)
+	case *fieldExpr:
+		return isTypedAttachmentField(n)
+	default:
+		return false
+	}
+}
+
+// hasFTSLeaf reports whether evalPostDecrypt can encounter any FTS expression,
+// including one below NOT. This is broader than extractFTSTerms, which
+// intentionally omits negative terms when deciding whether FTS alone needs a
+// collision recheck.
+func hasFTSLeaf(node exprNode) bool {
+	switch n := node.(type) {
+	case *binaryExpr:
+		return hasFTSLeaf(n.left) || hasFTSLeaf(n.right)
+	case *notExpr:
+		return hasFTSLeaf(n.child)
+	case *bareExpr:
+		return true
+	case *fieldExpr:
+		return n.field == "subject"
+	default:
+		return false
+	}
+}
+
+func needsPostDecryptFilter(node exprNode) bool {
+	return len(extractFTSTerms(node)) > 0 || hasTypedAttachmentFilter(node)
+}
+
 // postDecryptFilter returns the subset of candidateIDs whose decrypted
-// plaintext actually contains every fts term. ADR §4 specifies this
-// post-decrypt recheck as mandatory for the blind-FTS path; the audit
-// found it was promised but never implemented.
+// plaintext satisfies the full query AST. ADR §4 requires this recheck for
+// blind-FTS terms, and encrypted attachment metadata also requires it because
+// SQL can only select a conservative candidate set.
 //
-// When terms is empty (search has no FTS-bound terms, e.g. tag:inbox
-// alone), the filter is a no-op and returns candidateIDs unchanged
-// — there is no collision-via-search-count oracle to plug because the
-// blind-FTS index wasn't consulted.
+// When the query has neither kind of term (e.g. tag:inbox alone), the filter is
+// a no-op and returns candidateIDs unchanged.
 func (d *DB) postDecryptFilter(candidateIDs []int64, node exprNode) ([]int64, error) {
-	if node == nil || len(candidateIDs) == 0 || len(extractFTSTerms(node)) == 0 {
+	if node == nil || len(candidateIDs) == 0 || !needsPostDecryptFilter(node) {
 		return candidateIDs, nil
 	}
-	hs, err := d.postDecryptFetch(candidateIDs)
-	if err != nil {
-		return nil, fmt.Errorf("post-decrypt fetch: %w", err)
+	var hs map[int64]haystacks
+	var err error
+	if hasFTSLeaf(node) {
+		hs, err = d.postDecryptFetch(candidateIDs)
+		if err != nil {
+			return nil, fmt.Errorf("post-decrypt fetch: %w", err)
+		}
+	}
+	var attachments map[int64][]Attachment
+	if hasTypedAttachmentFilter(node) {
+		attachments, err = d.GetAttachmentsByMessages(candidateIDs)
+		if err != nil {
+			return nil, fmt.Errorf("post-decrypt attachments: %w", err)
+		}
 	}
 	// Per-candidate truth for each non-FTS leaf (tag:/from:/date:/...). Without
-	// it, evalFTS would assume those branches match, and an `OR` with a non-FTS
-	// branch (e.g. `from:alice OR hawaii`) would keep a message that only
+	// it, evalPostDecrypt would assume those branches match, and an `OR` with a
+	// non-FTS branch (e.g. `from:alice OR hawaii`) would keep a message that only
 	// entered through a blind-index collision for the FTS term — re-opening the
 	// search-count oracle the recheck exists to close.
 	leafSets, err := d.sqlLeafSets(node, candidateIDs)
@@ -105,14 +155,14 @@ func (d *DB) postDecryptFilter(candidateIDs []int64, node exprNode) ([]int64, er
 	lower := cases.Lower(language.Und)
 	surviving := candidateIDs[:0]
 	for _, id := range candidateIDs {
-		hay, ok := hs[id]
-		if !ok {
+		hay, messageFound := hs[id]
+		if hs != nil && !messageFound {
 			// Row vanished between FTS-MATCH and fetch (DELETE race).
 			// Conservatively drop — better a stale empty result than a
 			// false positive that the attacker can use as a signal.
 			continue
 		}
-		if evalFTS(node, hay, id, lower, leafSets) {
+		if evalPostDecrypt(node, hay, attachments[id], id, lower, leafSets) {
 			surviving = append(surviving, id)
 		}
 	}
@@ -122,7 +172,7 @@ func (d *DB) postDecryptFilter(candidateIDs []int64, node exprNode) ([]int64, er
 // sqlLeafSets computes, for every non-FTS field leaf in the query, the subset of
 // candidateIDs that genuinely satisfy that leaf's SQL predicate — reusing
 // fieldToSQL so the recheck can't drift from the candidate query's semantics.
-// evalFTS consults these instead of assuming a non-FTS branch matched. Returns
+// evalPostDecrypt consults these instead of assuming a non-FTS branch matched. Returns
 // nil when the query has no non-FTS leaves (a pure-FTS query needs none).
 func (d *DB) sqlLeafSets(node exprNode, ids []int64) (map[*fieldExpr]map[int64]bool, error) {
 	var leaves []*fieldExpr
@@ -169,7 +219,7 @@ func (d *DB) sqlLeafSets(node exprNode, ids []int64) (map[*fieldExpr]map[int64]b
 
 // collectSQLLeaves gathers every field leaf that is enforced in SQL rather than
 // through the blind-FTS index (i.e. not subject:). bare/subject FTS leaves and
-// star are handled by evalFTS directly.
+// star are handled by evalPostDecrypt directly.
 func collectSQLLeaves(node exprNode, out *[]*fieldExpr) {
 	switch n := node.(type) {
 	case *binaryExpr:
@@ -178,36 +228,36 @@ func collectSQLLeaves(node exprNode, out *[]*fieldExpr) {
 	case *notExpr:
 		collectSQLLeaves(n.child, out)
 	case *fieldExpr:
-		if n.field != "subject" {
+		if n.field != "subject" && !isTypedAttachmentField(n) {
 			*out = append(*out, n)
 		}
 	}
 }
 
-// evalFTS re-evaluates a query's blind-FTS conditions against one decrypted
-// message, mirroring the boolean structure the SQL WHERE clause used. This is
-// what keeps the collision recheck honest for positive FTS terms WITHOUT
-// collapsing OR into AND — the earlier "every extracted term must match" list
-// silently turned `a OR b` into `a AND b`, shrinking (not growing) the result
-// set with each added OR branch.
+// evalPostDecrypt re-evaluates encrypted search conditions against one
+// decrypted message, mirroring the boolean structure the SQL WHERE clause used.
+// This keeps the blind-FTS collision recheck honest and restores the exact
+// semantics of typed attachment filters whose SQL predicate is only a coarse
+// candidate selector.
 //
 //   - FTS leaves (bare, subject:) are substring-checked against the plaintext.
-//   - Non-FTS field leaves (tag:, from:, to:, date:, path:, has:, ...) use their
+//   - Typed attachment leaves match against decrypted filename/content-type.
+//   - Other non-FTS field leaves (tag:, from:, to:, date:, path:, ...) use their
 //     real per-candidate SQL truth from leafSets, NOT a blanket true — otherwise
 //     an `OR` with a non-FTS branch would mask a blind-index collision in the
 //     FTS branch and leak it through SearchCount.
 //   - NOT subtrees are negated over the real evaluation of their child, so a
 //     `hawaii OR NOT tag:x` cannot keep a collision candidate that actually has
 //     tag x.
-func evalFTS(node exprNode, hay haystacks, id int64, lower cases.Caser, leafSets map[*fieldExpr]map[int64]bool) bool {
+func evalPostDecrypt(node exprNode, hay haystacks, attachments []Attachment, id int64, lower cases.Caser, leafSets map[*fieldExpr]map[int64]bool) bool {
 	switch n := node.(type) {
 	case *binaryExpr:
 		if n.op == "OR" {
-			return evalFTS(n.left, hay, id, lower, leafSets) || evalFTS(n.right, hay, id, lower, leafSets)
+			return evalPostDecrypt(n.left, hay, attachments, id, lower, leafSets) || evalPostDecrypt(n.right, hay, attachments, id, lower, leafSets)
 		}
-		return evalFTS(n.left, hay, id, lower, leafSets) && evalFTS(n.right, hay, id, lower, leafSets)
+		return evalPostDecrypt(n.left, hay, attachments, id, lower, leafSets) && evalPostDecrypt(n.right, hay, attachments, id, lower, leafSets)
 	case *notExpr:
-		return !evalFTS(n.child, hay, id, lower, leafSets)
+		return !evalPostDecrypt(n.child, hay, attachments, id, lower, leafSets)
 	case *bareExpr:
 		t := ftsTerm{value: lower.String(n.value), phrase: n.phrase, scope: ftsScopeBare}
 		return termMatchesHay(t, hay.subjectLower+"\x00"+hay.bodyLower)
@@ -215,6 +265,16 @@ func evalFTS(node exprNode, hay haystacks, id int64, lower cases.Caser, leafSets
 		if n.field == "subject" {
 			t := ftsTerm{value: lower.String(n.value), phrase: n.phrase, scope: ftsScopeSubject}
 			return termMatchesHay(t, hay.subjectLower)
+		}
+		if isTypedAttachmentField(n) {
+			wantType := lower.String(n.value[len("attachment:"):])
+			for _, attachment := range attachments {
+				if strings.Contains(lower.String(attachment.ContentType), wantType) ||
+					strings.HasSuffix(lower.String(attachment.Filename), "."+wantType) {
+					return true
+				}
+			}
+			return false
 		}
 		return leafSets[n][id]
 	default: // starExpr matches every row

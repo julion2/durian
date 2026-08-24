@@ -112,6 +112,72 @@ func TestSearch_Subject(t *testing.T) {
 	}
 }
 
+func TestSearch_HasAttachmentTypeDecryptsMetadata(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	messages := []*Message{
+		{MessageID: "alpha@x", Subject: "Alpha", FromAddr: "alpha@x", Date: now, CreatedAt: now},
+		{MessageID: "beta@x", Subject: "Beta", FromAddr: "beta@x", Date: now + 1, CreatedAt: now + 1},
+		{MessageID: "gamma@x", Subject: "Gamma", FromAddr: "gamma@x", Date: now + 2, CreatedAt: now + 2},
+		{MessageID: "delta@x", Subject: "Delta", FromAddr: "delta@x", Date: now + 3, CreatedAt: now + 3},
+	}
+	for _, message := range messages {
+		if err := db.InsertMessage(message); err != nil {
+			t.Fatalf("insert message %s: %v", message.MessageID, err)
+		}
+	}
+	attachments := []*Attachment{
+		// The matching attachment is deliberately second on Alpha and only
+		// matches by its case-insensitive filename suffix.
+		{MessageDBID: messages[0].ID, PartID: 1, Filename: "readme.txt", ContentType: "text/plain"},
+		{MessageDBID: messages[0].ID, PartID: 2, Filename: "report.PDF", ContentType: "application/octet-stream"},
+		// Beta matches by content type despite having no useful extension.
+		{MessageDBID: messages[1].ID, PartID: 1, Filename: "scan.bin", ContentType: "application/pdf"},
+		{MessageDBID: messages[2].ID, PartID: 1, Filename: "photo.jpg", ContentType: "image/jpeg"},
+	}
+	for _, attachment := range attachments {
+		if err := db.InsertAttachment(attachment); err != nil {
+			t.Fatalf("insert attachment %s: %v", attachment.Filename, err)
+		}
+	}
+
+	assertSubjects := func(query string, want ...string) {
+		t.Helper()
+		results, err := db.Search(query, 50)
+		if err != nil {
+			t.Fatalf("search %q: %v", query, err)
+		}
+		got := make(map[string]bool, len(results))
+		for _, result := range results {
+			got[result.Subject] = true
+		}
+		if len(got) != len(want) {
+			t.Fatalf("search %q subjects = %v, want %v", query, got, want)
+		}
+		for _, subject := range want {
+			if !got[subject] {
+				t.Errorf("search %q missing subject %q (got %v)", query, subject, got)
+			}
+		}
+	}
+
+	assertSubjects("has:attachment:pdf", "Alpha", "Beta")
+	assertSubjects("has:attachment", "Alpha", "Beta", "Gamma")
+	assertSubjects("has:attachment:xlsx")
+	assertSubjects("NOT has:attachment:pdf", "Gamma", "Delta")
+	assertSubjects("has:attachment:pdf OR from:delta@x", "Alpha", "Beta", "Delta")
+	assertSubjects("has:attachment:pdf AND from:alpha@x", "Alpha")
+	assertSubjects("has:attachment:xlsx OR NOT alpha", "Beta", "Gamma", "Delta")
+
+	count, err := db.SearchCount("has:attachment:pdf")
+	if err != nil {
+		t.Fatalf("search count: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("SearchCount(has:attachment:pdf) = %d, want 2", count)
+	}
+}
+
 // TestSearch_PhraseWordOrder asserts that a quoted phrase query
 // distinguishes word order via the bigram tokens: two messages share
 // the same word set but differ in adjacent-pair sequence — only the
