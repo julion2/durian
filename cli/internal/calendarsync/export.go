@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/calendar"
 )
 
 // prodID identifies durian as the generator in exported VCALENDARs. The
@@ -67,7 +69,7 @@ func Export(ctx context.Context, p CalendarProvider, outDir string, from, to tim
 		for _, e := range events {
 			// The per-occurrence provider event id (not the iCalUID, which is
 			// shared across a recurring series) keeps filenames unique.
-			path := filepath.Join(calDir, sanitizeName(e.ID)+".ics")
+			path := filepath.Join(calDir, calendar.EventFileName(e.ID))
 			if err := WriteFileAtomic(path, []byte(EventToICS(e, prodID)), 0o600); err != nil {
 				return stats, fmt.Errorf("failed to write %s: %w", path, err)
 			}

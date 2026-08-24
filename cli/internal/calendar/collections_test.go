@@ -101,6 +101,20 @@ func TestReadCollectionsPrefersTheConfiguredName(t *testing.T) {
 	}
 }
 
+func TestCollectionsUnderSkipsHiddenRecoveryDirectories(t *testing.T) {
+	accountDir := t.TempDir()
+	seedCollection(t, filepath.Join(accountDir, "Work"), "uid-a", "Termin")
+	seedCollection(t, filepath.Join(accountDir, ".orphaned"), "uid-b", "Backup")
+
+	cols, err := CollectionsUnder(accountDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cols) != 1 || filepath.Base(cols[0].Dir) != "Work" {
+		t.Fatalf("collections = %+v, want only Work", cols)
+	}
+}
+
 func TestWriteEventInCreatesTheDirectory(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "privat")
 	cols := []Collection{{Dir: dir, Name: "Privat"}}

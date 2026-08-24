@@ -131,15 +131,22 @@ delete a remote event** without an interactive sync:
   `durian calendar sync`.
 
 A cross-process run lock serializes Load → Plan → Apply → Save per directory so a
-manual sync and the autosync loop can never collide.
+manual sync, GUI-triggered event sync and the autosync loop can never collide.
+
+The GUI may apply one event immediately after an explicit Save, Send, RSVP or
+Delete action. It still runs the normal account planner, but filters the result
+to the exact calendar + UID before Apply; unrelated pending actions never ride
+along. A target conflict is refused and left for the interactive CLI sync. Its
+newly fetched mirror is deliberately not persisted because actions for other
+events were not applied; the next autosync consumes them normally.
 
 ## Alternatives considered
 
 - **Server as source of truth (no local store).** Rejected: breaks offline use
   and makes every edit a network round-trip. The whole product is local-first.
-- **Push edits immediately.** Rejected: sends mail on every change and on every
-  background cycle, with no chance to review. The preview/confirm gate is the
-  point.
+- **Push every detected edit automatically.** Rejected: a background cycle must
+  not infer send intent. The GUI may push one event when Save/Send/RSVP/Delete
+  provides that intent; unattended autosync remains filtered.
 - **A full recurrence model that always re-serializes.** Rejected: guarantees
   corruption of any rule the model doesn't fully cover. The opaque-passthrough is
   strictly safer.
@@ -151,8 +158,9 @@ manual sync and the autosync loop can never collide.
 
 - The calendar is fully usable offline; edits are instant and reversible via the
   `.conflict` backups.
-- No calendar action can email anyone without an explicit, previewed
-  `durian calendar sync` — including everything the GUI does.
+- No unattended calendar action can email anyone. The CLI previews a whole
+  account plan; the GUI instead names the external effect as Send/Send Update
+  and applies only the event the user explicitly acted on.
 - Adding a provider is a `CalendarProvider` implementation, nothing in the engine.
 - A single cancelled occurrence of an Outlook series can linger locally —
   Microsoft Graph v1.0 gives no tombstone for it. Google is unaffected. This is

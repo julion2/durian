@@ -1341,6 +1341,20 @@ func TestFileStateStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFileStateStoreLoadReadOnlyDoesNotCreateDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "missing")
+	state, err := NewFileStateStore(dir).LoadReadOnly()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Calendars) != 0 {
+		t.Fatalf("state = %+v, want empty", state)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("read-only load created directory: %v", err)
+	}
+}
+
 // MARK: - Owner RSVP
 
 func TestRSVPSendsOnlyOnRealResponseChange(t *testing.T) {
@@ -2023,6 +2037,27 @@ func TestWriteFileAtomicLeavesNoScannableTemp(t *testing.T) {
 	}
 	if strings.HasSuffix(".uid-1.ics.12345.ics-tmp", ".ics") {
 		t.Error("the temp suffix must not end in .ics, or the scan would parse it")
+	}
+}
+
+func TestSyncDownloadUsesBoundedFilenameForLongUID(t *testing.T) {
+	h := newSyncHarness(t)
+	uid := strings.Repeat("040000008200E00074C5B7101A82E008", 12)
+	h.events = []map[string]any{masterEvent("g-long", uid, "Long UID", "ck1")}
+	stats := h.sync(SyncOptions{})
+	if stats != (SyncStats{Downloaded: 1}) {
+		t.Fatalf("stats = %+v, want Downloaded=1", stats)
+	}
+	name := calendar.EventFileName(uid)
+	if len(name) > 255 {
+		t.Fatalf("bounded filename has %d bytes: %q", len(name), name)
+	}
+	body, err := os.ReadFile(filepath.Join(h.calDir, name))
+	if err != nil {
+		t.Fatalf("long-UID event missing: %v", err)
+	}
+	if !strings.Contains(string(body), "UID:"+uid) {
+		t.Error("hashed filename did not preserve the full UID in event content")
 	}
 }
 

@@ -15,10 +15,12 @@ package calendarsync
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -63,13 +65,101 @@ type ItemStatus struct {
 // CalendarStatus is the sync status of one calendar: one ItemStatus per item
 // UID.
 type CalendarStatus struct {
+	// Name and Dir bind a remote calendar ID to its stable local collection.
+	// The display name may change remotely; Dir deliberately remains stable.
+	Name  string                `json:"name,omitempty"`
+	Dir   string                `json:"dir,omitempty"`
 	Items map[string]ItemStatus `json:"items"`
 }
 
 // SyncState is the whole per-account sync status: one CalendarStatus per
 // remote calendar id.
 type SyncState struct {
+	// Mailbox identifies the remote mailbox represented by this vdir. It
+	// prevents a changed account target from treating unrelated local files as
+	// new events to upload into the new mailbox.
+	Mailbox   string                    `json:"mailbox,omitempty"`
 	Calendars map[string]CalendarStatus `json:"calendars"`
+}
+
+// ErrMailboxRebindNeeded is returned when a dry run detects that the vdir
+// must first be quarantined before it can safely represent another mailbox.
+var ErrMailboxRebindNeeded = errors.New("calendar vdir belongs to another mailbox")
+
+// BindMailbox binds state and its vdir to mailbox. Legacy delegated-calendar
+// state is known to contain the authenticating user's /me calendars, so it is
+// treated as a mismatch even though old state files have no mailbox marker.
+// On a mismatch every existing entry except the held run-lock file is moved
+// into a timestamped sibling backup and a fresh state is returned. No local
+// data is deleted, and the account directory itself stays in place so the
+// run-level flock remains effective throughout the migration.
+func BindMailbox(dir string, state *SyncState, mailbox string, legacyDelegated, migrate bool) (*SyncState, string, error) {
+	state.normalize()
+	mismatch := state.Mailbox != "" && !strings.EqualFold(state.Mailbox, mailbox)
+	legacyMismatch := state.Mailbox == "" && legacyDelegated && len(state.Calendars) > 0
+	if state.Mailbox == "" && legacyDelegated && !legacyMismatch {
+		entries, err := os.ReadDir(dir)
+		if err != nil && !os.IsNotExist(err) {
+			return state, "", fmt.Errorf("failed to inspect legacy calendar vdir: %w", err)
+		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), ".") && entry.Name() != runLockName {
+				legacyMismatch = true
+				break
+			}
+		}
+	}
+	if !mismatch && !legacyMismatch {
+		state.Mailbox = mailbox
+		return state, "", nil
+	}
+	if !migrate {
+		return state, "", ErrMailboxRebindNeeded
+	}
+
+	backup := fmt.Sprintf("%s.mailbox-backup-%d", dir, time.Now().Unix())
+	for n := 2; ; n++ {
+		if _, err := os.Stat(backup); err != nil {
+			if os.IsNotExist(err) {
+				break
+			}
+			return state, "", fmt.Errorf("failed to inspect calendar mailbox backup %s: %w", backup, err)
+		}
+		backup = fmt.Sprintf("%s.mailbox-backup-%d-%d", dir, time.Now().Unix(), n)
+	}
+	if err := os.MkdirAll(backup, 0o700); err != nil {
+		return state, "", fmt.Errorf("failed to create calendar mailbox backup: %w", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return state, "", fmt.Errorf("failed to read calendar vdir for mailbox migration: %w", err)
+	}
+	moved := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Name() == runLockName {
+			continue
+		}
+		if err := os.Rename(filepath.Join(dir, entry.Name()), filepath.Join(backup, entry.Name())); err != nil {
+			migrationErr := fmt.Errorf("failed to quarantine calendar vdir entry %s: %w", entry.Name(), err)
+			var rollbackErrs []error
+			for i := len(moved) - 1; i >= 0; i-- {
+				name := moved[i]
+				if rollbackErr := os.Rename(filepath.Join(backup, name), filepath.Join(dir, name)); rollbackErr != nil {
+					rollbackErrs = append(rollbackErrs, fmt.Errorf("failed to restore calendar vdir entry %s: %w", name, rollbackErr))
+				}
+			}
+			if len(rollbackErrs) == 0 {
+				if removeErr := os.Remove(backup); removeErr != nil {
+					rollbackErrs = append(rollbackErrs, fmt.Errorf("failed to remove empty calendar mailbox backup: %w", removeErr))
+				}
+			}
+			return state, backup, errors.Join(append([]error{migrationErr}, rollbackErrs...)...)
+		}
+		moved = append(moved, entry.Name())
+	}
+	fresh := newSyncState()
+	fresh.Mailbox = mailbox
+	return fresh, backup, nil
 }
 
 // newSyncState returns an empty, fully initialized SyncState.
@@ -211,6 +301,25 @@ func (f *FileStateStore) Load() (*SyncState, error) {
 				"backup", backupPath)
 		}
 		return newSyncState(), nil
+	}
+	state.normalize()
+	return state, nil
+}
+
+// LoadReadOnly reads sync state without creating the vdir, lock file, or a
+// corruption backup. It is for read-only callers that only need collection
+// metadata and must not turn a GET request into a filesystem write.
+func (f *FileStateStore) LoadReadOnly() (*SyncState, error) {
+	data, err := os.ReadFile(f.path())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return newSyncState(), nil
+		}
+		return nil, fmt.Errorf("failed to read calendar state file: %w", err)
+	}
+	state := &SyncState{}
+	if err := json.Unmarshal(data, state); err != nil {
+		return nil, fmt.Errorf("failed to parse calendar state file: %w", err)
 	}
 	state.normalize()
 	return state, nil
