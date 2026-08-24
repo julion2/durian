@@ -4,7 +4,12 @@
 //
 //  Detail pane for one calendar event: time, location, organizer, attendees
 //  with their RSVP status, online-meeting join link and description.
-//  Presented as grouped rounded cards on the pane background.
+//
+//  Laid out flush rather than as a stack of bordered cards. The pane's facts
+//  are mostly one line each — a date, a place, a calendar name — and a card
+//  around a single line adds a border, a radius and a heading to group
+//  something that proximity already groups. What is left is a leading glyph
+//  per row, which names the kind of fact without spending a text label on it.
 //
 
 import SwiftUI
@@ -13,144 +18,142 @@ struct CalendarEventDetailView: View {
     let event: CalendarEvent
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                header
+        VStack(alignment: .leading, spacing: 0) {
+            header
 
-                whenCard
+            Divider().padding(.vertical, 14)
 
+            VStack(alignment: .leading, spacing: 10) {
                 if let location = event.location, !location.isEmpty {
-                    card("Location") {
-                        Text(location)
-                            .font(.callout)
-                            .foregroundStyle(Color.Detail.textBody)
-                            .textSelection(.enabled)
-                    }
+                    factRow("mappin.and.ellipse", location)
                 }
-
-                calendarCard
-
-                if event.organizer != nil || !event.attendees.isEmpty {
-                    peopleCard
+                factRow("calendar", event.calendar, dot: calendarColor)
+                if event.recurring {
+                    factRow("repeat", "Repeats")
                 }
-
-                rsvpCard
-
-                if let urlString = event.onlineMeetingURL, let url = URL(string: urlString) {
-                    Link(destination: url) {
-                        Label("Join online meeting", systemImage: "video.fill")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.regular)
-                }
-
-                if let description = event.description, !description.isEmpty {
-                    card("Description") {
-                        Text(description.trimmingCharacters(in: .whitespacesAndNewlines))
-                            .font(.callout)
-                            .foregroundStyle(Color.Detail.textBody)
-                            .textSelection(.enabled)
-                    }
-                }
-
-                actionRow
-
-                Spacer(minLength: 0)
             }
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let urlString = event.onlineMeetingURL, let url = URL(string: urlString) {
+                Link(destination: url) {
+                    Label("Join online meeting", systemImage: "video.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(ProfileManager.shared.resolvedAccentColor)
+                .padding(.top, 16)
+            }
+
+            if event.organizer != nil || !displayAttendees.isEmpty {
+                section("People") { people }
+            }
+
+            rsvpSection
+
+            if let description = event.description, !description.isEmpty {
+                section("Notes") {
+                    Text(description.trimmingCharacters(in: .whitespacesAndNewlines))
+                        .font(.callout)
+                        .foregroundStyle(Color.Detail.textBody)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
         }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
     // MARK: - Header
 
+    /// Title plus the one fact important enough to sit with it. Everything
+    /// else is a row below; the time is what you came here to read.
     private var header: some View {
         HStack(alignment: .top, spacing: 10) {
             RoundedRectangle(cornerRadius: 2)
                 .fill(calendarColor)
                 .frame(width: 4)
-                .frame(maxHeight: 24)
-                .padding(.top, 3)
-            Text(event.displaySubject)
-                .font(.title2).fontWeight(.semibold)
-                .foregroundStyle(Color.Detail.textPrimary)
-                .textSelection(.enabled)
+                .frame(maxHeight: .infinity)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(event.displaySubject)
+                    .font(.title3).fontWeight(.semibold)
+                    .foregroundStyle(Color.Detail.textPrimary)
+                    .textSelection(.enabled)
+                Text(whenText)
+                    .font(.callout)
+                    .foregroundStyle(Color.Detail.textSecondary)
+                    .textSelection(.enabled)
+            }
         }
-        .padding(.bottom, 4)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
-    // MARK: - Cards
+    // MARK: - Rows
 
-    private var whenCard: some View {
-        card("When") {
-            Text(whenText)
+    /// One fact: a glyph naming its kind, then the value. The glyph replaces
+    /// the caption heading a card would have needed.
+    private func factRow(_ symbol: String, _ text: String, dot: Color? = nil) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol)
+                .font(.system(size: 12))
+                .foregroundStyle(Color.Detail.textTertiary)
+                .frame(width: 16)
+            if let dot {
+                Circle().fill(dot).frame(width: 8, height: 8)
+            }
+            Text(text)
                 .font(.callout)
                 .foregroundStyle(Color.Detail.textBody)
                 .textSelection(.enabled)
-            if event.recurring {
-                Label("Recurring event", systemImage: "repeat")
-                    .font(.caption)
-                    .foregroundStyle(Color.Detail.textSecondary)
-            }
+            Spacer(minLength: 0)
         }
     }
 
-    private var calendarCard: some View {
-        card("Calendar") {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(calendarColor)
-                    .frame(width: 10, height: 10)
-                Text(event.calendar)
-                    .font(.callout)
-                    .foregroundStyle(Color.Detail.textBody)
-            }
+    /// A titled group. Headings survive where a run of rows genuinely needs
+    /// naming — a list of faces, a block of prose — and nowhere else.
+    private func section<Content: View>(_ title: String,
+                                        @ViewBuilder content: () -> Content) -> some View
+    {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.caption).fontWeight(.semibold)
+                .foregroundStyle(Color.Detail.textTertiary)
+            content()
         }
+        .padding(.top, 20)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var peopleCard: some View {
-        card(peopleTitle) {
-            VStack(alignment: .leading, spacing: 10) {
-                if let organizer = event.organizer {
-                    HStack(spacing: 8) {
-                        AvatarView(name: organizer.displayName, email: organizer.email, size: 28)
-                        Text(organizer.displayName)
-                            .font(.callout)
-                            .foregroundStyle(Color.Detail.textBody)
-                            .lineLimit(1)
-                        Spacer(minLength: 8)
-                        Text("Organizer")
-                            .font(.caption2)
-                            .foregroundStyle(Color.Detail.textSecondary)
-                    }
+    private var people: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let organizer = event.organizer {
+                personRow(name: organizer.displayName, email: organizer.email) {
+                    Text("Organizer")
+                        .font(.caption2)
+                        .foregroundStyle(Color.Detail.textTertiary)
                 }
-                ForEach(displayAttendees) { attendee in
-                    HStack(spacing: 8) {
-                        AvatarView(name: attendee.displayName, email: attendee.email, size: 28)
-                        Text(attendee.displayName)
-                            .font(.callout)
-                            .foregroundStyle(Color.Detail.textBody)
-                            .lineLimit(1)
-                        Spacer(minLength: 8)
-                        statusBadge(attendee.response, label: attendee.responseLabel)
-                    }
+            }
+            ForEach(displayAttendees) { attendee in
+                personRow(name: attendee.displayName, email: attendee.email) {
+                    statusBadge(attendee.response, label: attendee.responseLabel)
                 }
             }
         }
     }
 
-    /// Attendees without the organizer: some providers (e.g. Google) list the
-    /// organizer as a self-attendee, which would otherwise show them twice —
-    /// once in the organizer row and once here.
-    private var displayAttendees: [CalendarAttendee] {
-        guard let org = event.organizer?.email, !org.isEmpty else { return event.attendees }
-        return event.attendees.filter { $0.email.caseInsensitiveCompare(org) != .orderedSame }
-    }
-
-    private var peopleTitle: String {
-        displayAttendees.isEmpty ? "People" : "People (\(displayAttendees.count))"
+    private func personRow<Trailing: View>(name: String, email: String,
+                                           @ViewBuilder trailing: () -> Trailing) -> some View
+    {
+        HStack(spacing: 8) {
+            AvatarView(name: name, email: email, size: 26)
+            Text(name)
+                .font(.callout)
+                .foregroundStyle(Color.Detail.textBody)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            trailing()
+        }
     }
 
     // MARK: - RSVP
@@ -162,82 +165,41 @@ struct CalendarEventDetailView: View {
     private var showRSVP: Bool { !event.attendees.isEmpty && !isOrganizer }
 
     @ViewBuilder
-    private var rsvpCard: some View {
-        if showRSVP || myResponseLabel != nil {
-            card("My status") {
-                if let response = myResponseLabel {
-                    Text(response)
-                        .font(.callout)
-                        .foregroundStyle(Color.Detail.textBody)
-                }
-                if showRSVP {
-                    HStack(spacing: 8) {
-                        rsvpButton("Accept", target: "accepted", systemImage: "checkmark")
-                        rsvpButton("Tentative", target: "tentativelyAccepted", systemImage: "questionmark")
-                        rsvpButton("Decline", target: "declined", systemImage: "xmark")
-                    }
+    private var rsvpSection: some View {
+        if showRSVP {
+            section("My status") {
+                HStack(spacing: 8) {
+                    rsvpButton("Accept", target: "accepted", systemImage: "checkmark")
+                    rsvpButton("Tentative", target: "tentativelyAccepted", systemImage: "questionmark")
+                    rsvpButton("Decline", target: "declined", systemImage: "xmark")
                 }
             }
+        } else if let response = myResponseLabel {
+            factRow(statusGlyph(event.myResponse).0, response)
+                .padding(.top, 10)
         }
     }
 
+    /// The response already saved reads as filled; the other two as outlines,
+    /// so the card answers "what did I say" before it offers "say something
+    /// else".
+    @ViewBuilder
     private func rsvpButton(_ title: String, target: String, systemImage: String) -> some View {
         let isCurrent = event.myResponse == target
-        return Button {
-            CalendarManager.shared.requestRSVP(event, response: target)
-        } label: {
-            Label(title, systemImage: systemImage)
+        let action = { CalendarManager.shared.requestRSVP(event, response: target) }
+        if isCurrent {
+            Button(action: action) { Label(title, systemImage: systemImage) }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(ProfileManager.shared.resolvedAccentColor)
+        } else {
+            Button(action: action) { Label(title, systemImage: systemImage) }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
         }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .tint(isCurrent ? .accentColor : .secondary)
-    }
-
-    // MARK: - Actions
-
-    private var actionRow: some View {
-        HStack(spacing: 8) {
-            Button {
-                CalendarManager.shared.beginEdit()
-            } label: {
-                Label("Edit", systemImage: "pencil")
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            Spacer()
-            Button(role: .destructive) {
-                CalendarManager.shared.deleteSelected()
-            } label: {
-                Label("Delete", systemImage: "trash")
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .tint(.red)
-        }
-        .padding(.top, 4)
     }
 
     // MARK: - Styling helpers
-
-    /// A grouped rounded card: hairline border over the card surface, with an
-    /// optional caption heading above the content.
-    private func card<Content: View>(_ title: String? = nil,
-                                     @ViewBuilder content: () -> Content) -> some View
-    {
-        VStack(alignment: .leading, spacing: 8) {
-            if let title {
-                Text(title)
-                    .font(.caption).fontWeight(.semibold)
-                    .foregroundStyle(Color.Detail.textSecondary)
-            }
-            content()
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.Detail.cardBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 11))
-        .overlay(RoundedRectangle(cornerRadius: 11).stroke(Color.Detail.border, lineWidth: 1))
-    }
 
     /// PARTSTAT glyph + label for an attendee row's trailing edge.
     private func statusBadge(_ response: String?, label: String) -> some View {
@@ -248,7 +210,7 @@ struct CalendarEventDetailView: View {
                 .foregroundStyle(color)
             Text(label)
                 .font(.caption2)
-                .foregroundStyle(Color.Detail.textSecondary)
+                .foregroundStyle(Color.Detail.textTertiary)
         }
     }
 
@@ -261,24 +223,30 @@ struct CalendarEventDetailView: View {
         }
     }
 
+    /// Attendees without the organizer: some providers (e.g. Google) list the
+    /// organizer as a self-attendee, which would otherwise show them twice —
+    /// once in the organizer row and once here.
+    private var displayAttendees: [CalendarAttendee] {
+        guard let org = event.organizer?.email, !org.isEmpty else { return event.attendees }
+        return event.attendees.filter { $0.email.caseInsensitiveCompare(org) != .orderedSame }
+    }
+
     /// The event's calendar color (from the synced calendar list), used as a
     /// small accent — never as a large fill.
     private var calendarColor: Color {
-        CalendarManager.shared.calendars
-            .first { $0.name == event.calendar }?
-            .color ?? .secondary
+        CalendarManager.shared.color(for: event)
     }
 
     // MARK: - Formatting
 
     private var whenText: String {
         if event.allDay {
-            return "\(Self.dayFormatter.string(from: event.start)) (all-day)"
+            return "\(Self.dayFormatter.string(from: event.start)) · All-day"
         }
         let sameDay = Calendar.current.isDate(event.start, inSameDayAs: event.end)
         let day = Self.dayFormatter.string(from: event.start)
-        let startTime = Self.timeFormatter.string(from: event.start)
-        let endTime = Self.timeFormatter.string(from: event.end)
+        let startTime = CalendarTimeFormat.time(event.start)
+        let endTime = CalendarTimeFormat.time(event.end)
         if sameDay {
             return "\(day) · \(startTime) – \(endTime)"
         }
@@ -299,13 +267,6 @@ struct CalendarEventDetailView: View {
     private static let dayFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "EEEE, d MMMM yyyy"
-        return f
-    }()
-
-    private static let timeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.timeStyle = .short
-        f.dateStyle = .none
         return f
     }()
 }

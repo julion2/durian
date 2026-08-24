@@ -113,7 +113,9 @@ struct MiniMonthView: View {
             DayNumberBadge(date: day)
                 .background {
                     if isAnchor && !isToday {
-                        Circle().fill(Color.accentColor.opacity(0.2))
+                        // The same 0.2 accent wash the folder/tag/search
+                        // popups use for a selected row.
+                        Circle().fill(ProfileManager.shared.resolvedAccentColor.opacity(0.2))
                     }
                 }
                 .frame(maxWidth: .infinity)

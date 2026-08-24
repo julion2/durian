@@ -140,8 +140,20 @@ final class ProfileTests: XCTestCase {
     }
 
     func testColorHexInvalidFallback() {
-        let color = Color(hex: "XYZ")
-        XCTAssertNotNil(color)
+        let fallback = Color(red: 0.6, green: 0.4, blue: 0.2)
+        XCTAssertEqual(Color(hex: "XYZ"), fallback)
+        XCTAssertEqual(Color(hex: "123xyz"), fallback)
+        XCTAssertEqual(Color(hex: "FFFF"), fallback)
+        XCTAssertEqual(Color(hex: ""), fallback)
+    }
+
+    func testColorHexShorthandExpands() {
+        XCTAssertEqual(Color(hex: "F53"), Color(hex: "FF5533"))
+    }
+
+    func testContrastingForegroundForLightAndDarkColors() {
+        XCTAssertEqual(Color(hex: "FFFFFF").contrastingForeground(), .black)
+        XCTAssertEqual(Color(hex: "000000").contrastingForeground(), .white)
     }
 
     // MARK: - Profile.isAll

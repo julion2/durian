@@ -36,7 +36,7 @@ struct CalendarAgendaView: View {
                                 )
                                 .id(event.id)
                                 .contentShape(Rectangle())
-                                .onTapGesture { manager.selectedEventID = event.id }
+                                .calendarEventInteractions(event)
                             }
                         } header: {
                             dayHeader(group.date)

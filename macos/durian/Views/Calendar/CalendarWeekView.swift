@@ -81,9 +81,6 @@ struct CalendarWeekView: View {
 
     @State private var dragPreview = DragPreviewModel()
 
-    /// Which resize edge the pointer is currently over ("<uid>-s"/"-e"), so the
-    /// faint edge line shows only there. nil when no edge is hovered.
-    @State private var hoveredResizeEdge: String?
 
     var body: some View {
         // The GeometryReader supplies the day-column width the lane layout
@@ -94,10 +91,14 @@ struct CalendarWeekView: View {
             let geometry = TimeGeometry(hourHeight: hourHeight, dayWidth: colWidth,
                                         timeColumnWidth: timeColumnWidth,
                                         startHour: startHour, endHour: endHour)
+            // The week's days, resolved ONCE per body evaluation and passed
+            // down — the header rows, the layout and the column loop all need
+            // them, and the body re-evaluates on every resize-drag frame.
+            let days = weekDays
             // Computed ONCE per body for all 7 columns (and the move
             // preview) — a cache hit when neither events nor lane cap
             // changed, e.g. on every resize-drag step.
-            let layouts = layoutCache.layouts(days: weekDays, events: manager.events,
+            let layouts = layoutCache.layouts(days: days, events: manager.events,
                                               maxVisibleLanes: maxVisibleLanes(colWidth),
                                               calendar: calendar)
             ScrollViewReader { proxy in
@@ -106,7 +107,7 @@ struct CalendarWeekView: View {
                         Section {
                             HStack(alignment: .top, spacing: 0) {
                                 timeAxis
-                                ForEach(Array(weekDays.enumerated()), id: \.element) { index, day in
+                                ForEach(Array(days.enumerated()), id: \.element) { index, day in
                                     dayColumn(layouts[day] ?? DayLayoutIndex(), day: day,
                                               dayIndex: index, geometry: geometry)
                                         .frame(maxWidth: .infinity)
@@ -127,8 +128,8 @@ struct CalendarWeekView: View {
                             }
                         } header: {
                             VStack(spacing: 0) {
-                                dayHeaderRow
-                                allDayRow
+                                dayHeaderRow(days)
+                                allDayRow(days)
                                 Divider()
                             }
                             .background(Color(nsColor: .windowBackgroundColor))
@@ -161,10 +162,10 @@ struct CalendarWeekView: View {
     // MARK: - Header (pinned inside the scroll view so its columns share the
     // grid's width context and stay aligned).
 
-    private var dayHeaderRow: some View {
+    private func dayHeaderRow(_ days: [Date]) -> some View {
         HStack(spacing: 0) {
             Color.clear.frame(width: timeColumnWidth)
-            ForEach(weekDays, id: \.self) { day in
+            ForEach(days, id: \.self) { day in
                 VStack(spacing: 1) {
                     Text(Self.weekdayFormatter.string(from: day))
                         .font(.caption2).foregroundStyle(.secondary)
@@ -176,11 +177,14 @@ struct CalendarWeekView: View {
         .padding(.vertical, 4)
     }
 
-    private var allDayRow: some View {
+    private func allDayRow(_ days: [Date]) -> some View {
         HStack(alignment: .top, spacing: 0) {
-            Text("all-day").font(.system(size: 8)).foregroundStyle(.secondary)
-                .frame(width: timeColumnWidth)
-            ForEach(weekDays, id: \.self) { day in
+            Text("All-day")
+                .font(.system(size: 10))
+                .foregroundStyle(Color.Detail.textTertiary)
+                .padding(.trailing, 8)
+                .frame(width: timeColumnWidth, alignment: .trailing)
+            ForEach(days, id: \.self) { day in
                 VStack(spacing: 2) {
                     ForEach(allDayEvents(day)) { event in
                         eventChip(event)
@@ -199,13 +203,15 @@ struct CalendarWeekView: View {
     private var timeAxis: some View {
         VStack(alignment: .trailing, spacing: 0) {
             ForEach(startHour ..< endHour, id: \.self) { hour in
-                Text(String(format: "%02d", hour))
-                    .font(.system(size: 9)).foregroundStyle(.secondary)
+                Text(CalendarTimeFormat.axisHour(hour))
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.Detail.textTertiary)
                     .frame(height: hourHeight, alignment: .top)
                     .id("hour-\(hour)")
             }
         }
-        .frame(width: timeColumnWidth)
+        .padding(.trailing, 8)
+        .frame(width: timeColumnWidth, alignment: .trailing)
     }
 
     private func dayColumn(_ layout: DayLayoutIndex, day: Date, dayIndex: Int,
@@ -216,7 +222,9 @@ struct CalendarWeekView: View {
         }
         return ZStack(alignment: .topLeading) {
             ForEach(startHour ... endHour, id: \.self) { hour in
-                Rectangle().fill(Color.Detail.border.opacity(0.6))
+                // The grid recedes so the blocks can carry the contrast: the
+                // hour lines are a hint at the time axis, not a table rule.
+                Rectangle().fill(Color.Detail.border.opacity(0.45))
                     .frame(height: 0.5)
                     .frame(maxWidth: .infinity, alignment: .top)
                     .offset(y: geometry.y(forMinutes: hour * 60))
@@ -242,10 +250,11 @@ struct CalendarWeekView: View {
             if calendar.isDateInToday(day) {
                 nowIndicator(geometry: geometry)
             }
+            commandPreviewBlock(on: day, geometry: geometry)
         }
         .frame(height: geometry.totalHeight, alignment: .top)
         .overlay(alignment: .trailing) {
-            Rectangle().fill(Color.Detail.border.opacity(0.6)).frame(width: 0.5)
+            Rectangle().fill(Color.Detail.border.opacity(0.45)).frame(width: 0.5)
         }
         .contentShape(Rectangle())
         // Double-click an empty part of a day to create a new event at that
@@ -283,6 +292,38 @@ struct CalendarWeekView: View {
                 .allowsHitTesting(false)
                 .zIndex(2)
             }
+        }
+    }
+
+    /// The event `:new …` would create, drawn while it is still being typed.
+    ///
+    /// It reads the SAME parse the Return key commits, so what the grid shows
+    /// and what gets saved cannot drift. Dashed, because it does not exist
+    /// yet — a solid block would claim a commitment that has not happened.
+    @ViewBuilder
+    private func commandPreviewBlock(on day: Date, geometry: TimeGeometry) -> some View {
+        if manager.commandLineActive,
+           case .create(let start, let end, let title, _, _) = manager.commandPreview,
+           calendar.isDate(start, inSameDayAs: day)
+        {
+            let startMinutes = minutesFromMidnight(start)
+            let minutes = max(Int(end.timeIntervalSince(start) / 60), 15)
+            let shape = RoundedRectangle(cornerRadius: 8)
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.Detail.cursor)
+                .lineLimit(2)
+                .padding(.horizontal, 6).padding(.vertical, 3)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .frame(height: max(geometry.height(forMinutes: minutes), 16), alignment: .top)
+                .background(shape.fill(Color.Detail.cursor.opacity(0.10)))
+                .overlay(
+                    shape.strokeBorder(Color.Detail.cursor.opacity(0.8),
+                                       style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+                )
+                .offset(y: geometry.y(forMinutes: startMinutes))
+                .allowsHitTesting(false)
+                .zIndex(3)
         }
     }
 
@@ -327,13 +368,11 @@ struct CalendarWeekView: View {
         // the time label doesn't flicker in and out while the block is being
         // resized.
         return EventPillGridLabel(event: event, showsTime: committedHeight > 26)
-            // Extra leading room clears the pill's 3pt accent bar.
-            .padding(.leading, 7).padding(.trailing, 3).padding(.vertical, 2)
+            .padding(.horizontal, 6).padding(.vertical, 3)
             .frame(maxWidth: .infinity, alignment: .topLeading)
             .frame(height: height, alignment: .top)
-            .eventPill(color(for: event), variant: .timed, selected: selected,
-                       squareTop: block.continuesBefore, squareBottom: block.continuesAfter,
-                       cornerRadius: 4)
+            .eventPill(color(for: event), selected: selected,
+                       squareTop: block.continuesBefore, squareBottom: block.continuesAfter)
             .overlay(alignment: .top) {
                 if draggable { resizeHandle(event, edge: .resizeStart, blockHeight: height, geometry: geometry) }
             }
@@ -348,7 +387,7 @@ struct CalendarWeekView: View {
             .shadow(color: .black.opacity(resizing ? 0.3 : 0), radius: 4, y: 2)
             .padding(.horizontal, 1)
             .contentShape(Rectangle())
-            .onTapGesture { manager.selectedEventID = event.id }
+            .calendarEventInteractions(event)
             // Drag the body to move the event in time (and across days). The
             // resize handles sit on top of the edges, so they win there.
             .gesture(moveGesture(block, dayIndex: dayIndex, geometry: geometry, enabled: draggable))
@@ -361,22 +400,11 @@ struct CalendarWeekView: View {
     private func resizeHandle(_ event: CalendarEvent, edge: DragKind, blockHeight: CGFloat,
                               geometry: TimeGeometry) -> some View
     {
-        // No persistent grip — the affordance is the resize cursor and a faint
-        // edge line that appear only while the pointer is over the edge.
-        let key = "\(event.uid)-\(edge == .resizeStart ? "s" : "e")"
-        let hovering = hoveredResizeEdge == key
-        return Color.white.opacity(0.001) // invisible but hit-testable
-            .frame(height: min(8, max(blockHeight / 4, 4)))
-            .overlay(alignment: edge == .resizeStart ? .top : .bottom) {
-                Rectangle().fill(Color.primary.opacity(hovering ? 0.35 : 0))
-                    .frame(height: 2)
-            }
-            .contentShape(Rectangle())
-            .onHover { inside in
-                hoveredResizeEdge = inside ? key : (hoveredResizeEdge == key ? nil : hoveredResizeEdge)
-                if inside { NSCursor.resizeUpDown.set() } else { NSCursor.arrow.set() }
-            }
-            .gesture(resizeGesture(event, edge: edge, geometry: geometry))
+        WeekResizeHandle(
+            isTop: edge == .resizeStart,
+            height: min(8, max(blockHeight / 4, 4)),
+            gesture: resizeGesture(event, edge: edge, geometry: geometry)
+        )
     }
 
     private func resizeGesture(_ event: CalendarEvent, edge: DragKind,
@@ -501,8 +529,8 @@ struct CalendarWeekView: View {
         if let d = drag, d.kind == .move,
            let event = manager.events.first(where: { $0.id == d.eventID })
         {
-            MovePreview(model: dragPreview, geometry: geometry) {
-                previewBlock(event, geometry: geometry)
+            MovePreview(model: dragPreview, geometry: geometry) { target in
+                previewBlock(event, target: target, geometry: geometry)
                     // Full column width: until the drop re-lays-out the day,
                     // the landing cell is the whole column (the dimmed
                     // original keeps marking the origin lane).
@@ -511,19 +539,48 @@ struct CalendarWeekView: View {
         }
     }
 
-    /// The visual body of the floating copy: same look as timedBlock but
-    /// inert — no gestures, no resize handles, no hit testing — so pointer
-    /// events keep flowing to the stationary original underneath it.
-    private func previewBlock(_ event: CalendarEvent, geometry: TimeGeometry) -> some View {
+    /// The visual body of the floating copy: inert — no gestures, no resize
+    /// handles, no hit testing — so pointer events keep flowing to the
+    /// stationary original underneath it.
+    ///
+    /// A block in flight answers a different question than a block at rest.
+    /// At rest it says what it is; in flight the only thing worth reading is
+    /// where it will land, so its own content recedes behind a blur and the
+    /// drop time takes the middle. The tilt, the slight scale and the soft
+    /// shadow are what make it read as picked UP rather than merely moved —
+    /// a pure translation looks like a rendering artifact.
+    private func previewBlock(_ event: CalendarEvent, target: TimeGeometry.MoveTarget,
+                              geometry: TimeGeometry) -> some View
+    {
         let committedHeight = geometry.height(forMinutes: blockMinutes(event))
         return EventPillGridLabel(event: event, showsTime: committedHeight > 26)
-            .padding(.leading, 7).padding(.trailing, 3).padding(.vertical, 2)
+            .padding(.horizontal, 6).padding(.vertical, 3)
             .frame(maxWidth: .infinity, alignment: .topLeading)
             .frame(height: max(committedHeight, 16), alignment: .top)
-            .eventPill(color(for: event), variant: .timed, selected: false, cornerRadius: 4)
-            .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
+            .blur(radius: 2)
+            .opacity(0.45)
+            .overlay {
+                Text(dropLabel(target))
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+                    .padding(.horizontal, 4)
+            }
+            .eventPill(color(for: event), selected: false)
+            .rotationEffect(.degrees(-3))
+            .scaleEffect(1.04)
+            .shadow(color: .black.opacity(0.28), radius: 12, y: 6)
             .padding(.horizontal, 1)
             .allowsHitTesting(false)
+    }
+
+    /// "Wed 11:00" — the weekday and start time the drop will commit to.
+    private func dropLabel(_ target: TimeGeometry.MoveTarget) -> String {
+        guard target.dayIndex >= 0, target.dayIndex < weekDays.count else { return "" }
+        let day = weekDays[target.dayIndex]
+        let weekday = Self.weekdayFormatter.string(from: day)
+        guard let date = date(on: day, minutes: target.startMinute) else { return weekday }
+        return "\(weekday) \(CalendarTimeFormat.time(date))"
     }
 
     /// Positions the floating copy at the snapped landing cell. A dedicated
@@ -533,14 +590,14 @@ struct CalendarWeekView: View {
     private struct MovePreview<Content: View>: View {
         @ObservedObject var model: DragPreviewModel
         let geometry: TimeGeometry
-        let content: Content
+        let content: (TimeGeometry.MoveTarget) -> Content
 
         init(model: DragPreviewModel, geometry: TimeGeometry,
-             @ViewBuilder content: () -> Content)
+             @ViewBuilder content: @escaping (TimeGeometry.MoveTarget) -> Content)
         {
             self.model = model
             self.geometry = geometry
-            self.content = content()
+            self.content = content
         }
 
         var body: some View {
@@ -549,8 +606,9 @@ struct CalendarWeekView: View {
             // you see is where it lands, clicking from slot to slot instead
             // of tracking the pointer continuously.
             if let target = model.target {
-                content.offset(x: geometry.x(forDayIndex: target.dayIndex),
-                               y: geometry.y(forMinutes: target.startMinute))
+                content(target)
+                    .offset(x: geometry.x(forDayIndex: target.dayIndex),
+                            y: geometry.y(forMinutes: target.startMinute))
             }
         }
     }
@@ -602,31 +660,24 @@ struct CalendarWeekView: View {
     private func overflowBlock(_ item: DayLayoutIndex.OverflowBlock, geometry: TimeGeometry) -> some View {
         let selected = item.events.contains { $0.id == manager.selectedEventID }
         let height = max(geometry.height(forMinutes: item.endMinute - item.startMinute), 16)
-        let shape = RoundedRectangle(cornerRadius: 5)
         return Text("+\(item.events.count)")
-            .font(.system(size: 10)).fontWeight(.semibold)
-            .padding(.horizontal, 5).padding(.vertical, 2)
+            .font(.system(size: 11)).fontWeight(.semibold)
+            .padding(.horizontal, 6).padding(.vertical, 3)
             .frame(maxWidth: .infinity, alignment: .topLeading)
             .frame(height: height, alignment: .top)
-            // A muted neutral pill in the same language as the event pills:
-            // opaque surface first so the grid lines don't show through, a soft
-            // gray tint, and the calendar's lighter selection treatment.
-            .background {
-                ZStack {
-                    shape.fill(Color.Detail.cardBackground)
-                    shape.fill(Color.secondary.opacity(selected ? 0.32 : 0.18))
-                }
-            }
-            .overlay(shape.strokeBorder(Color.secondary.opacity(selected ? 0.7 : 0), lineWidth: 1.5))
-            .foregroundStyle(Color.Detail.textPrimary)
+            // The same chrome the event blocks use, in a neutral gray: the "+X"
+            // stands in for events, so it must read as one of them rather than
+            // as a separate kind of object. Going through the modifier is also
+            // what keeps its radius and selection ring from drifting.
+            .eventPill(.secondary, selected: selected)
             .padding(.horizontal, 1)
             .contentShape(Rectangle())
             .onTapGesture {
                 let ids = item.events.map(\.id)
                 if let current = manager.selectedEventID, let idx = ids.firstIndex(of: current) {
-                    manager.selectedEventID = ids[(idx + 1) % ids.count]
-                } else {
-                    manager.selectedEventID = ids.first
+                    manager.select(item.events[(idx + 1) % item.events.count])
+                } else if let first = item.events.first {
+                    manager.select(first)
                 }
             }
     }
@@ -634,12 +685,12 @@ struct CalendarWeekView: View {
     private func eventChip(_ event: CalendarEvent) -> some View {
         let selected = manager.selectedEventID == event.id
         return Text(event.displaySubject)
-            .font(.system(size: 9)).fontWeight(.medium).lineLimit(1)
-            .padding(.horizontal, 4).padding(.vertical, 1)
+            .font(.system(size: 10)).fontWeight(.semibold).lineLimit(1)
+            .padding(.horizontal, 6).padding(.vertical, 2)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .eventPill(color(for: event), variant: .allDay, selected: selected, cornerRadius: 4)
+            .eventPill(color(for: event), selected: selected, cornerRadius: 6)
             .contentShape(Rectangle())
-            .onTapGesture { manager.selectedEventID = event.id }
+            .calendarEventInteractions(event)
     }
 
     /// How many side-by-side lanes the column width supports (~40pt per lane,
@@ -666,7 +717,7 @@ struct CalendarWeekView: View {
     // MARK: - Data
 
     private func color(for event: CalendarEvent) -> Color {
-        manager.calendars.first { $0.name == event.calendar }?.color ?? .secondary
+        manager.color(for: event)
     }
 
     private var weekDays: [Date] {
@@ -687,4 +738,52 @@ struct CalendarWeekView: View {
     private static let weekdayFormatter: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "EEE"; return f
     }()
+}
+
+// MARK: - Resize handle
+
+/// The invisible grip on a block's top or bottom edge, owning its own hover
+/// state.
+///
+/// That ownership is the entire point of it being a separate view. The hover
+/// flag used to live on CalendarWeekView, so entering or leaving ANY grip
+/// invalidated the whole grid body — seven columns and every block in them —
+/// and a block carries two grips, so simply moving the pointer across the
+/// week re-rendered everything continuously. Local state keeps each hover to
+/// the ~8pt strip it happened in.
+private struct WeekResizeHandle<G: Gesture>: View {
+    let isTop: Bool
+    let height: CGFloat
+    let gesture: G
+
+    @State private var hovering = false
+
+    var body: some View {
+        // No persistent grip — the affordance is the resize cursor and a faint
+        // edge line, both only while the pointer is over the edge.
+        Color.white.opacity(0.001) // invisible but hit-testable
+            .frame(height: height)
+            .overlay(alignment: isTop ? .top : .bottom) {
+                Rectangle()
+                    .fill(Color.primary.opacity(hovering ? 0.35 : 0))
+                    .frame(height: 2)
+            }
+            .contentShape(Rectangle())
+            .onHover { inside in
+                if inside, !hovering {
+                    hovering = true
+                    NSCursor.resizeUpDown.push()
+                } else if !inside, hovering {
+                    hovering = false
+                    NSCursor.pop()
+                }
+            }
+            .onDisappear {
+                if hovering {
+                    hovering = false
+                    NSCursor.pop()
+                }
+            }
+            .gesture(gesture)
+    }
 }
