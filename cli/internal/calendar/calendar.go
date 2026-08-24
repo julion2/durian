@@ -435,7 +435,11 @@ type RecurrenceRange struct {
 // local scan ignores it even if a crash leaves one behind.
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.ics-tmp")
+	// Keep the temporary basename independent of the destination basename.
+	// Provider UIDs can approach the filesystem's per-component limit; adding
+	// a random suffix to that full name would make an otherwise valid target
+	// fail with ENAMETOOLONG before it can be written.
+	tmp, err := os.CreateTemp(dir, ".durian-*.ics-tmp")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file in %s: %w", dir, err)
 	}
@@ -479,6 +483,19 @@ func SanitizeName(s string) string {
 		return "unnamed"
 	}
 	return out
+}
+
+// EventFileName returns a safe, bounded .ics basename for a provider event
+// identity. Most IDs stay human-recognizable and backward-compatible. Long
+// IDs use their SHA-256 digest because common filesystems cap one path
+// component at 255 bytes, while Graph iCalUIds can exceed that limit.
+func EventFileName(id string) string {
+	const maxReadableBytes = 200
+	name := SanitizeName(id)
+	if len(name) > maxReadableBytes {
+		name = HashBytes([]byte(id))
+	}
+	return name + ".ics"
 }
 
 // CalendarIncluded reports whether a calendar display name passes the include

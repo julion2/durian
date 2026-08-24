@@ -35,6 +35,7 @@ func TestFilterDownloadOnlyPartition(t *testing.T) {
 	plans := []CalendarPlan{{
 		Calendar: Calendar{ID: "cal1", Name: "Work"},
 		Dir:      "/tmp/vdir/work",
+		Removed:  true,
 		Actions:  append([]Action(nil), all...),
 	}}
 
@@ -48,6 +49,9 @@ func TestFilterDownloadOnlyPartition(t *testing.T) {
 	}
 	if filtered[0].Calendar != plans[0].Calendar || filtered[0].Dir != plans[0].Dir {
 		t.Errorf("filtered plan must keep calendar and dir: %+v", filtered[0])
+	}
+	if !filtered[0].Removed {
+		t.Error("filtered plan lost removed-calendar marker")
 	}
 
 	wantKept := []string{"d1", "d2", "a1", "p1", "s1", "v2"}
@@ -66,6 +70,81 @@ func TestFilterDownloadOnlyPartition(t *testing.T) {
 	// The input must not be mutated.
 	if len(plans[0].Actions) != len(all) {
 		t.Errorf("input plan mutated: %d actions left, want %d", len(plans[0].Actions), len(all))
+	}
+}
+
+func TestFilterEventKeepsOnlyTheExplicitEvent(t *testing.T) {
+	plans := []CalendarPlan{
+		{
+			Calendar: Calendar{Name: "Work"},
+			Actions: []Action{
+				{Kind: ActionUploadUpdate, UID: "chosen"},
+				{Kind: ActionDeleteRemote, UID: "other"},
+			},
+		},
+		{
+			Calendar: Calendar{Name: "Personal"},
+			Removed:  true,
+			Actions:  []Action{{Kind: ActionUploadUpdate, UID: "chosen"}},
+		},
+	}
+
+	filtered, found := calendarsync.FilterEvent(plans, "work", "chosen")
+	if !found {
+		t.Fatal("FilterEvent did not find the chosen event")
+	}
+	if len(filtered) != 2 || len(filtered[0].Actions) != 1 || len(filtered[1].Actions) != 0 {
+		t.Fatalf("filtered plans = %+v", filtered)
+	}
+	if got := filtered[0].Actions[0]; got.UID != "chosen" || got.Kind != ActionUploadUpdate {
+		t.Fatalf("kept action = %+v", got)
+	}
+	if filtered[1].Removed {
+		t.Error("FilterEvent propagated removed marker to an unmatched calendar")
+	}
+}
+
+func TestFilterEventPreservesCompleteRemovedCalendarPlan(t *testing.T) {
+	plans := []CalendarPlan{{
+		Calendar: Calendar{Name: "Deleted"},
+		Removed:  true,
+		Actions:  []Action{{Kind: calendarsync.ActionArchiveLocal, UID: "chosen"}},
+	}}
+	filtered, found := calendarsync.FilterEvent(plans, "Deleted", "chosen")
+	if !found || len(filtered) != 1 || !filtered[0].Removed {
+		t.Fatalf("filtered = %+v, found = %v", filtered, found)
+	}
+}
+
+func TestFilterEventReportsMissingEvent(t *testing.T) {
+	plans := []CalendarPlan{{
+		Calendar: Calendar{Name: "Work"},
+		Actions:  []Action{{Kind: ActionUploadUpdate, UID: "other"}},
+	}}
+	filtered, found := calendarsync.FilterEvent(plans, "Work", "missing")
+	if found || len(filtered) != 1 || len(filtered[0].Actions) != 0 {
+		t.Fatalf("filtered = %+v, found = %v", filtered, found)
+	}
+}
+
+func TestFilterEventRejectsAmbiguousCalendarName(t *testing.T) {
+	plans := []calendarsync.CalendarPlan{
+		{Calendar: calendarsync.Calendar{ID: "cal1", Name: "Work"}, Dir: "/tmp/vdir/Work", Actions: []calendarsync.Action{{Kind: calendarsync.ActionUploadUpdate, UID: "chosen"}}},
+		{Calendar: calendarsync.Calendar{ID: "cal2", Name: "Work"}, Dir: "/tmp/vdir/Work-abcdef", Actions: []calendarsync.Action{{Kind: calendarsync.ActionUploadUpdate, UID: "chosen"}}},
+	}
+	filtered, found := calendarsync.FilterEvent(plans, "Work", "chosen")
+	if found {
+		t.Fatal("FilterEvent accepted an ambiguous display name")
+	}
+	for _, plan := range filtered {
+		if len(plan.Actions) != 0 {
+			t.Fatalf("ambiguous filter retained actions: %+v", filtered)
+		}
+	}
+
+	filtered, found = calendarsync.FilterEvent(plans, "cal2", "chosen")
+	if !found || len(filtered[0].Actions) != 0 || len(filtered[1].Actions) != 1 {
+		t.Fatalf("stable collection ref filter = %+v, found=%v", filtered, found)
 	}
 }
 

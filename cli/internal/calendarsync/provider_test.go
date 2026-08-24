@@ -9,6 +9,7 @@ package calendarsync_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,6 +23,14 @@ import (
 type fakeProvider struct {
 	// events is what FetchMasterEvents returns.
 	events []Event
+	// calendars and eventsByCalendar support collection identity tests. When
+	// calendars is nil, the single-calendar fields below retain their defaults.
+	calendars        []Calendar
+	eventsByCalendar map[string][]Event
+	// calendarName and noCalendars control ListCalendars for collection
+	// lifecycle tests. Empty name defaults to Work.
+	calendarName string
+	noCalendars  bool
 
 	// createResult is returned by CreateEvent; the received event/options are
 	// recorded per call.
@@ -48,10 +57,23 @@ type fakeProvider struct {
 func (f *fakeProvider) Owner() string { return testOwnerEmail }
 
 func (f *fakeProvider) ListCalendars(context.Context) ([]Calendar, error) {
-	return []Calendar{{ID: "cal1", Name: "Work"}}, nil
+	if f.noCalendars {
+		return nil, nil
+	}
+	if f.calendars != nil {
+		return f.calendars, nil
+	}
+	name := f.calendarName
+	if name == "" {
+		name = "Work"
+	}
+	return []Calendar{{ID: "cal1", Name: name}}, nil
 }
 
-func (f *fakeProvider) FetchMasterEvents(context.Context, string) ([]Event, error) {
+func (f *fakeProvider) FetchMasterEvents(_ context.Context, calendarID string) ([]Event, error) {
+	if f.eventsByCalendar != nil {
+		return f.eventsByCalendar[calendarID], nil
+	}
 	return f.events, nil
 }
 
@@ -137,6 +159,358 @@ func syncFake(t *testing.T, f *fakeProvider, dir string, status *CalendarStatus)
 		t.Fatalf("Sync: %v", err)
 	}
 	return stats
+}
+
+func TestCalendarRenameKeepsStableCollection(t *testing.T) {
+	f := &fakeProvider{events: []Event{remoteEvent("g1", "uid-1", "Standup")}, calendarName: "Old name"}
+	accountDir := t.TempDir()
+	state := &calendarsync.SyncState{Calendars: map[string]CalendarStatus{}}
+	plans, err := calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := calendarsync.ApplyAll(context.Background(), f, state, plans, SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	oldDir := filepath.Join(accountDir, "Old name")
+
+	f.calendarName = "New name"
+	plans, err = calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 1 || plans[0].Dir != oldDir || len(plans[0].Actions) != 0 {
+		t.Fatalf("rename plan = %+v, want stable old dir and no event actions", plans)
+	}
+	if _, err := calendarsync.ApplyAll(context.Background(), f, state, plans, SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	name, err := os.ReadFile(filepath.Join(oldDir, "displayname"))
+	if err != nil || string(name) != "New name\n" {
+		t.Fatalf("displayname = %q err=%v", name, err)
+	}
+	if _, err := os.Stat(filepath.Join(accountDir, "New name")); !os.IsNotExist(err) {
+		t.Fatalf("rename created a second collection: %v", err)
+	}
+}
+
+func TestSameNameCalendarsUseStableDistinctCollections(t *testing.T) {
+	f := &fakeProvider{calendars: []Calendar{{ID: "cal1", Name: "Work"}, {ID: "cal2", Name: "Work"}}}
+	accountDir := t.TempDir()
+	state := &calendarsync.SyncState{Calendars: map[string]CalendarStatus{}}
+	plans, err := calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 2 || plans[0].Dir == plans[1].Dir {
+		t.Fatalf("same-name calendar dirs = %+v, want two distinct collections", plans)
+	}
+	if _, err := calendarsync.ApplyAll(context.Background(), f, state, plans, SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	f.calendars = []Calendar{{ID: "cal2", Name: "Work"}, {ID: "cal1", Name: "Work"}}
+	again, err := calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 2 || again[0].Dir != plans[1].Dir || again[1].Dir != plans[0].Dir {
+		t.Fatalf("same-name calendar dirs changed: first=%+v second=%+v", plans, again)
+	}
+}
+
+func TestRecreatedSameNameCalendarDoesNotClaimDeletedCollection(t *testing.T) {
+	f := &fakeProvider{
+		calendars:        []Calendar{{ID: "old", Name: "Work"}},
+		eventsByCalendar: map[string][]Event{"old": {remoteEvent("g1", "uid-1", "Old event")}},
+	}
+	accountDir := t.TempDir()
+	state := &calendarsync.SyncState{Calendars: map[string]CalendarStatus{}}
+	plans, err := calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := calendarsync.ApplyAll(context.Background(), f, state, plans, SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	oldDir := state.Calendars["old"].Dir
+
+	f.calendars = []Calendar{{ID: "new", Name: "Work"}}
+	f.eventsByCalendar = map[string][]Event{"new": {}}
+	plans, err = calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 2 {
+		t.Fatalf("recreate plans = %+v, want live and removed calendar", plans)
+	}
+	for _, plan := range plans {
+		if plan.Calendar.ID == "new" {
+			if filepath.Base(plan.Dir) == oldDir {
+				t.Fatalf("new calendar claimed deleted collection %q", oldDir)
+			}
+			for _, action := range plan.Actions {
+				if action.Kind == calendarsync.ActionUploadCreate {
+					t.Fatalf("old local event would be uploaded into recreated calendar: %+v", action)
+				}
+			}
+		}
+	}
+}
+
+func TestRemoteCalendarDeletionPrunesUnchangedCollection(t *testing.T) {
+	f := &fakeProvider{events: []Event{remoteEvent("g1", "uid-1", "Standup")}}
+	accountDir := t.TempDir()
+	state := &calendarsync.SyncState{Calendars: map[string]CalendarStatus{}}
+	plans, err := calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := calendarsync.ApplyAll(context.Background(), f, state, plans, SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	f.noCalendars = true
+	plans, err = calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 1 || !plans[0].Removed || plans[0].Actions[0].Kind != calendarsync.ActionPruneLocal {
+		t.Fatalf("removed calendar plan = %+v", plans)
+	}
+	filtered, suppressed := calendarsync.FilterDownloadOnly(plans)
+	if suppressed != 0 || !filtered[0].Removed {
+		t.Fatalf("filtered removed calendar plan = %+v, suppressed = %d", filtered, suppressed)
+	}
+	if _, err := calendarsync.ApplyAll(context.Background(), f, state, filtered, SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := state.Calendars["cal1"]; ok {
+		t.Error("deleted calendar status retained")
+	}
+	if _, err := os.Stat(filepath.Join(accountDir, "Work")); !os.IsNotExist(err) {
+		t.Errorf("unchanged deleted collection retained: %v", err)
+	}
+}
+
+func TestRemovedCalendarCleanupWaitsAfterStaleLocalFile(t *testing.T) {
+	event := remoteEvent("g1", "uid-1", "Standup")
+	f := &fakeProvider{events: []Event{event}}
+	accountDir := t.TempDir()
+	state := &calendarsync.SyncState{Calendars: map[string]CalendarStatus{}}
+	plans, err := calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := calendarsync.ApplyAll(context.Background(), f, state, plans, SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	f.noCalendars = true
+	plans, err = calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event.Subject = "Changed after planning"
+	writeLocalICS(t, filepath.Join(accountDir, "Work"), event)
+	stats, err := calendarsync.ApplyAll(context.Background(), f, state, plans, SyncOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats != (SyncStats{Skipped: 1}) {
+		t.Fatalf("stats = %+v, want one skipped stale action and no cleanup failure", stats)
+	}
+	if _, err := os.Stat(filepath.Join(accountDir, "Work")); err != nil {
+		t.Fatalf("stale removed collection was cleaned up: %v", err)
+	}
+}
+
+func TestSyncRemovesLegacyMetadataOnlyOrphanCollection(t *testing.T) {
+	f := &fakeProvider{noCalendars: true}
+	accountDir := t.TempDir()
+	orphanDir := filepath.Join(accountDir, "Deleted calendar")
+	if err := os.Mkdir(orphanDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{"displayname": "Deleted calendar\n", "color": "#123456\n"} {
+		if err := os.WriteFile(filepath.Join(orphanDir, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyOrphan := "local.ics.orphan-123"
+	if err := os.WriteFile(filepath.Join(orphanDir, legacyOrphan), []byte("local edit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := &calendarsync.SyncState{Calendars: map[string]CalendarStatus{}}
+
+	plans, err := calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 1 || !plans[0].Removed || plans[0].Dir != orphanDir || len(plans[0].Actions) != 0 {
+		t.Fatalf("orphan cleanup plan = %+v", plans)
+	}
+	if _, err := calendarsync.ApplyAll(context.Background(), f, state, plans, SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := state.Calendars[""]; ok {
+		t.Fatal("legacy orphan cleanup created an empty calendar state key")
+	}
+	if _, err := os.Stat(orphanDir); !os.IsNotExist(err) {
+		t.Fatalf("metadata-only orphan retained: %v", err)
+	}
+	archived, err := os.ReadFile(filepath.Join(accountDir, ".orphaned", "Deleted calendar", legacyOrphan))
+	if err != nil || string(archived) != "local edit" {
+		t.Fatalf("recovery file = %q, err %v", archived, err)
+	}
+}
+
+func TestSyncPreservesUntrackedCalendarDirectoryWithUserData(t *testing.T) {
+	f := &fakeProvider{noCalendars: true}
+	accountDir := t.TempDir()
+	localDir := filepath.Join(accountDir, "Untracked")
+	if err := os.Mkdir(localDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "event.ics"), []byte("user data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := &calendarsync.SyncState{Calendars: map[string]CalendarStatus{}}
+
+	plans, err := calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 0 {
+		t.Fatalf("plans = %+v, want no cleanup for user data", plans)
+	}
+}
+
+func TestSyncPreservesEmptyUntrackedCalendarDirectory(t *testing.T) {
+	f := &fakeProvider{noCalendars: true}
+	accountDir := t.TempDir()
+	localDir := filepath.Join(accountDir, "Empty user calendar")
+	if err := os.Mkdir(localDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := &calendarsync.SyncState{Calendars: map[string]CalendarStatus{}}
+
+	plans, err := calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 0 {
+		t.Fatalf("plans = %+v, want no cleanup for empty user calendar", plans)
+	}
+	if _, err := os.Stat(localDir); err != nil {
+		t.Fatalf("empty user calendar was removed: %v", err)
+	}
+}
+
+func TestRemoteCalendarDeletionArchivesLocalEdit(t *testing.T) {
+	f := &fakeProvider{events: []Event{remoteEvent("g1", "uid-1", "Standup")}}
+	accountDir := t.TempDir()
+	state := &calendarsync.SyncState{Calendars: map[string]CalendarStatus{}}
+	plans, _ := calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if _, err := calendarsync.ApplyAll(context.Background(), f, state, plans, SyncOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(accountDir, "Work", "uid-1.ics")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, []byte("X-LOCAL-EDIT:yes\r\n")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.noCalendars = true
+	plans, err = calendarsync.PlanAll(context.Background(), f, accountDir, nil, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plans[0].Actions[0].Kind != calendarsync.ActionArchiveLocal {
+		t.Fatalf("local edit action = %s, want archive-local", plans[0].Actions[0].Kind)
+	}
+	stats, err := calendarsync.ApplyAll(context.Background(), f, state, plans, SyncOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Archived != 1 {
+		t.Fatalf("stats = %+v, want Archived=1", stats)
+	}
+	matches, _ := filepath.Glob(filepath.Join(accountDir, ".orphaned", "Work", "uid-1.ics.orphan-*"))
+	if len(matches) != 1 {
+		t.Fatalf("orphan backups = %v, want one", matches)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("scannable edited file retained: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(accountDir, "Work")); !os.IsNotExist(err) {
+		t.Errorf("deleted calendar collection retained: %v", err)
+	}
+}
+
+func TestBindMailboxQuarantinesLegacyDelegatedVdir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".durian-calsync-run.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldDir := filepath.Join(dir, "Calendar")
+	if err := os.Mkdir(oldDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldDir, "old.ics"), []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := &calendarsync.SyncState{Calendars: map[string]CalendarStatus{
+		"old": {Items: map[string]ItemStatus{}},
+	}}
+
+	if _, _, err := calendarsync.BindMailbox(dir, state, "shared@example.com", true, false); !errors.Is(err, calendarsync.ErrMailboxRebindNeeded) {
+		t.Fatalf("dry BindMailbox error = %v", err)
+	}
+	if _, err := os.Stat(oldDir); err != nil {
+		t.Fatalf("dry bind mutated vdir: %v", err)
+	}
+
+	fresh, backup, err := calendarsync.BindMailbox(dir, state, "shared@example.com", true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Mailbox != "shared@example.com" || len(fresh.Calendars) != 0 {
+		t.Fatalf("fresh state = %+v", fresh)
+	}
+	if _, err := os.Stat(filepath.Join(backup, "Calendar", "old.ics")); err != nil {
+		t.Fatalf("legacy event not quarantined: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".durian-calsync-run.lock")); err != nil {
+		t.Fatalf("run lock moved out of active vdir: %v", err)
+	}
+}
+
+func TestBindMailboxQuarantinesLegacyVdirWithEmptyState(t *testing.T) {
+	dir := t.TempDir()
+	oldDir := filepath.Join(dir, "Calendar")
+	if err := os.Mkdir(oldDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldDir, "old.ics"), []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := &calendarsync.SyncState{Calendars: map[string]CalendarStatus{}}
+
+	if _, _, err := calendarsync.BindMailbox(dir, state, "shared@example.com", true, false); !errors.Is(err, calendarsync.ErrMailboxRebindNeeded) {
+		t.Fatalf("dry BindMailbox error = %v", err)
+	}
+	fresh, backup, err := calendarsync.BindMailbox(dir, state, "shared@example.com", true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Mailbox != "shared@example.com" || len(fresh.Calendars) != 0 {
+		t.Fatalf("fresh state = %+v", fresh)
+	}
+	if _, err := os.Stat(filepath.Join(backup, "Calendar", "old.ics")); err != nil {
+		t.Fatalf("legacy event not quarantined: %v", err)
+	}
 }
 
 func TestSeamCreateRoleGateAndIdempotencyKey(t *testing.T) {

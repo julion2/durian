@@ -151,6 +151,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/julion2/durian/cli/internal/calendar"
 )
 
 // MARK: - Plan types
@@ -171,6 +173,9 @@ const (
 	ActionPruneLocal ActionKind = "prune-local"
 	// ActionDropStatus forgets a pair deleted on both sides; no writes.
 	ActionDropStatus ActionKind = "drop-status"
+	// ActionArchiveLocal preserves a local event as a non-scannable backup
+	// because its whole remote calendar was deleted.
+	ActionArchiveLocal ActionKind = "archive-local"
 	// ActionUploadCreate POSTs a new local event to Outlook.
 	ActionUploadCreate ActionKind = "upload-create"
 	// ActionUploadUpdate PATCHes a locally edited event to Outlook.
@@ -316,6 +321,9 @@ type CalendarPlan struct {
 	// Dir is the local collection directory of this calendar.
 	Dir     string
 	Actions []Action
+	// Removed marks a calendar that no longer exists remotely. Its unchanged
+	// local files are pruned; changed/untracked files are archived.
+	Removed bool
 }
 
 // RemoteMutations returns the actions of the plan that may write to the
@@ -342,7 +350,7 @@ func (p *CalendarPlan) RemoteMutations() []Action {
 func FilterDownloadOnly(plans []CalendarPlan) (filtered []CalendarPlan, suppressed int) {
 	filtered = make([]CalendarPlan, 0, len(plans))
 	for _, p := range plans {
-		fp := CalendarPlan{Calendar: p.Calendar, Dir: p.Dir}
+		fp := CalendarPlan{Calendar: p.Calendar, Dir: p.Dir, Removed: p.Removed}
 		for _, a := range p.Actions {
 			if a.RemoteMutation() {
 				suppressed++
@@ -368,7 +376,7 @@ func FilterDownloadOnly(plans []CalendarPlan) (filtered []CalendarPlan, suppress
 func FilterNonNotifying(plans []CalendarPlan) (filtered []CalendarPlan, autoUploads, deferred int) {
 	filtered = make([]CalendarPlan, 0, len(plans))
 	for _, p := range plans {
-		fp := CalendarPlan{Calendar: p.Calendar, Dir: p.Dir}
+		fp := CalendarPlan{Calendar: p.Calendar, Dir: p.Dir, Removed: p.Removed}
 		for _, a := range p.Actions {
 			switch {
 			case a.AutoDeferred():
@@ -382,6 +390,62 @@ func FilterNonNotifying(plans []CalendarPlan) (filtered []CalendarPlan, autoUplo
 		filtered = append(filtered, fp)
 	}
 	return filtered, autoUploads, deferred
+}
+
+// FilterEvent returns copies of the plans containing only actions for one
+// event in one calendar. It is the narrow execution boundary used when the GUI
+// has just performed an explicit Save/Send/RSVP/Delete action: pending changes
+// for other events must not ride along with that intent.
+//
+// The bool reports whether an action was found. A matching conflict is returned
+// as-is so the caller can refuse it instead of silently applying the account's
+// conflict policy under an event-level Send action.
+func FilterEvent(plans []CalendarPlan, calendarRef, uid string) (filtered []CalendarPlan, found bool) {
+	selected := -1
+	for i, p := range plans {
+		if p.Calendar.ID == calendarRef {
+			if selected != -1 {
+				return plansWithoutActions(plans), false
+			}
+			selected = i
+		}
+	}
+	if selected == -1 {
+		for i, p := range plans {
+			if !strings.EqualFold(p.Calendar.Name, calendarRef) {
+				continue
+			}
+			if selected != -1 {
+				return plansWithoutActions(plans), false
+			}
+			selected = i
+		}
+	}
+
+	filtered = make([]CalendarPlan, 0, len(plans))
+	for i, p := range plans {
+		fp := CalendarPlan{Calendar: p.Calendar, Dir: p.Dir}
+		calendarMatches := i == selected
+		if calendarMatches {
+			for _, a := range p.Actions {
+				if a.UID == uid {
+					fp.Actions = append(fp.Actions, a)
+					found = true
+				}
+			}
+		}
+		fp.Removed = p.Removed && calendarMatches && len(fp.Actions) > 0 && len(fp.Actions) == len(p.Actions)
+		filtered = append(filtered, fp)
+	}
+	return filtered, found
+}
+
+func plansWithoutActions(plans []CalendarPlan) []CalendarPlan {
+	filtered := make([]CalendarPlan, 0, len(plans))
+	for _, p := range plans {
+		filtered = append(filtered, CalendarPlan{Calendar: p.Calendar, Dir: p.Dir})
+	}
+	return filtered
 }
 
 // MARK: - Stats and options
@@ -400,6 +464,9 @@ type SyncStats struct {
 	Conflicts int
 	// Rsvps counts owner RSVP responses sent to the provider.
 	Rsvps int
+	// Archived counts local files moved into recovery because their remote
+	// calendar was deleted while the local copy had unpushed changes.
+	Archived int
 	// Skipped counts actions aborted gracefully instead of risking a wrong
 	// notification: precondition failures (remote changed since planning)
 	// and refused meeting re-creates. They re-plan on the next run.
@@ -421,6 +488,7 @@ func (s *SyncStats) add(o SyncStats) {
 	s.DeletedRemote += o.DeletedRemote
 	s.Conflicts += o.Conflicts
 	s.Rsvps += o.Rsvps
+	s.Archived += o.Archived
 	s.Skipped += o.Skipped
 	s.Failed += o.Failed
 }
@@ -472,13 +540,23 @@ func PlanAll(ctx context.Context, p CalendarProvider, accountDir string, include
 
 	var plans []CalendarPlan
 	visited := make(map[string]bool, len(calendars))
+	listed := make(map[string]bool, len(calendars))
+	claimedDirs := make(map[string]bool, len(calendars))
+	dirOwners := persistedCalendarDirOwners(accountDir, state.Calendars)
 	for _, cal := range calendars {
+		listed[cal.ID] = true
+		status := state.Calendars[cal.ID]
+		calDir := resolveCalendarDir(accountDir, cal, status, claimedDirs, dirOwners, p.Owner())
+		// A calendar excluded by name still exists remotely. Reserve its local
+		// directory so the legacy-orphan cleanup below cannot mistake an empty
+		// excluded collection for a deleted one.
 		if !calendarIncluded(cal.Name, include) {
+			claimedDirs[calDir] = true
 			slog.Debug("Skipping calendar not in include list", "module", "CALSYNC",
 				"calendar", cal.Name)
 			continue
 		}
-		calDir := filepath.Join(accountDir, sanitizeName(cal.Name))
+		claimedDirs[calDir] = true
 
 		remote, err := fetchRemote(ctx, p, cal, mirror)
 		if err != nil {
@@ -490,6 +568,61 @@ func PlanAll(ctx context.Context, p CalendarProvider, accountDir string, include
 			return nil, fmt.Errorf("failed to plan calendar %s: %w", cal.Name, err)
 		}
 		plans = append(plans, plan)
+	}
+
+	// Calendars absent from the complete provider listing were deleted
+	// remotely. Never map an old status onto a directory already claimed by a
+	// surviving calendar (for example, delete "Calendar", then create another
+	// "Calendar"): preserving stale files is safer than pruning the new one.
+	removedIDs := make([]string, 0, len(state.Calendars))
+	for id := range state.Calendars {
+		removedIDs = append(removedIDs, id)
+	}
+	sort.Strings(removedIDs)
+	for _, id := range removedIDs {
+		status := state.Calendars[id]
+		if listed[id] {
+			continue
+		}
+		calDir := resolveCalendarDir(accountDir, Calendar{ID: id, Name: status.Name}, status, claimedDirs, dirOwners, p.Owner())
+		if calDir == "" || claimedDirs[calDir] {
+			continue
+		}
+		claimedDirs[calDir] = true
+		name := status.Name
+		if name == "" {
+			name = filepath.Base(calDir)
+		}
+		plan, err := planRemovedCalendar(Calendar{ID: id, Name: name}, calDir, status, p.Owner())
+		if err != nil {
+			return nil, fmt.Errorf("failed to plan removed calendar %s: %w", name, err)
+		}
+		plans = append(plans, plan)
+	}
+
+	// Older sync versions could drop a remotely deleted calendar from state
+	// without removing its now-empty vdir collection. Recover those historical
+	// leftovers, but only when the directory contains generated metadata and
+	// belongs to neither a listed remote calendar nor retained sync state. Any
+	// event, archive, or unknown file makes the directory user data and keeps it.
+	entries, readErr := os.ReadDir(accountDir)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return nil, fmt.Errorf("failed to inspect calendar directories: %w", readErr)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		dir := filepath.Join(accountDir, entry.Name())
+		if claimedDirs[dir] || !recoverableDeletedCalendarDir(dir) {
+			continue
+		}
+		plans = append(plans, CalendarPlan{
+			Calendar: Calendar{Name: entry.Name()},
+			Dir:      dir,
+			Removed:  true,
+		})
+		claimedDirs[dir] = true
 	}
 
 	// Drop mirror entries for calendars this run did not touch — deleted
@@ -509,6 +642,160 @@ func PlanAll(ctx context.Context, p CalendarProvider, accountDir string, include
 		}
 	}
 	return plans, nil
+}
+
+// resolveCalendarDir keeps a collection directory stable across remote name
+// changes. Legacy state predates the Dir field, so when the name-derived path
+// is absent it identifies the old collection by overlap with tracked UIDs.
+func resolveCalendarDir(accountDir string, cal Calendar, status CalendarStatus, claimed map[string]bool, owners map[string]string, owner string) string {
+	if status.Dir != "" && filepath.Base(status.Dir) == status.Dir {
+		persisted := filepath.Join(accountDir, status.Dir)
+		if calendarDirAvailable(persisted, cal.ID, claimed, owners) {
+			return persisted
+		}
+	}
+	if cal.Name != "" {
+		desired := filepath.Join(accountDir, sanitizeName(cal.Name))
+		if info, err := os.Stat(desired); err == nil && info.IsDir() && calendarDirAvailable(desired, cal.ID, claimed, owners) {
+			return desired
+		}
+	}
+	if len(status.Items) == 0 {
+		return availableCalendarDir(accountDir, cal, claimed, owners)
+	}
+	entries, err := os.ReadDir(accountDir)
+	if err == nil {
+		bestPath, bestOverlap := "", 0
+		for _, entry := range entries {
+			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			path := filepath.Join(accountDir, entry.Name())
+			if !calendarDirAvailable(path, cal.ID, claimed, owners) {
+				continue
+			}
+			items, _, scanErr := scanLocalItems(path, owner)
+			if scanErr != nil {
+				continue
+			}
+			overlap := 0
+			for uid := range items {
+				if _, ok := status.Items[uid]; ok {
+					overlap++
+				}
+			}
+			if overlap > bestOverlap {
+				bestPath, bestOverlap = path, overlap
+			}
+		}
+		if bestOverlap > 0 {
+			return bestPath
+		}
+	}
+	if cal.Name == "" {
+		return ""
+	}
+	return availableCalendarDir(accountDir, cal, claimed, owners)
+}
+
+// persistedCalendarDirOwners reserves every collection named by sync state
+// before current remote calendars are assigned directories. This prevents a
+// newly created calendar from claiming a deleted calendar's same-name vdir.
+func persistedCalendarDirOwners(accountDir string, calendars map[string]CalendarStatus) map[string]string {
+	owners := make(map[string]string, len(calendars))
+	for id, status := range calendars {
+		name := ""
+		if status.Dir != "" {
+			if filepath.Base(status.Dir) != status.Dir {
+				continue
+			}
+			name = status.Dir
+		} else if status.Name != "" {
+			name = sanitizeName(status.Name)
+		} else {
+			continue
+		}
+		path := filepath.Join(accountDir, name)
+		if previous, exists := owners[path]; exists && previous != id {
+			owners[path] = "" // ambiguous legacy ownership: preserve it for neither side
+			continue
+		}
+		owners[path] = id
+	}
+	return owners
+}
+
+func calendarDirAvailable(path, calendarID string, claimed map[string]bool, owners map[string]string) bool {
+	if claimed[path] {
+		return false
+	}
+	owner, owned := owners[path]
+	return !owned || owner == calendarID
+}
+
+func availableCalendarDir(accountDir string, cal Calendar, claimed map[string]bool, owners map[string]string) string {
+	desired := filepath.Join(accountDir, sanitizeName(cal.Name))
+	if calendarDirAvailable(desired, cal.ID, claimed, owners) {
+		return desired
+	}
+
+	suffix := "-" + hashBytes([]byte(cal.ID))[:12]
+	base := sanitizeName(cal.Name)
+	if len(base)+len(suffix) > 200 {
+		base = hashBytes([]byte(cal.Name))
+	}
+	for n := 0; ; n++ {
+		name := base + suffix
+		if n > 0 {
+			name += fmt.Sprintf("-%d", n)
+		}
+		candidate := filepath.Join(accountDir, name)
+		if !calendarDirAvailable(candidate, cal.ID, claimed, owners) {
+			continue
+		}
+		if _, err := os.Stat(candidate); err != nil {
+			return candidate
+		}
+	}
+}
+
+func planRemovedCalendar(cal Calendar, calDir string, status CalendarStatus, owner string) (CalendarPlan, error) {
+	plan := CalendarPlan{Calendar: cal, Dir: calDir, Removed: true}
+	local, unreadable, err := scanLocalItems(calDir, owner)
+	if err != nil {
+		return plan, err
+	}
+	for _, uid := range unionUIDs(nil, local, status.Items) {
+		li, localHas := local[uid]
+		st, tracked := status.Items[uid]
+		a := Action{UID: uid, Prior: st, Tracked: tracked, Summary: uid}
+		if localHas {
+			a.LocalPath, a.LocalHash, a.LocalMtime, a.LocalExists = li.Path, li.Hash, li.Mtime, true
+		}
+		switch {
+		case !localHas:
+			a.Kind = ActionDropStatus
+		case tracked && li.Hash == st.LocalHash:
+			a.Kind = ActionPruneLocal
+		default:
+			a.Kind = ActionArchiveLocal
+		}
+		plan.Actions = append(plan.Actions, a)
+	}
+	for _, path := range unreadable {
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			if os.IsNotExist(readErr) {
+				continue
+			}
+			return plan, readErr
+		}
+		plan.Actions = append(plan.Actions, Action{
+			Kind: ActionArchiveLocal, UID: filepath.Base(path), LocalPath: path,
+			LocalHash: hashBytes(data), LocalExists: true,
+		})
+	}
+	return plan, nil
 }
 
 // fetchRemote returns the complete remote event set of one calendar, keyed by
@@ -1023,8 +1310,16 @@ func ApplyAll(ctx context.Context, p CalendarProvider, state *SyncState, plans [
 		}
 		stats, err := Apply(ctx, p, plan, &status, opts)
 		total.add(stats)
-		if !opts.DryRun {
-			state.Calendars[plan.Calendar.ID] = status
+		if !opts.DryRun && plan.Calendar.ID != "" {
+			if plan.Removed && stats.Failed == 0 && stats.Skipped == 0 && len(status.Items) == 0 {
+				delete(state.Calendars, plan.Calendar.ID)
+			} else {
+				if !plan.Removed {
+					status.Name = plan.Calendar.Name
+					status.Dir = filepath.Base(plan.Dir)
+				}
+				state.Calendars[plan.Calendar.ID] = status
+			}
 		}
 		if err != nil {
 			return total, fmt.Errorf("failed to apply plan for calendar %s: %w", plan.Calendar.Name, err)
@@ -1034,7 +1329,7 @@ func ApplyAll(ctx context.Context, p CalendarProvider, state *SyncState, plans [
 	slog.Info("Calendar sync complete", "module", "CALSYNC",
 		"downloaded", total.Downloaded, "pruned", total.Pruned,
 		"uploaded", total.Uploaded, "deletedRemote", total.DeletedRemote,
-		"conflicts", total.Conflicts, "rsvps", total.Rsvps,
+		"conflicts", total.Conflicts, "rsvps", total.Rsvps, "archived", total.Archived,
 		"skipped", total.Skipped, "failed", total.Failed, "dryRun", opts.DryRun)
 	return total, nil
 }
@@ -1081,6 +1376,8 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 				stats.Downloaded++
 			case ActionPruneLocal:
 				stats.Pruned++
+			case ActionArchiveLocal:
+				stats.Archived++
 			case ActionUploadCreate, ActionUploadUpdate:
 				stats.Uploaded++
 			case ActionDeleteRemote:
@@ -1098,8 +1395,10 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 		return stats, nil
 	}
 
-	if err := writeCalendarMeta(plan.Dir, plan.Calendar); err != nil {
-		return stats, err
+	if !plan.Removed {
+		if err := writeCalendarMeta(plan.Dir, plan.Calendar); err != nil {
+			return stats, err
+		}
 	}
 
 	for _, a := range plan.Actions {
@@ -1131,6 +1430,22 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 			slog.Debug("Event deleted on both sides, dropping status", "module", "CALSYNC",
 				"calendar", plan.Calendar.Name, "uid", a.UID)
 			delete(status.Items, a.UID)
+
+		case ActionArchiveLocal:
+			slog.Warn("Archiving local event because its remote calendar was deleted", "module", "CALSYNC",
+				"calendar", plan.Calendar.Name, "uid", a.UID, "path", a.LocalPath)
+			if err = checkLocalUnchanged(a); err != nil {
+				break
+			}
+			archiveName := fmt.Sprintf("%s.orphan-%d", filepath.Base(a.LocalPath), time.Now().Unix())
+			if _, renameErr := moveToOrphanArchive(a.LocalPath, archiveName); renameErr != nil {
+				err = fmt.Errorf("failed to archive %s: %w", a.LocalPath, renameErr)
+			} else {
+				stats.Archived++
+				if a.Tracked {
+					delete(status.Items, a.UID)
+				}
+			}
 
 		case ActionPruneLocal:
 			slog.Info("Pruning local event deleted remotely", "module", "CALSYNC",
@@ -1233,7 +1548,106 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 
 	slog.Debug("Applied calendar plan", "module", "CALSYNC",
 		"calendar", plan.Calendar.Name, "stats", fmt.Sprintf("%+v", stats))
+	if plan.Removed && stats.Failed == 0 && stats.Skipped == 0 {
+		if err := cleanupRemovedCalendarDir(plan.Dir); err != nil {
+			slog.Error("Failed to clean up local calendar deleted remotely", "module", "CALSYNC",
+				"calendar", plan.Calendar.Name, "dir", plan.Dir, "err", err)
+			stats.Failed++
+		}
+	}
 	return stats, nil
+}
+
+// cleanupRemovedCalendarDir removes a deleted collection and its generated
+// metadata. Legacy orphan backups are moved to the hidden account recovery
+// directory; any unknown entry retains the collection unchanged.
+func cleanupRemovedCalendarDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to inspect deleted calendar directory: %w", err)
+	}
+	if !recoverableDeletedCalendarEntries(entries) {
+		return fmt.Errorf("deleted calendar directory contains unknown or no generated entries")
+	}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		if isOrphanArchiveName(entry.Name()) {
+			if _, err := moveToOrphanArchive(path, entry.Name()); err != nil {
+				return fmt.Errorf("failed to preserve orphan archive %s: %w", entry.Name(), err)
+			}
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("failed to remove generated calendar entry %s: %w", entry.Name(), err)
+		}
+	}
+	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove deleted calendar directory: %w", err)
+	}
+	return nil
+}
+
+func recoverableDeletedCalendarDir(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	return recoverableDeletedCalendarEntries(entries)
+}
+
+func recoverableDeletedCalendarEntries(entries []os.DirEntry) bool {
+	if len(entries) == 0 {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || (entry.Name() != "displayname" && entry.Name() != "color" &&
+			!isOrphanArchiveName(entry.Name())) {
+			return false
+		}
+	}
+	return true
+}
+
+func isOrphanArchiveName(name string) bool {
+	base, suffix, ok := strings.Cut(name, ".ics.orphan-")
+	if !ok || base == "" || suffix == "" {
+		return false
+	}
+	for _, part := range strings.Split(suffix, ".") {
+		if part == "" {
+			return false
+		}
+		for _, char := range part {
+			if char < '0' || char > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func moveToOrphanArchive(path, name string) (string, error) {
+	calendarDir := filepath.Dir(path)
+	archiveDir := filepath.Join(filepath.Dir(calendarDir), ".orphaned", filepath.Base(calendarDir))
+	if err := os.MkdirAll(archiveDir, 0o700); err != nil {
+		return "", err
+	}
+	target := filepath.Join(archiveDir, name)
+	for suffix := 1; ; suffix++ {
+		if _, err := os.Stat(target); os.IsNotExist(err) {
+			break
+		} else if err != nil {
+			return "", err
+		}
+		target = filepath.Join(archiveDir, fmt.Sprintf("%s.%d", name, suffix))
+	}
+	if err := os.Rename(path, target); err != nil {
+		return "", err
+	}
+	return target, nil
 }
 
 // downloadRemoteEvent executes one download action: it writes the remote
@@ -1276,7 +1690,7 @@ func backupLocalFile(path string) (string, error) {
 // RSVP and attendee-set baselines).
 func writeRemoteEvent(calDir, path, uid string, ev Event, status *CalendarStatus, owner string) error {
 	if path == "" {
-		path = filepath.Join(calDir, sanitizeName(uid)+".ics")
+		path = filepath.Join(calDir, calendar.EventFileName(uid))
 	}
 	data, err := EventToICal(ev)
 	if err != nil {
@@ -1387,7 +1801,7 @@ func createFromLocal(ctx context.Context, p CalendarProvider, plan CalendarPlan,
 
 	path := a.LocalPath
 	if uid != a.UID {
-		path = filepath.Join(plan.Dir, sanitizeName(uid)+".ics")
+		path = filepath.Join(plan.Dir, calendar.EventFileName(uid))
 	}
 	if err := writeRemoteEvent(plan.Dir, path, uid, settled, status, p.Owner()); err != nil {
 		return err

@@ -85,7 +85,7 @@ func CollectionsUnderFor(accountDir, account, owner string) ([]Collection, error
 
 	var cols []Collection
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
 		cols = append(cols, Collection{
@@ -515,7 +515,7 @@ func WriteEventIn(cols []Collection, calendarName string, e Event) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("failed to serialize new event: %w", err)
 	}
-	path := filepath.Join(dir, SanitizeName(e.ICalUID)+".ics")
+	path := filepath.Join(dir, EventFileName(e.ICalUID))
 	if err := WriteFileAtomic(path, data, 0o600); err != nil {
 		return "", err
 	}

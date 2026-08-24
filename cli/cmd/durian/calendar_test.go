@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/julion2/durian/cli/internal/calendar"
+	"github.com/julion2/durian/cli/internal/calendarsync"
 )
 
 // ParseRSVPVerb/SetOwnerResponse moved to cli/internal/calendar (rsvp_test.go
@@ -36,6 +37,19 @@ func TestVisibleWidth(t *testing.T) {
 		if got := visibleWidth(in); got != want {
 			t.Errorf("visibleWidth(%q) = %d, want %d", in, got, want)
 		}
+	}
+}
+
+func TestSummarizePlansGatesLocalArchives(t *testing.T) {
+	summary := summarizePlans([]calendarsync.CalendarPlan{{
+		Calendar: calendarsync.Calendar{Name: "Work"},
+		Actions:  []calendarsync.Action{{Kind: calendarsync.ActionArchiveLocal, Summary: "Local edit"}},
+	}}, "remote")
+	if summary.archives != 1 || len(summary.gatedLines) != 1 {
+		t.Fatalf("archive summary = %+v, want one gated archive", summary)
+	}
+	if got, want := summary.gatedLines[0], "ARCHIVE LOCAL: Local edit [Work]"; got != want {
+		t.Fatalf("archive line = %q, want %q", got, want)
 	}
 }
 

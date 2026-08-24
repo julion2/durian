@@ -246,14 +246,14 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 
 	policy := cfg.CalendarConflictPolicy(account)
 	summary := summarizePlans(plans, policy)
-	fmt.Fprintf(os.Stderr, "Plan for %s: %d download(s), %d prune(s), %d upload(s), %d update(s), %d remote delete(s), %d conflict(s), %d RSVP(s)\n",
+	fmt.Fprintf(os.Stderr, "Plan for %s: %d download(s), %d prune(s), %d archive(s), %d upload(s), %d update(s), %d remote delete(s), %d conflict(s), %d RSVP(s)\n",
 		account.GetAliasOrName(), summary.downloads, summary.prunes,
-		summary.uploadCreates, summary.uploadUpdates, summary.deleteRemotes,
+		summary.archives, summary.uploadCreates, summary.uploadUpdates, summary.deleteRemotes,
 		summary.conflicts, summary.rsvps)
 	const maxListed = 20
-	for i, line := range summary.remoteLines {
+	for i, line := range summary.gatedLines {
 		if i == maxListed {
-			fmt.Fprintf(os.Stderr, "  ... and %d more\n", len(summary.remoteLines)-maxListed)
+			fmt.Fprintf(os.Stderr, "  ... and %d more\n", len(summary.gatedLines)-maxListed)
 			break
 		}
 		fmt.Fprintln(os.Stderr, "  "+line)
@@ -269,10 +269,10 @@ func runCalendarSync(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	remoteCount := len(summary.remoteLines)
-	if remoteCount > 0 && !calendarSyncYes {
-		fmt.Fprintf(os.Stderr, "Apply %d change(s) to Outlook (%d uploads, %d remote deletes, %d conflicts, %d RSVPs; %d notification message(s))? [y/N] ",
-			remoteCount, summary.uploadCreates+summary.uploadUpdates, summary.deleteRemotes,
+	gatedCount := len(summary.gatedLines)
+	if gatedCount > 0 && !calendarSyncYes {
+		fmt.Fprintf(os.Stderr, "Apply %d gated change(s) for %s (%d local archives, %d uploads, %d remote deletes, %d conflicts, %d RSVPs; %d notification message(s))? [y/N] ",
+			gatedCount, account.GetAliasOrName(), summary.archives, summary.uploadCreates+summary.uploadUpdates, summary.deleteRemotes,
 			summary.conflicts, summary.rsvps, len(notifications))
 		answer, readErr := bufio.NewReader(os.Stdin).ReadString('\n')
 		answer = strings.ToLower(strings.TrimSpace(answer))
@@ -343,20 +343,21 @@ func printNotificationPreview(notifications []calendarsync.Notification) {
 }
 
 // planSummary aggregates the per-kind counts of all calendar plans plus the
-// formatted list of remote-mutating actions for the confirmation output.
+// formatted list of actions that require confirmation.
 type planSummary struct {
 	downloads     int
 	prunes        int
+	archives      int
 	uploadCreates int
 	uploadUpdates int
 	deleteRemotes int
 	conflicts     int
 	rsvps         int
-	remoteLines   []string
+	gatedLines    []string
 }
 
 // summarizePlans counts every planned action and renders one human-readable
-// line per action that would change the Outlook calendar.
+// line per action that requires confirmation (remote writes or local archive).
 func summarizePlans(plans []calendarsync.CalendarPlan, conflictPolicy string) planSummary {
 	var s planSummary
 	for _, p := range plans {
@@ -366,24 +367,27 @@ func summarizePlans(plans []calendarsync.CalendarPlan, conflictPolicy string) pl
 				s.downloads++
 			case calendarsync.ActionPruneLocal:
 				s.prunes++
+			case calendarsync.ActionArchiveLocal:
+				s.archives++
+				s.gatedLines = append(s.gatedLines, fmt.Sprintf("ARCHIVE LOCAL: %s [%s]", a.Summary, p.Calendar.Name))
 			case calendarsync.ActionUploadCreate:
 				s.uploadCreates++
-				s.remoteLines = append(s.remoteLines, fmt.Sprintf("UPLOAD (create): %s [%s]", a.Summary, p.Calendar.Name))
+				s.gatedLines = append(s.gatedLines, fmt.Sprintf("UPLOAD (create): %s [%s]", a.Summary, p.Calendar.Name))
 			case calendarsync.ActionUploadUpdate:
 				s.uploadUpdates++
-				s.remoteLines = append(s.remoteLines, fmt.Sprintf("UPLOAD (update): %s [%s]", a.Summary, p.Calendar.Name))
+				s.gatedLines = append(s.gatedLines, fmt.Sprintf("UPLOAD (update): %s [%s]", a.Summary, p.Calendar.Name))
 			case calendarsync.ActionDeleteRemote:
 				s.deleteRemotes++
-				s.remoteLines = append(s.remoteLines, fmt.Sprintf("DELETE REMOTE: %s [%s]", a.Summary, p.Calendar.Name))
+				s.gatedLines = append(s.gatedLines, fmt.Sprintf("DELETE REMOTE: %s [%s]", a.Summary, p.Calendar.Name))
 			case calendarsync.ActionConflict:
 				s.conflicts++
-				s.remoteLines = append(s.remoteLines, fmt.Sprintf("CONFLICT (%s wins): %s [%s]", conflictPolicy, a.Summary, p.Calendar.Name))
+				s.gatedLines = append(s.gatedLines, fmt.Sprintf("CONFLICT (%s wins): %s [%s]", conflictPolicy, a.Summary, p.Calendar.Name))
 			case calendarsync.ActionRsvp:
 				// Rebaseline-only RSVPs touch no remote state and are not
 				// listed; a real response is a gated remote mutation.
 				if a.RemoteMutation() {
 					s.rsvps++
-					s.remoteLines = append(s.remoteLines, fmt.Sprintf("RSVP (%s): %s [%s]", a.Rsvp, a.Summary, p.Calendar.Name))
+					s.gatedLines = append(s.gatedLines, fmt.Sprintf("RSVP (%s): %s [%s]", a.Rsvp, a.Summary, p.Calendar.Name))
 				}
 			}
 		}
