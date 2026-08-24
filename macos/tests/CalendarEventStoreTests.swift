@@ -289,27 +289,74 @@ final class CalendarEventDraftWriteTests: XCTestCase {
 
         let write = draft.toWrite()
         XCTAssertEqual(write.attendees, ["alice@example.com", "bob@example.com"])
+        XCTAssertFalse(write.replace_attendees)
         XCTAssertTrue(write.request_online_meeting)
     }
 
-    func testExistingEventDraftNeverSendsAttendees() {
-        // Attendee editing is create-only: a draft of an existing event
-        // starts empty, and even a tampered draft sends the neutral values so
-        // the server-side merge preserves the meeting's attendee set.
-        let event = CalendarEvent(
-            uid: "evt-1", calendar: "Calendar", subject: "Sync",
-            start: Date(timeIntervalSince1970: 1_780_000_000),
-            end: Date(timeIntervalSince1970: 1_780_003_600),
-            account: "me@example.com"
+    func testOwnedExistingEventDraftEditsAttendees() throws {
+        let wire = CalendarEventWire(
+            calendar: "Calendar", uid: "evt-1", subject: "Sync",
+            start: "2026-05-27T09:00:00Z", end: "2026-05-27T10:00:00Z",
+            all_day: false, location: nil, my_response: "organizer",
+            online_meeting: false, online_meeting_url: nil, recurring: false,
+            organizer: CalendarPersonWire(name: "Me", email: "me@example.com"),
+            attendees: [
+                CalendarAttendeeWire(name: "Me", email: "me@example.com", type: "required", response: "organizer"),
+                CalendarAttendeeWire(name: "Alice", email: "alice@example.com", type: "required", response: "accepted"),
+                CalendarAttendeeWire(name: "Bob", email: "bob@example.com", type: "optional", response: "none"),
+            ],
+            description: nil
         )
+        var event = try XCTUnwrap(CalendarEvent(from: wire))
+        event.account = "me@example.com"
         var draft = CalendarEventDraft(from: event)
         XCTAssertFalse(draft.isNew)
-        XCTAssertTrue(draft.attendees.isEmpty)
+        XCTAssertTrue(draft.canEditAttendees)
+        XCTAssertEqual(draft.attendees, ["alice@example.com", "bob@example.com"])
+        XCTAssertFalse(draft.attendeesChanged)
 
-        draft.attendees = ["alice@example.com"]
+        draft.attendees.removeAll { $0 == "bob@example.com" }
         draft.requestOnlineMeeting = true
         let write = draft.toWrite()
-        XCTAssertEqual(write.attendees, [])
+        XCTAssertEqual(write.attendees, ["alice@example.com"])
+        XCTAssertTrue(write.replace_attendees)
+        XCTAssertTrue(draft.attendeesChanged)
         XCTAssertFalse(write.request_online_meeting)
+
+        // Drag/resize starts from a summary without attendee detail and must
+        // omit the field rather than interpreting summary's [] as "remove all".
+        XCTAssertNil(draft.toWrite(includeAttendees: false).attendees)
+        XCTAssertFalse(draft.toWrite(includeAttendees: false).replace_attendees)
+    }
+
+    func testInviteeCannotEditAttendees() throws {
+        let wire = CalendarEventWire(
+            calendar: "Calendar", uid: "evt-2", subject: "Customer call",
+            start: "2026-05-27T09:00:00Z", end: "2026-05-27T10:00:00Z",
+            all_day: false, location: nil, my_response: "accepted",
+            online_meeting: false, online_meeting_url: nil, recurring: false,
+            organizer: nil, attendees: [], description: nil
+        )
+        var event = try XCTUnwrap(CalendarEvent(from: wire))
+        event.account = "me@example.com"
+
+        let draft = CalendarEventDraft(from: event)
+        XCTAssertFalse(draft.canEditAttendees)
+        XCTAssertNil(draft.toWrite().attendees)
+        XCTAssertFalse(draft.toWrite().replace_attendees)
+    }
+
+    func testPlainAppointmentCanGainFirstAttendee() throws {
+        let wire = CalendarEventWire(
+            calendar: "Calendar", uid: "evt-3", subject: "Focus time",
+            start: "2026-05-27T09:00:00Z", end: "2026-05-27T10:00:00Z",
+            all_day: false, location: nil, my_response: "none",
+            online_meeting: false, online_meeting_url: nil, recurring: false,
+            organizer: nil, attendees: [], description: nil
+        )
+        var event = try XCTUnwrap(CalendarEvent(from: wire))
+        event.account = "me@example.com"
+
+        XCTAssertTrue(CalendarEventDraft(from: event).canEditAttendees)
     }
 }

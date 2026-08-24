@@ -24,22 +24,55 @@ import (
 // can email attendees on its own.
 
 // calendarEventWrite is the PUT /calendars/event request body (snake_case).
-// Attendees is a plain email list (each becomes a required attendee) and
-// RequestOnlineMeeting asks the provider for an online meeting — both are
-// honored on CREATE only; an update never wipes an existing meeting's
-// attendee set or pending online-meeting request (see the merge below).
+// Attendees is a plain email list (new entries become required attendees).
+// Updates preserve the stored set unless ReplaceAttendees explicitly opts into
+// replacing it, so legacy clients that send [] still preserve.
+// RequestOnlineMeeting is honored on create only.
 type calendarEventWrite struct {
-	Account              string   `json:"account"`
-	Calendar             string   `json:"calendar"`
-	UID                  string   `json:"uid"`
-	Subject              string   `json:"subject"`
-	Start                string   `json:"start"`
-	End                  string   `json:"end"`
-	AllDay               bool     `json:"all_day"`
-	Location             string   `json:"location"`
-	Description          string   `json:"description"`
-	Attendees            []string `json:"attendees"`
-	RequestOnlineMeeting bool     `json:"request_online_meeting"`
+	Account              string    `json:"account"`
+	Calendar             string    `json:"calendar"`
+	UID                  string    `json:"uid"`
+	Subject              string    `json:"subject"`
+	Start                string    `json:"start"`
+	End                  string    `json:"end"`
+	AllDay               bool      `json:"all_day"`
+	Location             string    `json:"location"`
+	Description          string    `json:"description"`
+	Attendees            *[]string `json:"attendees"`
+	ReplaceAttendees     bool      `json:"replace_attendees"`
+	RequestOnlineMeeting bool      `json:"request_online_meeting"`
+}
+
+// mergeUpdatedAttendees replaces an event's editable invitees while retaining
+// the full metadata of matching attendees (name, role and RSVP). Organizer
+// attendee entries are implicit and cannot be removed through the email-list
+// write API, just as the ORGANIZER property itself cannot be removed.
+func mergeUpdatedAttendees(existing calendar.Event, requested []calendar.Attendee, owner string) []calendar.Attendee {
+	merged := make([]calendar.Attendee, 0, len(requested)+1)
+	seen := make(map[string]bool, len(requested)+1)
+	for _, want := range requested {
+		key := strings.ToLower(want.Email)
+		for _, current := range existing.Attendees {
+			if strings.EqualFold(current.Email, want.Email) {
+				want = current
+				break
+			}
+		}
+		merged = append(merged, want)
+		seen[key] = true
+	}
+
+	ownerIsOrganizer := calendar.OwnerIsOrganizer(existing, owner)
+	for _, current := range existing.Attendees {
+		organizerEntry := existing.Organizer != nil && strings.EqualFold(current.Email, existing.Organizer.Email)
+		ownerEntry := ownerIsOrganizer && owner != "" && strings.EqualFold(current.Email, owner)
+		key := strings.ToLower(current.Email)
+		if (organizerEntry || ownerEntry) && !seen[key] {
+			merged = append(merged, current)
+			seen[key] = true
+		}
+	}
+	return merged
 }
 
 // refuseReadOnly reports whether the named calendar is configured read-only
@@ -72,11 +105,11 @@ func refuseReadOnly(w http.ResponseWriter, cols []calendar.Collection, name stri
 //     the CLI `calendar new` and the sync write boundary).
 //   - An update (known UID) merges over the existing event: organizer,
 //     recurrence, the owner's RSVP, the online-meeting link and a pending
-//     online-meeting request are always preserved, and the attendee list is
-//     preserved unless the request carries a non-empty one — so a GUI edit of
-//     subject/time can never silently strip a meeting's attendees (which the
-//     next sync would push as an uninvite wave). request_online_meeting is
-//     honored on create only.
+//     online-meeting request are always preserved. replace_attendees explicitly
+//     replaces editable invitees with the posted list, including an empty list
+//     to remove everyone, but only for an owned meeting (a plain appointment
+//     with no meeting role is implicitly owned). Otherwise attendees are kept.
+//     request_online_meeting is honored on create only.
 //   - An update must target the calendar the event already lives in; moving an
 //     event between calendars (a remote delete + re-invite) is rejected.
 func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request) {
@@ -96,7 +129,7 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 	// A local calendar never reaches a provider, so attendees / online meetings
 	// would silently go nowhere. Reject them rather than accept an invite that
 	// can never be sent.
-	if req.Account == config.LocalCalendarAccount && (len(req.Attendees) > 0 || req.RequestOnlineMeeting) {
+	if req.Account == config.LocalCalendarAccount && (req.Attendees != nil && len(*req.Attendees) > 0 || req.RequestOnlineMeeting) {
 		http.Error(w, "local calendars cannot have attendees or online meetings (they do not sync to a provider)", http.StatusBadRequest)
 		return
 	}
@@ -142,8 +175,12 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 	// Same attendee semantics as the CLI `calendar new --attendee`: every
 	// entry is a required attendee; blanks are skipped, duplicates collapse,
 	// and anything that does not look like an email is rejected.
-	seen := make(map[string]bool, len(req.Attendees))
-	for _, email := range req.Attendees {
+	attendeeEmails := []string(nil)
+	if req.Attendees != nil {
+		attendeeEmails = *req.Attendees
+	}
+	seen := make(map[string]bool, len(attendeeEmails))
+	for _, email := range attendeeEmails {
 		email = strings.TrimSpace(email)
 		if email == "" || seen[strings.ToLower(email)] {
 			continue
@@ -188,10 +225,19 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		merged.AllDay = ev.AllDay
 		merged.Location = ev.Location
 		merged.Description = ev.Description
-		if len(ev.Attendees) > 0 {
-			// The GUI edit form sends an empty list (attendee editing is
-			// create-only for now); an empty list can never strip a meeting.
-			merged.Attendees = ev.Attendees
+		if req.ReplaceAttendees {
+			if req.Attendees == nil {
+				http.Error(w, "'replace_attendees' requires an 'attendees' list", http.StatusBadRequest)
+				return
+			}
+			owner := calendar.CollectionOwner(cols, calName)
+			ownsMeeting := calendar.OwnerIsOrganizer(existing, owner) ||
+				(existing.Organizer == nil && existing.OwnerResponse == calendar.OwnerRespNone)
+			if !ownsMeeting {
+				http.Error(w, "only the organizer can edit attendees", http.StatusForbidden)
+				return
+			}
+			merged.Attendees = mergeUpdatedAttendees(existing, ev.Attendees, owner)
 		}
 		// request_online_meeting is a create-time flag: an update never sets
 		// it, and a still-pending marker (created locally, not yet synced)

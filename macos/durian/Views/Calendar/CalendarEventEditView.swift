@@ -46,11 +46,7 @@ struct CalendarEventEditView: View {
 
                     timeSection
 
-                    if draft.isNew {
-                        // Attendees and the online-meeting request are
-                        // create-only; editing an existing meeting's attendee
-                        // set is not supported yet (the write path preserves
-                        // it), so no control is offered that could touch it.
+                    if draft.canEditAttendees {
                         meetingSection
                     }
 
@@ -185,25 +181,26 @@ struct CalendarEventEditView: View {
         }
     }
 
-    /// Attendees + online-meeting request for a NEW event. Local-first:
-    /// saving only writes the local .ics — the invitations (and the online
-    /// meeting) go out on the next manual `durian calendar sync`, which
-    /// previews them first; automatic sync never sends them.
+    /// Attendees for an owned meeting, plus the online-meeting request for a
+    /// NEW event. Saving only writes the local .ics; attendee notifications go
+    /// out on the next manual `durian calendar sync`, after its preview.
     private var meetingSection: some View {
         section("Meeting") {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Online meeting")
-                        .font(.callout)
-                        .foregroundStyle(Color.Detail.textBody)
-                    Text("Teams for Microsoft, Meet for Google")
-                        .font(.caption)
-                        .foregroundStyle(Color.Detail.textSecondary)
+            if draft.isNew {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Online meeting")
+                            .font(.callout)
+                            .foregroundStyle(Color.Detail.textBody)
+                        Text("Teams for Microsoft, Meet for Google")
+                            .font(.caption)
+                            .foregroundStyle(Color.Detail.textSecondary)
+                    }
+                    Spacer()
+                    Toggle("", isOn: $draft.requestOnlineMeeting)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
                 }
-                Spacer()
-                Toggle("", isOn: $draft.requestOnlineMeeting)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
             }
 
             ForEach(draft.attendees, id: \.self) { email in
@@ -244,8 +241,8 @@ struct CalendarEventEditView: View {
                 }
             }
 
-            if !draft.attendees.isEmpty || draft.requestOnlineMeeting {
-                Label("Saved locally first — invitations are sent when you run 'durian calendar sync' (automatic sync skips them).",
+            if draft.attendeesChanged || draft.requestOnlineMeeting {
+                Label("Saved locally first — attendee updates are sent when you run 'durian calendar sync' (automatic sync skips them).",
                       systemImage: "paperplane")
                     .font(.caption)
                     .foregroundStyle(Color.Detail.textSecondary)
@@ -347,6 +344,14 @@ struct CalendarEventEditView: View {
                 guard let match = calendars.first(where: { $0.visibilityKey == key }) else { return }
                 draft.calendar = match.name
                 draft.account = match.account
+                // Local-only calendars never reach a provider. If the user
+                // switches to one after entering meeting details, discard
+                // those hidden values rather than submitting a request the
+                // API must reject.
+                if match.account == "local" {
+                    draft.attendees = []
+                    draft.requestOnlineMeeting = false
+                }
             }
         )
     }
