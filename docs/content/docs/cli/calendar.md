@@ -113,6 +113,17 @@ Meet on Google accounts (`--teams` is a deprecated alias). Times are interpreted
 in UTC.
 
 ```bash
+durian calendar modify <account> <event> [--calendar NAME]
+       [--subject SUBJECT] [--start WHEN]
+       [--end WHEN | --duration 1h30m] [--all-day | --all-day=false]
+       [--location L] [--description D]
+```
+
+Patches only the fields whose flags are present; recurrence, attendees and all
+other omitted fields are preserved. Pass an empty value such as `--location ""`
+to clear a text field. `edit` is an alias for `modify`.
+
+```bash
 durian calendar rsvp <account> <event> <accept|decline|tentative> [--calendar NAME]
 ```
 

@@ -131,19 +131,21 @@ durian calendar list --calendar "Team"   # filter to one calendar by display nam
 durian calendar search "standup"         # match by subject
 durian calendar show standup             # full detail (event by subject or UID)
 durian calendar new work --calendar "Calendar" -s "Lunch" --start "2026-08-01 12:00" --duration 1h
+durian calendar modify work standup --start "2026-08-01 12:30" --duration 30m
 durian calendar rsvp work standup accept # accept / decline / tentative
 durian calendar delete work standup --yes
 durian calendar sync work                # two-way sync for the account, with a preview + confirm
 durian calendar export work --out ./ics
 ```
 
-The positional argument to `new` / `rsvp` / `delete` / `sync` / `export` is the
-**account** (alias); events are addressed by subject or UID prefix. Reads and
-edits are **local-first** — `list`, `search`, `show`, `new`, `rsvp`, and
-`delete` all work offline against a local vdir of `.ics` files. Only `sync`,
-`export`, and the background autosync in `durian serve` touch the provider, and
-`sync` previews every outgoing invitation before it sends. Full walkthrough:
-[Calendar](../calendar/) and [Calendar Sync](../calendar-sync/).
+The positional argument to `new` / `modify` / `rsvp` / `delete` / `sync` /
+`export` is the **account** (alias); events are addressed by subject or UID
+prefix. Reads and edits are **local-first** — `list`, `search`, `show`, `new`,
+`modify`, `rsvp`, and `delete` all work offline against a local vdir of `.ics`
+files. Only `sync`, `export`, and the background autosync in `durian serve`
+touch the provider, and `sync` previews every outgoing invitation before it
+sends. Full walkthrough: [Calendar](../calendar/) and
+[Calendar Sync](../calendar-sync/).
 
 ## validate — check config
 
