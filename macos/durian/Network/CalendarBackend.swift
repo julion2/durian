@@ -89,6 +89,15 @@ struct CalendarRsvpWrite: Encodable {
     let response: String
 }
 
+/// POST /calendars/sync/event body. The server applies only this event's
+/// pending sync action; unrelated account changes remain pending.
+private struct CalendarEventSyncWrite: Encodable {
+    let account: String
+    let calendar: String
+    let uid: String
+    let operation: String
+}
+
 // MARK: - Calendar Backend
 
 @MainActor
@@ -139,17 +148,16 @@ final class CalendarBackend {
         return resp?.event
     }
 
-    /// Creates or updates a local event (empty uid = create). Local-first: this
-    /// only writes the vdir; Outlook is updated on the next sync.
+    /// Creates or updates a local event (empty uid = create). This first step
+    /// only writes the vdir; the manager follows it with syncEvent.
     func putEvent(_ write: CalendarEventWrite) async -> CalendarEventWire? {
         guard let data = try? JSONEncoder().encode(write) else { return nil }
         let resp: CalendarEventResponse? = await request("/calendars/event", method: "PUT", bodyData: data)
         return resp?.event
     }
 
-    /// Sets the owner's RSVP on a meeting. Local-first: only the owner's
-    /// PARTSTAT in the local .ics changes — the organizer is notified on the
-    /// next `durian calendar sync`.
+    /// Sets the owner's RSVP on a meeting in the local vdir. The manager follows
+    /// this with syncEvent to send the response.
     func rsvp(account: String, calendar: String?, ref: String, response: String) async -> CalendarEventWire? {
         let body = CalendarRsvpWrite(account: account, calendar: calendar, ref: ref, response: response)
         guard let data = try? JSONEncoder().encode(body) else { return nil }
@@ -171,13 +179,36 @@ final class CalendarBackend {
         return resp?.ok ?? false
     }
 
+    enum EventSyncResult: Equatable {
+        case applied
+        case alreadyConverged
+        case failed
+    }
+
+    /// Pushes exactly one explicit GUI calendar action to its provider. Local
+    /// calendars have no provider and are already complete after the vdir write.
+    func syncEvent(account: String, calendar: String, uid: String, operation: String) async -> EventSyncResult {
+        guard account != "local" else { return .alreadyConverged }
+        let body = CalendarEventSyncWrite(
+            account: account, calendar: calendar, uid: uid, operation: operation
+        )
+        guard let data = try? JSONEncoder().encode(body) else { return .failed }
+        struct SyncResponse: Decodable { let ok: Bool; let applied: Bool }
+        let resp: SyncResponse? = await request(
+            "/calendars/sync/event", method: "POST", bodyData: data, timeout: 120
+        )
+        guard let resp, resp.ok else { return .failed }
+        return resp.applied ? .applied : .alreadyConverged
+    }
+
     // MARK: - Request pipeline (mirrors EmailBackend.performRequest)
 
     private func request<T: Decodable>(
         _ path: String,
         _ queryItems: [URLQueryItem] = [],
         method: String = "GET",
-        bodyData: Data? = nil
+        bodyData: Data? = nil,
+        timeout: TimeInterval = 10
     ) async -> T? {
         guard var comps = URLComponents(string: "\(baseURL)\(path)") else { return nil }
         if !queryItems.isEmpty { comps.queryItems = queryItems }
@@ -185,7 +216,7 @@ final class CalendarBackend {
 
         var req = URLRequest(url: url)
         req.httpMethod = method
-        req.timeoutInterval = 10
+        req.timeoutInterval = timeout
         if let token = EmailBackend.authToken {
             req.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
@@ -195,7 +226,20 @@ final class CalendarBackend {
         }
 
         do {
-            let (data, _) = try await URLSession.shared.data(for: req)
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse else {
+                Log.error("CALENDAR", "Request to \(path) returned a non-HTTP response")
+                return nil
+            }
+            guard (200 ..< 300).contains(http.statusCode) else {
+                let message = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                Log.error(
+                    "CALENDAR",
+                    "Request to \(path) failed with HTTP \(http.statusCode)\(message.isEmpty ? "" : ": \(message)")"
+                )
+                return nil
+            }
             return try decoder.decode(T.self, from: data)
         } catch is CancellationError {
             return nil

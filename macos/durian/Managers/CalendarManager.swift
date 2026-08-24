@@ -316,7 +316,7 @@ final class CalendarManager: ObservableObject {
     /// costs nothing when none are configured — the endpoint answers with an
     /// empty list, exactly like an account that has no vdir yet.
     private var accountIdentifiers: [String] {
-        ConfigManager.shared.getAccounts().map { $0.email } + [Self.localCalendarAccount]
+        ConfigManager.shared.getAccounts().filter(\.calendarEnabled).map { $0.email } + [Self.localCalendarAccount]
     }
 
     /// Mirrors config.LocalCalendarAccount on the Go side.
@@ -665,10 +665,9 @@ final class CalendarManager: ObservableObject {
         selectedEventID = under.first?.id
     }
 
-    /// RSVP to a meeting via the local-first write endpoint (POST
-    /// /calendars/rsvp): only the owner's PARTSTAT in the local .ics changes —
-    /// no mail is sent now. The organizer is notified on the next `durian
-    /// calendar sync`, which previews the reply behind its confirmation gate.
+    /// RSVP to a meeting. Clicking a response is the user's send intent: save
+    /// locally first, then sync only this event so no unrelated pending change
+    /// can ride along.
     func requestRSVP(_ event: CalendarEvent, response: String) {
         guard !event.account.isEmpty else { return }
         let account = event.account
@@ -676,8 +675,8 @@ final class CalendarManager: ObservableObject {
         let calendar = event.calendar
         Task { [weak self] in
             guard let self else { return }
-            guard await backend.rsvp(account: account, calendar: calendar,
-                                     ref: uid, response: response) != nil
+            guard let written = await backend.rsvp(account: account, calendar: calendar,
+                                                   ref: uid, response: response)
             else {
                 BannerManager.shared.showWarning(
                     title: "Couldn't save RSVP",
@@ -685,15 +684,14 @@ final class CalendarManager: ObservableObject {
                 )
                 return
             }
-            // Make the local-first model explicit: the response is only saved
-            // locally until the next calendar sync notifies the organizer.
-            let name = ConfigManager.shared.getAccounts()
-                .first { $0.email == account }?.name ?? account
-            let syncTarget = name.contains(" ") ? "\"\(name)\"" : name
-            BannerManager.shared.showInfo(
-                title: "Response saved",
-                message: "Run 'durian calendar sync \(syncTarget)' (or wait for the next sync) to notify the organizer."
-            )
+            if await backend.syncEvent(account: account, calendar: calendar, uid: written.uid,
+                                       operation: "rsvp") == .failed
+            {
+                BannerManager.shared.showWarning(
+                    title: "Response saved, but not sent",
+                    message: "Try again or run 'durian calendar sync \(account)' to notify the organizer."
+                )
+            }
             // Reconcile the store with the server and refetch the detail so
             // the card shows the new response.
             refresh(force: true)
@@ -779,7 +777,7 @@ final class CalendarManager: ObservableObject {
         }
         Task { [weak self] in
             guard let self else { return }
-            guard await backend.putEvent(draft.toWrite()) != nil else {
+            guard let written = await backend.putEvent(draft.toWrite()) else {
                 BannerManager.shared.showWarning(
                     title: "Couldn't save event",
                     message: "The write failed — make sure the durian CLI is up to date."
@@ -788,18 +786,12 @@ final class CalendarManager: ObservableObject {
                 if !draft.isNew { loadDetail() }
                 return
             }
-            if draft.attendeesChanged || draft.requestOnlineMeeting {
-                // Make the local-first model explicit: inviting attendees (or
-                // changing them, or requesting an online meeting) is a
-                // notifying action, so
-                // automatic sync will NOT push it — the invitations go out
-                // only on a manual sync, behind its preview gate.
-                let name = ConfigManager.shared.getAccounts()
-                    .first { $0.email == draft.account }?.name ?? draft.account
-                let syncTarget = name.contains(" ") ? "\"\(name)\"" : name
-                BannerManager.shared.showInfo(
-                    title: "Event saved locally",
-                    message: "Run 'durian calendar sync \(syncTarget)' to send the attendee updates — automatic sync does not send them."
+            if await backend.syncEvent(account: draft.account, calendar: draft.calendar, uid: written.uid,
+                                       operation: "save") == .failed
+            {
+                BannerManager.shared.showWarning(
+                    title: draft.sendsNotifications ? "Event saved, but not sent" : "Event saved, but not synced",
+                    message: "Try again or run 'durian calendar sync \(draft.account)'."
                 )
             }
             // A local edit must reconcile against the server even when the
@@ -853,10 +845,20 @@ final class CalendarManager: ObservableObject {
         store.applyOptimistic(moved)
         Task { [weak self] in
             guard let self else { return }
-            if await backend.putEvent(draft.toWrite(includeAttendees: false)) == nil {
+            guard let written = await backend.putEvent(draft.toWrite(includeAttendees: false)) else {
                 BannerManager.shared.showWarning(
                     title: "Couldn't move event",
                     message: "The write failed — make sure the durian CLI is up to date."
+                )
+                refresh(force: true)
+                return
+            }
+            if await backend.syncEvent(account: draft.account, calendar: draft.calendar, uid: written.uid,
+                                       operation: "save") == .failed
+            {
+                BannerManager.shared.showWarning(
+                    title: "Event moved locally, but not synced",
+                    message: "Try again or run 'durian calendar sync \(draft.account)'."
                 )
             }
             refresh(force: true)
@@ -881,6 +883,13 @@ final class CalendarManager: ObservableObject {
                 BannerManager.shared.showWarning(
                     title: "Couldn't delete event",
                     message: "The delete failed — make sure the durian CLI is up to date."
+                )
+            } else if await backend.syncEvent(account: account, calendar: calendar, uid: uid,
+                                              operation: "delete") == .failed
+            {
+                BannerManager.shared.showWarning(
+                    title: "Event deleted locally, but not synced",
+                    message: "Run 'durian calendar sync \(account)' to finish the deletion."
                 )
             }
             refresh(force: true)

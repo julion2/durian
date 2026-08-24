@@ -218,6 +218,13 @@ swift_test(
     deps = [":durian_testlib"],
 )
 
+swift_test(
+    name = "server_handshake_test",
+    size = "small",
+    srcs = ["tests/ServerHandshakeTests.swift"],
+    deps = [":durian_testlib"],
+)
+
 genrule(
     name = "StampedInfoPlist",
     srcs = ["Info.plist"],

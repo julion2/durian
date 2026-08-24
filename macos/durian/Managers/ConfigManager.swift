@@ -17,9 +17,12 @@ struct MailAccount: Codable {
     let email: String
     let defaultSignature: String?
     let notifications: Bool?
+    let calendar: MailAccountCalendar?
+
+    var calendarEnabled: Bool { calendar?.enabled ?? true }
 
     enum CodingKeys: String, CodingKey {
-        case name, email, notifications
+        case name, email, notifications, calendar
         case defaultSignature = "default_signature"
     }
 
@@ -29,15 +32,32 @@ struct MailAccount: Codable {
         email = try container.decode(String.self, forKey: .email)
         defaultSignature = try container.decodeIfPresent(String.self, forKey: .defaultSignature)
         notifications = try container.decodeIfPresent(Bool.self, forKey: .notifications)
+        calendar = try container.decodeIfPresent(MailAccountCalendar.self, forKey: .calendar)
 
         // Skip IMAP/SMTP/Auth sections - they're handled by CLI
     }
 
-    init(name: String, email: String, defaultSignature: String? = nil, notifications: Bool? = nil) {
+    init(name: String, email: String, defaultSignature: String? = nil, notifications: Bool? = nil,
+         calendar: MailAccountCalendar? = nil)
+    {
         self.name = name
         self.email = email
         self.defaultSignature = defaultSignature
         self.notifications = notifications
+        self.calendar = calendar
+    }
+}
+
+struct MailAccountCalendar: Codable {
+    let enabled: Bool
+
+    init(enabled: Bool = true) {
+        self.enabled = enabled
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
     }
 }
 

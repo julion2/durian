@@ -291,8 +291,11 @@ struct CalendarEventDraft: Identifiable {
 
     var isNew: Bool { uid.isEmpty }
     var canEditAttendees: Bool { account != "local" && (isNew || ownsMeeting) }
-    var attendeesChanged: Bool {
-        Set(attendees.map { $0.lowercased() }) != Set(originalAttendees.map { $0.lowercased() })
+    /// Saving this draft can make the provider email invitees. Existing
+    /// invitees count too: changing the title or time of an owned meeting sends
+    /// an update even when the attendee list itself is unchanged.
+    var sendsNotifications: Bool {
+        canEditAttendees && (!attendees.isEmpty || !originalAttendees.isEmpty)
     }
 
     /// A draft pre-filled from an existing event for editing. For a recurring

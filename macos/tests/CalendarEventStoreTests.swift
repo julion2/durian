@@ -291,6 +291,7 @@ final class CalendarEventDraftWriteTests: XCTestCase {
         XCTAssertEqual(write.attendees, ["alice@example.com", "bob@example.com"])
         XCTAssertFalse(write.replace_attendees)
         XCTAssertTrue(write.request_online_meeting)
+        XCTAssertTrue(draft.sendsNotifications)
     }
 
     func testOwnedExistingEventDraftEditsAttendees() throws {
@@ -313,14 +314,13 @@ final class CalendarEventDraftWriteTests: XCTestCase {
         XCTAssertFalse(draft.isNew)
         XCTAssertTrue(draft.canEditAttendees)
         XCTAssertEqual(draft.attendees, ["alice@example.com", "bob@example.com"])
-        XCTAssertFalse(draft.attendeesChanged)
+        XCTAssertTrue(draft.sendsNotifications)
 
         draft.attendees.removeAll { $0 == "bob@example.com" }
         draft.requestOnlineMeeting = true
         let write = draft.toWrite()
         XCTAssertEqual(write.attendees, ["alice@example.com"])
         XCTAssertTrue(write.replace_attendees)
-        XCTAssertTrue(draft.attendeesChanged)
         XCTAssertFalse(write.request_online_meeting)
 
         // Drag/resize starts from a summary without attendee detail and must
@@ -342,6 +342,7 @@ final class CalendarEventDraftWriteTests: XCTestCase {
 
         let draft = CalendarEventDraft(from: event)
         XCTAssertFalse(draft.canEditAttendees)
+        XCTAssertFalse(draft.sendsNotifications)
         XCTAssertNil(draft.toWrite().attendees)
         XCTAssertFalse(draft.toWrite().replace_attendees)
     }
@@ -357,6 +358,8 @@ final class CalendarEventDraftWriteTests: XCTestCase {
         var event = try XCTUnwrap(CalendarEvent(from: wire))
         event.account = "me@example.com"
 
-        XCTAssertTrue(CalendarEventDraft(from: event).canEditAttendees)
+        let draft = CalendarEventDraft(from: event)
+        XCTAssertTrue(draft.canEditAttendees)
+        XCTAssertFalse(draft.sendsNotifications)
     }
 }

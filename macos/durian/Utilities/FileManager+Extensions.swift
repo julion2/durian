@@ -11,23 +11,26 @@ extension FileManager {
     }
 
     func resolveDurianPath() -> String? {
-        // 1. Check ~/.local/bin/durian
-        let homeURL = homeDirectoryForCurrentUser
-        let localBinURL = homeURL.appendingPathComponent(".local/bin/durian")
-        if fileExists(atPath: localBinURL.path) {
-            return localBinURL.path
+        // Match the CLI a terminal would launch instead of maintaining a
+        // second resolution order that can select a different installation.
+        if let path = ProcessInfo.processInfo.environment["PATH"] {
+            for directory in path.split(separator: ":") {
+                let candidate = URL(fileURLWithPath: String(directory)).appendingPathComponent("durian").path
+                if isExecutableFile(atPath: candidate) {
+                    return candidate
+                }
+            }
         }
 
-        // 2. Check standard Homebrew path
-        let brewPath = "/opt/homebrew/bin/durian"
-        if fileExists(atPath: brewPath) {
-            return brewPath
-        }
-
-        // 3. Fallback to /usr/local/bin
-        let usrLocalPath = "/usr/local/bin/durian"
-        if fileExists(atPath: usrLocalPath) {
-            return usrLocalPath
+        // Finder launches can have a minimal PATH. Keep deterministic
+        // fallbacks for the supported installation locations.
+        let fallbacks = [
+            "/opt/homebrew/bin/durian",
+            "/usr/local/bin/durian",
+            homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/durian").path,
+        ]
+        for candidate in fallbacks where isExecutableFile(atPath: candidate) {
+            return candidate
         }
 
         return nil
