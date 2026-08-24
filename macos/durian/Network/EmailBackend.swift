@@ -158,18 +158,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     // MARK: - Connection Management
 
     private func resolveDurianPath() -> String? {
-        // This helper remains the same
-        let homePath = "\(NSHomeDirectory())/.local/bin/durian"
-        if FileManager.default.fileExists(atPath: homePath) {
-            return homePath
-        }
-        let searchPaths = ["/usr/local/bin/durian", "/opt/homebrew/bin/durian"]
-        for path in searchPaths {
-            if FileManager.default.fileExists(atPath: path) {
-                return path
-            }
-        }
-        return nil
+        FileManager.default.resolveDurianPath()
     }
 
     func connect() async {
@@ -210,7 +199,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
             try durianProcess?.run()
             Log.info("BACKEND", "Started durian server process")
 
-            // Read the "READY token=<hex> addr=<addr>" handshake, with a timeout
+            // Read the "READY token=<hex> addr=<addr> api=<n>" handshake, with a timeout
             // so a serve that never binds can't hang the app, and line buffering
             // so a chunk-split READY line still parses.
             let token = try await Self.readReadyToken(from: stdoutPipe, timeout: 10)
@@ -223,7 +212,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         } catch {
             connectionStatus = "Failed to start or connect to server: \(error.localizedDescription)"
             Log.error("BACKEND", connectionStatus)
-            BannerManager.shared.showCritical(title: "Mail Server Error", message: "Could not connect. Try restarting.")
+            BannerManager.shared.showCritical(title: "Mail Server Error", message: error.localizedDescription)
             durianProcess?.terminate()
             durianProcess = nil
             isConnected = false
@@ -286,7 +275,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         return s.split(separator: "\n").compactMap { pid_t($0.trimmingCharacters(in: .whitespaces)) }
     }
 
-    /// Reads the `READY token=<hex> addr=<addr>` handshake line from serve's
+    /// Reads the `READY token=<hex> addr=<addr> api=<n>` handshake line from serve's
     /// stdout. Buffers partial reads until a newline (a split READY line still
     /// parses), ignores any non-READY lines, and fails after `timeout` seconds so
     /// a serve that never binds cannot hang the app. The continuation is resumed
@@ -323,10 +312,18 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
                 while let nl = state.buffer.firstIndex(of: "\n") {
                     let line = String(state.buffer[..<nl])
                     state.buffer = String(state.buffer[state.buffer.index(after: nl)...])
-                    guard line.hasPrefix("READY token=") else { continue }
-                    let token = line.split(separator: " ")
-                        .first(where: { $0.hasPrefix("token=") })
-                        .map { String($0.dropFirst(6)) } ?? ""
+                    let token: String
+                    do {
+                        guard let parsed = try parseReadyLine(line) else { continue }
+                        token = parsed
+                    } catch {
+                        if state.claim() {
+                            timeoutTask.cancel()
+                            h.readabilityHandler = nil
+                            continuation.resume(throwing: error)
+                        }
+                        return
+                    }
                     if state.claim() {
                         timeoutTask.cancel()
                         h.readabilityHandler = nil
@@ -336,6 +333,38 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
                 }
             }
         }
+    }
+
+    /// Parses one complete stdout line. Non-handshake output is ignored; a
+    /// READY line is authoritative and therefore fails immediately when its
+    /// API contract is missing or incompatible.
+    nonisolated static func parseReadyLine(_ line: String) throws -> String? {
+        guard line.hasPrefix("READY ") else { return nil }
+        var fields: [String: String] = [:]
+        for field in line.split(separator: " ") {
+            let parts = field.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            if parts.count == 2 {
+                fields[String(parts[0])] = String(parts[1])
+            }
+        }
+        guard fields["api"] == String(AppServer.apiProtocol) else {
+            let found = fields["api"] ?? "legacy"
+            let action: String
+            if let version = Int(found), version > AppServer.apiProtocol {
+                action = "Update the Durian app and restart it."
+            } else if found == "legacy" || Int(found) != nil {
+                action = "Update the durian CLI and restart the app."
+            } else {
+                action = "Install a compatible durian CLI and restart the app."
+            }
+            throw NSError(
+                domain: "EmailBackend",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Incompatible durian CLI API (found \(found), need \(AppServer.apiProtocol)). \(action)"]
+            )
+        }
+        return fields["token"] ?? ""
     }
 
     /// One-shot resume guard shared between the READY read and its timeout.
@@ -1056,5 +1085,3 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
 
 // MARK: - Protocol Conformance
 extension EmailBackend: MailBackendProtocol {}
-
-

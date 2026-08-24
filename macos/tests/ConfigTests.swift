@@ -91,6 +91,29 @@ final class ConfigTests: XCTestCase {
         XCTAssertNil(account.defaultSignature)
     }
 
+    func testCalendarDefaultsEnabled() throws {
+        let withoutCalendar = try JSONDecoder().decode(
+            MailAccount.self,
+            from: Data(#"{"name":"Personal","email":"me@example.com"}"#.utf8)
+        )
+        let emptyCalendar = try JSONDecoder().decode(
+            MailAccount.self,
+            from: Data(#"{"name":"Work","email":"work@example.com","calendar":{}}"#.utf8)
+        )
+
+        XCTAssertTrue(withoutCalendar.calendarEnabled)
+        XCTAssertTrue(emptyCalendar.calendarEnabled)
+    }
+
+    func testCalendarCanBeDisabled() throws {
+        let account = try JSONDecoder().decode(
+            MailAccount.self,
+            from: Data(#"{"name":"Mail only","email":"mail@example.com","calendar":{"enabled":false}}"#.utf8)
+        )
+
+        XCTAssertFalse(account.calendarEnabled)
+    }
+
     // MARK: - Config Loading Errors
 
     func testParseFailureIsVisibleWhileAccountsRemainEmpty() throws {

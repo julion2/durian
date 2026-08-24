@@ -11,6 +11,10 @@ import Foundation
 /// Nightly and Release apps never contend for the same port — and never kill
 /// each other's server. serve is told which port to use via `--port`.
 enum AppServer {
+    /// Local HTTP contract required by this GUI. Increment when a GUI release
+    /// requires an incompatible or newly mandatory server capability.
+    static let apiProtocol = 1
+
     /// 9723 for Release, 9724 for Nightly (bundle id ends in ".nightly").
     static let port: Int = {
         let id = Bundle.main.bundleIdentifier ?? ""

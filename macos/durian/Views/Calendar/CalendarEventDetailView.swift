@@ -159,8 +159,8 @@ struct CalendarEventDetailView: View {
     // MARK: - RSVP
 
     /// Shown for meetings the account owner attends (not organizes). The current
-    /// response is highlighted. The buttons save the response locally via
-    /// CalendarManager.requestRSVP; the organizer is notified on the next sync.
+    /// response is highlighted. Clicking a response saves it locally and sends
+    /// that one event's RSVP immediately.
     private var isOrganizer: Bool { event.myResponse == "organizer" }
     private var showRSVP: Bool { !event.attendees.isEmpty && !isOrganizer }
 

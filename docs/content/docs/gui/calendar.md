@@ -64,29 +64,25 @@ The form opens in the right pane (New: `n`, `o`, `O`, or the **+** button; Edit:
 Save with `Cmd+Return` (disabled until the title is non-empty and the end is at
 or after the start); Cancel or `Esc` discards.
 
-## Local-first writes
+## Local-first writes and sending
 
 Creating, editing, deleting, moving, and RSVPing all write the local `.ics`
-immediately and update the view optimistically — **nothing is sent
-automatically.** Invitations, online-meeting creation, and RSVP replies go out
-only when you run a sync from the terminal, which previews them first:
+first and update the view optimistically. The GUI then syncs exactly that event:
+normal appointments use the keyboard-first Save action, while a meeting makes
+the external effect explicit as **Send** or **Send Update**. Clicking an RSVP
+response sends that response. No other pending event in the account rides along.
+
+If the provider is unavailable or the event conflicts, the local edit remains
+safe on disk and the GUI reports that it was not sent. Resolve or retry it with:
 
 ```bash
 durian calendar sync "Work"
 ```
 
-A banner reminds you:
-
-> Run `durian calendar sync "Work"` to send the invitations — automatic sync
-> does not send them.
-
-What background autosync does with your edits depends on `autosync_upload`. By
-default (`"none"`) it only downloads, so even a plain, attendee-less event you
-create in the GUI waits for a manual `durian calendar sync`. With `"safe"`,
-autosync additionally uploads those non-notifying edits on its own — genuinely
-two-way — while anything that would email someone (invitations, RSVP replies)
-still waits for the manual, previewed sync. Autosync never sends mail or deletes
-a remote event in either mode. See [Calendar Sync](../../cli/calendar-sync/).
+Background autosync keeps its conservative policy: it never sends mail or
+deletes remotely by itself. The difference is intent: a GUI Save, Send, RSVP or
+Delete is a user action and therefore may sync its one event immediately. See
+[Calendar Sync](../../cli/calendar-sync/) for unattended sync behavior.
 
 ## Event detail pane
 

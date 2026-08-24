@@ -2,9 +2,9 @@
 //  CalendarEventEditView.swift
 //  Durian
 //
-//  Create/edit form shown in the floating event card. Local-first:
-//  saving writes the local .ics via the API; nothing is sent to Outlook until
-//  the next sync.
+//  Create/edit form shown in the floating event card. A normal event keeps the
+//  keyboard-first Save action; a meeting exposes the one irreversible action
+//  explicitly as Send / Send Update.
 //
 //  Laid out flush, matching CalendarEventDetailView: the form's fields are
 //  mostly one line each, and a bordered card around a single line adds a
@@ -81,14 +81,22 @@ struct CalendarEventEditView: View {
                 .foregroundStyle(Color.Detail.textPrimary)
             HStack {
                 Spacer()
-                Button("Save") {
-                    // A typed-but-not-committed attendee email still counts.
-                    addAttendee()
-                    onSave(draft)
+                if willSendNotifications {
+                    Button(draft.isNew ? "Send" : "Send Update", action: commit)
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!isValid)
+                } else {
+                    // Keep Return as the normal Save action without adding a
+                    // permanent button to a keyboard-first editor. Meetings
+                    // alone surface a visible action because they email people.
+                    Button("Save", action: commit)
+                        .keyboardShortcut(.defaultAction)
+                        .frame(width: 0, height: 0)
+                        .opacity(0)
+                        .accessibilityHidden(true)
+                        .disabled(!isValid)
                 }
-                .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
-                .disabled(!isValid)
             }
         }
         .padding(.horizontal, 16)
@@ -182,8 +190,8 @@ struct CalendarEventEditView: View {
     }
 
     /// Attendees for an owned meeting, plus the online-meeting request for a
-    /// NEW event. Saving only writes the local .ics; attendee notifications go
-    /// out on the next manual `durian calendar sync`, after its preview.
+    /// NEW event. A meeting's header action says Send rather than hiding the
+    /// external effect behind a generic Save button.
     private var meetingSection: some View {
         section("Meeting") {
             if draft.isNew {
@@ -241,8 +249,8 @@ struct CalendarEventEditView: View {
                 }
             }
 
-            if draft.attendeesChanged || draft.requestOnlineMeeting {
-                Label("Saved locally first — attendee updates are sent when you run 'durian calendar sync' (automatic sync skips them).",
+            if willSendNotifications {
+                Label(draft.isNew ? "Sending will invite these attendees." : "Sending will notify the meeting attendees.",
                       systemImage: "paperplane")
                     .font(.caption)
                     .foregroundStyle(Color.Detail.textSecondary)
@@ -273,6 +281,17 @@ struct CalendarEventEditView: View {
         }
         draft.attendees.append(email)
         attendeeInput = ""
+    }
+
+    private func commit() {
+        // A typed-but-not-committed attendee email still counts.
+        addAttendee()
+        onSave(draft)
+    }
+
+    private var willSendNotifications: Bool {
+        draft.sendsNotifications
+            || (!trimmedAttendeeInput.isEmpty && Self.looksLikeEmail(trimmedAttendeeInput))
     }
 
     private var notesSection: some View {
@@ -351,6 +370,7 @@ struct CalendarEventEditView: View {
                 if match.account == "local" {
                     draft.attendees = []
                     draft.requestOnlineMeeting = false
+                    attendeeInput = ""
                 }
             }
         )
