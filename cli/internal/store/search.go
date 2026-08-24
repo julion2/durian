@@ -10,19 +10,18 @@ import (
 	"github.com/julion2/durian/cli/internal/dbcrypto"
 )
 
-// SearchCount returns the number of threads matching a query. ADR-0001
-// audit H2: when the query has any blind-FTS terms, the count is taken
-// over the post-decrypt-filtered candidate set so HMAC collisions in
-// the index don't inflate the count and feed a chosen-plaintext oracle.
+// SearchCount returns the number of threads matching a query. Queries involving
+// blind-FTS terms or encrypted attachment metadata are counted from the
+// post-decrypt-filtered candidate set.
 func (d *DB) SearchCount(query string) (int, error) {
 	where, params, node, terms, err := d.parseQueryWithTerms(query)
 	if err != nil {
 		return 0, fmt.Errorf("parse query: %w", err)
 	}
 
-	if len(terms) == 0 {
-		// Fast path: pure SQL filter, no FTS involved → no collision risk
-		// → no need to materialize per-row decrypts just to count threads.
+	if len(terms) == 0 && !hasTypedAttachmentFilter(node) {
+		// Fast path: every leaf is fully enforced in SQL, so there is no
+		// encrypted value or blind-index match to verify after decryption.
 		q := "SELECT COUNT(DISTINCT m.thread_id) FROM messages m"
 		if where != "" {
 			q += " WHERE " + where
@@ -42,7 +41,7 @@ func (d *DB) SearchCount(query string) (int, error) {
 }
 
 // filteredThreadIDs returns the distinct thread_ids that survive the
-// post-decrypt filter for the given SQL WHERE + FTS terms. Used by
+// post-decrypt filter for the given SQL WHERE + parsed expression. Used by
 // both Search and SearchCount so the two endpoints can't diverge on
 // what "matches" means.
 func (d *DB) filteredThreadIDs(where string, params []any, node exprNode) ([]string, error) {
@@ -117,8 +116,10 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 	// chosen-plaintext attacker who can email the user and watch the
 	// count delta can confirm token-collision pairs and recover the
 	// fts_token sub-key one bit at a time.
+	// Typed attachment filters use the same path because their filename and
+	// content-type predicates cannot be evaluated over encrypted SQL columns.
 	var threadFilter string
-	if len(terms) > 0 {
+	if len(terms) > 0 || hasTypedAttachmentFilter(node) {
 		threadIDs, err := d.filteredThreadIDs(where, params, node)
 		if err != nil {
 			return nil, err
@@ -643,26 +644,39 @@ func (p *parser) parsePrimary() (exprNode, error) {
 // Promoted to a method on *DB so the bareExpr and subject: cases can reach the
 // FTSToken sub-key for tokenizing user input against messages_blind_fts.
 func (d *DB) exprToSQL(node exprNode) (string, []interface{}, error) {
+	return d.exprToSQLWithPolarity(node, false)
+}
+
+// exprToSQLWithPolarity tracks whether a leaf is under an odd number of NOTs.
+// Most leaves have exact SQL predicates. Typed attachment filters only have a
+// coarse SQL candidate predicate because their metadata is encrypted: positive
+// leaves use "has any attachment", while negative leaves use false so the
+// surrounding NOT becomes true. Both are conservative supersets; the exact
+// predicate is restored by postDecryptFilter.
+func (d *DB) exprToSQLWithPolarity(node exprNode, underNot bool) (string, []interface{}, error) {
 	switch n := node.(type) {
 	case *binaryExpr:
-		leftSQL, leftParams, err := d.exprToSQL(n.left)
+		leftSQL, leftParams, err := d.exprToSQLWithPolarity(n.left, underNot)
 		if err != nil {
 			return "", nil, err
 		}
-		rightSQL, rightParams, err := d.exprToSQL(n.right)
+		rightSQL, rightParams, err := d.exprToSQLWithPolarity(n.right, underNot)
 		if err != nil {
 			return "", nil, err
 		}
 		return "(" + leftSQL + " " + n.op + " " + rightSQL + ")", append(leftParams, rightParams...), nil
 
 	case *notExpr:
-		childSQL, childParams, err := d.exprToSQL(n.child)
+		childSQL, childParams, err := d.exprToSQLWithPolarity(n.child, !underNot)
 		if err != nil {
 			return "", nil, err
 		}
 		return "NOT (" + childSQL + ")", childParams, nil
 
 	case *fieldExpr:
+		if isTypedAttachmentField(n) && underNot {
+			return "1=0", nil, nil
+		}
 		return d.fieldToSQL(n)
 
 	case *bareExpr:
@@ -721,10 +735,9 @@ func (d *DB) parseQuery(query string) (where string, params []interface{}, err e
 
 // parseQueryWithTerms parses the query like parseQuery and also returns
 // the flat list of FTS-bound terms extracted from the AST. ADR-0001
-// audit H2 callers feed the terms into postDecryptFilter to verify the
-// FTS5 MATCH wasn't satisfied by an HMAC truncation collision. If the
-// query has no blind-FTS terms, terms is nil and callers can take the
-// pure-SQL fast path.
+// audit H2 callers use the terms to decide whether the FTS5 MATCH needs a
+// post-decrypt collision check. If terms is nil, callers still inspect the AST
+// for encrypted predicates such as typed attachment metadata.
 func (d *DB) parseQueryWithTerms(query string) (where string, params []interface{}, node exprNode, terms []ftsTerm, err error) {
 	if len(query) > MaxQueryLen {
 		return "", nil, nil, nil, ErrQueryTooLong
@@ -798,9 +811,9 @@ func (d *DB) fieldToSQL(f *fieldExpr) (string, []interface{}, error) {
 			return "EXISTS (SELECT 1 FROM attachments WHERE attachments.message_db_id = m.id)", nil, nil
 		}
 		if strings.HasPrefix(val, "attachment:") {
-			wantType := val[len("attachment:"):]
-			return "EXISTS (SELECT 1 FROM attachments WHERE attachments.message_db_id = m.id AND (LOWER(attachments.content_type) LIKE ? OR LOWER(attachments.filename) LIKE ?))",
-				[]interface{}{"%" + wantType + "%", "%." + wantType}, nil
+			// Filename and content type are encrypted. SQL only narrows the
+			// candidate set; postDecryptFilter performs the exact match.
+			return "EXISTS (SELECT 1 FROM attachments WHERE attachments.message_db_id = m.id)", nil, nil
 		}
 		return "", nil, fmt.Errorf("unknown has: value %q (try: attachment, attachment:pdf)", f.value)
 
