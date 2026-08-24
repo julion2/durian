@@ -305,19 +305,35 @@ func TestCalendarPutUpdatePreservesMeetingFields(t *testing.T) {
 		t.Error("IsCancelled dropped by the update merge")
 	}
 
-	// An explicit non-empty attendee list in the request replaces the
-	// existing one; an empty list (what the GUI edit form sends) does not.
-	body = `{"account":"work","calendar":"Calendar","uid":"evt-meeting","subject":"Weekly Sync (moved)","start":"2026-08-06T10:00:00Z","end":"2026-08-06T11:00:00Z","attendees":["bob@example.com"]}`
+	// Compatibility: old GUI clients sent attendees:[] for every ordinary edit.
+	// Without the explicit replacement flag that still means preserve.
+	body = `{"account":"work","calendar":"Calendar","uid":"evt-meeting","subject":"Weekly Sync (moved)","start":"2026-08-06T10:00:00Z","end":"2026-08-06T11:00:00Z","attendees":[]}`
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
 	if w.Code != http.StatusOK {
-		t.Fatalf("PUT with attendees status %d: %s", w.Code, w.Body.String())
+		t.Fatalf("legacy PUT status %d: %s", w.Code, w.Body.String())
 	}
+
+	// A meeting attendee may still edit ordinary fields (the omitted list
+	// above), but may not replace the organizer's attendee set.
+	body = `{"account":"work","calendar":"Calendar","uid":"evt-meeting","subject":"Weekly Sync (moved)","start":"2026-08-06T10:00:00Z","end":"2026-08-06T11:00:00Z","attendees":["alice@example.com","bob@example.com"],"replace_attendees":true}`
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("invitee PUT with attendees status = %d, want 403: %s", w.Code, w.Body.String())
+	}
+	got = struct {
+		Event calendar.CalendarEvent `json:"event"`
+	}{}
 	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref=evt-meeting", &got); code != http.StatusOK {
 		t.Fatalf("GET status %d", code)
 	}
-	if len(got.Event.Attendees) != 1 || got.Event.Attendees[0].Email != "bob@example.com" {
-		t.Errorf("attendees = %+v, want the explicit replacement", got.Event.Attendees)
+	emails := make(map[string]bool, len(got.Event.Attendees))
+	for _, attendee := range got.Event.Attendees {
+		emails[attendee.Email] = true
+	}
+	if len(got.Event.Attendees) != 2 || !emails["me@example.com"] || !emails["alice@example.com"] {
+		t.Errorf("attendees after rejected edit = %+v, want original set", got.Event.Attendees)
 	}
 
 	// Moving an event to another calendar is rejected.
@@ -326,6 +342,90 @@ func TestCalendarPutUpdatePreservesMeetingFields(t *testing.T) {
 	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("PUT calendar move = %d, want 400", w.Code)
+	}
+}
+
+func TestCalendarPutAttendeeEditPreservesOrganizerEntry(t *testing.T) {
+	r, calDir := newCalendarHandler(t)
+	writeCalendarTestEvent(t, calDir, calendar.Event{
+		ICalUID: "evt-owned", Subject: "Owned meeting",
+		Start:     time.Date(2026, 8, 7, 9, 0, 0, 0, time.UTC),
+		End:       time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC),
+		Organizer: &calendar.Person{Name: "Me", Email: "me@example.com"},
+		Attendees: []calendar.Attendee{
+			{Name: "Me", Email: "me@example.com", Type: "required", Response: "accepted"},
+			{Name: "Alice", Email: "alice@example.com", Type: "optional", Response: "accepted"},
+		},
+	})
+
+	// A present attendee list replaces the editable invitees. Retained
+	// attendees keep their full role/RSVP metadata; new addresses are required.
+	body := `{"account":"work","calendar":"Calendar","uid":"evt-owned","subject":"Owned meeting","start":"2026-08-07T09:00:00Z","end":"2026-08-07T10:00:00Z","attendees":["alice@example.com","bob@example.com"],"replace_attendees":true}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT status %d: %s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Event calendar.CalendarEvent `json:"event"`
+	}
+	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref=evt-owned", &got); code != http.StatusOK {
+		t.Fatalf("GET status %d", code)
+	}
+	if len(got.Event.Attendees) != 3 {
+		t.Fatalf("attendees = %+v, want Alice, Bob and the organizer", got.Event.Attendees)
+	}
+	byEmail := make(map[string]calendar.AttendeeDTO, len(got.Event.Attendees))
+	for _, attendee := range got.Event.Attendees {
+		byEmail[attendee.Email] = attendee
+	}
+	if alice := byEmail["alice@example.com"]; alice.Name != "Alice" || alice.Type != "optional" || alice.Response != "accepted" {
+		t.Errorf("retained attendee = %+v, want Alice's metadata preserved", alice)
+	}
+	if bob := byEmail["bob@example.com"]; bob.Type != "required" {
+		t.Errorf("new attendee = %+v, want required Bob", bob)
+	}
+
+	// The GUI hides the organizer from its editable attendee list. Clearing the
+	// visible list sends [], which removes invitees but retains that implicit
+	// organizer attendee entry and its metadata.
+	body = `{"account":"work","calendar":"Calendar","uid":"evt-owned","subject":"Owned meeting","start":"2026-08-07T09:00:00Z","end":"2026-08-07T10:00:00Z","attendees":[],"replace_attendees":true}`
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT clearing attendees status %d: %s", w.Code, w.Body.String())
+	}
+	got = struct {
+		Event calendar.CalendarEvent `json:"event"`
+	}{}
+	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref=evt-owned", &got); code != http.StatusOK {
+		t.Fatalf("GET after clear status %d", code)
+	}
+	if len(got.Event.Attendees) != 1 {
+		t.Fatalf("attendees after clear = %+v, want only the organizer entry", got.Event.Attendees)
+	}
+	organizer := got.Event.Attendees[0]
+	if organizer.Email != "me@example.com" || organizer.Name != "Me" || organizer.Response != "accepted" {
+		t.Errorf("organizer attendee = %+v, want its metadata preserved", organizer)
+	}
+}
+
+func TestCalendarPutPlainAppointmentCanGainFirstAttendee(t *testing.T) {
+	r, _ := newCalendarHandler(t)
+	body := `{"account":"work","calendar":"Calendar","uid":"evt-lunch","subject":"Team Lunch","start":"2026-08-01T12:00:00Z","end":"2026-08-01T13:00:00Z","attendees":["alice@example.com"],"replace_attendees":true}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT first attendee status %d: %s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Event calendar.CalendarEvent `json:"event"`
+	}
+	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&ref=evt-lunch", &got); code != http.StatusOK {
+		t.Fatalf("GET status %d", code)
+	}
+	if len(got.Event.Attendees) != 1 || got.Event.Attendees[0].Email != "alice@example.com" {
+		t.Errorf("attendees = %+v, want the first attendee", got.Event.Attendees)
 	}
 }
 
@@ -375,12 +475,11 @@ func TestCalendarPutCreateWithAttendeesAndOnlineMeeting(t *testing.T) {
 		t.Errorf("ics missing the online-meeting marker:\n%s", ics)
 	}
 
-	// A follow-up GUI edit (empty attendee list, flag false — what the edit
-	// form always sends) must not strip the attendees or the still-pending
-	// online-meeting request.
+	// A follow-up partial edit that omits attendees must not strip them or the
+	// still-pending online-meeting request.
 	body = `{"account":"work","calendar":"Calendar","uid":"` + put.Event.UID + `",` +
 		`"subject":"Kickoff (moved)","start":"2026-08-10T11:00:00Z","end":"2026-08-10T12:00:00Z",` +
-		`"attendees":[],"request_online_meeting":false}`
+		`"request_online_meeting":false}`
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
 	if w.Code != http.StatusOK {

@@ -278,15 +278,22 @@ struct CalendarEventDraft: Identifiable {
     /// The edited event is a recurring series: the form warns that saving
     /// changes the whole series, and the draft times are the series master's.
     var recurring: Bool = false
-    /// Attendee emails to invite — meaningful for a NEW event only. Editing
-    /// the attendee set of an existing event is not supported yet, so drafts
-    /// of existing events keep this empty and the write path sends an empty
-    /// list, which the server treats as "preserve the existing attendees".
+    /// Attendee emails to invite. The organizer is implicit and excluded.
     var attendees: [String] = []
     /// Ask the provider to attach an online meeting (Teams/Meet) on create.
     var requestOnlineMeeting: Bool = false
 
+    /// Whether this account may send meeting updates. Attendees are editable
+    /// for provider-backed new events and existing events owned by the account,
+    /// never for a local-only calendar or somebody else's meeting.
+    private var ownsMeeting: Bool = true
+    private var originalAttendees: [String] = []
+
     var isNew: Bool { uid.isEmpty }
+    var canEditAttendees: Bool { account != "local" && (isNew || ownsMeeting) }
+    var attendeesChanged: Bool {
+        Set(attendees.map { $0.lowercased() }) != Set(originalAttendees.map { $0.lowercased() })
+    }
 
     /// A draft pre-filled from an existing event for editing. For a recurring
     /// event the SERIES MASTER times are used (falling back to the occurrence
@@ -308,6 +315,21 @@ struct CalendarEventDraft: Identifiable {
         allDay = event.allDay
         location = event.location ?? ""
         description = event.description ?? ""
+        let organizerEmail = event.organizer?.email
+        attendees = event.attendees.compactMap { attendee in
+            if attendee.response == "organizer" { return nil }
+            if let organizerEmail,
+               attendee.email.caseInsensitiveCompare(organizerEmail) == .orderedSame
+            {
+                return nil
+            }
+            return attendee.email
+        }
+        originalAttendees = attendees
+        let hasNoMeetingRole = event.myResponse == nil || event.myResponse == "" || event.myResponse == "none"
+        ownsMeeting = event.myResponse == "organizer"
+            || event.organizer?.email.caseInsensitiveCompare(event.account) == .orderedSame
+            || (event.organizer == nil && hasNoMeetingRole)
     }
 
     /// A blank draft for a new event in a calendar at a given time.
@@ -327,7 +349,7 @@ struct CalendarEventDraft: Identifiable {
     /// midnight of the LOCAL calendar day the pickers show (the inverse of the
     /// read mapping in CalendarEvent), with the end snapped to at least one
     /// full day — the shape Graph requires.
-    func toWrite() -> CalendarEventWrite {
+    func toWrite(includeAttendees: Bool = true) -> CalendarEventWrite {
         var s = start
         var e = end
         if allDay {
@@ -339,16 +361,19 @@ struct CalendarEventDraft: Identifiable {
         }
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
-        // Attendees and the online-meeting request only apply to a create;
-        // an edit of an existing event always sends the neutral values (the
-        // server preserves the existing attendee set for an empty list and
-        // ignores the flag on update), so an edit can never alter a meeting's
-        // invitations.
+        let writesAttendees = includeAttendees && canEditAttendees
         return CalendarEventWrite(
             account: account, calendar: calendar, uid: uid, subject: subject,
             start: f.string(from: s), end: f.string(from: e),
             all_day: allDay, location: location, description: description,
-            attendees: isNew ? attendees : [],
+            // Summary events omit attendees, so drag/resize callers must omit
+            // this field and let the server preserve the stored set. A real
+            // edit starts from full detail and sends its authoritative list;
+            // an empty list deliberately removes every invitee.
+            attendees: writesAttendees ? attendees : nil,
+            // Opt in explicitly on update so an older GUI's historical
+            // attendees:[] payload keeps its preserve semantics.
+            replace_attendees: !isNew && writesAttendees,
             request_online_meeting: isNew ? requestOnlineMeeting : false
         )
     }

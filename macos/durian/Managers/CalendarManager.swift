@@ -710,7 +710,15 @@ final class CalendarManager: ObservableObject {
     /// Transforms the floating peek into an editor for the selected event (uses
     /// the full detail so the description/attendees are available).
     func beginEdit() {
-        guard let event = detailEvent ?? selectedEvent else { return }
+        guard let event = detailEvent, event.id == selectedEventID else {
+            // Summary events deliberately omit attendees. Treating that empty
+            // list as authoritative would remove every invitee on save.
+            BannerManager.shared.showWarning(
+                title: "Event details still loading",
+                message: "Try editing again in a moment."
+            )
+            return
+        }
         if event.recurring && event.seriesStart == nil {
             // Only the detail fetch knows the series master's times; editing a
             // recurring event from the summary alone would write the selected
@@ -780,9 +788,10 @@ final class CalendarManager: ObservableObject {
                 if !draft.isNew { loadDetail() }
                 return
             }
-            if draft.isNew && (!draft.attendees.isEmpty || draft.requestOnlineMeeting) {
+            if draft.attendeesChanged || draft.requestOnlineMeeting {
                 // Make the local-first model explicit: inviting attendees (or
-                // requesting an online meeting) is a notifying action, so
+                // changing them, or requesting an online meeting) is a
+                // notifying action, so
                 // automatic sync will NOT push it — the invitations go out
                 // only on a manual sync, behind its preview gate.
                 let name = ConfigManager.shared.getAccounts()
@@ -790,7 +799,7 @@ final class CalendarManager: ObservableObject {
                 let syncTarget = name.contains(" ") ? "\"\(name)\"" : name
                 BannerManager.shared.showInfo(
                     title: "Event saved locally",
-                    message: "Run 'durian calendar sync \(syncTarget)' to send the invitations — automatic sync does not send them."
+                    message: "Run 'durian calendar sync \(syncTarget)' to send the attendee updates — automatic sync does not send them."
                 )
             }
             // A local edit must reconcile against the server even when the
@@ -844,7 +853,7 @@ final class CalendarManager: ObservableObject {
         store.applyOptimistic(moved)
         Task { [weak self] in
             guard let self else { return }
-            if await backend.putEvent(draft.toWrite()) == nil {
+            if await backend.putEvent(draft.toWrite(includeAttendees: false)) == nil {
                 BannerManager.shared.showWarning(
                     title: "Couldn't move event",
                     message: "The write failed — make sure the durian CLI is up to date."

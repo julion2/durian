@@ -62,10 +62,10 @@ private struct CalendarEventResponse: Decodable {
     let event: CalendarEventWire?
 }
 
-/// PUT /calendars/event body (snake_case). uid empty = create. attendees
-/// (email list) and request_online_meeting are honored on create only; on an
-/// update the server preserves the event's existing attendees when the list
-/// is empty, so an edit can never strip a meeting.
+/// PUT /calendars/event body (snake_case). uid empty = create. On update,
+/// replace_attendees opts into replacing the existing set with attendees,
+/// including an empty list to remove everyone. request_online_meeting remains
+/// create-only.
 struct CalendarEventWrite: Encodable {
     let account: String
     let calendar: String
@@ -76,7 +76,8 @@ struct CalendarEventWrite: Encodable {
     let all_day: Bool
     let location: String
     let description: String
-    let attendees: [String]
+    let attendees: [String]?
+    let replace_attendees: Bool
     let request_online_meeting: Bool
 }
 

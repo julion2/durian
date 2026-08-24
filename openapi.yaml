@@ -523,9 +523,12 @@ paths:
         An all-day event is normalized to midnight-UTC day boundaries and its
         end is snapped to at least start + 1 day (the shape Graph requires).
         An update preserves the existing event's organizer, recurrence, RSVP
-        state, online-meeting link — and its attendees unless the request
-        carries an attendee list — and must target the calendar the event
-        already lives in (moving between calendars is rejected with 400).
+        state and online-meeting link. On update, attendees are preserved unless
+        replace_attendees is true; that explicitly replaces them with the posted
+        list, including an empty list to remove every invitee, and is accepted
+        only when the account owns the meeting. An update must target the
+        calendar the event already lives in (moving between calendars is
+        rejected with 400).
       requestBody:
         required: true
         content:
@@ -541,6 +544,8 @@ paths:
                 $ref: '#/components/schemas/CalendarEventResponse'
         '400':
           description: Missing/invalid fields (account, calendar, start/end)
+        '403':
+          description: Read-only calendar or attendee edit by a non-organizer
         '404':
           description: Account not found
     delete:
@@ -1055,13 +1060,20 @@ components:
           type: array
           items:
             type: string
-          default: []
           description: >-
-            Attendee email addresses; each becomes a required attendee.
-            Honored on create only — local-first, the invitations are sent by
-            the next 'durian calendar sync' behind its notification gate. On
-            update an empty or absent list preserves the event's existing
-            attendees (attendee editing is not supported here).
+            Attendee email addresses; new entries become required attendees.
+            On update this list is applied only when replace_attendees is true;
+            otherwise the existing set is preserved for compatibility with old
+            clients. Existing meeting attendees can only be replaced by the
+            organizer. Local-first: invitations and attendee updates are sent
+            by the next 'durian calendar sync' behind its notification gate.
+        replace_attendees:
+          type: boolean
+          default: false
+          description: >-
+            On update, replace the stored editable invitees with attendees.
+            Requires attendees to be present; an empty list removes all
+            invitees. Ignored on create.
         request_online_meeting:
           type: boolean
           default: false
