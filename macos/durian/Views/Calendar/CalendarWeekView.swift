@@ -81,6 +81,13 @@ struct CalendarWeekView: View {
 
     @State private var dragPreview = DragPreviewModel()
 
+    /// A time range being drawn on empty grid space before the editor opens.
+    private struct CreateSelection {
+        let day: Date
+        var range: TimeGeometry.SelectionRange
+    }
+
+    @State private var createSelection: CreateSelection?
 
     var body: some View {
         // The GeometryReader supplies the day-column width the lane layout
@@ -141,7 +148,10 @@ struct CalendarWeekView: View {
                 }
                 // A drag session must not outlive the grid: tear it down (and
                 // its Escape monitor) if the view goes away mid-drag.
-                .onDisappear { endDragSession() }
+                .onDisappear {
+                    endDragSession()
+                    createSelection = nil
+                }
             }
         }
     }
@@ -221,6 +231,8 @@ struct CalendarWeekView: View {
             geometry.dayWidth / CGFloat(max(laneCount, 1))
         }
         return ZStack(alignment: .topLeading) {
+            emptyGridInteraction(day: day, geometry: geometry)
+
             ForEach(startHour ... endHour, id: \.self) { hour in
                 // The grid recedes so the blocks can carry the contrast: the
                 // hour lines are a hint at the time axis, not a table rule.
@@ -228,7 +240,9 @@ struct CalendarWeekView: View {
                     .frame(height: 0.5)
                     .frame(maxWidth: .infinity, alignment: .top)
                     .offset(y: geometry.y(forMinutes: hour * 60))
+                    .allowsHitTesting(false)
             }
+            createSelectionBlock(on: day, geometry: geometry)
             ForEach(layout.visible) { block in
                 // The block never moves during a drag: a move shows the
                 // floating copy in movePreview while the original stays here
@@ -255,17 +269,86 @@ struct CalendarWeekView: View {
         .frame(height: geometry.totalHeight, alignment: .top)
         .overlay(alignment: .trailing) {
             Rectangle().fill(Color.Detail.border.opacity(0.45)).frame(width: 0.5)
+                .allowsHitTesting(false)
         }
         .contentShape(Rectangle())
-        // Double-click an empty part of a day to create a new event at that
-        // time. Single clicks stay free for selecting/deselecting; event blocks
-        // handle their own tap, so this only fires on empty space.
-        .gesture(SpatialTapGesture(count: 2).onEnded { value in
-            let hour = min(max(Int(value.location.y / hourHeight) + startHour, startHour), endHour - 1)
-            if let date = dateAt(day, hour: hour) {
-                manager.beginCreate(at: date)
-            }
-        })
+    }
+
+    /// Owns pointer input only where no event block is above it. A vertical
+    /// mouse drag paints a snapped range; release opens the normal editor with
+    /// those exact times. Trackpad/wheel scrolling remains owned by ScrollView.
+    private func emptyGridInteraction(day: Date, geometry: TimeGeometry) -> some View {
+        Color.clear
+            .frame(maxWidth: .infinity)
+            .frame(height: geometry.totalHeight)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 6)
+                    .onChanged { value in
+                        guard drag == nil, !manager.commandLineActive else { return }
+                        createSelection = CreateSelection(
+                            day: day,
+                            range: geometry.selectionRange(fromY: value.startLocation.y,
+                                                           toY: value.location.y)
+                        )
+                    }
+                    .onEnded { value in
+                        guard drag == nil, !manager.commandLineActive else {
+                            createSelection = nil
+                            return
+                        }
+                        let range = geometry.selectionRange(fromY: value.startLocation.y,
+                                                            toY: value.location.y)
+                        createSelection = nil
+                        if let start = date(on: day, minutes: range.startMinute),
+                           let end = date(on: day, minutes: range.endMinute)
+                        {
+                            manager.beginCreate(at: start, endingAt: end)
+                        }
+                    }
+            )
+            // Preserve the existing fast path: a double-click creates a
+            // one-hour event at the clicked hour.
+            .simultaneousGesture(SpatialTapGesture(count: 2).onEnded { value in
+                let hour = min(max(Int(value.location.y / hourHeight) + startHour, startHour), endHour - 1)
+                if let date = dateAt(day, hour: hour) {
+                    manager.beginCreate(at: date)
+                }
+            })
+    }
+
+    @ViewBuilder
+    private func createSelectionBlock(on day: Date, geometry: TimeGeometry) -> some View {
+        if let selection = createSelection,
+           calendar.isDate(selection.day, inSameDayAs: day)
+        {
+            let range = selection.range
+            let height = geometry.height(forMinutes: range.endMinute - range.startMinute)
+            let shape = RoundedRectangle(cornerRadius: 8)
+            shape
+                .fill(Color.Detail.cursor.opacity(0.16))
+                .overlay {
+                    shape.strokeBorder(Color.Detail.cursor.opacity(0.85), lineWidth: 1.5)
+                }
+                .overlay(alignment: .topLeading) {
+                    if height >= 24,
+                       let start = date(on: day, minutes: range.startMinute),
+                       let end = date(on: day, minutes: range.endMinute)
+                    {
+                        Text("\(CalendarTimeFormat.time(start))–\(CalendarTimeFormat.time(end))")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Color.Detail.cursor)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: max(height, 4))
+                .padding(.horizontal, 1)
+                .offset(y: geometry.y(forMinutes: range.startMinute))
+                .allowsHitTesting(false)
+                .zIndex(3)
+        }
     }
 
     private func dateAt(_ day: Date, hour: Int) -> Date? {

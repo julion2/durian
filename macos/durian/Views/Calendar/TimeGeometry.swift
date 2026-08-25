@@ -59,6 +59,29 @@ struct TimeGeometry: Equatable {
         return Int((rawMinutes / Double(snapMinutes)).rounded()) * snapMinutes
     }
 
+    struct SelectionRange: Equatable {
+        var startMinute: Int
+        var endMinute: Int
+    }
+
+    /// The snapped time range selected by dragging between two vertical grid
+    /// positions. Direction does not matter; a click-sized drag still selects
+    /// one slot, and positions beyond the grid clamp to its first/last slot.
+    func selectionRange(fromY startY: CGFloat, toY endY: CGFloat) -> SelectionRange {
+        let lowerBound = startHour * 60
+        let upperBound = endHour * 60
+        let start = min(max(snap(minutes: minutes(atY: startY)), lowerBound), upperBound)
+        let end = min(max(snap(minutes: minutes(atY: endY)), lowerBound), upperBound)
+
+        if start == end {
+            if start == upperBound {
+                return SelectionRange(startMinute: upperBound - snapMinutes, endMinute: upperBound)
+            }
+            return SelectionRange(startMinute: start, endMinute: min(start + snapMinutes, upperBound))
+        }
+        return SelectionRange(startMinute: min(start, end), endMinute: max(start, end))
+    }
+
     // MARK: - Horizontal (day columns)
 
     /// The x position of a day column's leading edge (index 0 sits right of

@@ -733,7 +733,7 @@ final class CalendarManager: ObservableObject {
 
     /// Opens the floating editor for a new event, defaulting to `date` (or the
     /// time cursor) in the busiest calendar.
-    func beginCreate(at date: Date? = nil) {
+    func beginCreate(at date: Date? = nil, endingAt explicitEnd: Date? = nil) {
         // Default to the busiest calendar (usually the primary one) rather than
         // the alphabetically-first (e.g. "Birthdays").
         guard let calendar = calendars.max(by: { $0.eventCount < $1.eventCount }) else {
@@ -748,7 +748,7 @@ final class CalendarManager: ObservableObject {
         // implicit argument, so a new event lands in the slot under it rather
         // than at an invented default hour.
         let start = date ?? cursorDate
-        let end = cal.date(byAdding: .hour, value: 1, to: start) ?? start
+        let end = explicitEnd ?? cal.date(byAdding: .hour, value: 1, to: start) ?? start
         detailExpanded = false
         editingDraft = CalendarEventDraft(account: calendar.account, calendar: calendar.name, start: start, end: end)
     }
