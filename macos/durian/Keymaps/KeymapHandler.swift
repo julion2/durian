@@ -254,6 +254,13 @@ class KeymapHandler: ObservableObject {
             return true
         }
 
+        // NSDatePicker is an editable control but is not an NSTextField.
+        // Without this exemption, calendar vim bindings consume its digits
+        // before AppKit can edit the selected date/time component.
+        if responder is NSDatePicker {
+            return true
+        }
+
         return false
     }
 }
