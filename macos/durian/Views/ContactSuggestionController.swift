@@ -17,6 +17,7 @@ class ContactSuggestionController {
     private var popupPanel: NSPanel?
     private var hostingView: NSHostingView<AnyView>?
     private var clickOutsideMonitor: Any?
+    private var currentOwner: UUID?
     private var currentOnDismiss: (() -> Void)?
     private var currentOnSelect: ((Contact) -> Void)?
 
@@ -29,15 +30,25 @@ class ContactSuggestionController {
         popupPanel?.isVisible ?? false
     }
 
+    func isVisible(for owner: UUID) -> Bool {
+        currentOwner == owner && isVisible
+    }
+
     /// Show the contact suggestion popup below the cursor in the given token field
     func show(
+        owner: UUID,
         for tokenField: NSTokenField,
         contacts: [Contact],
         selectedIndex: Int,
         onSelect: @escaping (Contact) -> Void,
         onDismiss: @escaping () -> Void
     ) {
+        if currentOwner != owner {
+            currentOnDismiss?()
+        }
+
         // Store callbacks
+        currentOwner = owner
         currentOnDismiss = onDismiss
         currentOnSelect = onSelect
 
@@ -60,7 +71,8 @@ class ContactSuggestionController {
     }
 
     /// Update popup content without recreating the window
-    func update(contacts: [Contact], selectedIndex: Int) {
+    func update(owner: UUID, contacts: [Contact], selectedIndex: Int) {
+        guard currentOwner == owner else { return }
         updateContent(contacts: contacts, selectedIndex: selectedIndex)
     }
 
@@ -70,9 +82,15 @@ class ContactSuggestionController {
     }
 
     /// Hide and cleanup the popup
-    func dismiss() {
+    func dismiss(owner: UUID) {
+        guard currentOwner == owner else { return }
+        dismissCurrent()
+    }
+
+    private func dismissCurrent() {
         popupPanel?.orderOut(nil)
         removeClickOutsideMonitor()
+        currentOwner = nil
         currentOnDismiss = nil
         currentOnSelect = nil
     }
@@ -109,11 +127,11 @@ class ContactSuggestionController {
             selectedIndex: selectedIndex,
             onSelect: { [weak self] contact in
                 self?.currentOnSelect?(contact)
-                self?.dismiss()
+                self?.dismissCurrent()
             },
             onDismiss: { [weak self] in
                 self?.currentOnDismiss?()
-                self?.dismiss()
+                self?.dismissCurrent()
             }
         )
 
@@ -259,7 +277,7 @@ class ContactSuggestionController {
             let clickLocation = NSEvent.mouseLocation
             if !NSPointInRect(clickLocation, panel.frame) {
                 currentOnDismiss?()
-                dismiss()
+                dismissCurrent()
             }
 
             return event

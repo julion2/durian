@@ -211,42 +211,32 @@ struct CalendarEventEditView: View {
                 }
             }
 
-            ForEach(draft.attendees, id: \.self) { email in
-                fieldRow("person") {
-                    Text(email)
-                        .font(.callout)
-                        .foregroundStyle(Color.Detail.textBody)
-                        .lineLimit(1)
-                    Spacer(minLength: 8)
-                    Button {
-                        draft.attendees.removeAll { $0 == email }
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(Color.Detail.textSecondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Remove attendee")
-                    .accessibilityLabel("Remove \(email)")
-                }
-            }
-
             fieldRow("person.badge.plus") {
-                TextField("Add attendee (email, press Return)", text: $attendeeInput)
-                    .textFieldStyle(.plain)
-                    .font(.callout)
-                    .foregroundStyle(Color.Detail.textBody)
-                    .onSubmit(addAttendee)
+                ContactTokenField(
+                    tokens: $draft.attendees,
+                    contactToken: { $0.email },
+                    isValidToken: EmailTokenHelper.isValidEmail,
+                    wrapsTokens: true,
+                    tokenFieldAccessibilityLabel: "Attendees",
+                    onPartialTextChange: { attendeeInput = $0 }
+                )
+                .frame(minHeight: 24)
                 if !trimmedAttendeeInput.isEmpty,
-                   !Self.looksLikeEmail(trimmedAttendeeInput)
+                   !EmailTokenHelper.isValidEmail(trimmedAttendeeInput)
                 {
-                    // Subtle malformed-email hint; Return simply does nothing
-                    // until the address parses, and Save ignores it.
                     Image(systemName: "exclamationmark.circle")
                         .font(.caption)
                         .foregroundStyle(.orange)
                         .help("Not a valid email address")
                         .accessibilityLabel("Not a valid email address")
                 }
+            }
+
+            if !invalidAttendees.isEmpty {
+                Text("Remove or correct invalid attendee: \(invalidAttendees.joined(separator: ", "))")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .accessibilityLabel("Invalid attendees: \(invalidAttendees.joined(separator: ", "))")
             }
 
             if willSendNotifications {
@@ -264,18 +254,19 @@ struct CalendarEventEditView: View {
         attendeeInput.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Minimal shape check (user@host, no spaces) — deliverability is the
-    /// provider's problem; this only guards against obvious typos.
-    private static func looksLikeEmail(_ candidate: String) -> Bool {
-        candidate.split(separator: "@").count == 2 && !candidate.contains(" ")
+    private var invalidAttendees: [String] {
+        draft.attendees.filter { !EmailTokenHelper.isValidEmail($0) }
     }
 
-    /// Commits the typed attendee email to the draft: trimmed, must look like
-    /// an email (user@host), duplicates (case-insensitive) and blanks ignored.
+    /// Commits pending attendee text for mouse-driven saves. Keyboard commits
+    /// are handled by NSTokenField; normalization and dedup keep both paths
+    /// equivalent.
     private func addAttendee() {
-        let email = trimmedAttendeeInput
-        guard !email.isEmpty, Self.looksLikeEmail(email) else { return }
-        guard !draft.attendees.contains(where: { $0.caseInsensitiveCompare(email) == .orderedSame }) else {
+        let email = EmailTokenHelper.cleanEmail(trimmedAttendeeInput)
+        guard EmailTokenHelper.isValidEmail(email) else { return }
+        guard !draft.attendees.contains(where: {
+            EmailTokenHelper.cleanEmail($0).caseInsensitiveCompare(email) == .orderedSame
+        }) else {
             attendeeInput = ""
             return
         }
@@ -286,12 +277,18 @@ struct CalendarEventEditView: View {
     private func commit() {
         // A typed-but-not-committed attendee email still counts.
         addAttendee()
+        draft.attendees = draft.attendees.reduce(into: []) { result, attendee in
+            let email = EmailTokenHelper.cleanEmail(attendee)
+            guard EmailTokenHelper.isValidEmail(email),
+                  !result.contains(where: { $0.caseInsensitiveCompare(email) == .orderedSame }) else { return }
+            result.append(email)
+        }
         onSave(draft)
     }
 
     private var willSendNotifications: Bool {
         draft.sendsNotifications
-            || (!trimmedAttendeeInput.isEmpty && Self.looksLikeEmail(trimmedAttendeeInput))
+            || (!trimmedAttendeeInput.isEmpty && EmailTokenHelper.isValidEmail(trimmedAttendeeInput))
     }
 
     private var notesSection: some View {
@@ -390,6 +387,9 @@ struct CalendarEventEditView: View {
 
     private var isValid: Bool {
         guard !draft.subject.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        guard trimmedAttendeeInput.isEmpty
+            || EmailTokenHelper.isValidEmail(trimmedAttendeeInput) else { return false }
+        guard invalidAttendees.isEmpty else { return false }
         if draft.allDay {
             // A same-day all-day event is valid — the write path snaps it to a
             // full day. Only an end day before the start day is invalid.

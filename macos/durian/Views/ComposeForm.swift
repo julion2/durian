@@ -49,14 +49,6 @@ struct ComposeForm: View {
     @State private var vimSearchText: String = ""
     @FocusState private var focusedField: ComposeField?  // Shared focus state
 
-    // Contact suggestion popup state (internal so ComposeForm+Contacts extension can access)
-    @State var contactSuggestions: [Contact] = []
-    @State var selectedSuggestionIndex: Int = 0
-    @State var activeTokenField: ComposeField? = nil
-    @State var activeNSTokenField: NSTokenField? = nil  // Reference to actual NSTokenField
-    @State var showingContactPopup = false
-    @State var contactSearchTask: Task<Void, Never>?
-
     private let signatures: [String: String]
     private let maxAttachmentSize: Int64 = 25_000_000
     private let maxTotalSize: Int64 = 50_000_000
@@ -146,12 +138,6 @@ struct ComposeForm: View {
         .onChange(of: draft) { oldValue, newDraft in
             currentDraft = newDraft
         }
-        .onChange(of: focusedField) { _, newField in
-            // Dismiss contact suggestions when focus moves away from recipient fields
-            if newField != .to && newField != .cc && newField != .bcc {
-                dismissContactSuggestions()
-            }
-        }
         .onAppear {
             currentDraft = draft
             updateBodyWithSignature()
@@ -215,17 +201,11 @@ struct ComposeForm: View {
                 .foregroundColor(labelColor)
                 .frame(width: 50, alignment: .leading)
 
-            TokenField(
+            ContactTokenField(
                 tokens: $draft.to,
                 focusedField: $focusedField,
                 fieldIdentifier: .to,
-                onCommit: { scheduleAutoSave() },
-                onPartialTextChange: { query, tokenField in
-                    handlePartialTextChange(query: query, tokenField: tokenField, field: .to)
-                },
-                onKeyCommand: { command in
-                    handleSuggestionKeyCommand(command)
-                }
+                onCommit: { scheduleAutoSave() }
             )
 
             // Expand Cc/Bcc Button
@@ -256,17 +236,11 @@ struct ComposeForm: View {
                 .foregroundColor(labelColor)
                 .frame(width: 50, alignment: .leading)
 
-            TokenField(
+            ContactTokenField(
                 tokens: $draft.cc,
                 focusedField: $focusedField,
                 fieldIdentifier: .cc,
-                onCommit: { scheduleAutoSave() },
-                onPartialTextChange: { query, tokenField in
-                    handlePartialTextChange(query: query, tokenField: tokenField, field: .cc)
-                },
-                onKeyCommand: { command in
-                    handleSuggestionKeyCommand(command)
-                }
+                onCommit: { scheduleAutoSave() }
             )
 
             // Spacer to align with To row
@@ -287,17 +261,11 @@ struct ComposeForm: View {
                 .foregroundColor(labelColor)
                 .frame(width: 50, alignment: .leading)
 
-            TokenField(
+            ContactTokenField(
                 tokens: $draft.bcc,
                 focusedField: $focusedField,
                 fieldIdentifier: .bcc,
-                onCommit: { scheduleAutoSave() },
-                onPartialTextChange: { query, tokenField in
-                    handlePartialTextChange(query: query, tokenField: tokenField, field: .bcc)
-                },
-                onKeyCommand: { command in
-                    handleSuggestionKeyCommand(command)
-                }
+                onCommit: { scheduleAutoSave() }
             )
 
             // Spacer to align with To row
@@ -762,4 +730,3 @@ struct ComposeForm: View {
     }
 
 }
-
