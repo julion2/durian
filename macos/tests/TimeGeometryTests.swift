@@ -73,6 +73,12 @@ final class TimeGeometryTests: XCTestCase {
         XCTAssertEqual(geo.snappedMinuteDelta(fromPoints: -11), -15)
     }
 
+    func testSnappedMinuteAtYClampsToGrid() {
+        XCTAssertEqual(geo.snappedMinute(atY: -100), 0)
+        XCTAssertEqual(geo.snappedMinute(atY: geo.y(forMinutes: 9 * 60 + 8)), 9 * 60 + 15)
+        XCTAssertEqual(geo.snappedMinute(atY: geo.totalHeight + 100), 24 * 60)
+    }
+
     func testSelectionRangeSnapsInEitherDirection() {
         XCTAssertEqual(
             geo.selectionRange(fromY: geo.y(forMinutes: 9 * 60 + 8),
@@ -134,5 +140,14 @@ final class TimeGeometryTests: XCTestCase {
         XCTAssertEqual(geo.dayDelta(fromPoints: 190), 2)
         XCTAssertEqual(geo.dayDelta(fromPoints: -60), -1)
         XCTAssertEqual(geo.dayDelta(fromPoints: -59), 0)
+    }
+
+    func testDayIndexAtLocalXWalksAcrossColumnsAndClamps() {
+        XCTAssertEqual(geo.dayIndex(atLocalX: 0, relativeTo: 3), 3)
+        XCTAssertEqual(geo.dayIndex(atLocalX: 119.9, relativeTo: 3), 3)
+        XCTAssertEqual(geo.dayIndex(atLocalX: 120, relativeTo: 3), 4)
+        XCTAssertEqual(geo.dayIndex(atLocalX: -0.1, relativeTo: 3), 2)
+        XCTAssertEqual(geo.dayIndex(atLocalX: -500, relativeTo: 3), 0)
+        XCTAssertEqual(geo.dayIndex(atLocalX: 500, relativeTo: 3), 6)
     }
 }

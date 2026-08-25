@@ -83,8 +83,8 @@ struct CalendarWeekView: View {
 
     /// A time range being drawn on empty grid space before the editor opens.
     private struct CreateSelection {
-        let day: Date
-        var range: TimeGeometry.SelectionRange
+        var start: Date
+        var end: Date
     }
 
     @State private var createSelection: CreateSelection?
@@ -231,7 +231,7 @@ struct CalendarWeekView: View {
             geometry.dayWidth / CGFloat(max(laneCount, 1))
         }
         return ZStack(alignment: .topLeading) {
-            emptyGridInteraction(day: day, geometry: geometry)
+            emptyGridInteraction(day: day, dayIndex: dayIndex, geometry: geometry)
 
             ForEach(startHour ... endHour, id: \.self) { hour in
                 // The grid recedes so the blocks can carry the contrast: the
@@ -274,10 +274,13 @@ struct CalendarWeekView: View {
         .contentShape(Rectangle())
     }
 
-    /// Owns pointer input only where no event block is above it. A vertical
-    /// mouse drag paints a snapped range; release opens the normal editor with
-    /// those exact times. Trackpad/wheel scrolling remains owned by ScrollView.
-    private func emptyGridInteraction(day: Date, geometry: TimeGeometry) -> some View {
+    /// Owns pointer input only where no event block is above it. A mouse drag
+    /// paints a snapped range within one day or across neighbouring columns;
+    /// release opens the normal editor with those exact times. Trackpad/wheel
+    /// scrolling remains owned by ScrollView.
+    private func emptyGridInteraction(day: Date, dayIndex: Int,
+                                      geometry: TimeGeometry) -> some View
+    {
         Color.clear
             .frame(maxWidth: .infinity)
             .frame(height: geometry.totalHeight)
@@ -286,10 +289,12 @@ struct CalendarWeekView: View {
                 DragGesture(minimumDistance: 6)
                     .onChanged { value in
                         guard drag == nil, !manager.commandLineActive else { return }
-                        createSelection = CreateSelection(
-                            day: day,
-                            range: geometry.selectionRange(fromY: value.startLocation.y,
-                                                           toY: value.location.y)
+                        createSelection = createInterval(
+                            from: value.startLocation,
+                            to: value.location,
+                            on: day,
+                            dayIndex: dayIndex,
+                            geometry: geometry
                         )
                     }
                     .onEnded { value in
@@ -297,13 +302,16 @@ struct CalendarWeekView: View {
                             createSelection = nil
                             return
                         }
-                        let range = geometry.selectionRange(fromY: value.startLocation.y,
-                                                            toY: value.location.y)
+                        let selection = createInterval(
+                            from: value.startLocation,
+                            to: value.location,
+                            on: day,
+                            dayIndex: dayIndex,
+                            geometry: geometry
+                        )
                         createSelection = nil
-                        if let start = date(on: day, minutes: range.startMinute),
-                           let end = date(on: day, minutes: range.endMinute)
-                        {
-                            manager.beginCreate(at: start, endingAt: end)
+                        if let selection {
+                            manager.beginCreate(at: selection.start, endingAt: selection.end)
                         }
                     }
             )
@@ -317,12 +325,50 @@ struct CalendarWeekView: View {
             })
     }
 
+    /// Resolves the absolute interval selected from one column into any other
+    /// visible day. The mouse-down time stays fixed; the current pointer's day
+    /// and time form the other endpoint, and dragging backwards simply swaps
+    /// the resulting dates.
+    private func createInterval(from startLocation: CGPoint, to location: CGPoint,
+                                on day: Date, dayIndex: Int,
+                                geometry: TimeGeometry) -> CreateSelection?
+    {
+        var startMinute = geometry.snappedMinute(atY: startLocation.y)
+        // Starting exactly on the grid's lower edge means the final slot, not
+        // midnight of the following day.
+        if startMinute == endHour * 60 {
+            startMinute -= geometry.snapMinutes
+        }
+        let targetDayIndex = geometry.dayIndex(
+            atLocalX: location.x,
+            relativeTo: dayIndex,
+            dayCount: weekDays.count
+        )
+        var targetMinute = geometry.snappedMinute(atY: location.y)
+        // The lower edge of an earlier column means that day's final slot,
+        // not midnight of the day after it. Forward drags keep midnight so a
+        // full target day can still be selected.
+        if targetDayIndex < dayIndex, targetMinute == endHour * 60 {
+            targetMinute -= geometry.snapMinutes
+        }
+        guard targetDayIndex < weekDays.count,
+              let anchor = date(on: day, minutes: startMinute),
+              let target = date(on: weekDays[targetDayIndex],
+                                minutes: targetMinute)
+        else { return nil }
+
+        if anchor == target {
+            guard let end = calendar.date(byAdding: .minute, value: geometry.snapMinutes, to: anchor) else { return nil }
+            return CreateSelection(start: anchor, end: end)
+        }
+        return CreateSelection(start: min(anchor, target), end: max(anchor, target))
+    }
+
     @ViewBuilder
     private func createSelectionBlock(on day: Date, geometry: TimeGeometry) -> some View {
         if let selection = createSelection,
-           calendar.isDate(selection.day, inSameDayAs: day)
+           let range = createSelectionRange(selection, on: day)
         {
-            let range = selection.range
             let height = geometry.height(forMinutes: range.endMinute - range.startMinute)
             let shape = RoundedRectangle(cornerRadius: 8)
             shape
@@ -331,11 +377,8 @@ struct CalendarWeekView: View {
                     shape.strokeBorder(Color.Detail.cursor.opacity(0.85), lineWidth: 1.5)
                 }
                 .overlay(alignment: .topLeading) {
-                    if height >= 24,
-                       let start = date(on: day, minutes: range.startMinute),
-                       let end = date(on: day, minutes: range.endMinute)
-                    {
-                        Text("\(CalendarTimeFormat.time(start))–\(CalendarTimeFormat.time(end))")
+                    if height >= 24 {
+                        Text(createSelectionLabel(selection, on: day))
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(Color.Detail.cursor)
                             .padding(.horizontal, 6)
@@ -348,6 +391,37 @@ struct CalendarWeekView: View {
                 .offset(y: geometry.y(forMinutes: range.startMinute))
                 .allowsHitTesting(false)
                 .zIndex(3)
+        }
+    }
+
+    /// The slice of an absolute selection visible in one day column.
+    private func createSelectionRange(_ selection: CreateSelection,
+                                      on day: Date) -> TimeGeometry.SelectionRange?
+    {
+        let dayStart = calendar.startOfDay(for: day)
+        guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart),
+              selection.start < dayEnd, selection.end > dayStart else { return nil }
+        let startMinute = selection.start <= dayStart ? 0 : minutesFromMidnight(selection.start)
+        let endMinute = selection.end >= dayEnd ? 24 * 60 : minutesFromMidnight(selection.end)
+        return TimeGeometry.SelectionRange(startMinute: startMinute, endMinute: endMinute)
+    }
+
+    private func createSelectionLabel(_ selection: CreateSelection, on day: Date) -> String {
+        let dayStart = calendar.startOfDay(for: day)
+        let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+        let startsHere = calendar.isDate(selection.start, inSameDayAs: day)
+        // Midnight belongs to the following calendar date, but visually it is
+        // also the lower edge of this day's rendered selection slice.
+        let endsHere = selection.end > dayStart && selection.end <= dayEnd
+        switch (startsHere, endsHere) {
+        case (true, true):
+            return "\(CalendarTimeFormat.time(selection.start))–\(CalendarTimeFormat.time(selection.end))"
+        case (true, false):
+            return "\(CalendarTimeFormat.time(selection.start)) →"
+        case (false, true):
+            return "→ \(CalendarTimeFormat.time(selection.end))"
+        case (false, false):
+            return "Continues"
         }
     }
 

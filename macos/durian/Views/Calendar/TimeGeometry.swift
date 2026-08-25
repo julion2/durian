@@ -59,6 +59,12 @@ struct TimeGeometry: Equatable {
         return Int((rawMinutes / Double(snapMinutes)).rounded()) * snapMinutes
     }
 
+    /// A y position as a snapped, in-grid wall-clock minute. The upper bound
+    /// is inclusive so a drag can end exactly at midnight.
+    func snappedMinute(atY y: CGFloat) -> Int {
+        min(max(snap(minutes: minutes(atY: y)), startHour * 60), endHour * 60)
+    }
+
     struct SelectionRange: Equatable {
         var startMinute: Int
         var endMinute: Int
@@ -68,10 +74,9 @@ struct TimeGeometry: Equatable {
     /// positions. Direction does not matter; a click-sized drag still selects
     /// one slot, and positions beyond the grid clamp to its first/last slot.
     func selectionRange(fromY startY: CGFloat, toY endY: CGFloat) -> SelectionRange {
-        let lowerBound = startHour * 60
         let upperBound = endHour * 60
-        let start = min(max(snap(minutes: minutes(atY: startY)), lowerBound), upperBound)
-        let end = min(max(snap(minutes: minutes(atY: endY)), lowerBound), upperBound)
+        let start = snappedMinute(atY: startY)
+        let end = snappedMinute(atY: endY)
 
         if start == end {
             if start == upperBound {
@@ -101,6 +106,17 @@ struct TimeGeometry: Equatable {
     /// (the move gesture snaps horizontally to whole days).
     func dayDelta(fromPoints dx: CGFloat) -> Int {
         Int((Double(dx) / Double(dayWidth)).rounded())
+    }
+
+    /// Maps a pointer x in one day column's local coordinate space to a day
+    /// in the whole grid. DragGesture keeps reporting local positions after
+    /// leaving its source view, so negative and >width values naturally walk
+    /// into neighbouring columns.
+    func dayIndex(atLocalX x: CGFloat, relativeTo originDayIndex: Int,
+                  dayCount: Int = 7) -> Int
+    {
+        let offset = Int((Double(x) / Double(dayWidth)).rounded(.down))
+        return min(max(originDayIndex + offset, 0), dayCount - 1)
     }
 
     // MARK: - Move targeting
