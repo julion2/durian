@@ -73,6 +73,38 @@ final class TimeGeometryTests: XCTestCase {
         XCTAssertEqual(geo.snappedMinuteDelta(fromPoints: -11), -15)
     }
 
+    func testSelectionRangeSnapsInEitherDirection() {
+        XCTAssertEqual(
+            geo.selectionRange(fromY: geo.y(forMinutes: 9 * 60 + 8),
+                               toY: geo.y(forMinutes: 10 * 60 + 22)),
+            TimeGeometry.SelectionRange(startMinute: 9 * 60 + 15, endMinute: 10 * 60 + 15)
+        )
+        XCTAssertEqual(
+            geo.selectionRange(fromY: geo.y(forMinutes: 10 * 60 + 22),
+                               toY: geo.y(forMinutes: 9 * 60 + 8)),
+            TimeGeometry.SelectionRange(startMinute: 9 * 60 + 15, endMinute: 10 * 60 + 15)
+        )
+    }
+
+    func testSelectionRangeUsesOneSlotForClickSizedDrag() {
+        XCTAssertEqual(
+            geo.selectionRange(fromY: geo.y(forMinutes: 9 * 60),
+                               toY: geo.y(forMinutes: 9 * 60 + 2)),
+            TimeGeometry.SelectionRange(startMinute: 9 * 60, endMinute: 9 * 60 + 15)
+        )
+    }
+
+    func testSelectionRangeClampsToGridEdges() {
+        XCTAssertEqual(
+            geo.selectionRange(fromY: -100, toY: geo.y(forMinutes: 30)),
+            TimeGeometry.SelectionRange(startMinute: 0, endMinute: 30)
+        )
+        XCTAssertEqual(
+            geo.selectionRange(fromY: geo.totalHeight + 100, toY: geo.totalHeight + 200),
+            TimeGeometry.SelectionRange(startMinute: 23 * 60 + 45, endMinute: 24 * 60)
+        )
+    }
+
     // MARK: - Day columns
 
     func testXForDayIndex() {
