@@ -16,6 +16,8 @@
 
 import SwiftUI
 
+import AppKit
+
 struct CalendarEventEditView: View {
     @State var draft: CalendarEventDraft
     let calendars: [CalendarInfo]
@@ -162,23 +164,42 @@ struct CalendarEventEditView: View {
 
     private var timeSection: some View {
         section("Time") {
-            Picker("", selection: $draft.allDay) {
-                Text("All-Day").tag(true)
-                Text("Time Slot").tag(false)
+            HStack(spacing: 10) {
+                Image(systemName: draft.allDay ? "sun.max" : "clock")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(selectedCalendarColor)
+                    .frame(width: 16)
+                Text("All day")
+                    .font(.callout)
+                    .foregroundStyle(Color.Detail.textBody)
+                Spacer()
+                Toggle("All day", isOn: $draft.allDay)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
 
-            if draft.allDay {
-                // Make the all-day semantics explicit: the rows below only
-                // pick days, and the write path snaps them to full days.
-                Text("Covers whole days — no start or end time.")
-                    .font(.caption)
-                    .foregroundStyle(Color.Detail.textSecondary)
+            VStack(spacing: 0) {
+                dateRow("Starts", selection: startSelection, isStart: true)
+
+                Divider()
+                    .padding(.leading, 30)
+
+                dateRow("Ends", selection: $draft.end, isStart: false)
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.Detail.cardBackground)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.Detail.border.opacity(0.7), lineWidth: 0.5)
+                    .allowsHitTesting(false)
             }
 
-            dateRow("Starts", selection: $draft.start)
-            dateRow("Ends", selection: $draft.end)
+            if !draft.allDay {
+                durationPresets
+            }
 
             if draft.recurring {
                 Label("Recurring event — saving changes the whole series.",
@@ -336,18 +357,92 @@ struct CalendarEventEditView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// A "Starts"/"Ends" row: label on the left, the picker trailing. The time
-    /// component disappears while All-Day is on.
-    private func dateRow(_ label: String, selection: Binding<Date>) -> some View {
-        HStack {
+    /// One stop on the event timeline. Separate controls make both keyboard
+    /// editing and mouse selection predictable; the color rail preserves the
+    /// relationship between start and end without another heading or label.
+    private func dateRow(_ label: String, selection: Binding<Date>, isStart: Bool) -> some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Rectangle()
+                    .fill(selectedCalendarColor.opacity(0.35))
+                    .frame(width: 1)
+                    .frame(maxHeight: .infinity)
+                Circle()
+                    .fill(isStart ? selectedCalendarColor : Color.Detail.cardBackground)
+                    .overlay {
+                        Circle().strokeBorder(selectedCalendarColor, lineWidth: 1.5)
+                    }
+                    .frame(width: 9, height: 9)
+            }
+            .frame(width: 18)
+
             Text(label)
-                .font(.callout)
+                .font(.caption)
+                .fontWeight(.medium)
                 .foregroundStyle(Color.Detail.textSecondary)
-            Spacer()
-            DatePicker("", selection: selection, displayedComponents: dateComponents)
-                .labelsHidden()
+                .frame(width: 42, alignment: .leading)
+
+            Spacer(minLength: 6)
+
+            CalendarDateField(
+                selection: selection,
+                elements: [.yearMonthDay],
+                accessibilityLabel: "\(label) date"
+            )
+            .frame(width: 116, height: 22)
+
+            if !draft.allDay {
+                CalendarDateField(
+                    selection: selection,
+                    elements: [.hourMinute],
+                    accessibilityLabel: "\(label) time"
+                )
+                .frame(width: 64, height: 22)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+    }
+
+    /// Common meeting lengths stay one click away. Any manually entered end
+    /// remains valid and simply leaves every preset unselected.
+    private var durationPresets: some View {
+        HStack(spacing: 4) {
+            Text("Duration")
+                .font(.caption)
+                .foregroundStyle(Color.Detail.textTertiary)
+
+            Spacer(minLength: 6)
+
+            ForEach(Self.durationOptions, id: \.seconds) { option in
+                let selected = abs(draft.end.timeIntervalSince(draft.start) - option.seconds) < 1
+                Button {
+                    draft.end = draft.start.addingTimeInterval(option.seconds)
+                } label: {
+                    Text(option.label)
+                        .font(.caption)
+                        .fontWeight(selected ? .semibold : .regular)
+                        .foregroundStyle(selected ? selectedCalendarColor : Color.Detail.textSecondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(
+                            Capsule()
+                                .fill(selected ? selectedCalendarColor.opacity(0.14) : .clear)
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Set duration to \(option.accessibilityLabel)")
+            }
         }
     }
+
+    private static let durationOptions: [(label: String, accessibilityLabel: String, seconds: TimeInterval)] = [
+        ("15m", "15 minutes", 15 * 60),
+        ("30m", "30 minutes", 30 * 60),
+        ("1h", "1 hour", 60 * 60),
+        ("1.5h", "1 hour 30 minutes", 90 * 60),
+        ("2h", "2 hours", 2 * 60 * 60),
+    ]
 
     /// Selection over the (account, calendar) identity rather than the bare
     /// name. Two accounts commonly each own a calendar called "Calendar", and
@@ -381,8 +476,18 @@ struct CalendarEventEditView: View {
         selectedCalendar?.color ?? .secondary
     }
 
-    private var dateComponents: DatePickerComponents {
-        draft.allDay ? [.date] : [.date, .hourAndMinute]
+    /// Changing the start keeps the existing duration. This matches how users
+    /// move an event: choosing a new start should not unexpectedly shorten it
+    /// or leave the end behind on the previous day.
+    private var startSelection: Binding<Date> {
+        Binding(
+            get: { draft.start },
+            set: { newStart in
+                let duration = draft.end.timeIntervalSince(draft.start)
+                draft.start = newStart
+                draft.end = newStart.addingTimeInterval(duration)
+            }
+        )
     }
 
     private var isValid: Bool {
@@ -397,5 +502,55 @@ struct CalendarEventEditView: View {
             return cal.startOfDay(for: draft.end) >= cal.startOfDay(for: draft.start)
         }
         return draft.end > draft.start
+    }
+}
+
+/// A native date field without AppKit's bezel. Unlike SwiftUI's compact
+/// DatePicker, its individual date/time components accept direct keyboard
+/// input while preserving the other components of the bound Date.
+private struct CalendarDateField: NSViewRepresentable {
+    @Binding var selection: Date
+    let elements: NSDatePicker.ElementFlags
+    let accessibilityLabel: String
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeNSView(context: Context) -> NSDatePicker {
+        let picker = NSDatePicker()
+        picker.datePickerStyle = .textField
+        picker.datePickerElements = elements
+        picker.presentsCalendarOverlay = elements.contains(.yearMonthDay)
+        picker.isBordered = false
+        picker.drawsBackground = false
+        picker.font = .systemFont(ofSize: 13)
+        picker.dateValue = selection
+        picker.target = context.coordinator
+        picker.action = #selector(Coordinator.dateChanged(_:))
+        picker.setAccessibilityLabel(accessibilityLabel)
+        return picker
+    }
+
+    func updateNSView(_ picker: NSDatePicker, context: Context) {
+        context.coordinator.parent = self
+        picker.datePickerElements = elements
+        picker.presentsCalendarOverlay = elements.contains(.yearMonthDay)
+        picker.setAccessibilityLabel(accessibilityLabel)
+        if picker.dateValue != selection {
+            picker.dateValue = selection
+        }
+    }
+
+    final class Coordinator: NSObject {
+        var parent: CalendarDateField
+
+        init(_ parent: CalendarDateField) {
+            self.parent = parent
+        }
+
+        @objc func dateChanged(_ sender: NSDatePicker) {
+            parent.selection = sender.dateValue
+        }
     }
 }
