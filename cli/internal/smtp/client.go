@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/smtp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -94,7 +95,7 @@ func NewClient(host string, port int, auth Auth) *Client {
 
 // Send sends an email message
 func (c *Client) Send(msg *Message) error {
-	addr := fmt.Sprintf("%s:%d", c.Host, c.Port)
+	addr := net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 
 	// Connect with timeout — try IPv4 first, fall back to IPv6
 	conn, err := net.DialTimeout("tcp4", addr, c.Timeout)

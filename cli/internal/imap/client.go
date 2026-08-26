@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -83,7 +84,7 @@ func NewClient(account *config.AccountConfig) *Client {
 
 // Connect establishes a TLS connection to the IMAP server
 func (c *Client) Connect() error {
-	addr := fmt.Sprintf("%s:%d", c.account.IMAP.Host, c.account.IMAP.Port)
+	addr := net.JoinHostPort(c.account.IMAP.Host, strconv.Itoa(c.account.IMAP.Port))
 
 	// Connect with timeout
 	dialer := &net.Dialer{Timeout: c.timeout}
