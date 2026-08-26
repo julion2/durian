@@ -260,6 +260,9 @@ func (s *Sender) uploadAttachment(ctx context.Context, draftID string, a mailsen
 	if sess.UploadURL == "" {
 		return fmt.Errorf("graph upload session returned no uploadUrl")
 	}
+	if err := validateUploadURL(sess.UploadURL); err != nil {
+		return fmt.Errorf("refusing graph upload URL: %w", err)
+	}
 
 	total := len(a.Data)
 	for start := 0; start < total; start += uploadChunkSize {
@@ -278,19 +281,43 @@ func (s *Sender) uploadAttachment(ctx context.Context, draftID string, a mailsen
 // pre-authorized (no bearer token). Graph returns 200/201 on the final chunk and
 // 202 while more are expected.
 func (s *Sender) putChunk(ctx context.Context, uploadURL string, chunk []byte, start, end, total int) error {
+	if err := validateUploadURL(uploadURL); err != nil {
+		return fmt.Errorf("refusing graph upload URL: %w", err)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(chunk))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end-1, total))
 	req.ContentLength = int64(len(chunk))
-	resp, err := s.b.httpClient.Do(req)
+	uploadClient := *s.b.httpClient
+	uploadClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if err := validateUploadURL(req.URL.String()); err != nil {
+			return fmt.Errorf("refusing graph upload redirect: %w", err)
+		}
+		return nil
+	}
+	resp, err := uploadClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("upload chunk: %w", err)
 	}
 	defer drainClose(resp)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return newStatusError(resp)
+	}
+	return nil
+}
+
+// validateUploadURL accepts Graph's pre-authorized upload endpoints. They are
+// legitimately hosted off-origin on Azure, but attachment bytes must only be
+// sent over TLS and never to a URL containing user credentials.
+func validateUploadURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil || !u.IsAbs() || u.User != nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" {
+		return errors.New("upload URL must be an absolute HTTPS URL without userinfo")
 	}
 	return nil
 }
