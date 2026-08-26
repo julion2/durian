@@ -19,6 +19,7 @@ func TestLiveJMAPRoundTrip(t *testing.T) {
 	sessionURL := os.Getenv("DURIAN_JMAP_TEST_SESSION_URL")
 	username := os.Getenv("DURIAN_JMAP_TEST_USERNAME")
 	password := os.Getenv("DURIAN_JMAP_TEST_PASSWORD")
+	auth := liveJMAPAuth()
 	if sessionURL == "" || username == "" || password == "" {
 		t.Skip("live JMAP credentials not configured")
 	}
@@ -27,16 +28,7 @@ func TestLiveJMAPRoundTrip(t *testing.T) {
 	getCredential = func(_, _ string) (string, error) { return password, nil }
 	t.Cleanup(func() { getCredential = original })
 
-	account := &config.AccountConfig{
-		Name: "JMAP Integration", Email: username, Alias: "jmap-integration", SyncEngine: "jmap",
-		Auth: &config.AuthConfig{Username: username},
-		JMAP: &config.JMAPConfig{SessionURL: sessionURL, Auth: "password"},
-	}
-	b, err := New(account)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = b.Close() })
+	b := newLiveBackend(t, sessionURL, auth, "JMAP Integration", username)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
@@ -140,6 +132,201 @@ func TestLiveJMAPRoundTrip(t *testing.T) {
 	if !foundSent {
 		t.Fatalf("submission %s did not appear in the sent mailbox", submissionMessageID)
 	}
+}
+
+func TestLiveJMAPHTMLThreading(t *testing.T) {
+	sessionURL := os.Getenv("DURIAN_JMAP_TEST_SESSION_URL")
+	username := os.Getenv("DURIAN_JMAP_TEST_USERNAME")
+	password := os.Getenv("DURIAN_JMAP_TEST_PASSWORD")
+	auth := liveJMAPAuth()
+	if sessionURL == "" || username == "" || password == "" {
+		t.Skip("live JMAP credentials not configured")
+	}
+
+	original := getCredential
+	getCredential = func(_, _ string) (string, error) { return password, nil }
+	t.Cleanup(func() { getCredential = original })
+
+	b := newLiveBackend(t, sessionURL, auth, "JMAP HTML Threading", username)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if _, err := b.FetchFolders(ctx); err != nil {
+		t.Fatalf("discover folders: %v", err)
+	}
+	initial, err := b.FetchMessages(ctx, allMailStream, nil, 500)
+	if err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+
+	marker := time.Now().UTC().Format("20060102T150405.000000000")
+	parentID := "durian-jmap-html-parent-" + marker + "@example.test"
+	replyID := "durian-jmap-html-reply-" + marker + "@example.test"
+	sender := &Sender{b: b}
+	if err := sender.Send(ctx, &mailsend.Message{
+		From: username, To: []string{username}, Subject: "Durian JMAP HTML threading " + marker,
+		Body: "<p>HTML body with <strong>formatting</strong>.</p>", IsHTML: true, MessageID: parentID,
+	}); err != nil {
+		t.Fatalf("HTML parent submission: %v", err)
+	}
+	if err := sender.Send(ctx, &mailsend.Message{
+		From: username, To: []string{username}, Subject: "Re: Durian JMAP HTML threading " + marker,
+		Body: "threaded reply", MessageID: replyID, InReplyTo: "<" + parentID + ">", References: "<" + parentID + ">",
+	}); err != nil {
+		t.Fatalf("thread reply submission: %v", err)
+	}
+
+	delta, err := b.FetchMessages(ctx, allMailStream, initial.Cursor, 500)
+	if err != nil {
+		t.Fatalf("submission delta: %v", err)
+	}
+	refs := make(map[string]string)
+	for _, message := range delta.Messages {
+		messageID := strings.Trim(message.MessageID, "<>")
+		if messageID != parentID && messageID != replyID {
+			continue
+		}
+		t.Cleanup(func() { destroyLiveEmail(b, message.Ref.ID) })
+		refs[messageID] = message.Ref.ID
+		raw := strings.ToLower(string(message.Raw))
+		if messageID == parentID && (!strings.Contains(raw, "content-type: text/html") || !strings.Contains(raw, "<strong>formatting</strong>")) {
+			t.Fatal("HTML parent was not preserved as text/html")
+		}
+		parentIDLower := strings.ToLower(parentID)
+		if messageID == replyID && (!strings.Contains(raw, "in-reply-to: <"+parentIDLower+">") || !strings.Contains(raw, "references: <"+parentIDLower+">")) {
+			t.Fatal("reply threading headers were not preserved")
+		}
+	}
+	if refs[parentID] == "" || refs[replyID] == "" {
+		t.Fatalf("submission delta did not contain both thread messages: parent=%t reply=%t", refs[parentID] != "", refs[replyID] != "")
+	}
+	objects, missing, _, err := b.getEmailObjects(ctx, []string{refs[parentID], refs[replyID]})
+	if err != nil {
+		t.Fatalf("fetch JMAP thread metadata: %v", err)
+	}
+	if len(missing) != 0 || len(objects) != 2 || objects[0].ThreadID == "" || objects[0].ThreadID != objects[1].ThreadID {
+		t.Fatalf("server did not group parent and reply into one JMAP thread: objects=%v missing=%v", objects, missing)
+	}
+}
+
+func TestLiveJMAPTwoAccountDelivery(t *testing.T) {
+	sessionURL := os.Getenv("DURIAN_JMAP_TEST_SESSION_URL")
+	senderUsername := os.Getenv("DURIAN_JMAP_TEST_USERNAME")
+	senderPassword := os.Getenv("DURIAN_JMAP_TEST_PASSWORD")
+	recipientUsername := os.Getenv("DURIAN_JMAP_TEST_RECIPIENT_USERNAME")
+	recipientPassword := os.Getenv("DURIAN_JMAP_TEST_RECIPIENT_PASSWORD")
+	auth := liveJMAPAuth()
+	if sessionURL == "" || senderUsername == "" || senderPassword == "" || recipientUsername == "" || recipientPassword == "" {
+		t.Skip("live two-account JMAP credentials not configured")
+	}
+
+	original := getCredential
+	getCredential = func(_, account string) (string, error) {
+		switch account {
+		case senderUsername:
+			return senderPassword, nil
+		case recipientUsername:
+			return recipientPassword, nil
+		default:
+			return "", errors.New("unexpected live JMAP account")
+		}
+	}
+	t.Cleanup(func() { getCredential = original })
+
+	senderBackend := newLiveBackend(t, sessionURL, auth, "JMAP Integration Sender", senderUsername)
+	recipientBackend := newLiveBackend(t, sessionURL, auth, "JMAP Integration Recipient", recipientUsername)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	for name, b := range map[string]*Backend{"sender": senderBackend, "recipient": recipientBackend} {
+		if _, err := b.FetchFolders(ctx); err != nil {
+			t.Fatalf("discover %s folders: %v", name, err)
+		}
+	}
+
+	senderInitial, err := senderBackend.FetchMessages(ctx, allMailStream, nil, 500)
+	if err != nil {
+		t.Fatalf("initial sender sync: %v", err)
+	}
+	recipientInitial, err := recipientBackend.FetchMessages(ctx, allMailStream, nil, 500)
+	if err != nil {
+		t.Fatalf("initial recipient sync: %v", err)
+	}
+
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	watchResult := make(chan error, 1)
+	changed := make(chan struct{}, 1)
+	go func() {
+		watchResult <- recipientBackend.Watch(watchCtx, "", func() {
+			select {
+			case changed <- struct{}{}:
+			default:
+			}
+		})
+	}()
+	time.Sleep(300 * time.Millisecond)
+
+	marker := time.Now().UTC().Format("20060102T150405.000000000")
+	messageID := "durian-jmap-two-account-" + marker + "@example.test"
+	if err := (&Sender{b: senderBackend}).Send(ctx, &mailsend.Message{
+		From: senderUsername, To: []string{recipientUsername}, Subject: "Durian JMAP two-account " + marker,
+		Body: "delivered between two JMAP accounts", MessageID: messageID,
+	}); err != nil {
+		t.Fatalf("two-account submission: %v", err)
+	}
+
+	select {
+	case <-changed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("recipient JMAP EventSource did not announce delivered email")
+	}
+	stopWatch()
+	if err := <-watchResult; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("recipient watch: %v", err)
+	}
+
+	recipientDelta, err := recipientBackend.FetchMessages(ctx, allMailStream, recipientInitial.Cursor, 500)
+	if err != nil {
+		t.Fatalf("recipient incremental sync: %v", err)
+	}
+	if !containsMessage(recipientDelta.Messages, messageID, func(message backend.Message) bool {
+		t.Cleanup(func() { destroyLiveEmail(recipientBackend, message.Ref.ID) })
+		return strings.Contains(string(message.Raw), "delivered between two JMAP accounts") && containsString(message.Labels, "inbox")
+	}) {
+		t.Fatalf("recipient sync did not return delivered message %s in inbox", messageID)
+	}
+
+	senderDelta, err := senderBackend.FetchMessages(ctx, allMailStream, senderInitial.Cursor, 500)
+	if err != nil {
+		t.Fatalf("sender incremental sync: %v", err)
+	}
+	if !containsMessage(senderDelta.Messages, messageID, func(message backend.Message) bool {
+		t.Cleanup(func() { destroyLiveEmail(senderBackend, message.Ref.ID) })
+		return containsString(message.Labels, "sent")
+	}) {
+		t.Fatalf("sender sync did not return submitted message %s in sent", messageID)
+	}
+}
+
+func liveJMAPAuth() string {
+	if auth := os.Getenv("DURIAN_JMAP_TEST_AUTH"); auth != "" {
+		return auth
+	}
+	return "password"
+}
+
+func newLiveBackend(t *testing.T, sessionURL, auth, name, username string) *Backend {
+	t.Helper()
+	account := &config.AccountConfig{
+		Name: name, Email: username, SyncEngine: "jmap",
+		Auth: &config.AuthConfig{Username: username},
+		JMAP: &config.JMAPConfig{SessionURL: sessionURL, Auth: auth},
+	}
+	b, err := New(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	return b
 }
 
 func containsMessage(messages []backend.Message, messageID string, check func(backend.Message) bool) bool {
