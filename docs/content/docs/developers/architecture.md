@@ -141,13 +141,16 @@ implements — `FetchFolders`, `FetchMessages` (cursor-paged incremental),
 handle, never a store key.
 
 A `Capabilities` struct lets the engine adapt to provider quirks without
-branching on provider names: `ServerSideSent` (provider auto-saves Sent),
-`NativeMove`, `PushWatch`, `FlagChangesInDelta` (the delta already carries flag
-changes, so the flag pass is O(changes)), `LabelsAreTags` (Gmail/JMAP — `Message.Labels`
+branching on provider names: `PushWatch`, `FlagChangesInDelta` (the delta already
+carries flag changes, so the flag pass is O(changes)), `LabelsAreTags` (Gmail/JMAP — `Message.Labels`
 is the authoritative tag set), and `AnsweredUnsupported` (Gmail can't persist
 `\Answered`, so it's excluded from the merge to stop per-sync ping-pong). A
 label-native backend also implements the optional `LabelWriter` interface
 (`LabelTags`, `ApplyLabels`).
+
+Outbound transport behavior belongs to `mailsend.Sender`: `SavesSentCopy`
+decides whether Durian appends an IMAP Sent copy without branching on provider
+names.
 
 The implementations: **`imapbackend`** wraps the existing `cli/internal/imap`
 client; **`graphbackend`** speaks Microsoft Graph (`/me` or `/users/{email}` for
@@ -185,10 +188,38 @@ of the legacy path's IMAP-UIDNEXT diffing.
   with backoff and jitter.
 - **JMAP EventSource** (`handler/enginewatcher.go`) — an account-wide push stream
   triggers serialized incremental syncs; a slow full poll remains as recovery
-  for dropped notifications.
+  for dropped notifications. RFC 8887 WebSocket push is intentionally not
+  implemented; EventSource is the supported JMAP push transport.
 
-Gmail-engine accounts are not polled by a resident watcher on this path — they
-sync through `durian sync` (invoked manually or by the GUI's periodic sync).
+Gmail and Graph accounts use the polling loops. JMAP and opt-in engine/IMAP
+accounts use their backend's `PushWatch` capability for EventSource or IMAP
+IDLE, plus a slow safety poll. Local tag mutations trigger an immediate,
+coalesced upload-only engine pass for all engine accounts.
+
+### Live JMAP tests
+
+The build-tagged live suite is a normal Bazel target, so `bazel test //cli/...`
+always compiles it and reports it skipped when credentials are absent. To run it
+against a test account, pass the environment through Bazel:
+
+```sh
+bazel test //cli/internal/jmapbackend:jmapbackend_live_integration_test \
+  --test_env=DURIAN_JMAP_TEST_SESSION_URL \
+  --test_env=DURIAN_JMAP_TEST_USERNAME \
+  --test_env=DURIAN_JMAP_TEST_PASSWORD \
+  --test_env=DURIAN_JMAP_TEST_AUTH \
+  --test_env=DURIAN_JMAP_TEST_RECIPIENT_USERNAME \
+  --test_env=DURIAN_JMAP_TEST_RECIPIENT_PASSWORD
+```
+
+Set those three variables in the invoking shell. The session URL and primary
+credentials are required. `DURIAN_JMAP_TEST_AUTH` optionally selects `password`
+(the default) or `bearer`. To additionally exercise delivery between accounts,
+set and pass `DURIAN_JMAP_TEST_RECIPIENT_USERNAME` and
+`DURIAN_JMAP_TEST_RECIPIENT_PASSWORD`. Unset optional variables remain absent
+when passed this way. The tests create, send,
+modify, and delete real messages; use disposable test accounts. The JMAP session
+URL must be HTTPS unless it addresses loopback.
 
 ### Routing and validation
 

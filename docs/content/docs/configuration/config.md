@@ -183,12 +183,19 @@ mail for offline use, maps mailbox memberships to tags, follows `Email/changes`
 state tokens, listens to EventSource push notifications in `durian serve`, and
 sends via JMAP Submission. Use `auth = "bearer"` for a provider API token (for
 example Fastmail) or `auth = "password"` for HTTP Basic authentication, then run
-`durian auth login <alias>`. IMAP and SMTP blocks are not required.
+`durian auth login <alias>`. The session URL must use HTTPS, except that HTTP is
+allowed for loopback addresses. Durian intentionally supports JMAP EventSource
+push, not the optional RFC 8887 WebSocket transport.
+
+IMAP and SMTP blocks are not required for sync or sending. Compose autosaves,
+the outbox, and undo-send are local and work with JMAP, but the server-side
+`durian draft save` and `durian draft delete` commands still require an IMAP
+configuration; Durian does not currently upload drafts through JMAP.
 
 `durian validate` rejects: a value outside the five above; `graph` without a Microsoft OAuth
 account; `gmail` without a Google OAuth account; and `legacy`/`engine` on a
 Microsoft account (Microsoft must use Graph). `jmap` requires an absolute HTTP(S)
-session URL. Changing `sync_engine` triggers a
+session URL and rejects non-loopback HTTP. Changing `sync_engine` triggers a
 fresh full resync (the per-backend cursors are incompatible) but is safe — the
 store upserts by Message-ID.
 

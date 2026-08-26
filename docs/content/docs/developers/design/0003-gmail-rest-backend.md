@@ -55,7 +55,6 @@ Capabilities advertised to the engine:
 | Flag | Why |
 |---|---|
 | `LabelsAreTags` | `Message.Labels` is the authoritative tag set; the engine mirrors labels ⇄ tags instead of folder-role mapping. |
-| `ServerSideSent` | Gmail files sent mail itself; don't append a Sent copy. |
 | `FlagChangesInDelta` | `history.list` already carries flag changes, so the flag pass is O(changes). |
 | `AnsweredUnsupported` | Gmail has no per-message `\Answered`; see below. |
 
@@ -105,10 +104,9 @@ concern, not this one.
 - **A Gmail-specific syncer (not behind the neutral seam).** Rejected: it would
   duplicate the engine's ingest, merge, and notification logic. Implementing
   `Backend` reuses all of it.
-- **A resident push watcher for Gmail in `durian serve`.** Not built. The Graph
-  poll watcher (`enginewatcher.go`) is Graph-specific; Gmail-engine accounts sync
-  through `durian sync` (manual or the GUI's periodic sync). A Gmail
-  watch/pub-sub loop is possible future work.
+- **Gmail Pub/Sub push in `durian serve`.** Not built because it requires a
+  public receiving endpoint. The provider-neutral engine watcher polls Gmail's
+  incremental history cursor instead.
 
 ## Consequences
 
