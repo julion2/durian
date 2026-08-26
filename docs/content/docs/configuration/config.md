@@ -187,6 +187,23 @@ example Fastmail) or `auth = "password"` for HTTP Basic authentication, then run
 allowed for loopback addresses. Durian intentionally supports JMAP EventSource
 push, not the optional RFC 8887 WebSocket transport.
 
+Fastmail needs no IMAP or SMTP configuration:
+
+```pkl
+new {
+  name = "Fastmail"
+  email = "you@fastmail.com"
+  alias = "fastmail"
+  sync_engine = "jmap"
+  jmap {
+    session_url = "https://api.fastmail.com/jmap/session"
+    auth = "bearer"
+  }
+}
+```
+
+Run `durian auth login fastmail` and paste a Fastmail API token.
+
 IMAP and SMTP blocks are not required for sync or sending. Compose autosaves,
 the outbox, and undo-send are local and work with JMAP, but the server-side
 `durian draft save` and `durian draft delete` commands still require an IMAP

@@ -169,7 +169,7 @@ accounts: Listing<C.AccountConfig> = new {
   // ── JMAP (Fastmail or compatible server) ─────────────────
   new {
     name = "Fastmail"
-    email = "you@example.com"
+    email = "you@fastmail.com"
     alias = "fastmail"
     jmap {
       session_url = "https://api.fastmail.com/jmap/session"
