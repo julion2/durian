@@ -285,6 +285,33 @@ func validateJMAPURL(raw string) error {
 	return nil
 }
 
+func validateJMAPRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if err := validateJMAPURL(req.URL.String()); err != nil {
+		return err
+	}
+	if len(via) > 0 && !sameOrigin(via[0].URL, req.URL) {
+		return errors.New("JMAP redirect origin differs from request origin")
+	}
+	return nil
+}
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) && effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
 func decodeJSONLimited(r io.Reader, limit int64, out interface{}) error {
 	data, err := readLimited(r, limit, "JMAP JSON response")
 	if err != nil {

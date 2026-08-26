@@ -453,6 +453,13 @@ func (b *Backend) replacementSnapshot(ctx context.Context, folder string) (backe
 		priorToken = page.NextPageToken
 		q.Set("pageToken", page.NextPageToken)
 	}
+	if len(refs) == 0 {
+		// A false-empty authoritative snapshot would delete the account's
+		// complete local read model. Gmail exposes no exact total with which to
+		// distinguish that response from a genuinely empty mailbox, so prefer a
+		// retry over irreversible local deletion.
+		return backend.FetchResult{}, errors.New("Gmail replacement snapshot returned no messages")
+	}
 	return backend.FetchResult{
 		Cursor:       encodeCursor(gmailCursor{HistoryID: snapshot}),
 		FullSnapshot: true,

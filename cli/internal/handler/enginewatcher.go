@@ -384,13 +384,14 @@ func (w *EngineWatcher) syncAccountMode(ctx context.Context, account *config.Acc
 		cursors = syncengine.NewFileCursorStoreWithSuffix(account.AccountIdentifier(), suffix)
 	}
 	engine := syncengine.New(syncengine.Options{
-		Store:           w.store,
-		Cursors:         cursors,
-		Account:         account.AccountIdentifier(),
-		BatchLimit:      account.GetIMAPBatchSize(),
+		Store:      w.store,
+		Cursors:    cursors,
+		Account:    account.AccountIdentifier(),
+		BatchLimit: account.GetIMAPBatchSize(),
 		// Keep provider-engine semantics aligned with `durian sync`: an explicit
-		// zero means full local-first sync. Pkl supplies the ordinary 5000 default.
-		MaxPerFolder:    account.IMAP.MaxMessages,
+		// zero means full local-first sync. Daemon passes retain the 5000-message
+		// safety cap so a large initial sync yields before its watchdog.
+		MaxPerFolder:    account.GetIMAPMaxMessages(),
 		Folders:         folders,
 		Mode:            mode,
 		Timeout:         syncTimeout,

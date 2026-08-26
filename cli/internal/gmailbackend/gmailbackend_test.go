@@ -437,6 +437,21 @@ func TestReplacementSnapshotPaginatesAndRejectsNoProgress(t *testing.T) {
 	}
 }
 
+func TestReplacementSnapshotRejectsEmptyMailbox(t *testing.T) {
+	mux := http.NewServeMux()
+	registerProfile(t, mux, "321")
+	mux.HandleFunc("/users/me/messages", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	result, err := newTestBackend(t, srv).replacementSnapshot(t.Context(), allMailStream)
+	if err == nil || !strings.Contains(err.Error(), "returned no messages") || result.FullSnapshot {
+		t.Fatalf("replacementSnapshot = %+v, err %v; want false-empty rejection", result, err)
+	}
+}
+
 func TestMutationIsNotRetriedAfterThrottle(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

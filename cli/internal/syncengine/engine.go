@@ -182,23 +182,22 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 				folderDeadline = folderSync.deadline
 			}
 		}
-		errorsBeforeFlags := len(result.Errors)
 		folderCtx, cancel := contextWithDeadline(ctx, folderDeadline)
-		e.reconcileFolderFlags(folderCtx, b, folder, deltaFlags, result)
+		cursorSafe := e.reconcileFolderFlags(folderCtx, b, folder, deltaFlags, result)
 		cancel()
 		if folderSync != nil && folderSync.pendingCursor != nil && !e.opts.DryRun {
 			if err := ctx.Err(); err != nil {
-				return result, fmt.Errorf("sync canceled before replacement cursor persistence: %w", err)
+				return result, fmt.Errorf("sync canceled before cursor persistence: %w", err)
 			}
 			if !folderDeadline.IsZero() && time.Now().After(folderDeadline) {
-				return result, fmt.Errorf("sync timed out before replacement cursor persistence: %w", context.DeadlineExceeded)
+				return result, fmt.Errorf("sync timed out before cursor persistence: %w", context.DeadlineExceeded)
 			}
-			if len(result.Errors) > errorsBeforeFlags {
-				result.Errors = append(result.Errors, fmt.Errorf("folder %s: replacement cursor held back after flag reconciliation failed", folder.Name))
+			if !cursorSafe {
+				result.Errors = append(result.Errors, fmt.Errorf("folder %s: cursor held back after flag reconciliation failed", folder.Name))
 				continue
 			}
 			if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, folderSync.pendingCursor); err != nil {
-				result.Errors = append(result.Errors, fmt.Errorf("folder %s: persist replacement cursor: %w", folder.Name, err))
+				result.Errors = append(result.Errors, fmt.Errorf("folder %s: persist cursor: %w", folder.Name, err))
 			}
 		}
 	}
@@ -417,6 +416,12 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		}
 
 		for _, del := range res.Deleted {
+			if res.FullSnapshot {
+				delete(snapshotRefs, del.Ref.ID)
+				delete(snapshotUnavailable, del.Ref.ID)
+				delete(snapshotSkipHydration, del.Ref.ID)
+				delete(deltaFlags, del.Ref.ID)
+			}
 			if e.handleDeleted(folder, del, sessionRefs, result) {
 				result.Deleted++
 			}
@@ -456,24 +461,11 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 					return nil, errors.New("full-snapshot reconciliation failed")
 				}
 			}
-			// A replacement cursor remains pending until the caller's flag pass
-			// succeeds. Advancing it here could permanently lose a flag change
-			// recovered from the expired-cursor gap.
-			if !e.opts.DryRun && !fullSnapshot {
-				if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, res.Cursor); err != nil {
-					return nil, fmt.Errorf("persist cursor: %w", err)
-				}
-			}
 			state := &folderSyncResult{deltaFlags: deltaFlags, deadline: deadline}
-			if fullSnapshot {
+			if !e.opts.DryRun {
 				state.pendingCursor = res.Cursor
 			}
 			return state, nil
-		}
-		if !e.opts.DryRun && !fullSnapshot {
-			if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, res.Cursor); err != nil {
-				return nil, fmt.Errorf("persist cursor: %w", err)
-			}
 		}
 		// Stop at the per-folder cap (newest-first), so a first sync of a large
 		// folder does not page its entire history — parity with the legacy
@@ -485,7 +477,16 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		if e.opts.MaxPerFolder > 0 && fetched >= e.opts.MaxPerFolder && !fullSnapshot {
 			slog.Debug("Reached per-folder message cap, stopping", "module", "SYNCENGINE", // encgrep:allow folder name and cap counts are operational sync metadata, not message content
 				"folder", folder.Name, "cap", e.opts.MaxPerFolder, "fetched", fetched)
-			return &folderSyncResult{deltaFlags: deltaFlags, deadline: deadline}, nil
+			state := &folderSyncResult{deltaFlags: deltaFlags, deadline: deadline}
+			if !e.opts.DryRun {
+				state.pendingCursor = res.Cursor
+			}
+			return state, nil
+		}
+		if !e.opts.DryRun && !fullSnapshot {
+			if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, res.Cursor); err != nil {
+				return nil, fmt.Errorf("persist cursor: %w", err)
+			}
 		}
 		// Defensive guard: a backend that reports HasMore without changing
 		// anything would loop forever; bail out instead.
@@ -539,7 +540,9 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 	hydrator, ok := b.(backend.SnapshotHydrator)
 	if !ok {
 		if len(missing) > 0 {
-			return fmt.Errorf("backend returned a metadata-only full snapshot with %d locally missing messages but cannot hydrate them", len(missing))
+			slog.Warn("Snapshot refs are absent locally and backend cannot hydrate them, skipping refs", "module", "SYNCENGINE",
+				"folder", folder.Name, "count", len(missing)) // encgrep:allow folder and count are operational sync metadata
+			removeMissingSnapshotRefs(present, deltaFlags, missing)
 		}
 		return nil
 	}
@@ -674,13 +677,14 @@ func (e *Engine) reconcileFullSnapshot(folder backend.Folder, present map[string
 // New messages ingested this run already carry their flag tags and baseline,
 // so the pass no-ops for them. The pass is skipped entirely in DryRun: it
 // would otherwise write to the server, tags and baselines.
-func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, folder backend.Folder, deltaFlags map[string]backend.Flags, result *Result) {
+func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, folder backend.Folder, deltaFlags map[string]backend.Flags, result *Result) bool {
 	if e.opts.NoFlags || e.opts.DryRun {
-		return
+		return true
 	}
 	if ctx.Err() != nil {
-		return
+		return false
 	}
+	cursorSafe := true
 
 	upload := e.opts.Mode != DownloadOnly
 	download := e.opts.Mode != UploadOnly
@@ -688,10 +692,10 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 	rows, err := e.opts.Store.GetFolderFlagState(e.opts.Account, folder.Name)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Errorf("flag sync %s: load flag state: %w", folder.Name, err))
-		return
+		return false
 	}
 	if len(rows) == 0 {
-		return
+		return true
 	}
 
 	// Choose which messages to fetch server flags for. A delta backend already
@@ -725,6 +729,7 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 					// candidate check and the merge below must agree, and the
 					// merge re-reads rows[i]. Skip; the next sync retries.
 					result.Errors = append(result.Errors, fmt.Errorf("seed flag baseline for %s: %w", row.MessageID, err))
+					cursorSafe = false
 					continue
 				}
 				// Update BOTH the local copy (for the candidate check just below)
@@ -744,7 +749,7 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 		slog.Info("Seeded flag baselines for migrated messages", "module", "SYNCENGINE", "folder", folder.Name, "count", seeded) // encgrep:allow folder name + count are operational metadata, not content
 	}
 	if len(refs) == 0 {
-		return
+		return cursorSafe
 	}
 
 	server, err := b.FetchFlags(ctx, folder.Name, refs)
@@ -752,18 +757,12 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 		slog.Warn("Flag fetch failed, continuing", "module", "SYNCENGINE",
 			"account", e.opts.Account, "folder", folder.Name, "err", err)
 		result.Errors = append(result.Errors, fmt.Errorf("flag sync %s: %w", folder.Name, err))
-		return
+		return false
 	}
 
 	uploaded, downloaded := 0, 0
 	for _, row := range rows {
 		serverFlags, ok := server[row.RemoteRef]
-		if !ok && useDelta {
-			// A delta already carries authoritative flags for remote changes.
-			// Use them when a batched follow-up omitted one transiently; locally
-			// dirty refs have no delta fallback and remain pending for next pass.
-			serverFlags, ok = deltaFlags[row.RemoteRef]
-		}
 		if !ok {
 			continue // Not fetched (no candidate change) or not on the server.
 		}
@@ -802,6 +801,7 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 				slog.Warn("Flag upload failed", "module", "SYNCENGINE",
 					"folder", folder.Name, "message_id", row.MessageID, "err", err)
 				result.Errors = append(result.Errors, fmt.Errorf("flag upload for %s: %w", row.MessageID, err))
+				continue
 			} else {
 				if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, joinFlags(local)); err != nil {
 					result.Errors = append(result.Errors, fmt.Errorf("flag baseline for %s: %w", row.MessageID, err))
@@ -822,11 +822,13 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 				add, remove := target.ToTagOps()
 				if err := e.opts.Store.ModifyTagsByMessageIDAndAccount(row.MessageID, e.opts.Account, add, remove); err != nil {
 					result.Errors = append(result.Errors, fmt.Errorf("flag tags for %s: %w", row.MessageID, err))
+					cursorSafe = false
 					continue // Baseline stays put so the download is retried next sync.
 				}
 			}
 			if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, joinFlags(target)); err != nil {
 				result.Errors = append(result.Errors, fmt.Errorf("flag baseline for %s: %w", row.MessageID, err))
+				cursorSafe = false
 			}
 			downloaded++
 		}
@@ -834,6 +836,7 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 
 	slog.Debug("Flag pass complete", "module", "SYNCENGINE",
 		"folder", folder.Name, "uploaded", uploaded, "downloaded", downloaded)
+	return cursorSafe
 }
 
 // flagCandidate reports whether a delta backend still needs this row's server

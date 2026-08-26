@@ -103,6 +103,7 @@ type fakeBackend struct {
 	// fetchFlagsCalls / applyFlagsCalls record the flag-pass invocations.
 	fetchFlagsCalls []fetchFlagsCall
 	applyFlagsCalls []applyFlagsCall
+	applyFlagsErr   error
 	// moveCalls records Backend.Move invocations (folder-move upload pass).
 	moveCalls []moveCall
 	// moveErr, when set, is returned by every Move instead of succeeding.
@@ -222,7 +223,7 @@ func (f *fakeBackend) FetchSnapshotMetadata(_ context.Context, refs []backend.Re
 
 func (f *fakeBackend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, remove backend.Flags) error {
 	f.applyFlagsCalls = append(f.applyFlagsCalls, applyFlagsCall{ref: ref, add: add, remove: remove})
-	return nil
+	return f.applyFlagsErr
 }
 
 func (f *fakeBackend) FetchFlags(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
@@ -577,6 +578,46 @@ func TestEngineRefreshesExistingSnapshotMetadata(t *testing.T) {
 	}
 }
 
+func TestEngineReplaysFinalDeltaWhenFlagFetchFails(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	message := backend.Message{
+		MessageID: "delta-replay@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "m1"},
+		Raw:   rawMessage("delta-replay@example.com", "a@example.com", testAccount, "Replay", "body"),
+		Flags: backend.Flags{Flagged: true},
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {
+			{Messages: []backend.Message{message}, Cursor: backend.Cursor("c1")},
+			{Messages: []backend.Message{message}, Cursor: backend.Cursor("c2")},
+			{Messages: []backend.Message{message}, Cursor: backend.Cursor("c2")},
+		},
+	})
+	fake.caps.FlagChangesInDelta = true
+	fake.flagsByRef["m1"] = message.Flags
+	engine := newTestEngine(db, cursors)
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("seed result=%+v err=%v", result, err)
+	}
+	fake.fetchFlagsErr = errors.New("transient Graph batch failure")
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) == 0 {
+		t.Fatalf("failed delta result=%+v err=%v", result, err)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "c1" {
+		t.Fatalf("cursor after failed flag fetch = %q, want c1", got)
+	}
+	fake.fetchFlagsErr = nil
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("replayed delta result=%+v err=%v", result, err)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "c2" {
+		t.Fatalf("cursor after replay = %q, want c2", got)
+	}
+	if got := fake.seenCursors["INBOX"]; len(got) != 3 || string(got[1]) != "c1" || string(got[2]) != "c1" {
+		t.Fatalf("FetchMessages cursors = %q, want final delta replayed from c1", got)
+	}
+}
+
 func TestEngineRejectsSnapshotToDeltaTransition(t *testing.T) {
 	db := newTestDB(t)
 	cursors := newMemCursorStore()
@@ -652,6 +693,79 @@ func TestEngineDryRunReplacementDoesNotRequireHydrator(t *testing.T) {
 	}
 	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "old" {
 		t.Fatalf("dry-run cursor = %q, want old", got)
+	}
+}
+
+func TestEngineReplacementSkipsAbsentRefWithoutHydrator(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {{
+			Cursor: backend.Cursor("replacement"), FullSnapshot: true,
+			Present: []backend.RemoteRef{{Folder: "INBOX", ID: "collapsed-or-expunged"}},
+		}},
+	})
+	result, err := newTestEngine(db, cursors).Sync(t.Context(), &backendOnly{Backend: fake})
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("Sync result=%+v err=%v", result, err)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "replacement" {
+		t.Fatalf("cursor = %q, want replacement", got)
+	}
+}
+
+func TestEngineReplacementToleratesDuplicateMessageIDRefs(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	message := func(ref string) backend.Message {
+		return backend.Message{
+			MessageID: "duplicate@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: ref},
+			Raw: rawMessage("duplicate@example.com", "a@example.com", testAccount, "Duplicate", "body"),
+		}
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {{
+			Messages: []backend.Message{message("r1"), message("r2")}, Cursor: backend.Cursor("replacement"), FullSnapshot: true,
+			Present: []backend.RemoteRef{{Folder: "INBOX", ID: "r1"}, {Folder: "INBOX", ID: "r2"}},
+		}},
+	})
+	result, err := newTestEngine(db, cursors).Sync(t.Context(), &backendOnly{Backend: fake})
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("Sync result=%+v err=%v", result, err)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "replacement" {
+		t.Fatalf("cursor = %q, want replacement", got)
+	}
+}
+
+func TestEngineReplacementRemovesRefExpungedOnLaterPage(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	message := backend.Message{
+		MessageID: "expunged@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "gone"},
+		Raw: rawMessage("expunged@example.com", "a@example.com", testAccount, "Gone", "body"),
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {
+			{
+				Messages: []backend.Message{message}, Cursor: backend.Cursor("page-1"), HasMore: true, FullSnapshot: true,
+				Present: []backend.RemoteRef{message.Ref},
+			},
+			{
+				Cursor: backend.Cursor("replacement"), FullSnapshot: true,
+				Deleted: []backend.Deletion{{Ref: message.Ref, MessageID: message.MessageID}},
+			},
+		},
+	})
+	result, err := newTestEngine(db, cursors).Sync(t.Context(), &backendOnly{Backend: fake})
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("Sync result=%+v err=%v", result, err)
+	}
+	if got, _ := db.GetByMessageID(message.MessageID); got != nil {
+		t.Fatalf("expunged message remains: %#v", got)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "replacement" {
+		t.Fatalf("cursor = %q, want replacement", got)
 	}
 }
 
@@ -828,6 +942,38 @@ func TestEngineDoesNotPersistSnapshotCursorWhenReconciliationFails(t *testing.T)
 	}
 	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "old" {
 		t.Fatalf("cursor advanced to %q after reconciliation failure", got)
+	}
+}
+
+func TestEnginePersistsReplacementCursorWhenFlagUploadFails(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	message := backend.Message{
+		MessageID: "upload-denied@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "m1"},
+		Raw:   rawMessage("upload-denied@example.com", "a@example.com", testAccount, "Denied", "body"),
+		Flags: backend.Flags{Flagged: true},
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {
+			{Messages: []backend.Message{message}, Cursor: backend.Cursor("old")},
+			{Cursor: backend.Cursor("replacement"), FullSnapshot: true, Present: []backend.RemoteRef{message.Ref}},
+		},
+	})
+	fake.flagsByRef["m1"] = backend.Flags{Flagged: true}
+	engine := newTestEngine(db, cursors)
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("seed result=%+v err=%v", result, err)
+	}
+	if err := db.ModifyTagsByMessageIDAndAccount("upload-denied@example.com", testAccount, nil, []string{"unread"}); err != nil {
+		t.Fatal(err)
+	}
+	fake.applyFlagsErr = errors.New("permanent access denied")
+	result, err := engine.Sync(t.Context(), &backendOnly{Backend: fake})
+	if err != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "flag upload") {
+		t.Fatalf("replacement result=%+v err=%v", result, err)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "replacement" {
+		t.Fatalf("cursor = %q, want replacement despite durable local upload failure", got)
 	}
 }
 
@@ -1723,45 +1869,6 @@ func TestEngineFlagPassScopedToDelta(t *testing.T) {
 	// The local read change was still uploaded.
 	if len(fake.applyFlagsCalls) != 1 || fake.applyFlagsCalls[0].ref.ID != "602" || !fake.applyFlagsCalls[0].add.Seen {
 		t.Errorf("ApplyFlags = %+v, want one Seen upload for 602", fake.applyFlagsCalls)
-	}
-}
-
-func TestEngineUsesDeltaFlagsWhenFollowUpFetchOmitsChangedRef(t *testing.T) {
-	db := newTestDB(t)
-	cursors := newMemCursorStore()
-	folder := backend.Folder{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}
-	message := func(seen bool, cursor string) backend.FetchResult {
-		return backend.FetchResult{
-			Messages: []backend.Message{{
-				MessageID: "delta-flags@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "m1"},
-				Raw:   rawMessage("delta-flags@example.com", "a@example.com", testAccount, "Flags", "body"),
-				Flags: backend.Flags{Seen: seen, Flagged: true},
-			}},
-			Cursor: backend.Cursor(cursor),
-		}
-	}
-	fake := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
-		"INBOX": {message(false, "c1"), message(true, "c2")},
-	})
-	fake.caps.FlagChangesInDelta = true
-	engine := newTestEngine(db, cursors)
-	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
-		t.Fatalf("initial result=%+v err=%v", result, err)
-	}
-	// FetchFlags intentionally returns no entry for m1. The second delta still
-	// carries Seen=true and must advance the baseline without losing the change.
-	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
-		t.Fatalf("delta result=%+v err=%v", result, err)
-	}
-	rows, err := db.GetFolderFlagState(testAccount, "INBOX")
-	if err != nil || len(rows) != 1 {
-		t.Fatalf("flag rows=%v err=%v", rows, err)
-	}
-	if !strings.Contains(rows[0].SyncedFlags, `\Seen`) || !strings.Contains(rows[0].SyncedFlags, `\Flagged`) || slices.Contains(rows[0].Tags, "unread") {
-		t.Fatalf("flags after delta = tags:%v baseline:%q, want Seen+Flagged", rows[0].Tags, rows[0].SyncedFlags)
-	}
-	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "c2" {
-		t.Fatalf("cursor = %q, want c2", got)
 	}
 }
 

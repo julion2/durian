@@ -603,6 +603,25 @@ func TestValidateJMAPURLAllowsOnlySecureOrLoopback(t *testing.T) {
 	}
 }
 
+func TestValidateJMAPRedirect(t *testing.T) {
+	origin, _ := http.NewRequest(http.MethodGet, "https://mail.example.test/jmap", nil)
+	same, _ := http.NewRequest(http.MethodGet, "https://mail.example.test/next", nil)
+	if err := validateJMAPRedirect(same, []*http.Request{origin}); err != nil {
+		t.Fatalf("same-origin redirect rejected: %v", err)
+	}
+	offOrigin, _ := http.NewRequest(http.MethodGet, "https://attacker.example/steal", nil)
+	if err := validateJMAPRedirect(offOrigin, []*http.Request{origin}); err == nil {
+		t.Fatal("off-origin redirect accepted")
+	}
+	via := make([]*http.Request, 10)
+	for i := range via {
+		via[i] = origin
+	}
+	if err := validateJMAPRedirect(same, via); err == nil {
+		t.Fatal("redirect limit was not enforced")
+	}
+}
+
 func TestExpandTemplateEscapesValues(t *testing.T) {
 	got := expandTemplate("https://x/{accountId}/{blobId}/{name}?accept={type}", map[string]string{
 		"accountId": "a/1", "blobId": "b 1", "name": "mail one.eml", "type": "message/rfc822",

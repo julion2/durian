@@ -21,7 +21,11 @@ go_test(
     srcs = ["backendfactory_test.go"],
     embed = [":backendfactory"],
     deps = [
+        "//cli/internal/backend",
         "//cli/internal/config",
+        "//cli/internal/gmailbackend",
+        "//cli/internal/graphbackend",
+        "//cli/internal/imapbackend",
         "//cli/internal/jmapbackend",
     ],
 )

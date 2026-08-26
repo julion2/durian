@@ -579,6 +579,23 @@ func TestFetchFlagsDoesNotTreatTransientSubresponseAsMissing(t *testing.T) {
 	}
 }
 
+func TestFetchFlagsReturnsErrorAfterTransientRetriesExhausted(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		writeJSON(t, w, map[string]any{"responses": []map[string]any{{"id": "0", "status": 503}}})
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	_, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{{Folder: "folder1", ID: "msg1"}})
+	if err == nil || !strings.Contains(err.Error(), "remain unavailable") {
+		t.Fatalf("FetchFlags() error = %v, want exhausted transient error", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 4 {
+		t.Fatalf("batch calls = %d, want initial request plus 3 retries", got)
+	}
+}
+
 func TestFetchFlagsSkipsForbiddenSubresponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, map[string]any{"responses": []map[string]any{{"id": "0", "status": 403}}})

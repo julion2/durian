@@ -192,9 +192,11 @@ of the legacy path's IMAP-UIDNEXT diffing.
   implemented; EventSource is the supported JMAP push transport.
 
 Gmail and Graph accounts use the polling loops. JMAP and opt-in engine/IMAP
-accounts use their backend's `PushWatch` capability for EventSource or IMAP
-IDLE, plus a slow safety poll. Local tag mutations trigger an immediate,
-coalesced upload-only engine pass for all engine accounts.
+accounts use statically selected EventSource or IMAP IDLE push, plus a slow
+safety poll. A test keeps that startup-time selection aligned with each
+backend's `PushWatch` capability without connecting during watcher setup. Local
+tag mutations trigger an immediate, coalesced upload-only engine pass for all
+engine accounts.
 
 Daemon-triggered engine passes have a 5-minute watchdog so a stalled provider
 does not hold the per-account mutex indefinitely. An authoritative replacement

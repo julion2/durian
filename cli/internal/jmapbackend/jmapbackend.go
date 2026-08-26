@@ -101,10 +101,8 @@ func New(account *config.AccountConfig) (*Backend, error) {
 		account: account,
 		client: &client{
 			httpClient: &http.Client{
-				Timeout: 90 * time.Second,
-				CheckRedirect: func(req *http.Request, _ []*http.Request) error {
-					return validateJMAPURL(req.URL.String())
-				},
+				Timeout:       90 * time.Second,
+				CheckRedirect: validateJMAPRedirect,
 			},
 			sessionURL: account.JMAP.SessionURL,
 			credential: credential{mode: mode, username: username},

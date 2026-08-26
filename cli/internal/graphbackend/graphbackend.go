@@ -810,9 +810,7 @@ func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []back
 			return flags, nil
 		}
 		if attempt >= maxSubresponseRetries {
-			slog.Warn("Graph flags remain unavailable after retries, skipping affected items", "module", "GRAPHBACKEND", // encgrep:allow folder and retry count are operational metadata
-				"folder", folder, "retries", attempt)
-			return flags, nil
+			return nil, fmt.Errorf("Graph flags remain unavailable after %d retries in %s", attempt, folder)
 		}
 		delay := time.Second << attempt
 		slog.Warn("Graph batch subrequest throttled, backing off", "module", "GRAPHBACKEND",
