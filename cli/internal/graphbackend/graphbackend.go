@@ -769,6 +769,7 @@ func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []back
 	}
 
 	flags := make(map[string]backend.Flags, len(refs))
+	var forbidden []string
 	for attempt := 0; ; attempt++ {
 		var envelope struct {
 			Responses []batchResponseItem `json:"responses"`
@@ -799,6 +800,12 @@ func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []back
 				// Message moved or disappeared after the delta; absence is the
 				// FetchFlags contract for a dead ref.
 			case item.Status == http.StatusForbidden:
+				// Unresolved, NOT dead: unlike the 404 above, absence here means
+				// "we were not allowed to read it", so the caller must be able to
+				// tell the two apart. Recorded and surfaced as ErrPartialFlags so
+				// the engine falls back to what the delta carried instead of
+				// treating the omission as a deletion.
+				forbidden = append(forbidden, refID)
 				slog.Warn("Graph flags are not accessible for message, skipping item", "module", "GRAPHBACKEND", // encgrep:allow folder/id are remote operational metadata, not message content
 					"folder", folder, "id", refID, "status", item.Status)
 			case item.Status == http.StatusTooManyRequests || item.Status >= http.StatusInternalServerError:
@@ -814,6 +821,10 @@ func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []back
 			return nil, fmt.Errorf("batch flag fetch returned %d of %d responses", len(seen), len(requests))
 		}
 		if len(transient) == 0 {
+			if len(forbidden) > 0 {
+				return flags, fmt.Errorf("%w: Graph denied flag access for %d message(s) in %s",
+					backend.ErrPartialFlags, len(forbidden), folder)
+			}
 			return flags, nil
 		}
 		if attempt >= maxSubresponseRetries {

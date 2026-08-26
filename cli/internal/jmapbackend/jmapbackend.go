@@ -804,6 +804,12 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 }
 
 func (b *Backend) createArchiveMailbox(ctx context.Context) error {
+	return b.createRoleMailbox(ctx, "archive", "Archive")
+}
+
+// createRoleMailbox creates a role mailbox the account is missing and reloads
+// the mailbox table so the new id is resolvable by tag.
+func (b *Backend) createRoleMailbox(ctx context.Context, role, name string) error {
 	var result struct {
 		Created map[string]struct {
 			ID string `json:"id"`
@@ -813,9 +819,9 @@ func (b *Backend) createArchiveMailbox(ctx context.Context) error {
 	args := map[string]interface{}{
 		"accountId": b.client.accountID,
 		"create": map[string]interface{}{
-			"archive": map[string]interface{}{
-				"name":         "Archive",
-				"role":         "archive",
+			role: map[string]interface{}{
+				"name":         name,
+				"role":         role,
 				"isSubscribed": true,
 			},
 		},
@@ -823,13 +829,33 @@ func (b *Backend) createArchiveMailbox(ctx context.Context) error {
 	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Mailbox/set", args, &result); err != nil {
 		return err
 	}
-	if createErr, ok := result.NotCreated["archive"]; ok {
+	if createErr, ok := result.NotCreated[role]; ok {
 		return &createErr
 	}
-	if result.Created["archive"].ID == "" {
-		return errors.New("Mailbox/set returned no created archive mailbox")
+	if result.Created[role].ID == "" {
+		return fmt.Errorf("Mailbox/set returned no created %s mailbox", role)
 	}
 	return b.loadMailboxes(ctx)
+}
+
+// destroyEmail removes an email the caller imported but could not complete an
+// operation for, so a retry does not accumulate copies.
+func (b *Backend) destroyEmail(ctx context.Context, id string) error {
+	args := map[string]interface{}{
+		"accountId": b.client.accountID,
+		"destroy":   []string{id},
+	}
+	var result struct {
+		Destroyed    []string               `json:"destroyed"`
+		NotDestroyed map[string]methodError `json:"notDestroyed"`
+	}
+	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/set", args, &result); err != nil {
+		return err
+	}
+	if destroyErr, ok := result.NotDestroyed[id]; ok {
+		return &destroyErr
+	}
+	return nil
 }
 
 func (b *Backend) updateEmail(ctx context.Context, id string, patch map[string]interface{}) error {

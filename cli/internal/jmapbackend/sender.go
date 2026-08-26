@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -60,9 +61,22 @@ func (b *Backend) sendRaw(ctx context.Context, raw []byte) error {
 		return err
 	}
 	draftsID := b.mailboxIDForTag("draft")
-	sentID := b.mailboxIDForTag("sent")
 	if draftsID == "" {
 		return errNoDraftsMailbox
+	}
+	// Without a Sent mailbox there is nowhere to move the message to on success,
+	// and RFC 8621 forbids clearing its last mailbox — it would stay in Drafts,
+	// flagged $draft, while SavesSentCopy() tells the engine not to write a local
+	// Sent copy either. Create the role mailbox rather than report a send that
+	// left no record anywhere.
+	sentID := b.mailboxIDForTag("sent")
+	if sentID == "" {
+		if err := b.createRoleMailbox(ctx, "sent", "Sent"); err != nil {
+			return fmt.Errorf("create JMAP sent mailbox: %w", err)
+		}
+		if sentID = b.mailboxIDForTag("sent"); sentID == "" {
+			return errors.New("created JMAP sent mailbox could not be resolved")
+		}
 	}
 	identityID, err := b.identityID(ctx)
 	if err != nil {
@@ -83,14 +97,12 @@ func (b *Backend) sendRaw(ctx context.Context, raw []byte) error {
 			},
 		},
 	}
-	if sentID != "" {
-		args["onSuccessUpdateEmail"] = map[string]interface{}{
-			"#" + createID: map[string]interface{}{
-				"keywords/$draft":        nil,
-				"mailboxIds/" + draftsID: nil,
-				"mailboxIds/" + sentID:   true,
-			},
-		}
+	args["onSuccessUpdateEmail"] = map[string]interface{}{
+		"#" + createID: map[string]interface{}{
+			"keywords/$draft":        nil,
+			"mailboxIds/" + draftsID: nil,
+			"mailboxIds/" + sentID:   true,
+		},
 	}
 	var result struct {
 		Created map[string]struct {
@@ -98,6 +110,20 @@ func (b *Backend) sendRaw(ctx context.Context, raw []byte) error {
 		} `json:"created"`
 		NotCreated map[string]methodError `json:"notCreated"`
 	}
+	// Every failure past this point leaves the imported copy behind. The outbox
+	// retries a transient send, so without cleanup each attempt would add
+	// another draft to the user's Drafts mailbox.
+	submitted := false
+	defer func() {
+		if submitted {
+			return
+		}
+		if err := b.destroyEmail(context.WithoutCancel(ctx), ref.ID); err != nil {
+			slog.Warn("Failed to remove imported draft after unsuccessful submission", "module", "JMAPBACKEND", // encgrep:allow remote id is operational metadata, not message content
+				"id", ref.ID, "err", err)
+		}
+	}()
+
 	if err := b.client.call(ctx, []string{coreCapability, mailCapability, submissionCapability}, "EmailSubmission/set", args, &result); err != nil {
 		return err
 	}
@@ -107,6 +133,7 @@ func (b *Backend) sendRaw(ctx context.Context, raw []byte) error {
 	if _, ok := result.Created[createID]; !ok {
 		return errors.New("EmailSubmission/set returned no created submission")
 	}
+	submitted = true
 	return nil
 }
 

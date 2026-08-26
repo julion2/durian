@@ -639,15 +639,21 @@ func TestFetchFlagsPreservesHealthyRefsWhenOneExhaustsRetries(t *testing.T) {
 	}
 }
 
-func TestFetchFlagsSkipsForbiddenSubresponse(t *testing.T) {
+// A 403 means "not allowed to read", not "gone". Graph signals both by omitting
+// the ref, so FetchFlags must surface ErrPartialFlags — otherwise the engine
+// cannot tell the two apart and silently discards the delta's flag change.
+func TestFetchFlagsReportsPartialWhenSubresponseForbidden(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, map[string]any{"responses": []map[string]any{{"id": "0", "status": 403}}})
 	}))
 	defer srv.Close()
 	b := newTestBackend(t, srv)
 	flags, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{{Folder: "folder1", ID: "msg1"}})
-	if err != nil || len(flags) != 0 {
-		t.Fatalf("FetchFlags() flags=%v error=%v, want inaccessible item skipped", flags, err)
+	if !errors.Is(err, backend.ErrPartialFlags) {
+		t.Fatalf("FetchFlags() error=%v, want ErrPartialFlags so the engine keeps the delta flags", err)
+	}
+	if len(flags) != 0 {
+		t.Fatalf("FetchFlags() flags=%v, want the inaccessible item omitted, not fabricated", flags)
 	}
 }
 

@@ -108,3 +108,94 @@ func TestSenderRejectsHeaderInjection(t *testing.T) {
 		t.Fatalf("Send() error = %v", err)
 	}
 }
+
+// A failed submission must not leave the imported copy in Drafts: the outbox
+// retries, so every attempt would otherwise add another draft.
+func TestSenderDestroysImportedDraftWhenSubmissionFails(t *testing.T) {
+	s := newTestJMAPServer(t)
+	var destroyed []string
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		case "Email/import":
+			return map[string]interface{}{"accountId": "a1", "oldState": "s1", "newState": "s2", "created": map[string]interface{}{"0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
+		case "EmailSubmission/set":
+			return map[string]interface{}{"accountId": "a1", "oldState": "sub1", "newState": "sub1", "created": map[string]interface{}{}, "notCreated": map[string]interface{}{
+				"s0": map[string]interface{}{"type": "forbiddenFrom", "description": "identity not allowed"},
+			}}
+		case "Email/set":
+			for _, id := range args["destroy"].([]interface{}) {
+				destroyed = append(destroyed, id.(string))
+			}
+			return map[string]interface{}{"accountId": "a1", "oldState": "s2", "newState": "s3", "destroyed": []string{"draft-1"}, "notDestroyed": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	sender := &Sender{b: s.backend(t)}
+	err := sender.Send(t.Context(), &mailsend.Message{
+		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
+	})
+	if err == nil {
+		t.Fatal("Send returned nil for a rejected submission")
+	}
+	if len(destroyed) != 1 || destroyed[0] != "draft-1" {
+		t.Fatalf("destroyed = %v, want [draft-1]: the imported draft leaked", destroyed)
+	}
+}
+
+// Without a Sent mailbox the message would stay in Drafts flagged $draft while
+// SavesSentCopy() suppresses the local copy — a send with no record anywhere.
+func TestSenderCreatesSentMailboxWhenMissing(t *testing.T) {
+	s := newTestJMAPServer(t)
+	mailboxes := []map[string]interface{}{
+		{"id": "inbox-id", "name": "Inbox", "role": "inbox", "isSubscribed": true},
+		{"id": "drafts-id", "name": "Drafts", "role": "drafts", "isSubscribed": true},
+	}
+	created := false
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"state": "mb1", "list": mailboxes}
+		case "Mailbox/set":
+			create := args["create"].(map[string]interface{})["sent"].(map[string]interface{})
+			if create["role"] != "sent" {
+				t.Errorf("Mailbox/set create = %#v, want role sent", create)
+			}
+			created = true
+			mailboxes = append(mailboxes, map[string]interface{}{"id": "sent-id", "name": "Sent", "role": "sent", "isSubscribed": true})
+			return map[string]interface{}{"accountId": "a1", "oldState": "mb1", "newState": "mb2", "created": map[string]interface{}{"sent": map[string]string{"id": "sent-id"}}, "notCreated": map[string]interface{}{}}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		case "Email/import":
+			return map[string]interface{}{"accountId": "a1", "oldState": "s1", "newState": "s2", "created": map[string]interface{}{"0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
+		case "EmailSubmission/set":
+			s.extra = []interface{}{[]interface{}{"Email/set", map[string]interface{}{"updated": map[string]interface{}{"draft-1": nil}}, "0"}}
+			updates, ok := args["onSuccessUpdateEmail"].(map[string]interface{})["#s0"].(map[string]interface{})
+			if !ok {
+				t.Fatal("onSuccessUpdateEmail missing: message would stay in Drafts")
+			}
+			if updates["mailboxIds/sent-id"] != true || updates["mailboxIds/drafts-id"] != nil {
+				t.Errorf("onSuccessUpdateEmail = %#v", updates)
+			}
+			if _, hasDraftKeyword := updates["keywords/$draft"]; !hasDraftKeyword {
+				t.Error("$draft keyword is not cleared")
+			}
+			return map[string]interface{}{"accountId": "a1", "oldState": "sub1", "newState": "sub2", "created": map[string]interface{}{"s0": map[string]string{"id": "submission-1"}}, "notCreated": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	sender := &Sender{b: s.backend(t)}
+	if err := sender.Send(t.Context(), &mailsend.Message{
+		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("Sent mailbox was not created")
+	}
+}

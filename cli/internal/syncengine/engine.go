@@ -799,6 +799,14 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 			// unusable map and let the merge below fall back to deltaFlags,
 			// which only holds messages that genuinely changed server-side.
 			server = nil
+			// NOTE: this still pins a REPLACEMENT cursor when FetchFlags fails
+			// permanently (delta cursors were decoupled separately). Holding it
+			// is deliberate — TestEngineRefreshesExistingSnapshotMetadata relies
+			// on the snapshot being retried so its metadata refresh completes —
+			// but a permanently failing flag endpoint therefore loops. Fixing
+			// that needs a persisted "flags pending for these refs" marker so
+			// the cursor can advance while the flag work stays queued — see
+			// https://github.com/julion2/durian/issues/360.
 			cursorSafe = false
 		}
 	}
