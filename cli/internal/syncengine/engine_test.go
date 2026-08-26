@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/dbcrypto"
@@ -120,6 +121,30 @@ type fakeBackend struct {
 	// caps is returned by Capabilities(); zero value matches the default IMAP-like
 	// backend. Tests set FlagChangesInDelta to exercise the delta flag path.
 	caps backend.Capabilities
+}
+
+// backendOnly deliberately hides optional interfaces implemented by fakeBackend
+// so tests can exercise Graph/IMAP-style full-body replacement snapshots.
+type backendOnly struct{ backend.Backend }
+
+type delayedBackend struct {
+	backend.Backend
+	delays []time.Duration
+	calls  int
+}
+
+func (b *delayedBackend) FetchMessages(ctx context.Context, folder string, cursor backend.Cursor, limit int) (backend.FetchResult, error) {
+	if b.calls < len(b.delays) && b.delays[b.calls] > 0 {
+		timer := time.NewTimer(b.delays[b.calls])
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return backend.FetchResult{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	b.calls++
+	return b.Backend.FetchMessages(ctx, folder, cursor, limit)
 }
 
 type labelCall struct {
@@ -552,7 +577,7 @@ func TestEngineRefreshesExistingSnapshotMetadata(t *testing.T) {
 	}
 }
 
-func TestEngineRejectsMixedFullSnapshotPages(t *testing.T) {
+func TestEngineRejectsSnapshotToDeltaTransition(t *testing.T) {
 	db := newTestDB(t)
 	cursors := newMemCursorStore()
 	_ = cursors.Set(testAccount, "ALL", backend.Cursor("old"))
@@ -566,11 +591,211 @@ func TestEngineRejectsMixedFullSnapshotPages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sync returned top-level error: %v", err)
 	}
-	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "mixed replacement-snapshot and delta") {
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "replacement-snapshot back to delta") {
 		t.Fatalf("Sync errors = %v", result.Errors)
 	}
 	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "old" {
 		t.Fatalf("cursor advanced to %q", got)
+	}
+}
+
+func TestEngineAllowsDeltaToReplacementRestart(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	_ = cursors.Set(testAccount, "ALL", backend.Cursor("old"))
+	message := func(id, ref string) backend.Message {
+		return backend.Message{
+			MessageID: id, Ref: backend.RemoteRef{Folder: "ALL", ID: ref},
+			Raw: rawMessage(id, "a@example.com", testAccount, "Hello", "body"),
+		}
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Selectable: true}}, map[string][]backend.FetchResult{
+		"ALL": {
+			{Messages: []backend.Message{message("delta@example.com", "d1")}, Cursor: backend.Cursor("expired-next"), HasMore: true},
+			{Messages: []backend.Message{message("snapshot@example.com", "s1")}, Cursor: backend.Cursor("replacement"), FullSnapshot: true, Present: []backend.RemoteRef{{Folder: "ALL", ID: "d1"}, {Folder: "ALL", ID: "s1"}}},
+		},
+	})
+	result, err := newTestEngine(db, cursors).Sync(t.Context(), fake)
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("Sync result=%+v err=%v", result, err)
+	}
+	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "replacement" {
+		t.Fatalf("cursor = %q, want replacement", got)
+	}
+	for _, id := range []string{"delta@example.com", "snapshot@example.com"} {
+		if got, _ := db.GetByMessageID(id); got == nil {
+			t.Fatalf("message %s was not retained", id)
+		}
+	}
+}
+
+func TestEngineDryRunReplacementDoesNotRequireHydrator(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	_ = cursors.Set(testAccount, "INBOX", backend.Cursor("old"))
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {{
+			Cursor: backend.Cursor("replacement"), FullSnapshot: true,
+			Present: []backend.RemoteRef{{Folder: "INBOX", ID: "1"}, {Folder: "INBOX", ID: "2"}},
+		}},
+	})
+	engine := New(Options{
+		Store: db, Cursors: cursors, Account: testAccount, DryRun: true,
+		Ingest: IngestOptions{Account: testAccount},
+	})
+	result, err := engine.Sync(t.Context(), &backendOnly{Backend: fake})
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("Sync result=%+v err=%v", result, err)
+	}
+	if result.New != 2 {
+		t.Fatalf("New = %d, want 2 projected arrivals", result.New)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "old" {
+		t.Fatalf("dry-run cursor = %q, want old", got)
+	}
+}
+
+func TestEngineDryRunFullBodyReplacementCountsEachArrivalOnce(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	message := backend.Message{
+		MessageID: "projected@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "1"},
+		Raw: rawMessage("projected@example.com", "a@example.com", testAccount, "Projected", "body"),
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {{
+			Messages: []backend.Message{message}, Cursor: backend.Cursor("replacement"), FullSnapshot: true,
+			Present: []backend.RemoteRef{message.Ref},
+		}},
+	})
+	engine := New(Options{
+		Store: db, Cursors: cursors, Account: testAccount, DryRun: true,
+		Ingest: IngestOptions{Account: testAccount},
+	})
+	result, err := engine.Sync(t.Context(), &backendOnly{Backend: fake})
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("Sync result=%+v err=%v", result, err)
+	}
+	if result.New != 1 {
+		t.Fatalf("New = %d, want one projected arrival", result.New)
+	}
+}
+
+func TestEngineReplacementSkipsPermanentIngestFailureWithoutHydrator(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {{
+			Messages: []backend.Message{{
+				MessageID: "broken@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "broken"},
+				Raw: []byte("malformed header line\r\n\r\nbody"),
+			}},
+			Cursor: backend.Cursor("replacement"), FullSnapshot: true,
+			Present: []backend.RemoteRef{{Folder: "INBOX", ID: "broken"}},
+		}},
+	})
+	engine := newTestEngine(db, cursors)
+	result, err := engine.Sync(t.Context(), &backendOnly{Backend: fake})
+	if err != nil {
+		t.Fatalf("Sync error = %v", err)
+	}
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "parse message") {
+		t.Fatalf("Sync errors = %v, want one permanent parse failure", result.Errors)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "replacement" {
+		t.Fatalf("cursor = %q, want replacement", got)
+	}
+}
+
+func TestEngineReplacementPreservesExistingRefAfterPermanentIngestFailure(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	valid := backend.Message{
+		MessageID: "existing@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "existing"},
+		Raw: rawMessage("existing@example.com", "a@example.com", testAccount, "Existing", "body"),
+	}
+	broken := valid
+	broken.Raw = []byte("malformed header line\r\n\r\nbody")
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {
+			{Messages: []backend.Message{valid}, Cursor: backend.Cursor("old")},
+			{
+				Messages: []backend.Message{broken}, Cursor: backend.Cursor("replacement"), FullSnapshot: true,
+				Present: []backend.RemoteRef{{Folder: "INBOX", ID: "existing"}},
+			},
+		},
+	})
+	engine := newTestEngine(db, cursors)
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("seed result=%+v err=%v", result, err)
+	}
+	result, err := engine.Sync(t.Context(), &backendOnly{Backend: fake})
+	if err != nil || len(result.Errors) != 1 {
+		t.Fatalf("replacement result=%+v err=%v", result, err)
+	}
+	if got, _ := db.GetByMessageID("existing@example.com"); got == nil {
+		t.Fatal("existing local copy was removed after malformed replacement body")
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "replacement" {
+		t.Fatalf("cursor = %q, want replacement", got)
+	}
+}
+
+func TestEngineReplacementPreservesUnavailableExistingRef(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	folder := backend.Folder{Name: "INBOX", Selectable: true}
+	seed := backend.Message{
+		MessageID: "protected@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "protected"},
+		Raw: rawMessage("protected@example.com", "a@example.com", testAccount, "Protected", "body"),
+	}
+	fake := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+		"INBOX": {
+			{Messages: []backend.Message{seed}, Cursor: backend.Cursor("old")},
+			{
+				Cursor: backend.Cursor("replacement"), FullSnapshot: true,
+				Present:     []backend.RemoteRef{{Folder: "INBOX", ID: "protected"}, {Folder: "INBOX", ID: "new-protected"}},
+				Unavailable: []backend.RemoteRef{{Folder: "INBOX", ID: "protected"}, {Folder: "INBOX", ID: "new-protected"}},
+			},
+		},
+	})
+	engine := newTestEngine(db, cursors)
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("seed result=%+v err=%v", result, err)
+	}
+	result, err := engine.Sync(t.Context(), &backendOnly{Backend: fake})
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("replacement result=%+v err=%v", result, err)
+	}
+	if got, _ := db.GetByMessageID("protected@example.com"); got == nil {
+		t.Fatal("existing inaccessible message was removed")
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "replacement" {
+		t.Fatalf("cursor = %q, want replacement", got)
+	}
+}
+
+func TestEngineLetsReplacementFinishBeyondOrdinaryTimeout(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Selectable: true}}, map[string][]backend.FetchResult{
+		"ALL": {
+			{Cursor: backend.Cursor("page-1"), HasMore: true, FullSnapshot: true},
+			{Cursor: backend.Cursor("final"), FullSnapshot: true},
+		},
+	})
+	delayed := &delayedBackend{Backend: fake, delays: []time.Duration{0, 100 * time.Millisecond}}
+	engine := New(Options{
+		Store: db, Cursors: cursors, Account: testAccount,
+		Timeout: 50 * time.Millisecond, RecoveryTimeout: 500 * time.Millisecond,
+		Ingest: IngestOptions{Account: testAccount},
+	})
+	result, err := engine.Sync(t.Context(), delayed)
+	if !errors.Is(err, context.DeadlineExceeded) || len(result.Errors) != 0 {
+		t.Fatalf("Sync result=%+v err=%v, want ordinary deadline after completed recovery", result, err)
+	}
+	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "final" {
+		t.Fatalf("cursor = %q, want final", got)
 	}
 }
 
@@ -1498,6 +1723,45 @@ func TestEngineFlagPassScopedToDelta(t *testing.T) {
 	// The local read change was still uploaded.
 	if len(fake.applyFlagsCalls) != 1 || fake.applyFlagsCalls[0].ref.ID != "602" || !fake.applyFlagsCalls[0].add.Seen {
 		t.Errorf("ApplyFlags = %+v, want one Seen upload for 602", fake.applyFlagsCalls)
+	}
+}
+
+func TestEngineUsesDeltaFlagsWhenFollowUpFetchOmitsChangedRef(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	folder := backend.Folder{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}
+	message := func(seen bool, cursor string) backend.FetchResult {
+		return backend.FetchResult{
+			Messages: []backend.Message{{
+				MessageID: "delta-flags@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "m1"},
+				Raw:   rawMessage("delta-flags@example.com", "a@example.com", testAccount, "Flags", "body"),
+				Flags: backend.Flags{Seen: seen, Flagged: true},
+			}},
+			Cursor: backend.Cursor(cursor),
+		}
+	}
+	fake := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+		"INBOX": {message(false, "c1"), message(true, "c2")},
+	})
+	fake.caps.FlagChangesInDelta = true
+	engine := newTestEngine(db, cursors)
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("initial result=%+v err=%v", result, err)
+	}
+	// FetchFlags intentionally returns no entry for m1. The second delta still
+	// carries Seen=true and must advance the baseline without losing the change.
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("delta result=%+v err=%v", result, err)
+	}
+	rows, err := db.GetFolderFlagState(testAccount, "INBOX")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("flag rows=%v err=%v", rows, err)
+	}
+	if !strings.Contains(rows[0].SyncedFlags, `\Seen`) || !strings.Contains(rows[0].SyncedFlags, `\Flagged`) || slices.Contains(rows[0].Tags, "unread") {
+		t.Fatalf("flags after delta = tags:%v baseline:%q, want Seen+Flagged", rows[0].Tags, rows[0].SyncedFlags)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "c2" {
+		t.Fatalf("cursor = %q, want c2", got)
 	}
 }
 

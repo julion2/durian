@@ -45,6 +45,7 @@ const (
 	// tokenExpiryBuffer refreshes the cached Graph token this long before its
 	// actual expiry, so a request never starts with an about-to-expire token.
 	tokenExpiryBuffer = 5 * time.Minute
+	maxJSONBytes      = 16 << 20
 )
 
 // errNotImplemented marks the methods that have not landed yet (append, send,
@@ -112,9 +113,17 @@ func New(account *config.AccountConfig) (*Backend, error) {
 		clientID:     account.OAuth.ClientID,
 		clientSecret: account.OAuth.ClientSecret,
 		tenant:       account.OAuth.Tenant,
-		httpClient:   &http.Client{Timeout: 60 * time.Second},
 		baseURL:      defaultBaseURL,
 		mailbox:      mailbox,
+	}
+	b.httpClient = &http.Client{
+		Timeout: 60 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			return validateAuthenticatedURL(b.baseURL, req.URL.String())
+		},
 	}
 	b.tokenFn = b.cachedGraphToken
 	return b, nil
@@ -158,7 +167,7 @@ func (e *statusError) Error() string {
 }
 
 // do executes one authenticated Graph request with throttle handling. GET/HEAD
-// requests retry on 429 and once on 503/504; mutation requests are never
+// requests retry on 429 and once on any 5xx; mutation requests are never
 // replayed because the first response may have been lost after the server
 // committed it. All waits respect ctx cancellation.
 func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*http.Response, error) {
@@ -171,6 +180,10 @@ func (b *Backend) doWithRetry(ctx context.Context, method, reqURL string, body [
 		maxThrottleRetries = 3
 		transientBackoff   = 2 * time.Second
 	)
+
+	if err := validateAuthenticatedURL(b.baseURL, reqURL); err != nil {
+		return nil, fmt.Errorf("refusing graph request URL: %w", err)
+	}
 
 	throttleRetries := 0
 	transientRetried := false
@@ -208,7 +221,7 @@ func (b *Backend) doWithRetry(ctx context.Context, method, reqURL string, body [
 			if err := sleepCtx(ctx, delay); err != nil {
 				return nil, err
 			}
-		case safeToRetry && (resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout) && !transientRetried:
+		case safeToRetry && resp.StatusCode >= http.StatusInternalServerError && !transientRetried:
 			transientRetried = true
 			drainClose(resp)
 			slog.Warn("Graph transient error, retrying once", "module", "GRAPHBACKEND",
@@ -250,10 +263,47 @@ func (b *Backend) doJSONWithRetry(ctx context.Context, method, reqURL string, bo
 	if out == nil {
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if err := decodeJSONLimited(resp.Body, maxJSONBytes, out); err != nil {
 		return fmt.Errorf("failed to decode graph response: %w", err)
 	}
 	return nil
+}
+
+func validateAuthenticatedURL(baseURL, requestURL string) error {
+	base, err := url.Parse(baseURL)
+	if err != nil || !base.IsAbs() || base.User != nil {
+		return errors.New("graph base URL is invalid")
+	}
+	target, err := url.Parse(requestURL)
+	if err != nil || !target.IsAbs() || target.User != nil || (target.Scheme != "http" && target.Scheme != "https") {
+		return errors.New("authenticated URL must be an absolute HTTP(S) URL without userinfo")
+	}
+	if !strings.EqualFold(base.Scheme, target.Scheme) ||
+		!strings.EqualFold(base.Hostname(), target.Hostname()) || effectivePort(base) != effectivePort(target) {
+		return errors.New("authenticated URL origin differs from Graph API origin")
+	}
+	return nil
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
+func decodeJSONLimited(r io.Reader, limit int64, out any) error {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > limit {
+		return fmt.Errorf("graph JSON response exceeds %d bytes", limit)
+	}
+	return json.Unmarshal(data, out)
 }
 
 // doRaw executes a GET and streams the raw response body (e.g. RFC822 MIME
@@ -448,9 +498,10 @@ func encodeGraphCursor(state graphCursor) backend.Cursor {
 // size, so limit is only a soft hint and is not enforced here. Each changed
 // message triggers a separate raw MIME ($value) fetch, because the delta JSON
 // has no RFC822 body. A transient body failure aborts the page so its cursor is
-// not advanced; an explicit 404 is treated as a concurrent deletion. HasMore
-// reports a pending @odata.nextLink; the returned cursor is that nextLink, or the
-// @odata.deltaLink once the delta round is complete.
+// not advanced; an explicit 404 is treated as a concurrent deletion and a 403
+// as permanently inaccessible content. HasMore reports a pending
+// @odata.nextLink; the returned cursor is that nextLink, or the @odata.deltaLink
+// once the delta round is complete.
 func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backend.Cursor, limit int) (backend.FetchResult, error) {
 	_ = limit // Soft hint only: Graph fixes the delta page size server-side.
 	var result backend.FetchResult
@@ -500,7 +551,7 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 		}
 		content = append(content, item)
 	}
-	messages, missing, err := b.fetchBodies(ctx, folder, content)
+	messages, missing, unavailable, err := b.fetchBodies(ctx, folder, content)
 	if err != nil {
 		return backend.FetchResult{}, err
 	}
@@ -510,9 +561,18 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 	}
 	if state.FullReplacement {
 		result.FullSnapshot = true
-		result.Present = make([]backend.RemoteRef, 0, len(result.Messages))
-		for _, message := range result.Messages {
-			result.Present = append(result.Present, message.Ref)
+		missingSet := make(map[string]struct{}, len(missing))
+		for _, id := range missing {
+			missingSet[id] = struct{}{}
+		}
+		result.Present = make([]backend.RemoteRef, 0, len(content)-len(missingSet))
+		for _, item := range content {
+			if _, gone := missingSet[item.ID]; !gone {
+				result.Present = append(result.Present, backend.RemoteRef{Folder: folder, ID: item.ID})
+			}
+		}
+		for _, id := range unavailable {
+			result.Unavailable = append(result.Unavailable, backend.RemoteRef{Folder: folder, ID: id})
 		}
 	}
 
@@ -534,11 +594,13 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 const fetchConcurrency = 6
 
 // fetchBodies downloads raw MIME concurrently. Explicit 404s are reported as
-// missing refs; every other per-message error fails the page so replay is safe.
-func (b *Backend) fetchBodies(ctx context.Context, folder string, items []deltaItem) ([]backend.Message, []string, error) {
+// missing refs. A permanent per-item 403 is unavailable; other failures hold
+// the page cursor so transient outages cannot silently lose mail.
+func (b *Backend) fetchBodies(ctx context.Context, folder string, items []deltaItem) ([]backend.Message, []string, []string, error) {
 	msgs := make([]backend.Message, len(items)) // indexed by item; failures stay zero
 	errs := make([]error, len(items))
 	missing := make([]bool, len(items))
+	unavailable := make([]bool, len(items))
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, fetchConcurrency)
@@ -548,7 +610,7 @@ func (b *Backend) fetchBodies(ctx context.Context, folder string, items []deltaI
 		case sem <- struct{}{}:
 		case <-ctx.Done():
 			wg.Wait()
-			return nil, nil, ctx.Err()
+			return nil, nil, nil, ctx.Err()
 		}
 		wg.Add(1)
 		go func(i int) {
@@ -557,8 +619,20 @@ func (b *Backend) fetchBodies(ctx context.Context, folder string, items []deltaI
 			msg, err := b.fetchOne(ctx, folder, items[i])
 			if err != nil {
 				var statusErr *statusError
-				if errors.As(err, &statusErr) && statusErr.status == http.StatusNotFound {
-					missing[i] = true
+				if errors.As(err, &statusErr) {
+					switch statusErr.status {
+					case http.StatusNotFound:
+						missing[i] = true
+					case http.StatusForbidden:
+						// Some protected Graph items expose metadata but deny
+						// $value permanently. Keep an existing local copy during a
+						// snapshot and let the delta advance past this one item.
+						slog.Warn("Graph message body is not accessible, skipping item", "module", "GRAPHBACKEND", // encgrep:allow folder/id are remote operational metadata, not message content
+							"folder", folder, "id", items[i].ID, "status", statusErr.status)
+						unavailable[i] = true
+					default:
+						errs[i] = err
+					}
 				} else {
 					errs[i] = err
 				}
@@ -570,16 +644,19 @@ func (b *Backend) fetchBodies(ctx context.Context, folder string, items []deltaI
 	wg.Wait()
 	for _, err := range errs {
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to fetch raw MIME: %w", err)
+			return nil, nil, nil, fmt.Errorf("failed to fetch raw MIME: %w", err)
 		}
 	}
 	var missingIDs []string
+	var unavailableIDs []string
 	for i, gone := range missing {
 		if gone {
 			missingIDs = append(missingIDs, items[i].ID)
+		} else if unavailable[i] {
+			unavailableIDs = append(unavailableIDs, items[i].ID)
 		}
 	}
-	return filterFetched(msgs), missingIDs, nil
+	return filterFetched(msgs), missingIDs, unavailableIDs, nil
 }
 
 // filterFetched drops skipped (zero) entries in place, preserving order.
@@ -717,7 +794,10 @@ func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []back
 			case item.Status == http.StatusNotFound:
 				// Message moved or disappeared after the delta; absence is the
 				// FetchFlags contract for a dead ref.
-			case item.Status == http.StatusTooManyRequests || item.Status == http.StatusServiceUnavailable || item.Status == http.StatusGatewayTimeout:
+			case item.Status == http.StatusForbidden:
+				slog.Warn("Graph flags are not accessible for message, skipping item", "module", "GRAPHBACKEND", // encgrep:allow folder/id are remote operational metadata, not message content
+					"folder", folder, "id", refID, "status", item.Status)
+			case item.Status == http.StatusTooManyRequests || item.Status >= http.StatusInternalServerError:
 				transient = true
 			default:
 				return nil, fmt.Errorf("batch flag fetch for %s failed with status %d", refID, item.Status)
@@ -730,7 +810,9 @@ func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []back
 			return flags, nil
 		}
 		if attempt >= maxSubresponseRetries {
-			return nil, fmt.Errorf("batch flag fetch still throttled after %d retries", attempt)
+			slog.Warn("Graph flags remain unavailable after retries, skipping affected items", "module", "GRAPHBACKEND", // encgrep:allow folder and retry count are operational metadata
+				"folder", folder, "retries", attempt)
+			return flags, nil
 		}
 		delay := time.Second << attempt
 		slog.Warn("Graph batch subrequest throttled, backing off", "module", "GRAPHBACKEND",

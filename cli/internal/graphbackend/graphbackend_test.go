@@ -176,6 +176,66 @@ func TestFetchMessagesRecoversFromExpiredToken(t *testing.T) {
 	}
 }
 
+func TestFetchMessagesRejectsOffOriginCursorBeforeAuthorization(t *testing.T) {
+	var attackerCalls int32
+	attacker := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		atomic.AddInt32(&attackerCalls, 1)
+	}))
+	defer attacker.Close()
+	trusted := httptest.NewServer(http.NotFoundHandler())
+	defer trusted.Close()
+	b := newTestBackend(t, trusted)
+	tokenCalls := 0
+	b.tokenFn = func(context.Context) (string, error) {
+		tokenCalls++
+		return "secret", nil
+	}
+
+	_, err := b.FetchMessages(t.Context(), "folder1", backend.Cursor(attacker.URL+"/steal"), 50)
+	if err == nil || !strings.Contains(err.Error(), "origin differs") {
+		t.Fatalf("FetchMessages() error = %v, want off-origin rejection", err)
+	}
+	if tokenCalls != 0 || atomic.LoadInt32(&attackerCalls) != 0 {
+		t.Fatalf("token calls=%d attacker calls=%d, want request rejected before authorization", tokenCalls, attackerCalls)
+	}
+}
+
+func TestAuthenticatedRequestRejectsOffOriginRedirect(t *testing.T) {
+	var attackerCalls int32
+	attacker := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		atomic.AddInt32(&attackerCalls, 1)
+	}))
+	defer attacker.Close()
+	trusted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL+"/steal", http.StatusFound)
+	}))
+	defer trusted.Close()
+	b, err := New(&config.AccountConfig{
+		Email: "test@example.com", OAuth: &config.OAuthConfig{Provider: "microsoft"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.baseURL = trusted.URL
+	b.tokenFn = func(context.Context) (string, error) { return "secret", nil }
+
+	_, err = b.do(t.Context(), http.MethodGet, trusted.URL+"/redirect", nil)
+	if err == nil || !strings.Contains(err.Error(), "origin differs") {
+		t.Fatalf("do() error = %v, want redirect origin rejection", err)
+	}
+	if atomic.LoadInt32(&attackerCalls) != 0 {
+		t.Fatal("off-origin redirect target was contacted")
+	}
+}
+
+func TestDecodeJSONLimitedRejectsOversizedResponse(t *testing.T) {
+	var out map[string]any
+	err := decodeJSONLimited(strings.NewReader(`{"ok":true}x`), int64(len(`{"ok":true}`)), &out)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("decodeJSONLimited() error = %v", err)
+	}
+}
+
 func TestMailboxRouting(t *testing.T) {
 	own, err := New(&config.AccountConfig{
 		Email: "me@example.com",
@@ -270,6 +330,40 @@ func TestFetchMessagesHoldsCursorWhenBodyFetchFails(t *testing.T) {
 	b := newTestBackend(t, srv)
 	if _, err := b.FetchMessages(t.Context(), "f", nil, 50); err == nil {
 		t.Fatal("FetchMessages() succeeded after body fetch failed")
+	}
+}
+
+func TestFetchMessagesMarksForbiddenBodyUnavailable(t *testing.T) {
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/mailFolders/f/messages/delta", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("$deltatoken") == "stale" {
+			w.WriteHeader(http.StatusGone)
+			_, _ = w.Write([]byte(`{"error":{"code":"SyncStateNotFound"}}`))
+			return
+		}
+		writeJSON(t, w, map[string]any{
+			"value":            []map[string]any{{"id": "protected", "internetMessageId": "<protected@example.com>"}},
+			"@odata.deltaLink": srv.URL + "/done",
+		})
+	})
+	mux.HandleFunc("/v1.0/me/messages/protected/$value", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	stale := backend.Cursor(srv.URL + "/v1.0/me/mailFolders/f/messages/delta?$deltatoken=stale")
+	result, err := b.FetchMessages(t.Context(), "f", stale, 50)
+	if err != nil {
+		t.Fatalf("FetchMessages() error = %v", err)
+	}
+	if len(result.Messages) != 0 || len(result.Present) != 1 || result.Present[0].ID != "protected" {
+		t.Fatalf("replacement result = %+v", result)
+	}
+	if len(result.Unavailable) != 1 || result.Unavailable[0].ID != "protected" {
+		t.Fatalf("Unavailable = %+v, want protected", result.Unavailable)
 	}
 }
 
@@ -485,15 +579,15 @@ func TestFetchFlagsDoesNotTreatTransientSubresponseAsMissing(t *testing.T) {
 	}
 }
 
-func TestFetchFlagsRejectsPermanentSubresponseFailure(t *testing.T) {
+func TestFetchFlagsSkipsForbiddenSubresponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, map[string]any{"responses": []map[string]any{{"id": "0", "status": 403}}})
 	}))
 	defer srv.Close()
 	b := newTestBackend(t, srv)
-	_, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{{Folder: "folder1", ID: "msg1"}})
-	if err == nil || !strings.Contains(err.Error(), "status 403") {
-		t.Fatalf("FetchFlags() error = %v, want permanent subresponse failure", err)
+	flags, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{{Folder: "folder1", ID: "msg1"}})
+	if err != nil || len(flags) != 0 {
+		t.Fatalf("FetchFlags() flags=%v error=%v, want inaccessible item skipped", flags, err)
 	}
 }
 

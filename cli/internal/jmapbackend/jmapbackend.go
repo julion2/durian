@@ -73,9 +73,9 @@ type jmapEmail struct {
 }
 
 type jmapCursor struct {
-	Snapshot   string   `json:"snapshot,omitempty"`
-	PendingIDs []string `json:"pendingIds,omitempty"`
-	EmailState string   `json:"emailState,omitempty"`
+	Snapshot   string   `json:"snapshot,omitempty"`   // State anchoring an in-progress replacement snapshot.
+	PendingIDs []string `json:"pendingIds,omitempty"` // Remaining IDs captured for that snapshot.
+	EmailState string   `json:"emailState,omitempty"` // Last fully applied Email state token.
 }
 
 // New creates a JMAP backend for an account configured with sync_engine=jmap.
@@ -120,7 +120,7 @@ func (b *Backend) ensure(ctx context.Context) error {
 	}
 	secret, err := getCredential(keychain.JMAPKeychainService, b.account.Email)
 	legacyCredential := false
-	if errors.Is(err, keychain.ErrNotFound) {
+	if errors.Is(err, keychain.ErrNotFound) && b.client.credential.mode == "password" {
 		secret, err = getCredential(keychain.PasswordKeychainService, b.account.Email)
 		legacyCredential = err == nil
 	}
@@ -268,6 +268,8 @@ func buildMailboxMappings(mailboxes map[string]jmapMailbox) (map[string]string, 
 	return mailboxToTag, tagToID
 }
 
+// FetchFolders refreshes mailbox metadata and exposes JMAP's account-wide mail
+// set as one logical stream. Mailbox memberships are represented as tags.
 func (b *Backend) FetchFolders(ctx context.Context) ([]backend.Folder, error) {
 	if err := b.loadMailboxes(ctx); err != nil {
 		return nil, fmt.Errorf("load JMAP mailboxes: %w", err)
@@ -288,6 +290,8 @@ func encodeCursor(cursor jmapCursor) backend.Cursor {
 	return encoded
 }
 
+// FetchMessages pages an initial account snapshot or follows Email/changes from
+// the last fully applied state token.
 func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backend.Cursor, limit int) (backend.FetchResult, error) {
 	if folder != allMailStream {
 		return backend.FetchResult{}, fmt.Errorf("unknown JMAP stream %q", folder)

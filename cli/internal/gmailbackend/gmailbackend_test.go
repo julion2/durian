@@ -42,6 +42,88 @@ func writeJSON(t *testing.T, w http.ResponseWriter, v any) {
 	}
 }
 
+func TestAuthenticatedRequestRejectsOffOriginBeforeToken(t *testing.T) {
+	var attackerCalls int32
+	attacker := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		atomic.AddInt32(&attackerCalls, 1)
+	}))
+	defer attacker.Close()
+	trusted := httptest.NewServer(http.NotFoundHandler())
+	defer trusted.Close()
+	b := newTestBackend(t, trusted)
+	tokenCalls := 0
+	b.tokenFn = func(context.Context) (string, error) {
+		tokenCalls++
+		return "secret", nil
+	}
+
+	_, err := b.do(t.Context(), http.MethodGet, attacker.URL+"/steal", nil)
+	if err == nil || !strings.Contains(err.Error(), "origin differs") {
+		t.Fatalf("do() error = %v, want off-origin rejection", err)
+	}
+	if tokenCalls != 0 || atomic.LoadInt32(&attackerCalls) != 0 {
+		t.Fatalf("token calls=%d attacker calls=%d, want request rejected before authorization", tokenCalls, attackerCalls)
+	}
+}
+
+func TestAuthenticatedRequestRejectsOffOriginRedirect(t *testing.T) {
+	var attackerCalls int32
+	attacker := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		atomic.AddInt32(&attackerCalls, 1)
+	}))
+	defer attacker.Close()
+	trusted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL+"/steal", http.StatusFound)
+	}))
+	defer trusted.Close()
+	b, err := New(&config.AccountConfig{
+		Email: "test@gmail.com", OAuth: &config.OAuthConfig{Provider: "google"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.baseURL = trusted.URL
+	b.tokenFn = func(context.Context) (string, error) { return "secret", nil }
+
+	_, err = b.do(t.Context(), http.MethodGet, trusted.URL+"/redirect", nil)
+	if err == nil || !strings.Contains(err.Error(), "origin differs") {
+		t.Fatalf("do() error = %v, want redirect origin rejection", err)
+	}
+	if atomic.LoadInt32(&attackerCalls) != 0 {
+		t.Fatal("off-origin redirect target was contacted")
+	}
+}
+
+func TestDecodeJSONLimitedRejectsOversizedResponse(t *testing.T) {
+	var out map[string]any
+	err := decodeJSONLimited(strings.NewReader(`{"ok":true}x`), int64(len(`{"ok":true}`)), &out)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("decodeJSONLimited() error = %v", err)
+	}
+}
+
+func TestApplyFlagsRetriesReplaySafeModify(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/messages/m1/modify") {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	if err := b.ApplyFlags(t.Context(), backend.RemoteRef{ID: "m1"}, backend.Flags{Seen: true}, backend.Flags{}); err != nil {
+		t.Fatalf("ApplyFlags() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("modify calls = %d, want 2", got)
+	}
+}
+
 // registerProfile serves users.getProfile so the initial full sync can snapshot
 // the start-of-sync historyId.
 func registerProfile(t *testing.T, mux *http.ServeMux, historyID string) {

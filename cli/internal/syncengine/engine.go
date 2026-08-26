@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/imap"
@@ -68,6 +69,11 @@ type Options struct {
 	// count of messages ingested this run — for a live progress line during a
 	// large full sync. Must be safe to call from the sync goroutine.
 	OnProgress func(count int)
+	// Timeout bounds an ordinary sync pass. RecoveryTimeout may extend that
+	// deadline after a backend enters an authoritative replacement snapshot.
+	// Zero leaves the corresponding mode unbounded (used by explicit CLI syncs).
+	Timeout         time.Duration
+	RecoveryTimeout time.Duration
 }
 
 // Result aggregates the outcome of one Engine.Sync run.
@@ -126,7 +132,13 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 	// folder-role mapping; carry the capability into ingest.
 	e.opts.Ingest.LabelsAsTags = b.Capabilities().LabelsAreTags
 
-	folders, err := b.FetchFolders(ctx)
+	deadline := time.Time{}
+	if e.opts.Timeout > 0 {
+		deadline = time.Now().Add(e.opts.Timeout)
+	}
+	requestCtx, cancel := contextWithDeadline(ctx, deadline)
+	folders, err := b.FetchFolders(requestCtx)
+	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("fetch folders: %w", err)
 	}
@@ -135,6 +147,9 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 	for _, folder := range folders {
 		if err := ctx.Err(); err != nil {
 			return result, fmt.Errorf("sync canceled: %w", err)
+		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return result, context.DeadlineExceeded
 		}
 		if !folder.Selectable {
 			continue
@@ -151,7 +166,7 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 		// server yet, defeating the upload we're about to do.
 		var folderSync *folderSyncResult
 		if e.opts.Mode != UploadOnly {
-			folderSync, err = e.syncFolder(ctx, b, folder, result)
+			folderSync, err = e.syncFolder(ctx, b, folder, result, deadline)
 			if err != nil {
 				slog.Warn("Folder sync failed, continuing", "module", "SYNCENGINE",
 					"account", e.opts.Account, "folder", folder.Name, "err", err)
@@ -160,14 +175,23 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 			}
 		}
 		var deltaFlags map[string]backend.Flags
+		folderDeadline := deadline
 		if folderSync != nil {
 			deltaFlags = folderSync.deltaFlags
+			if folderSync.deadline.After(folderDeadline) {
+				folderDeadline = folderSync.deadline
+			}
 		}
 		errorsBeforeFlags := len(result.Errors)
-		e.reconcileFolderFlags(ctx, b, folder, deltaFlags, result)
+		folderCtx, cancel := contextWithDeadline(ctx, folderDeadline)
+		e.reconcileFolderFlags(folderCtx, b, folder, deltaFlags, result)
+		cancel()
 		if folderSync != nil && folderSync.pendingCursor != nil && !e.opts.DryRun {
 			if err := ctx.Err(); err != nil {
 				return result, fmt.Errorf("sync canceled before replacement cursor persistence: %w", err)
+			}
+			if !folderDeadline.IsZero() && time.Now().After(folderDeadline) {
+				return result, fmt.Errorf("sync timed out before replacement cursor persistence: %w", context.DeadlineExceeded)
 			}
 			if len(result.Errors) > errorsBeforeFlags {
 				result.Errors = append(result.Errors, fmt.Errorf("folder %s: replacement cursor held back after flag reconciliation failed", folder.Name))
@@ -193,14 +217,20 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 			e.opts.Folders, e.opts.Account, strings.Join(available, ", "))
 	}
 
+	if !deadline.IsZero() && time.Now().After(deadline) {
+		return result, context.DeadlineExceeded
+	}
+
 	// Upload local archive/delete actions (INBOX messages that lost the "inbox"
 	// tag) to the server. Runs after downloads so it sees the freshest folders.
 	// Folder backends move between mailboxes; a LabelsAreTags backend (Gmail/JMAP) has
 	// no folders, so the label-upload pass handles the same archive/delete intent
 	// (and arbitrary label changes) by pushing label diffs instead. Each self-
 	// gates, so exactly one does work for a given backend.
-	e.uploadFolderMoves(ctx, b, folders, result)
-	e.uploadLabelChanges(ctx, b, result)
+	uploadCtx, cancel := contextWithDeadline(ctx, deadline)
+	e.uploadFolderMoves(uploadCtx, b, folders, result)
+	e.uploadLabelChanges(uploadCtx, b, result)
+	cancel()
 
 	slog.Info("Sync complete", "module", "SYNCENGINE", "account", e.opts.Account, // encgrep:allow account identifier (config name) and counts, not an encrypted column
 		"folders", result.Folders, "new", result.New, "deleted", result.Deleted,
@@ -256,9 +286,10 @@ func (e *Engine) folderSelected(folder backend.Folder) bool {
 type folderSyncResult struct {
 	deltaFlags    map[string]backend.Flags
 	pendingCursor backend.Cursor
+	deadline      time.Time
 }
 
-func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backend.Folder, result *Result) (*folderSyncResult, error) {
+func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backend.Folder, result *Result, deadline time.Time) (*folderSyncResult, error) {
 	cursor, err := e.opts.Cursors.Get(e.opts.Account, folder.Name)
 	if err != nil {
 		return nil, fmt.Errorf("load cursor: %w", err)
@@ -281,6 +312,8 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 	// snapshot. It is separate from sessionRefs because a malformed current
 	// message must not make the engine delete an older local copy.
 	snapshotRefs := make(map[string]struct{})
+	snapshotUnavailable := make(map[string]struct{})
+	snapshotSkipHydration := make(map[string]struct{})
 	fullSnapshot := false
 	snapshotModeSet := false
 
@@ -294,20 +327,41 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 			return nil, fmt.Errorf("canceled: %w", err)
 		}
 
-		res, err := b.FetchMessages(ctx, folder.Name, cursor, e.opts.BatchLimit)
+		fetchCtx, cancel := contextWithDeadline(ctx, deadline)
+		res, err := b.FetchMessages(fetchCtx, folder.Name, cursor, e.opts.BatchLimit)
+		cancel()
 		if err != nil {
 			return nil, fmt.Errorf("fetch messages: %w", err)
 		}
-		if snapshotModeSet && res.FullSnapshot != fullSnapshot {
-			return nil, errors.New("backend mixed replacement-snapshot and delta pages in one fetch sequence")
+		if snapshotModeSet && fullSnapshot && !res.FullSnapshot {
+			return nil, errors.New("backend switched from replacement-snapshot back to delta pages in one fetch sequence")
+		}
+		if snapshotModeSet && !fullSnapshot && res.FullSnapshot {
+			// A delta page token may expire between pages. The backend then
+			// restarts an authoritative enumeration from its first page. Earlier
+			// delta changes remain safely ingested, while only pages from this
+			// restart contribute to snapshot presence and cursor persistence.
+			fullSnapshot = true
+			if e.opts.RecoveryTimeout > 0 {
+				deadline = time.Now().Add(e.opts.RecoveryTimeout)
+			}
 		}
 		if !snapshotModeSet {
 			fullSnapshot = res.FullSnapshot
 			snapshotModeSet = true
+			if fullSnapshot && e.opts.RecoveryTimeout > 0 {
+				deadline = time.Now().Add(e.opts.RecoveryTimeout)
+			}
 		}
 		if res.FullSnapshot {
 			for _, ref := range res.Present {
 				snapshotRefs[ref.ID] = struct{}{}
+			}
+			for _, ref := range res.Unavailable {
+				if _, present := snapshotRefs[ref.ID]; !present {
+					return nil, fmt.Errorf("backend reported unavailable ref %q outside snapshot presence", ref.ID)
+				}
+				snapshotUnavailable[ref.ID] = struct{}{}
 			}
 		}
 
@@ -322,6 +376,9 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				slog.Debug("[dry-run] Would ingest message", "module", "SYNCENGINE",
 					"folder", folder.Name, "ref", msg.Ref.ID, "message_id", msg.MessageID)
 				result.New++
+				if res.FullSnapshot {
+					snapshotSkipHydration[msg.Ref.ID] = struct{}{}
+				}
 				continue
 			}
 			messageID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, e.opts.Ingest)
@@ -335,6 +392,11 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				// the whole folder on every run without ever making progress.
 				if isRetryableStoreError(err) {
 					ingestFailed = true
+				} else if res.FullSnapshot {
+					// A full-body snapshot already made its one ingestion attempt.
+					// Mark a permanently malformed item so hydration can skip it
+					// when absent locally while preserving any older local copy.
+					snapshotSkipHydration[msg.Ref.ID] = struct{}{}
 				}
 				continue
 			}
@@ -361,8 +423,8 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		}
 
 		// A delta cursor is a promise that everything before it is stored. If
-		// any message in this batch failed to ingest (a locked database, a
-		// malformed body), advancing past it would drop that message for good:
+		// any message in this batch failed to ingest for a retryable reason (for
+		// example, a locked database), advancing past it would drop that message:
 		// the next delta starts after it and the server never mentions it
 		// again. Stop the folder here instead and let the next pass refetch
 		// the same batch — ingest is idempotent, so replaying it is free.
@@ -380,7 +442,10 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 
 		if !res.HasMore {
 			if fullSnapshot {
-				if err := e.hydrateFullSnapshot(ctx, b, folder, snapshotRefs, deltaFlags, result); err != nil {
+				recoveryCtx, cancel := contextWithDeadline(ctx, deadline)
+				err := e.hydrateFullSnapshot(recoveryCtx, b, folder, snapshotRefs, snapshotUnavailable, snapshotSkipHydration, deltaFlags, result)
+				cancel()
+				if err != nil {
 					return nil, err
 				}
 			}
@@ -399,7 +464,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 					return nil, fmt.Errorf("persist cursor: %w", err)
 				}
 			}
-			state := &folderSyncResult{deltaFlags: deltaFlags}
+			state := &folderSyncResult{deltaFlags: deltaFlags, deadline: deadline}
 			if fullSnapshot {
 				state.pendingCursor = res.Cursor
 			}
@@ -420,7 +485,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		if e.opts.MaxPerFolder > 0 && fetched >= e.opts.MaxPerFolder && !fullSnapshot {
 			slog.Debug("Reached per-folder message cap, stopping", "module", "SYNCENGINE", // encgrep:allow folder name and cap counts are operational sync metadata, not message content
 				"folder", folder.Name, "cap", e.opts.MaxPerFolder, "fetched", fetched)
-			return &folderSyncResult{deltaFlags: deltaFlags}, nil
+			return &folderSyncResult{deltaFlags: deltaFlags, deadline: deadline}, nil
 		}
 		// Defensive guard: a backend that reports HasMore without changing
 		// anything would loop forever; bail out instead.
@@ -431,7 +496,14 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 	}
 }
 
-func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, folder backend.Folder, present map[string]struct{}, deltaFlags map[string]backend.Flags, result *Result) error {
+func contextWithDeadline(ctx context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return context.WithCancel(ctx)
+	}
+	return context.WithDeadline(ctx, deadline)
+}
+
+func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, folder backend.Folder, present, unavailable, skipHydration map[string]struct{}, deltaFlags map[string]backend.Flags, result *Result) error {
 	rows, err := e.opts.Store.GetFolderFlagState(e.opts.Account, folder.Name)
 	if err != nil {
 		return fmt.Errorf("load full-snapshot hydration state for %s: %w", folder.Name, err)
@@ -447,12 +519,23 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 	for id := range present {
 		if _, ok := existing[id]; ok {
 			current = append(current, backend.RemoteRef{Folder: folder.Name, ID: id})
-		} else {
+		} else if _, skip := skipHydration[id]; skip {
+			delete(present, id)
+			delete(deltaFlags, id)
+		} else if _, inaccessible := unavailable[id]; !inaccessible {
 			missing = append(missing, backend.RemoteRef{Folder: folder.Name, ID: id})
 		}
 	}
 	sort.Slice(missing, func(i, j int) bool { return missing[i].ID < missing[j].ID })
 	sort.Slice(current, func(i, j int) bool { return current[i].ID < current[j].ID })
+	if e.opts.DryRun {
+		// Dry-run does not populate the local read model, so every snapshot ref
+		// would otherwise look absent and metadata-only backends would fail the
+		// hydration contract. Report projected arrivals without downloading
+		// bodies; reconciliation and cursor persistence are already disabled.
+		result.New += len(missing)
+		return nil
+	}
 	hydrator, ok := b.(backend.SnapshotHydrator)
 	if !ok {
 		if len(missing) > 0 {
@@ -675,6 +758,12 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 	uploaded, downloaded := 0, 0
 	for _, row := range rows {
 		serverFlags, ok := server[row.RemoteRef]
+		if !ok && useDelta {
+			// A delta already carries authoritative flags for remote changes.
+			// Use them when a batched follow-up omitted one transiently; locally
+			// dirty refs have no delta fallback and remain pending for next pass.
+			serverFlags, ok = deltaFlags[row.RemoteRef]
+		}
 		if !ok {
 			continue // Not fetched (no candidate change) or not on the server.
 		}

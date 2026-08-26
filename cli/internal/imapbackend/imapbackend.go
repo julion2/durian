@@ -205,9 +205,6 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 		if err != nil {
 			return result, fmt.Errorf("failed to fetch messages in %s: %w", folder, err)
 		}
-		if len(fetched) != len(newUIDs) {
-			return result, fmt.Errorf("incomplete fetch in %s: requested %d messages, received %d", folder, len(newUIDs), len(fetched))
-		}
 		requested := make(map[uint32]struct{}, len(newUIDs))
 		for _, uid := range newUIDs {
 			requested[uid] = struct{}{}
@@ -220,7 +217,14 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 			delete(requested, msg.Uid)
 			raw := readRawBody(msg.Body)
 			if len(raw) == 0 {
-				return result, fmt.Errorf("message UID %d in %s has no body data", msg.Uid, folder)
+				slog.Warn("Message has no body data, skipping inaccessible item", "module", "IMAPBACKEND", // encgrep:allow folder name and UID are operational sync metadata, not message content
+					"folder", folder, "uid", msg.Uid)
+				if fullReplacement {
+					ref := backend.RemoteRef{Folder: folder, ID: formatUID(msg.Uid)}
+					result.Present = append(result.Present, ref)
+					result.Unavailable = append(result.Unavailable, ref)
+				}
+				continue
 			}
 
 			messageID := extractMessageID(raw)
@@ -246,6 +250,13 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 			if fullReplacement {
 				result.Present = append(result.Present, backend.RemoteRef{Folder: folder, ID: formatUID(msg.Uid)})
 			}
+		}
+		if len(requested) > 0 {
+			// UIDs may be expunged between SEARCH and UID FETCH. Their absence is
+			// authoritative for this page; keeping them out of Present also makes
+			// UIDVALIDITY replacement snapshots reconcile the race correctly.
+			slog.Debug("Messages disappeared before fetch completed", "module", "IMAPBACKEND",
+				"folder", folder, "count", len(requested)) // encgrep:allow folder name and count are operational sync metadata
 		}
 	}
 

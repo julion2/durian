@@ -39,3 +39,16 @@ func CursorSuffix(account *config.AccountConfig) string {
 		return ""
 	}
 }
+
+// PushWatch reports whether the selected backend has a native long-lived push
+// transport. It is deliberately static so watcher startup does not connect and
+// authenticate an IMAP account merely to read a capability constant.
+func PushWatch(account *config.AccountConfig) bool {
+	return !account.UsesGraphBackend() && !account.UsesGmailBackend()
+}
+
+// PushInboxOnly reports whether the backend's push transport watches only the
+// inbox. JMAP EventSource is account-wide; IMAP IDLE watches INBOX.
+func PushInboxOnly(account *config.AccountConfig) bool {
+	return !account.UsesGraphBackend() && !account.UsesGmailBackend() && !account.UsesJMAPBackend()
+}

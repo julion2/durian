@@ -123,11 +123,17 @@ type FetchResult struct {
 	// FullSnapshot reports that this page is part of a complete replacement
 	// snapshot. Present contains every remote ref that existed in this page of
 	// that snapshot. Once the final page is processed, the engine removes local
-	// refs that were not present in any page. Every page in one fetch sequence
-	// must use the same FullSnapshot value. Delta-capable backends use this to
-	// recover safely when a server can no longer calculate changes from a cursor.
+	// refs that were not present in any page. A sequence may switch once from
+	// delta to FullSnapshot when an intermediate provider cursor expires and
+	// enumeration restarts from the beginning; it must never switch back to
+	// delta. Delta-capable backends use this to recover safely when a server can
+	// no longer calculate changes from a cursor.
 	FullSnapshot bool
 	Present      []RemoteRef
+	// Unavailable is the subset of Present whose body the provider explicitly
+	// denied access to. Replacement reconciliation preserves an existing local
+	// copy but does not require a locally absent ref to be hydrated.
+	Unavailable []RemoteRef
 }
 
 // Capabilities describes backend-specific behavior the sync engine adapts to,

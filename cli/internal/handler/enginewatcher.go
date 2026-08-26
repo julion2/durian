@@ -49,6 +49,11 @@ const (
 	probeJitter = 0.2
 	// maxProbeBackoff caps the exponential backoff after repeated failures.
 	maxProbeBackoff = 30 * time.Minute
+	// Ordinary daemon passes retain the previous watchdog. A state-expiry
+	// replacement may extend it because the authoritative snapshot must finish
+	// atomically before its cursor can advance.
+	syncTimeout         = 5 * time.Minute
+	recoverySyncTimeout = 60 * time.Minute
 	// pushReconnectBase is the initial delay before rebuilding a push backend
 	// after its long-lived connection ends unexpectedly.
 	pushReconnectBase = time.Second
@@ -181,13 +186,7 @@ func (w *EngineWatcher) triggerLoop(ctx context.Context, account *config.Account
 }
 
 func (w *EngineWatcher) pushEnabled(account *config.AccountConfig) bool {
-	b, err := backendfactory.New(account)
-	if err != nil {
-		slog.Warn("Backend capability probe failed; using polling", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
-		return false
-	}
-	defer b.Close()
-	return b.Capabilities().PushWatch
+	return backendfactory.PushWatch(account)
 }
 
 // pushLoop converts provider push notifications into serialized full engine
@@ -208,13 +207,14 @@ func (w *EngineWatcher) pushLoopWith(
 		return
 	}
 	failures := 0
+	inboxOnly := backendfactory.PushInboxOnly(account)
 	for {
 		// Establish a baseline before every (re)connection. A provider change
 		// while push was disconnected is then covered before listening resumes.
 		// Run this before constructing the watch backend: IMAP constructors open
 		// their connection eagerly, and some servers reject a second concurrent
 		// connection from the recovery sync.
-		if err := syncAccount(ctx, account, false); err != nil {
+		if err := syncAccount(ctx, account, inboxOnly); err != nil {
 			slog.Warn("Push-backend recovery sync failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
 		}
 
@@ -253,7 +253,7 @@ func (w *EngineWatcher) pushLoopWith(
 				disconnected = true
 			case <-changes:
 				failures = 0
-				if err := syncAccount(ctx, account, false); err != nil {
+				if err := syncAccount(ctx, account, inboxOnly); err != nil {
 					slog.Warn("Push-triggered sync failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
 				}
 			}
@@ -384,13 +384,17 @@ func (w *EngineWatcher) syncAccountMode(ctx context.Context, account *config.Acc
 		cursors = syncengine.NewFileCursorStoreWithSuffix(account.AccountIdentifier(), suffix)
 	}
 	engine := syncengine.New(syncengine.Options{
-		Store:        w.store,
-		Cursors:      cursors,
-		Account:      account.AccountIdentifier(),
-		BatchLimit:   account.GetIMAPBatchSize(),
-		MaxPerFolder: account.GetIMAPMaxMessages(),
-		Folders:      folders,
-		Mode:         mode,
+		Store:           w.store,
+		Cursors:         cursors,
+		Account:         account.AccountIdentifier(),
+		BatchLimit:      account.GetIMAPBatchSize(),
+		// Keep provider-engine semantics aligned with `durian sync`: an explicit
+		// zero means full local-first sync. Pkl supplies the ordinary 5000 default.
+		MaxPerFolder:    account.IMAP.MaxMessages,
+		Folders:         folders,
+		Mode:            mode,
+		Timeout:         syncTimeout,
+		RecoveryTimeout: recoverySyncTimeout,
 		Ingest: syncengine.IngestOptions{
 			Account:        account.AccountIdentifier(),
 			FilterRules:    w.filterRules,

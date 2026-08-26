@@ -196,6 +196,14 @@ accounts use their backend's `PushWatch` capability for EventSource or IMAP
 IDLE, plus a slow safety poll. Local tag mutations trigger an immediate,
 coalesced upload-only engine pass for all engine accounts.
 
+Daemon-triggered engine passes have a 5-minute watchdog so a stalled provider
+does not hold the per-account mutex indefinitely. An authoritative replacement
+snapshot may extend that deadline to 60 minutes: the snapshot must complete
+before its cursor can advance. The extension applies only to that recovery and
+its flag reconciliation; the ordinary deadline still bounds later folders and
+the upload pass rather than granting the entire account pass another hour.
+Explicit `durian sync` commands remain caller-controlled.
+
 ### Live JMAP tests
 
 The build-tagged live suite is a normal Bazel target, so `bazel test //cli/...`

@@ -242,6 +242,31 @@ func TestEnsurePrefersJMAPCredential(t *testing.T) {
 	}
 }
 
+func TestEnsureDoesNotAdoptLegacyPasswordAsBearerToken(t *testing.T) {
+	originalGet := getCredential
+	t.Cleanup(func() { getCredential = originalGet })
+	legacyGets := 0
+	getCredential = func(service, _ string) (string, error) {
+		if service == keychain.JMAPKeychainService {
+			return "", keychain.ErrNotFound
+		}
+		legacyGets++
+		return "imap-app-password", nil
+	}
+	s := newTestJMAPServer(t)
+	b, err := New(&config.AccountConfig{
+		Name: "Test", Email: "me@example.test", SyncEngine: "jmap",
+		JMAP: &config.JMAPConfig{SessionURL: s.server.URL + "/session", Auth: "bearer"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = b.ensure(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "run durian auth login") || legacyGets != 0 {
+		t.Fatalf("ensure error=%v legacyGets=%d, want missing JMAP token without legacy lookup", err, legacyGets)
+	}
+}
+
 func TestQueryAllEmailIDsRejectsIncompleteResult(t *testing.T) {
 	s := newTestJMAPServer(t)
 	b := s.backend(t)

@@ -24,3 +24,27 @@ func TestJMAPBackendSelection(t *testing.T) {
 		t.Fatalf("CursorSuffix() = %q, want -jmap", got)
 	}
 }
+
+func TestPushWatchIsStaticByBackendType(t *testing.T) {
+	tests := []struct {
+		name      string
+		account   *config.AccountConfig
+		wantPush  bool
+		wantInbox bool
+	}{
+		{name: "IMAP", account: &config.AccountConfig{SyncEngine: "engine"}, wantPush: true, wantInbox: true},
+		{name: "JMAP", account: &config.AccountConfig{SyncEngine: "jmap"}, wantPush: true},
+		{name: "Graph", account: &config.AccountConfig{SyncEngine: "graph"}},
+		{name: "Gmail", account: &config.AccountConfig{SyncEngine: "gmail"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := PushWatch(tt.account); got != tt.wantPush {
+				t.Fatalf("PushWatch() = %v, want %v", got, tt.wantPush)
+			}
+			if got := PushInboxOnly(tt.account); got != tt.wantInbox {
+				t.Fatalf("PushInboxOnly() = %v, want %v", got, tt.wantInbox)
+			}
+		})
+	}
+}

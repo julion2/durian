@@ -187,11 +187,13 @@ example Fastmail) or `auth = "password"` for HTTP Basic authentication, then run
 allowed for loopback addresses. Durian intentionally supports JMAP EventSource
 push, not the optional RFC 8887 WebSocket transport.
 
-`imap.max_messages` limits ordinary initial and incremental engine passes. If a
-Gmail history ID or JMAP Email state expires, the authoritative replacement
-snapshot deliberately completes the whole mailbox before advancing its cursor;
-otherwise applying the cap could treat a partial ID set as complete and delete
-valid local mail. Individual provider requests remain paged and bounded.
+`imap.max_messages` limits ordinary initial and incremental engine passes in
+both `durian sync` and `durian serve`. The schema default is 5000; set it to `0`
+for an unlimited full local-first sync. If a Gmail history ID or JMAP Email
+state expires, the authoritative replacement snapshot deliberately completes
+the whole mailbox before advancing its cursor; otherwise applying the cap could
+treat a partial ID set as complete and delete valid local mail. Individual
+provider requests remain paged and bounded.
 
 Fastmail needs no IMAP or SMTP configuration:
 

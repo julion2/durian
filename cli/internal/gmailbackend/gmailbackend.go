@@ -42,6 +42,10 @@ const (
 	defaultBaseURL = "https://gmail.googleapis.com/gmail/v1"
 	// tokenExpiryBuffer refreshes the access token slightly before it expires.
 	tokenExpiryBuffer = 2 * time.Minute
+	// RAW messages are base64url-encoded inside JSON; leave room for Gmail's
+	// largest accepted messages plus encoding overhead while still bounding
+	// every response allocation.
+	maxJSONBytes = 128 << 20
 	// allMailStream is the single synthetic folder the engine iterates: Gmail is
 	// folderless, so all messages flow through one stream and their labels become
 	// tags. "me" is Gmail's alias for the authenticated user in message queries.
@@ -97,8 +101,16 @@ func New(account *config.AccountConfig) (*Backend, error) {
 		account:      account,
 		clientID:     account.OAuth.ClientID,
 		clientSecret: account.OAuth.ClientSecret,
-		httpClient:   &http.Client{Timeout: 60 * time.Second},
 		baseURL:      defaultBaseURL,
+	}
+	b.httpClient = &http.Client{
+		Timeout: 60 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			return validateAuthenticatedURL(b.baseURL, req.URL.String())
+		},
 	}
 	b.tokenFn = b.cachedGoogleToken
 	return b, nil
@@ -140,13 +152,20 @@ func (e *statusError) Error() string {
 // do executes one authenticated Gmail request with throttle handling: for
 // idempotent HTTP methods it retries
 // 429 and quota 403 (rateLimitExceeded / userRateLimitExceeded) honoring the
-// Retry-After header, and retries 503 once, all with exponential backoff and
+// Retry-After header, and retries any 5xx once, all with exponential backoff and
 // respecting ctx. A non-retryable response (including a permission 403) is
 // returned with its body intact so the caller can read the error.
 func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*http.Response, error) {
+	return b.doWithRetry(ctx, method, reqURL, body, method == http.MethodGet || method == http.MethodHead)
+}
+
+func (b *Backend) doWithRetry(ctx context.Context, method, reqURL string, body []byte, safeToRetry bool) (*http.Response, error) {
 	const maxRetries = 3
 
-	safeToRetry := method == http.MethodGet || method == http.MethodHead
+	if err := validateAuthenticatedURL(b.baseURL, reqURL); err != nil {
+		return nil, fmt.Errorf("refusing Gmail request URL: %w", err)
+	}
+
 	backoff := time.Second
 	transientRetried := false
 	for attempt := 0; ; attempt++ {
@@ -196,7 +215,7 @@ func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*
 				return nil, err
 			}
 			backoff *= 2
-		case safeToRetry && resp.StatusCode == http.StatusServiceUnavailable && !transientRetried:
+		case safeToRetry && resp.StatusCode >= http.StatusInternalServerError && !transientRetried:
 			transientRetried = true
 			drainClose(resp)
 			if err := sleepCtx(ctx, backoff); err != nil {
@@ -231,6 +250,10 @@ func isQuotaBody(b []byte) bool {
 // doJSON executes a Gmail request and decodes the JSON response into out (out
 // may be nil to discard the body).
 func (b *Backend) doJSON(ctx context.Context, method, reqURL string, body any, out any) error {
+	return b.doJSONWithRetry(ctx, method, reqURL, body, out, method == http.MethodGet || method == http.MethodHead)
+}
+
+func (b *Backend) doJSONWithRetry(ctx context.Context, method, reqURL string, body any, out any, safeToRetry bool) error {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -238,7 +261,7 @@ func (b *Backend) doJSON(ctx context.Context, method, reqURL string, body any, o
 			return fmt.Errorf("marshal request: %w", err)
 		}
 	}
-	resp, err := b.do(ctx, method, reqURL, payload)
+	resp, err := b.doWithRetry(ctx, method, reqURL, payload, safeToRetry)
 	if err != nil {
 		return err
 	}
@@ -250,10 +273,47 @@ func (b *Backend) doJSON(ctx context.Context, method, reqURL string, body any, o
 	if out == nil {
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if err := decodeJSONLimited(resp.Body, maxJSONBytes, out); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
+}
+
+func validateAuthenticatedURL(baseURL, requestURL string) error {
+	base, err := url.Parse(baseURL)
+	if err != nil || !base.IsAbs() || base.User != nil {
+		return errors.New("Gmail base URL is invalid")
+	}
+	target, err := url.Parse(requestURL)
+	if err != nil || !target.IsAbs() || target.User != nil || (target.Scheme != "http" && target.Scheme != "https") {
+		return errors.New("authenticated URL must be an absolute HTTP(S) URL without userinfo")
+	}
+	if !strings.EqualFold(base.Scheme, target.Scheme) ||
+		!strings.EqualFold(base.Hostname(), target.Hostname()) || effectivePort(base) != effectivePort(target) {
+		return errors.New("authenticated URL origin differs from Gmail API origin")
+	}
+	return nil
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
+func decodeJSONLimited(r io.Reader, limit int64, out any) error {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > limit {
+		return fmt.Errorf("Gmail JSON response exceeds %d bytes", limit)
+	}
+	return json.Unmarshal(data, out)
 }
 
 func newStatusError(resp *http.Response) error {
@@ -934,8 +994,8 @@ func (b *Backend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, re
 	if len(removeLabels) > 0 {
 		body["removeLabelIds"] = removeLabels
 	}
-	if err := b.doJSON(ctx, http.MethodPost,
-		b.baseURL+"/users/me/messages/"+url.PathEscape(ref.ID)+"/modify", body, nil); err != nil {
+	if err := b.doJSONWithRetry(ctx, http.MethodPost,
+		b.baseURL+"/users/me/messages/"+url.PathEscape(ref.ID)+"/modify", body, nil, true); err != nil {
 		return fmt.Errorf("modify labels for %s: %w", ref.ID, err)
 	}
 	slog.Debug("Applied flags", "module", "GMAILBACKEND", "id", ref.ID, "add", addLabels, "remove", removeLabels) // encgrep:allow logs Gmail reserved label names (UNREAD/STARRED), not message content
@@ -1032,8 +1092,8 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 	if len(removeIDs) > 0 {
 		body["removeLabelIds"] = removeIDs
 	}
-	if err := b.doJSON(ctx, http.MethodPost,
-		b.baseURL+"/users/me/messages/"+url.PathEscape(ref.ID)+"/modify", body, nil); err != nil {
+	if err := b.doJSONWithRetry(ctx, http.MethodPost,
+		b.baseURL+"/users/me/messages/"+url.PathEscape(ref.ID)+"/modify", body, nil, true); err != nil {
 		return fmt.Errorf("modify labels for %s: %w", ref.ID, err)
 	}
 	slog.Debug("Applied labels", "module", "GMAILBACKEND", "id", ref.ID, "add", addIDs, "remove", removeIDs) // encgrep:allow logs Gmail label ids, not message content
