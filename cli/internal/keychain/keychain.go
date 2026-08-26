@@ -12,7 +12,7 @@ import (
 // Service names used by Durian. Centralised here so callers and tests share
 // one source of truth (see ADR-0001 §2 for the DB-key naming convention).
 const (
-	// PasswordKeychainService stores IMAP/SMTP passwords keyed by account email.
+	// PasswordKeychainService stores IMAP/SMTP/JMAP credentials keyed by account email.
 	PasswordKeychainService = "durian-password"
 	// OAuthKeychainService stores OAuth tokens keyed by account email.
 	OAuthKeychainService = "durian"

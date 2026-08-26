@@ -11,10 +11,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/julion2/durian/cli/internal/backend"
+	"github.com/julion2/durian/cli/internal/backendfactory"
 	"github.com/julion2/durian/cli/internal/config"
-	"github.com/julion2/durian/cli/internal/graphbackend"
 	"github.com/julion2/durian/cli/internal/imap"
-	"github.com/julion2/durian/cli/internal/imapbackend"
 	"github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/store"
 )
@@ -145,13 +144,7 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 // fetchAttachmentPartViaBackend fetches msg's raw body through the account's
 // backend and returns the requested attachment part's decoded bytes.
 func fetchAttachmentPartViaBackend(ctx context.Context, account *config.AccountConfig, msg *store.Message, partID int) ([]byte, error) {
-	var b backend.Backend
-	var err error
-	if account.UsesGraphBackend() {
-		b, err = graphbackend.New(account)
-	} else {
-		b, err = imapbackend.New(account)
-	}
+	b, err := backendfactory.New(account)
 	if err != nil {
 		return nil, err
 	}

@@ -94,8 +94,8 @@ func runAuthLogin(cmd *cobra.Command, args []string) error {
 		return runOAuthLogin(account)
 	}
 
-	// Check if password auth is configured
-	if account.SMTP.Auth == "password" || account.IMAP.Auth == "password" {
+	// Passwords and JMAP bearer tokens share the OS-keychain credential path.
+	if account.JMAP != nil || account.SMTP.Auth == "password" || account.IMAP.Auth == "password" {
 		return runPasswordLogin(account)
 	}
 
@@ -144,16 +144,21 @@ func runOAuthLogin(account *config.AccountConfig) error {
 
 // runPasswordLogin handles password-based authentication
 func runPasswordLogin(account *config.AccountConfig) error {
-	fmt.Printf("Password authentication for %s\n\n", account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+	credentialName := "Password"
+	prompt := "Enter password: "
+	if account.JMAP != nil && account.JMAP.Auth == "bearer" {
+		credentialName = "JMAP API token"
+		prompt = "Enter JMAP API token: "
+	}
+	fmt.Printf("%s authentication for %s\n\n", credentialName, account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 
-	// Prompt for password
-	password, err := promptPassword("Enter password: ")
+	password, err := promptPassword(prompt)
 	if err != nil {
 		return fmt.Errorf("failed to read password: %w", err)
 	}
 
 	if password == "" {
-		return errors.New("password cannot be empty")
+		return fmt.Errorf("%s cannot be empty", strings.ToLower(credentialName))
 	}
 
 	// Store password in keychain
@@ -161,7 +166,7 @@ func runPasswordLogin(account *config.AccountConfig) error {
 		return fmt.Errorf("failed to save password: %w", err)
 	}
 
-	fmt.Printf("\n✓ Password stored securely in Keychain\n")
+	fmt.Printf("\n✓ %s stored securely in Keychain\n", credentialName)
 	fmt.Printf("✓ Service: %s\n", PasswordKeychainService)
 	fmt.Printf("✓ Account: %s\n", account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 
@@ -382,7 +387,7 @@ func getAccountStatusShort(account *config.AccountConfig) string {
 		}
 		return "valid"
 	}
-	if account.SMTP.Auth == "password" || account.IMAP.Auth == "password" {
+	if account.JMAP != nil || account.SMTP.Auth == "password" || account.IMAP.Auth == "password" {
 		if keychain.Exists(PasswordKeychainService, account.Email) {
 			return "stored"
 		}
@@ -415,9 +420,15 @@ func getAccountStatus(account *config.AccountConfig) string {
 	}
 
 	// Check password accounts
-	if account.SMTP.Auth == "password" || account.IMAP.Auth == "password" {
+	if account.JMAP != nil || account.SMTP.Auth == "password" || account.IMAP.Auth == "password" {
 		if keychain.Exists(PasswordKeychainService, account.Email) {
+			if account.JMAP != nil && account.JMAP.Auth == "bearer" {
+				return "✓ JMAP API token stored"
+			}
 			return "✓ Password stored"
+		}
+		if account.JMAP != nil && account.JMAP.Auth == "bearer" {
+			return fmt.Sprintf("✗ No JMAP API token\n%34sRun: durian auth login %s", "", account.Email)
 		}
 		return fmt.Sprintf("✗ No password\n%34sRun: durian auth login %s", "", account.Email)
 	}
@@ -428,6 +439,9 @@ func getAccountStatus(account *config.AccountConfig) string {
 func getAuthType(account *config.AccountConfig) string {
 	if account.OAuth != nil && account.OAuth.Provider != "" {
 		return account.OAuth.Provider
+	}
+	if account.JMAP != nil {
+		return "jmap-" + account.JMAP.Auth
 	}
 	if account.SMTP.Auth == "password" || account.IMAP.Auth == "password" {
 		return "password"

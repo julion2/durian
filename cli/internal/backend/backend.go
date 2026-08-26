@@ -1,10 +1,9 @@
 // Package backend defines the provider-agnostic mail sync abstraction.
 //
-// Both the IMAP syncer (Gmail, generic providers) and the Microsoft Graph
-// backend implement Backend, so the sync engine, store, tags and search stay
-// provider-neutral. Message identity is always the RFC822 Message-ID plus the
-// account; RemoteRef is only the provider's own transient handle for follow-up
-// operations and is never used as a primary key.
+// IMAP, Microsoft Graph, Gmail REST, and JMAP backends implement Backend, so the
+// sync engine, store, tags and search stay provider-neutral. Message identity is
+// always the RFC822 Message-ID plus the account; RemoteRef is only the provider's
+// own transient handle for follow-up operations and is never used as a primary key.
 package backend
 
 import (
@@ -126,7 +125,7 @@ type FetchResult struct {
 // Capabilities describes backend-specific behavior the sync engine adapts to,
 // so provider quirks stay out of the engine's control flow.
 type Capabilities struct {
-	// ServerSideSent reports the provider auto-saves sent mail (Gmail, M365),
+	// ServerSideSent reports the provider auto-saves sent mail (Gmail, M365, JMAP),
 	// so Durian must not append its own Sent copy.
 	ServerSideSent bool
 	// NativeMove reports a true atomic move (Graph) rather than the IMAP
@@ -140,7 +139,7 @@ type Capabilities struct {
 	// polling every message's flags each sync, which is O(changes) not O(mailbox).
 	FlagChangesInDelta bool
 	// LabelsAreTags reports that Message.Labels is the authoritative tag set for
-	// each message (Gmail), so the engine mirrors those labels to Durian tags —
+	// each message (Gmail/JMAP), so the engine mirrors those labels to Durian tags —
 	// adding new ones and removing labels the server dropped — instead of the
 	// folder-role tag mapping. Durian-local tags (rules, flags) are left intact.
 	LabelsAreTags bool

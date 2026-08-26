@@ -38,6 +38,7 @@ go_library(
         "//cli/internal/agekey",
         "//cli/internal/auth",
         "//cli/internal/backend",
+        "//cli/internal/backendfactory",
         "//cli/internal/calendar",
         "//cli/internal/calendarsync",
         "//cli/internal/config",

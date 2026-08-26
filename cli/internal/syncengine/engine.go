@@ -121,7 +121,7 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 		return nil, fmt.Errorf("syncengine: Options.Cursors is required")
 	}
 
-	// A label backend (Gmail) mirrors Message.Labels to tags instead of using the
+	// A label backend (Gmail/JMAP) mirrors Message.Labels to tags instead of using the
 	// folder-role mapping; carry the capability into ingest.
 	e.opts.Ingest.LabelsAsTags = b.Capabilities().LabelsAreTags
 
@@ -178,7 +178,7 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 
 	// Upload local archive/delete actions (INBOX messages that lost the "inbox"
 	// tag) to the server. Runs after downloads so it sees the freshest folders.
-	// Folder backends move between mailboxes; a LabelsAreTags backend (Gmail) has
+	// Folder backends move between mailboxes; a LabelsAreTags backend (Gmail/JMAP) has
 	// no folders, so the label-upload pass handles the same archive/delete intent
 	// (and arbitrary label changes) by pushing label diffs instead. Each self-
 	// gates, so exactly one does work for a given backend.
@@ -737,7 +737,7 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 }
 
 // uploadLabelChanges is the label-native counterpart to uploadFolderMoves for a
-// LabelsAreTags backend (Gmail): rather than relocating messages between
+// LabelsAreTags backend (Gmail/JMAP): rather than relocating messages between
 // folders, it pushes each message's local tag changes as label add/removes.
 // Archiving (dropping the "inbox" tag) becomes a label removal; deleting adds
 // the "trash" tag, which maps to Gmail's TRASH. It runs only when the backend

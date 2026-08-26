@@ -248,7 +248,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 		})
 	}
 
-	// Resolve the account's transport (SMTP today; Graph/Gmail slot in later).
+	// Resolve the account's configured SMTP, Graph, Gmail, or JMAP transport.
 	mailSender, err := sender.For(account)
 	if err != nil {
 		// Transport setup resolves keychain credentials, so sanitize before the
@@ -364,8 +364,8 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mail
 
 // appendToSent saves a copy to the IMAP Sent folder (skip for providers that auto-save).
 func (w *OutboxWorker) appendToSent(account *config.AccountConfig, msg *mailsend.Message) {
-	if account.OAuth != nil && (account.OAuth.Provider == "google" || account.OAuth.Provider == "microsoft") {
-		slog.Debug("Skipping Sent append", "module", "OUTBOX", "provider", account.OAuth.Provider) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+	if account.UsesGraphBackend() || account.UsesGmailBackend() || account.UsesJMAPBackend() {
+		slog.Debug("Skipping Sent append for native provider", "module", "OUTBOX", "engine", account.EffectiveSyncEngine())
 		return
 	}
 

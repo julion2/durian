@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -9,8 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/julion2/durian/cli/internal/backendfactory"
 	"github.com/julion2/durian/cli/internal/config"
-	"github.com/julion2/durian/cli/internal/graphbackend"
 	"github.com/julion2/durian/cli/internal/store"
 	"github.com/julion2/durian/cli/internal/syncengine"
 )
@@ -96,6 +97,18 @@ func (w *EngineWatcher) Start(ctx context.Context, accounts []*config.AccountCon
 		// probe in the same second.
 		offset := time.Duration(i) * 3 * time.Second
 		wg.Add(2)
+		if account.UsesJMAPBackend() {
+			go func(a *config.AccountConfig, off time.Duration) {
+				defer wg.Done()
+				w.pushLoop(ctx, a, off)
+			}(account, offset)
+			go func(a *config.AccountConfig, off time.Duration) {
+				defer wg.Done()
+				// Keep a slow full poll as recovery for a dropped push connection.
+				w.loop(ctx, a, off+15*time.Second, false)
+			}(account, offset)
+			continue
+		}
 		go func(a *config.AccountConfig, off time.Duration) {
 			defer wg.Done()
 			w.loop(ctx, a, off, true)
@@ -110,6 +123,52 @@ func (w *EngineWatcher) Start(ctx context.Context, accounts []*config.AccountCon
 	slog.Info("Started engine watchers", "module", "ENGINEWATCH", "accounts", len(accounts), // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		"inbox_interval_active", inboxIntervalActive, "full_interval_active", fullIntervalActive)
 	wg.Wait()
+}
+
+// pushLoop converts provider push notifications into serialized full engine
+// syncs. The buffered signal coalesces bursts while a sync is already running;
+// JMAP state cursors make one pass sufficient to consume every queued change.
+func (w *EngineWatcher) pushLoop(ctx context.Context, account *config.AccountConfig, startDelay time.Duration) {
+	if !sleepCtx(ctx, startDelay) {
+		return
+	}
+	// Establish a baseline before listening so a change between daemon startup
+	// and EventSource connection is already covered by the persisted state.
+	if err := w.syncAccount(ctx, account, false); err != nil {
+		slog.Warn("Initial push-backend sync failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier(), "err", err) // encgrep:allow account identifier and operational error
+	}
+	b, err := backendfactory.New(account)
+	if err != nil {
+		slog.Warn("Push backend creation failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier(), "err", err) // encgrep:allow account identifier and operational error
+		return
+	}
+	defer b.Close()
+
+	changes := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- b.Watch(ctx, "", func() {
+			select {
+			case changes <- struct{}{}:
+			default:
+			}
+		})
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-done:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				slog.Warn("Push watch stopped", "module", "ENGINEWATCH", "account", account.AccountIdentifier(), "err", err) // encgrep:allow account identifier and operational error
+			}
+			return
+		case <-changes:
+			if err := w.syncAccount(ctx, account, false); err != nil {
+				slog.Warn("Push-triggered sync failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier(), "err", err) // encgrep:allow account identifier and operational error
+			}
+		}
+	}
 }
 
 // loop runs one account's probe cycle. inboxOnly picks the fast inbox pass over
@@ -207,7 +266,7 @@ func (w *EngineWatcher) syncAccount(ctx context.Context, account *config.Account
 	ctx, cancel := context.WithTimeout(ctx, syncTimeout)
 	defer cancel()
 
-	b, err := graphbackend.New(account)
+	b, err := backendfactory.New(account)
 	if err != nil {
 		return fmt.Errorf("connect backend: %w", err)
 	}
@@ -220,9 +279,14 @@ func (w *EngineWatcher) syncAccount(ctx context.Context, account *config.Account
 		folders = []string{"INBOX"}
 	}
 
+	suffix := backendfactory.CursorSuffix(account)
+	var cursors syncengine.CursorStore = syncengine.NewFileCursorStore(account.AccountIdentifier())
+	if suffix != "" {
+		cursors = syncengine.NewFileCursorStoreWithSuffix(account.AccountIdentifier(), suffix)
+	}
 	engine := syncengine.New(syncengine.Options{
 		Store:        w.store,
-		Cursors:      syncengine.NewFileCursorStoreWithSuffix(account.AccountIdentifier(), "-graph"),
+		Cursors:      cursors,
 		Account:      account.AccountIdentifier(),
 		BatchLimit:   account.GetIMAPBatchSize(),
 		MaxPerFolder: account.GetIMAPMaxMessages(),

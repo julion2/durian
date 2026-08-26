@@ -24,8 +24,8 @@ var (
 
 var syncCmd = &cobra.Command{
 	Use:   "sync [account] [mailbox]",
-	Short: "Sync email via IMAP",
-	Long:  "Sync email from IMAP to local SQLite. Bidirectional by default.",
+	Short: "Sync email to the local store",
+	Long:  "Sync email from IMAP or a native provider API to local SQLite. Bidirectional by default.",
 	Example: `  durian sync
   durian sync gmail
   durian sync you@company.com
@@ -107,7 +107,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("account not found: %s\nAvailable accounts: %s", args[0], cfg.ListAccountIdentifiers())
 		}
 
-		if account.IMAP.Host == "" {
+		if account.IMAP.Host == "" && !account.UsesGraphBackend() && !account.UsesGmailBackend() && !account.UsesJMAPBackend() {
 			return fmt.Errorf("account %s has no IMAP configuration", account.Email)
 		}
 
@@ -118,16 +118,16 @@ func runSync(cmd *cobra.Command, args []string) error {
 			options.Mailboxes = args[1:]
 		}
 	} else {
-		// Sync all accounts with IMAP config
-		accounts = cfg.GetAccountsWithIMAP()
+		// Sync all accounts with an IMAP or native API backend.
+		accounts = cfg.GetMailSyncAccounts()
 		if len(accounts) == 0 {
-			return fmt.Errorf("no accounts with IMAP configuration found")
+			return fmt.Errorf("no accounts with a mail sync backend found")
 		}
 	}
 
-	// Partition accounts by sync implementation. Engine accounts (opt-in via
-	// account.sync_engine = "engine" in config.pkl) use the provider-agnostic
-	// engine; all others use the classic IMAP syncer.
+	// Partition accounts by sync implementation. Native API accounts and IMAP
+	// accounts opting into sync_engine="engine" use the provider-neutral engine;
+	// all others use the classic IMAP syncer.
 	var legacyAccounts, engineAccounts []*config.AccountConfig
 	for _, a := range accounts {
 		if a.UsesSyncEngine() {

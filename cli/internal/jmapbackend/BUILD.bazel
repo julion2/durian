@@ -1,0 +1,34 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "jmapbackend",
+    srcs = [
+        "client.go",
+        "jmapbackend.go",
+        "sender.go",
+    ],
+    importpath = "github.com/julion2/durian/cli/internal/jmapbackend",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "//cli/internal/backend",
+        "//cli/internal/config",
+        "//cli/internal/keychain",
+        "//cli/internal/mailsend",
+        "//cli/internal/smtp",
+    ],
+)
+
+go_test(
+    name = "jmapbackend_test",
+    size = "small",
+    srcs = [
+        "jmapbackend_test.go",
+        "sender_test.go",
+    ],
+    embed = [":jmapbackend"],
+    deps = [
+        "//cli/internal/backend",
+        "//cli/internal/config",
+        "//cli/internal/mailsend",
+    ],
+)

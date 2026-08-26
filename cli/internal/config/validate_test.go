@@ -24,6 +24,7 @@ func TestEffectiveSyncEngine(t *testing.T) {
 		{"google unset defaults to gmail", AccountConfig{OAuth: google}, "gmail"},
 		{"explicit legacy overrides gmail default", AccountConfig{OAuth: google, SyncEngine: "legacy"}, "legacy"},
 		{"no oauth unset stays legacy", AccountConfig{}, "legacy"},
+		{"explicit jmap", AccountConfig{SyncEngine: "jmap", JMAP: &JMAPConfig{SessionURL: "https://mail.example/.well-known/jmap", Auth: "bearer"}}, "jmap"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -32,6 +33,9 @@ func TestEffectiveSyncEngine(t *testing.T) {
 			}
 			if c.acct.UsesGraphBackend() != (c.want == "graph") {
 				t.Errorf("UsesGraphBackend() disagrees with effective engine %q", c.want)
+			}
+			if c.acct.UsesJMAPBackend() != (c.want == "jmap") {
+				t.Errorf("UsesJMAPBackend() disagrees with effective engine %q", c.want)
 			}
 		})
 	}
@@ -124,6 +128,63 @@ func TestValidateConfig_SyncEngineInvalidValue(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected error for invalid sync_engine value, got errors: %v", errs)
+	}
+}
+
+func TestValidateConfig_JMAP(t *testing.T) {
+	valid := &Config{Accounts: []AccountConfig{{
+		Name: "Fastmail", Email: "me@example.com", SyncEngine: "jmap",
+		JMAP: &JMAPConfig{SessionURL: "https://api.fastmail.com/jmap/session", Auth: "bearer"},
+		SMTP: SMTPConfig{Port: 587, Auth: "password"},
+		IMAP: IMAPConfig{Port: 993, Auth: "password"},
+	}}}
+	for _, e := range ValidateConfig(valid) {
+		if e.Severity == "error" {
+			t.Fatalf("valid JMAP config rejected: %v", e)
+		}
+	}
+
+	invalid := &Config{Accounts: []AccountConfig{{
+		Name: "Broken", Email: "me@example.com", SyncEngine: "jmap",
+	}}}
+	found := false
+	for _, e := range ValidateConfig(invalid) {
+		if strings.Contains(e.Field, "sync_engine") && strings.Contains(e.Message, "jmap") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing JMAP block was not rejected: %v", ValidateConfig(invalid))
+	}
+
+	invalid.Accounts[0].JMAP = &JMAPConfig{SessionURL: "/jmap/session", Auth: "password"}
+	found = false
+	for _, e := range ValidateConfig(invalid) {
+		if strings.Contains(e.Field, "jmap.session_url") && strings.Contains(e.Message, "absolute") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("relative JMAP session URL was not rejected: %v", ValidateConfig(invalid))
+	}
+}
+
+func TestNativeMailAccountSelection(t *testing.T) {
+	cfg := &Config{Accounts: []AccountConfig{
+		{Name: "legacy", IMAP: IMAPConfig{Host: "imap.example.test"}},
+		{Name: "engine", SyncEngine: "engine", IMAP: IMAPConfig{Host: "imap.example.test"}},
+		{Name: "graph", SyncEngine: "graph", OAuth: &OAuthConfig{Provider: "microsoft"}},
+		{Name: "gmail", SyncEngine: "gmail", OAuth: &OAuthConfig{Provider: "google"}},
+		{Name: "jmap", SyncEngine: "jmap", JMAP: &JMAPConfig{SessionURL: "https://mail.example.test/jmap/session", Auth: "password"}},
+		{Name: "none"},
+	}}
+	mailAccounts := cfg.GetMailSyncAccounts()
+	if len(mailAccounts) != 5 {
+		t.Fatalf("GetMailSyncAccounts() returned %d accounts, want 5", len(mailAccounts))
+	}
+	watchAccounts := cfg.GetEngineAccounts()
+	if len(watchAccounts) != 3 || watchAccounts[0].Name != "engine" || watchAccounts[1].Name != "graph" || watchAccounts[2].Name != "jmap" {
+		t.Fatalf("GetEngineAccounts() = %#v, want engine/graph/jmap", watchAccounts)
 	}
 }
 

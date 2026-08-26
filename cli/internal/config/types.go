@@ -191,17 +191,18 @@ type AccountConfig struct {
 	Notifications    *bool                  `pkl:"notifications" json:"notifications"` // Per-account notification override (nil = use global setting)
 	SMTP             SMTPConfig             `pkl:"smtp" json:"smtp"`
 	IMAP             IMAPConfig             `pkl:"imap" json:"imap"`
+	JMAP             *JMAPConfig            `pkl:"jmap" json:"jmap"`
 	Auth             *AuthConfig            `pkl:"auth" json:"auth"`
 	OAuth            *OAuthConfig           `pkl:"oauth" json:"oauth"`
 	Calendar         *AccountCalendarConfig `pkl:"calendar" json:"calendar"` // Vdir calendar export settings (nil = defaults)
 	// SyncEngine selects the sync implementation for this account:
 	//   "engine" — the provider-agnostic engine on the IMAP backend;
 	//   "graph"  — the engine on the Microsoft Graph backend;
+	//   "gmail"  — the engine on the Gmail REST backend;
+	//   "jmap"   — the engine on the configured JMAP server;
 	//   "legacy" — the classic IMAP syncer.
-	// When unset, Microsoft accounts default to "graph" and everything else to
-	// "legacy" (see EffectiveSyncEngine). Not supported for Google accounts (the
-	// engine has no X-GM-LABELS path); "graph" additionally requires a Microsoft
-	// account.
+	// When unset, Microsoft accounts default to "graph", Google accounts to
+	// "gmail", and everything else to "legacy" (see EffectiveSyncEngine).
 	SyncEngine string `pkl:"sync_engine" json:"sync_engine"`
 }
 
@@ -229,7 +230,7 @@ func (a *AccountConfig) EffectiveSyncEngine() string {
 // provider-agnostic engine (on any backend) instead of the legacy IMAP syncer.
 func (a *AccountConfig) UsesSyncEngine() bool {
 	e := a.EffectiveSyncEngine()
-	return e == "engine" || e == "graph" || e == "gmail"
+	return e == "engine" || e == "graph" || e == "gmail" || e == "jmap"
 }
 
 // UsesGraphBackend reports whether the engine should drive the Microsoft Graph
@@ -242,6 +243,12 @@ func (a *AccountConfig) UsesGraphBackend() bool {
 // backend rather than the IMAP backend for this account.
 func (a *AccountConfig) UsesGmailBackend() bool {
 	return a.EffectiveSyncEngine() == "gmail"
+}
+
+// UsesJMAPBackend reports whether the engine should drive the standards-based
+// JMAP backend rather than IMAP or a provider-specific REST backend.
+func (a *AccountConfig) UsesJMAPBackend() bool {
+	return a.EffectiveSyncEngine() == "jmap"
 }
 
 // CalendarDir returns the subdirectory name under the vdir base path for this
@@ -365,6 +372,13 @@ type IMAPConfig struct {
 	MaxMessages int      `pkl:"max_messages" json:"max_messages"`
 	BatchSize   int      `pkl:"batch_size" json:"batch_size"`
 	Mailboxes   []string `pkl:"mailboxes" json:"mailboxes"`
+}
+
+// JMAPConfig contains the JMAP session endpoint and authentication mode. The
+// credential itself is stored in the OS keychain under the account email.
+type JMAPConfig struct {
+	SessionURL string `pkl:"session_url" json:"session_url"`
+	Auth       string `pkl:"auth" json:"auth"` // "password" or "bearer"
 }
 
 // AuthConfig contains password-based authentication settings.

@@ -1,0 +1,27 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "backendfactory",
+    srcs = ["backendfactory.go"],
+    importpath = "github.com/julion2/durian/cli/internal/backendfactory",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "//cli/internal/backend",
+        "//cli/internal/config",
+        "//cli/internal/gmailbackend",
+        "//cli/internal/graphbackend",
+        "//cli/internal/imapbackend",
+        "//cli/internal/jmapbackend",
+    ],
+)
+
+go_test(
+    name = "backendfactory_test",
+    size = "small",
+    srcs = ["backendfactory_test.go"],
+    embed = [":backendfactory"],
+    deps = [
+        "//cli/internal/config",
+        "//cli/internal/jmapbackend",
+    ],
+)

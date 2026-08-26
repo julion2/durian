@@ -586,7 +586,7 @@ func (d *DB) SetSyncedLabels(messageID, account, syncedLabels string) error {
 
 // LabelStateRow is one message's label-upload state: its durable Message-ID,
 // the provider ref to modify, the last-synced label baseline, and the current
-// local tags. Used by the label three-way upload (Gmail).
+// local tags. Used by the label three-way upload (Gmail/JMAP).
 type LabelStateRow struct {
 	MessageID    string
 	RemoteRef    string

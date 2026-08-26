@@ -34,16 +34,16 @@ Durian is a terminal-first email client with a SwiftUI GUI on macOS and a Qt6 GU
                           via `durian tagsync push/pull`)
 ```
 
-**One backend, many frontends.** The Go CLI is the only component that talks to the mail providers (IMAP/SMTP, Microsoft Graph, Gmail API) and owns the SQLite store. Both GUIs are thin HTTP clients to `localhost:9723` — they never touch the DB directly.
+**One backend, many frontends.** The Go CLI is the only component that talks to the mail providers (IMAP/SMTP, Microsoft Graph, Gmail API, JMAP) and owns the SQLite store. Both GUIs are thin HTTP clients to `localhost:9723` — they never touch the DB directly.
 
 ## Directory layout
 
 | Path | Purpose |
 |---|---|
 | `cli/cmd/durian/` | CLI commands (`sync`, `serve`, `auth`, `search`, `send`, `validate`, `contacts`, …) |
-| `cli/internal/handler/` | HTTP API handlers + IMAP IDLE watcher (`watcher.go`) + Graph poll watcher (`enginewatcher.go`) + SSE event hub |
+| `cli/internal/handler/` | HTTP API handlers + IMAP IDLE watcher (`watcher.go`) + native-backend poll/push watcher (`enginewatcher.go`) + SSE event hub |
 | `cli/internal/backend/` | The provider-neutral `Backend` seam: interface, `Capabilities`, `LabelWriter`, neutral `Message`/`Folder`/`Flags`/`Cursor` types |
-| `cli/internal/imapbackend/`, `graphbackend/`, `gmailbackend/` | The three `Backend` implementations (IMAP, Microsoft Graph, Gmail REST) |
+| `cli/internal/imapbackend/`, `graphbackend/`, `gmailbackend/`, `jmapbackend/` | Provider-neutral backend implementations (IMAP, Microsoft Graph, Gmail REST, JMAP) |
 | `cli/internal/syncengine/` | Provider-neutral sync engine: cursor-paged fetch, ingest, three-way flag merge, folder-move + label upload |
 | `cli/internal/imap/` | Legacy IMAP syncer (`sync_engine = "legacy"`) + the low-level IMAP client that `imapbackend` reuses |
 | `cli/internal/store/` | SQLite schema, FTS5 search, tags, attachments, local drafts, outbox |
@@ -119,7 +119,7 @@ Search uses notmuch-style query syntax (`tag:inbox AND from:boss@example.com`) p
 
 ## Sync model
 
-Durian talks to three kinds of mail provider through **one neutral seam**. An
+Durian talks to mail providers through **one neutral seam**. An
 account's `sync_engine` (resolved by `AccountConfig.EffectiveSyncEngine`) picks
 the path:
 
@@ -128,6 +128,7 @@ the path:
 | `legacy` (default for IMAP) | any IMAP | the classic `imap.Syncer` + IDLE watcher |
 | `graph` (default + required for Microsoft) | Microsoft 365 | `graphbackend` + `syncengine` + poll watcher |
 | `gmail` (default for Google) | Gmail | `gmailbackend` + `syncengine`, synced on demand |
+| `jmap` | Fastmail / JMAP | `jmapbackend` + `syncengine` + EventSource push watcher |
 | `engine` | generic IMAP | `imapbackend` + `syncengine` (opt-in) |
 
 ### The Backend seam
@@ -142,18 +143,21 @@ handle, never a store key.
 A `Capabilities` struct lets the engine adapt to provider quirks without
 branching on provider names: `ServerSideSent` (provider auto-saves Sent),
 `NativeMove`, `PushWatch`, `FlagChangesInDelta` (the delta already carries flag
-changes, so the flag pass is O(changes)), `LabelsAreTags` (Gmail — `Message.Labels`
+changes, so the flag pass is O(changes)), `LabelsAreTags` (Gmail/JMAP — `Message.Labels`
 is the authoritative tag set), and `AnsweredUnsupported` (Gmail can't persist
 `\Answered`, so it's excluded from the merge to stop per-sync ping-pong). A
 label-native backend also implements the optional `LabelWriter` interface
 (`LabelTags`, `ApplyLabels`).
 
-The three implementations: **`imapbackend`** wraps the existing `cli/internal/imap`
+The implementations: **`imapbackend`** wraps the existing `cli/internal/imap`
 client; **`graphbackend`** speaks Microsoft Graph (`/me` or `/users/{email}` for
 shared mailboxes, cursor = Graph delta URL, native `/move`); **`gmailbackend`**
 speaks the Gmail REST API (no folders — one "All Mail" stream, labels-as-tags,
-cursor = `history.list` historyId). Graph and Gmail send via a dedicated
-`sender.go` in each package.
+cursor = `history.list` historyId); **`jmapbackend`** discovers RFC 8620/8621
+endpoints, exposes one account-wide stream, maps mailbox memberships to tags,
+and advances an `Email/changes` state cursor. `backendfactory` is the shared
+composition root used by sync, body/attachment fetching, and daemon watchers.
+Graph, Gmail, and JMAP send via a dedicated `sender.go` in each package.
 
 ### The engine
 
@@ -179,6 +183,9 @@ of the legacy path's IMAP-UIDNEXT diffing.
   full-mailbox pass) funneled through one per-account mutex. Cadence adapts to
   whether an SSE client is attached (inbox 30 s active / 2 m idle; full 5 m / 15 m),
   with backoff and jitter.
+- **JMAP EventSource** (`handler/enginewatcher.go`) — an account-wide push stream
+  triggers serialized incremental syncs; a slow full poll remains as recovery
+  for dropped notifications.
 
 Gmail-engine accounts are not polled by a resident watcher on this path — they
 sync through `durian sync` (invoked manually or by the GUI's periodic sync).
@@ -188,9 +195,10 @@ sync through `durian sync` (invoked manually or by the GUI's periodic sync).
 `EffectiveSyncEngine` defaults Microsoft OAuth to `graph`, Google OAuth to
 `gmail`, and everything else to `legacy` (the provider presets set the value
 explicitly). `durian validate` rejects the impossible combinations: `graph` on a
-non-Microsoft account, `gmail` on a non-Google account, and `legacy`/`engine` on
+non-Microsoft account, `gmail` on a non-Google account, `jmap` without its
+session configuration, and `legacy`/`engine` on
 a Microsoft account (Microsoft must use Graph). Each backend namespaces its
-cursor file (`-graph`, `-gmail`, unsuffixed for IMAP) so switching engines can't
+cursor file (`-graph`, `-gmail`, `-jmap`, unsuffixed for IMAP) so switching engines can't
 feed one backend another's incompatible cursor — it just forces a fresh full
 resync, which is safe because the store upserts by Message-ID.
 
@@ -247,7 +255,7 @@ Three languages (Go, Swift, C++/Qt), two platforms, one binary cache, reproducib
 ## Where to look next
 
 - **Adding a new API endpoint**: `cli/internal/handler/` + matching entry in `cli/cmd/durian/serve.go` route list + `openapi.yaml`.
-- **Changing the sync logic**: `cli/internal/syncengine/engine.go` for the neutral engine (Graph/Gmail/opt-in IMAP); `cli/internal/imap/sync_mailbox.go` + `sync_flags.go` for the legacy IMAP path. Adding a provider = a new `backend.Backend` implementation.
+- **Changing the sync logic**: `cli/internal/syncengine/engine.go` for the neutral engine (Graph/Gmail/JMAP/opt-in IMAP); `cli/internal/imap/sync_mailbox.go` + `sync_flags.go` for the legacy IMAP path. Adding a provider = a new `backend.Backend` implementation plus factory wiring.
 - **Adding a GUI feature**: start in the appropriate Swift Manager (`macos/durian/Managers/`), wire it to views.
 - **Adding a CLI command**: `cli/cmd/durian/` — each command is a Cobra subcommand.
 - **Onboarding end users**: [Getting Started](../../getting-started/).
