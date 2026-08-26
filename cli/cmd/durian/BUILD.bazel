@@ -38,19 +38,17 @@ go_library(
         "//cli/internal/agekey",
         "//cli/internal/auth",
         "//cli/internal/backend",
+        "//cli/internal/backendfactory",
         "//cli/internal/calendar",
         "//cli/internal/calendarsync",
         "//cli/internal/config",
         "//cli/internal/contacts",
         "//cli/internal/dbcrypto",
         "//cli/internal/draft",
-        "//cli/internal/gmailbackend",
         "//cli/internal/googlecalendar",
-        "//cli/internal/graphbackend",
         "//cli/internal/graphcalendar",
         "//cli/internal/handler",
         "//cli/internal/imap",
-        "//cli/internal/imapbackend",
         "//cli/internal/keychain",
         "//cli/internal/mail",
         "//cli/internal/mailsend",
@@ -75,8 +73,15 @@ go_library(
 go_test(
     name = "durian_test",
     size = "small",
-    srcs = ["calendar_test.go"],
+    srcs = [
+        "auth_test.go",
+        "calendar_test.go",
+    ],
     embed = [":durian_lib"],
+    deps = [
+        "//cli/internal/config",
+        "//cli/internal/keychain",
+    ],
 )
 
 go_binary(

@@ -377,3 +377,28 @@ func (c *Config) GetGraphAccounts() []*AccountConfig {
 	}
 	return accounts
 }
+
+// GetEngineAccounts returns accounts driven by the provider-neutral background
+// watcher in durian serve.
+func (c *Config) GetEngineAccounts() []*AccountConfig {
+	var accounts []*AccountConfig
+	for i := range c.Accounts {
+		if c.Accounts[i].UsesSyncEngine() {
+			accounts = append(accounts, &c.Accounts[i])
+		}
+	}
+	return accounts
+}
+
+// GetMailSyncAccounts returns every account with a usable sync transport.
+// Native API accounts do not need an IMAP host.
+func (c *Config) GetMailSyncAccounts() []*AccountConfig {
+	var accounts []*AccountConfig
+	for i := range c.Accounts {
+		account := &c.Accounts[i]
+		if account.IMAP.Host != "" || account.UsesGraphBackend() || account.UsesGmailBackend() || account.UsesJMAPBackend() {
+			accounts = append(accounts, account)
+		}
+	}
+	return accounts
+}

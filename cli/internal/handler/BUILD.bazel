@@ -26,14 +26,13 @@ go_library(
     deps = [
         "//cli/internal/auth",
         "//cli/internal/backend",
+        "//cli/internal/backendfactory",
         "//cli/internal/calendar",
         "//cli/internal/calendarsync",
         "//cli/internal/config",
         "//cli/internal/contacts",
         "//cli/internal/encoding",
-        "//cli/internal/graphbackend",
         "//cli/internal/imap",
-        "//cli/internal/imapbackend",
         "//cli/internal/mail",
         "//cli/internal/mailsend",
         "//cli/internal/protocol",
@@ -65,6 +64,7 @@ go_test(
     ],
     embed = [":handler"],
     deps = [
+        "//cli/internal/backend",
         "//cli/internal/calendar",
         "//cli/internal/calendarsync",
         "//cli/internal/config",

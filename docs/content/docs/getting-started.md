@@ -88,7 +88,8 @@ durian validate
 Pick one guide based on your provider:
 
 - **Gmail or Microsoft 365** → [OAuth setup](../auth/oauth/)
-- **GMX, web.de, iCloud, Fastmail, custom IMAP** → [Password setup](../auth/password/)
+- **Fastmail or another JMAP provider** → configure the [JMAP sync engine](../configuration/config/#sync-engine), then store its API token with `durian auth login <alias>`
+- **GMX, web.de, iCloud, custom IMAP** → [Password setup](../auth/password/)
 
 After following the guide, you should be able to run:
 

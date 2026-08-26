@@ -2,10 +2,9 @@
 // backend's folders, pages incremental changes via opaque per-folder cursors,
 // ingests messages into the SQLite store, and applies folder/flag/rule tags.
 //
-// This is the Phase 1 strangler-fig replacement for the legacy imap.Syncer.
-// Both coexist: Gmail accounts stay on the legacy syncer (X-GM-LABELS), while
-// Microsoft/generic-IMAP accounts move to this engine, where folder-role
-// mapping is authoritative.
+// It coexists with the legacy imap.Syncer. Backend-specific cursor suffixes let
+// Graph, Gmail, JMAP, and opt-in IMAP state coexist without one implementation
+// reading another's cursor format.
 package syncengine
 
 import (
@@ -47,7 +46,7 @@ type FileCursorStore struct {
 	// suffix namespaces the cursor file by backend, so a cursor written by one
 	// backend (e.g. an IMAP MailboxState) is never fed to a different backend
 	// (e.g. a Graph deltaLink) for the same account. Empty for IMAP, "-graph"
-	// for the Graph backend.
+	// for Graph, "-gmail" for Gmail, and "-jmap" for JMAP.
 	suffix string
 }
 

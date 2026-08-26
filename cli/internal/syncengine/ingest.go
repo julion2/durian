@@ -262,7 +262,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		}
 	}
 
-	// Tags from the source's organization: a label backend (Gmail) mirrors the
+	// Tags from the source's organization: a label backend (Gmail/JMAP) mirrors the
 	// message's labels to tags (add + remove against the baseline); everything
 	// else applies the folder-role SPECIAL-USE tag mapping.
 	if opts.LabelsAsTags {

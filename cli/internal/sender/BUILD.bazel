@@ -10,6 +10,7 @@ go_library(
         "//cli/internal/config",
         "//cli/internal/gmailbackend",
         "//cli/internal/graphbackend",
+        "//cli/internal/jmapbackend",
         "//cli/internal/mailsend",
         "//cli/internal/smtp",
     ],

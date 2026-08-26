@@ -1,10 +1,9 @@
 // Package backend defines the provider-agnostic mail sync abstraction.
 //
-// Both the IMAP syncer (Gmail, generic providers) and the Microsoft Graph
-// backend implement Backend, so the sync engine, store, tags and search stay
-// provider-neutral. Message identity is always the RFC822 Message-ID plus the
-// account; RemoteRef is only the provider's own transient handle for follow-up
-// operations and is never used as a primary key.
+// IMAP, Microsoft Graph, Gmail REST, and JMAP backends implement Backend, so the
+// sync engine, store, tags and search stay provider-neutral. Message identity is
+// always the RFC822 Message-ID plus the account; RemoteRef is only the provider's
+// own transient handle for follow-up operations and is never used as a primary key.
 package backend
 
 import (
@@ -60,6 +59,12 @@ type RemoteRef struct {
 // failure worth retrying. Retrying an ErrRefGone operation can never succeed —
 // providers that renumber on move (Graph) never resurrect an old id.
 var ErrRefGone = errors.New("remote ref no longer exists on server")
+
+// ErrPartialFlags reports that FetchFlags resolved a usable subset of the
+// requested refs. The returned map must contain every successfully resolved
+// ref; the engine reconciles that subset, reports the error, and leaves omitted
+// refs pending without pinning message-download progress.
+var ErrPartialFlags = errors.New("some remote flags remain unresolved")
 
 // Cursor is an opaque, per-folder incremental-sync token, owned and interpreted
 // solely by the Backend that issued it. The sync engine persists it verbatim
@@ -121,17 +126,25 @@ type FetchResult struct {
 	// HasMore reports that limit was reached and more changes remain; the engine
 	// should call FetchMessages again with Cursor to continue paginating.
 	HasMore bool
+	// FullSnapshot reports that this page is part of a complete replacement
+	// snapshot. Present contains every remote ref that existed in this page of
+	// that snapshot. Once the final page is processed, the engine removes local
+	// refs that were not present in any page. A sequence may switch once from
+	// delta to FullSnapshot when an intermediate provider cursor expires and
+	// enumeration restarts from the beginning; it must never switch back to
+	// delta. Delta-capable backends use this to recover safely when a server can
+	// no longer calculate changes from a cursor.
+	FullSnapshot bool
+	Present      []RemoteRef
+	// Unavailable is the subset of Present whose body the provider explicitly
+	// denied access to. Replacement reconciliation preserves an existing local
+	// copy but does not require a locally absent ref to be hydrated.
+	Unavailable []RemoteRef
 }
 
 // Capabilities describes backend-specific behavior the sync engine adapts to,
 // so provider quirks stay out of the engine's control flow.
 type Capabilities struct {
-	// ServerSideSent reports the provider auto-saves sent mail (Gmail, M365),
-	// so Durian must not append its own Sent copy.
-	ServerSideSent bool
-	// NativeMove reports a true atomic move (Graph) rather than the IMAP
-	// copy + \Deleted + expunge dance.
-	NativeMove bool
 	// PushWatch reports real push/delta notifications rather than poll-only.
 	PushWatch bool
 	// FlagChangesInDelta reports that FetchMessages already surfaces server-side
@@ -140,7 +153,7 @@ type Capabilities struct {
 	// polling every message's flags each sync, which is O(changes) not O(mailbox).
 	FlagChangesInDelta bool
 	// LabelsAreTags reports that Message.Labels is the authoritative tag set for
-	// each message (Gmail), so the engine mirrors those labels to Durian tags —
+	// each message (Gmail/JMAP), so the engine mirrors those labels to Durian tags —
 	// adding new ones and removing labels the server dropped — instead of the
 	// folder-role tag mapping. Durian-local tags (rules, flags) are left intact.
 	LabelsAreTags bool
@@ -176,7 +189,9 @@ type Backend interface {
 	// FetchFlags returns the current server flag state for the given messages in a
 	// folder, keyed by RemoteRef.ID. Messages the backend cannot resolve are simply
 	// absent from the map. The engine drives the three-way merge; the backend only
-	// reports server state (and applies changes via ApplyFlags).
+	// reports server state (and applies changes via ApplyFlags). A backend may
+	// return a non-nil map with an error wrapping ErrPartialFlags when only a
+	// subset resolved; other errors make the map unusable.
 	FetchFlags(ctx context.Context, folder string, refs []RemoteRef) (map[string]Flags, error)
 
 	// Move relocates ref into destFolder, returning its new handle. Returns an
@@ -190,6 +205,8 @@ type Backend interface {
 	Send(ctx context.Context, msg []byte) error
 
 	// Watch blocks and invokes onChange whenever folder changes, until ctx is done.
+	// An empty folder requests an account-wide watch; implementations that only
+	// support per-folder push should watch INBOX in that case.
 	Watch(ctx context.Context, folder string, onChange func()) error
 
 	// Capabilities describes optional behaviors the sync engine should adapt to.
@@ -211,9 +228,31 @@ type LabelWriter interface {
 	LabelTags(ctx context.Context) ([]string, error)
 
 	// ApplyLabels resolves each add/remove tag to its server label and applies
-	// the change to ref in one call. Tags with no server label are skipped; a
-	// call that resolves to no change is a no-op. The engine resets its baseline
+	// the change to ref in one call. An unknown added tag returns an error rather
+	// than silently losing a local change. The engine resets its baseline
 	// to the deterministic (local tags ∩ LabelTags) set itself, so ApplyLabels
 	// returns only an error.
 	ApplyLabels(ctx context.Context, ref RemoteRef, add, remove []string) error
+}
+
+// SnapshotHydrator is implemented by metadata-first backends. A replacement
+// snapshot can list every remote ref cheaply; the engine then asks for full
+// messages only for refs that are not already in the local read model before it
+// advances the replacement cursor.
+type SnapshotBatch struct {
+	// Messages contains every requested ref that still exists.
+	Messages []Message
+	// Missing contains requested refs that the provider explicitly reported as
+	// gone after the authoritative snapshot was listed. The engine removes them
+	// from that snapshot rather than retrying an impossible hydration forever.
+	Missing []RemoteRef
+}
+
+type SnapshotHydrator interface {
+	// FetchSnapshotMetadata returns current flags and labels for locally existing
+	// refs without downloading their RFC 5322 bodies. Every requested ref must
+	// appear in either Messages or Missing.
+	FetchSnapshotMetadata(ctx context.Context, refs []RemoteRef) (SnapshotBatch, error)
+	// FetchSnapshotMessages returns complete messages for locally absent refs.
+	FetchSnapshotMessages(ctx context.Context, refs []RemoteRef) (SnapshotBatch, error)
 }

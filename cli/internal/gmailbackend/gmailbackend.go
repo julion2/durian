@@ -42,6 +42,10 @@ const (
 	defaultBaseURL = "https://gmail.googleapis.com/gmail/v1"
 	// tokenExpiryBuffer refreshes the access token slightly before it expires.
 	tokenExpiryBuffer = 2 * time.Minute
+	// RAW messages are base64url-encoded inside JSON; leave room for Gmail's
+	// largest accepted messages plus encoding overhead while still bounding
+	// every response allocation.
+	maxJSONBytes = 128 << 20
 	// allMailStream is the single synthetic folder the engine iterates: Gmail is
 	// folderless, so all messages flow through one stream and their labels become
 	// tags. "me" is Gmail's alias for the authenticated user in message queries.
@@ -81,6 +85,8 @@ type Backend struct {
 	tagToID map[string]string
 }
 
+var _ backend.SnapshotHydrator = (*Backend)(nil)
+
 // Compile-time check that Backend satisfies the interface.
 var _ backend.Backend = (*Backend)(nil)
 var _ backend.LabelWriter = (*Backend)(nil)
@@ -95,8 +101,16 @@ func New(account *config.AccountConfig) (*Backend, error) {
 		account:      account,
 		clientID:     account.OAuth.ClientID,
 		clientSecret: account.OAuth.ClientSecret,
-		httpClient:   &http.Client{Timeout: 60 * time.Second},
 		baseURL:      defaultBaseURL,
+	}
+	b.httpClient = &http.Client{
+		Timeout: 60 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			return validateAuthenticatedURL(b.baseURL, req.URL.String())
+		},
 	}
 	b.tokenFn = b.cachedGoogleToken
 	return b, nil
@@ -135,13 +149,22 @@ func (e *statusError) Error() string {
 	return fmt.Sprintf("gmail request failed: status %d: %s", e.status, e.body)
 }
 
-// do executes one authenticated Gmail request with throttle handling: it retries
+// do executes one authenticated Gmail request with throttle handling: for
+// idempotent HTTP methods it retries
 // 429 and quota 403 (rateLimitExceeded / userRateLimitExceeded) honoring the
-// Retry-After header, and retries 503 once, all with exponential backoff and
+// Retry-After header, and retries any 5xx once, all with exponential backoff and
 // respecting ctx. A non-retryable response (including a permission 403) is
 // returned with its body intact so the caller can read the error.
 func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*http.Response, error) {
+	return b.doWithRetry(ctx, method, reqURL, body, method == http.MethodGet || method == http.MethodHead)
+}
+
+func (b *Backend) doWithRetry(ctx context.Context, method, reqURL string, body []byte, safeToRetry bool) (*http.Response, error) {
 	const maxRetries = 3
+
+	if err := validateAuthenticatedURL(b.baseURL, reqURL); err != nil {
+		return nil, fmt.Errorf("refusing Gmail request URL: %w", err)
+	}
 
 	backoff := time.Second
 	transientRetried := false
@@ -169,7 +192,7 @@ func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*
 		}
 
 		switch {
-		case resp.StatusCode == http.StatusTooManyRequests && attempt < maxRetries:
+		case safeToRetry && resp.StatusCode == http.StatusTooManyRequests && attempt < maxRetries:
 			delay := retryAfter(resp, backoff)
 			drainClose(resp)
 			slog.Warn("Gmail throttled (429), backing off", "module", "GMAILBACKEND", "retry", attempt+1, "delay", delay)
@@ -177,7 +200,7 @@ func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*
 				return nil, err
 			}
 			backoff *= 2
-		case resp.StatusCode == http.StatusForbidden && attempt < maxRetries:
+		case safeToRetry && resp.StatusCode == http.StatusForbidden && attempt < maxRetries:
 			// A 403 is either a quota error (retryable) or a real permission
 			// error (not). Buffer the body to tell them apart without losing it.
 			buf, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
@@ -192,7 +215,7 @@ func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*
 				return nil, err
 			}
 			backoff *= 2
-		case resp.StatusCode == http.StatusServiceUnavailable && !transientRetried:
+		case safeToRetry && resp.StatusCode >= http.StatusInternalServerError && !transientRetried:
 			transientRetried = true
 			drainClose(resp)
 			if err := sleepCtx(ctx, backoff); err != nil {
@@ -227,6 +250,10 @@ func isQuotaBody(b []byte) bool {
 // doJSON executes a Gmail request and decodes the JSON response into out (out
 // may be nil to discard the body).
 func (b *Backend) doJSON(ctx context.Context, method, reqURL string, body any, out any) error {
+	return b.doJSONWithRetry(ctx, method, reqURL, body, out, method == http.MethodGet || method == http.MethodHead)
+}
+
+func (b *Backend) doJSONWithRetry(ctx context.Context, method, reqURL string, body any, out any, safeToRetry bool) error {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -234,7 +261,7 @@ func (b *Backend) doJSON(ctx context.Context, method, reqURL string, body any, o
 			return fmt.Errorf("marshal request: %w", err)
 		}
 	}
-	resp, err := b.do(ctx, method, reqURL, payload)
+	resp, err := b.doWithRetry(ctx, method, reqURL, payload, safeToRetry)
 	if err != nil {
 		return err
 	}
@@ -246,10 +273,47 @@ func (b *Backend) doJSON(ctx context.Context, method, reqURL string, body any, o
 	if out == nil {
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if err := decodeJSONLimited(resp.Body, maxJSONBytes, out); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
+}
+
+func validateAuthenticatedURL(baseURL, requestURL string) error {
+	base, err := url.Parse(baseURL)
+	if err != nil || !base.IsAbs() || base.User != nil {
+		return errors.New("Gmail base URL is invalid")
+	}
+	target, err := url.Parse(requestURL)
+	if err != nil || !target.IsAbs() || target.User != nil || (target.Scheme != "http" && target.Scheme != "https") {
+		return errors.New("authenticated URL must be an absolute HTTP(S) URL without userinfo")
+	}
+	if !strings.EqualFold(base.Scheme, target.Scheme) ||
+		!strings.EqualFold(base.Hostname(), target.Hostname()) || effectivePort(base) != effectivePort(target) {
+		return errors.New("authenticated URL origin differs from Gmail API origin")
+	}
+	return nil
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
+func decodeJSONLimited(r io.Reader, limit int64, out any) error {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > limit {
+		return fmt.Errorf("Gmail JSON response exceeds %d bytes", limit)
+	}
+	return json.Unmarshal(data, out)
 }
 
 func newStatusError(resp *http.Response) error {
@@ -349,12 +413,132 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 	if gc.HistoryID != "" {
 		res, err := b.historySync(ctx, folder, gc, limit)
 		if isNotFound(err) {
-			slog.Info("Gmail historyId expired, restarting full sync", "module", "GMAILBACKEND")
-			return b.initialList(ctx, folder, gmailCursor{}, limit)
+			slog.Info("Gmail historyId expired, reconciling remote IDs", "module", "GMAILBACKEND")
+			return b.replacementSnapshot(ctx, folder)
 		}
 		return res, err
 	}
 	return b.initialList(ctx, folder, gc, limit)
+}
+
+// replacementSnapshot cheaply reconciles an expired history cursor from
+// messages.list IDs only. The history snapshot is captured first, so changes
+// concurrent with the listing are replayed by the next incremental sync.
+func (b *Backend) replacementSnapshot(ctx context.Context, folder string) (backend.FetchResult, error) {
+	snapshot, err := b.profileHistoryID(ctx)
+	if err != nil {
+		return backend.FetchResult{}, fmt.Errorf("snapshot historyId: %w", err)
+	}
+	q := url.Values{}
+	q.Set("includeSpamTrash", "true")
+	q.Set("maxResults", "500")
+	var refs []backend.RemoteRef
+	priorToken := ""
+	for {
+		var page gmailMessageList
+		if err := b.doJSON(ctx, http.MethodGet, b.baseURL+"/users/me/messages?"+q.Encode(), nil, &page); err != nil {
+			return backend.FetchResult{}, fmt.Errorf("list replacement snapshot: %w", err)
+		}
+		for _, message := range page.Messages {
+			if message.ID != "" {
+				refs = append(refs, backend.RemoteRef{Folder: folder, ID: message.ID})
+			}
+		}
+		if page.NextPageToken == "" {
+			break
+		}
+		if page.NextPageToken == priorToken {
+			return backend.FetchResult{}, errors.New("Gmail replacement snapshot pagination made no progress")
+		}
+		priorToken = page.NextPageToken
+		q.Set("pageToken", page.NextPageToken)
+	}
+	if len(refs) == 0 {
+		// A false-empty authoritative snapshot would delete the account's
+		// complete local read model. Gmail exposes no exact total with which to
+		// distinguish that response from a genuinely empty mailbox, so prefer a
+		// retry over irreversible local deletion.
+		return backend.FetchResult{}, errors.New("Gmail replacement snapshot returned no messages")
+	}
+	return backend.FetchResult{
+		Cursor:       encodeCursor(gmailCursor{HistoryID: snapshot}),
+		FullSnapshot: true,
+		Present:      refs,
+	}, nil
+}
+
+// FetchSnapshotMessages hydrates only replacement-snapshot refs absent from
+// Durian's local read model; the engine determines that set before calling.
+func (b *Backend) FetchSnapshotMessages(ctx context.Context, refs []backend.RemoteRef) (backend.SnapshotBatch, error) {
+	if len(refs) == 0 {
+		return backend.SnapshotBatch{}, nil
+	}
+	folder := refs[0].Folder
+	batch := backend.SnapshotBatch{}
+	ids := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		ids = append(ids, ref.ID)
+	}
+	messages, missing, err := b.fetchMany(ctx, folder, ids)
+	batch.Messages = messages
+	for _, id := range missing {
+		batch.Missing = append(batch.Missing, backend.RemoteRef{Folder: folder, ID: id})
+	}
+	return batch, err
+}
+
+// FetchSnapshotMetadata refreshes flags and labels for replacement-snapshot
+// refs already in Durian without downloading their raw MIME bodies.
+func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.RemoteRef) (backend.SnapshotBatch, error) {
+	messages := make([]backend.Message, len(refs))
+	errs := make([]error, len(refs))
+	missing := make([]bool, len(refs))
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, fetchConcurrency)
+	for i := range refs {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return backend.SnapshotBatch{}, ctx.Err()
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ref := refs[i]
+			var gm gmailMessage
+			endpoint := b.baseURL + "/users/me/messages/" + url.PathEscape(ref.ID) + "?format=MINIMAL"
+			if err := b.doJSON(ctx, http.MethodGet, endpoint, nil, &gm); err != nil {
+				if isNotFound(err) {
+					missing[i] = true
+				} else {
+					errs[i] = err
+				}
+				return
+			}
+			messages[i] = backend.Message{
+				Ref:   backend.RemoteRef{Folder: ref.Folder, ID: gm.ID},
+				Flags: flagsFromLabels(gm.LabelIDs), Labels: b.resolveLabels(gm.LabelIDs),
+			}
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return backend.SnapshotBatch{}, fmt.Errorf("fetch snapshot metadata: %w", err)
+		}
+	}
+	batch := backend.SnapshotBatch{Messages: messages[:0]}
+	for i, message := range messages {
+		if missing[i] {
+			batch.Missing = append(batch.Missing, refs[i])
+			continue
+		}
+		batch.Messages = append(batch.Messages, message)
+	}
+	return batch, nil
 }
 
 // profileHistoryID returns the mailbox's current historyId (users.getProfile),
@@ -403,7 +587,7 @@ func (b *Backend) initialList(ctx context.Context, folder string, gc gmailCursor
 	for i, m := range page.Messages {
 		ids[i] = m.ID
 	}
-	msgs, err := b.fetchMany(ctx, folder, ids)
+	msgs, _, err := b.fetchMany(ctx, folder, ids)
 	if err != nil {
 		return result, err
 	}
@@ -456,9 +640,10 @@ const fetchConcurrency = 20
 // fetchMany downloads the raw MIME for each id concurrently, preserving order.
 // A 404 (message deleted since it was listed) is skipped; any other error fails
 // the whole call so the caller does not advance the cursor past a lost message.
-func (b *Backend) fetchMany(ctx context.Context, folder string, ids []string) ([]backend.Message, error) {
+func (b *Backend) fetchMany(ctx context.Context, folder string, ids []string) ([]backend.Message, []string, error) {
 	msgs := make([]backend.Message, len(ids))
 	errs := make([]error, len(ids))
+	missing := make([]bool, len(ids))
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, fetchConcurrency)
@@ -467,7 +652,7 @@ func (b *Backend) fetchMany(ctx context.Context, folder string, ids []string) ([
 		case sem <- struct{}{}:
 		case <-ctx.Done():
 			wg.Wait()
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		}
 		wg.Add(1)
 		go func(i int) {
@@ -475,7 +660,9 @@ func (b *Backend) fetchMany(ctx context.Context, folder string, ids []string) ([
 			defer func() { <-sem }()
 			m, err := b.fetchOne(ctx, folder, ids[i])
 			if err != nil {
-				if !isNotFound(err) {
+				if isNotFound(err) {
+					missing[i] = true
+				} else {
 					errs[i] = err // own slot: no shared write, no mutex
 				}
 				return // 404 -> leave msgs[i] zero, filtered out below
@@ -487,17 +674,20 @@ func (b *Backend) fetchMany(ctx context.Context, folder string, ids []string) ([
 
 	for _, e := range errs {
 		if e != nil {
-			return nil, fmt.Errorf("fetch message: %w", e)
+			return nil, nil, fmt.Errorf("fetch message: %w", e)
 		}
 	}
 	// Drop skipped (zero) entries in place, preserving order.
 	out := msgs[:0]
-	for _, m := range msgs {
-		if m.Ref.ID != "" {
+	var missingIDs []string
+	for i, m := range msgs {
+		if missing[i] {
+			missingIDs = append(missingIDs, ids[i])
+		} else {
 			out = append(out, m)
 		}
 	}
-	return out, nil
+	return out, missingIDs, nil
 }
 
 // gmailHistoryRef is a message reference inside a history record.
@@ -577,7 +767,7 @@ func (b *Backend) historySync(ctx context.Context, folder string, gc gmailCursor
 			toFetch = append(toFetch, id)
 		}
 	}
-	msgs, err := b.fetchMany(ctx, folder, toFetch)
+	msgs, _, err := b.fetchMany(ctx, folder, toFetch)
 	if err != nil {
 		return result, err
 	}
@@ -762,8 +952,6 @@ func parseInternalDate(ms string) time.Time {
 
 func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
-		// Gmail auto-saves a Sent copy, so Durian must not append its own.
-		ServerSideSent: true,
 		// history.list reports label changes (including UNREAD/STARRED), so a
 		// server-side flag change surfaces in the incremental stream — the engine
 		// reconciles flags from it (via FetchFlags) instead of polling every message.
@@ -813,8 +1001,8 @@ func (b *Backend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, re
 	if len(removeLabels) > 0 {
 		body["removeLabelIds"] = removeLabels
 	}
-	if err := b.doJSON(ctx, http.MethodPost,
-		b.baseURL+"/users/me/messages/"+url.PathEscape(ref.ID)+"/modify", body, nil); err != nil {
+	if err := b.doJSONWithRetry(ctx, http.MethodPost,
+		b.baseURL+"/users/me/messages/"+url.PathEscape(ref.ID)+"/modify", body, nil, true); err != nil {
 		return fmt.Errorf("modify labels for %s: %w", ref.ID, err)
 	}
 	slog.Debug("Applied flags", "module", "GMAILBACKEND", "id", ref.ID, "add", addLabels, "remove", removeLabels) // encgrep:allow logs Gmail reserved label names (UNREAD/STARRED), not message content
@@ -911,8 +1099,8 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 	if len(removeIDs) > 0 {
 		body["removeLabelIds"] = removeIDs
 	}
-	if err := b.doJSON(ctx, http.MethodPost,
-		b.baseURL+"/users/me/messages/"+url.PathEscape(ref.ID)+"/modify", body, nil); err != nil {
+	if err := b.doJSONWithRetry(ctx, http.MethodPost,
+		b.baseURL+"/users/me/messages/"+url.PathEscape(ref.ID)+"/modify", body, nil, true); err != nil {
 		return fmt.Errorf("modify labels for %s: %w", ref.ID, err)
 	}
 	slog.Debug("Applied labels", "module", "GMAILBACKEND", "id", ref.ID, "add", addIDs, "remove", removeIDs) // encgrep:allow logs Gmail label ids, not message content

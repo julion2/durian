@@ -169,6 +169,7 @@ func (ms *MailboxState) Reset(uidValidity uint32) {
 	ms.UIDValidity = uidValidity
 	ms.LastUID = 0
 	ms.SyncedUIDs = make([]uint32, 0)
+	ms.syncedSet = make(map[uint32]struct{})
 	ms.MessageFlags = make(map[uint32]FlagState)
 	ms.UIDToMessageID = make(map[uint32]string)
 	ms.MessageIDToUID = make(map[string]uint32)

@@ -37,8 +37,8 @@ var (
 
 var sendCmd = &cobra.Command{
 	Use:   "send",
-	Short: "Send an email via SMTP",
-	Long:  "Send an email via SMTP. Omit --body to compose in $EDITOR.",
+	Short: "Send an email",
+	Long:  "Send an email through the account's configured transport. Omit --body to compose in $EDITOR.",
 	Example: `  durian send --to "recipient@example.com" --subject "Hello" --body "Message"
   durian send --to "main@example.com" --cc "copy@example.com" --bcc "hidden@example.com" --subject "Hello" --body "Message"
   durian send --to "..." --subject "..." --body "..." --attach file.pdf --attach file2.jpg
@@ -87,11 +87,6 @@ func runSend(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("no default account configured\nUse --from to specify an account or set default=true in config.pkl")
 		}
-	}
-
-	// Check SMTP config
-	if account.SMTP.Host == "" {
-		return fmt.Errorf("no SMTP host configured for %s", account.Email)
 	}
 
 	// Get To address (prompt if not provided)
@@ -215,7 +210,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Resolve the account's transport (SMTP today; Graph/Gmail slot in later).
+	// Resolve the account's configured SMTP, Graph, Gmail, or JMAP transport.
 	mailSender, err := sender.For(account)
 	if err != nil {
 		return err
@@ -228,10 +223,9 @@ func runSend(cmd *cobra.Command, args []string) error {
 
 	fmt.Fprintf(os.Stderr, "✓ Email sent successfully to %s\n", to)
 
-	// Save a copy to the IMAP Sent folder
-	// Skip for providers that auto-save sent mail (Google, Microsoft)
-	if account.OAuth != nil && (account.OAuth.Provider == "google" || account.OAuth.Provider == "microsoft") {
-		fmt.Fprintf(os.Stderr, "✓ %s saves sent mail automatically\n", account.OAuth.Provider)
+	// Some transports save sent mail server-side.
+	if mailSender.SavesSentCopy() {
+		fmt.Fprintln(os.Stderr, "✓ Provider saves sent mail automatically")
 		return nil
 	}
 

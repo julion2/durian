@@ -119,19 +119,27 @@ class AccountCalendarConfig {
 // ── Account ────────────────────────────────────────────────
 
 class SMTPConfig {
-  host: String
+  host: String = ""
   port: Int(this == 465 || this == 587) = 587
-  auth: "password"|"oauth2"
+  auth: "password"|"oauth2" = "password"
   max_attachment_size: String = "25MB"
 }
 
 class IMAPConfig {
-  host: String
+  host: String = ""
   port: Int = 993
-  auth: "password"|"oauth2"
+  auth: "password"|"oauth2" = "password"
   max_messages: Int = 5000
   batch_size: Int(this > 0) = 100
   mailboxes: Listing<String>?
+}
+
+class JMAPConfig {
+  /// Absolute JMAP session URL, normally the provider's /.well-known/jmap endpoint.
+  session_url: String(!isEmpty)
+  /// Password uses HTTP Basic auth; bearer uses an API token. The secret is
+  /// always read from the OS keychain by `durian auth login`.
+  auth: "password"|"bearer" = "password"
 }
 
 class AuthConfig {
@@ -154,8 +162,10 @@ class AccountConfig {
   default: Boolean = false
   default_signature: String?
   notifications: Boolean?
-  smtp: SMTPConfig
-  imap: IMAPConfig
+  /// SMTP and IMAP are optional for native API backends such as JMAP.
+  smtp: SMTPConfig = new {}
+  imap: IMAPConfig = new {}
+  jmap: JMAPConfig?
   auth: AuthConfig?
   oauth: OAuthConfig?
   /// Vdir calendar sync settings (Microsoft and Google accounts).
@@ -163,10 +173,12 @@ class AccountConfig {
   /// Sync implementation: "legacy" (default for IMAP accounts) uses the classic
   /// IMAP syncer; "engine" uses the provider-agnostic engine on the IMAP
   /// backend; "graph" uses the Microsoft Graph backend; "gmail" uses the Gmail
-  /// REST backend (labels become tags). The microsoft365 template sets "graph"
-  /// and the gmail template sets "gmail"; for those providers the IMAP paths are
-  /// rejected. "graph" requires Microsoft, "gmail" requires Google.
-  sync_engine: "legacy"|"engine"|"graph"|"gmail" = "legacy"
+  /// REST backend; "jmap" uses the configured JMAP server. Gmail labels and
+  /// JMAP mailbox memberships become Durian tags. The microsoft365 template
+  /// sets "graph" and the gmail template sets "gmail"; for those providers the
+  /// IMAP paths are rejected. "graph" requires Microsoft, "gmail" requires Google,
+  /// and "jmap" requires a jmap block.
+  sync_engine: "legacy"|"engine"|"graph"|"gmail"|"jmap" = "legacy"
 }
 
 // ── Defaults ───────────────────────────────────────────────

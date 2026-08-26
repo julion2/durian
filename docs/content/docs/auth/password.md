@@ -75,7 +75,7 @@ After this, `durian` will no longer prompt for Keychain access.
 | web.de | smtp.web.de | 587 | Max 20MB attachments |
 | Yahoo | smtp.mail.yahoo.com | 587 | Use app password |
 | iCloud | smtp.mail.me.com | 587 | Use app-specific password |
-| Fastmail | smtp.fastmail.com | 587 | Use app password |
+| Fastmail | smtp.fastmail.com | 587 | IMAP/SMTP fallback; native [JMAP](../../configuration/config/#sync-engine) is recommended |
 
 ## Troubleshooting
 

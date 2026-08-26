@@ -45,6 +45,7 @@ const (
 	// tokenExpiryBuffer refreshes the cached Graph token this long before its
 	// actual expiry, so a request never starts with an about-to-expire token.
 	tokenExpiryBuffer = 5 * time.Minute
+	maxJSONBytes      = 16 << 20
 )
 
 // errNotImplemented marks the methods that have not landed yet (append, send,
@@ -112,9 +113,17 @@ func New(account *config.AccountConfig) (*Backend, error) {
 		clientID:     account.OAuth.ClientID,
 		clientSecret: account.OAuth.ClientSecret,
 		tenant:       account.OAuth.Tenant,
-		httpClient:   &http.Client{Timeout: 60 * time.Second},
 		baseURL:      defaultBaseURL,
 		mailbox:      mailbox,
+	}
+	b.httpClient = &http.Client{
+		Timeout: 60 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			return validateAuthenticatedURL(b.baseURL, req.URL.String())
+		},
 	}
 	b.tokenFn = b.cachedGraphToken
 	return b, nil
@@ -157,15 +166,24 @@ func (e *statusError) Error() string {
 	return fmt.Sprintf("graph request failed: status %d: %s", e.status, e.body)
 }
 
-// do executes one authenticated Graph request with throttle handling: up to 3
-// retries on 429 honoring the Retry-After header, and one retry with a short
-// backoff on 503/504. All waits respect ctx cancellation. The caller owns the
-// returned response body (including non-2xx responses).
+// do executes one authenticated Graph request with throttle handling. GET/HEAD
+// requests retry on 429 and once on any 5xx; mutation requests are never
+// replayed because the first response may have been lost after the server
+// committed it. All waits respect ctx cancellation.
 func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*http.Response, error) {
+	safeToRetry := method == http.MethodGet || method == http.MethodHead
+	return b.doWithRetry(ctx, method, reqURL, body, safeToRetry)
+}
+
+func (b *Backend) doWithRetry(ctx context.Context, method, reqURL string, body []byte, safeToRetry bool) (*http.Response, error) {
 	const (
 		maxThrottleRetries = 3
 		transientBackoff   = 2 * time.Second
 	)
+
+	if err := validateAuthenticatedURL(b.baseURL, reqURL); err != nil {
+		return nil, fmt.Errorf("refusing graph request URL: %w", err)
+	}
 
 	throttleRetries := 0
 	transientRetried := false
@@ -194,7 +212,7 @@ func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*
 		}
 
 		switch {
-		case resp.StatusCode == http.StatusTooManyRequests && throttleRetries < maxThrottleRetries:
+		case safeToRetry && resp.StatusCode == http.StatusTooManyRequests && throttleRetries < maxThrottleRetries:
 			throttleRetries++
 			delay := retryAfter(resp)
 			drainClose(resp)
@@ -203,7 +221,7 @@ func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*
 			if err := sleepCtx(ctx, delay); err != nil {
 				return nil, err
 			}
-		case (resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout) && !transientRetried:
+		case safeToRetry && resp.StatusCode >= http.StatusInternalServerError && !transientRetried:
 			transientRetried = true
 			drainClose(resp)
 			slog.Warn("Graph transient error, retrying once", "module", "GRAPHBACKEND",
@@ -220,6 +238,10 @@ func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*
 // doJSON executes a Graph request with an optional JSON body and decodes the
 // JSON response into out (out may be nil to discard the response).
 func (b *Backend) doJSON(ctx context.Context, method, reqURL string, body any, out any) error {
+	return b.doJSONWithRetry(ctx, method, reqURL, body, out, method == http.MethodGet || method == http.MethodHead)
+}
+
+func (b *Backend) doJSONWithRetry(ctx context.Context, method, reqURL string, body any, out any, safeToRetry bool) error {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -229,7 +251,7 @@ func (b *Backend) doJSON(ctx context.Context, method, reqURL string, body any, o
 		}
 	}
 
-	resp, err := b.do(ctx, method, reqURL, payload)
+	resp, err := b.doWithRetry(ctx, method, reqURL, payload, safeToRetry)
 	if err != nil {
 		return err
 	}
@@ -241,10 +263,47 @@ func (b *Backend) doJSON(ctx context.Context, method, reqURL string, body any, o
 	if out == nil {
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if err := decodeJSONLimited(resp.Body, maxJSONBytes, out); err != nil {
 		return fmt.Errorf("failed to decode graph response: %w", err)
 	}
 	return nil
+}
+
+func validateAuthenticatedURL(baseURL, requestURL string) error {
+	base, err := url.Parse(baseURL)
+	if err != nil || !base.IsAbs() || base.User != nil {
+		return errors.New("graph base URL is invalid")
+	}
+	target, err := url.Parse(requestURL)
+	if err != nil || !target.IsAbs() || target.User != nil || (target.Scheme != "http" && target.Scheme != "https") {
+		return errors.New("authenticated URL must be an absolute HTTP(S) URL without userinfo")
+	}
+	if !strings.EqualFold(base.Scheme, target.Scheme) ||
+		!strings.EqualFold(base.Hostname(), target.Hostname()) || effectivePort(base) != effectivePort(target) {
+		return errors.New("authenticated URL origin differs from Graph API origin")
+	}
+	return nil
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
+func decodeJSONLimited(r io.Reader, limit int64, out any) error {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > limit {
+		return fmt.Errorf("graph JSON response exceeds %d bytes", limit)
+	}
+	return json.Unmarshal(data, out)
 }
 
 // doRaw executes a GET and streams the raw response body (e.g. RFC822 MIME
@@ -410,21 +469,47 @@ type deltaPage struct {
 	DeltaLink string      `json:"@odata.deltaLink"`
 }
 
+type graphCursor struct {
+	URL             string `json:"url"`
+	FullReplacement bool   `json:"fullReplacement,omitempty"`
+}
+
+func decodeGraphCursor(cursor backend.Cursor) graphCursor {
+	if len(cursor) == 0 {
+		return graphCursor{}
+	}
+	var state graphCursor
+	if cursor[0] == '{' && json.Unmarshal(cursor, &state) == nil && state.URL != "" {
+		return state
+	}
+	return graphCursor{URL: string(cursor)}
+}
+
+func encodeGraphCursor(state graphCursor) backend.Cursor {
+	if !state.FullReplacement {
+		return backend.Cursor(state.URL)
+	}
+	encoded, _ := json.Marshal(state)
+	return encoded
+}
+
 // FetchMessages returns the changes in folder since cursor via the Graph delta
 // query. One call consumes exactly one delta page — Graph controls the page
 // size, so limit is only a soft hint and is not enforced here. Each changed
 // message triggers a separate raw MIME ($value) fetch, because the delta JSON
-// has no RFC822 body; a message whose body fetch fails is skipped with a
-// warning rather than aborting the batch. HasMore reports a pending
-// @odata.nextLink; the returned cursor is that nextLink, or the
-// @odata.deltaLink once the delta round is complete.
+// has no RFC822 body. A transient body failure aborts the page so its cursor is
+// not advanced; an explicit 404 is treated as a concurrent deletion and a 403
+// as permanently inaccessible content. HasMore reports a pending
+// @odata.nextLink; the returned cursor is that nextLink, or the @odata.deltaLink
+// once the delta round is complete.
 func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backend.Cursor, limit int) (backend.FetchResult, error) {
 	_ = limit // Soft hint only: Graph fixes the delta page size server-side.
 	var result backend.FetchResult
 
 	freshURL := fmt.Sprintf("%s%s/mailFolders/%s/messages/delta?$select=%s",
 		b.baseURL, b.mailbox, url.PathEscape(folder), deltaSelect)
-	pageURL := string(cursor)
+	state := decodeGraphCursor(cursor)
+	pageURL := state.URL
 	if pageURL == "" {
 		pageURL = freshURL
 	}
@@ -437,6 +522,7 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 		// instead of the whole account sync aborting.
 		if pageURL != freshURL && isSyncStateExpired(err) {
 			slog.Info("Graph delta token expired, restarting full delta for folder", "module", "GRAPHBACKEND", "folder", folder) // encgrep:allow folder name is operational sync metadata, not message content
+			state.FullReplacement = true
 			page = deltaPage{}
 			if err := b.doJSON(ctx, http.MethodGet, freshURL, nil, &page); err != nil {
 				return result, fmt.Errorf("failed to restart delta for %s: %w", folder, err)
@@ -465,10 +551,33 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 		}
 		content = append(content, item)
 	}
-	result.Messages = b.fetchBodies(ctx, folder, content)
+	messages, missing, unavailable, err := b.fetchBodies(ctx, folder, content)
+	if err != nil {
+		return backend.FetchResult{}, err
+	}
+	result.Messages = messages
+	for _, id := range missing {
+		result.Deleted = append(result.Deleted, backend.Deletion{Ref: backend.RemoteRef{Folder: folder, ID: id}})
+	}
+	if state.FullReplacement {
+		result.FullSnapshot = true
+		missingSet := make(map[string]struct{}, len(missing))
+		for _, id := range missing {
+			missingSet[id] = struct{}{}
+		}
+		result.Present = make([]backend.RemoteRef, 0, len(content)-len(missingSet))
+		for _, item := range content {
+			if _, gone := missingSet[item.ID]; !gone {
+				result.Present = append(result.Present, backend.RemoteRef{Folder: folder, ID: item.ID})
+			}
+		}
+		for _, id := range unavailable {
+			result.Unavailable = append(result.Unavailable, backend.RemoteRef{Folder: folder, ID: id})
+		}
+	}
 
 	if page.NextLink != "" {
-		result.Cursor = backend.Cursor(page.NextLink)
+		result.Cursor = encodeGraphCursor(graphCursor{URL: page.NextLink, FullReplacement: state.FullReplacement})
 		result.HasMore = true
 	} else {
 		result.Cursor = backend.Cursor(page.DeltaLink)
@@ -484,11 +593,14 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 // per-app throttle ceiling (do() still backs off on a 429).
 const fetchConcurrency = 6
 
-// fetchBodies downloads the raw MIME for each content item concurrently and
-// returns the successfully fetched messages. A per-message fetch failure skips
-// only that message (logged), never the whole page.
-func (b *Backend) fetchBodies(ctx context.Context, folder string, items []deltaItem) []backend.Message {
+// fetchBodies downloads raw MIME concurrently. Explicit 404s are reported as
+// missing refs. A permanent per-item 403 is unavailable; other failures hold
+// the page cursor so transient outages cannot silently lose mail.
+func (b *Backend) fetchBodies(ctx context.Context, folder string, items []deltaItem) ([]backend.Message, []string, []string, error) {
 	msgs := make([]backend.Message, len(items)) // indexed by item; failures stay zero
+	errs := make([]error, len(items))
+	missing := make([]bool, len(items))
+	unavailable := make([]bool, len(items))
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, fetchConcurrency)
@@ -498,7 +610,7 @@ func (b *Backend) fetchBodies(ctx context.Context, folder string, items []deltaI
 		case sem <- struct{}{}:
 		case <-ctx.Done():
 			wg.Wait()
-			return filterFetched(msgs)
+			return nil, nil, nil, ctx.Err()
 		}
 		wg.Add(1)
 		go func(i int) {
@@ -506,15 +618,45 @@ func (b *Backend) fetchBodies(ctx context.Context, folder string, items []deltaI
 			defer func() { <-sem }()
 			msg, err := b.fetchOne(ctx, folder, items[i])
 			if err != nil {
-				slog.Warn("Failed to fetch raw MIME, skipping message", "module", "GRAPHBACKEND",
-					"folder", folder, "id", items[i].ID, "err", err)
+				var statusErr *statusError
+				if errors.As(err, &statusErr) {
+					switch statusErr.status {
+					case http.StatusNotFound:
+						missing[i] = true
+					case http.StatusForbidden:
+						// Some protected Graph items expose metadata but deny
+						// $value permanently. Keep an existing local copy during a
+						// snapshot and let the delta advance past this one item.
+						slog.Warn("Graph message body is not accessible, skipping item", "module", "GRAPHBACKEND", // encgrep:allow folder/id are remote operational metadata, not message content
+							"folder", folder, "id", items[i].ID, "status", statusErr.status)
+						unavailable[i] = true
+					default:
+						errs[i] = err
+					}
+				} else {
+					errs[i] = err
+				}
 				return
 			}
 			msgs[i] = msg // own slot: no shared write, no mutex needed
 		}(i)
 	}
 	wg.Wait()
-	return filterFetched(msgs)
+	for _, err := range errs {
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to fetch raw MIME: %w", err)
+		}
+	}
+	var missingIDs []string
+	var unavailableIDs []string
+	for i, gone := range missing {
+		if gone {
+			missingIDs = append(missingIDs, items[i].ID)
+		} else if unavailable[i] {
+			unavailableIDs = append(unavailableIDs, items[i].ID)
+		}
+	}
+	return filterFetched(msgs), missingIDs, unavailableIDs, nil
 }
 
 // filterFetched drops skipped (zero) entries in place, preserving order.
@@ -592,59 +734,110 @@ type flagFields struct {
 // only used for error context.
 func (b *Backend) FetchFlags(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
 	flags := make(map[string]backend.Flags, len(refs))
+	var partialErr error
 	for start := 0; start < len(refs); start += batchLimit {
 		chunk := refs[start:min(start+batchLimit, len(refs))]
-
-		// Sub-request ids are the chunk indices, mapped back to ref ids on the
-		// way out — Graph does not guarantee response ordering.
-		requests := make([]batchRequest, len(chunk))
-		refIDByRequestID := make(map[string]string, len(chunk))
-		for i, ref := range chunk {
-			requestID := strconv.Itoa(i)
-			requests[i] = batchRequest{
-				ID:     requestID,
-				Method: http.MethodGet,
-				URL:    b.mailbox + "/messages/" + url.PathEscape(ref.ID) + "?$select=id,isRead,flag",
-			}
-			refIDByRequestID[requestID] = ref.ID
+		chunkFlags, err := b.fetchFlagChunk(ctx, folder, chunk)
+		for id, state := range chunkFlags {
+			flags[id] = state
 		}
-
-		var envelope struct {
-			Responses []batchResponseItem `json:"responses"`
-		}
-		if err := b.doJSON(ctx, http.MethodPost, b.baseURL+"/$batch",
-			map[string]any{"requests": requests}, &envelope); err != nil {
-			return nil, fmt.Errorf("failed to batch-fetch flags in %s: %w", folder, err)
-		}
-
-		for _, item := range envelope.Responses {
-			refID, ok := refIDByRequestID[item.ID]
-			if !ok {
-				slog.Warn("Ignoring batch sub-response with unknown id", "module", "GRAPHBACKEND",
-					"folder", folder, "request_id", item.ID)
-				continue
+		if err != nil {
+			if !errors.Is(err, backend.ErrPartialFlags) {
+				return nil, err
 			}
-			if item.Status < 200 || item.Status >= 300 {
-				// 404 = message gone since the last delta: expected, stays absent
-				// from the map. Other statuses are unexpected but also just skip
-				// the one message rather than failing the whole reconciliation.
-				if item.Status != http.StatusNotFound {
-					slog.Warn("Batch flag fetch failed for message, skipping", "module", "GRAPHBACKEND",
-						"folder", folder, "id", refID, "status", item.Status)
-				}
-				continue
-			}
-			var msg flagFields
-			if err := json.Unmarshal(item.Body, &msg); err != nil {
-				return nil, fmt.Errorf("failed to decode batched flags for %s: %w", refID, err)
-			}
-			flags[refID] = flagsFromGraph(msg.IsRead, msg.Flag)
+			partialErr = errors.Join(partialErr, err)
 		}
 	}
 
 	slog.Debug("Fetched flags", "module", "GRAPHBACKEND", "folder", folder, // encgrep:allow logs folder name and flag counts, not flag values or message content
 		"requested", len(refs), "resolved", len(flags))
-	return flags, nil
+	return flags, partialErr
+}
+
+func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
+	const maxSubresponseRetries = 3
+	requests := make([]batchRequest, len(refs))
+	refIDByRequestID := make(map[string]string, len(refs))
+	for i, ref := range refs {
+		requestID := strconv.Itoa(i)
+		requests[i] = batchRequest{
+			ID:     requestID,
+			Method: http.MethodGet,
+			URL:    b.mailbox + "/messages/" + url.PathEscape(ref.ID) + "?$select=id,isRead,flag",
+		}
+		refIDByRequestID[requestID] = ref.ID
+	}
+
+	flags := make(map[string]backend.Flags, len(refs))
+	var forbidden []string
+	for attempt := 0; ; attempt++ {
+		var envelope struct {
+			Responses []batchResponseItem `json:"responses"`
+		}
+		// The outer request is POST, but every subrequest is GET, so replaying
+		// this particular batch is safe even though generic mutations are not.
+		if err := b.doJSONWithRetry(ctx, http.MethodPost, b.baseURL+"/$batch",
+			map[string]any{"requests": requests}, &envelope, true); err != nil {
+			return nil, fmt.Errorf("failed to batch-fetch flags in %s: %w", folder, err)
+		}
+
+		seen := make(map[string]struct{}, len(requests))
+		transient := make([]batchRequest, 0)
+		for _, item := range envelope.Responses {
+			refID, ok := refIDByRequestID[item.ID]
+			if !ok {
+				return nil, fmt.Errorf("batch flag fetch returned unknown request id %q", item.ID)
+			}
+			seen[item.ID] = struct{}{}
+			switch {
+			case item.Status >= 200 && item.Status < 300:
+				var msg flagFields
+				if err := json.Unmarshal(item.Body, &msg); err != nil {
+					return nil, fmt.Errorf("failed to decode batched flags for %s: %w", refID, err)
+				}
+				flags[refID] = flagsFromGraph(msg.IsRead, msg.Flag)
+			case item.Status == http.StatusNotFound:
+				// Message moved or disappeared after the delta; absence is the
+				// FetchFlags contract for a dead ref.
+			case item.Status == http.StatusForbidden:
+				// Unresolved, NOT dead: unlike the 404 above, absence here means
+				// "we were not allowed to read it", so the caller must be able to
+				// tell the two apart. Recorded and surfaced as ErrPartialFlags so
+				// the engine falls back to what the delta carried instead of
+				// treating the omission as a deletion.
+				forbidden = append(forbidden, refID)
+				slog.Warn("Graph flags are not accessible for message, skipping item", "module", "GRAPHBACKEND", // encgrep:allow folder/id are remote operational metadata, not message content
+					"folder", folder, "id", refID, "status", item.Status)
+			case item.Status == http.StatusTooManyRequests || item.Status >= http.StatusInternalServerError:
+				transient = append(transient, batchRequest{
+					ID: item.ID, Method: http.MethodGet,
+					URL: b.mailbox + "/messages/" + url.PathEscape(refID) + "?$select=id,isRead,flag",
+				})
+			default:
+				return nil, fmt.Errorf("batch flag fetch for %s failed with status %d", refID, item.Status)
+			}
+		}
+		if len(seen) != len(requests) {
+			return nil, fmt.Errorf("batch flag fetch returned %d of %d responses", len(seen), len(requests))
+		}
+		if len(transient) == 0 {
+			if len(forbidden) > 0 {
+				return flags, fmt.Errorf("%w: Graph denied flag access for %d message(s) in %s",
+					backend.ErrPartialFlags, len(forbidden), folder)
+			}
+			return flags, nil
+		}
+		if attempt >= maxSubresponseRetries {
+			return flags, fmt.Errorf("%w: Graph flags remain unavailable after %d retries in %s", backend.ErrPartialFlags, attempt, folder)
+		}
+		delay := time.Second << attempt
+		slog.Warn("Graph batch subrequest throttled, backing off", "module", "GRAPHBACKEND",
+			"folder", folder, "retry", attempt+1, "delay", delay)
+		if err := sleepCtx(ctx, delay); err != nil {
+			return nil, err
+		}
+		requests = transient
+	}
 }
 
 // ApplyFlags pushes flag changes to Graph by PATCHing only the message fields
@@ -747,13 +940,10 @@ func (b *Backend) Watch(ctx context.Context, _ string, _ func()) error {
 	return ctx.Err()
 }
 
-// Capabilities reports Graph backend behavior: M365 auto-saves sent mail
-// server-side, moves are native atomic operations, and there is no push
-// notification support (see Watch — none exists for mail on this transport).
+// Capabilities reports Graph delta behavior and the lack of a local push
+// notification transport (see Watch).
 func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
-		ServerSideSent:     true,
-		NativeMove:         true,
 		PushWatch:          false,
 		FlagChangesInDelta: true,
 	}

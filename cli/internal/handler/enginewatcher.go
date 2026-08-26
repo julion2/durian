@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -9,8 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/julion2/durian/cli/internal/backend"
+	"github.com/julion2/durian/cli/internal/backendfactory"
 	"github.com/julion2/durian/cli/internal/config"
-	"github.com/julion2/durian/cli/internal/graphbackend"
 	"github.com/julion2/durian/cli/internal/store"
 	"github.com/julion2/durian/cli/internal/syncengine"
 )
@@ -47,8 +49,17 @@ const (
 	probeJitter = 0.2
 	// maxProbeBackoff caps the exponential backoff after repeated failures.
 	maxProbeBackoff = 30 * time.Minute
-	// syncTimeout bounds one engine run so a hung request cannot wedge a loop.
-	syncTimeout = 5 * time.Minute
+	// Ordinary daemon passes retain the previous watchdog. A state-expiry
+	// replacement may extend it because the authoritative snapshot must finish
+	// atomically before its cursor can advance.
+	syncTimeout         = 5 * time.Minute
+	recoverySyncTimeout = 60 * time.Minute
+	// pushReconnectBase is the initial delay before rebuilding a push backend
+	// after its long-lived connection ends unexpectedly.
+	pushReconnectBase = time.Second
+	// maxPushReconnectBackoff prevents a broken push endpoint from being
+	// hammered while the independent slow poll remains available as recovery.
+	maxPushReconnectBackoff = time.Minute
 )
 
 // EngineWatcher keeps sync-engine accounts up to date inside `durian serve`.
@@ -70,8 +81,9 @@ type EngineWatcher struct {
 	groups         map[string]config.GroupEntry
 	indexedHeaders []string
 
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	mu       sync.Mutex
+	locks    map[string]*sync.Mutex
+	triggers map[string]chan struct{}
 }
 
 // NewEngineWatcher creates an EngineWatcher. It mirrors NewWatcherManager's
@@ -84,18 +96,39 @@ func NewEngineWatcher(hub *EventHub, st *store.DB, rules []config.RuleConfig, gr
 		groups:         groups,
 		indexedHeaders: indexedHeaders,
 		locks:          make(map[string]*sync.Mutex),
+		triggers:       make(map[string]chan struct{}),
 	}
 }
 
 // Start launches the watch loops for every account and blocks until ctx is
 // done. Accounts are independent: one failing account never stops another.
 func (w *EngineWatcher) Start(ctx context.Context, accounts []*config.AccountConfig) {
+	w.RegisterAccounts(accounts)
 	var wg sync.WaitGroup
 	for i, account := range accounts {
 		// Stagger account start-up so N accounts do not all fire their first
 		// probe in the same second.
 		offset := time.Duration(i) * 3 * time.Second
-		wg.Add(2)
+		w.mu.Lock()
+		trigger := w.triggers[account.AccountIdentifier()]
+		w.mu.Unlock()
+		wg.Add(3)
+		go func(a *config.AccountConfig, ch <-chan struct{}) {
+			defer wg.Done()
+			w.triggerLoop(ctx, a, ch)
+		}(account, trigger)
+		if w.pushEnabled(account) {
+			go func(a *config.AccountConfig, off time.Duration) {
+				defer wg.Done()
+				w.pushLoop(ctx, a, off)
+			}(account, offset)
+			go func(a *config.AccountConfig, off time.Duration) {
+				defer wg.Done()
+				// Keep a slow full poll as recovery for a dropped push connection.
+				w.loop(ctx, a, off+15*time.Second, false)
+			}(account, offset)
+			continue
+		}
 		go func(a *config.AccountConfig, off time.Duration) {
 			defer wg.Done()
 			w.loop(ctx, a, off, true)
@@ -110,6 +143,135 @@ func (w *EngineWatcher) Start(ctx context.Context, accounts []*config.AccountCon
 	slog.Info("Started engine watchers", "module", "ENGINEWATCH", "accounts", len(accounts), // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		"inbox_interval_active", inboxIntervalActive, "full_interval_active", fullIntervalActive)
 	wg.Wait()
+}
+
+// RegisterAccounts installs trigger queues synchronously, before the HTTP
+// handler starts accepting mutations. Start calls it too for non-daemon users.
+func (w *EngineWatcher) RegisterAccounts(accounts []*config.AccountConfig) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, account := range accounts {
+		id := account.AccountIdentifier()
+		if w.triggers[id] == nil {
+			w.triggers[id] = make(chan struct{}, 1)
+		}
+	}
+}
+
+// TriggerSync schedules a coalesced upload-only engine pass for account.
+func (w *EngineWatcher) TriggerSync(account string) {
+	w.mu.Lock()
+	trigger := w.triggers[account]
+	w.mu.Unlock()
+	if trigger == nil {
+		return
+	}
+	select {
+	case trigger <- struct{}{}:
+	default:
+	}
+}
+
+func (w *EngineWatcher) triggerLoop(ctx context.Context, account *config.AccountConfig, trigger <-chan struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-trigger:
+			if err := w.syncAccountMode(ctx, account, false, syncengine.UploadOnly); err != nil {
+				slog.Warn("Mutation-triggered engine sync failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
+			}
+		}
+	}
+}
+
+func (w *EngineWatcher) pushEnabled(account *config.AccountConfig) bool {
+	return backendfactory.PushWatch(account)
+}
+
+// pushLoop converts provider push notifications into serialized full engine
+// syncs. The buffered signal coalesces bursts while a sync is already running;
+// JMAP state cursors make one pass sufficient to consume every queued change.
+func (w *EngineWatcher) pushLoop(ctx context.Context, account *config.AccountConfig, startDelay time.Duration) {
+	w.pushLoopWith(ctx, account, startDelay, backendfactory.New, w.syncAccount)
+}
+
+func (w *EngineWatcher) pushLoopWith(
+	ctx context.Context,
+	account *config.AccountConfig,
+	startDelay time.Duration,
+	newBackend func(*config.AccountConfig) (backend.Backend, error),
+	syncAccount func(context.Context, *config.AccountConfig, bool) error,
+) {
+	if !sleepCtx(ctx, startDelay) {
+		return
+	}
+	failures := 0
+	inboxOnly := backendfactory.PushInboxOnly(account)
+	for {
+		// Establish a baseline before every (re)connection. A provider change
+		// while push was disconnected is then covered before listening resumes.
+		// Run this before constructing the watch backend: IMAP constructors open
+		// their connection eagerly, and some servers reject a second concurrent
+		// connection from the recovery sync.
+		if err := syncAccount(ctx, account, inboxOnly); err != nil {
+			slog.Warn("Push-backend recovery sync failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
+		}
+
+		b, err := newBackend(account)
+		if err != nil {
+			failures++
+			slog.Warn("Push backend creation failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
+			if !sleepCtx(ctx, pushReconnectDelay(failures)) {
+				return
+			}
+			continue
+		}
+
+		changes := make(chan struct{}, 1)
+		done := make(chan error, 1)
+		go func() {
+			done <- b.Watch(ctx, "", func() {
+				select {
+				case changes <- struct{}{}:
+				default:
+				}
+			})
+		}()
+		disconnected := false
+		for !disconnected {
+			select {
+			case <-ctx.Done():
+				// Watch owns protocol goroutines and must finish before Close runs.
+				<-done
+				_ = b.Close()
+				return
+			case err := <-done:
+				if err != nil && !errors.Is(err, context.Canceled) {
+					slog.Warn("Push watch stopped; reconnecting", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
+				}
+				disconnected = true
+			case <-changes:
+				failures = 0
+				if err := syncAccount(ctx, account, inboxOnly); err != nil {
+					slog.Warn("Push-triggered sync failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
+				}
+			}
+		}
+		_ = b.Close()
+		failures++
+		if !sleepCtx(ctx, pushReconnectDelay(failures)) {
+			return
+		}
+	}
+}
+
+func pushReconnectDelay(failures int) time.Duration {
+	delay := pushReconnectBase
+	for i := 1; i < failures && delay < maxPushReconnectBackoff; i++ {
+		delay *= 2
+	}
+	return min(delay, maxPushReconnectBackoff)
 }
 
 // loop runs one account's probe cycle. inboxOnly picks the fast inbox pass over
@@ -200,33 +362,40 @@ func (w *EngineWatcher) accountLock(account string) *sync.Mutex {
 
 // syncAccount runs one engine pass and broadcasts any new inbox arrivals.
 func (w *EngineWatcher) syncAccount(ctx context.Context, account *config.AccountConfig, inboxOnly bool) error {
+	return w.syncAccountMode(ctx, account, inboxOnly, syncengine.Bidirectional)
+}
+
+func (w *EngineWatcher) syncAccountMode(ctx context.Context, account *config.AccountConfig, inboxOnly bool, mode syncengine.Mode) error {
 	mu := w.accountLock(account.AccountIdentifier())
 	mu.Lock()
 	defer mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, syncTimeout)
-	defer cancel()
-
-	b, err := graphbackend.New(account)
+	b, err := backendfactory.New(account)
 	if err != nil {
 		return fmt.Errorf("connect backend: %w", err)
 	}
 	defer b.Close()
 
-	var folders []string
-	if inboxOnly {
-		// Matched against the folder's role, so this stays correct on a Graph
-		// mailbox whose inbox is an opaque id displayed in another language.
-		folders = []string{"INBOX"}
-	}
+	folders := watchedFolders(inboxOnly, b.Capabilities())
 
+	suffix := backendfactory.CursorSuffix(account)
+	var cursors syncengine.CursorStore = syncengine.NewFileCursorStore(account.AccountIdentifier())
+	if suffix != "" {
+		cursors = syncengine.NewFileCursorStoreWithSuffix(account.AccountIdentifier(), suffix)
+	}
 	engine := syncengine.New(syncengine.Options{
-		Store:        w.store,
-		Cursors:      syncengine.NewFileCursorStoreWithSuffix(account.AccountIdentifier(), "-graph"),
-		Account:      account.AccountIdentifier(),
-		BatchLimit:   account.GetIMAPBatchSize(),
-		MaxPerFolder: account.GetIMAPMaxMessages(),
-		Folders:      folders,
+		Store:      w.store,
+		Cursors:    cursors,
+		Account:    account.AccountIdentifier(),
+		BatchLimit: account.GetIMAPBatchSize(),
+		// Keep provider-engine semantics aligned with `durian sync`: an explicit
+		// zero means full local-first sync. Daemon passes retain the 5000-message
+		// safety cap so a large initial sync yields before its watchdog.
+		MaxPerFolder:    account.GetIMAPMaxMessages(),
+		Folders:         folders,
+		Mode:            mode,
+		Timeout:         syncTimeout,
+		RecoveryTimeout: recoverySyncTimeout,
 		Ingest: syncengine.IngestOptions{
 			Account:        account.AccountIdentifier(),
 			FilterRules:    w.filterRules,
@@ -239,12 +408,26 @@ func (w *EngineWatcher) syncAccount(ctx context.Context, account *config.Account
 	if err != nil {
 		return err
 	}
+	if len(res.Errors) > 0 {
+		return fmt.Errorf("engine sync completed with %d folder errors: %w", len(res.Errors), res.Errors[0])
+	}
 	if res.New > 0 || res.Deleted > 0 || res.Moved > 0 {
 		slog.Info("Engine watch sync applied changes", "module", "ENGINEWATCH", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			"account", account.AccountIdentifier(), "new", res.New,
 			"deleted", res.Deleted, "moved", res.Moved, "inbox_only", inboxOnly)
 	}
 	w.broadcastNewMail(account, res.NewMessageIDs)
+	return nil
+}
+
+func watchedFolders(inboxOnly bool, capabilities backend.Capabilities) []string {
+	// Matched against the folder's role, so this stays correct on a Graph
+	// mailbox whose inbox is an opaque id displayed in another language.
+	// Label-stream backends expose one account-wide RoleAll stream; arrivals are
+	// filtered by their inbox label after ingestion instead.
+	if inboxOnly && !capabilities.LabelsAreTags {
+		return []string{"INBOX"}
+	}
 	return nil
 }
 

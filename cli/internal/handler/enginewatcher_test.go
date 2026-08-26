@@ -1,9 +1,77 @@
 package handler
 
 import (
+	"context"
+	"errors"
+	"io"
 	"testing"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/backend"
+	"github.com/julion2/durian/cli/internal/config"
 )
+
+type watchBackend struct {
+	watch func(context.Context, func()) error
+}
+
+func (b *watchBackend) FetchFolders(context.Context) ([]backend.Folder, error) { return nil, nil }
+func (b *watchBackend) FetchMessages(context.Context, string, backend.Cursor, int) (backend.FetchResult, error) {
+	return backend.FetchResult{}, nil
+}
+func (b *watchBackend) FetchBody(context.Context, backend.RemoteRef, io.Writer) error { return nil }
+func (b *watchBackend) ApplyFlags(context.Context, backend.RemoteRef, backend.Flags, backend.Flags) error {
+	return nil
+}
+func (b *watchBackend) FetchFlags(context.Context, string, []backend.RemoteRef) (map[string]backend.Flags, error) {
+	return nil, nil
+}
+func (b *watchBackend) Move(context.Context, backend.RemoteRef, string) (backend.RemoteRef, error) {
+	return backend.RemoteRef{}, nil
+}
+func (b *watchBackend) Append(context.Context, string, backend.Flags, []byte) (backend.RemoteRef, error) {
+	return backend.RemoteRef{}, nil
+}
+func (b *watchBackend) Send(context.Context, []byte) error { return nil }
+func (b *watchBackend) Watch(ctx context.Context, _ string, onChange func()) error {
+	return b.watch(ctx, onChange)
+}
+func (b *watchBackend) Capabilities() backend.Capabilities {
+	return backend.Capabilities{PushWatch: true}
+}
+func (b *watchBackend) Close() error { return nil }
+
+type recordingSyncTrigger struct{ accounts []string }
+
+func (r *recordingSyncTrigger) TriggerSync(account string) { r.accounts = append(r.accounts, account) }
+
+func TestSyncTriggerGroupFansOut(t *testing.T) {
+	first, second := &recordingSyncTrigger{}, &recordingSyncTrigger{}
+	SyncTriggerGroup{first, nil, second}.TriggerSync("work")
+	if len(first.accounts) != 1 || first.accounts[0] != "work" || len(second.accounts) != 1 || second.accounts[0] != "work" {
+		t.Fatalf("fan-out = %v / %v", first.accounts, second.accounts)
+	}
+}
+
+func TestEngineWatcherRegistersTriggersSynchronously(t *testing.T) {
+	w := NewEngineWatcher(NewEventHub(), nil, nil, nil, nil)
+	account := &config.AccountConfig{Name: "JMAP", Alias: "jmap"}
+	w.RegisterAccounts([]*config.AccountConfig{account})
+	w.TriggerSync("jmap")
+	w.mu.Lock()
+	queued := len(w.triggers["jmap"])
+	w.mu.Unlock()
+	if queued != 1 {
+		t.Fatalf("queued triggers = %d, want 1 before Start", queued)
+	}
+	w.TriggerSync("jmap")
+	w.mu.Lock()
+	coalesced := len(w.triggers["jmap"])
+	w.mu.Unlock()
+	if coalesced != 1 {
+		t.Fatalf("coalesced triggers = %d, want 1", coalesced)
+	}
+}
 
 // TestEngineWatcherIntervalTiers proves the cadence policy: fast on the inbox
 // while a GUI is attached, slower everywhere else, and slower again once the
@@ -49,6 +117,58 @@ func TestEngineWatcherBackoff(t *testing.T) {
 		if got > time.Duration(float64(maxProbeBackoff)*(1+probeJitter)) {
 			t.Errorf("nextInterval(%d failures) = %v, want <= %v (+jitter)", failures, got, maxProbeBackoff)
 		}
+	}
+}
+
+func TestEngineWatcherReconnectsStoppedPushBackend(t *testing.T) {
+	w := NewEngineWatcher(NewEventHub(), nil, nil, nil, nil)
+	account := &config.AccountConfig{Name: "IMAP", Alias: "imap"}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	created := make(chan int, 2)
+	count := 0
+	factory := func(*config.AccountConfig) (backend.Backend, error) {
+		count++
+		created <- count
+		if count == 1 {
+			return &watchBackend{watch: func(context.Context, func()) error {
+				return errors.New("IDLE connection dropped")
+			}}, nil
+		}
+		return &watchBackend{watch: func(ctx context.Context, _ func()) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}}, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		w.pushLoopWith(ctx, account, 0, factory, func(context.Context, *config.AccountConfig, bool) error { return nil })
+		close(done)
+	}()
+	for want := 1; want <= 2; want++ {
+		select {
+		case got := <-created:
+			if got != want {
+				t.Fatalf("created backend %d, want %d", got, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for backend creation %d", want)
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("push loop did not stop after cancellation")
+	}
+}
+
+func TestWatchedFoldersUsesAllMailForLabelBackends(t *testing.T) {
+	if got := watchedFolders(true, backend.Capabilities{LabelsAreTags: true}); got != nil {
+		t.Fatalf("label-backend fast-pass folders = %v, want account-wide stream", got)
+	}
+	if got := watchedFolders(true, backend.Capabilities{}); len(got) != 1 || got[0] != "INBOX" {
+		t.Fatalf("folder-backend fast-pass folders = %v, want INBOX", got)
 	}
 }
 

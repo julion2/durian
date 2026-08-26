@@ -165,4 +165,17 @@ accounts: Listing<C.AccountConfig> = new {
     // once in your Cloud project. To fall back to IMAP: sync_engine = "legacy".
     // Then run: durian auth login gmail
   }
+
+  // ── JMAP (Fastmail or compatible server) ─────────────────
+  new {
+    name = "Fastmail"
+    email = "you@fastmail.com"
+    alias = "fastmail"
+    jmap {
+      session_url = "https://api.fastmail.com/jmap/session"
+      auth = "bearer"                  // "password" for Basic-auth JMAP servers
+    }
+    sync_engine = "jmap"
+    // Then run: durian auth login fastmail and paste a Fastmail API token.
+  }
 }

@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -118,8 +120,9 @@ func ValidateConfig(cfg *Config) []ValidationError {
 			}
 		}
 
+		nativeMail := acct.UsesGraphBackend() || acct.UsesGmailBackend() || acct.UsesJMAPBackend()
 		// SMTP
-		if acct.SMTP.Host != "" || acct.SMTP.Port != 0 {
+		if acct.SMTP.Host != "" || (acct.SMTP.Port != 0 && !nativeMail) {
 			if acct.SMTP.Host == "" {
 				add(prefix+".smtp.host", "required when smtp is configured")
 			}
@@ -137,7 +140,7 @@ func ValidateConfig(cfg *Config) []ValidationError {
 		}
 
 		// IMAP
-		if acct.IMAP.Host != "" || acct.IMAP.Port != 0 {
+		if acct.IMAP.Host != "" || (acct.IMAP.Port != 0 && !nativeMail) {
 			if acct.IMAP.Host == "" {
 				add(prefix+".imap.host", "required when imap is configured")
 			}
@@ -146,6 +149,23 @@ func ValidateConfig(cfg *Config) []ValidationError {
 			}
 			if acct.IMAP.Auth != "" && acct.IMAP.Auth != "password" && acct.IMAP.Auth != "oauth2" {
 				add(prefix+".imap.auth", fmt.Sprintf("must be \"password\" or \"oauth2\", got %q", acct.IMAP.Auth))
+			}
+		}
+
+		// JMAP
+		if acct.JMAP != nil {
+			sessionURL := strings.TrimSpace(acct.JMAP.SessionURL)
+			if sessionURL == "" {
+				add(prefix+".jmap.session_url", "required when jmap is configured")
+			} else if parsed, err := url.Parse(sessionURL); err != nil || !parsed.IsAbs() || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+				add(prefix+".jmap.session_url", "must be an absolute http or https URL")
+			} else if parsed.Scheme == "http" && !isLoopbackHost(parsed.Hostname()) {
+				add(prefix+".jmap.session_url", "must use https unless the host is loopback")
+			}
+			switch acct.JMAP.Auth {
+			case "", "password", "bearer":
+			default:
+				add(prefix+".jmap.auth", fmt.Sprintf("must be \"password\" or \"bearer\", got %q", acct.JMAP.Auth))
 			}
 		}
 
@@ -185,9 +205,9 @@ func ValidateConfig(cfg *Config) []ValidationError {
 
 		// Sync engine selection
 		switch acct.SyncEngine {
-		case "", "legacy", "engine", "graph", "gmail":
+		case "", "legacy", "engine", "graph", "gmail", "jmap":
 		default:
-			add(prefix+".sync_engine", fmt.Sprintf("must be \"legacy\", \"engine\", \"graph\", or \"gmail\", got %q", acct.SyncEngine))
+			add(prefix+".sync_engine", fmt.Sprintf("must be \"legacy\", \"engine\", \"graph\", \"gmail\", or \"jmap\", got %q", acct.SyncEngine))
 		}
 		// The IMAP-backend engine has no X-GM-LABELS path, so a Google account
 		// must use "gmail" (the Gmail REST backend) or "legacy", not "engine".
@@ -200,6 +220,12 @@ func ValidateConfig(cfg *Config) []ValidationError {
 		if acct.SyncEngine == "gmail" && (acct.OAuth == nil || acct.OAuth.Provider != "google") {
 			add(prefix+".sync_engine", "\"gmail\" requires a Google OAuth account")
 		}
+		if acct.SyncEngine == "jmap" && acct.JMAP == nil {
+			add(prefix+".sync_engine", "\"jmap\" requires a jmap configuration block")
+		}
+		if acct.JMAP != nil && !acct.UsesJMAPBackend() {
+			add(prefix+".sync_engine", "a jmap configuration block requires sync_engine = \"jmap\"")
+		}
 		if acct.OAuth != nil && acct.OAuth.Provider == "microsoft" &&
 			(acct.SyncEngine == "legacy" || acct.SyncEngine == "engine") {
 			add(prefix+".sync_engine", "Microsoft accounts sync via Graph; the IMAP path (\"legacy\"/\"engine\") is not supported")
@@ -211,6 +237,14 @@ func ValidateConfig(cfg *Config) []ValidationError {
 	}
 
 	return errs
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // ValidateRules validates rules.pkl entries. Pass a RuleQueryValidator to check match syntax.

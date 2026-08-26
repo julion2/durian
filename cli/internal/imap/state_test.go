@@ -208,6 +208,9 @@ func TestMailboxState_Reset(t *testing.T) {
 		LastUID:     500,
 		SyncedUIDs:  []uint32{100, 200, 300, 400, 500},
 	}
+	if !ms.IsUIDSynced(100) {
+		t.Fatal("expected UID 100 to be synced before reset")
+	}
 
 	ms.Reset(67890)
 
@@ -221,6 +224,9 @@ func TestMailboxState_Reset(t *testing.T) {
 
 	if len(ms.SyncedUIDs) != 0 {
 		t.Errorf("expected empty SyncedUIDs, got %v", ms.SyncedUIDs)
+	}
+	if ms.IsUIDSynced(100) {
+		t.Error("expected transient synced UID index to be cleared")
 	}
 }
 

@@ -14,9 +14,8 @@ import (
 	"time"
 
 	"github.com/julion2/durian/cli/internal/backend"
+	"github.com/julion2/durian/cli/internal/backendfactory"
 	"github.com/julion2/durian/cli/internal/config"
-	"github.com/julion2/durian/cli/internal/graphbackend"
-	"github.com/julion2/durian/cli/internal/imapbackend"
 	internmail "github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/protocol"
 	"github.com/julion2/durian/cli/internal/sanitize"
@@ -260,7 +259,7 @@ func (h *Handler) fetchAttachmentViaBackend(ctx context.Context, msg *store.Mess
 	}
 	b, err := newMailBackend(account)
 	if err != nil {
-		return nil, "", err
+		return nil, "", fmt.Errorf("create backend: %w", err)
 	}
 	defer b.Close()
 	var buf bytes.Buffer
@@ -271,13 +270,9 @@ func (h *Handler) fetchAttachmentViaBackend(ctx context.Context, msg *store.Mess
 	return internmail.ExtractAttachmentPart(buf.Bytes(), partID)
 }
 
-// newMailBackend builds the backend for an account: Graph for Graph-backed
-// accounts, IMAP otherwise.
+// newMailBackend builds the provider selected by account.sync_engine.
 func newMailBackend(account *config.AccountConfig) (backend.Backend, error) {
-	if account.UsesGraphBackend() {
-		return graphbackend.New(account)
-	}
-	return imapbackend.New(account)
+	return backendfactory.New(account)
 }
 
 // extractSenderEmail returns the lowercase email address from a

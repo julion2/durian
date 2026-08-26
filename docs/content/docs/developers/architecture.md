@@ -34,16 +34,16 @@ Durian is a terminal-first email client with a SwiftUI GUI on macOS and a Qt6 GU
                           via `durian tagsync push/pull`)
 ```
 
-**One backend, many frontends.** The Go CLI is the only component that talks to the mail providers (IMAP/SMTP, Microsoft Graph, Gmail API) and owns the SQLite store. Both GUIs are thin HTTP clients to `localhost:9723` — they never touch the DB directly.
+**One backend, many frontends.** The Go CLI is the only component that talks to the mail providers (IMAP/SMTP, Microsoft Graph, Gmail API, JMAP) and owns the SQLite store. Both GUIs are thin HTTP clients to `localhost:9723` — they never touch the DB directly.
 
 ## Directory layout
 
 | Path | Purpose |
 |---|---|
 | `cli/cmd/durian/` | CLI commands (`sync`, `serve`, `auth`, `search`, `send`, `validate`, `contacts`, …) |
-| `cli/internal/handler/` | HTTP API handlers + IMAP IDLE watcher (`watcher.go`) + Graph poll watcher (`enginewatcher.go`) + SSE event hub |
+| `cli/internal/handler/` | HTTP API handlers + IMAP IDLE watcher (`watcher.go`) + native-backend poll/push watcher (`enginewatcher.go`) + SSE event hub |
 | `cli/internal/backend/` | The provider-neutral `Backend` seam: interface, `Capabilities`, `LabelWriter`, neutral `Message`/`Folder`/`Flags`/`Cursor` types |
-| `cli/internal/imapbackend/`, `graphbackend/`, `gmailbackend/` | The three `Backend` implementations (IMAP, Microsoft Graph, Gmail REST) |
+| `cli/internal/imapbackend/`, `graphbackend/`, `gmailbackend/`, `jmapbackend/` | Provider-neutral backend implementations (IMAP, Microsoft Graph, Gmail REST, JMAP) |
 | `cli/internal/syncengine/` | Provider-neutral sync engine: cursor-paged fetch, ingest, three-way flag merge, folder-move + label upload |
 | `cli/internal/imap/` | Legacy IMAP syncer (`sync_engine = "legacy"`) + the low-level IMAP client that `imapbackend` reuses |
 | `cli/internal/store/` | SQLite schema, FTS5 search, tags, attachments, local drafts, outbox |
@@ -119,7 +119,7 @@ Search uses notmuch-style query syntax (`tag:inbox AND from:boss@example.com`) p
 
 ## Sync model
 
-Durian talks to three kinds of mail provider through **one neutral seam**. An
+Durian talks to mail providers through **one neutral seam**. An
 account's `sync_engine` (resolved by `AccountConfig.EffectiveSyncEngine`) picks
 the path:
 
@@ -128,6 +128,7 @@ the path:
 | `legacy` (default for IMAP) | any IMAP | the classic `imap.Syncer` + IDLE watcher |
 | `graph` (default + required for Microsoft) | Microsoft 365 | `graphbackend` + `syncengine` + poll watcher |
 | `gmail` (default for Google) | Gmail | `gmailbackend` + `syncengine`, synced on demand |
+| `jmap` | Fastmail / JMAP | `jmapbackend` + `syncengine` + EventSource push watcher |
 | `engine` | generic IMAP | `imapbackend` + `syncengine` (opt-in) |
 
 ### The Backend seam
@@ -140,20 +141,26 @@ implements — `FetchFolders`, `FetchMessages` (cursor-paged incremental),
 handle, never a store key.
 
 A `Capabilities` struct lets the engine adapt to provider quirks without
-branching on provider names: `ServerSideSent` (provider auto-saves Sent),
-`NativeMove`, `PushWatch`, `FlagChangesInDelta` (the delta already carries flag
-changes, so the flag pass is O(changes)), `LabelsAreTags` (Gmail — `Message.Labels`
+branching on provider names: `PushWatch`, `FlagChangesInDelta` (the delta already
+carries flag changes, so the flag pass is O(changes)), `LabelsAreTags` (Gmail/JMAP — `Message.Labels`
 is the authoritative tag set), and `AnsweredUnsupported` (Gmail can't persist
 `\Answered`, so it's excluded from the merge to stop per-sync ping-pong). A
 label-native backend also implements the optional `LabelWriter` interface
 (`LabelTags`, `ApplyLabels`).
 
-The three implementations: **`imapbackend`** wraps the existing `cli/internal/imap`
+Outbound transport behavior belongs to `mailsend.Sender`: `SavesSentCopy`
+decides whether Durian appends an IMAP Sent copy without branching on provider
+names.
+
+The implementations: **`imapbackend`** wraps the existing `cli/internal/imap`
 client; **`graphbackend`** speaks Microsoft Graph (`/me` or `/users/{email}` for
 shared mailboxes, cursor = Graph delta URL, native `/move`); **`gmailbackend`**
 speaks the Gmail REST API (no folders — one "All Mail" stream, labels-as-tags,
-cursor = `history.list` historyId). Graph and Gmail send via a dedicated
-`sender.go` in each package.
+cursor = `history.list` historyId); **`jmapbackend`** discovers RFC 8620/8621
+endpoints, exposes one account-wide stream, maps mailbox memberships to tags,
+and advances an `Email/changes` state cursor. `backendfactory` is the shared
+composition root used by sync, body/attachment fetching, and daemon watchers.
+Graph, Gmail, and JMAP send via a dedicated `sender.go` in each package.
 
 ### The engine
 
@@ -173,24 +180,66 @@ of the legacy path's IMAP-UIDNEXT diffing.
 
 - **IMAP IDLE** (`handler/watcher.go`, `WatcherManager`) — one long-lived IDLE
   connection per legacy account; wakes on new mail or a `TriggerSync` signal.
-  Graph accounts are skipped here.
+  Accounts using the provider-neutral sync engine are skipped here.
 - **Graph poll** (`handler/enginewatcher.go`) — Graph has no usable desktop push,
   so each Graph account gets two polling loops (a fast inbox pass, a slow
   full-mailbox pass) funneled through one per-account mutex. Cadence adapts to
   whether an SSE client is attached (inbox 30 s active / 2 m idle; full 5 m / 15 m),
   with backoff and jitter.
+- **JMAP EventSource** (`handler/enginewatcher.go`) — an account-wide push stream
+  triggers serialized incremental syncs; a slow full poll remains as recovery
+  for dropped notifications. RFC 8887 WebSocket push is intentionally not
+  implemented; EventSource is the supported JMAP push transport.
 
-Gmail-engine accounts are not polled by a resident watcher on this path — they
-sync through `durian sync` (invoked manually or by the GUI's periodic sync).
+Gmail and Graph accounts use the polling loops. JMAP and opt-in engine/IMAP
+accounts use statically selected EventSource or IMAP IDLE push, plus a slow
+safety poll. A test keeps that startup-time selection aligned with each
+backend's `PushWatch` capability without connecting during watcher setup. Local
+tag mutations trigger an immediate, coalesced upload-only engine pass for all
+engine accounts.
+
+Daemon-triggered engine passes have a 5-minute watchdog so a stalled provider
+does not hold the per-account mutex indefinitely. An authoritative replacement
+snapshot may extend that deadline to 60 minutes: the snapshot must complete
+before its cursor can advance. The extension applies only to that recovery and
+its flag reconciliation; the ordinary deadline still bounds later folders and
+the upload pass rather than granting the entire account pass another hour.
+Explicit `durian sync` commands remain caller-controlled.
+
+### Live JMAP tests
+
+The build-tagged live suite is a normal Bazel target, so `bazel test //cli/...`
+always compiles it and reports it skipped when credentials are absent. To run it
+against a test account, pass the environment through Bazel:
+
+```sh
+bazel test //cli/internal/jmapbackend:jmapbackend_live_integration_test \
+  --test_env=DURIAN_JMAP_TEST_SESSION_URL \
+  --test_env=DURIAN_JMAP_TEST_USERNAME \
+  --test_env=DURIAN_JMAP_TEST_PASSWORD \
+  --test_env=DURIAN_JMAP_TEST_AUTH \
+  --test_env=DURIAN_JMAP_TEST_RECIPIENT_USERNAME \
+  --test_env=DURIAN_JMAP_TEST_RECIPIENT_PASSWORD
+```
+
+Set the applicable variables in the invoking shell. The session URL and primary
+credentials are required. `DURIAN_JMAP_TEST_AUTH` optionally selects `password`
+(the default) or `bearer`. To additionally exercise delivery between accounts,
+set and pass `DURIAN_JMAP_TEST_RECIPIENT_USERNAME` and
+`DURIAN_JMAP_TEST_RECIPIENT_PASSWORD`. Unset optional variables remain absent
+when passed this way. The tests create, send,
+modify, and delete real messages; use disposable test accounts. The JMAP session
+URL must be HTTPS unless it addresses loopback.
 
 ### Routing and validation
 
 `EffectiveSyncEngine` defaults Microsoft OAuth to `graph`, Google OAuth to
 `gmail`, and everything else to `legacy` (the provider presets set the value
 explicitly). `durian validate` rejects the impossible combinations: `graph` on a
-non-Microsoft account, `gmail` on a non-Google account, and `legacy`/`engine` on
+non-Microsoft account, `gmail` on a non-Google account, `jmap` without its
+session configuration, and `legacy`/`engine` on
 a Microsoft account (Microsoft must use Graph). Each backend namespaces its
-cursor file (`-graph`, `-gmail`, unsuffixed for IMAP) so switching engines can't
+cursor file (`-graph`, `-gmail`, `-jmap`, unsuffixed for IMAP) so switching engines can't
 feed one backend another's incompatible cursor — it just forces a fresh full
 resync, which is safe because the store upserts by Message-ID.
 
@@ -247,7 +296,7 @@ Three languages (Go, Swift, C++/Qt), two platforms, one binary cache, reproducib
 ## Where to look next
 
 - **Adding a new API endpoint**: `cli/internal/handler/` + matching entry in `cli/cmd/durian/serve.go` route list + `openapi.yaml`.
-- **Changing the sync logic**: `cli/internal/syncengine/engine.go` for the neutral engine (Graph/Gmail/opt-in IMAP); `cli/internal/imap/sync_mailbox.go` + `sync_flags.go` for the legacy IMAP path. Adding a provider = a new `backend.Backend` implementation.
+- **Changing the sync logic**: `cli/internal/syncengine/engine.go` for the neutral engine (Graph/Gmail/JMAP/opt-in IMAP); `cli/internal/imap/sync_mailbox.go` + `sync_flags.go` for the legacy IMAP path. Adding a provider = a new `backend.Backend` implementation plus factory wiring.
 - **Adding a GUI feature**: start in the appropriate Swift Manager (`macos/durian/Managers/`), wire it to views.
 - **Adding a CLI command**: `cli/cmd/durian/` — each command is a Cobra subcommand.
 - **Onboarding end users**: [Getting Started](../../getting-started/).

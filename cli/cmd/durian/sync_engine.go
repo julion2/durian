@@ -8,12 +8,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/julion2/durian/cli/internal/backend"
+	"github.com/julion2/durian/cli/internal/backendfactory"
 	"github.com/julion2/durian/cli/internal/config"
-	"github.com/julion2/durian/cli/internal/gmailbackend"
-	"github.com/julion2/durian/cli/internal/graphbackend"
 	"github.com/julion2/durian/cli/internal/imap"
-	"github.com/julion2/durian/cli/internal/imapbackend"
 	"github.com/julion2/durian/cli/internal/syncengine"
 )
 
@@ -37,27 +34,21 @@ func runEngineSync(ctx context.Context, accounts []*config.AccountConfig, option
 }
 
 // syncOneWithEngine runs a single account through the engine on the backend its
-// sync_engine setting selects: the Microsoft Graph backend ("graph") or the IMAP
-// backend ("engine"). Cursors are namespaced per backend so the two never read
-// each other's incompatible cursor payloads.
+// sync_engine setting selects: Microsoft Graph, Gmail REST, JMAP, or IMAP.
+// Cursors are namespaced per backend so implementations never read each other's
+// incompatible cursor payloads.
 func syncOneWithEngine(ctx context.Context, account *config.AccountConfig, options *imap.SyncOptions) *imap.SyncResult {
 	start := time.Now()
 	result := &imap.SyncResult{Account: account.AccountIdentifier()}
 
 	var (
-		b       backend.Backend
 		cursors syncengine.CursorStore
 		err     error
 	)
-	switch {
-	case account.UsesGraphBackend():
-		b, err = graphbackend.New(account)
-		cursors = syncengine.NewFileCursorStoreWithSuffix(account.AccountIdentifier(), "-graph")
-	case account.UsesGmailBackend():
-		b, err = gmailbackend.New(account)
-		cursors = syncengine.NewFileCursorStoreWithSuffix(account.AccountIdentifier(), "-gmail")
-	default:
-		b, err = imapbackend.New(account)
+	b, err := backendfactory.New(account)
+	if suffix := backendfactory.CursorSuffix(account); suffix != "" {
+		cursors = syncengine.NewFileCursorStoreWithSuffix(account.AccountIdentifier(), suffix)
+	} else {
 		cursors = syncengine.NewFileCursorStore(account.AccountIdentifier())
 	}
 	if err != nil {

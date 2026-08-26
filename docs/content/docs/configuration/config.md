@@ -151,8 +151,9 @@ A `Listing<AccountConfig>`. Each entry can be a literal `new { ... }` (password 
 | `default` | `true` on the default compose account |
 | `default_signature` | Signature key from `signatures {}` |
 | `notifications` | Per-account override of `settings.notifications_enabled` |
-| `smtp` | `{ host, port, auth }` |
-| `imap` | `{ host, port, auth, max_messages }` |
+| `smtp` | Optional `{ host, port, auth }`; not needed by native Graph, Gmail, or JMAP sending |
+| `imap` | Optional `{ host, port, auth, max_messages }`; required by IMAP engines and JMAP's server-side draft-command fallback |
+| `jmap` | `{ session_url, auth }`; `auth` is `password` or `bearer` |
 | `auth` | `{ username }` for password, or `oauth { client_id, client_secret }` for Google |
 | `sync_engine` | Which sync path this account uses — see [Sync engine](#sync-engine) |
 | `calendar` | Per-account calendar overrides — see [calendar](#calendar) |
@@ -170,14 +171,62 @@ for Google OAuth, and `legacy` for everything else — so the `C.microsoft365` a
 | `engine` | Provider-neutral engine on the IMAP backend | Generic IMAP only |
 | `graph` | Provider-neutral engine on Microsoft Graph | Microsoft only — **required** for Microsoft |
 | `gmail` | Provider-neutral engine on the Gmail REST API | Google only — the default for Gmail |
+| `jmap` | Provider-neutral engine on JMAP Mail and Submission | Fastmail and compatible JMAP servers |
 
 The `gmail` engine syncs over the Gmail API instead of IMAP: it maps Gmail
 **labels to tags**, downloads full message bodies for offline use, and syncs
 incrementally via the history API. It needs the Gmail API enabled once in your
-Google Cloud project — see [OAuth setup](../../auth/oauth/). `durian validate`
-rejects: a value outside the four above; `graph` without a Microsoft OAuth
+Google Cloud project — see [OAuth setup](../../auth/oauth/).
+
+The `jmap` engine discovers capabilities from `jmap.session_url`, downloads all
+mail for offline use, maps mailbox memberships to tags, follows `Email/changes`
+state tokens, listens to EventSource push notifications in `durian serve`, and
+sends via JMAP Submission. Use `auth = "bearer"` for a provider API token (for
+example Fastmail) or `auth = "password"` for HTTP Basic authentication, then run
+`durian auth login <alias>`. The session URL must use HTTPS, except that HTTP is
+allowed for loopback addresses. Durian intentionally supports JMAP EventSource
+push, not the optional RFC 8887 WebSocket transport.
+
+`imap.max_messages` limits ordinary initial and incremental engine passes. The
+schema default is 5000. An explicit `0` makes `durian sync` an unlimited full
+local-first sync; `durian serve` retains a 5000-message safety cap per pass so a
+large initial sync yields before its watchdog and resumes from its cursor on the
+normal cadence. If a Gmail history ID or JMAP Email state expires, the
+authoritative replacement snapshot deliberately completes the whole mailbox
+before advancing its cursor; otherwise applying the cap could treat a partial
+ID set as complete and delete valid local mail. Individual provider requests
+remain paged and bounded.
+
+Fastmail needs no IMAP or SMTP configuration:
+
+```pkl
+new {
+  name = "Fastmail"
+  email = "you@fastmail.com"
+  alias = "fastmail"
+  sync_engine = "jmap"
+  jmap {
+    session_url = "https://api.fastmail.com/jmap/session"
+    auth = "bearer"
+  }
+}
+```
+
+Run `durian auth login fastmail` and paste a Fastmail API token.
+
+IMAP and SMTP blocks are not required for sync or sending. Compose autosaves,
+the outbox, and undo-send are local and work with JMAP, but the server-side
+`durian draft save` and `durian draft delete` commands still require an IMAP
+configuration; Durian does not currently upload drafts through JMAP.
+When a JMAP account also configures password-authenticated IMAP,
+`durian auth login <alias>` prompts separately for the JMAP credential and the
+IMAP password so neither overwrites the other.
+
+`durian validate` rejects: a value outside the five above; `graph` without a Microsoft OAuth
 account; `gmail` without a Google OAuth account; and `legacy`/`engine` on a
-Microsoft account (Microsoft must use Graph). Changing `sync_engine` triggers a
+Microsoft account (Microsoft must use Graph). `jmap` requires an absolute HTTP(S)
+session URL and a `jmap` block; conversely, configuring a `jmap` block requires
+`sync_engine = "jmap"`. Remote HTTP is rejected. Changing `sync_engine` triggers a
 fresh full resync (the per-backend cursors are incompatible) but is safe — the
 store upserts by Message-ID.
 

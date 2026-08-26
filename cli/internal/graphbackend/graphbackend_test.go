@@ -171,6 +171,69 @@ func TestFetchMessagesRecoversFromExpiredToken(t *testing.T) {
 	if len(result.Messages) != 1 || result.Messages[0].Ref.ID != "msg1" {
 		t.Fatalf("expected 1 recovered message, got %+v", result.Messages)
 	}
+	if !result.FullSnapshot || len(result.Present) != 1 || result.Present[0].ID != "msg1" {
+		t.Fatalf("expired-token recovery is not authoritative: %+v", result)
+	}
+}
+
+func TestFetchMessagesRejectsOffOriginCursorBeforeAuthorization(t *testing.T) {
+	var attackerCalls int32
+	attacker := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		atomic.AddInt32(&attackerCalls, 1)
+	}))
+	defer attacker.Close()
+	trusted := httptest.NewServer(http.NotFoundHandler())
+	defer trusted.Close()
+	b := newTestBackend(t, trusted)
+	tokenCalls := 0
+	b.tokenFn = func(context.Context) (string, error) {
+		tokenCalls++
+		return "secret", nil
+	}
+
+	_, err := b.FetchMessages(t.Context(), "folder1", backend.Cursor(attacker.URL+"/steal"), 50)
+	if err == nil || !strings.Contains(err.Error(), "origin differs") {
+		t.Fatalf("FetchMessages() error = %v, want off-origin rejection", err)
+	}
+	if tokenCalls != 0 || atomic.LoadInt32(&attackerCalls) != 0 {
+		t.Fatalf("token calls=%d attacker calls=%d, want request rejected before authorization", tokenCalls, attackerCalls)
+	}
+}
+
+func TestAuthenticatedRequestRejectsOffOriginRedirect(t *testing.T) {
+	var attackerCalls int32
+	attacker := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		atomic.AddInt32(&attackerCalls, 1)
+	}))
+	defer attacker.Close()
+	trusted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL+"/steal", http.StatusFound)
+	}))
+	defer trusted.Close()
+	b, err := New(&config.AccountConfig{
+		Email: "test@example.com", OAuth: &config.OAuthConfig{Provider: "microsoft"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.baseURL = trusted.URL
+	b.tokenFn = func(context.Context) (string, error) { return "secret", nil }
+
+	_, err = b.do(t.Context(), http.MethodGet, trusted.URL+"/redirect", nil)
+	if err == nil || !strings.Contains(err.Error(), "origin differs") {
+		t.Fatalf("do() error = %v, want redirect origin rejection", err)
+	}
+	if atomic.LoadInt32(&attackerCalls) != 0 {
+		t.Fatal("off-origin redirect target was contacted")
+	}
+}
+
+func TestDecodeJSONLimitedRejectsOversizedResponse(t *testing.T) {
+	var out map[string]any
+	err := decodeJSONLimited(strings.NewReader(`{"ok":true}x`), int64(len(`{"ok":true}`)), &out)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("decodeJSONLimited() error = %v", err)
+	}
 }
 
 func TestMailboxRouting(t *testing.T) {
@@ -228,10 +291,6 @@ func TestFetchMessagesConcurrentBodiesBounded(t *testing.T) {
 		time.Sleep(3 * time.Millisecond) // widen the overlap window
 		atomic.AddInt32(&inFlight, -1)
 
-		if strings.Contains(r.URL.Path, "/m7/") { // one message fails to fetch
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
 		_, _ = w.Write([]byte("Subject: hi\r\n\r\nbody"))
 	})
 	srv = httptest.NewServer(mux)
@@ -242,14 +301,69 @@ func TestFetchMessagesConcurrentBodiesBounded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchMessages: %v", err)
 	}
-	if len(result.Messages) != n-1 {
-		t.Errorf("got %d messages, want %d (failed fetch not skipped?)", len(result.Messages), n-1)
+	if len(result.Messages) != n {
+		t.Errorf("got %d messages, want %d", len(result.Messages), n)
 	}
 	if maxInFlight > fetchConcurrency {
 		t.Errorf("max in-flight %d exceeded bound %d", maxInFlight, fetchConcurrency)
 	}
 	if maxInFlight < 2 {
 		t.Errorf("max in-flight %d — bodies fetched serially, not concurrently", maxInFlight)
+	}
+}
+
+func TestFetchMessagesHoldsCursorWhenBodyFetchFails(t *testing.T) {
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/mailFolders/f/messages/delta", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]any{
+			"value":            []map[string]any{{"id": "m1", "internetMessageId": "<m1@example.com>"}},
+			"@odata.deltaLink": srv.URL + "/done",
+		})
+	})
+	mux.HandleFunc("/v1.0/me/messages/m1/$value", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	if _, err := b.FetchMessages(t.Context(), "f", nil, 50); err == nil {
+		t.Fatal("FetchMessages() succeeded after body fetch failed")
+	}
+}
+
+func TestFetchMessagesMarksForbiddenBodyUnavailable(t *testing.T) {
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/mailFolders/f/messages/delta", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("$deltatoken") == "stale" {
+			w.WriteHeader(http.StatusGone)
+			_, _ = w.Write([]byte(`{"error":{"code":"SyncStateNotFound"}}`))
+			return
+		}
+		writeJSON(t, w, map[string]any{
+			"value":            []map[string]any{{"id": "protected", "internetMessageId": "<protected@example.com>"}},
+			"@odata.deltaLink": srv.URL + "/done",
+		})
+	})
+	mux.HandleFunc("/v1.0/me/messages/protected/$value", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	stale := backend.Cursor(srv.URL + "/v1.0/me/mailFolders/f/messages/delta?$deltatoken=stale")
+	result, err := b.FetchMessages(t.Context(), "f", stale, 50)
+	if err != nil {
+		t.Fatalf("FetchMessages() error = %v", err)
+	}
+	if len(result.Messages) != 0 || len(result.Present) != 1 || result.Present[0].ID != "protected" {
+		t.Fatalf("replacement result = %+v", result)
+	}
+	if len(result.Unavailable) != 1 || result.Unavailable[0].ID != "protected" {
+		t.Fatalf("Unavailable = %+v, want protected", result.Unavailable)
 	}
 }
 
@@ -443,6 +557,103 @@ func TestFetchFlags(t *testing.T) {
 	}
 	if got := flags["bulk44"]; !got.Seen {
 		t.Errorf("flags[bulk44] = %+v, want Seen=true (last chunk not fetched?)", got)
+	}
+}
+
+func TestFetchFlagsDoesNotTreatTransientSubresponseAsMissing(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		writeJSON(t, w, map[string]any{"responses": []map[string]any{{"id": "0", "status": 429}}})
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, err := b.FetchFlags(ctx, "folder1", []backend.RemoteRef{{Folder: "folder1", ID: "msg1"}})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("FetchFlags() error = %v, want context deadline while backing off", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("batch calls = %d, want 1 before cancellation", got)
+	}
+}
+
+func TestFetchFlagsReturnsErrorAfterTransientRetriesExhausted(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		writeJSON(t, w, map[string]any{"responses": []map[string]any{{"id": "0", "status": 503}}})
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	_, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{{Folder: "folder1", ID: "msg1"}})
+	if !errors.Is(err, backend.ErrPartialFlags) || !strings.Contains(err.Error(), "remain unavailable") {
+		t.Fatalf("FetchFlags() error = %v, want exhausted transient error", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 4 {
+		t.Fatalf("batch calls = %d, want initial request plus 3 retries", got)
+	}
+}
+
+func TestFetchFlagsPreservesHealthyRefsWhenOneExhaustsRetries(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		var request struct {
+			Requests []batchRequest `json:"requests"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		responses := make([]map[string]any, 0, len(request.Requests))
+		for _, item := range request.Requests {
+			if item.ID == "0" {
+				responses = append(responses, map[string]any{
+					"id": item.ID, "status": 200,
+					"body": map[string]any{"id": "healthy", "isRead": true},
+				})
+			} else {
+				responses = append(responses, map[string]any{"id": item.ID, "status": 503})
+			}
+		}
+		writeJSON(t, w, map[string]any{"responses": responses})
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	flags, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{
+		{Folder: "folder1", ID: "healthy"},
+		{Folder: "folder1", ID: "poisoned"},
+	})
+	if !errors.Is(err, backend.ErrPartialFlags) {
+		t.Fatalf("FetchFlags() error = %v, want partial-flags error", err)
+	}
+	if got, ok := flags["healthy"]; !ok || !got.Seen {
+		t.Fatalf("healthy flags = %+v (present=%v), want Seen", got, ok)
+	}
+	if _, ok := flags["poisoned"]; ok {
+		t.Fatal("poisoned ref unexpectedly resolved")
+	}
+	if got := atomic.LoadInt32(&calls); got != 4 {
+		t.Fatalf("batch calls = %d, want initial request plus 3 poisoned-ref retries", got)
+	}
+}
+
+// A 403 means "not allowed to read", not "gone". Graph signals both by omitting
+// the ref, so FetchFlags must surface ErrPartialFlags — otherwise the engine
+// cannot tell the two apart and silently discards the delta's flag change.
+func TestFetchFlagsReportsPartialWhenSubresponseForbidden(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, map[string]any{"responses": []map[string]any{{"id": "0", "status": 403}}})
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	flags, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{{Folder: "folder1", ID: "msg1"}})
+	if !errors.Is(err, backend.ErrPartialFlags) {
+		t.Fatalf("FetchFlags() error=%v, want ErrPartialFlags so the engine keeps the delta flags", err)
+	}
+	if len(flags) != 0 {
+		t.Fatalf("FetchFlags() flags=%v, want the inaccessible item omitted, not fabricated", flags)
 	}
 }
 
@@ -645,5 +856,23 @@ func TestThrottleRetry(t *testing.T) {
 	}
 	if want := srv.URL + "/v1.0/me/mailFolders/f/messages/delta?$deltatoken=done"; string(result.Cursor) != want {
 		t.Errorf("Cursor = %q, want %q", result.Cursor, want)
+	}
+}
+
+func TestMutationIsNotRetriedAfterThrottle(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	resp, err := b.do(t.Context(), http.MethodPost, srv.URL+"/mutation", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("mutation calls = %d, want 1", got)
 	}
 }
