@@ -588,11 +588,54 @@ func TestFetchFlagsReturnsErrorAfterTransientRetriesExhausted(t *testing.T) {
 	defer srv.Close()
 	b := newTestBackend(t, srv)
 	_, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{{Folder: "folder1", ID: "msg1"}})
-	if err == nil || !strings.Contains(err.Error(), "remain unavailable") {
+	if !errors.Is(err, backend.ErrPartialFlags) || !strings.Contains(err.Error(), "remain unavailable") {
 		t.Fatalf("FetchFlags() error = %v, want exhausted transient error", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 4 {
 		t.Fatalf("batch calls = %d, want initial request plus 3 retries", got)
+	}
+}
+
+func TestFetchFlagsPreservesHealthyRefsWhenOneExhaustsRetries(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		var request struct {
+			Requests []batchRequest `json:"requests"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		responses := make([]map[string]any, 0, len(request.Requests))
+		for _, item := range request.Requests {
+			if item.ID == "0" {
+				responses = append(responses, map[string]any{
+					"id": item.ID, "status": 200,
+					"body": map[string]any{"id": "healthy", "isRead": true},
+				})
+			} else {
+				responses = append(responses, map[string]any{"id": item.ID, "status": 503})
+			}
+		}
+		writeJSON(t, w, map[string]any{"responses": responses})
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	flags, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{
+		{Folder: "folder1", ID: "healthy"},
+		{Folder: "folder1", ID: "poisoned"},
+	})
+	if !errors.Is(err, backend.ErrPartialFlags) {
+		t.Fatalf("FetchFlags() error = %v, want partial-flags error", err)
+	}
+	if got, ok := flags["healthy"]; !ok || !got.Seen {
+		t.Fatalf("healthy flags = %+v (present=%v), want Seen", got, ok)
+	}
+	if _, ok := flags["poisoned"]; ok {
+		t.Fatal("poisoned ref unexpectedly resolved")
+	}
+	if got := atomic.LoadInt32(&calls); got != 4 {
+		t.Fatalf("batch calls = %d, want initial request plus 3 poisoned-ref retries", got)
 	}
 }
 

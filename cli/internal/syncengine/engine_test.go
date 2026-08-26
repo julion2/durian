@@ -578,7 +578,7 @@ func TestEngineRefreshesExistingSnapshotMetadata(t *testing.T) {
 	}
 }
 
-func TestEngineReplaysFinalDeltaWhenFlagFetchFails(t *testing.T) {
+func TestEngineAdvancesFinalDeltaWhenFlagFetchFails(t *testing.T) {
 	db := newTestDB(t)
 	cursors := newMemCursorStore()
 	message := backend.Message{
@@ -590,7 +590,7 @@ func TestEngineReplaysFinalDeltaWhenFlagFetchFails(t *testing.T) {
 		"INBOX": {
 			{Messages: []backend.Message{message}, Cursor: backend.Cursor("c1")},
 			{Messages: []backend.Message{message}, Cursor: backend.Cursor("c2")},
-			{Messages: []backend.Message{message}, Cursor: backend.Cursor("c2")},
+			{Messages: []backend.Message{message}, Cursor: backend.Cursor("c3")},
 		},
 	})
 	fake.caps.FlagChangesInDelta = true
@@ -599,22 +599,21 @@ func TestEngineReplaysFinalDeltaWhenFlagFetchFails(t *testing.T) {
 	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
 		t.Fatalf("seed result=%+v err=%v", result, err)
 	}
-	fake.fetchFlagsErr = errors.New("transient Graph batch failure")
+	fake.fetchFlagsErr = errors.New("permanent Graph batch failure")
 	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) == 0 {
 		t.Fatalf("failed delta result=%+v err=%v", result, err)
 	}
-	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "c1" {
-		t.Fatalf("cursor after failed flag fetch = %q, want c1", got)
-	}
-	fake.fetchFlagsErr = nil
-	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
-		t.Fatalf("replayed delta result=%+v err=%v", result, err)
-	}
 	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "c2" {
-		t.Fatalf("cursor after replay = %q, want c2", got)
+		t.Fatalf("cursor after failed flag fetch = %q, want c2", got)
 	}
-	if got := fake.seenCursors["INBOX"]; len(got) != 3 || string(got[1]) != "c1" || string(got[2]) != "c1" {
-		t.Fatalf("FetchMessages cursors = %q, want final delta replayed from c1", got)
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) == 0 {
+		t.Fatalf("next failed delta result=%+v err=%v", result, err)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "c3" {
+		t.Fatalf("cursor after repeated flag failure = %q, want c3", got)
+	}
+	if got := fake.seenCursors["INBOX"]; len(got) != 3 || string(got[1]) != "c1" || string(got[2]) != "c2" {
+		t.Fatalf("FetchMessages cursors = %q, want forward progress despite flag failures", got)
 	}
 }
 
@@ -818,6 +817,41 @@ func TestEngineReplacementSkipsPermanentIngestFailureWithoutHydrator(t *testing.
 	}
 	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "replacement" {
 		t.Fatalf("cursor = %q, want replacement", got)
+	}
+}
+
+func TestEngineReplacementSkipsPermanentHydratedIngestFailure(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	prior := backend.Message{
+		MessageID: "broken@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "prior"},
+		Raw: rawMessage("broken@example.com", "a@example.com", testAccount, "Prior", "body"),
+	}
+	if _, _, err := Ingest(db, prior, "INBOX", backend.RoleNone, IngestOptions{Account: testAccount}); err != nil {
+		t.Fatalf("seed prior copy: %v", err)
+	}
+	ref := backend.RemoteRef{Folder: "INBOX", ID: "broken"}
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {{
+			Cursor: backend.Cursor("replacement"), FullSnapshot: true,
+			Present: []backend.RemoteRef{ref},
+		}},
+	})
+	fake.snapshotMessages = map[string]backend.Message{
+		ref.ID: {MessageID: "broken@example.com", Ref: ref, Raw: []byte("malformed header line\r\n\r\nbody")},
+	}
+	result, err := newTestEngine(db, cursors).Sync(t.Context(), fake)
+	if err != nil {
+		t.Fatalf("Sync error = %v", err)
+	}
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "parse message") {
+		t.Fatalf("Sync errors = %v, want one permanent hydrated parse failure", result.Errors)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "replacement" {
+		t.Fatalf("cursor = %q, want replacement", got)
+	}
+	if got, _ := db.GetByMessageID(prior.MessageID); got == nil {
+		t.Fatal("older local copy was removed after hydrated body failed permanently")
 	}
 }
 
@@ -1581,6 +1615,35 @@ func TestEngineMaxPerFolder(t *testing.T) {
 	}
 	if msg, _ := db.GetByMessageID("cap3@example.com"); msg != nil {
 		t.Error("third message ingested, want skipped by the per-folder cap")
+	}
+}
+
+func TestEngineMaxPerFolderPersistsProgressWhenFlagFetchFails(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	message := func(id string) backend.Message {
+		return backend.Message{
+			MessageID: id, Ref: backend.RemoteRef{Folder: "INBOX", ID: id},
+			Raw: rawMessage(id, "s@example.com", testAccount, "Capped", "body"),
+		}
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {
+			{Messages: []backend.Message{message("cap1@example.com")}, Cursor: backend.Cursor("page1"), HasMore: true},
+			{Messages: []backend.Message{message("cap2@example.com")}, Cursor: backend.Cursor("page2"), HasMore: true},
+		},
+	})
+	fake.fetchFlagsErr = errors.New("permanent flag failure")
+	engine := New(Options{
+		Store: db, Cursors: cursors, Account: testAccount, MaxPerFolder: 2,
+		Ingest: IngestOptions{Account: testAccount},
+	})
+	result, err := engine.Sync(t.Context(), fake)
+	if err != nil || len(result.Errors) != 1 || result.New != 2 {
+		t.Fatalf("Sync result=%+v err=%v", result, err)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "page2" {
+		t.Fatalf("cursor = %q, want capped progress page2", got)
 	}
 }
 

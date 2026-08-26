@@ -734,20 +734,24 @@ type flagFields struct {
 // only used for error context.
 func (b *Backend) FetchFlags(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
 	flags := make(map[string]backend.Flags, len(refs))
+	var partialErr error
 	for start := 0; start < len(refs); start += batchLimit {
 		chunk := refs[start:min(start+batchLimit, len(refs))]
 		chunkFlags, err := b.fetchFlagChunk(ctx, folder, chunk)
-		if err != nil {
-			return nil, err
-		}
 		for id, state := range chunkFlags {
 			flags[id] = state
+		}
+		if err != nil {
+			if !errors.Is(err, backend.ErrPartialFlags) {
+				return nil, err
+			}
+			partialErr = errors.Join(partialErr, err)
 		}
 	}
 
 	slog.Debug("Fetched flags", "module", "GRAPHBACKEND", "folder", folder, // encgrep:allow logs folder name and flag counts, not flag values or message content
 		"requested", len(refs), "resolved", len(flags))
-	return flags, nil
+	return flags, partialErr
 }
 
 func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
@@ -764,6 +768,7 @@ func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []back
 		refIDByRequestID[requestID] = ref.ID
 	}
 
+	flags := make(map[string]backend.Flags, len(refs))
 	for attempt := 0; ; attempt++ {
 		var envelope struct {
 			Responses []batchResponseItem `json:"responses"`
@@ -775,9 +780,8 @@ func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []back
 			return nil, fmt.Errorf("failed to batch-fetch flags in %s: %w", folder, err)
 		}
 
-		flags := make(map[string]backend.Flags, len(refs))
-		seen := make(map[string]struct{}, len(refs))
-		transient := false
+		seen := make(map[string]struct{}, len(requests))
+		transient := make([]batchRequest, 0)
 		for _, item := range envelope.Responses {
 			refID, ok := refIDByRequestID[item.ID]
 			if !ok {
@@ -798,7 +802,10 @@ func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []back
 				slog.Warn("Graph flags are not accessible for message, skipping item", "module", "GRAPHBACKEND", // encgrep:allow folder/id are remote operational metadata, not message content
 					"folder", folder, "id", refID, "status", item.Status)
 			case item.Status == http.StatusTooManyRequests || item.Status >= http.StatusInternalServerError:
-				transient = true
+				transient = append(transient, batchRequest{
+					ID: item.ID, Method: http.MethodGet,
+					URL: b.mailbox + "/messages/" + url.PathEscape(refID) + "?$select=id,isRead,flag",
+				})
 			default:
 				return nil, fmt.Errorf("batch flag fetch for %s failed with status %d", refID, item.Status)
 			}
@@ -806,11 +813,11 @@ func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []back
 		if len(seen) != len(requests) {
 			return nil, fmt.Errorf("batch flag fetch returned %d of %d responses", len(seen), len(requests))
 		}
-		if !transient {
+		if len(transient) == 0 {
 			return flags, nil
 		}
 		if attempt >= maxSubresponseRetries {
-			return nil, fmt.Errorf("Graph flags remain unavailable after %d retries in %s", attempt, folder)
+			return flags, fmt.Errorf("%w: Graph flags remain unavailable after %d retries in %s", backend.ErrPartialFlags, attempt, folder)
 		}
 		delay := time.Second << attempt
 		slog.Warn("Graph batch subrequest throttled, backing off", "module", "GRAPHBACKEND",
@@ -818,6 +825,7 @@ func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []back
 		if err := sleepCtx(ctx, delay); err != nil {
 			return nil, err
 		}
+		requests = transient
 	}
 }
 

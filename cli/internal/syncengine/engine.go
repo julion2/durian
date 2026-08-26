@@ -461,8 +461,16 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 					return nil, errors.New("full-snapshot reconciliation failed")
 				}
 			}
+			// Ordinary delta cursors record downloaded/ingested progress and must
+			// not be pinned by an independent flag-reconciliation failure. Only an
+			// authoritative replacement cursor waits for the flag pass below.
+			if !e.opts.DryRun && !fullSnapshot {
+				if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, res.Cursor); err != nil {
+					return nil, fmt.Errorf("persist cursor: %w", err)
+				}
+			}
 			state := &folderSyncResult{deltaFlags: deltaFlags, deadline: deadline}
-			if !e.opts.DryRun {
+			if fullSnapshot {
 				state.pendingCursor = res.Cursor
 			}
 			return state, nil
@@ -477,11 +485,12 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		if e.opts.MaxPerFolder > 0 && fetched >= e.opts.MaxPerFolder && !fullSnapshot {
 			slog.Debug("Reached per-folder message cap, stopping", "module", "SYNCENGINE", // encgrep:allow folder name and cap counts are operational sync metadata, not message content
 				"folder", folder.Name, "cap", e.opts.MaxPerFolder, "fetched", fetched)
-			state := &folderSyncResult{deltaFlags: deltaFlags, deadline: deadline}
 			if !e.opts.DryRun {
-				state.pendingCursor = res.Cursor
+				if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, res.Cursor); err != nil {
+					return nil, fmt.Errorf("persist cursor: %w", err)
+				}
 			}
-			return state, nil
+			return &folderSyncResult{deltaFlags: deltaFlags, deadline: deadline}, nil
 		}
 		if !e.opts.DryRun && !fullSnapshot {
 			if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, res.Cursor); err != nil {
@@ -511,9 +520,11 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 	}
 	existing := make(map[string]struct{}, len(rows))
 	messageIDs := make(map[string]string, len(rows))
+	refsByMessageID := make(map[string]string, len(rows))
 	for _, row := range rows {
 		existing[row.RemoteRef] = struct{}{}
 		messageIDs[row.RemoteRef] = row.MessageID
+		refsByMessageID[row.MessageID] = row.RemoteRef
 	}
 	missing := make([]backend.RemoteRef, 0)
 	current := make([]backend.RemoteRef, 0, len(existing))
@@ -589,7 +600,19 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 			}
 			messageID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, e.opts.Ingest)
 			if err != nil {
-				return fmt.Errorf("ingest hydrated snapshot message %s: %w", msg.Ref.ID, err)
+				result.Errors = append(result.Errors, fmt.Errorf("ingest hydrated snapshot message %s: %w", msg.Ref.ID, err))
+				if isRetryableStoreError(err) {
+					return fmt.Errorf("cursor held back: hydrated snapshot message %s could not be stored yet", msg.Ref.ID)
+				}
+				// A permanently malformed hydrated body would fail identically on
+				// every replacement. Exclude it from authoritative presence so the
+				// replacement can complete and a later provider change can retry it.
+				// Preserve an older local copy carrying the same durable Message-ID.
+				if priorRef := refsByMessageID[msg.MessageID]; priorRef != "" {
+					present[priorRef] = struct{}{}
+				}
+				removeMissingSnapshotRefs(present, deltaFlags, []backend.RemoteRef{msg.Ref})
+				continue
 			}
 			if created {
 				result.New++
@@ -757,7 +780,9 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 		slog.Warn("Flag fetch failed, continuing", "module", "SYNCENGINE",
 			"account", e.opts.Account, "folder", folder.Name, "err", err)
 		result.Errors = append(result.Errors, fmt.Errorf("flag sync %s: %w", folder.Name, err))
-		return false
+		if !errors.Is(err, backend.ErrPartialFlags) || server == nil {
+			return false
+		}
 	}
 
 	uploaded, downloaded := 0, 0

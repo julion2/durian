@@ -60,6 +60,12 @@ type RemoteRef struct {
 // providers that renumber on move (Graph) never resurrect an old id.
 var ErrRefGone = errors.New("remote ref no longer exists on server")
 
+// ErrPartialFlags reports that FetchFlags resolved a usable subset of the
+// requested refs. The returned map must contain every successfully resolved
+// ref; the engine reconciles that subset, reports the error, and leaves omitted
+// refs pending without pinning message-download progress.
+var ErrPartialFlags = errors.New("some remote flags remain unresolved")
+
 // Cursor is an opaque, per-folder incremental-sync token, owned and interpreted
 // solely by the Backend that issued it. The sync engine persists it verbatim
 // and hands it back to the next FetchMessages call. IMAP encodes UIDVALIDITY
@@ -183,7 +189,9 @@ type Backend interface {
 	// FetchFlags returns the current server flag state for the given messages in a
 	// folder, keyed by RemoteRef.ID. Messages the backend cannot resolve are simply
 	// absent from the map. The engine drives the three-way merge; the backend only
-	// reports server state (and applies changes via ApplyFlags).
+	// reports server state (and applies changes via ApplyFlags). A backend may
+	// return a non-nil map with an error wrapping ErrPartialFlags when only a
+	// subset resolved; other errors make the map unusable.
 	FetchFlags(ctx context.Context, folder string, refs []RemoteRef) (map[string]Flags, error)
 
 	// Move relocates ref into destFolder, returning its new handle. Returns an
