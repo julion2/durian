@@ -312,7 +312,7 @@ func TestFetchMessagesConcurrentBodiesBounded(t *testing.T) {
 	}
 }
 
-func TestFetchMessagesHoldsCursorWhenBodyFetchFails(t *testing.T) {
+func TestFetchMessagesStoresMetadataWhenBodyFetchKeepsFailing(t *testing.T) {
 	var srv *httptest.Server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1.0/me/mailFolders/f/messages/delta", func(w http.ResponseWriter, _ *http.Request) {
@@ -328,8 +328,18 @@ func TestFetchMessagesHoldsCursorWhenBodyFetchFails(t *testing.T) {
 	defer srv.Close()
 
 	b := newTestBackend(t, srv)
-	if _, err := b.FetchMessages(t.Context(), "f", nil, 50); err == nil {
-		t.Fatal("FetchMessages() succeeded after body fetch failed")
+	result, err := b.FetchMessages(t.Context(), "f", nil, 50)
+	if err != nil {
+		t.Fatalf("FetchMessages() error = %v", err)
+	}
+	if got := string(result.Cursor); got != srv.URL+"/done" {
+		t.Fatalf("Cursor = %q, want final delta cursor", got)
+	}
+	if len(result.Messages) != 1 {
+		t.Fatalf("Messages = %+v, want one metadata-only message", result.Messages)
+	}
+	if msg := result.Messages[0]; msg.MessageID != "m1@example.com" || msg.Ref.ID != "m1" || msg.Raw != nil {
+		t.Fatalf("metadata-only message = %+v", msg)
 	}
 }
 
@@ -359,7 +369,7 @@ func TestFetchMessagesMarksForbiddenBodyUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchMessages() error = %v", err)
 	}
-	if len(result.Messages) != 0 || len(result.Present) != 1 || result.Present[0].ID != "protected" {
+	if len(result.Messages) != 1 || result.Messages[0].Raw != nil || len(result.Present) != 1 || result.Present[0].ID != "protected" {
 		t.Fatalf("replacement result = %+v", result)
 	}
 	if len(result.Unavailable) != 1 || result.Unavailable[0].ID != "protected" {

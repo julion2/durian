@@ -855,6 +855,50 @@ func TestEngineReplacementSkipsPermanentHydratedIngestFailure(t *testing.T) {
 	}
 }
 
+func TestIngestStoresMetadataOnlyMessageWithoutErasingExistingBody(t *testing.T) {
+	db := newTestDB(t)
+	full := backend.Message{
+		MessageID: "metadata@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "old-ref"},
+		Raw: rawMessage("metadata@example.com", "sender@example.com", testAccount, "Original subject", "Original body"),
+	}
+	if _, _, err := Ingest(db, full, "INBOX", backend.RoleInbox, IngestOptions{Account: testAccount}); err != nil {
+		t.Fatalf("ingest full message: %v", err)
+	}
+	metadata := backend.Message{
+		MessageID: "metadata@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "new-ref"},
+		Flags: backend.Flags{Seen: true},
+	}
+	if _, created, err := Ingest(db, metadata, "INBOX", backend.RoleInbox, IngestOptions{Account: testAccount}); err != nil {
+		t.Fatalf("ingest metadata-only update: %v", err)
+	} else if created {
+		t.Fatal("metadata-only update reported an existing message as created")
+	}
+
+	got, err := db.GetByMessageID(full.MessageID)
+	if err != nil || got == nil {
+		t.Fatalf("GetByMessageID() = %+v, %v", got, err)
+	}
+	if got.Subject != "Original subject" || !strings.Contains(got.BodyText, "Original body") || !got.FetchedBody {
+		t.Fatalf("metadata-only update erased full content: %+v", got)
+	}
+	if got.RemoteRef != "new-ref" {
+		t.Fatalf("RemoteRef = %q, want new-ref", got.RemoteRef)
+	}
+
+	missing := backend.Message{
+		MessageID: "bodyless@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "bodyless-ref"},
+	}
+	if _, created, err := Ingest(db, missing, "INBOX", backend.RoleInbox, IngestOptions{Account: testAccount}); err != nil {
+		t.Fatalf("ingest new metadata-only message: %v", err)
+	} else if !created {
+		t.Fatal("new metadata-only message was not created")
+	}
+	bodyless, err := db.GetByMessageID(missing.MessageID)
+	if err != nil || bodyless == nil || bodyless.FetchedBody {
+		t.Fatalf("metadata-only row = %+v, %v", bodyless, err)
+	}
+}
+
 func TestEngineReplacementPreservesExistingRefAfterPermanentIngestFailure(t *testing.T) {
 	db := newTestDB(t)
 	cursors := newMemCursorStore()

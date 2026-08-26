@@ -594,8 +594,9 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 const fetchConcurrency = 6
 
 // fetchBodies downloads raw MIME concurrently. Explicit 404s are reported as
-// missing refs. A permanent per-item 403 is unavailable; other failures hold
-// the page cursor so transient outages cannot silently lose mail.
+// missing refs. A permanent 403 or a 5xx that remains after the request retry
+// is stored as metadata-only, allowing the page cursor to advance without
+// losing the message identity. Other failures hold the cursor.
 func (b *Backend) fetchBodies(ctx context.Context, folder string, items []deltaItem) ([]backend.Message, []string, []string, error) {
 	msgs := make([]backend.Message, len(items)) // indexed by item; failures stay zero
 	errs := make([]error, len(items))
@@ -630,8 +631,15 @@ func (b *Backend) fetchBodies(ctx context.Context, folder string, items []deltaI
 						slog.Warn("Graph message body is not accessible, skipping item", "module", "GRAPHBACKEND", // encgrep:allow folder/id are remote operational metadata, not message content
 							"folder", folder, "id", items[i].ID, "status", statusErr.status)
 						unavailable[i] = true
+						msgs[i] = messageFromDelta(folder, items[i], nil)
 					default:
-						errs[i] = err
+						if statusErr.status >= http.StatusInternalServerError {
+							slog.Warn("Graph message body remains unavailable after retry, storing metadata", "module", "GRAPHBACKEND", // encgrep:allow folder/id are remote operational metadata, not message content
+								"folder", folder, "id", items[i].ID, "status", statusErr.status)
+							msgs[i] = messageFromDelta(folder, items[i], nil)
+						} else {
+							errs[i] = err
+						}
 					}
 				} else {
 					errs[i] = err
@@ -677,14 +685,18 @@ func (b *Backend) fetchOne(ctx context.Context, folder string, item deltaItem) (
 	if err := b.doRaw(ctx, rawURL, &raw); err != nil {
 		return backend.Message{}, err
 	}
+	return messageFromDelta(folder, item, raw.Bytes()), nil
+}
+
+func messageFromDelta(folder string, item deltaItem, raw []byte) backend.Message {
 	return backend.Message{
 		MessageID:    trimAngles(item.InternetMessageID),
 		Ref:          backend.RemoteRef{Folder: folder, ID: item.ID},
-		Raw:          raw.Bytes(),
+		Raw:          raw,
 		Flags:        flagsFromGraph(item.IsRead, item.Flag),
 		Labels:       item.Categories,
 		InternalDate: parseGraphTime(item.ReceivedDateTime),
-	}, nil
+	}
 }
 
 // FetchBody streams the full RFC822 message for ref to w via the $value

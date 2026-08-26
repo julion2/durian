@@ -127,10 +127,14 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 			remote_ref, synced_flags
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id, IFNULL(account_id, 0)) DO UPDATE SET
-			subject_ct = excluded.subject_ct,
-			from_addr = excluded.from_addr,
-			to_addrs = excluded.to_addrs,
-			cc_addrs = excluded.cc_addrs,
+			subject_ct = CASE WHEN excluded.fetched_body = 1
+			                  THEN excluded.subject_ct ELSE messages.subject_ct END,
+			from_addr = CASE WHEN excluded.fetched_body = 1
+			                 THEN excluded.from_addr ELSE messages.from_addr END,
+			to_addrs = CASE WHEN excluded.fetched_body = 1
+			                THEN excluded.to_addrs ELSE messages.to_addrs END,
+			cc_addrs = CASE WHEN excluded.fetched_body = 1
+			                THEN excluded.cc_addrs ELSE messages.cc_addrs END,
 			body_text_ct = CASE WHEN excluded.fetched_body = 1 AND messages.fetched_body = 0
 			                 THEN excluded.body_text_ct ELSE messages.body_text_ct END,
 			body_html_ct = CASE WHEN excluded.fetched_body = 1 AND messages.fetched_body = 0

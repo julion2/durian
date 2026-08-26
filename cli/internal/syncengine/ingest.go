@@ -146,7 +146,15 @@ func (o IngestOptions) headerSet() []string {
 // whether the row was newly created — false when the message already existed and
 // was updated in place, e.g. re-delivered by a delta because a flag changed.
 func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.Role, opts IngestOptions) (string, bool, error) {
-	parsed, err := mail.ReadMessage(bytes.NewReader(msg.Raw))
+	bodyFetched := msg.Raw != nil
+	raw := msg.Raw
+	if !bodyFetched {
+		// Metadata-only backend results still need a durable row before their
+		// provider cursor can advance. A minimal RFC822 envelope lets the normal
+		// identity/flag path run while fetched_body remains false.
+		raw = []byte("Message-ID: <" + strings.Trim(msg.MessageID, "<>") + ">\r\n\r\n")
+	}
+	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
 	if err != nil {
 		return "", false, fmt.Errorf("parse message: %w", err)
 	}
@@ -207,7 +215,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		// provider handle instead.
 		UID:         0,
 		Size:        len(msg.Raw),
-		FetchedBody: true,
+		FetchedBody: bodyFetched,
 		Account:     opts.Account,
 		RemoteRef:   msg.Ref.ID,
 		// The message's current server flags are the correct initial
@@ -233,8 +241,11 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		return messageID, created, nil
 	}
 
-	// Clear old attachments on upsert, then re-insert
-	_ = db.DeleteAttachmentsByMessageDBID(storeMsg.ID)
+	// A metadata-only upsert must not erase content already stored locally.
+	// Full-body ingestion refreshes attachments, indexed headers and rules.
+	if bodyFetched {
+		_ = db.DeleteAttachmentsByMessageDBID(storeMsg.ID)
+	}
 	for i, att := range content.Attachments {
 		partID := att.PartID
 		if partID == 0 {
@@ -288,14 +299,16 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	}
 
 	// Eagerly detect calendar content
-	if bytes.Contains(msg.Raw, []byte("text/calendar")) {
+	if bodyFetched && bytes.Contains(msg.Raw, []byte("text/calendar")) {
 		if err := db.AddTag(storeMsg.ID, "cal"); err != nil {
 			return "", false, fmt.Errorf("add cal tag: %w", err)
 		}
 	}
 
-	if err := applyFilterRules(db, storeMsg, content, parsed, opts); err != nil {
-		return "", false, err
+	if bodyFetched {
+		if err := applyFilterRules(db, storeMsg, content, parsed, opts); err != nil {
+			return "", false, err
+		}
 	}
 
 	return messageID, created, nil
