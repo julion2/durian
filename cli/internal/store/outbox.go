@@ -53,6 +53,19 @@ func (d *DB) MarkAttempted(id int64, lastErr string) error {
 	return nil
 }
 
+// DeferOutboxItem postpones a retry without incrementing the permanent-failure
+// attempt count. It is used for offline/network failures so the worker does not
+// immediately dequeue the same item in a tight loop.
+func (d *DB) DeferOutboxItem(id int64, sendAfter int64, lastErr string) error {
+	_, err := d.db.Exec(
+		"UPDATE outbox SET send_after = ?, last_error = ?, last_attempted_at = ? WHERE id = ?",
+		sendAfter, lastErr, time.Now().Unix(), id)
+	if err != nil {
+		return fmt.Errorf("defer outbox item: %w", err)
+	}
+	return nil
+}
+
 // PoisonOutboxItem marks an item as permanently failed by setting attempts to 5.
 func (d *DB) PoisonOutboxItem(id int64, reason string) error {
 	_, err := d.db.Exec(

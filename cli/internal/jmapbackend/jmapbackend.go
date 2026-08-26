@@ -58,9 +58,10 @@ type jmapEmail struct {
 }
 
 type jmapCursor struct {
-	Position   int    `json:"position,omitempty"`
-	Snapshot   string `json:"snapshot,omitempty"`
-	EmailState string `json:"emailState,omitempty"`
+	Snapshot   string   `json:"snapshot,omitempty"`
+	PendingIDs []string `json:"pendingIds,omitempty"`
+	Reconcile  bool     `json:"reconcile,omitempty"`
+	EmailState string   `json:"emailState,omitempty"`
 }
 
 func New(account *config.AccountConfig) (*Backend, error) {
@@ -84,7 +85,12 @@ func New(account *config.AccountConfig) (*Backend, error) {
 	return &Backend{
 		account: account,
 		client: &client{
-			httpClient: &http.Client{Timeout: 90 * time.Second},
+			httpClient: &http.Client{
+				Timeout: 90 * time.Second,
+				CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+					return validateJMAPURL(req.URL.String())
+				},
+			},
 			sessionURL: account.JMAP.SessionURL,
 			credential: credential{mode: mode, username: username},
 		},
@@ -208,36 +214,82 @@ func (b *Backend) initialPage(ctx context.Context, state jmapCursor, limit int) 
 		if err != nil {
 			return backend.FetchResult{}, fmt.Errorf("snapshot JMAP email state: %w", err)
 		}
+		// Capture the complete ID set before paging bodies. Anchoring each query
+		// page to the last ID avoids the position shifts caused by concurrent
+		// inserts/deletes. A deleted anchor restarts the short ID-only scan.
+		state.PendingIDs, err = b.queryAllEmailIDs(ctx)
+		if err != nil {
+			return backend.FetchResult{}, err
+		}
 	}
-	var query struct {
-		QueryState string   `json:"queryState"`
-		Position   int      `json:"position"`
-		IDs        []string `json:"ids"`
-		Total      int      `json:"total"`
-	}
-	args := map[string]interface{}{
-		"accountId":      b.client.accountID,
-		"position":       state.Position,
-		"limit":          limit,
-		"calculateTotal": true,
-		"sort":           []map[string]interface{}{{"property": "receivedAt", "isAscending": false}},
-	}
-	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/query", args, &query); err != nil {
-		return backend.FetchResult{}, err
-	}
-	messages, missing, err := b.getMessages(ctx, query.IDs)
+	count := min(limit, len(state.PendingIDs))
+	ids := state.PendingIDs[:count]
+	messages, missing, err := b.getMessages(ctx, ids)
 	if err != nil {
 		return backend.FetchResult{}, err
 	}
 	deleted := deletions(allMailStream, missing)
-	next := state.Position + len(query.IDs)
-	hasMore := next < query.Total && len(query.IDs) > 0
+	present := presentRefs(allMailStream, ids, missing)
+	reconcile := state.Reconcile
+	state.PendingIDs = state.PendingIDs[count:]
+	hasMore := len(state.PendingIDs) > 0
 	if hasMore {
-		state.Position = next
+		state.PendingIDs = append([]string(nil), state.PendingIDs...)
 	} else {
 		state = jmapCursor{EmailState: state.Snapshot}
 	}
-	return backend.FetchResult{Messages: messages, Deleted: deleted, Cursor: encodeCursor(state), HasMore: hasMore}, nil
+	return backend.FetchResult{
+		Messages: messages, Deleted: deleted, Cursor: encodeCursor(state), HasMore: hasMore,
+		FullSnapshot: reconcile, Present: present,
+	}, nil
+}
+
+func (b *Backend) queryAllEmailIDs(ctx context.Context) ([]string, error) {
+	const maxAnchorRestarts = 3
+	for attempt := 0; attempt < maxAnchorRestarts; attempt++ {
+		ids, err := b.queryAllEmailIDsOnce(ctx)
+		if err == nil {
+			return ids, nil
+		}
+		var methodErr *methodError
+		if !errors.As(err, &methodErr) || methodErr.Type != "anchorNotFound" {
+			return nil, err
+		}
+	}
+	return nil, errors.New("Email/query anchor repeatedly disappeared during initial sync")
+}
+
+func (b *Backend) queryAllEmailIDsOnce(ctx context.Context) ([]string, error) {
+	const queryPageSize = 1000
+	args := map[string]interface{}{
+		"accountId":      b.client.accountID,
+		"position":       0,
+		"limit":          queryPageSize,
+		"calculateTotal": true,
+		"sort":           []map[string]interface{}{{"property": "receivedAt", "isAscending": false}},
+	}
+	var ids []string
+	for {
+		var query struct {
+			Position int      `json:"position"`
+			IDs      []string `json:"ids"`
+			Total    int      `json:"total"`
+		}
+		if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/query", args, &query); err != nil {
+			return nil, err
+		}
+		ids = append(ids, query.IDs...)
+		if len(query.IDs) == 0 || query.Position+len(query.IDs) >= query.Total {
+			return uniqueStrings(ids), nil
+		}
+		nextAnchor := query.IDs[len(query.IDs)-1]
+		if priorAnchor, ok := args["anchor"].(string); ok && priorAnchor == nextAnchor {
+			return nil, errors.New("Email/query anchor pagination made no progress")
+		}
+		delete(args, "position")
+		args["anchor"] = nextAnchor
+		args["anchorOffset"] = 1
+	}
 }
 
 func (b *Backend) changesPage(ctx context.Context, state jmapCursor, limit int) (backend.FetchResult, error) {
@@ -257,7 +309,7 @@ func (b *Backend) changesPage(ctx context.Context, state jmapCursor, limit int) 
 	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/changes", args, &changes); err != nil {
 		var methodErr *methodError
 		if errors.As(err, &methodErr) && methodErr.Type == "cannotCalculateChanges" {
-			return b.initialPage(ctx, jmapCursor{}, limit)
+			return b.initialPage(ctx, jmapCursor{Reconcile: true}, limit)
 		}
 		return backend.FetchResult{}, err
 	}
@@ -369,7 +421,7 @@ func (b *Backend) downloadRaw(ctx context.Context, email jmapEmail) ([]byte, err
 		return nil, err
 	}
 	defer r.Close()
-	return io.ReadAll(r)
+	return readLimited(r, maxMessageBytes, "JMAP message")
 }
 
 func (b *Backend) FetchBody(ctx context.Context, ref backend.RemoteRef, w io.Writer) error {
@@ -492,10 +544,13 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 		}
 	}
 	patch := make(map[string]interface{})
+	var unknown []string
 	b.mu.Lock()
 	for _, tag := range add {
 		if id := b.tagToID[strings.ToLower(tag)]; id != "" {
 			patch["mailboxIds/"+id] = true
+		} else {
+			unknown = append(unknown, tag)
 		}
 	}
 	for _, tag := range remove {
@@ -504,6 +559,9 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 		}
 	}
 	b.mu.Unlock()
+	if len(unknown) > 0 {
+		return fmt.Errorf("JMAP account has no mailbox for label %q", strings.Join(unknown, ", "))
+	}
 	if len(patch) == 0 {
 		return nil
 	}
@@ -637,6 +695,20 @@ func deletions(folder string, ids []string) []backend.Deletion {
 	result := make([]backend.Deletion, 0, len(ids))
 	for _, id := range ids {
 		result = append(result, backend.Deletion{Ref: backend.RemoteRef{Folder: folder, ID: id}})
+	}
+	return result
+}
+
+func presentRefs(folder string, ids, missing []string) []backend.RemoteRef {
+	missingSet := make(map[string]struct{}, len(missing))
+	for _, id := range missing {
+		missingSet[id] = struct{}{}
+	}
+	result := make([]backend.RemoteRef, 0, len(ids)-len(missingSet))
+	for _, id := range ids {
+		if _, absent := missingSet[id]; !absent {
+			result = append(result, backend.RemoteRef{Folder: folder, ID: id})
+		}
 	}
 	return result
 }

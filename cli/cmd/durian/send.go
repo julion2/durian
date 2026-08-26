@@ -89,11 +89,6 @@ func runSend(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Check SMTP config
-	if account.SMTP.Host == "" {
-		return fmt.Errorf("no SMTP host configured for %s", account.Email)
-	}
-
 	// Get To address (prompt if not provided)
 	to := sendTo
 	if to == "" {

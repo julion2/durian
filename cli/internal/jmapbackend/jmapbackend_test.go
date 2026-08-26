@@ -3,6 +3,7 @@ package jmapbackend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,11 @@ type testJMAPServer struct {
 	uploaded []byte
 	events   string
 	extra    []interface{}
+}
+
+type testMethodResponse struct {
+	name  string
+	value interface{}
 }
 
 func newTestJMAPServer(t *testing.T) *testJMAPServer {
@@ -67,7 +73,12 @@ func (s *testJMAPServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if s.handler != nil {
 			result = s.handler(method, args)
 		}
-		responses := []interface{}{[]interface{}{method, result, "0"}}
+		responseName := method
+		if response, ok := result.(testMethodResponse); ok {
+			responseName = response.name
+			result = response.value
+		}
+		responses := []interface{}{[]interface{}{responseName, result, "0"}}
 		responses = append(responses, s.extra...)
 		s.extra = nil
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"methodResponses": responses, "sessionState": "session-1"})
@@ -173,6 +184,126 @@ func TestInitialAndIncrementalSync(t *testing.T) {
 	}
 }
 
+func TestInitialSyncCapturesStableIDSetBeforePagingBodies(t *testing.T) {
+	s := newTestJMAPServer(t)
+	queryCalls := 0
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+		case "Email/query":
+			queryCalls++
+			if queryCalls == 1 {
+				if args["position"] != float64(0) {
+					t.Errorf("first query position = %#v", args["position"])
+				}
+				return map[string]interface{}{"queryState": "q1", "position": 0, "ids": []string{"e1", "e2"}, "total": 3, "limit": 2}
+			}
+			if args["anchor"] != "e2" || args["anchorOffset"] != float64(1) {
+				t.Errorf("second query anchor args = %#v", args)
+			}
+			if _, ok := args["position"]; ok {
+				t.Error("anchored query must not also set position")
+			}
+			return map[string]interface{}{"queryState": "q1", "position": 2, "ids": []string{"e3"}, "total": 3, "limit": 2}
+		case "Email/get":
+			ids, _ := args["ids"].([]interface{})
+			if len(ids) == 0 {
+				return map[string]interface{}{"state": "s1", "list": []interface{}{}, "notFound": []interface{}{}}
+			}
+			list := make([]interface{}, 0, len(ids))
+			for _, rawID := range ids {
+				id := rawID.(string)
+				list = append(list, emailObject(id, nil, map[string]bool{"inbox-id": true}))
+			}
+			return map[string]interface{}{"state": "s1", "list": list, "notFound": []interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	b := s.backend(t)
+	first, err := b.FetchMessages(t.Context(), allMailStream, nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Messages) != 2 || !first.HasMore {
+		t.Fatalf("first page = %#v", first)
+	}
+	second, err := b.FetchMessages(t.Context(), allMailStream, first.Cursor, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Messages) != 1 || second.HasMore || queryCalls != 2 {
+		t.Fatalf("second page = %#v, query calls = %d", second, queryCalls)
+	}
+}
+
+func TestReplacementSnapshotMarksEveryPageForReconciliation(t *testing.T) {
+	s := newTestJMAPServer(t)
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+		case "Email/query":
+			return map[string]interface{}{"ids": []string{"e1", "e2"}, "total": 2}
+		case "Email/get":
+			ids, _ := args["ids"].([]interface{})
+			if len(ids) == 0 {
+				return map[string]interface{}{"state": "s2", "list": []interface{}{}, "notFound": []interface{}{}}
+			}
+			id := ids[0].(string)
+			return map[string]interface{}{"state": "s2", "list": []interface{}{emailObject(id, nil, map[string]bool{"inbox-id": true})}, "notFound": []interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	b := s.backend(t)
+	if _, err := b.FetchFolders(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	first, err := b.initialPage(t.Context(), jmapCursor{Reconcile: true}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := b.FetchMessages(t.Context(), allMailStream, first.Cursor, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.FullSnapshot || !second.FullSnapshot || len(first.Present) != 1 || len(second.Present) != 1 {
+		t.Fatalf("replacement pages = %#v / %#v", first, second)
+	}
+}
+
+func TestCannotCalculateChangesStartsReplacementSnapshot(t *testing.T) {
+	s := newTestJMAPServer(t)
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+		case "Email/changes":
+			return testMethodResponse{name: "error", value: methodError{Type: "cannotCalculateChanges"}}
+		case "Email/query":
+			return map[string]interface{}{"ids": []string{"e1"}, "total": 1}
+		case "Email/get":
+			ids, _ := args["ids"].([]interface{})
+			if len(ids) == 0 {
+				return map[string]interface{}{"state": "new-state", "list": []interface{}{}, "notFound": []interface{}{}}
+			}
+			return map[string]interface{}{"state": "new-state", "list": []interface{}{emailObject("e1", nil, map[string]bool{"inbox-id": true})}, "notFound": []interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	b := s.backend(t)
+	result, err := b.FetchMessages(t.Context(), allMailStream, encodeCursor(jmapCursor{EmailState: "expired"}), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.FullSnapshot || len(result.Messages) != 1 || len(result.Present) != 1 {
+		t.Fatalf("replacement result = %#v", result)
+	}
+}
+
 func TestFlagsLabelsAndAppend(t *testing.T) {
 	s := newTestJMAPServer(t)
 	var patches []map[string]interface{}
@@ -262,6 +393,48 @@ func TestWatchDispatchesEmailStateChange(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("watch did not stop after context cancellation")
+	}
+}
+
+func TestWatchReturnsPermanentHTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "revoked", http.StatusUnauthorized)
+	}))
+	t.Cleanup(server.Close)
+	c := &client{
+		httpClient: &http.Client{Timeout: time.Second},
+		session:    session{EventSourceURL: server.URL},
+		accountID:  "a1",
+	}
+	err := c.watch(t.Context(), func() {})
+	var statusErr *statusError
+	if !errors.As(err, &statusErr) || statusErr.Status != http.StatusUnauthorized {
+		t.Fatalf("watch error = %v, want HTTP 401", err)
+	}
+}
+
+func TestMutatingMethodIsNotRetriedAfterServerError(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		http.Error(w, "ambiguous failure", http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	c := &client{httpClient: server.Client(), session: session{APIURL: server.URL}}
+	err := c.call(t.Context(), []string{coreCapability, mailCapability, submissionCapability}, "EmailSubmission/set", map[string]interface{}{}, nil)
+	if err == nil || calls != 1 {
+		t.Fatalf("call error = %v, requests = %d; mutating call must not retry", err, calls)
+	}
+}
+
+func TestValidateJMAPURLAllowsOnlySecureOrLoopback(t *testing.T) {
+	for _, raw := range []string{"https://api.example.test/jmap", "http://localhost:8080/jmap", "http://127.0.0.1/jmap", "http://[::1]/jmap"} {
+		if err := validateJMAPURL(raw); err != nil {
+			t.Errorf("validateJMAPURL(%q) = %v", raw, err)
+		}
+	}
+	if err := validateJMAPURL("http://api.example.test/jmap"); err == nil {
+		t.Fatal("insecure non-loopback JMAP URL was accepted")
 	}
 }
 

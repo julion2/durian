@@ -167,6 +167,46 @@ func TestValidateConfig_JMAP(t *testing.T) {
 	if !found {
 		t.Fatalf("relative JMAP session URL was not rejected: %v", ValidateConfig(invalid))
 	}
+
+	insecure := &Config{Accounts: []AccountConfig{{
+		Name: "Insecure", Email: "me@example.com", SyncEngine: "jmap",
+		JMAP: &JMAPConfig{SessionURL: "http://mail.example.com/jmap", Auth: "password"},
+	}}}
+	found = false
+	for _, e := range ValidateConfig(insecure) {
+		if strings.Contains(e.Field, "jmap.session_url") && strings.Contains(e.Message, "https") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("insecure remote JMAP URL was not rejected: %v", ValidateConfig(insecure))
+	}
+
+	wrongEngine := &Config{Accounts: []AccountConfig{{
+		Name: "Wrong engine", Email: "me@example.com", SyncEngine: "legacy",
+		JMAP: &JMAPConfig{SessionURL: "https://mail.example.com/jmap", Auth: "password"},
+	}}}
+	found = false
+	for _, e := range ValidateConfig(wrongEngine) {
+		if strings.Contains(e.Field, "sync_engine") && strings.Contains(e.Message, "jmap configuration") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("JMAP block with legacy engine was not rejected: %v", ValidateConfig(wrongEngine))
+	}
+}
+
+func TestValidateConfigNativeAccountsDoNotRequireLegacyHosts(t *testing.T) {
+	accounts := []AccountConfig{
+		{Name: "Graph", Email: "graph@example.com", SyncEngine: "graph", OAuth: &OAuthConfig{Provider: "microsoft"}, SMTP: SMTPConfig{Port: 587}, IMAP: IMAPConfig{Port: 993}},
+		{Name: "Gmail", Email: "gmail@example.com", SyncEngine: "gmail", OAuth: &OAuthConfig{Provider: "google"}, SMTP: SMTPConfig{Port: 587}, IMAP: IMAPConfig{Port: 993}},
+	}
+	for _, validationErr := range ValidateConfig(&Config{Accounts: accounts}) {
+		if strings.Contains(validationErr.Field, ".smtp.host") || strings.Contains(validationErr.Field, ".imap.host") {
+			t.Errorf("native account required legacy host: %v", validationErr)
+		}
+	}
 }
 
 func TestNativeMailAccountSelection(t *testing.T) {

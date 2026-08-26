@@ -94,6 +94,29 @@ func TestMarkAttempted(t *testing.T) {
 	}
 }
 
+func TestDeferOutboxItemPostponesWithoutCountingAttempt(t *testing.T) {
+	db := newTestDB(t)
+	id, _ := db.Enqueue(`{"subject":"offline"}`, 0)
+
+	if err := db.DeferOutboxItem(id, time.Now().Unix()+30, "offline"); err != nil {
+		t.Fatal(err)
+	}
+	item, err := db.Dequeue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item != nil {
+		t.Fatal("deferred item was immediately dequeued")
+	}
+	items, err := db.ListOutbox()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("ListOutbox() = %#v, %v", items, err)
+	}
+	if items[0].Attempts != 0 || items[0].LastError != "offline" {
+		t.Fatalf("deferred item = %#v, want zero attempts and recorded error", items[0])
+	}
+}
+
 func TestDequeueSkipsPoisoned(t *testing.T) {
 	db := newTestDB(t)
 

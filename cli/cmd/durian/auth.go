@@ -95,7 +95,7 @@ func runAuthLogin(cmd *cobra.Command, args []string) error {
 	}
 
 	// Passwords and JMAP bearer tokens share the OS-keychain credential path.
-	if account.JMAP != nil || account.SMTP.Auth == "password" || account.IMAP.Auth == "password" {
+	if account.UsesJMAPBackend() || account.SMTP.Auth == "password" || account.IMAP.Auth == "password" {
 		return runPasswordLogin(account)
 	}
 

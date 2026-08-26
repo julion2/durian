@@ -135,11 +135,11 @@ func (w *EngineWatcher) pushLoop(ctx context.Context, account *config.AccountCon
 	// Establish a baseline before listening so a change between daemon startup
 	// and EventSource connection is already covered by the persisted state.
 	if err := w.syncAccount(ctx, account, false); err != nil {
-		slog.Warn("Initial push-backend sync failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier(), "err", err) // encgrep:allow account identifier and operational error
+		slog.Warn("Initial push-backend sync failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
 	}
 	b, err := backendfactory.New(account)
 	if err != nil {
-		slog.Warn("Push backend creation failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier(), "err", err) // encgrep:allow account identifier and operational error
+		slog.Warn("Push backend creation failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
 		return
 	}
 	defer b.Close()
@@ -160,12 +160,12 @@ func (w *EngineWatcher) pushLoop(ctx context.Context, account *config.AccountCon
 			return
 		case err := <-done:
 			if err != nil && !errors.Is(err, context.Canceled) {
-				slog.Warn("Push watch stopped", "module", "ENGINEWATCH", "account", account.AccountIdentifier(), "err", err) // encgrep:allow account identifier and operational error
+				slog.Warn("Push watch stopped", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
 			}
 			return
 		case <-changes:
 			if err := w.syncAccount(ctx, account, false); err != nil {
-				slog.Warn("Push-triggered sync failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier(), "err", err) // encgrep:allow account identifier and operational error
+				slog.Warn("Push-triggered sync failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
 			}
 		}
 	}

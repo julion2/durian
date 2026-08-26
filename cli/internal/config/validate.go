@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -119,8 +120,9 @@ func ValidateConfig(cfg *Config) []ValidationError {
 			}
 		}
 
+		nativeMail := acct.UsesGraphBackend() || acct.UsesGmailBackend() || acct.UsesJMAPBackend()
 		// SMTP
-		if acct.SMTP.Host != "" || (acct.SMTP.Port != 0 && !acct.UsesJMAPBackend()) {
+		if acct.SMTP.Host != "" || (acct.SMTP.Port != 0 && !nativeMail) {
 			if acct.SMTP.Host == "" {
 				add(prefix+".smtp.host", "required when smtp is configured")
 			}
@@ -138,7 +140,7 @@ func ValidateConfig(cfg *Config) []ValidationError {
 		}
 
 		// IMAP
-		if acct.IMAP.Host != "" || (acct.IMAP.Port != 0 && !acct.UsesJMAPBackend()) {
+		if acct.IMAP.Host != "" || (acct.IMAP.Port != 0 && !nativeMail) {
 			if acct.IMAP.Host == "" {
 				add(prefix+".imap.host", "required when imap is configured")
 			}
@@ -157,6 +159,8 @@ func ValidateConfig(cfg *Config) []ValidationError {
 				add(prefix+".jmap.session_url", "required when jmap is configured")
 			} else if parsed, err := url.Parse(sessionURL); err != nil || !parsed.IsAbs() || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 				add(prefix+".jmap.session_url", "must be an absolute http or https URL")
+			} else if parsed.Scheme == "http" && !isLoopbackHost(parsed.Hostname()) {
+				add(prefix+".jmap.session_url", "must use https unless the host is loopback")
 			}
 			switch acct.JMAP.Auth {
 			case "password", "bearer":
@@ -219,6 +223,9 @@ func ValidateConfig(cfg *Config) []ValidationError {
 		if acct.SyncEngine == "jmap" && acct.JMAP == nil {
 			add(prefix+".sync_engine", "\"jmap\" requires a jmap configuration block")
 		}
+		if acct.JMAP != nil && !acct.UsesJMAPBackend() {
+			add(prefix+".sync_engine", "a jmap configuration block requires sync_engine = \"jmap\"")
+		}
 		if acct.OAuth != nil && acct.OAuth.Provider == "microsoft" &&
 			(acct.SyncEngine == "legacy" || acct.SyncEngine == "engine") {
 			add(prefix+".sync_engine", "Microsoft accounts sync via Graph; the IMAP path (\"legacy\"/\"engine\") is not supported")
@@ -230,6 +237,14 @@ func ValidateConfig(cfg *Config) []ValidationError {
 	}
 
 	return errs
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // ValidateRules validates rules.pkl entries. Pass a RuleQueryValidator to check match syntax.

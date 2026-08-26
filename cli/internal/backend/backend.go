@@ -120,6 +120,13 @@ type FetchResult struct {
 	// HasMore reports that limit was reached and more changes remain; the engine
 	// should call FetchMessages again with Cursor to continue paginating.
 	HasMore bool
+	// FullSnapshot reports that this page is part of a complete replacement
+	// snapshot. Present contains every remote ref that existed in this page of
+	// that snapshot. Once the final page is processed, the engine removes local
+	// refs that were not present in any page. Delta-capable backends use this to
+	// recover safely when a server can no longer calculate changes from a cursor.
+	FullSnapshot bool
+	Present      []RemoteRef
 }
 
 // Capabilities describes backend-specific behavior the sync engine adapts to,
@@ -210,8 +217,8 @@ type LabelWriter interface {
 	LabelTags(ctx context.Context) ([]string, error)
 
 	// ApplyLabels resolves each add/remove tag to its server label and applies
-	// the change to ref in one call. Tags with no server label are skipped; a
-	// call that resolves to no change is a no-op. The engine resets its baseline
+	// the change to ref in one call. An unknown added tag returns an error rather
+	// than silently losing a local change. The engine resets its baseline
 	// to the deterministic (local tags ∩ LabelTags) set itself, so ApplyLabels
 	// returns only an error.
 	ApplyLabels(ctx context.Context, ref RemoteRef, add, remove []string) error

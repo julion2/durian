@@ -312,6 +312,74 @@ func TestEngineReportsNewInboxArrivals(t *testing.T) {
 	}
 }
 
+func TestEngineReportsInboxLabelArrivalFromAllMailStream(t *testing.T) {
+	db := newTestDB(t)
+	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Role: backend.RoleAll, Selectable: true}}, map[string][]backend.FetchResult{
+		"ALL": {{
+			Messages: []backend.Message{{
+				MessageID: "jmap-arrival@example.com",
+				Ref:       backend.RemoteRef{Folder: "ALL", ID: "j1"},
+				Raw:       rawMessage("jmap-arrival@example.com", "a@example.com", testAccount, "Hello", "body"),
+				Labels:    []string{"inbox"},
+			}},
+			Cursor: backend.Cursor("c1"),
+		}},
+	})
+	fake.caps.LabelsAreTags = true
+	res, err := newTestEngine(db, newMemCursorStore()).Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := res.NewMessageIDs, []string{"jmap-arrival@example.com"}; !slices.Equal(got, want) {
+		t.Fatalf("NewMessageIDs = %v, want %v", got, want)
+	}
+}
+
+func TestEngineReconcilesReplacementFullSnapshot(t *testing.T) {
+	db := newTestDB(t)
+	folder := backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true}
+	message := func(id, ref string) backend.Message {
+		return backend.Message{
+			MessageID: id, Ref: backend.RemoteRef{Folder: "ALL", ID: ref},
+			Raw: rawMessage(id, "a@example.com", testAccount, "Hello", "body"),
+		}
+	}
+	fake := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+		"ALL": {
+			{Messages: []backend.Message{message("keep@example.com", "r1"), message("stale@example.com", "r2")}, Cursor: backend.Cursor("c1")},
+			{Messages: []backend.Message{message("keep@example.com", "r1")}, Cursor: backend.Cursor("replacement-page-1"), HasMore: true, FullSnapshot: true, Present: []backend.RemoteRef{{Folder: "ALL", ID: "r1"}}},
+			{Messages: []backend.Message{message("new@example.com", "r3")}, Cursor: backend.Cursor("c2"), FullSnapshot: true, Present: []backend.RemoteRef{{Folder: "ALL", ID: "r3"}}},
+		},
+	})
+	cursors := newMemCursorStore()
+	engine := New(Options{
+		Store: db, Cursors: cursors, Account: testAccount, MaxPerFolder: 1,
+		Ingest: IngestOptions{Account: testAccount},
+	})
+	if _, err := engine.Sync(context.Background(), fake); err != nil {
+		t.Fatal(err)
+	}
+	res, err := engine.Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Deleted != 1 {
+		t.Fatalf("Deleted = %d, want 1", res.Deleted)
+	}
+	if stale, _ := db.GetByMessageID("stale@example.com"); stale != nil {
+		t.Fatalf("stale message still present: %#v", stale)
+	}
+	if keep, _ := db.GetByMessageID("keep@example.com"); keep == nil {
+		t.Fatal("present message was removed")
+	}
+	if added, _ := db.GetByMessageID("new@example.com"); added == nil {
+		t.Fatal("second replacement page was skipped by the normal message cap")
+	}
+	if got := string(cursors.cursors[cursors.key(testAccount, "ALL")]); got != "c2" {
+		t.Fatalf("persisted cursor = %q, want final replacement cursor", got)
+	}
+}
+
 // TestIsRetryableStoreError pins which ingest failures may hold a folder's
 // cursor back. Getting this wrong is costly in both directions: treating a
 // permanent failure as retryable re-downloads the folder forever without

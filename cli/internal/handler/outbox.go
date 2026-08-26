@@ -270,8 +270,12 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 		safeMsg := sanitizeOutboxError(err)
 		switch mailsend.Classify(err) {
 		case mailsend.KindNetwork:
-			// Offline/timeout — don't count as an attempt, retry silently.
+			// Offline/timeout — don't count as an attempt, but move the item out
+			// of the ready queue so processQueue cannot dequeue it in a tight loop.
 			slog.Warn("Network error, will retry later", "module", "OUTBOX", "id", item.ID, "err", err)
+			if deferErr := w.store.DeferOutboxItem(item.ID, time.Now().Add(30*time.Second).Unix(), safeMsg); deferErr != nil {
+				slog.Error("Failed to defer outbox item", "module", "OUTBOX", "id", item.ID, "err", deferErr)
+			}
 			return
 		case mailsend.KindPermanent:
 			slog.Error("Send failed permanently", "module", "OUTBOX", "id", item.ID, "err", err)
@@ -365,7 +369,7 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mail
 // appendToSent saves a copy to the IMAP Sent folder (skip for providers that auto-save).
 func (w *OutboxWorker) appendToSent(account *config.AccountConfig, msg *mailsend.Message) {
 	if account.UsesGraphBackend() || account.UsesGmailBackend() || account.UsesJMAPBackend() {
-		slog.Debug("Skipping Sent append for native provider", "module", "OUTBOX", "engine", account.EffectiveSyncEngine())
+		slog.Debug("Skipping Sent append for native provider", "module", "OUTBOX", "engine", account.EffectiveSyncEngine()) // encgrep:allow engine name is static configuration, not message content
 		return
 	}
 

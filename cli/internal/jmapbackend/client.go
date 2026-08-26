@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -19,6 +20,9 @@ const (
 	coreCapability       = "urn:ietf:params:jmap:core"
 	mailCapability       = "urn:ietf:params:jmap:mail"
 	submissionCapability = "urn:ietf:params:jmap:submission"
+	maxSessionBytes      = 4 << 20
+	maxMethodBytes       = 64 << 20
+	maxMessageBytes      = 100 << 20
 )
 
 type session struct {
@@ -84,19 +88,22 @@ func (e *statusError) Error() string {
 }
 
 func (c *client) discover(ctx context.Context) error {
-	resp, err := c.doHTTP(ctx, http.MethodGet, c.sessionURL, nil, "")
+	resp, err := c.doHTTP(ctx, http.MethodGet, c.sessionURL, nil, "", true)
 	if err != nil {
 		return fmt.Errorf("discover JMAP session: %w", err)
 	}
 	defer resp.Body.Close()
-	if err := json.NewDecoder(resp.Body).Decode(&c.session); err != nil {
+	if err := decodeJSONLimited(resp.Body, maxSessionBytes, &c.session); err != nil {
 		return fmt.Errorf("decode JMAP session: %w", err)
 	}
 	if _, ok := c.session.Capabilities[coreCapability]; !ok {
 		return errors.New("JMAP server does not advertise the core capability")
 	}
 	accountID := c.session.PrimaryAccounts[mailCapability]
-	if accountID == "" {
+	account, primaryOK := c.session.Accounts[accountID]
+	_, primaryHasMail := account.AccountCapabilities[mailCapability]
+	if accountID == "" || !primaryOK || !primaryHasMail || account.IsReadOnly {
+		accountID = ""
 		for id, account := range c.session.Accounts {
 			if _, ok := account.AccountCapabilities[mailCapability]; ok && !account.IsReadOnly {
 				accountID = id
@@ -115,6 +122,16 @@ func (c *client) discover(ctx context.Context) error {
 	c.session.DownloadURL = resolveURL(c.sessionURL, c.session.DownloadURL)
 	c.session.UploadURL = resolveURL(c.sessionURL, c.session.UploadURL)
 	c.session.EventSourceURL = resolveURL(c.sessionURL, c.session.EventSourceURL)
+	for name, endpoint := range map[string]string{
+		"apiUrl": c.session.APIURL, "downloadUrl": c.session.DownloadURL,
+		"uploadUrl": c.session.UploadURL, "eventSourceUrl": c.session.EventSourceURL,
+	} {
+		if endpoint != "" {
+			if err := validateJMAPURL(endpoint); err != nil {
+				return fmt.Errorf("invalid JMAP %s: %w", name, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -141,13 +158,14 @@ func (c *client) call(ctx context.Context, using []string, method string, args, 
 	if err != nil {
 		return fmt.Errorf("encode %s request: %w", method, err)
 	}
-	resp, err := c.doHTTP(ctx, http.MethodPost, c.session.APIURL, body, "application/json")
+	safeToRetry := strings.HasSuffix(method, "/get") || strings.HasSuffix(method, "/query") || strings.HasSuffix(method, "/changes")
+	resp, err := c.doHTTP(ctx, http.MethodPost, c.session.APIURL, body, "application/json", safeToRetry)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	var envelope methodResponseEnvelope
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+	if err := decodeJSONLimited(resp.Body, maxMethodBytes, &envelope); err != nil {
 		return fmt.Errorf("decode %s response: %w", method, err)
 	}
 	if len(envelope.MethodResponses) == 0 {
@@ -191,7 +209,10 @@ func (c *client) call(ctx context.Context, using []string, method string, args, 
 	return fmt.Errorf("JMAP response did not include %s", method)
 }
 
-func (c *client) doHTTP(ctx context.Context, method, requestURL string, body []byte, contentType string) (*http.Response, error) {
+func (c *client) doHTTP(ctx context.Context, method, requestURL string, body []byte, contentType string, safeToRetry bool) (*http.Response, error) {
+	if err := validateJMAPURL(requestURL); err != nil {
+		return nil, err
+	}
 	const maxRetries = 3
 	for attempt := 0; ; attempt++ {
 		var reader io.Reader
@@ -215,7 +236,7 @@ func (c *client) doHTTP(ctx context.Context, method, requestURL string, body []b
 		}
 		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
-		if attempt < maxRetries && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) {
+		if safeToRetry && attempt < maxRetries && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) {
 			delay := time.Duration(1<<attempt) * time.Second
 			if seconds, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && seconds > 0 {
 				delay = time.Duration(seconds) * time.Second
@@ -237,12 +258,50 @@ func (c *client) authorize(req *http.Request) {
 	req.SetBasicAuth(c.credential.username, c.credential.secret)
 }
 
+func validateJMAPURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("JMAP endpoint must be an absolute HTTP(S) URL")
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("unencrypted JMAP endpoints are only allowed on loopback")
+	}
+	return nil
+}
+
+func decodeJSONLimited(r io.Reader, limit int64, out interface{}) error {
+	data, err := readLimited(r, limit, "JMAP JSON response")
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, out)
+}
+
+func readLimited(r io.Reader, limit int64, description string) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%s exceeds %d bytes", description, limit)
+	}
+	return data, nil
+}
+
 func (c *client) upload(ctx context.Context, data []byte, contentType string) (string, error) {
 	if c.session.UploadURL == "" {
 		return "", errors.New("JMAP session has no uploadUrl")
 	}
 	u := expandTemplate(c.session.UploadURL, map[string]string{"accountId": c.accountID})
-	resp, err := c.doHTTP(ctx, http.MethodPost, u, data, contentType)
+	resp, err := c.doHTTP(ctx, http.MethodPost, u, data, contentType, false)
 	if err != nil {
 		return "", err
 	}
@@ -250,7 +309,7 @@ func (c *client) upload(ctx context.Context, data []byte, contentType string) (s
 	var result struct {
 		BlobID string `json:"blobId"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decodeJSONLimited(resp.Body, maxSessionBytes, &result); err != nil {
 		return "", fmt.Errorf("decode JMAP upload response: %w", err)
 	}
 	if result.BlobID == "" {
@@ -269,7 +328,7 @@ func (c *client) download(ctx context.Context, blobID, name, mediaType string) (
 		"name":      name,
 		"type":      mediaType,
 	})
-	resp, err := c.doHTTP(ctx, http.MethodGet, u, nil, "")
+	resp, err := c.doHTTP(ctx, http.MethodGet, u, nil, "", true)
 	if err != nil {
 		return nil, err
 	}
@@ -297,7 +356,10 @@ func (c *client) watch(ctx context.Context, onChange func()) error {
 	q.Set("ping", "30")
 	u.RawQuery = q.Encode()
 
+	eventClient := *c.httpClient
+	eventClient.Timeout = 0
 	var lastEventID string
+	retryAttempt := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -311,17 +373,35 @@ func (c *client) watch(ctx context.Context, onChange func()) error {
 		if lastEventID != "" {
 			req.Header.Set("Last-Event-ID", lastEventID)
 		}
-		resp, err := c.httpClient.Do(req)
+		resp, err := eventClient.Do(req)
 		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			lastEventID, err = c.consumeEvents(ctx, resp.Body, lastEventID, onChange)
 			_ = resp.Body.Close()
 		} else if resp != nil {
+			responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			_ = resp.Body.Close()
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+				return &statusError{Status: resp.StatusCode, Body: strings.TrimSpace(string(responseBody))}
+			}
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := sleep(ctx, time.Second); err != nil {
+		if err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			retryAttempt = 0
+		} else if retryAttempt < 6 {
+			retryAttempt++
+		}
+		delay := time.Duration(1<<retryAttempt) * time.Second
+		if delay > time.Minute {
+			delay = time.Minute
+		}
+		if resp != nil {
+			if seconds, parseErr := strconv.Atoi(resp.Header.Get("Retry-After")); parseErr == nil && seconds > 0 {
+				delay = time.Duration(seconds) * time.Second
+			}
+		}
+		if err := sleep(ctx, delay); err != nil {
 			return err
 		}
 	}

@@ -233,8 +233,9 @@ func (e *Engine) folderSelected(folder backend.Folder) bool {
 }
 
 // syncFolder pages through one folder's changes until the backend reports no
-// more, persisting the cursor after every successfully processed batch so a
-// crash mid-folder resumes where it left off.
+// more, normally persisting the cursor after every successfully processed
+// batch. Replacement snapshots persist only their final cursor so a crash
+// restarts the complete reconciliation instead of treating a tail as complete.
 func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backend.Folder, result *Result) (map[string]backend.Flags, error) {
 	cursor, err := e.opts.Cursors.Get(e.opts.Account, folder.Name)
 	if err != nil {
@@ -254,6 +255,11 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 	// cannot resolve and that was not seen this run is logged and skipped, which
 	// is safe — the row lingers rather than risking deleting the wrong message.
 	sessionRefs := make(map[string]string)
+	// snapshotRefs accumulates the authoritative refs from a replacement full
+	// snapshot. It is separate from sessionRefs because a malformed current
+	// message must not make the engine delete an older local copy.
+	snapshotRefs := make(map[string]struct{})
+	fullSnapshot := false
 
 	// fetched counts messages pulled this run, to enforce MaxPerFolder.
 	fetched := 0
@@ -268,6 +274,12 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		res, err := b.FetchMessages(ctx, folder.Name, cursor, e.opts.BatchLimit)
 		if err != nil {
 			return nil, fmt.Errorf("fetch messages: %w", err)
+		}
+		if res.FullSnapshot {
+			fullSnapshot = true
+			for _, ref := range res.Present {
+				snapshotRefs[ref.ID] = struct{}{}
+			}
 		}
 
 		for _, msg := range res.Messages {
@@ -305,7 +317,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				// Only inbox arrivals are worth notifying about; a message
 				// ingested into Sent is the user's own, and Archive/Junk are
 				// not events they asked to be interrupted for.
-				if folder.Role == backend.RoleInbox {
+				if folder.Role == backend.RoleInbox || (b.Capabilities().LabelsAreTags && tagsContain(msg.Labels, "inbox")) {
 					result.NewMessageIDs = append(result.NewMessageIDs, messageID)
 				}
 			} else {
@@ -332,7 +344,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		// Persist the cursor only after the batch was fully processed, and
 		// never in dry-run (advancing it would silently skip these changes on
 		// the next real sync).
-		if !e.opts.DryRun {
+		if !e.opts.DryRun && (!res.FullSnapshot || !res.HasMore) {
 			if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, res.Cursor); err != nil {
 				return nil, fmt.Errorf("persist cursor: %w", err)
 			}
@@ -347,12 +359,19 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		}
 
 		if !res.HasMore {
+			if fullSnapshot && !e.opts.DryRun {
+				e.reconcileFullSnapshot(folder, snapshotRefs, result)
+			}
 			return deltaFlags, nil
 		}
 		// Stop at the per-folder cap (newest-first), so a first sync of a large
 		// folder does not page its entire history — parity with the legacy
 		// syncer's GetIMAPMaxMessages.
-		if e.opts.MaxPerFolder > 0 && fetched >= e.opts.MaxPerFolder {
+		// A replacement snapshot must finish in this run: intermediate cursors
+		// are deliberately not persisted, and reconciliation needs Present refs
+		// from every page. State-expiry recovery is rare and correctness takes
+		// precedence over the normal first-sync cap.
+		if e.opts.MaxPerFolder > 0 && fetched >= e.opts.MaxPerFolder && !fullSnapshot {
 			slog.Debug("Reached per-folder message cap, stopping", "module", "SYNCENGINE", // encgrep:allow folder name and cap counts are operational sync metadata, not message content
 				"folder", folder.Name, "cap", e.opts.MaxPerFolder, "fetched", fetched)
 			return deltaFlags, nil
@@ -363,6 +382,29 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 			return nil, fmt.Errorf("backend reported HasMore without progress (cursor unchanged, no changes)")
 		}
 		cursor = res.Cursor
+	}
+}
+
+// reconcileFullSnapshot removes local refs that are absent from an
+// authoritative replacement snapshot. This is used only after every page has
+// completed; a capped or interrupted backfill never performs reconciliation.
+func (e *Engine) reconcileFullSnapshot(folder backend.Folder, present map[string]struct{}, result *Result) {
+	rows, err := e.opts.Store.GetFolderFlagState(e.opts.Account, folder.Name)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("load full-snapshot state for %s: %w", folder.Name, err))
+		return
+	}
+	for _, row := range rows {
+		if _, ok := present[row.RemoteRef]; ok {
+			continue
+		}
+		del := backend.Deletion{
+			Ref:       backend.RemoteRef{Folder: folder.Name, ID: row.RemoteRef},
+			MessageID: row.MessageID,
+		}
+		if e.handleDeleted(folder, del, nil, result) {
+			result.Deleted++
+		}
 	}
 }
 

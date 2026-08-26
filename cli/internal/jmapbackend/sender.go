@@ -104,6 +104,10 @@ func (b *Backend) identityID(ctx context.Context) (string, error) {
 	if _, ok := b.client.session.Capabilities[submissionCapability]; !ok {
 		return "", errors.New("JMAP server does not advertise mail submission")
 	}
+	account, ok := b.client.session.Accounts[b.client.accountID]
+	if _, supportsSubmission := account.AccountCapabilities[submissionCapability]; !ok || !supportsSubmission {
+		return "", errors.New("JMAP mail account does not support submission")
+	}
 	var result struct {
 		List []struct {
 			ID    string `json:"id"`
