@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -246,6 +247,8 @@ func (c *client) doHTTP(ctx context.Context, method, requestURL string, body []b
 			if seconds, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && seconds > 0 {
 				delay = time.Duration(seconds) * time.Second
 			}
+			slog.Warn("JMAP request throttled or unavailable, backing off", "module", "JMAPBACKEND",
+				"status", resp.StatusCode, "retry", attempt+1, "delay", delay)
 			if err := sleep(ctx, delay); err != nil {
 				return nil, err
 			}
@@ -406,6 +409,8 @@ func (c *client) watch(ctx context.Context, onChange func()) error {
 				delay = time.Duration(seconds) * time.Second
 			}
 		}
+		slog.Warn("JMAP EventSource disconnected, reconnecting", "module", "JMAPBACKEND",
+			"retry", retryAttempt, "delay", delay)
 		if err := sleep(ctx, delay); err != nil {
 			return err
 		}

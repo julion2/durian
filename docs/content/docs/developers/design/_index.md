@@ -17,6 +17,9 @@ honest.
 | #    | Title                                                | Status     |
 | ---- | ---------------------------------------------------- | ---------- |
 | [0001](0001-mail-content-encryption-at-rest/) | Mail content encryption at rest with searchable blind-token FTS5 | Proposed |
+| [0002](0002-calendar-two-way-sync-and-recurrence/) | Calendar two-way sync and recurrence | Proposed |
+| [0003](0003-gmail-rest-backend/) | Gmail REST backend | Proposed |
+| [0004](0004-jmap-backend/) | Native JMAP mail, submission, and EventSource push | Proposed |
 
 ## Status lifecycle
 

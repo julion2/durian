@@ -225,10 +225,20 @@ type LabelWriter interface {
 // snapshot can list every remote ref cheaply; the engine then asks for full
 // messages only for refs that are not already in the local read model before it
 // advances the replacement cursor.
+type SnapshotBatch struct {
+	// Messages contains every requested ref that still exists.
+	Messages []Message
+	// Missing contains requested refs that the provider explicitly reported as
+	// gone after the authoritative snapshot was listed. The engine removes them
+	// from that snapshot rather than retrying an impossible hydration forever.
+	Missing []RemoteRef
+}
+
 type SnapshotHydrator interface {
 	// FetchSnapshotMetadata returns current flags and labels for locally existing
-	// refs without downloading their RFC 5322 bodies.
-	FetchSnapshotMetadata(ctx context.Context, refs []RemoteRef) ([]Message, error)
+	// refs without downloading their RFC 5322 bodies. Every requested ref must
+	// appear in either Messages or Missing.
+	FetchSnapshotMetadata(ctx context.Context, refs []RemoteRef) (SnapshotBatch, error)
 	// FetchSnapshotMessages returns complete messages for locally absent refs.
-	FetchSnapshotMessages(ctx context.Context, refs []RemoteRef) ([]Message, error)
+	FetchSnapshotMessages(ctx context.Context, refs []RemoteRef) (SnapshotBatch, error)
 }

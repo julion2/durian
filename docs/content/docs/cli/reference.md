@@ -37,7 +37,9 @@ configured **JMAP** accounts over JMAP Mail (mailbox memberships become tags);
 everything else uses IMAP. The command and flags are identical regardless — see
 [Sync engine](../../configuration/config/#sync-engine).
 
-The GUI runs `durian serve`, which keeps a long-lived IDLE connection open per account — explicit `durian sync` is mainly useful for cron jobs or troubleshooting.
+The GUI runs `durian serve`, which watches legacy and opt-in IMAP accounts with
+IDLE, JMAP accounts with EventSource, and polls Gmail and Graph. Explicit
+`durian sync` is mainly useful for cron jobs or troubleshooting.
 
 ## search — query the local store
 

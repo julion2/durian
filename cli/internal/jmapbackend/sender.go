@@ -24,6 +24,7 @@ type Sender struct {
 	b *Backend
 }
 
+// NewSender creates a JMAP submission sender for account.
 func NewSender(account *config.AccountConfig) (*Sender, error) {
 	b, err := New(account)
 	if err != nil {

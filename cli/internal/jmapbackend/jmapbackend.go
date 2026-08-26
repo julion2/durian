@@ -1,5 +1,11 @@
 // Package jmapbackend implements Durian's provider-neutral mail backend on
 // RFC 8620 (JMAP Core) and RFC 8621 (JMAP Mail and Submission).
+//
+// Cursor encoding is opaque JSON. During initial sync it contains a start-state
+// snapshot and the remaining stable Email/query ID set; after that it contains
+// only EmailState. If Email/changes returns cannotCalculateChanges, the backend
+// emits a metadata-first replacement snapshot and advances EmailState only
+// after the engine has hydrated and reconciled the complete remote ID set.
 package jmapbackend
 
 import (
@@ -30,6 +36,7 @@ var (
 
 var errIncompleteQuery = errors.New("JMAP Email/query returned an incomplete snapshot")
 
+// Backend translates JMAP Mail objects into Durian's provider-neutral model.
 type Backend struct {
 	account *config.AccountConfig
 	client  *client
@@ -68,10 +75,10 @@ type jmapEmail struct {
 type jmapCursor struct {
 	Snapshot   string   `json:"snapshot,omitempty"`
 	PendingIDs []string `json:"pendingIds,omitempty"`
-	Reconcile  bool     `json:"reconcile,omitempty"`
 	EmailState string   `json:"emailState,omitempty"`
 }
 
+// New creates a JMAP backend for an account configured with sync_engine=jmap.
 func New(account *config.AccountConfig) (*Backend, error) {
 	if account == nil || account.JMAP == nil || !account.UsesJMAPBackend() {
 		return nil, errors.New("JMAP backend requires sync_engine=\"jmap\" and a jmap configuration block")
@@ -320,8 +327,6 @@ func (b *Backend) initialPage(ctx context.Context, state jmapCursor, limit int) 
 		return backend.FetchResult{}, err
 	}
 	deleted := deletions(allMailStream, missing)
-	present := presentRefs(allMailStream, ids, missing)
-	reconcile := state.Reconcile
 	state.PendingIDs = state.PendingIDs[count:]
 	hasMore := len(state.PendingIDs) > 0
 	if hasMore {
@@ -331,7 +336,6 @@ func (b *Backend) initialPage(ctx context.Context, state jmapCursor, limit int) 
 	}
 	return backend.FetchResult{
 		Messages: messages, Deleted: deleted, Cursor: encodeCursor(state), HasMore: hasMore,
-		FullSnapshot: reconcile, Present: present,
 	}, nil
 }
 
@@ -452,28 +456,25 @@ func (b *Backend) replacementSnapshot(ctx context.Context) (backend.FetchResult,
 
 // FetchSnapshotMessages hydrates only replacement-snapshot refs absent from
 // Durian's local read model; the engine determines that set before calling.
-func (b *Backend) FetchSnapshotMessages(ctx context.Context, refs []backend.RemoteRef) ([]backend.Message, error) {
+func (b *Backend) FetchSnapshotMessages(ctx context.Context, refs []backend.RemoteRef) (backend.SnapshotBatch, error) {
 	ids := make([]string, 0, len(refs))
 	for _, ref := range refs {
 		ids = append(ids, ref.ID)
 	}
-	messages, _, err := b.getMessages(ctx, ids)
-	return messages, err
+	messages, missing, err := b.getMessages(ctx, ids)
+	return backend.SnapshotBatch{Messages: messages, Missing: presentRefs(allMailStream, missing, nil)}, err
 }
 
 // FetchSnapshotMetadata returns current mailbox memberships and keywords in a
 // batched Email/get without downloading RFC 5322 blobs.
-func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.RemoteRef) ([]backend.Message, error) {
+func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.RemoteRef) (backend.SnapshotBatch, error) {
 	ids := make([]string, 0, len(refs))
 	for _, ref := range refs {
 		ids = append(ids, ref.ID)
 	}
 	objects, missing, _, err := b.getEmailObjects(ctx, ids)
 	if err != nil {
-		return nil, err
-	}
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("JMAP snapshot metadata omitted %d messages", len(missing))
+		return backend.SnapshotBatch{}, err
 	}
 	messages := make([]backend.Message, 0, len(objects))
 	for _, email := range objects {
@@ -482,7 +483,7 @@ func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.Remo
 			Flags: flagsFromKeywords(email.Keywords), Labels: b.labelsFor(email.MailboxIDs),
 		})
 	}
-	return messages, nil
+	return backend.SnapshotBatch{Messages: messages, Missing: presentRefs(allMailStream, missing, nil)}, nil
 }
 
 func (b *Backend) currentEmailState(ctx context.Context) (string, error) {
@@ -527,7 +528,9 @@ func (b *Backend) getMessages(ctx context.Context, ids []string) ([]backend.Mess
 	if err != nil {
 		return nil, nil, err
 	}
-	const downloadConcurrency = 12
+	// Each worker can hold a maxMessageBytes MIME body. Four workers preserve
+	// useful parallelism without allowing a pathological page to retain 1.2 GB.
+	const downloadConcurrency = 4
 	messages := make([]backend.Message, len(objects))
 	errs := make([]error, len(objects))
 	notFound := make([]bool, len(objects))
@@ -614,6 +617,7 @@ func (b *Backend) downloadRaw(ctx context.Context, email jmapEmail) ([]byte, err
 	return readLimited(r, maxMessageBytes, "JMAP message")
 }
 
+// FetchBody streams the RFC 5322 body addressed by ref into w.
 func (b *Backend) FetchBody(ctx context.Context, ref backend.RemoteRef, w io.Writer) error {
 	if err := b.ensure(ctx); err != nil {
 		return err
@@ -660,6 +664,7 @@ func flagsToKeywords(flags backend.Flags) map[string]bool {
 	return keywords
 }
 
+// ApplyFlags updates JMAP keywords corresponding to Durian flags.
 func (b *Backend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, remove backend.Flags) error {
 	patch := make(map[string]interface{})
 	setFlagPatch(patch, "$seen", add.Seen, remove.Seen)
@@ -680,6 +685,7 @@ func setFlagPatch(patch map[string]interface{}, keyword string, add, remove bool
 	}
 }
 
+// FetchFlags returns current JMAP keyword state for refs that still exist.
 func (b *Backend) FetchFlags(ctx context.Context, _ string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
 	ids := make([]string, 0, len(refs))
 	for _, ref := range refs {
@@ -696,6 +702,7 @@ func (b *Backend) FetchFlags(ctx context.Context, _ string, refs []backend.Remot
 	return result, nil
 }
 
+// Move adds the destination mailbox and removes the source mailbox membership.
 func (b *Backend) Move(ctx context.Context, ref backend.RemoteRef, destFolder string) (backend.RemoteRef, error) {
 	patch := map[string]interface{}{"mailboxIds/" + destFolder: true}
 	if ref.Folder != "" && ref.Folder != allMailStream && ref.Folder != destFolder {
@@ -707,6 +714,7 @@ func (b *Backend) Move(ctx context.Context, ref backend.RemoteRef, destFolder st
 	return backend.RemoteRef{Folder: destFolder, ID: ref.ID}, nil
 }
 
+// LabelTags returns canonical tags for every server mailbox.
 func (b *Backend) LabelTags(ctx context.Context) ([]string, error) {
 	if err := b.loadMailboxes(ctx); err != nil {
 		return nil, err
@@ -721,6 +729,7 @@ func (b *Backend) LabelTags(ctx context.Context) ([]string, error) {
 	return tags, nil
 }
 
+// ApplyLabels updates mailbox memberships represented by canonical Durian tags.
 func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, remove []string) error {
 	if err := b.loadMailboxes(ctx); err != nil {
 		return err
@@ -844,6 +853,7 @@ func (b *Backend) updateEmail(ctx context.Context, id string, patch map[string]i
 	return nil
 }
 
+// Append uploads and imports an RFC 5322 message into folder.
 func (b *Backend) Append(ctx context.Context, folder string, flags backend.Flags, msg []byte) (backend.RemoteRef, error) {
 	if err := b.loadMailboxes(ctx); err != nil {
 		return backend.RemoteRef{}, err
@@ -888,10 +898,12 @@ func (b *Backend) Append(ctx context.Context, folder string, flags backend.Flags
 	return backend.RemoteRef{Folder: folder, ID: created.ID}, nil
 }
 
+// Send submits a raw RFC 5322 message through JMAP Submission.
 func (b *Backend) Send(ctx context.Context, msg []byte) error {
 	return b.sendRaw(ctx, msg)
 }
 
+// Watch consumes the account-wide JMAP EventSource stream until ctx ends.
 func (b *Backend) Watch(ctx context.Context, _ string, onChange func()) error {
 	if err := b.ensure(ctx); err != nil {
 		return err
@@ -899,6 +911,7 @@ func (b *Backend) Watch(ctx context.Context, _ string, onChange func()) error {
 	return b.client.watch(ctx, onChange)
 }
 
+// Capabilities reports JMAP's account-wide push and label-native delta support.
 func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
 		PushWatch:          true,
@@ -907,6 +920,7 @@ func (b *Backend) Capabilities() backend.Capabilities {
 	}
 }
 
+// Close releases idle HTTP connections held by the backend.
 func (b *Backend) Close() error {
 	if b.client != nil && b.client.httpClient != nil {
 		b.client.httpClient.CloseIdleConnections()

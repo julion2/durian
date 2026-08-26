@@ -2,6 +2,8 @@ package jmapbackend
 
 import (
 	"errors"
+	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -61,6 +63,35 @@ func TestClassifySendErrorTreatsLocalJMAPPreconditionsAsPermanent(t *testing.T) 
 			var sendErr *mailsend.Error
 			if !errors.As(classified, &sendErr) || sendErr.Kind != mailsend.KindPermanent || !errors.Is(classified, err) {
 				t.Fatalf("classifySendError(%v) = %#v", err, classified)
+			}
+		})
+	}
+}
+
+func TestClassifySendError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		kind mailsend.Kind
+	}{
+		{name: "HTTP client error", err: &statusError{Status: http.StatusUnauthorized}, kind: mailsend.KindPermanent},
+		{name: "HTTP rate limit", err: &statusError{Status: http.StatusTooManyRequests}, kind: mailsend.KindTransient},
+		{name: "HTTP server error", err: &statusError{Status: http.StatusServiceUnavailable}, kind: mailsend.KindTransient},
+		{name: "permanent method error", err: &methodError{Type: "invalidArguments"}, kind: mailsend.KindPermanent},
+		{name: "server method error", err: &methodError{Type: "serverFail"}, kind: mailsend.KindTransient},
+		{name: "partial server method error", err: &methodError{Type: "serverPartialFail"}, kind: mailsend.KindTransient},
+		{name: "method rate limit", err: &methodError{Type: "rateLimit"}, kind: mailsend.KindTransient},
+		{name: "network error", err: errors.New("connection reset"), kind: mailsend.KindNetwork},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			classified := classifySendError(fmt.Errorf("send submission: %w", tt.err))
+			var sendErr *mailsend.Error
+			if !errors.As(classified, &sendErr) || sendErr.Kind != tt.kind {
+				t.Fatalf("classifySendError(%v) = %#v, want kind %v", tt.err, classified, tt.kind)
+			}
+			if !errors.Is(classified, tt.err) {
+				t.Fatalf("classified error does not wrap original %v", tt.err)
 			}
 		})
 	}

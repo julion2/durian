@@ -171,6 +171,9 @@ func TestFetchMessagesRecoversFromExpiredToken(t *testing.T) {
 	if len(result.Messages) != 1 || result.Messages[0].Ref.ID != "msg1" {
 		t.Fatalf("expected 1 recovered message, got %+v", result.Messages)
 	}
+	if !result.FullSnapshot || len(result.Present) != 1 || result.Present[0].ID != "msg1" {
+		t.Fatalf("expired-token recovery is not authoritative: %+v", result)
+	}
 }
 
 func TestMailboxRouting(t *testing.T) {
@@ -228,10 +231,6 @@ func TestFetchMessagesConcurrentBodiesBounded(t *testing.T) {
 		time.Sleep(3 * time.Millisecond) // widen the overlap window
 		atomic.AddInt32(&inFlight, -1)
 
-		if strings.Contains(r.URL.Path, "/m7/") { // one message fails to fetch
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
 		_, _ = w.Write([]byte("Subject: hi\r\n\r\nbody"))
 	})
 	srv = httptest.NewServer(mux)
@@ -242,14 +241,35 @@ func TestFetchMessagesConcurrentBodiesBounded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchMessages: %v", err)
 	}
-	if len(result.Messages) != n-1 {
-		t.Errorf("got %d messages, want %d (failed fetch not skipped?)", len(result.Messages), n-1)
+	if len(result.Messages) != n {
+		t.Errorf("got %d messages, want %d", len(result.Messages), n)
 	}
 	if maxInFlight > fetchConcurrency {
 		t.Errorf("max in-flight %d exceeded bound %d", maxInFlight, fetchConcurrency)
 	}
 	if maxInFlight < 2 {
 		t.Errorf("max in-flight %d — bodies fetched serially, not concurrently", maxInFlight)
+	}
+}
+
+func TestFetchMessagesHoldsCursorWhenBodyFetchFails(t *testing.T) {
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/mailFolders/f/messages/delta", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]any{
+			"value":            []map[string]any{{"id": "m1", "internetMessageId": "<m1@example.com>"}},
+			"@odata.deltaLink": srv.URL + "/done",
+		})
+	})
+	mux.HandleFunc("/v1.0/me/messages/m1/$value", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	if _, err := b.FetchMessages(t.Context(), "f", nil, 50); err == nil {
+		t.Fatal("FetchMessages() succeeded after body fetch failed")
 	}
 }
 
@@ -443,6 +463,37 @@ func TestFetchFlags(t *testing.T) {
 	}
 	if got := flags["bulk44"]; !got.Seen {
 		t.Errorf("flags[bulk44] = %+v, want Seen=true (last chunk not fetched?)", got)
+	}
+}
+
+func TestFetchFlagsDoesNotTreatTransientSubresponseAsMissing(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		writeJSON(t, w, map[string]any{"responses": []map[string]any{{"id": "0", "status": 429}}})
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, err := b.FetchFlags(ctx, "folder1", []backend.RemoteRef{{Folder: "folder1", ID: "msg1"}})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("FetchFlags() error = %v, want context deadline while backing off", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("batch calls = %d, want 1 before cancellation", got)
+	}
+}
+
+func TestFetchFlagsRejectsPermanentSubresponseFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, map[string]any{"responses": []map[string]any{{"id": "0", "status": 403}}})
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	_, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{{Folder: "folder1", ID: "msg1"}})
+	if err == nil || !strings.Contains(err.Error(), "status 403") {
+		t.Fatalf("FetchFlags() error = %v, want permanent subresponse failure", err)
 	}
 }
 

@@ -379,42 +379,6 @@ func TestInitialSyncCapturesStableIDSetBeforePagingBodies(t *testing.T) {
 	}
 }
 
-func TestReplacementSnapshotMarksEveryPageForReconciliation(t *testing.T) {
-	s := newTestJMAPServer(t)
-	s.handler = func(method string, args map[string]interface{}) interface{} {
-		switch method {
-		case "Mailbox/get":
-			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
-		case "Email/query":
-			return map[string]interface{}{"ids": []string{"e1", "e2"}, "total": 2}
-		case "Email/get":
-			ids, _ := args["ids"].([]interface{})
-			if len(ids) == 0 {
-				return map[string]interface{}{"state": "s2", "list": []interface{}{}, "notFound": []interface{}{}}
-			}
-			id := ids[0].(string)
-			return map[string]interface{}{"state": "s2", "list": []interface{}{emailObject(id, nil, map[string]bool{"inbox-id": true})}, "notFound": []interface{}{}}
-		}
-		t.Fatalf("unexpected method %s", method)
-		return nil
-	}
-	b := s.backend(t)
-	if _, err := b.FetchFolders(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	first, err := b.initialPage(t.Context(), jmapCursor{Reconcile: true}, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := b.FetchMessages(t.Context(), allMailStream, first.Cursor, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !first.FullSnapshot || !second.FullSnapshot || len(first.Present) != 1 || len(second.Present) != 1 {
-		t.Fatalf("replacement pages = %#v / %#v", first, second)
-	}
-}
-
 func TestCannotCalculateChangesStartsReplacementSnapshot(t *testing.T) {
 	s := newTestJMAPServer(t)
 	s.handler = func(method string, args map[string]interface{}) interface{} {
@@ -465,10 +429,11 @@ func TestFetchSnapshotMetadataDoesNotDownloadBodies(t *testing.T) {
 	if _, err := b.FetchFolders(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	messages, err := b.FetchSnapshotMetadata(t.Context(), []backend.RemoteRef{{Folder: allMailStream, ID: "e1"}})
+	batch, err := b.FetchSnapshotMetadata(t.Context(), []backend.RemoteRef{{Folder: allMailStream, ID: "e1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	messages := batch.Messages
 	if len(messages) != 1 || messages[0].Ref.ID != "e1" || !messages[0].Flags.Seen {
 		t.Fatalf("metadata = %+v", messages)
 	}

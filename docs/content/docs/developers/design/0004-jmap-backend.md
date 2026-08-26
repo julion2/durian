@@ -68,3 +68,17 @@ improving the state-token correctness model and is therefore out of scope.
 - Live integration tests can run against disposable Stalwart or Fastmail
   accounts and are always compiled by the Bazel CLI suite.
 - Calendar and contacts JMAP capabilities are not part of this decision.
+
+## Alternatives considered
+
+- **Keep IMAP/SMTP for JMAP providers.** Rejected as the default because it
+  gives up standardized state tokens, mailbox metadata, submission, and push;
+  IMAP remains available only for the currently IMAP-only draft commands.
+- **Add Fastmail-specific REST code.** Rejected because RFC 8620/8621 provides
+  the same portable capability seam for Fastmail, Stalwart, Cyrus, and future
+  providers.
+- **Use RFC 8887 WebSocket push.** Deferred: EventSource is part of JMAP Core,
+  works with the same state-token recovery, and avoids a second transport.
+- **Persist mailbox-sized ID sets as steady-state cursors.** Rejected for state
+  expiry recovery; authoritative replacement IDs are consumed as recovery
+  state and the durable steady-state cursor remains the provider's EmailState.

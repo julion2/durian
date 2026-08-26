@@ -169,10 +169,11 @@ func TestFetchSnapshotMetadataUsesMinimalFormat(t *testing.T) {
 	if err := b.loadLabels(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	messages, err := b.FetchSnapshotMetadata(t.Context(), []backend.RemoteRef{{Folder: allMailStream, ID: "m1"}})
+	batch, err := b.FetchSnapshotMetadata(t.Context(), []backend.RemoteRef{{Folder: allMailStream, ID: "m1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	messages := batch.Messages
 	if len(messages) != 1 || messages[0].Ref.ID != "m1" || messages[0].Flags.Seen {
 		t.Fatalf("messages = %+v", messages)
 	}

@@ -139,36 +139,48 @@ func runOAuthLogin(account *config.AccountConfig) error {
 
 // runPasswordLogin handles password-based authentication
 func runPasswordLogin(account *config.AccountConfig) error {
-	credentialName := "Password"
-	prompt := "Enter password: "
-	if account.JMAP != nil && account.JMAP.Auth == "bearer" {
-		credentialName = "JMAP API token"
-		prompt = "Enter JMAP API token: "
+	requests := credentialRequests(account)
+	for _, request := range requests {
+		fmt.Printf("%s authentication for %s\n\n", request.name, account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+		password, err := promptPassword(request.prompt)
+		if err != nil {
+			return fmt.Errorf("failed to read %s: %w", strings.ToLower(request.name), err)
+		}
+		if password == "" {
+			return fmt.Errorf("%s cannot be empty", strings.ToLower(request.name))
+		}
+		if err := keychain.SetPassword(request.service, account.Email, password); err != nil {
+			return fmt.Errorf("failed to save %s: %w", strings.ToLower(request.name), err)
+		}
+		fmt.Printf("\n✓ %s stored securely in Keychain\n", request.name)
+		fmt.Printf("✓ Service: %s\n", request.service)
+		fmt.Printf("✓ Account: %s\n", account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 	}
-	fmt.Printf("%s authentication for %s\n\n", credentialName, account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-
-	password, err := promptPassword(prompt)
-	if err != nil {
-		return fmt.Errorf("failed to read password: %w", err)
-	}
-
-	if password == "" {
-		return fmt.Errorf("%s cannot be empty", strings.ToLower(credentialName))
-	}
-
-	service := keychain.PasswordKeychainService
-	if account.UsesJMAPBackend() {
-		service = keychain.JMAPKeychainService
-	}
-	if err := keychain.SetPassword(service, account.Email, password); err != nil {
-		return fmt.Errorf("failed to save password: %w", err)
-	}
-
-	fmt.Printf("\n✓ %s stored securely in Keychain\n", credentialName)
-	fmt.Printf("✓ Service: %s\n", service)
-	fmt.Printf("✓ Account: %s\n", account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 
 	return nil
+}
+
+type credentialRequest struct {
+	name    string
+	prompt  string
+	service string
+}
+
+func credentialRequests(account *config.AccountConfig) []credentialRequest {
+	if !account.UsesJMAPBackend() {
+		return []credentialRequest{{name: "Password", prompt: "Enter password: ", service: keychain.PasswordKeychainService}}
+	}
+	name, prompt := "JMAP password", "Enter JMAP password: "
+	if account.JMAP != nil && account.JMAP.Auth == "bearer" {
+		name, prompt = "JMAP API token", "Enter JMAP API token: "
+	}
+	requests := []credentialRequest{{name: name, prompt: prompt, service: keychain.JMAPKeychainService}}
+	if account.IMAP.Host != "" && account.IMAP.Auth == "password" {
+		requests = append(requests, credentialRequest{
+			name: "IMAP password", prompt: "Enter IMAP password for server-side draft commands: ", service: keychain.PasswordKeychainService,
+		})
+	}
+	return requests
 }
 
 // stdinPromptReader is a single bufio.Reader over os.Stdin shared across all
@@ -299,12 +311,15 @@ func runAuthLogout(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to delete token: %w", err)
 		}
 	} else if account.UsesJMAPBackend() {
-		if !keychain.Exists(keychain.JMAPKeychainService, account.Email) {
+		found, err := deleteCredentials(account.Email,
+			[]string{keychain.JMAPKeychainService, keychain.PasswordKeychainService},
+			keychain.Exists, keychain.DeletePassword)
+		if err != nil {
+			return err
+		}
+		if !found {
 			fmt.Printf("No JMAP credential found for %s\n", account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 			return nil
-		}
-		if err := keychain.DeletePassword(keychain.JMAPKeychainService, account.Email); err != nil {
-			return fmt.Errorf("failed to delete JMAP credential: %w", err)
 		}
 	} else {
 		// Password account
@@ -322,6 +337,26 @@ func runAuthLogout(cmd *cobra.Command, args []string) error {
 	fmt.Printf("✓ Credentials removed from Keychain\n")
 
 	return nil
+}
+
+func deleteCredentials(
+	account string,
+	services []string,
+	exists func(string, string) bool,
+	remove func(string, string) error,
+) (bool, error) {
+	found := false
+	var errs []error
+	for _, service := range services {
+		if !exists(service, account) {
+			continue
+		}
+		found = true
+		if err := remove(service, account); err != nil {
+			errs = append(errs, fmt.Errorf("failed to delete credential from %s: %w", service, err))
+		}
+	}
+	return found, errors.Join(errs...)
 }
 
 func runAuthRefresh(cmd *cobra.Command, args []string) error {

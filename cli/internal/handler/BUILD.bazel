@@ -64,6 +64,7 @@ go_test(
     ],
     embed = [":handler"],
     deps = [
+        "//cli/internal/backend",
         "//cli/internal/calendar",
         "//cli/internal/calendarsync",
         "//cli/internal/config",

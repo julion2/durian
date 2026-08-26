@@ -40,10 +40,10 @@ type Options struct {
 	Account string
 	// BatchLimit caps messages per FetchMessages call; <=0 means default (200).
 	BatchLimit int
-	// MaxPerFolder caps how many messages are fetched per folder per run
-	// (newest first, since the backend returns newest UIDs first), mirroring
-	// the legacy syncer's GetIMAPMaxMessages. 0 means unlimited. Without this
-	// the engine would page a folder's entire history on first sync.
+	// MaxPerFolder caps ordinary initial/delta message fetches per folder per run
+	// (newest first), mirroring the legacy syncer's GetIMAPMaxMessages. Zero is
+	// unlimited. Authoritative state-expiry recovery deliberately bypasses the
+	// cap because reconciliation cannot safely use a partial remote ID set.
 	MaxPerFolder int
 	// Mode is the sync direction.
 	Mode Mode
@@ -467,14 +467,15 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 	for start := 0; start < len(current); start += batchSize {
 		end := min(start+batchSize, len(current))
 		batch := current[start:end]
-		messages, err := hydrator.FetchSnapshotMetadata(ctx, batch)
+		hydrated, err := hydrator.FetchSnapshotMetadata(ctx, batch)
 		if err != nil {
 			return fmt.Errorf("refresh full snapshot metadata: %w", err)
 		}
-		if err := validateSnapshotBatch(batch, messages); err != nil {
+		if err := validateSnapshotBatch(batch, hydrated); err != nil {
 			return err
 		}
-		for _, msg := range messages {
+		removeMissingSnapshotRefs(present, deltaFlags, hydrated.Missing)
+		for _, msg := range hydrated.Messages {
 			deltaFlags[msg.Ref.ID] = msg.Flags
 			if e.opts.Ingest.LabelsAsTags && !e.opts.DryRun {
 				if err := reconcileLabels(e.opts.Store, messageIDs[msg.Ref.ID], e.opts.Account, msg.Labels); err != nil {
@@ -486,14 +487,15 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 	for start := 0; start < len(missing); start += batchSize {
 		end := min(start+batchSize, len(missing))
 		batch := missing[start:end]
-		messages, err := hydrator.FetchSnapshotMessages(ctx, batch)
+		hydrated, err := hydrator.FetchSnapshotMessages(ctx, batch)
 		if err != nil {
 			return fmt.Errorf("hydrate full snapshot: %w", err)
 		}
-		if err := validateSnapshotBatch(batch, messages); err != nil {
+		if err := validateSnapshotBatch(batch, hydrated); err != nil {
 			return err
 		}
-		for _, msg := range messages {
+		removeMissingSnapshotRefs(present, deltaFlags, hydrated.Missing)
+		for _, msg := range hydrated.Messages {
 			deltaFlags[msg.Ref.ID] = msg.Flags
 			if e.opts.DryRun {
 				result.New++
@@ -516,21 +518,34 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 	return nil
 }
 
-func validateSnapshotBatch(requested []backend.RemoteRef, messages []backend.Message) error {
+func validateSnapshotBatch(requested []backend.RemoteRef, batch backend.SnapshotBatch) error {
 	expected := make(map[string]struct{}, len(requested))
 	for _, ref := range requested {
 		expected[ref.ID] = struct{}{}
 	}
-	for _, msg := range messages {
+	for _, msg := range batch.Messages {
 		if _, ok := expected[msg.Ref.ID]; !ok {
 			return fmt.Errorf("snapshot hydrator returned unexpected ref %q", msg.Ref.ID)
 		}
 		delete(expected, msg.Ref.ID)
 	}
+	for _, ref := range batch.Missing {
+		if _, ok := expected[ref.ID]; !ok {
+			return fmt.Errorf("snapshot hydrator reported unexpected missing ref %q", ref.ID)
+		}
+		delete(expected, ref.ID)
+	}
 	if len(expected) > 0 {
 		return fmt.Errorf("snapshot hydrator omitted %d requested messages", len(expected))
 	}
 	return nil
+}
+
+func removeMissingSnapshotRefs(present map[string]struct{}, flags map[string]backend.Flags, missing []backend.RemoteRef) {
+	for _, ref := range missing {
+		delete(present, ref.ID)
+		delete(flags, ref.ID)
+	}
 }
 
 // reconcileFullSnapshot removes local refs that are absent from an

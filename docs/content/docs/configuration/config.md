@@ -151,8 +151,8 @@ A `Listing<AccountConfig>`. Each entry can be a literal `new { ... }` (password 
 | `default` | `true` on the default compose account |
 | `default_signature` | Signature key from `signatures {}` |
 | `notifications` | Per-account override of `settings.notifications_enabled` |
-| `smtp` | `{ host, port, auth }` |
-| `imap` | `{ host, port, auth, max_messages }` |
+| `smtp` | Optional `{ host, port, auth }`; not needed by native Graph, Gmail, or JMAP sending |
+| `imap` | Optional `{ host, port, auth, max_messages }`; required by IMAP engines and JMAP's server-side draft-command fallback |
 | `jmap` | `{ session_url, auth }`; `auth` is `password` or `bearer` |
 | `auth` | `{ username }` for password, or `oauth { client_id, client_secret }` for Google |
 | `sync_engine` | Which sync path this account uses — see [Sync engine](#sync-engine) |
@@ -187,6 +187,12 @@ example Fastmail) or `auth = "password"` for HTTP Basic authentication, then run
 allowed for loopback addresses. Durian intentionally supports JMAP EventSource
 push, not the optional RFC 8887 WebSocket transport.
 
+`imap.max_messages` limits ordinary initial and incremental engine passes. If a
+Gmail history ID or JMAP Email state expires, the authoritative replacement
+snapshot deliberately completes the whole mailbox before advancing its cursor;
+otherwise applying the cap could treat a partial ID set as complete and delete
+valid local mail. Individual provider requests remain paged and bounded.
+
 Fastmail needs no IMAP or SMTP configuration:
 
 ```pkl
@@ -208,11 +214,15 @@ IMAP and SMTP blocks are not required for sync or sending. Compose autosaves,
 the outbox, and undo-send are local and work with JMAP, but the server-side
 `durian draft save` and `durian draft delete` commands still require an IMAP
 configuration; Durian does not currently upload drafts through JMAP.
+When a JMAP account also configures password-authenticated IMAP,
+`durian auth login <alias>` prompts separately for the JMAP credential and the
+IMAP password so neither overwrites the other.
 
 `durian validate` rejects: a value outside the five above; `graph` without a Microsoft OAuth
 account; `gmail` without a Google OAuth account; and `legacy`/`engine` on a
 Microsoft account (Microsoft must use Graph). `jmap` requires an absolute HTTP(S)
-session URL and rejects non-loopback HTTP. Changing `sync_engine` triggers a
+session URL and a `jmap` block; conversely, configuring a `jmap` block requires
+`sync_engine = "jmap"`. Remote HTTP is rejected. Changing `sync_engine` triggers a
 fresh full resync (the per-backend cursors are incompatible) but is safe — the
 store upserts by Message-ID.
 

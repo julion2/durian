@@ -402,23 +402,30 @@ func (b *Backend) replacementSnapshot(ctx context.Context, folder string) (backe
 
 // FetchSnapshotMessages hydrates only replacement-snapshot refs absent from
 // Durian's local read model; the engine determines that set before calling.
-func (b *Backend) FetchSnapshotMessages(ctx context.Context, refs []backend.RemoteRef) ([]backend.Message, error) {
+func (b *Backend) FetchSnapshotMessages(ctx context.Context, refs []backend.RemoteRef) (backend.SnapshotBatch, error) {
 	if len(refs) == 0 {
-		return nil, nil
+		return backend.SnapshotBatch{}, nil
 	}
 	folder := refs[0].Folder
+	batch := backend.SnapshotBatch{}
 	ids := make([]string, 0, len(refs))
 	for _, ref := range refs {
 		ids = append(ids, ref.ID)
 	}
-	return b.fetchMany(ctx, folder, ids)
+	messages, missing, err := b.fetchMany(ctx, folder, ids)
+	batch.Messages = messages
+	for _, id := range missing {
+		batch.Missing = append(batch.Missing, backend.RemoteRef{Folder: folder, ID: id})
+	}
+	return batch, err
 }
 
 // FetchSnapshotMetadata refreshes flags and labels for replacement-snapshot
 // refs already in Durian without downloading their raw MIME bodies.
-func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.RemoteRef) ([]backend.Message, error) {
+func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.RemoteRef) (backend.SnapshotBatch, error) {
 	messages := make([]backend.Message, len(refs))
 	errs := make([]error, len(refs))
+	missing := make([]bool, len(refs))
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, fetchConcurrency)
@@ -427,7 +434,7 @@ func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.Remo
 		case sem <- struct{}{}:
 		case <-ctx.Done():
 			wg.Wait()
-			return nil, ctx.Err()
+			return backend.SnapshotBatch{}, ctx.Err()
 		}
 		wg.Add(1)
 		go func(i int) {
@@ -437,7 +444,11 @@ func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.Remo
 			var gm gmailMessage
 			endpoint := b.baseURL + "/users/me/messages/" + url.PathEscape(ref.ID) + "?format=MINIMAL"
 			if err := b.doJSON(ctx, http.MethodGet, endpoint, nil, &gm); err != nil {
-				errs[i] = err
+				if isNotFound(err) {
+					missing[i] = true
+				} else {
+					errs[i] = err
+				}
 				return
 			}
 			messages[i] = backend.Message{
@@ -449,10 +460,18 @@ func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.Remo
 	wg.Wait()
 	for _, err := range errs {
 		if err != nil {
-			return nil, fmt.Errorf("fetch snapshot metadata: %w", err)
+			return backend.SnapshotBatch{}, fmt.Errorf("fetch snapshot metadata: %w", err)
 		}
 	}
-	return messages, nil
+	batch := backend.SnapshotBatch{Messages: messages[:0]}
+	for i, message := range messages {
+		if missing[i] {
+			batch.Missing = append(batch.Missing, refs[i])
+			continue
+		}
+		batch.Messages = append(batch.Messages, message)
+	}
+	return batch, nil
 }
 
 // profileHistoryID returns the mailbox's current historyId (users.getProfile),
@@ -501,7 +520,7 @@ func (b *Backend) initialList(ctx context.Context, folder string, gc gmailCursor
 	for i, m := range page.Messages {
 		ids[i] = m.ID
 	}
-	msgs, err := b.fetchMany(ctx, folder, ids)
+	msgs, _, err := b.fetchMany(ctx, folder, ids)
 	if err != nil {
 		return result, err
 	}
@@ -554,9 +573,10 @@ const fetchConcurrency = 20
 // fetchMany downloads the raw MIME for each id concurrently, preserving order.
 // A 404 (message deleted since it was listed) is skipped; any other error fails
 // the whole call so the caller does not advance the cursor past a lost message.
-func (b *Backend) fetchMany(ctx context.Context, folder string, ids []string) ([]backend.Message, error) {
+func (b *Backend) fetchMany(ctx context.Context, folder string, ids []string) ([]backend.Message, []string, error) {
 	msgs := make([]backend.Message, len(ids))
 	errs := make([]error, len(ids))
+	missing := make([]bool, len(ids))
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, fetchConcurrency)
@@ -565,7 +585,7 @@ func (b *Backend) fetchMany(ctx context.Context, folder string, ids []string) ([
 		case sem <- struct{}{}:
 		case <-ctx.Done():
 			wg.Wait()
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		}
 		wg.Add(1)
 		go func(i int) {
@@ -573,7 +593,9 @@ func (b *Backend) fetchMany(ctx context.Context, folder string, ids []string) ([
 			defer func() { <-sem }()
 			m, err := b.fetchOne(ctx, folder, ids[i])
 			if err != nil {
-				if !isNotFound(err) {
+				if isNotFound(err) {
+					missing[i] = true
+				} else {
 					errs[i] = err // own slot: no shared write, no mutex
 				}
 				return // 404 -> leave msgs[i] zero, filtered out below
@@ -585,17 +607,20 @@ func (b *Backend) fetchMany(ctx context.Context, folder string, ids []string) ([
 
 	for _, e := range errs {
 		if e != nil {
-			return nil, fmt.Errorf("fetch message: %w", e)
+			return nil, nil, fmt.Errorf("fetch message: %w", e)
 		}
 	}
 	// Drop skipped (zero) entries in place, preserving order.
 	out := msgs[:0]
-	for _, m := range msgs {
-		if m.Ref.ID != "" {
+	var missingIDs []string
+	for i, m := range msgs {
+		if missing[i] {
+			missingIDs = append(missingIDs, ids[i])
+		} else {
 			out = append(out, m)
 		}
 	}
-	return out, nil
+	return out, missingIDs, nil
 }
 
 // gmailHistoryRef is a message reference inside a history record.
@@ -675,7 +700,7 @@ func (b *Backend) historySync(ctx context.Context, folder string, gc gmailCursor
 			toFetch = append(toFetch, id)
 		}
 	}
-	msgs, err := b.fetchMany(ctx, folder, toFetch)
+	msgs, _, err := b.fetchMany(ctx, folder, toFetch)
 	if err != nil {
 		return result, err
 	}

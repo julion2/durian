@@ -46,7 +46,7 @@ type FileCursorStore struct {
 	// suffix namespaces the cursor file by backend, so a cursor written by one
 	// backend (e.g. an IMAP MailboxState) is never fed to a different backend
 	// (e.g. a Graph deltaLink) for the same account. Empty for IMAP, "-graph"
-	// for the Graph backend.
+	// for Graph, "-gmail" for Gmail, and "-jmap" for JMAP.
 	suffix string
 }
 

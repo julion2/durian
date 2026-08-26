@@ -112,8 +112,10 @@ type fakeBackend struct {
 	labelVocab       []string
 	labelCalls       []labelCall
 	snapshotMessages map[string]backend.Message
+	snapshotMissing  map[string]bool
 	snapshotHydrated []backend.RemoteRef
 	snapshotMetadata map[string]backend.Message
+	metadataMissing  map[string]bool
 	metadataFetched  []backend.RemoteRef
 	// caps is returned by Capabilities(); zero value matches the default IMAP-like
 	// backend. Tests set FlagChangesInDelta to exercise the delta flag path.
@@ -161,28 +163,36 @@ func (f *fakeBackend) FetchBody(ctx context.Context, ref backend.RemoteRef, w io
 	return fmt.Errorf("fakeBackend: FetchBody not scripted")
 }
 
-func (f *fakeBackend) FetchSnapshotMessages(_ context.Context, refs []backend.RemoteRef) ([]backend.Message, error) {
+func (f *fakeBackend) FetchSnapshotMessages(_ context.Context, refs []backend.RemoteRef) (backend.SnapshotBatch, error) {
 	f.snapshotHydrated = append(f.snapshotHydrated, refs...)
-	var messages []backend.Message
+	var result backend.SnapshotBatch
 	for _, ref := range refs {
+		if f.snapshotMissing[ref.ID] {
+			result.Missing = append(result.Missing, ref)
+			continue
+		}
 		if message, ok := f.snapshotMessages[ref.ID]; ok {
-			messages = append(messages, message)
+			result.Messages = append(result.Messages, message)
 		}
 	}
-	return messages, nil
+	return result, nil
 }
 
-func (f *fakeBackend) FetchSnapshotMetadata(_ context.Context, refs []backend.RemoteRef) ([]backend.Message, error) {
+func (f *fakeBackend) FetchSnapshotMetadata(_ context.Context, refs []backend.RemoteRef) (backend.SnapshotBatch, error) {
 	f.metadataFetched = append(f.metadataFetched, refs...)
-	messages := make([]backend.Message, 0, len(refs))
+	result := backend.SnapshotBatch{Messages: make([]backend.Message, 0, len(refs))}
 	for _, ref := range refs {
+		if f.metadataMissing[ref.ID] {
+			result.Missing = append(result.Missing, ref)
+			continue
+		}
 		message, ok := f.snapshotMetadata[ref.ID]
 		if !ok {
 			message.Ref = ref
 		}
-		messages = append(messages, message)
+		result.Messages = append(result.Messages, message)
 	}
-	return messages, nil
+	return result, nil
 }
 
 func (f *fakeBackend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, remove backend.Flags) error {
@@ -442,6 +452,41 @@ func TestEngineHydratesLocallyMissingSnapshotMessages(t *testing.T) {
 	}
 	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "new" {
 		t.Fatalf("cursor = %q, want new", got)
+	}
+}
+
+func TestEngineCompletesSnapshotWhenListedMessagesDisappearDuringHydration(t *testing.T) {
+	db := newTestDB(t)
+	folder := backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true}
+	seed := backend.Message{
+		MessageID: "existing@example.com", Ref: backend.RemoteRef{Folder: "ALL", ID: "r1"},
+		Raw: rawMessage("existing@example.com", "a@example.com", testAccount, "Existing", "body"),
+	}
+	fake := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+		"ALL": {
+			{Messages: []backend.Message{seed}, Cursor: backend.Cursor("old")},
+			{Cursor: backend.Cursor("new"), FullSnapshot: true, Present: []backend.RemoteRef{{Folder: "ALL", ID: "r1"}, {Folder: "ALL", ID: "r2"}}},
+		},
+	})
+	fake.metadataMissing = map[string]bool{"r1": true}
+	fake.snapshotMissing = map[string]bool{"r2": true}
+	cursors := newMemCursorStore()
+	engine := newTestEngine(db, cursors)
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("seed sync result=%+v err=%v", result, err)
+	}
+	result, err := engine.Sync(t.Context(), fake)
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("replacement sync result=%+v err=%v", result, err)
+	}
+	if result.Deleted != 1 {
+		t.Fatalf("Deleted = %d, want existing ref removed after provider reported it gone", result.Deleted)
+	}
+	if got, _ := db.GetByMessageID("existing@example.com"); got != nil {
+		t.Fatalf("disappeared existing message still present: %#v", got)
+	}
+	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "new" {
+		t.Fatalf("cursor = %q, want replacement cursor new", got)
 	}
 }
 

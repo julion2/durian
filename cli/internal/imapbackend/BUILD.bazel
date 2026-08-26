@@ -1,4 +1,4 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "imapbackend",
@@ -10,5 +10,16 @@ go_library(
         "//cli/internal/config",
         "//cli/internal/imap",
         "@com_github_emersion_go_imap//:go-imap",
+    ],
+)
+
+go_test(
+    name = "imapbackend_test",
+    size = "small",
+    srcs = ["imapbackend_test.go"],
+    embed = [":imapbackend"],
+    deps = [
+        "//cli/internal/backend",
+        "//cli/internal/imap",
     ],
 )

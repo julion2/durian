@@ -180,7 +180,7 @@ of the legacy path's IMAP-UIDNEXT diffing.
 
 - **IMAP IDLE** (`handler/watcher.go`, `WatcherManager`) — one long-lived IDLE
   connection per legacy account; wakes on new mail or a `TriggerSync` signal.
-  Graph accounts are skipped here.
+  Accounts using the provider-neutral sync engine are skipped here.
 - **Graph poll** (`handler/enginewatcher.go`) — Graph has no usable desktop push,
   so each Graph account gets two polling loops (a fast inbox pass, a slow
   full-mailbox pass) funneled through one per-account mutex. Cadence adapts to
@@ -212,7 +212,7 @@ bazel test //cli/internal/jmapbackend:jmapbackend_live_integration_test \
   --test_env=DURIAN_JMAP_TEST_RECIPIENT_PASSWORD
 ```
 
-Set those three variables in the invoking shell. The session URL and primary
+Set the applicable variables in the invoking shell. The session URL and primary
 credentials are required. `DURIAN_JMAP_TEST_AUTH` optionally selects `password`
 (the default) or `bearer`. To additionally exercise delivery between accounts,
 set and pass `DURIAN_JMAP_TEST_RECIPIENT_USERNAME` and

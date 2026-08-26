@@ -3,10 +3,12 @@
 // wrapper: all protocol work is delegated to imap.Client, no behavior of the
 // existing syncer is changed, and both code paths coexist.
 //
-// Cursor encoding: the per-folder backend.Cursor is a JSON snapshot of
-// imap.MailboxState (UIDVALIDITY, synced UID set, per-UID flags and
-// UID<->Message-ID maps). An empty cursor, or a UIDVALIDITY mismatch on the
-// server, triggers a full resync of the folder.
+// Cursor encoding: the per-folder backend.Cursor is normally a JSON snapshot
+// of imap.MailboxState (UIDVALIDITY, synced UID set, per-UID flags and
+// UID<->Message-ID maps). During recovery from a UIDVALIDITY mismatch it is a
+// temporary envelope that also marks every page as part of one authoritative
+// replacement snapshot. The final cursor returns to the legacy-compatible
+// direct MailboxState representation.
 package imapbackend
 
 import (
@@ -139,8 +141,9 @@ func (b *Backend) fetchFoldersOnce() ([]backend.Folder, error) {
 // MARK: - Messages
 
 // FetchMessages returns the changes in folder since cursor. The cursor is a
-// JSON-encoded imap.MailboxState; empty cursor or a UIDVALIDITY change resets
-// it and treats every server UID as new (full resync). New UIDs are fetched
+// JSON-encoded imap.MailboxState; an empty cursor treats every server UID as
+// new. A UIDVALIDITY change starts an authoritative replacement snapshot so
+// stale local refs are removed after all pages succeed. New UIDs are fetched
 // newest-first, capped at limit (limit <= 0 means no cap).
 func (b *Backend) FetchMessages(_ context.Context, folder string, cursor backend.Cursor, limit int) (backend.FetchResult, error) {
 	var result backend.FetchResult
@@ -161,7 +164,7 @@ func (b *Backend) FetchMessages(_ context.Context, folder string, cursor backend
 func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit int) (backend.FetchResult, error) {
 	var result backend.FetchResult
 
-	state, err := decodeCursor(cursor)
+	state, fullReplacement, err := decodeCursor(cursor)
 	if err != nil {
 		return result, fmt.Errorf("failed to decode cursor for %s: %w", folder, err)
 	}
@@ -175,9 +178,11 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 		if state.UIDValidity != 0 {
 			slog.Info("UIDVALIDITY changed, full resync", "module", "IMAPBACKEND",
 				"folder", folder, "old", state.UIDValidity, "new", status.UidValidity)
+			fullReplacement = true
 		}
 		state.Reset(status.UidValidity)
 	}
+	result.FullSnapshot = fullReplacement
 
 	serverUIDs, err := b.client.SearchAll()
 	if err != nil {
@@ -200,13 +205,22 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 		if err != nil {
 			return result, fmt.Errorf("failed to fetch messages in %s: %w", folder, err)
 		}
+		if len(fetched) != len(newUIDs) {
+			return result, fmt.Errorf("incomplete fetch in %s: requested %d messages, received %d", folder, len(newUIDs), len(fetched))
+		}
+		requested := make(map[uint32]struct{}, len(newUIDs))
+		for _, uid := range newUIDs {
+			requested[uid] = struct{}{}
+		}
 
 		for _, msg := range fetched {
+			if _, ok := requested[msg.Uid]; !ok {
+				return result, fmt.Errorf("fetch in %s returned unexpected or duplicate UID %d", folder, msg.Uid)
+			}
+			delete(requested, msg.Uid)
 			raw := readRawBody(msg.Body)
 			if len(raw) == 0 {
-				slog.Warn("Message has no body data, skipping", "module", "IMAPBACKEND", // encgrep:allow "body data" in message text; folder name is operational sync metadata, no content logged
-					"folder", folder, "uid", msg.Uid)
-				continue
+				return result, fmt.Errorf("message UID %d in %s has no body data", msg.Uid, folder)
 			}
 
 			messageID := extractMessageID(raw)
@@ -229,6 +243,9 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 
 			state.AddSyncedUID(msg.Uid)
 			state.SetMessageID(msg.Uid, messageID)
+			if fullReplacement {
+				result.Present = append(result.Present, backend.RemoteRef{Folder: folder, ID: formatUID(msg.Uid)})
+			}
 		}
 	}
 
@@ -245,7 +262,7 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 		state.RemoveSyncedUID(uid)
 	}
 
-	newCursor, err := encodeCursor(state)
+	newCursor, err := encodeCursor(state, fullReplacement && result.HasMore)
 	if err != nil {
 		return result, fmt.Errorf("failed to encode cursor for %s: %w", folder, err)
 	}
@@ -507,22 +524,42 @@ func isConnectionError(err error) bool {
 
 // MARK: - Cursor encoding
 
-// decodeCursor decodes a JSON cursor into an imap.MailboxState. An empty or
-// nil cursor yields a fresh state (full resync).
-func decodeCursor(cursor backend.Cursor) (*imap.MailboxState, error) {
-	state := &imap.MailboxState{}
-	if len(cursor) == 0 {
-		return state, nil
-	}
-	if err := json.Unmarshal(cursor, state); err != nil {
-		return nil, fmt.Errorf("unmarshal mailbox state: %w", err)
-	}
-	return state, nil
+type replacementCursor struct {
+	State           *imap.MailboxState `json:"state"`
+	FullReplacement bool               `json:"full_replacement"`
 }
 
-// encodeCursor serializes the mailbox state back into an opaque cursor.
-func encodeCursor(state *imap.MailboxState) (backend.Cursor, error) {
-	data, err := json.Marshal(state)
+// decodeCursor decodes both the long-standing direct MailboxState format and
+// the temporary envelope used while paging a UIDVALIDITY replacement. An empty
+// or nil cursor yields a fresh state.
+func decodeCursor(cursor backend.Cursor) (*imap.MailboxState, bool, error) {
+	state := &imap.MailboxState{}
+	if len(cursor) == 0 {
+		return state, false, nil
+	}
+
+	var envelope replacementCursor
+	if err := json.Unmarshal(cursor, &envelope); err != nil {
+		return nil, false, fmt.Errorf("unmarshal mailbox state: %w", err)
+	}
+	if envelope.State != nil {
+		return envelope.State, envelope.FullReplacement, nil
+	}
+	if err := json.Unmarshal(cursor, state); err != nil {
+		return nil, false, fmt.Errorf("unmarshal mailbox state: %w", err)
+	}
+	return state, false, nil
+}
+
+// encodeCursor uses an envelope only between replacement pages. Successful
+// completion returns to the direct representation, preserving downgrade
+// compatibility for ordinary durable cursors.
+func encodeCursor(state *imap.MailboxState, fullReplacement bool) (backend.Cursor, error) {
+	value := any(state)
+	if fullReplacement {
+		value = replacementCursor{State: state, FullReplacement: true}
+	}
+	data, err := json.Marshal(value)
 	if err != nil {
 		return nil, fmt.Errorf("marshal mailbox state: %w", err)
 	}
