@@ -608,7 +608,14 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 				// every replacement. Exclude it from authoritative presence so the
 				// replacement can complete and a later provider change can retry it.
 				// Preserve an older local copy carrying the same durable Message-ID.
-				if priorRef := refsByMessageID[msg.MessageID]; priorRef != "" {
+				// Hydrators are expected to populate Message.MessageID, but not all
+				// do (gmailbackend builds metadata-only messages without it), so fall
+				// back to a tolerant header scan — strict parsing is what just failed.
+				msgID := msg.MessageID
+				if msgID == "" {
+					msgID = messageIDFromRaw(msg.Raw)
+				}
+				if priorRef := refsByMessageID[msgID]; msgID != "" && priorRef != "" {
 					present[priorRef] = struct{}{}
 				}
 				removeMissingSnapshotRefs(present, deltaFlags, []backend.RemoteRef{msg.Ref})
@@ -775,13 +782,24 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 		return cursorSafe
 	}
 
+	// fetchIncomplete distinguishes "the backend could not resolve this ref" from
+	// "the backend positively reports this ref as dead". On the success path an
+	// omission is the FetchFlags contract for a gone message (see graphbackend's
+	// 404 branch), so the delta fallback below must not second-guess it.
 	server, err := b.FetchFlags(ctx, folder.Name, refs)
+	fetchIncomplete := err != nil
 	if err != nil {
 		slog.Warn("Flag fetch failed, continuing", "module", "SYNCENGINE",
 			"account", e.opts.Account, "folder", folder.Name, "err", err)
 		result.Errors = append(result.Errors, fmt.Errorf("flag sync %s: %w", folder.Name, err))
 		if !errors.Is(err, backend.ErrPartialFlags) || server == nil {
-			return false
+			// Do not return: the folder cursor has already advanced past this
+			// page, so a later pass would not re-select these rows and any
+			// server change the delta carried would be lost for good. Drop the
+			// unusable map and let the merge below fall back to deltaFlags,
+			// which only holds messages that genuinely changed server-side.
+			server = nil
+			cursorSafe = false
 		}
 	}
 
@@ -789,7 +807,18 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 	for _, row := range rows {
 		serverFlags, ok := server[row.RemoteRef]
 		if !ok {
-			continue // Not fetched (no candidate change) or not on the server.
+			// Only when the fetch itself was incomplete: the delta already carried
+			// this message's server flags, and the folder cursor has advanced past
+			// the page, so no later pass re-selects the row (flagCandidate reads
+			// deltaFlags, which is per-run). Falling back beats dropping the
+			// server change permanently.
+			if !fetchIncomplete {
+				continue // Not a candidate, or the backend reports it as gone.
+			}
+			serverFlags, ok = deltaFlags[row.RemoteRef]
+			if !ok {
+				continue // Nothing the delta could vouch for either.
+			}
 		}
 
 		local := imap.FlagStateFromTags(row.Tags)
@@ -878,6 +907,46 @@ func (e *Engine) flagCandidate(row store.FolderFlagRow, deltaFlags map[string]ba
 	local := imap.FlagStateFromTags(row.Tags)
 	baseline := imap.FlagStateFromIMAP(splitFlags(row.SyncedFlags))
 	return imap.NeedsUpload(local, baseline)
+}
+
+// messageIDFromRaw extracts the Message-ID header from a raw RFC822 message
+// with a tolerant line scan, returning "" when absent.
+//
+// It deliberately avoids mail.ReadMessage: the only caller is the
+// replacement-snapshot preservation path, which runs precisely when strict
+// parsing has already rejected the message. Folded continuation lines are
+// honoured so a wrapped Message-ID still resolves. Angle brackets are trimmed
+// to match how Ingest records the durable key.
+func messageIDFromRaw(raw []byte) string {
+	const header = "message-id:"
+	for len(raw) > 0 {
+		line := raw
+		if i := bytes.IndexByte(raw, '\n'); i >= 0 {
+			line, raw = raw[:i], raw[i+1:]
+		} else {
+			raw = nil
+		}
+		line = bytes.TrimRight(line, "\r")
+		if len(line) == 0 {
+			return "" // End of headers.
+		}
+		if len(line) < len(header) || !strings.EqualFold(string(line[:len(header)]), header) {
+			continue
+		}
+		value := string(bytes.TrimSpace(line[len(header):]))
+		// Unfold: continuation lines start with space or tab.
+		for len(raw) > 0 && (raw[0] == ' ' || raw[0] == '\t') {
+			cont := raw
+			if i := bytes.IndexByte(raw, '\n'); i >= 0 {
+				cont, raw = raw[:i], raw[i+1:]
+			} else {
+				raw = nil
+			}
+			value += " " + string(bytes.TrimSpace(bytes.TrimRight(cont, "\r")))
+		}
+		return strings.Trim(strings.TrimSpace(value), "<>")
+	}
+	return ""
 }
 
 // splitFlags splits a comma-joined IMAP flag string (the store's synced_flags

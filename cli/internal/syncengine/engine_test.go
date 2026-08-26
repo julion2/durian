@@ -2225,3 +2225,157 @@ func TestEngineAnsweredFlagNoPingPong(t *testing.T) {
 		}
 	}
 }
+
+// A FetchFlags outage must not discard a server flag change the delta already
+// carried: the folder cursor advances regardless (download progress is
+// independent of flag reconciliation), so no later pass re-selects the row and
+// the change would otherwise be lost permanently.
+func TestEngineAppliesDeltaFlagsWhenFlagFetchFails(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	ref := backend.RemoteRef{Folder: "INBOX", ID: "m1"}
+	flagged := backend.Message{
+		MessageID: "m1@example.com", Ref: ref, Flags: backend.Flags{Flagged: true},
+		Raw: rawMessage("m1@example.com", "a@example.com", testAccount, "Subject", "body"),
+	}
+	read := flagged
+	read.Flags = backend.Flags{Seen: true, Flagged: true}
+
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {
+			{Messages: []backend.Message{flagged}, Cursor: backend.Cursor("c1")},
+			// Second pass: the server marked it read and the delta says so, but
+			// the flag fetch is down for this pass.
+			{Messages: []backend.Message{read}, Cursor: backend.Cursor("c2")},
+		},
+	})
+	// Seed pass: a successful flag fetch establishes a real baseline, so the
+	// baseline-seeding branch stays out of the way on the second pass.
+	fake.flagsByRef["m1"] = backend.Flags{Flagged: true}
+	engine := newTestEngine(db, cursors)
+	if _, err := engine.Sync(t.Context(), fake); err != nil {
+		t.Fatalf("seed sync: %v", err)
+	}
+	fake.fetchFlagsErr = errors.New("flag endpoint unavailable")
+
+	result, err := engine.Sync(t.Context(), fake)
+	if err != nil {
+		t.Fatalf("Sync error = %v", err)
+	}
+	if len(result.Errors) != 1 {
+		t.Fatalf("Sync errors = %v, want the flag-fetch failure recorded", result.Errors)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "c2" {
+		t.Fatalf("cursor = %q, want c2 (download progress must not wait on the flag pass)", got)
+	}
+	rows, err := db.GetFolderFlagState(testAccount, "INBOX")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("GetFolderFlagState = %v, %v", rows, err)
+	}
+	if tagsContain(rows[0].Tags, "unread") {
+		t.Error("server read state was discarded when FetchFlags failed; the delta carried it")
+	}
+}
+
+// gmailbackend builds hydrated messages without Message.MessageID, so the
+// preservation of an older local copy must not depend on that field being set.
+func TestEngineReplacementPreservesPriorCopyWhenHydratorOmitsMessageID(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	prior := backend.Message{
+		MessageID: "shared@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "prior"},
+		Raw: rawMessage("shared@example.com", "a@example.com", testAccount, "Prior", "body"),
+	}
+	if _, _, err := Ingest(db, prior, "INBOX", backend.RoleNone, IngestOptions{Account: testAccount}); err != nil {
+		t.Fatalf("seed prior copy: %v", err)
+	}
+	ref := backend.RemoteRef{Folder: "INBOX", ID: "broken"}
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {{
+			Cursor: backend.Cursor("replacement"), FullSnapshot: true,
+			Present: []backend.RemoteRef{ref},
+		}},
+	})
+	// Message-ID resolvable from the raw headers, but the body still fails
+	// strict parsing — exactly the shape that reaches the preservation path.
+	fake.snapshotMessages = map[string]backend.Message{
+		ref.ID: {Ref: ref, Raw: []byte("Message-ID: <shared@example.com>\r\nmalformed header line\r\n\r\nbody")},
+	}
+	result, err := newTestEngine(db, cursors).Sync(t.Context(), fake)
+	if err != nil {
+		t.Fatalf("Sync error = %v", err)
+	}
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "parse message") {
+		t.Fatalf("Sync errors = %v, want one permanent hydrated parse failure", result.Errors)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "replacement" {
+		t.Fatalf("cursor = %q, want replacement (must not wedge)", got)
+	}
+	if got, _ := db.GetByMessageID(prior.MessageID); got == nil {
+		t.Fatal("older local copy was deleted: preservation keyed on an unset Message.MessageID")
+	}
+}
+
+func TestMessageIDFromRaw(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"simple", "Message-ID: <a@example.com>\r\n\r\nbody", "a@example.com"},
+		{"case insensitive", "message-id: <b@example.com>\r\n\r\nbody", "b@example.com"},
+		{"after other headers", "From: x@y\r\nMessage-ID: <c@example.com>\r\n\r\nbody", "c@example.com"},
+		{"folded", "Message-ID:\r\n <d@example.com>\r\n\r\nbody", "d@example.com"},
+		{"absent", "From: x@y\r\n\r\nbody", ""},
+		{"body only match ignored", "From: x@y\r\n\r\nMessage-ID: <e@example.com>", ""},
+		{"empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := messageIDFromRaw([]byte(tt.raw)); got != tt.want {
+				t.Errorf("messageIDFromRaw = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// On the success path an omission from FetchFlags is the backend's way of
+// reporting a dead ref (graphbackend's 404 branch), so the delta fallback must
+// not resurrect stale flags for it.
+func TestEngineDoesNotFallBackToDeltaFlagsWhenFetchSucceeds(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	ref := backend.RemoteRef{Folder: "INBOX", ID: "m1"}
+	flagged := backend.Message{
+		MessageID: "m1@example.com", Ref: ref, Flags: backend.Flags{Flagged: true},
+		Raw: rawMessage("m1@example.com", "a@example.com", testAccount, "Subject", "body"),
+	}
+	read := flagged
+	read.Flags = backend.Flags{Seen: true, Flagged: true}
+
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {
+			{Messages: []backend.Message{flagged}, Cursor: backend.Cursor("c1")},
+			{Messages: []backend.Message{read}, Cursor: backend.Cursor("c2")},
+		},
+	})
+	fake.flagsByRef["m1"] = backend.Flags{Flagged: true}
+	engine := newTestEngine(db, cursors)
+	if _, err := engine.Sync(t.Context(), fake); err != nil {
+		t.Fatalf("seed sync: %v", err)
+	}
+	// Second pass: the fetch succeeds but reports the ref as gone by omitting it.
+	delete(fake.flagsByRef, "m1")
+
+	result, err := engine.Sync(t.Context(), fake)
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("Sync result=%+v err=%v, want a clean pass", result, err)
+	}
+	rows, err := db.GetFolderFlagState(testAccount, "INBOX")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("GetFolderFlagState = %v, %v", rows, err)
+	}
+	if !tagsContain(rows[0].Tags, "unread") {
+		t.Error("delta flags were applied to a ref the backend reported as gone")
+	}
+}
