@@ -1264,7 +1264,7 @@ func TestEngineSyncIngests(t *testing.T) {
 				MessageID: "seen-msg@example.com",
 				Ref:       backend.RemoteRef{Folder: "Archive", ID: "201"},
 				Raw:       rawMessage("seen-msg@example.com", "bob@example.com", testAccount, "Old news", "archived body"),
-				Flags:     backend.Flags{Seen: true},
+				Flags:     backend.Flags{Seen: true, Flagged: true},
 			}},
 			Cursor: backend.Cursor("archive-c1"),
 		}},
@@ -1334,6 +1334,12 @@ func TestEngineSyncIngests(t *testing.T) {
 	}
 	if slices.Contains(archTags, "unread") {
 		t.Errorf("archive msg tags = %v, must not contain %q (Seen=true)", archTags, "unread")
+	}
+	if !slices.Contains(archTags, "flagged") {
+		t.Errorf("archive msg tags = %v, want to contain %q", archTags, "flagged")
+	}
+	if got := strings.Fields(archMsg.Flags); !slices.Contains(got, `\Seen`) || !slices.Contains(got, `\Flagged`) {
+		t.Errorf("archive msg flags = %q, want Seen and Flagged to round-trip", archMsg.Flags)
 	}
 
 	// Cursors persisted per folder.

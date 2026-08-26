@@ -183,11 +183,10 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		dateUnix = msg.InternalDate.Unix()
 	}
 
-	// Flags column: the store splits this comma-joined IMAP-style flag string
-	// elsewhere, so derive it via FlagState.ToIMAPFlags to keep the format
-	// byte-identical with rows written by the legacy syncer.
+	// Flags column: the store tokenizes the IMAP-style flag string with
+	// strings.Fields, matching rows written by the legacy syncer.
 	flagState := flagStateFromBackend(msg.Flags)
-	flagStr := strings.Join(flagState.ToIMAPFlags(), ",")
+	flagStr := strings.Join(flagState.ToIMAPFlags(), " ")
 
 	storeMsg := &store.Message{
 		MessageID: messageID,
