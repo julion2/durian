@@ -29,6 +29,20 @@ go_test(
     deps = [
         "//cli/internal/backend",
         "//cli/internal/config",
+        "//cli/internal/keychain",
+        "//cli/internal/mailsend",
+    ],
+)
+
+go_test(
+    name = "jmapbackend_live_integration_test",
+    size = "large",
+    srcs = ["live_integration_test.go"],
+    embed = [":jmapbackend"],
+    gotags = ["jmapintegration"],
+    deps = [
+        "//cli/internal/backend",
+        "//cli/internal/config",
         "//cli/internal/mailsend",
     ],
 )

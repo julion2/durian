@@ -250,20 +250,24 @@ func runServe(cmd *cobra.Command, args []string) {
 			}
 			watched = append(watched, a)
 		}
+		watcher := handler.NewWatcherManager(eventHub, emailDB, rules, groups, cfg.Sync.IndexedHeaders)
+		engineWatcher := handler.NewEngineWatcher(eventHub, emailDB, rules, groups, cfg.Sync.IndexedHeaders)
+		engineAccounts := cfg.GetEngineAccounts()
+		engineWatcher.RegisterAccounts(engineAccounts)
+		// Lazy body/attachment fetching and immediate post-mutation sync are
+		// useful for every account, even when no legacy IMAP IDLE loop runs.
+		h.SetFetcher(watcher)
+		h.SetSyncTrigger(handler.SyncTriggerGroup{watcher, engineWatcher})
 		if len(watched) == 0 {
 			slog.Info("No IMAP watcher accounts configured, skipping watchers", "module", "SERVE") // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		} else {
-			watcher := handler.NewWatcherManager(eventHub, emailDB, rules, groups, cfg.Sync.IndexedHeaders)
-			h.SetFetcher(watcher)
-			h.SetSyncTrigger(watcher)
 			go watcher.Start(watcherCtx, watched)
 			slog.Info("Started IDLE watchers", "module", "SERVE", "accounts", len(watched)) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		}
 
 		// Engine-backed accounts get provider-neutral background sync. JMAP uses
 		// push plus a safety poll; providers without local push use polling.
-		if engineAccounts := cfg.GetEngineAccounts(); len(engineAccounts) > 0 {
-			engineWatcher := handler.NewEngineWatcher(eventHub, emailDB, rules, groups, cfg.Sync.IndexedHeaders)
+		if len(engineAccounts) > 0 {
 			go engineWatcher.Start(watcherCtx, engineAccounts)
 		}
 

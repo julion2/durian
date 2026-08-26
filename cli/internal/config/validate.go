@@ -163,7 +163,7 @@ func ValidateConfig(cfg *Config) []ValidationError {
 				add(prefix+".jmap.session_url", "must use https unless the host is loopback")
 			}
 			switch acct.JMAP.Auth {
-			case "password", "bearer":
+			case "", "password", "bearer":
 			default:
 				add(prefix+".jmap.auth", fmt.Sprintf("must be \"password\" or \"bearer\", got %q", acct.JMAP.Auth))
 			}

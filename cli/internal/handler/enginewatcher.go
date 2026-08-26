@@ -71,8 +71,9 @@ type EngineWatcher struct {
 	groups         map[string]config.GroupEntry
 	indexedHeaders []string
 
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	mu       sync.Mutex
+	locks    map[string]*sync.Mutex
+	triggers map[string]chan struct{}
 }
 
 // NewEngineWatcher creates an EngineWatcher. It mirrors NewWatcherManager's
@@ -85,19 +86,28 @@ func NewEngineWatcher(hub *EventHub, st *store.DB, rules []config.RuleConfig, gr
 		groups:         groups,
 		indexedHeaders: indexedHeaders,
 		locks:          make(map[string]*sync.Mutex),
+		triggers:       make(map[string]chan struct{}),
 	}
 }
 
 // Start launches the watch loops for every account and blocks until ctx is
 // done. Accounts are independent: one failing account never stops another.
 func (w *EngineWatcher) Start(ctx context.Context, accounts []*config.AccountConfig) {
+	w.RegisterAccounts(accounts)
 	var wg sync.WaitGroup
 	for i, account := range accounts {
 		// Stagger account start-up so N accounts do not all fire their first
 		// probe in the same second.
 		offset := time.Duration(i) * 3 * time.Second
-		wg.Add(2)
-		if account.UsesJMAPBackend() {
+		w.mu.Lock()
+		trigger := w.triggers[account.AccountIdentifier()]
+		w.mu.Unlock()
+		wg.Add(3)
+		go func(a *config.AccountConfig, ch <-chan struct{}) {
+			defer wg.Done()
+			w.triggerLoop(ctx, a, ch)
+		}(account, trigger)
+		if w.pushEnabled(account) {
 			go func(a *config.AccountConfig, off time.Duration) {
 				defer wg.Done()
 				w.pushLoop(ctx, a, off)
@@ -123,6 +133,56 @@ func (w *EngineWatcher) Start(ctx context.Context, accounts []*config.AccountCon
 	slog.Info("Started engine watchers", "module", "ENGINEWATCH", "accounts", len(accounts), // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		"inbox_interval_active", inboxIntervalActive, "full_interval_active", fullIntervalActive)
 	wg.Wait()
+}
+
+// RegisterAccounts installs trigger queues synchronously, before the HTTP
+// handler starts accepting mutations. Start calls it too for non-daemon users.
+func (w *EngineWatcher) RegisterAccounts(accounts []*config.AccountConfig) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, account := range accounts {
+		id := account.AccountIdentifier()
+		if w.triggers[id] == nil {
+			w.triggers[id] = make(chan struct{}, 1)
+		}
+	}
+}
+
+// TriggerSync schedules a coalesced upload-only engine pass for account.
+func (w *EngineWatcher) TriggerSync(account string) {
+	w.mu.Lock()
+	trigger := w.triggers[account]
+	w.mu.Unlock()
+	if trigger == nil {
+		return
+	}
+	select {
+	case trigger <- struct{}{}:
+	default:
+	}
+}
+
+func (w *EngineWatcher) triggerLoop(ctx context.Context, account *config.AccountConfig, trigger <-chan struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-trigger:
+			if err := w.syncAccountMode(ctx, account, false, syncengine.UploadOnly); err != nil {
+				slog.Warn("Mutation-triggered engine sync failed", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
+			}
+		}
+	}
+}
+
+func (w *EngineWatcher) pushEnabled(account *config.AccountConfig) bool {
+	b, err := backendfactory.New(account)
+	if err != nil {
+		slog.Warn("Backend capability probe failed; using polling", "module", "ENGINEWATCH", "account", account.AccountIdentifier()) // encgrep:allow account identifier; provider errors may be credential-tainted
+		return false
+	}
+	defer b.Close()
+	return b.Capabilities().PushWatch
 }
 
 // pushLoop converts provider push notifications into serialized full engine
@@ -157,6 +217,8 @@ func (w *EngineWatcher) pushLoop(ctx context.Context, account *config.AccountCon
 	for {
 		select {
 		case <-ctx.Done():
+			// Watch owns protocol goroutines and must finish before Close runs.
+			<-done
 			return
 		case err := <-done:
 			if err != nil && !errors.Is(err, context.Canceled) {
@@ -259,6 +321,10 @@ func (w *EngineWatcher) accountLock(account string) *sync.Mutex {
 
 // syncAccount runs one engine pass and broadcasts any new inbox arrivals.
 func (w *EngineWatcher) syncAccount(ctx context.Context, account *config.AccountConfig, inboxOnly bool) error {
+	return w.syncAccountMode(ctx, account, inboxOnly, syncengine.Bidirectional)
+}
+
+func (w *EngineWatcher) syncAccountMode(ctx context.Context, account *config.AccountConfig, inboxOnly bool, mode syncengine.Mode) error {
 	mu := w.accountLock(account.AccountIdentifier())
 	mu.Lock()
 	defer mu.Unlock()
@@ -291,6 +357,7 @@ func (w *EngineWatcher) syncAccount(ctx context.Context, account *config.Account
 		BatchLimit:   account.GetIMAPBatchSize(),
 		MaxPerFolder: account.GetIMAPMaxMessages(),
 		Folders:      folders,
+		Mode:         mode,
 		Ingest: syncengine.IngestOptions{
 			Account:        account.AccountIdentifier(),
 			FilterRules:    w.filterRules,
@@ -302,6 +369,9 @@ func (w *EngineWatcher) syncAccount(ctx context.Context, account *config.Account
 	res, err := engine.Sync(ctx, b)
 	if err != nil {
 		return err
+	}
+	if len(res.Errors) > 0 {
+		return fmt.Errorf("engine sync completed with %d folder errors: %w", len(res.Errors), res.Errors[0])
 	}
 	if res.New > 0 || res.Deleted > 0 || res.Moved > 0 {
 		slog.Info("Engine watch sync applied changes", "module", "ENGINEWATCH", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys

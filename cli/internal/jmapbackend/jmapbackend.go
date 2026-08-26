@@ -4,10 +4,12 @@ package jmapbackend
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -21,22 +23,28 @@ import (
 
 const allMailStream = "JMAP-ALL"
 
-var getCredential = keychain.GetPassword
+var (
+	getCredential = keychain.GetPassword
+	setCredential = keychain.SetPassword
+)
+
+var errIncompleteQuery = errors.New("JMAP Email/query returned an incomplete snapshot")
 
 type Backend struct {
 	account *config.AccountConfig
 	client  *client
 
-	mu          sync.Mutex
-	initialized bool
-	initErr     error
-	mailboxes   map[string]jmapMailbox
-	tagToID     map[string]string
+	mu           sync.Mutex
+	initialized  bool
+	mailboxes    map[string]jmapMailbox
+	mailboxToTag map[string]string
+	tagToID      map[string]string
 }
 
 var (
-	_ backend.Backend     = (*Backend)(nil)
-	_ backend.LabelWriter = (*Backend)(nil)
+	_ backend.Backend          = (*Backend)(nil)
+	_ backend.LabelWriter      = (*Backend)(nil)
+	_ backend.SnapshotHydrator = (*Backend)(nil)
 )
 
 type jmapMailbox struct {
@@ -101,21 +109,32 @@ func (b *Backend) ensure(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.initialized {
-		return b.initErr
+		return nil
 	}
-	b.initialized = true
-	secret, err := getCredential(keychain.PasswordKeychainService, b.account.Email)
+	secret, err := getCredential(keychain.JMAPKeychainService, b.account.Email)
+	legacyCredential := false
+	if errors.Is(err, keychain.ErrNotFound) {
+		secret, err = getCredential(keychain.PasswordKeychainService, b.account.Email)
+		legacyCredential = err == nil
+	}
 	if err != nil {
 		if errors.Is(err, keychain.ErrNotFound) {
-			b.initErr = fmt.Errorf("no JMAP credential stored for %s; run durian auth login %s", b.account.Email, b.account.GetAliasOrName())
+			return fmt.Errorf("no JMAP credential stored for %s; run durian auth login %s", b.account.Email, b.account.GetAliasOrName())
 		} else {
-			b.initErr = fmt.Errorf("load JMAP credential: %w", err)
+			return fmt.Errorf("load JMAP credential: %w", err)
 		}
-		return b.initErr
 	}
 	b.client.credential.secret = secret
-	b.initErr = b.client.discover(ctx)
-	return b.initErr
+	if err := b.client.discover(ctx); err != nil {
+		return err
+	}
+	if legacyCredential {
+		if err := setCredential(keychain.JMAPKeychainService, b.account.Email, secret); err != nil {
+			slog.Warn("Could not migrate legacy JMAP credential", "module", "JMAPBACKEND", "account", b.account.AccountIdentifier()) // encgrep:allow account identifier, no credential value
+		}
+	}
+	b.initialized = true
+	return nil
 }
 
 func (b *Backend) loadMailboxes(ctx context.Context) error {
@@ -133,23 +152,20 @@ func (b *Backend) loadMailboxes(ctx context.Context) error {
 		return err
 	}
 	mailboxes := make(map[string]jmapMailbox, len(result.List))
-	tagToID := make(map[string]string, len(result.List))
 	for _, mailbox := range result.List {
 		mailboxes[mailbox.ID] = mailbox
-		tag := mailboxTag(mailbox)
-		if tag != "" {
-			tagToID[strings.ToLower(tag)] = mailbox.ID
-		}
 	}
+	mailboxToTag, tagToID := buildMailboxMappings(mailboxes)
 	b.mu.Lock()
 	b.mailboxes = mailboxes
+	b.mailboxToTag = mailboxToTag
 	b.tagToID = tagToID
 	b.mu.Unlock()
 	return nil
 }
 
-func mailboxTag(mailbox jmapMailbox) string {
-	switch strings.ToLower(mailbox.Role) {
+func roleTag(role string) string {
+	switch strings.ToLower(role) {
 	case "inbox":
 		return "inbox"
 	case "archive":
@@ -167,7 +183,82 @@ func mailboxTag(mailbox jmapMailbox) string {
 	case "important":
 		return "important"
 	}
-	return strings.TrimSpace(mailbox.Name)
+	return ""
+}
+
+func canonicalMailboxSegment(name string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(name)), " ", "-")
+}
+
+func mailboxTagSuffix(id string) string {
+	sum := sha256.Sum256([]byte(id))
+	return fmt.Sprintf("%x", sum[:4])
+}
+
+// buildMailboxMappings creates one stable, reversible Durian tag for every
+// mailbox. Special-use roles keep their fixed vocabulary; user mailboxes use
+// canonical parent paths, with an ID-derived suffix for ambiguous paths.
+func buildMailboxMappings(mailboxes map[string]jmapMailbox) (map[string]string, map[string]string) {
+	ids := make([]string, 0, len(mailboxes))
+	for id := range mailboxes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	roleOwners := make(map[string]string)
+	for _, id := range ids {
+		if tag := roleTag(mailboxes[id].Role); tag != "" && roleOwners[tag] == "" {
+			roleOwners[tag] = id
+		}
+	}
+
+	raw := make(map[string]string, len(ids))
+	isRole := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		mailbox := mailboxes[id]
+		if tag := roleTag(mailbox.Role); tag != "" && roleOwners[tag] == id {
+			raw[id] = tag
+			isRole[id] = true
+			continue
+		}
+		var segments []string
+		seen := make(map[string]bool)
+		current := id
+		for current != "" && !seen[current] {
+			seen[current] = true
+			ancestor, ok := mailboxes[current]
+			if !ok {
+				break
+			}
+			segment := canonicalMailboxSegment(ancestor.Name)
+			if segment == "" {
+				segment = "mailbox~" + mailboxTagSuffix(current)
+			}
+			segments = append(segments, segment)
+			current = ancestor.ParentID
+		}
+		for left, right := 0, len(segments)-1; left < right; left, right = left+1, right-1 {
+			segments[left], segments[right] = segments[right], segments[left]
+		}
+		raw[id] = strings.Join(segments, "/")
+	}
+
+	groups := make(map[string][]string)
+	for _, id := range ids {
+		groups[raw[id]] = append(groups[raw[id]], id)
+	}
+	mailboxToTag := make(map[string]string, len(ids))
+	tagToID := make(map[string]string, len(ids))
+	for _, id := range ids {
+		tag := raw[id]
+		if len(groups[tag]) > 1 && !isRole[id] {
+			tag += "~" + mailboxTagSuffix(id)
+		}
+		mailboxToTag[id] = tag
+		if existing := tagToID[tag]; existing == "" || (isRole[id] && !isRole[existing]) {
+			tagToID[tag] = id
+		}
+	}
+	return mailboxToTag, tagToID
 }
 
 func (b *Backend) FetchFolders(ctx context.Context) ([]backend.Folder, error) {
@@ -252,11 +343,11 @@ func (b *Backend) queryAllEmailIDs(ctx context.Context) ([]string, error) {
 			return ids, nil
 		}
 		var methodErr *methodError
-		if !errors.As(err, &methodErr) || methodErr.Type != "anchorNotFound" {
+		if (!errors.As(err, &methodErr) || methodErr.Type != "anchorNotFound") && !errors.Is(err, errIncompleteQuery) {
 			return nil, err
 		}
 	}
-	return nil, errors.New("Email/query anchor repeatedly disappeared during initial sync")
+	return nil, errors.New("Email/query could not produce a stable complete snapshot")
 }
 
 func (b *Backend) queryAllEmailIDsOnce(ctx context.Context) ([]string, error) {
@@ -269,6 +360,7 @@ func (b *Backend) queryAllEmailIDsOnce(ctx context.Context) ([]string, error) {
 		"sort":           []map[string]interface{}{{"property": "receivedAt", "isAscending": false}},
 	}
 	var ids []string
+	expectedTotal := 0
 	for {
 		var query struct {
 			Position int      `json:"position"`
@@ -278,9 +370,16 @@ func (b *Backend) queryAllEmailIDsOnce(ctx context.Context) ([]string, error) {
 		if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/query", args, &query); err != nil {
 			return nil, err
 		}
+		expectedTotal = query.Total
 		ids = append(ids, query.IDs...)
-		if len(query.IDs) == 0 || query.Position+len(query.IDs) >= query.Total {
-			return uniqueStrings(ids), nil
+		if len(query.IDs) == 0 {
+			if len(ids) < query.Total {
+				return nil, fmt.Errorf("%w: got %d of %d ids", errIncompleteQuery, len(ids), query.Total)
+			}
+			break
+		}
+		if query.Position+len(query.IDs) >= query.Total {
+			break
 		}
 		nextAnchor := query.IDs[len(query.IDs)-1]
 		if priorAnchor, ok := args["anchor"].(string); ok && priorAnchor == nextAnchor {
@@ -290,6 +389,11 @@ func (b *Backend) queryAllEmailIDsOnce(ctx context.Context) ([]string, error) {
 		args["anchor"] = nextAnchor
 		args["anchorOffset"] = 1
 	}
+	ids = uniqueStrings(ids)
+	if len(ids) != expectedTotal {
+		return nil, fmt.Errorf("%w: got %d unique ids, expected %d", errIncompleteQuery, len(ids), expectedTotal)
+	}
+	return ids, nil
 }
 
 func (b *Backend) changesPage(ctx context.Context, state jmapCursor, limit int) (backend.FetchResult, error) {
@@ -309,7 +413,8 @@ func (b *Backend) changesPage(ctx context.Context, state jmapCursor, limit int) 
 	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/changes", args, &changes); err != nil {
 		var methodErr *methodError
 		if errors.As(err, &methodErr) && methodErr.Type == "cannotCalculateChanges" {
-			return b.initialPage(ctx, jmapCursor{Reconcile: true}, limit)
+			slog.Info("JMAP state expired, reconciling remote IDs", "module", "JMAPBACKEND")
+			return b.replacementSnapshot(ctx)
 		}
 		return backend.FetchResult{}, err
 	}
@@ -327,6 +432,57 @@ func (b *Backend) changesPage(ctx context.Context, state jmapCursor, limit int) 
 		Cursor:   encodeCursor(state),
 		HasMore:  changes.HasMoreChanges,
 	}, nil
+}
+
+func (b *Backend) replacementSnapshot(ctx context.Context) (backend.FetchResult, error) {
+	state, err := b.currentEmailState(ctx)
+	if err != nil {
+		return backend.FetchResult{}, fmt.Errorf("snapshot JMAP email state: %w", err)
+	}
+	ids, err := b.queryAllEmailIDs(ctx)
+	if err != nil {
+		return backend.FetchResult{}, fmt.Errorf("query JMAP replacement snapshot: %w", err)
+	}
+	return backend.FetchResult{
+		Cursor:       encodeCursor(jmapCursor{EmailState: state}),
+		FullSnapshot: true,
+		Present:      presentRefs(allMailStream, ids, nil),
+	}, nil
+}
+
+// FetchSnapshotMessages hydrates only replacement-snapshot refs absent from
+// Durian's local read model; the engine determines that set before calling.
+func (b *Backend) FetchSnapshotMessages(ctx context.Context, refs []backend.RemoteRef) ([]backend.Message, error) {
+	ids := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		ids = append(ids, ref.ID)
+	}
+	messages, _, err := b.getMessages(ctx, ids)
+	return messages, err
+}
+
+// FetchSnapshotMetadata returns current mailbox memberships and keywords in a
+// batched Email/get without downloading RFC 5322 blobs.
+func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.RemoteRef) ([]backend.Message, error) {
+	ids := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		ids = append(ids, ref.ID)
+	}
+	objects, missing, _, err := b.getEmailObjects(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("JMAP snapshot metadata omitted %d messages", len(missing))
+	}
+	messages := make([]backend.Message, 0, len(objects))
+	for _, email := range objects {
+		messages = append(messages, backend.Message{
+			Ref:   backend.RemoteRef{Folder: allMailStream, ID: email.ID},
+			Flags: flagsFromKeywords(email.Keywords), Labels: b.labelsFor(email.MailboxIDs),
+		})
+	}
+	return messages, nil
 }
 
 func (b *Backend) currentEmailState(ctx context.Context) (string, error) {
@@ -371,27 +527,63 @@ func (b *Backend) getMessages(ctx context.Context, ids []string) ([]backend.Mess
 	if err != nil {
 		return nil, nil, err
 	}
-	messages := make([]backend.Message, 0, len(objects))
-	for _, email := range objects {
-		body, err := b.downloadRaw(ctx, email)
-		if err != nil {
-			return nil, nil, fmt.Errorf("download email %s: %w", email.ID, err)
+	const downloadConcurrency = 12
+	messages := make([]backend.Message, len(objects))
+	errs := make([]error, len(objects))
+	notFound := make([]bool, len(objects))
+	sem := make(chan struct{}, downloadConcurrency)
+	var wg sync.WaitGroup
+	for i := range objects {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return nil, nil, ctx.Err()
 		}
-		received, _ := time.Parse(time.RFC3339, email.ReceivedAt)
-		messageID := ""
-		if len(email.MessageID) > 0 {
-			messageID = email.MessageID[0]
-		}
-		messages = append(messages, backend.Message{
-			MessageID:    messageID,
-			Ref:          backend.RemoteRef{Folder: allMailStream, ID: email.ID},
-			Raw:          body,
-			Flags:        flagsFromKeywords(email.Keywords),
-			Labels:       b.labelsFor(email.MailboxIDs),
-			InternalDate: received,
-		})
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			email := objects[i]
+			body, err := b.downloadRaw(ctx, email)
+			if err != nil {
+				var statusErr *statusError
+				if errors.As(err, &statusErr) && statusErr.Status == http.StatusNotFound {
+					notFound[i] = true
+					return
+				}
+				errs[i] = fmt.Errorf("download email %s: %w", email.ID, err)
+				return
+			}
+			received, parseErr := time.Parse(time.RFC3339, email.ReceivedAt)
+			if parseErr != nil {
+				slog.Warn("Could not parse JMAP receivedAt", "module", "JMAPBACKEND", "err", parseErr)
+			}
+			messageID := ""
+			if len(email.MessageID) > 0 {
+				messageID = email.MessageID[0]
+			}
+			messages[i] = backend.Message{
+				MessageID: messageID, Ref: backend.RemoteRef{Folder: allMailStream, ID: email.ID}, Raw: body,
+				Flags: flagsFromKeywords(email.Keywords), Labels: b.labelsFor(email.MailboxIDs), InternalDate: received,
+			}
+		}(i)
 	}
-	return messages, missing, nil
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	result := messages[:0]
+	for i, message := range messages {
+		if notFound[i] {
+			missing = append(missing, objects[i].ID)
+			continue
+		}
+		result = append(result, message)
+	}
+	return result, missing, nil
 }
 
 func (b *Backend) labelsFor(mailboxIDs map[string]bool) []string {
@@ -402,10 +594,8 @@ func (b *Backend) labelsFor(mailboxIDs map[string]bool) []string {
 		if !present {
 			continue
 		}
-		if mailbox, ok := b.mailboxes[id]; ok {
-			if tag := mailboxTag(mailbox); tag != "" {
-				labels = append(labels, tag)
-			}
+		if tag := b.mailboxToTag[id]; tag != "" {
+			labels = append(labels, tag)
 		}
 	}
 	sort.Strings(labels)
@@ -536,7 +726,7 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 		return err
 	}
 	for _, tag := range add {
-		if strings.EqualFold(tag, "archive") && b.mailboxIDForTag("archive") == "" {
+		if canonicalMailboxSegment(tag) == "archive" && b.mailboxIDForTag("archive") == "" {
 			if err := b.createArchiveMailbox(ctx); err != nil {
 				return fmt.Errorf("create JMAP archive mailbox: %w", err)
 			}
@@ -547,14 +737,14 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 	var unknown []string
 	b.mu.Lock()
 	for _, tag := range add {
-		if id := b.tagToID[strings.ToLower(tag)]; id != "" {
+		if id := b.tagToID[canonicalMailboxSegment(tag)]; id != "" {
 			patch["mailboxIds/"+id] = true
 		} else {
 			unknown = append(unknown, tag)
 		}
 	}
 	for _, tag := range remove {
-		if id := b.tagToID[strings.ToLower(tag)]; id != "" {
+		if id := b.tagToID[canonicalMailboxSegment(tag)]; id != "" {
 			patch["mailboxIds/"+id] = nil
 		}
 	}
@@ -564,6 +754,40 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 	}
 	if len(patch) == 0 {
 		return nil
+	}
+	objects, missing, _, err := b.getEmailObjects(ctx, []string{ref.ID})
+	if err != nil {
+		return fmt.Errorf("load JMAP mailbox membership: %w", err)
+	}
+	if len(missing) > 0 || len(objects) == 0 {
+		return fmt.Errorf("%w: JMAP email %s", backend.ErrRefGone, ref.ID)
+	}
+	remaining := make(map[string]bool, len(objects[0].MailboxIDs))
+	for id, present := range objects[0].MailboxIDs {
+		if present {
+			remaining[id] = true
+		}
+	}
+	for path, value := range patch {
+		id := strings.TrimPrefix(path, "mailboxIds/")
+		if value == nil {
+			delete(remaining, id)
+		} else {
+			remaining[id] = true
+		}
+	}
+	if len(remaining) == 0 {
+		archiveID := b.mailboxIDForTag("archive")
+		if archiveID == "" {
+			if err := b.createArchiveMailbox(ctx); err != nil {
+				return fmt.Errorf("create JMAP archive mailbox: %w", err)
+			}
+			archiveID = b.mailboxIDForTag("archive")
+		}
+		if archiveID == "" {
+			return errors.New("created JMAP archive mailbox could not be resolved")
+		}
+		patch["mailboxIds/"+archiveID] = true
 	}
 	return b.updateEmail(ctx, ref.ID, patch)
 }
@@ -677,7 +901,6 @@ func (b *Backend) Watch(ctx context.Context, _ string, onChange func()) error {
 
 func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
-		ServerSideSent:     true,
 		PushWatch:          true,
 		FlagChangesInDelta: true,
 		LabelsAreTags:      true,
@@ -704,7 +927,11 @@ func presentRefs(folder string, ids, missing []string) []backend.RemoteRef {
 	for _, id := range missing {
 		missingSet[id] = struct{}{}
 	}
-	result := make([]backend.RemoteRef, 0, len(ids)-len(missingSet))
+	capacity := len(ids) - len(missingSet)
+	if capacity < 0 {
+		capacity = 0
+	}
+	result := make([]backend.RemoteRef, 0, capacity)
 	for _, id := range ids {
 		if _, absent := missingSet[id]; !absent {
 			result = append(result, backend.RemoteRef{Folder: folder, ID: id})

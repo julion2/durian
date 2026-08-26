@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -103,12 +104,16 @@ func (c *client) discover(ctx context.Context) error {
 	account, primaryOK := c.session.Accounts[accountID]
 	_, primaryHasMail := account.AccountCapabilities[mailCapability]
 	if accountID == "" || !primaryOK || !primaryHasMail || account.IsReadOnly {
-		accountID = ""
+		var candidates []string
 		for id, account := range c.session.Accounts {
 			if _, ok := account.AccountCapabilities[mailCapability]; ok && !account.IsReadOnly {
-				accountID = id
-				break
+				candidates = append(candidates, id)
 			}
+		}
+		sort.Strings(candidates)
+		accountID = ""
+		if len(candidates) > 0 {
+			accountID = candidates[0]
 		}
 	}
 	if accountID == "" {
@@ -161,7 +166,7 @@ func (c *client) call(ctx context.Context, using []string, method string, args, 
 	safeToRetry := strings.HasSuffix(method, "/get") || strings.HasSuffix(method, "/query") || strings.HasSuffix(method, "/changes")
 	resp, err := c.doHTTP(ctx, http.MethodPost, c.session.APIURL, body, "application/json", safeToRetry)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: %w", method, err)
 	}
 	defer resp.Body.Close()
 	var envelope methodResponseEnvelope
@@ -409,6 +414,7 @@ func (c *client) watch(ctx context.Context, onChange func()) error {
 
 func (c *client) consumeEvents(ctx context.Context, r io.Reader, lastID string, onChange func()) (string, error) {
 	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	var data strings.Builder
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -419,6 +425,9 @@ func (c *client) consumeEvents(ctx context.Context, r io.Reader, lastID string, 
 		case strings.HasPrefix(line, "id:"):
 			lastID = strings.TrimSpace(strings.TrimPrefix(line, "id:"))
 		case strings.HasPrefix(line, "data:"):
+			if data.Len() > 0 {
+				data.WriteByte('\n')
+			}
 			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 		case line == "":
 			if stateChangeIncludesEmail(data.String(), c.accountID) {

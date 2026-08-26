@@ -3,7 +3,41 @@ package handler
 import (
 	"testing"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/config"
 )
+
+type recordingSyncTrigger struct{ accounts []string }
+
+func (r *recordingSyncTrigger) TriggerSync(account string) { r.accounts = append(r.accounts, account) }
+
+func TestSyncTriggerGroupFansOut(t *testing.T) {
+	first, second := &recordingSyncTrigger{}, &recordingSyncTrigger{}
+	SyncTriggerGroup{first, nil, second}.TriggerSync("work")
+	if len(first.accounts) != 1 || first.accounts[0] != "work" || len(second.accounts) != 1 || second.accounts[0] != "work" {
+		t.Fatalf("fan-out = %v / %v", first.accounts, second.accounts)
+	}
+}
+
+func TestEngineWatcherRegistersTriggersSynchronously(t *testing.T) {
+	w := NewEngineWatcher(NewEventHub(), nil, nil, nil, nil)
+	account := &config.AccountConfig{Name: "JMAP", Alias: "jmap"}
+	w.RegisterAccounts([]*config.AccountConfig{account})
+	w.TriggerSync("jmap")
+	w.mu.Lock()
+	queued := len(w.triggers["jmap"])
+	w.mu.Unlock()
+	if queued != 1 {
+		t.Fatalf("queued triggers = %d, want 1 before Start", queued)
+	}
+	w.TriggerSync("jmap")
+	w.mu.Lock()
+	coalesced := len(w.triggers["jmap"])
+	w.mu.Unlock()
+	if coalesced != 1 {
+		t.Fatalf("coalesced triggers = %d, want 1", coalesced)
+	}
+}
 
 // TestEngineWatcherIntervalTiers proves the cadence policy: fast on the inbox
 // while a GUI is attached, slower everywhere else, and slower again once the

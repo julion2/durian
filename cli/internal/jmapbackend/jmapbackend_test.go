@@ -7,12 +7,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/keychain"
 )
 
 const testRaw = "From: Alice <alice@example.test>\r\nTo: Me <me@example.test>\r\nSubject: hello\r\nMessage-ID: <m1@example.test>\r\nDate: Tue, 25 Aug 2026 12:00:00 +0000\r\n\r\nbody\r\n"
@@ -121,6 +123,145 @@ func testMailboxes() []map[string]interface{} {
 	}
 }
 
+func TestBuildMailboxMappingsCanonicalAndDeterministic(t *testing.T) {
+	mailboxes := map[string]jmapMailbox{
+		"role":      {ID: "role", Name: "Whatever", Role: "InBoX"},
+		"collision": {ID: "collision", Name: " INBOX "},
+		"parent-a":  {ID: "parent-a", Name: "Projects"},
+		"parent-b":  {ID: "parent-b", Name: "projects"},
+		"leaf-a":    {ID: "leaf-a", Name: "Current", ParentID: "parent-a"},
+		"leaf-b":    {ID: "leaf-b", Name: "CURRENT", ParentID: "parent-b"},
+		"cycle-a":   {ID: "cycle-a", Name: "A", ParentID: "cycle-b"},
+		"cycle-b":   {ID: "cycle-b", Name: "B", ParentID: "cycle-a"},
+		"orphan":    {ID: "orphan", Name: "Orphan", ParentID: "missing"},
+	}
+	forward, reverse := buildMailboxMappings(mailboxes)
+	if forward["role"] != "inbox" || reverse["inbox"] != "role" {
+		t.Fatalf("special role did not win inbox collision: forward=%v reverse=%v", forward, reverse)
+	}
+	if forward["collision"] != "inbox~"+mailboxTagSuffix("collision") {
+		t.Errorf("ordinary inbox collision = %q", forward["collision"])
+	}
+	if forward["leaf-a"] == forward["leaf-b"] || !strings.HasPrefix(forward["leaf-a"], "projects/current~") || !strings.HasPrefix(forward["leaf-b"], "projects/current~") {
+		t.Errorf("duplicate canonical paths not disambiguated: %q %q", forward["leaf-a"], forward["leaf-b"])
+	}
+	if forward["orphan"] != "orphan" || forward["cycle-a"] == "" || forward["cycle-b"] == "" {
+		t.Errorf("missing-parent/cycle mappings = %v", forward)
+	}
+	forward2, reverse2 := buildMailboxMappings(mailboxes)
+	if !mapsEqual(forward, forward2) || !mapsEqual(reverse, reverse2) {
+		t.Fatalf("mapping is nondeterministic: %v/%v then %v/%v", forward, reverse, forward2, reverse2)
+	}
+}
+
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, value := range a {
+		if b[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func TestConsumeEventsSupportsMultilineAndLargeData(t *testing.T) {
+	c := &client{accountID: "a1"}
+	largePadding := strings.Repeat(" ", 70<<10)
+	events := "id: 7\ndata: {\"@type\":\"StateChange\",\ndata: \"changed\":{\"a1\":{\"Email\":\"s2\"}}}" + largePadding + "\n\n"
+	called := 0
+	lastID, err := c.consumeEvents(t.Context(), strings.NewReader(events), "", func() { called++ })
+	if err != nil || lastID != "7" || called != 1 {
+		t.Fatalf("consumeEvents() = id %q, calls %d, err %v", lastID, called, err)
+	}
+}
+
+func TestEnsureRetriesDiscoveryAndMigratesLegacyOnlyAfterSuccess(t *testing.T) {
+	originalGet, originalSet := getCredential, setCredential
+	t.Cleanup(func() { getCredential, setCredential = originalGet, originalSet })
+	var jmapGets, legacyGets, migrations, sessions int
+	getCredential = func(service, _ string) (string, error) {
+		if service == keychain.JMAPKeychainService {
+			jmapGets++
+			return "", keychain.ErrNotFound
+		}
+		legacyGets++
+		return "secret", nil
+	}
+	setCredential = func(service, _, password string) error {
+		if service != keychain.JMAPKeychainService || password != "secret" {
+			t.Fatalf("unexpected migration: %q %q", service, password)
+		}
+		migrations++
+		return nil
+	}
+	s := newTestJMAPServer(t)
+	baseHandler := s.server.Config.Handler
+	s.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/session" {
+			sessions++
+			if sessions <= 4 {
+				http.Error(w, "temporary", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		baseHandler.ServeHTTP(w, r)
+	})
+	b, err := New(&config.AccountConfig{Name: "Test", Email: "me@example.test", SyncEngine: "jmap", JMAP: &config.JMAPConfig{SessionURL: s.server.URL + "/session", Auth: "password"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ensure(t.Context()); err == nil || migrations != 0 {
+		t.Fatalf("first ensure err=%v migrations=%d", err, migrations)
+	}
+	if err := b.ensure(t.Context()); err != nil || migrations != 1 || sessions != 5 || jmapGets != 2 || legacyGets != 2 {
+		t.Fatalf("retry ensure err=%v migrations=%d sessions=%d gets=%d/%d", err, migrations, sessions, jmapGets, legacyGets)
+	}
+}
+
+func TestEnsurePrefersJMAPCredential(t *testing.T) {
+	originalGet, originalSet := getCredential, setCredential
+	t.Cleanup(func() { getCredential, setCredential = originalGet, originalSet })
+	legacyGets, migrations := 0, 0
+	getCredential = func(service, _ string) (string, error) {
+		if service == keychain.JMAPKeychainService {
+			return "secret", nil
+		}
+		legacyGets++
+		return "legacy", nil
+	}
+	setCredential = func(_, _, _ string) error { migrations++; return nil }
+	s := newTestJMAPServer(t)
+	b, err := New(&config.AccountConfig{Name: "Test", Email: "me@example.test", SyncEngine: "jmap", JMAP: &config.JMAPConfig{SessionURL: s.server.URL + "/session", Auth: "password"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ensure(t.Context()); err != nil || legacyGets != 0 || migrations != 0 {
+		t.Fatalf("ensure err=%v legacyGets=%d migrations=%d", err, legacyGets, migrations)
+	}
+}
+
+func TestQueryAllEmailIDsRejectsIncompleteResult(t *testing.T) {
+	s := newTestJMAPServer(t)
+	b := s.backend(t)
+	if err := b.ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		if method != "Email/query" {
+			t.Fatalf("unexpected method %s", method)
+		}
+		if _, paged := args["anchor"]; paged {
+			return map[string]interface{}{"position": 1, "ids": []string{}, "total": 2}
+		}
+		return map[string]interface{}{"position": 0, "ids": []string{"e1"}, "total": 2}
+	}
+	if _, err := b.queryAllEmailIDsOnce(t.Context()); !errors.Is(err, errIncompleteQuery) {
+		t.Fatalf("query error = %v, want errIncompleteQuery", err)
+	}
+}
+
 func emailObject(id string, keywords map[string]bool, mailboxes map[string]bool) map[string]interface{} {
 	return map[string]interface{}{
 		"id": id, "blobId": "blob-" + id, "threadId": "thread-1", "mailboxIds": mailboxes,
@@ -167,7 +308,7 @@ func TestInitialAndIncrementalSync(t *testing.T) {
 	if !first.Messages[0].Flags.Seen || !first.Messages[0].Flags.Flagged {
 		t.Errorf("initial flags = %#v", first.Messages[0].Flags)
 	}
-	if got := strings.Join(first.Messages[0].Labels, ","); got != "Project X,inbox" {
+	if got := strings.Join(first.Messages[0].Labels, ","); got != "inbox,project-x" {
 		t.Errorf("labels = %q", got)
 	}
 
@@ -299,8 +440,40 @@ func TestCannotCalculateChangesStartsReplacementSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.FullSnapshot || len(result.Messages) != 1 || len(result.Present) != 1 {
+	if !result.FullSnapshot || len(result.Messages) != 0 || len(result.Present) != 1 {
 		t.Fatalf("replacement result = %#v", result)
+	}
+}
+
+func TestFetchSnapshotMetadataDoesNotDownloadBodies(t *testing.T) {
+	s := newTestJMAPServer(t)
+	s.handler = func(method string, _ map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+		case "Email/get":
+			return map[string]interface{}{
+				"state":    "s1",
+				"list":     []interface{}{emailObject("e1", map[string]bool{"$seen": true}, map[string]bool{"inbox-id": true})},
+				"notFound": []interface{}{},
+			}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	b := s.backend(t)
+	if _, err := b.FetchFolders(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := b.FetchSnapshotMetadata(t.Context(), []backend.RemoteRef{{Folder: allMailStream, ID: "e1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || messages[0].Ref.ID != "e1" || !messages[0].Flags.Seen {
+		t.Fatalf("metadata = %+v", messages)
+	}
+	if got, want := messages[0].Labels, []string{"inbox"}; !slices.Equal(got, want) {
+		t.Fatalf("labels = %v, want %v", got, want)
 	}
 }
 
@@ -360,6 +533,8 @@ func TestApplyLabelsCreatesMissingArchiveMailbox(t *testing.T) {
 		case "Mailbox/set":
 			createdArchive = true
 			return map[string]interface{}{"created": map[string]interface{}{"archive": map[string]string{"id": "archive-id"}}, "notCreated": map[string]interface{}{}}
+		case "Email/get":
+			return map[string]interface{}{"state": "s1", "list": []interface{}{emailObject("e1", nil, map[string]bool{"inbox-id": true})}, "notFound": []interface{}{}}
 		case "Email/set":
 			emailPatch = args["update"].(map[string]interface{})["e1"].(map[string]interface{})
 			return map[string]interface{}{"updated": map[string]interface{}{"e1": nil}, "notUpdated": map[string]interface{}{}}

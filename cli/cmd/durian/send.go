@@ -223,8 +223,8 @@ func runSend(cmd *cobra.Command, args []string) error {
 
 	fmt.Fprintf(os.Stderr, "✓ Email sent successfully to %s\n", to)
 
-	// Native API transports save sent mail server-side.
-	if account.UsesGraphBackend() || account.UsesGmailBackend() || account.UsesJMAPBackend() {
+	// Some transports save sent mail server-side.
+	if mailSender.SavesSentCopy() {
 		fmt.Fprintln(os.Stderr, "✓ Provider saves sent mail automatically")
 		return nil
 	}

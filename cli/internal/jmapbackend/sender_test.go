@@ -1,6 +1,7 @@
 package jmapbackend
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -50,6 +51,18 @@ func TestSenderImportsAndSubmits(t *testing.T) {
 	}
 	if !strings.Contains(string(s.uploaded), "Bcc: hidden@example.test") || !strings.Contains(string(s.uploaded), "Subject: JMAP test") {
 		t.Fatalf("uploaded MIME missing headers:\n%s", s.uploaded)
+	}
+}
+
+func TestClassifySendErrorTreatsLocalJMAPPreconditionsAsPermanent(t *testing.T) {
+	for _, err := range []error{errNoDraftsMailbox, errSubmissionUnavailable, errNoSubmissionIdentity} {
+		t.Run(err.Error(), func(t *testing.T) {
+			classified := classifySendError(errors.Join(errors.New("context"), err))
+			var sendErr *mailsend.Error
+			if !errors.As(classified, &sendErr) || sendErr.Kind != mailsend.KindPermanent || !errors.Is(classified, err) {
+				t.Fatalf("classifySendError(%v) = %#v", err, classified)
+			}
+		})
 	}
 }
 

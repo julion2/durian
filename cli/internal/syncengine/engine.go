@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 
 	"github.com/julion2/durian/cli/internal/backend"
@@ -148,18 +149,34 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 		// re-fetching the server's copy, which would re-add role tags like
 		// "inbox" to messages the user archived but that haven't moved on the
 		// server yet, defeating the upload we're about to do.
-		var deltaFlags map[string]backend.Flags
+		var folderSync *folderSyncResult
 		if e.opts.Mode != UploadOnly {
-			df, err := e.syncFolder(ctx, b, folder, result)
+			folderSync, err = e.syncFolder(ctx, b, folder, result)
 			if err != nil {
 				slog.Warn("Folder sync failed, continuing", "module", "SYNCENGINE",
 					"account", e.opts.Account, "folder", folder.Name, "err", err)
 				result.Errors = append(result.Errors, fmt.Errorf("folder %s: %w", folder.Name, err))
 				continue
 			}
-			deltaFlags = df
 		}
+		var deltaFlags map[string]backend.Flags
+		if folderSync != nil {
+			deltaFlags = folderSync.deltaFlags
+		}
+		errorsBeforeFlags := len(result.Errors)
 		e.reconcileFolderFlags(ctx, b, folder, deltaFlags, result)
+		if folderSync != nil && folderSync.pendingCursor != nil && !e.opts.DryRun {
+			if err := ctx.Err(); err != nil {
+				return result, fmt.Errorf("sync canceled before replacement cursor persistence: %w", err)
+			}
+			if len(result.Errors) > errorsBeforeFlags {
+				result.Errors = append(result.Errors, fmt.Errorf("folder %s: replacement cursor held back after flag reconciliation failed", folder.Name))
+				continue
+			}
+			if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, folderSync.pendingCursor); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("folder %s: persist replacement cursor: %w", folder.Name, err))
+			}
+		}
 	}
 
 	// An explicit folder filter that selected nothing is a caller bug (a typo, or
@@ -234,9 +251,14 @@ func (e *Engine) folderSelected(folder backend.Folder) bool {
 
 // syncFolder pages through one folder's changes until the backend reports no
 // more, normally persisting the cursor after every successfully processed
-// batch. Replacement snapshots persist only their final cursor so a crash
-// restarts the complete reconciliation instead of treating a tail as complete.
-func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backend.Folder, result *Result) (map[string]backend.Flags, error) {
+// batch. It returns a replacement snapshot's final cursor to Sync so it can be
+// persisted only after the subsequent flag reconciliation also succeeds.
+type folderSyncResult struct {
+	deltaFlags    map[string]backend.Flags
+	pendingCursor backend.Cursor
+}
+
+func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backend.Folder, result *Result) (*folderSyncResult, error) {
 	cursor, err := e.opts.Cursors.Get(e.opts.Account, folder.Name)
 	if err != nil {
 		return nil, fmt.Errorf("load cursor: %w", err)
@@ -260,6 +282,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 	// message must not make the engine delete an older local copy.
 	snapshotRefs := make(map[string]struct{})
 	fullSnapshot := false
+	snapshotModeSet := false
 
 	// fetched counts messages pulled this run, to enforce MaxPerFolder.
 	fetched := 0
@@ -275,8 +298,14 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		if err != nil {
 			return nil, fmt.Errorf("fetch messages: %w", err)
 		}
+		if snapshotModeSet && res.FullSnapshot != fullSnapshot {
+			return nil, errors.New("backend mixed replacement-snapshot and delta pages in one fetch sequence")
+		}
+		if !snapshotModeSet {
+			fullSnapshot = res.FullSnapshot
+			snapshotModeSet = true
+		}
 		if res.FullSnapshot {
-			fullSnapshot = true
 			for _, ref := range res.Present {
 				snapshotRefs[ref.ID] = struct{}{}
 			}
@@ -341,15 +370,6 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 			return nil, fmt.Errorf("cursor held back: a message in this batch could not be stored yet")
 		}
 
-		// Persist the cursor only after the batch was fully processed, and
-		// never in dry-run (advancing it would silently skip these changes on
-		// the next real sync).
-		if !e.opts.DryRun && (!res.FullSnapshot || !res.HasMore) {
-			if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, res.Cursor); err != nil {
-				return nil, fmt.Errorf("persist cursor: %w", err)
-			}
-		}
-
 		fetched += len(res.Messages)
 		if e.opts.OnProgress != nil {
 			// Total processed, not just new: a legacy->engine migration re-ingests
@@ -359,10 +379,36 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		}
 
 		if !res.HasMore {
-			if fullSnapshot && !e.opts.DryRun {
-				e.reconcileFullSnapshot(folder, snapshotRefs, result)
+			if fullSnapshot {
+				if err := e.hydrateFullSnapshot(ctx, b, folder, snapshotRefs, deltaFlags, result); err != nil {
+					return nil, err
+				}
 			}
-			return deltaFlags, nil
+			if fullSnapshot && !e.opts.DryRun {
+				errorsBefore := len(result.Errors)
+				e.reconcileFullSnapshot(folder, snapshotRefs, result)
+				if len(result.Errors) > errorsBefore {
+					return nil, errors.New("full-snapshot reconciliation failed")
+				}
+			}
+			// A replacement cursor remains pending until the caller's flag pass
+			// succeeds. Advancing it here could permanently lose a flag change
+			// recovered from the expired-cursor gap.
+			if !e.opts.DryRun && !fullSnapshot {
+				if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, res.Cursor); err != nil {
+					return nil, fmt.Errorf("persist cursor: %w", err)
+				}
+			}
+			state := &folderSyncResult{deltaFlags: deltaFlags}
+			if fullSnapshot {
+				state.pendingCursor = res.Cursor
+			}
+			return state, nil
+		}
+		if !e.opts.DryRun && !fullSnapshot {
+			if err := e.opts.Cursors.Set(e.opts.Account, folder.Name, res.Cursor); err != nil {
+				return nil, fmt.Errorf("persist cursor: %w", err)
+			}
 		}
 		// Stop at the per-folder cap (newest-first), so a first sync of a large
 		// folder does not page its entire history — parity with the legacy
@@ -374,7 +420,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		if e.opts.MaxPerFolder > 0 && fetched >= e.opts.MaxPerFolder && !fullSnapshot {
 			slog.Debug("Reached per-folder message cap, stopping", "module", "SYNCENGINE", // encgrep:allow folder name and cap counts are operational sync metadata, not message content
 				"folder", folder.Name, "cap", e.opts.MaxPerFolder, "fetched", fetched)
-			return deltaFlags, nil
+			return &folderSyncResult{deltaFlags: deltaFlags}, nil
 		}
 		// Defensive guard: a backend that reports HasMore without changing
 		// anything would loop forever; bail out instead.
@@ -383,6 +429,108 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		}
 		cursor = res.Cursor
 	}
+}
+
+func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, folder backend.Folder, present map[string]struct{}, deltaFlags map[string]backend.Flags, result *Result) error {
+	rows, err := e.opts.Store.GetFolderFlagState(e.opts.Account, folder.Name)
+	if err != nil {
+		return fmt.Errorf("load full-snapshot hydration state for %s: %w", folder.Name, err)
+	}
+	existing := make(map[string]struct{}, len(rows))
+	messageIDs := make(map[string]string, len(rows))
+	for _, row := range rows {
+		existing[row.RemoteRef] = struct{}{}
+		messageIDs[row.RemoteRef] = row.MessageID
+	}
+	missing := make([]backend.RemoteRef, 0)
+	current := make([]backend.RemoteRef, 0, len(existing))
+	for id := range present {
+		if _, ok := existing[id]; ok {
+			current = append(current, backend.RemoteRef{Folder: folder.Name, ID: id})
+		} else {
+			missing = append(missing, backend.RemoteRef{Folder: folder.Name, ID: id})
+		}
+	}
+	sort.Slice(missing, func(i, j int) bool { return missing[i].ID < missing[j].ID })
+	sort.Slice(current, func(i, j int) bool { return current[i].ID < current[j].ID })
+	hydrator, ok := b.(backend.SnapshotHydrator)
+	if !ok {
+		if len(missing) > 0 {
+			return fmt.Errorf("backend returned a metadata-only full snapshot with %d locally missing messages but cannot hydrate them", len(missing))
+		}
+		return nil
+	}
+	batchSize := e.opts.BatchLimit
+	if batchSize <= 0 {
+		batchSize = defaultBatchLimit
+	}
+	for start := 0; start < len(current); start += batchSize {
+		end := min(start+batchSize, len(current))
+		batch := current[start:end]
+		messages, err := hydrator.FetchSnapshotMetadata(ctx, batch)
+		if err != nil {
+			return fmt.Errorf("refresh full snapshot metadata: %w", err)
+		}
+		if err := validateSnapshotBatch(batch, messages); err != nil {
+			return err
+		}
+		for _, msg := range messages {
+			deltaFlags[msg.Ref.ID] = msg.Flags
+			if e.opts.Ingest.LabelsAsTags && !e.opts.DryRun {
+				if err := reconcileLabels(e.opts.Store, messageIDs[msg.Ref.ID], e.opts.Account, msg.Labels); err != nil {
+					return fmt.Errorf("reconcile snapshot labels for %s: %w", msg.Ref.ID, err)
+				}
+			}
+		}
+	}
+	for start := 0; start < len(missing); start += batchSize {
+		end := min(start+batchSize, len(missing))
+		batch := missing[start:end]
+		messages, err := hydrator.FetchSnapshotMessages(ctx, batch)
+		if err != nil {
+			return fmt.Errorf("hydrate full snapshot: %w", err)
+		}
+		if err := validateSnapshotBatch(batch, messages); err != nil {
+			return err
+		}
+		for _, msg := range messages {
+			deltaFlags[msg.Ref.ID] = msg.Flags
+			if e.opts.DryRun {
+				result.New++
+				continue
+			}
+			messageID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, e.opts.Ingest)
+			if err != nil {
+				return fmt.Errorf("ingest hydrated snapshot message %s: %w", msg.Ref.ID, err)
+			}
+			if created {
+				result.New++
+				if folder.Role == backend.RoleInbox || (b.Capabilities().LabelsAreTags && tagsContain(msg.Labels, "inbox")) {
+					result.NewMessageIDs = append(result.NewMessageIDs, messageID)
+				}
+			} else {
+				result.Deduplicated++
+			}
+		}
+	}
+	return nil
+}
+
+func validateSnapshotBatch(requested []backend.RemoteRef, messages []backend.Message) error {
+	expected := make(map[string]struct{}, len(requested))
+	for _, ref := range requested {
+		expected[ref.ID] = struct{}{}
+	}
+	for _, msg := range messages {
+		if _, ok := expected[msg.Ref.ID]; !ok {
+			return fmt.Errorf("snapshot hydrator returned unexpected ref %q", msg.Ref.ID)
+		}
+		delete(expected, msg.Ref.ID)
+	}
+	if len(expected) > 0 {
+		return fmt.Errorf("snapshot hydrator omitted %d requested messages", len(expected))
+	}
+	return nil
 }
 
 // reconcileFullSnapshot removes local refs that are absent from an

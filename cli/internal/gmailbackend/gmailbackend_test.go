@@ -7,6 +7,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/julion2/durian/cli/internal/backend"
@@ -147,6 +150,37 @@ func TestFetchMessagesListAndRaw(t *testing.T) {
 	}
 }
 
+func TestFetchSnapshotMetadataUsesMinimalFormat(t *testing.T) {
+	mux := http.NewServeMux()
+	registerLabels(t, mux)
+	mux.HandleFunc("/users/me/messages/m1", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("format"); got != "MINIMAL" {
+			t.Errorf("format = %q, want MINIMAL", got)
+		}
+		writeJSON(t, w, map[string]any{
+			"id":       "m1",
+			"labelIds": []string{"INBOX", "UNREAD", "Label_5"},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	if err := b.loadLabels(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := b.FetchSnapshotMetadata(t.Context(), []backend.RemoteRef{{Folder: allMailStream, ID: "m1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || messages[0].Ref.ID != "m1" || messages[0].Flags.Seen {
+		t.Fatalf("messages = %+v", messages)
+	}
+	if got, want := messages[0].Labels, []string{"inbox", "newsletter"}; !slices.Equal(got, want) {
+		t.Fatalf("labels = %v, want %v", got, want)
+	}
+}
+
 func TestFetchMessagesPaginates(t *testing.T) {
 	mux := http.NewServeMux()
 	registerProfile(t, mux, "999")
@@ -253,7 +287,7 @@ func TestHistorySyncChangesAndDeletes(t *testing.T) {
 	}
 }
 
-func TestHistoryExpiredRestartsFullSync(t *testing.T) {
+func TestHistoryExpiredReconcilesIDsWithoutBodies(t *testing.T) {
 	mux := http.NewServeMux()
 	registerProfile(t, mux, "999")
 	registerLabels(t, mux)
@@ -271,13 +305,70 @@ func TestHistoryExpiredRestartsFullSync(t *testing.T) {
 	defer srv.Close()
 
 	b := newTestBackend(t, srv)
-	// A stale historyId (404) must transparently restart the full messages.list sync.
+	// A stale historyId (404) must reconcile from an ID-only messages.list snapshot.
 	result, err := b.FetchMessages(context.Background(), allMailStream, encodeCursor(gmailCursor{HistoryID: "5"}), 50)
 	if err != nil {
 		t.Fatalf("FetchMessages after expiry: %v", err)
 	}
-	if len(result.Messages) != 1 || result.Messages[0].Ref.ID != "m1" {
-		t.Fatalf("messages = %+v, want [m1] from the restarted full sync", result.Messages)
+	if !result.FullSnapshot || len(result.Messages) != 0 || len(result.Present) != 1 || result.Present[0].ID != "m1" {
+		t.Fatalf("replacement snapshot = %+v, want present [m1] without body downloads", result)
+	}
+	if gc := decodeCursor(result.Cursor); gc.HistoryID != "999" {
+		t.Fatalf("cursor = %+v, want historyId 999", gc)
+	}
+}
+
+func TestReplacementSnapshotPaginatesAndRejectsNoProgress(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		secondPage bool
+		wantErr    bool
+	}{
+		{name: "paginates", secondPage: true},
+		{name: "no progress", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			registerProfile(t, mux, "321")
+			registerLabels(t, mux)
+			mux.HandleFunc("/users/me/messages", func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("pageToken") == "next" && tc.secondPage {
+					writeJSON(t, w, map[string]any{"messages": []map[string]string{{"id": "m2"}}})
+					return
+				}
+				writeJSON(t, w, map[string]any{"messages": []map[string]string{{"id": "m1"}}, "nextPageToken": "next"})
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+			result, err := newTestBackend(t, srv).replacementSnapshot(t.Context(), allMailStream)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "no progress") {
+					t.Fatalf("replacementSnapshot error = %v", err)
+				}
+				return
+			}
+			if err != nil || len(result.Present) != 2 || result.Present[0].ID != "m1" || result.Present[1].ID != "m2" || decodeCursor(result.Cursor).HistoryID != "321" {
+				t.Fatalf("replacementSnapshot = %+v, err %v", result, err)
+			}
+		})
+	}
+}
+
+func TestMutationIsNotRetriedAfterThrottle(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	resp, err := b.do(t.Context(), http.MethodPost, srv.URL+"/mutation", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("mutation calls = %d, want 1", got)
 	}
 }
 

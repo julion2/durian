@@ -9,6 +9,15 @@ import (
 	"time"
 )
 
+func TestSenderReportsServerSideSentBehavior(t *testing.T) {
+	if NewSender("smtp.example.test", 587, nil, false).SavesSentCopy() {
+		t.Fatal("generic SMTP unexpectedly reports a server-side Sent copy")
+	}
+	if !NewSender("smtp.gmail.com", 587, nil, true).SavesSentCopy() {
+		t.Fatal("provider-managed SMTP Sent copy was not reported")
+	}
+}
+
 func TestMessageBuild(t *testing.T) {
 	msg := &Message{
 		From:    "sender@example.com",

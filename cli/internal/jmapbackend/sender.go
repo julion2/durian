@@ -13,6 +13,12 @@ import (
 	"github.com/julion2/durian/cli/internal/smtp"
 )
 
+var (
+	errNoDraftsMailbox       = errors.New("JMAP account has no drafts mailbox")
+	errSubmissionUnavailable = errors.New("JMAP mail submission is unavailable")
+	errNoSubmissionIdentity  = errors.New("JMAP account has no submission identity")
+)
+
 // Sender delivers RFC 5322 mail via JMAP Email/import and EmailSubmission/set.
 type Sender struct {
 	b *Backend
@@ -45,6 +51,9 @@ func (s *Sender) Send(ctx context.Context, message *mailsend.Message) error {
 	return nil
 }
 
+// SavesSentCopy reports that JMAP Submission stores sent mail server-side.
+func (s *Sender) SavesSentCopy() bool { return true }
+
 func (b *Backend) sendRaw(ctx context.Context, raw []byte) error {
 	if err := b.loadMailboxes(ctx); err != nil {
 		return err
@@ -52,7 +61,7 @@ func (b *Backend) sendRaw(ctx context.Context, raw []byte) error {
 	draftsID := b.mailboxIDForTag("draft")
 	sentID := b.mailboxIDForTag("sent")
 	if draftsID == "" {
-		return errors.New("JMAP account has no drafts mailbox")
+		return errNoDraftsMailbox
 	}
 	identityID, err := b.identityID(ctx)
 	if err != nil {
@@ -102,11 +111,11 @@ func (b *Backend) sendRaw(ctx context.Context, raw []byte) error {
 
 func (b *Backend) identityID(ctx context.Context) (string, error) {
 	if _, ok := b.client.session.Capabilities[submissionCapability]; !ok {
-		return "", errors.New("JMAP server does not advertise mail submission")
+		return "", fmt.Errorf("%w: server capability missing", errSubmissionUnavailable)
 	}
 	account, ok := b.client.session.Accounts[b.client.accountID]
 	if _, supportsSubmission := account.AccountCapabilities[submissionCapability]; !ok || !supportsSubmission {
-		return "", errors.New("JMAP mail account does not support submission")
+		return "", fmt.Errorf("%w: account capability missing", errSubmissionUnavailable)
 	}
 	var result struct {
 		List []struct {
@@ -124,7 +133,7 @@ func (b *Backend) identityID(ctx context.Context) (string, error) {
 		}
 	}
 	if len(result.List) == 0 {
-		return "", errors.New("JMAP account has no submission identity")
+		return "", errNoSubmissionIdentity
 	}
 	return result.List[0].ID, nil
 }
@@ -132,10 +141,13 @@ func (b *Backend) identityID(ctx context.Context) (string, error) {
 func (b *Backend) mailboxIDForTag(tag string) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.tagToID[strings.ToLower(tag)]
+	return b.tagToID[canonicalMailboxSegment(tag)]
 }
 
 func classifySendError(err error) error {
+	if errors.Is(err, errNoDraftsMailbox) || errors.Is(err, errSubmissionUnavailable) || errors.Is(err, errNoSubmissionIdentity) {
+		return &mailsend.Error{Kind: mailsend.KindPermanent, Err: err}
+	}
 	var statusErr *statusError
 	if errors.As(err, &statusErr) {
 		kind := mailsend.KindTransient

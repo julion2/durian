@@ -146,7 +146,7 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 func fetchAttachmentPartViaBackend(ctx context.Context, account *config.AccountConfig, msg *store.Message, partID int) ([]byte, error) {
 	b, err := backendfactory.New(account)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create backend: %w", err)
 	}
 	defer b.Close()
 	var buf bytes.Buffer

@@ -647,3 +647,21 @@ func TestThrottleRetry(t *testing.T) {
 		t.Errorf("Cursor = %q, want %q", result.Cursor, want)
 	}
 }
+
+func TestMutationIsNotRetriedAfterThrottle(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	resp, err := b.do(t.Context(), http.MethodPost, srv.URL+"/mutation", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("mutation calls = %d, want 1", got)
+	}
+}

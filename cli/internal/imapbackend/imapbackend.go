@@ -399,6 +399,9 @@ func (b *Backend) Send(_ context.Context, _ []byte) error {
 // Watch blocks in IMAP IDLE on folder and invokes onChange for every mailbox
 // update until ctx is done.
 func (b *Backend) Watch(ctx context.Context, folder string, onChange func()) error {
+	if folder == "" {
+		folder = "INBOX"
+	}
 	if _, err := b.client.SelectMailbox(folder); err != nil {
 		return fmt.Errorf("failed to select %s for watch: %w", folder, err)
 	}
@@ -451,21 +454,10 @@ func (b *Backend) idleOnce(ctx context.Context, onChange func()) (ctxDone bool, 
 
 // MARK: - Capabilities / Close
 
-// Capabilities reports IMAP backend behavior. Gmail and Microsoft auto-save
-// sent mail server-side; generic IMAP providers do not. IMAP has no native
-// atomic move here (copy + expunge), but IDLE provides push notifications.
+// Capabilities reports that IMAP IDLE provides push notifications.
 func (b *Backend) Capabilities() backend.Capabilities {
-	serverSideSent := false
-	if b.account.OAuth != nil {
-		switch b.account.OAuth.Provider {
-		case "google", "microsoft":
-			serverSideSent = true
-		}
-	}
 	return backend.Capabilities{
-		ServerSideSent: serverSideSent,
-		NativeMove:     false,
-		PushWatch:      true,
+		PushWatch: true,
 	}
 }
 

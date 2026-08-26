@@ -115,6 +115,9 @@ func (s *Sender) Send(ctx context.Context, m *mailsend.Message) error {
 	return nil
 }
 
+// SavesSentCopy reports that Microsoft Graph stores sent mail server-side.
+func (s *Sender) SavesSentCopy() bool { return true }
+
 // newDraft creates a fresh draft with small attachments inline, returning its
 // id and Graph-assigned Message-ID.
 func (s *Sender) newDraft(ctx context.Context, m *mailsend.Message, small []mailsend.Attachment) (string, string, error) {

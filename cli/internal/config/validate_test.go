@@ -223,8 +223,20 @@ func TestNativeMailAccountSelection(t *testing.T) {
 		t.Fatalf("GetMailSyncAccounts() returned %d accounts, want 5", len(mailAccounts))
 	}
 	watchAccounts := cfg.GetEngineAccounts()
-	if len(watchAccounts) != 3 || watchAccounts[0].Name != "engine" || watchAccounts[1].Name != "graph" || watchAccounts[2].Name != "jmap" {
-		t.Fatalf("GetEngineAccounts() = %#v, want engine/graph/jmap", watchAccounts)
+	if len(watchAccounts) != 4 || watchAccounts[0].Name != "engine" || watchAccounts[1].Name != "graph" || watchAccounts[2].Name != "gmail" || watchAccounts[3].Name != "jmap" {
+		t.Fatalf("GetEngineAccounts() = %#v, want engine/graph/gmail/jmap", watchAccounts)
+	}
+}
+
+func TestValidateJMAPAllowsEmptyAuth(t *testing.T) {
+	cfg := &Config{Accounts: []AccountConfig{{
+		Name: "jmap", Email: "me@example.test", SyncEngine: "jmap",
+		JMAP: &JMAPConfig{SessionURL: "https://mail.example.test/.well-known/jmap"},
+	}}}
+	for _, err := range ValidateConfig(cfg) {
+		if strings.Contains(err.Field, "jmap.auth") {
+			t.Fatalf("empty JMAP auth rejected: %+v", err)
+		}
 	}
 }
 

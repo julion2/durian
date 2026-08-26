@@ -157,16 +157,17 @@ func (e *statusError) Error() string {
 	return fmt.Sprintf("graph request failed: status %d: %s", e.status, e.body)
 }
 
-// do executes one authenticated Graph request with throttle handling: up to 3
-// retries on 429 honoring the Retry-After header, and one retry with a short
-// backoff on 503/504. All waits respect ctx cancellation. The caller owns the
-// returned response body (including non-2xx responses).
+// do executes one authenticated Graph request with throttle handling. GET/HEAD
+// requests retry on 429 and once on 503/504; mutation requests are never
+// replayed because the first response may have been lost after the server
+// committed it. All waits respect ctx cancellation.
 func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*http.Response, error) {
 	const (
 		maxThrottleRetries = 3
 		transientBackoff   = 2 * time.Second
 	)
 
+	safeToRetry := method == http.MethodGet || method == http.MethodHead
 	throttleRetries := 0
 	transientRetried := false
 	for {
@@ -194,7 +195,7 @@ func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*
 		}
 
 		switch {
-		case resp.StatusCode == http.StatusTooManyRequests && throttleRetries < maxThrottleRetries:
+		case safeToRetry && resp.StatusCode == http.StatusTooManyRequests && throttleRetries < maxThrottleRetries:
 			throttleRetries++
 			delay := retryAfter(resp)
 			drainClose(resp)
@@ -203,7 +204,7 @@ func (b *Backend) do(ctx context.Context, method, reqURL string, body []byte) (*
 			if err := sleepCtx(ctx, delay); err != nil {
 				return nil, err
 			}
-		case (resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout) && !transientRetried:
+		case safeToRetry && (resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout) && !transientRetried:
 			transientRetried = true
 			drainClose(resp)
 			slog.Warn("Graph transient error, retrying once", "module", "GRAPHBACKEND",
@@ -747,13 +748,10 @@ func (b *Backend) Watch(ctx context.Context, _ string, _ func()) error {
 	return ctx.Err()
 }
 
-// Capabilities reports Graph backend behavior: M365 auto-saves sent mail
-// server-side, moves are native atomic operations, and there is no push
-// notification support (see Watch — none exists for mail on this transport).
+// Capabilities reports Graph delta behavior and the lack of a local push
+// notification transport (see Watch).
 func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
-		ServerSideSent:     true,
-		NativeMove:         true,
 		PushWatch:          false,
 		FlagChangesInDelta: true,
 	}

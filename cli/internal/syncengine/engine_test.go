@@ -97,7 +97,8 @@ type fakeBackend struct {
 	// flagsByRef scripts the server flag state FetchFlags reports per
 	// RemoteRef.ID. Empty by default, so unrelated tests see "not on server"
 	// for every message and the engine's flag pass no-ops.
-	flagsByRef map[string]backend.Flags
+	flagsByRef    map[string]backend.Flags
+	fetchFlagsErr error
 	// fetchFlagsCalls / applyFlagsCalls record the flag-pass invocations.
 	fetchFlagsCalls []fetchFlagsCall
 	applyFlagsCalls []applyFlagsCall
@@ -108,8 +109,12 @@ type fakeBackend struct {
 	// labelVocab is what LabelTags reports; labelCalls records ApplyLabels
 	// invocations (label-upload pass). Both are the LabelWriter side used by the
 	// Gmail-style label-upload tests. Empty vocab makes the pass a no-op.
-	labelVocab []string
-	labelCalls []labelCall
+	labelVocab       []string
+	labelCalls       []labelCall
+	snapshotMessages map[string]backend.Message
+	snapshotHydrated []backend.RemoteRef
+	snapshotMetadata map[string]backend.Message
+	metadataFetched  []backend.RemoteRef
 	// caps is returned by Capabilities(); zero value matches the default IMAP-like
 	// backend. Tests set FlagChangesInDelta to exercise the delta flag path.
 	caps backend.Capabilities
@@ -156,6 +161,30 @@ func (f *fakeBackend) FetchBody(ctx context.Context, ref backend.RemoteRef, w io
 	return fmt.Errorf("fakeBackend: FetchBody not scripted")
 }
 
+func (f *fakeBackend) FetchSnapshotMessages(_ context.Context, refs []backend.RemoteRef) ([]backend.Message, error) {
+	f.snapshotHydrated = append(f.snapshotHydrated, refs...)
+	var messages []backend.Message
+	for _, ref := range refs {
+		if message, ok := f.snapshotMessages[ref.ID]; ok {
+			messages = append(messages, message)
+		}
+	}
+	return messages, nil
+}
+
+func (f *fakeBackend) FetchSnapshotMetadata(_ context.Context, refs []backend.RemoteRef) ([]backend.Message, error) {
+	f.metadataFetched = append(f.metadataFetched, refs...)
+	messages := make([]backend.Message, 0, len(refs))
+	for _, ref := range refs {
+		message, ok := f.snapshotMetadata[ref.ID]
+		if !ok {
+			message.Ref = ref
+		}
+		messages = append(messages, message)
+	}
+	return messages, nil
+}
+
 func (f *fakeBackend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, remove backend.Flags) error {
 	f.applyFlagsCalls = append(f.applyFlagsCalls, applyFlagsCall{ref: ref, add: add, remove: remove})
 	return nil
@@ -163,6 +192,9 @@ func (f *fakeBackend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add
 
 func (f *fakeBackend) FetchFlags(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
 	f.fetchFlagsCalls = append(f.fetchFlagsCalls, fetchFlagsCall{folder: folder, refs: slices.Clone(refs)})
+	if f.fetchFlagsErr != nil {
+		return nil, f.fetchFlagsErr
+	}
 	result := make(map[string]backend.Flags)
 	for _, ref := range refs {
 		if flags, ok := f.flagsByRef[ref.ID]; ok {
@@ -377,6 +409,155 @@ func TestEngineReconcilesReplacementFullSnapshot(t *testing.T) {
 	}
 	if got := string(cursors.cursors[cursors.key(testAccount, "ALL")]); got != "c2" {
 		t.Fatalf("persisted cursor = %q, want final replacement cursor", got)
+	}
+}
+
+func TestEngineHydratesLocallyMissingSnapshotMessages(t *testing.T) {
+	db := newTestDB(t)
+	folder := backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true}
+	message := func(id, ref string) backend.Message {
+		return backend.Message{MessageID: id, Ref: backend.RemoteRef{Folder: "ALL", ID: ref}, Raw: rawMessage(id, "a@example.com", testAccount, "Hello", "body")}
+	}
+	fake := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+		"ALL": {
+			{Messages: []backend.Message{message("keep@example.com", "r1")}, Cursor: backend.Cursor("old")},
+			{Cursor: backend.Cursor("new"), FullSnapshot: true, Present: []backend.RemoteRef{{Folder: "ALL", ID: "r1"}, {Folder: "ALL", ID: "r2"}}},
+		},
+	})
+	fake.snapshotMessages = map[string]backend.Message{"r2": message("missed@example.com", "r2")}
+	cursors := newMemCursorStore()
+	engine := newTestEngine(db, cursors)
+	if _, err := engine.Sync(t.Context(), fake); err != nil {
+		t.Fatal(err)
+	}
+	result, err := engine.Sync(t.Context(), fake)
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("replacement sync result=%+v err=%v", result, err)
+	}
+	if len(fake.snapshotHydrated) != 1 || fake.snapshotHydrated[0].ID != "r2" {
+		t.Fatalf("hydrated refs = %+v, want only r2", fake.snapshotHydrated)
+	}
+	if got, _ := db.GetByMessageID("missed@example.com"); got == nil {
+		t.Fatal("locally missing snapshot message was not ingested")
+	}
+	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "new" {
+		t.Fatalf("cursor = %q, want new", got)
+	}
+}
+
+func TestEngineRefreshesExistingSnapshotMetadata(t *testing.T) {
+	db := newTestDB(t)
+	folder := backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true}
+	seed := backend.Message{
+		MessageID: "existing@example.com",
+		Ref:       backend.RemoteRef{Folder: "ALL", ID: "r1"},
+		Raw:       rawMessage("existing@example.com", "a@example.com", testAccount, "Hello", "body"),
+		Flags:     backend.Flags{Seen: true},
+		Labels:    []string{"old-label"},
+	}
+	fake := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+		"ALL": {
+			{Messages: []backend.Message{seed}, Cursor: backend.Cursor("old")},
+			{Cursor: backend.Cursor("new"), FullSnapshot: true, Present: []backend.RemoteRef{{Folder: "ALL", ID: "r1"}}},
+			{Cursor: backend.Cursor("new"), FullSnapshot: true, Present: []backend.RemoteRef{{Folder: "ALL", ID: "r1"}}},
+		},
+	})
+	fake.caps.LabelsAreTags = true
+	fake.caps.FlagChangesInDelta = true
+	fake.flagsByRef["r1"] = backend.Flags{}
+	fake.snapshotMetadata = map[string]backend.Message{
+		"r1": {Ref: backend.RemoteRef{Folder: "ALL", ID: "r1"}, Labels: []string{"new-label"}},
+	}
+	cursors := newMemCursorStore()
+	engine := newTestEngine(db, cursors)
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("seed sync result=%+v err=%v", result, err)
+	}
+	if err := db.ModifyTagsByMessageIDAndAccount("existing@example.com", testAccount, []string{"local"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	fake.fetchFlagsErr = errors.New("temporary flag fetch failure")
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) == 0 {
+		t.Fatalf("failed replacement sync result=%+v err=%v", result, err)
+	}
+	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "old" {
+		t.Fatalf("cursor after failed flag reconciliation = %q, want old", got)
+	}
+	fake.fetchFlagsErr = nil
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("replacement sync result=%+v err=%v", result, err)
+	}
+	if got := fake.metadataFetched; len(got) != 2 || got[0].ID != "r1" || got[1].ID != "r1" {
+		t.Fatalf("metadata refs = %+v, want r1 retried", got)
+	}
+	rows, err := db.GetFolderFlagState(testAccount, "ALL")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("flag state = %+v, err=%v", rows, err)
+	}
+	for _, want := range []string{"new-label", "local", "unread"} {
+		if !slices.Contains(rows[0].Tags, want) {
+			t.Errorf("tags = %v, missing %q", rows[0].Tags, want)
+		}
+	}
+	if slices.Contains(rows[0].Tags, "old-label") {
+		t.Errorf("tags = %v, stale label remains", rows[0].Tags)
+	}
+	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "new" {
+		t.Fatalf("cursor = %q, want new", got)
+	}
+}
+
+func TestEngineRejectsMixedFullSnapshotPages(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	_ = cursors.Set(testAccount, "ALL", backend.Cursor("old"))
+	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Selectable: true}}, map[string][]backend.FetchResult{
+		"ALL": {
+			{Cursor: backend.Cursor("snapshot"), HasMore: true, FullSnapshot: true},
+			{Cursor: backend.Cursor("delta"), FullSnapshot: false},
+		},
+	})
+	result, err := newTestEngine(db, cursors).Sync(t.Context(), fake)
+	if err != nil {
+		t.Fatalf("Sync returned top-level error: %v", err)
+	}
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "mixed replacement-snapshot and delta") {
+		t.Fatalf("Sync errors = %v", result.Errors)
+	}
+	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "old" {
+		t.Fatalf("cursor advanced to %q", got)
+	}
+}
+
+func TestEngineDoesNotPersistSnapshotCursorWhenReconciliationFails(t *testing.T) {
+	db := newTestDB(t)
+	message := backend.Message{
+		MessageID: "stale@example.com", Ref: backend.RemoteRef{Folder: "ALL", ID: "stale"},
+		Raw: rawMessage("stale@example.com", "a@example.com", testAccount, "Stale", "body"),
+	}
+	cursors := newMemCursorStore()
+	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Selectable: true}}, map[string][]backend.FetchResult{
+		"ALL": {
+			{Messages: []backend.Message{message}, Cursor: backend.Cursor("old")},
+			{Cursor: backend.Cursor("final"), FullSnapshot: true},
+		},
+	})
+	engine := newTestEngine(db, cursors)
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("seed sync result=%+v err=%v", result, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := engine.Sync(t.Context(), fake)
+	if err != nil {
+		t.Fatalf("Sync returned top-level error: %v", err)
+	}
+	if len(result.Errors) == 0 {
+		t.Fatal("Sync unexpectedly succeeded with closed reconciliation store")
+	}
+	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "old" {
+		t.Fatalf("cursor advanced to %q after reconciliation failure", got)
 	}
 }
 

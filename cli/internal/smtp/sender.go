@@ -11,14 +11,15 @@ import (
 
 // Sender adapts the SMTP client to the provider-neutral mailsend.Sender seam.
 type Sender struct {
-	host string
-	port int
-	auth Auth
+	host          string
+	port          int
+	auth          Auth
+	savesSentCopy bool
 }
 
 // NewSender returns a mailsend.Sender that delivers over SMTP.
-func NewSender(host string, port int, auth Auth) *Sender {
-	return &Sender{host: host, port: port, auth: auth}
+func NewSender(host string, port int, auth Auth, savesSentCopy bool) *Sender {
+	return &Sender{host: host, port: port, auth: auth, savesSentCopy: savesSentCopy}
 }
 
 // Send renders the neutral message as MIME and delivers it, tagging any failure
@@ -29,6 +30,9 @@ func (s *Sender) Send(_ context.Context, m *mailsend.Message) error {
 	}
 	return nil
 }
+
+// SavesSentCopy reports whether this SMTP provider files submissions in Sent.
+func (s *Sender) SavesSentCopy() bool { return s.savesSentCopy }
 
 // FromMessage converts a provider-neutral message into an smtp.Message — for the
 // SMTP transport and for building a MIME copy to append to the Sent folder. The

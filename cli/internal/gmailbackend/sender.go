@@ -78,6 +78,9 @@ func (s *Sender) Send(ctx context.Context, m *mailsend.Message) error {
 	return nil
 }
 
+// SavesSentCopy reports that Gmail stores sent mail server-side.
+func (s *Sender) SavesSentCopy() bool { return true }
+
 // sentMessageID reads the RFC822 Message-Id header of the just-sent message.
 func (s *Sender) sentMessageID(ctx context.Context, gmailID string) string {
 	if gmailID == "" {

@@ -55,9 +55,11 @@ type Attachment struct {
 	Data     []byte
 }
 
-// Sender delivers a Message via one provider.
+// Sender delivers a Message via one provider and reports whether that transport
+// stores the submitted message in Sent itself.
 type Sender interface {
 	Send(ctx context.Context, msg *Message) error
+	SavesSentCopy() bool
 }
 
 // Kind classifies a send failure so the outbox's retry/poison policy stays

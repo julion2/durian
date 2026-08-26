@@ -188,16 +188,20 @@ func (w *OutboxWorker) processQueue() {
 			return // queue empty
 		}
 
-		w.sendItem(item)
+		if !w.sendItem(item) {
+			return
+		}
 	}
 }
 
-func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
+// sendItem returns false when queue processing must stop because a failed send
+// could not be moved out of the ready queue safely.
+func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 	var draft OutboxDraft
 	if err := json.Unmarshal([]byte(item.DraftJSON), &draft); err != nil {
 		slog.Error("Failed to unmarshal draft", "module", "OUTBOX", "id", item.ID, "err", err) // encgrep:allow word "draft" in message text, no draft value logged
 		w.store.MarkAttempted(item.ID, sanitizeOutboxError(err))
-		return
+		return true
 	}
 
 	// Look up account config by sender email
@@ -207,7 +211,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 		slog.Error(errMsg, "module", "OUTBOX", "id", item.ID)
 		w.store.PoisonOutboxItem(item.ID, errMsg)
 		w.broadcastStatus(item.ID, "failed", errMsg, draft.Subject, strings.Join(draft.To, ", "))
-		return
+		return true
 	}
 
 	// Build the provider-neutral outgoing message. The Message-ID is fixed here
@@ -239,7 +243,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 			// Drop the filename from the SSE broadcast too — it's
 			// user-supplied content that may carry sensitive metadata.
 			w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
-			return
+			return true
 		}
 		msg.Attachments = append(msg.Attachments, mailsend.Attachment{
 			Filename: att.Filename,
@@ -257,7 +261,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 		slog.Error("Sender setup failed for outbox item", "module", "OUTBOX", "id", item.ID, "err", safeMsg)
 		w.store.MarkAttempted(item.ID, safeMsg)
 		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
-		return
+		return true
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -275,8 +279,9 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 			slog.Warn("Network error, will retry later", "module", "OUTBOX", "id", item.ID, "err", err)
 			if deferErr := w.store.DeferOutboxItem(item.ID, time.Now().Add(30*time.Second).Unix(), safeMsg); deferErr != nil {
 				slog.Error("Failed to defer outbox item", "module", "OUTBOX", "id", item.ID, "err", deferErr)
+				return false
 			}
-			return
+			return true
 		case mailsend.KindPermanent:
 			slog.Error("Send failed permanently", "module", "OUTBOX", "id", item.ID, "err", err)
 			w.store.PoisonOutboxItem(item.ID, safeMsg)
@@ -285,7 +290,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 			w.store.MarkAttempted(item.ID, safeMsg)
 		}
 		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
-		return
+		return true
 	}
 
 	// Success — delete from outbox
@@ -298,7 +303,8 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) {
 	w.broadcastStatus(item.ID, "sent", "", draft.Subject, strings.Join(draft.To, ", "))
 
 	// Append to IMAP Sent folder (best-effort; providers that auto-save skip it).
-	w.appendToSent(account, msg)
+	w.appendToSent(account, msg, mailSender.SavesSentCopy())
+	return true
 }
 
 // findAccount looks up the account config matching the sender email or display name format.
@@ -367,8 +373,8 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mail
 }
 
 // appendToSent saves a copy to the IMAP Sent folder (skip for providers that auto-save).
-func (w *OutboxWorker) appendToSent(account *config.AccountConfig, msg *mailsend.Message) {
-	if account.UsesGraphBackend() || account.UsesGmailBackend() || account.UsesJMAPBackend() {
+func (w *OutboxWorker) appendToSent(account *config.AccountConfig, msg *mailsend.Message, savedServerSide bool) {
+	if savedServerSide {
 		slog.Debug("Skipping Sent append for native provider", "module", "OUTBOX", "engine", account.EffectiveSyncEngine()) // encgrep:allow engine name is static configuration, not message content
 		return
 	}

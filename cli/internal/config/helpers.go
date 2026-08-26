@@ -379,12 +379,11 @@ func (c *Config) GetGraphAccounts() []*AccountConfig {
 }
 
 // GetEngineAccounts returns accounts driven by the provider-neutral background
-// watcher in durian serve. Gmail is excluded: its API engine remains on-demand
-// and is triggered periodically by the GUI rather than by this daemon watcher.
+// watcher in durian serve.
 func (c *Config) GetEngineAccounts() []*AccountConfig {
 	var accounts []*AccountConfig
 	for i := range c.Accounts {
-		if c.Accounts[i].UsesSyncEngine() && !c.Accounts[i].UsesGmailBackend() {
+		if c.Accounts[i].UsesSyncEngine() {
 			accounts = append(accounts, &c.Accounts[i])
 		}
 	}

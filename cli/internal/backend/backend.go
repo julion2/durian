@@ -123,7 +123,8 @@ type FetchResult struct {
 	// FullSnapshot reports that this page is part of a complete replacement
 	// snapshot. Present contains every remote ref that existed in this page of
 	// that snapshot. Once the final page is processed, the engine removes local
-	// refs that were not present in any page. Delta-capable backends use this to
+	// refs that were not present in any page. Every page in one fetch sequence
+	// must use the same FullSnapshot value. Delta-capable backends use this to
 	// recover safely when a server can no longer calculate changes from a cursor.
 	FullSnapshot bool
 	Present      []RemoteRef
@@ -132,12 +133,6 @@ type FetchResult struct {
 // Capabilities describes backend-specific behavior the sync engine adapts to,
 // so provider quirks stay out of the engine's control flow.
 type Capabilities struct {
-	// ServerSideSent reports the provider auto-saves sent mail (Gmail, M365, JMAP),
-	// so Durian must not append its own Sent copy.
-	ServerSideSent bool
-	// NativeMove reports a true atomic move (Graph) rather than the IMAP
-	// copy + \Deleted + expunge dance.
-	NativeMove bool
 	// PushWatch reports real push/delta notifications rather than poll-only.
 	PushWatch bool
 	// FlagChangesInDelta reports that FetchMessages already surfaces server-side
@@ -196,6 +191,8 @@ type Backend interface {
 	Send(ctx context.Context, msg []byte) error
 
 	// Watch blocks and invokes onChange whenever folder changes, until ctx is done.
+	// An empty folder requests an account-wide watch; implementations that only
+	// support per-folder push should watch INBOX in that case.
 	Watch(ctx context.Context, folder string, onChange func()) error
 
 	// Capabilities describes optional behaviors the sync engine should adapt to.
@@ -222,4 +219,16 @@ type LabelWriter interface {
 	// to the deterministic (local tags ∩ LabelTags) set itself, so ApplyLabels
 	// returns only an error.
 	ApplyLabels(ctx context.Context, ref RemoteRef, add, remove []string) error
+}
+
+// SnapshotHydrator is implemented by metadata-first backends. A replacement
+// snapshot can list every remote ref cheaply; the engine then asks for full
+// messages only for refs that are not already in the local read model before it
+// advances the replacement cursor.
+type SnapshotHydrator interface {
+	// FetchSnapshotMetadata returns current flags and labels for locally existing
+	// refs without downloading their RFC 5322 bodies.
+	FetchSnapshotMetadata(ctx context.Context, refs []RemoteRef) ([]Message, error)
+	// FetchSnapshotMessages returns complete messages for locally absent refs.
+	FetchSnapshotMessages(ctx context.Context, refs []RemoteRef) ([]Message, error)
 }

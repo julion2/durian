@@ -375,7 +375,8 @@ type IMAPConfig struct {
 }
 
 // JMAPConfig contains the JMAP session endpoint and authentication mode. The
-// credential itself is stored in the OS keychain under the account email.
+// credential itself is stored in the JMAP-specific OS keychain service under
+// the account email.
 type JMAPConfig struct {
 	SessionURL string `pkl:"session_url" json:"session_url"`
 	Auth       string `pkl:"auth" json:"auth"` // "password" or "bearer"

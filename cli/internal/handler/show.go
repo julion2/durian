@@ -259,7 +259,7 @@ func (h *Handler) fetchAttachmentViaBackend(ctx context.Context, msg *store.Mess
 	}
 	b, err := newMailBackend(account)
 	if err != nil {
-		return nil, "", err
+		return nil, "", fmt.Errorf("create backend: %w", err)
 	}
 	defer b.Close()
 	var buf bytes.Buffer

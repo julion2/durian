@@ -29,5 +29,6 @@ func For(account *config.AccountConfig) (mailsend.Sender, error) {
 	if err != nil {
 		return nil, err
 	}
-	return smtp.NewSender(account.SMTP.Host, account.SMTP.Port, smtpAuth), nil
+	savesSentCopy := account.OAuth != nil && (account.OAuth.Provider == "google" || account.OAuth.Provider == "microsoft")
+	return smtp.NewSender(account.SMTP.Host, account.SMTP.Port, smtpAuth, savesSentCopy), nil
 }

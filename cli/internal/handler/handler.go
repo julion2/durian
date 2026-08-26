@@ -26,6 +26,18 @@ type SyncTrigger interface {
 	TriggerSync(account string)
 }
 
+// SyncTriggerGroup fans one mutation notification out to legacy and engine
+// watchers; each implementation ignores accounts it does not own.
+type SyncTriggerGroup []SyncTrigger
+
+func (g SyncTriggerGroup) TriggerSync(account string) {
+	for _, trigger := range g {
+		if trigger != nil {
+			trigger.TriggerSync(account)
+		}
+	}
+}
+
 // Handler processes commands and returns responses
 type Handler struct {
 	store          *store.DB // SQLite store (primary read backend)
