@@ -23,7 +23,7 @@ var parser = durianmail.NewParser()
 // constraint of touching no existing files). Keep the two lists in sync until
 // the legacy syncer is retired.
 var builtinIndexedHeaders = []string{
-	"List-Id", "List-Unsubscribe", "Precedence",
+	"Reply-To", "List-Id", "List-Unsubscribe", "Precedence",
 	"X-Mailer", "Return-Path", "X-GitHub-Reason",
 	"Authentication-Results",
 }
@@ -222,9 +222,18 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		return "", false, fmt.Errorf("insert message: %w", err)
 	}
 
+	// Store selected headers before the label-backend fast path. This also lets
+	// an existing Gmail/JMAP row acquire newly indexed headers such as Reply-To
+	// on its next re-delivery without forcing body/attachment re-processing.
+	for _, hdrName := range opts.headerSet() {
+		if v := parsed.Header.Get(hdrName); v != "" {
+			_ = db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v)
+		}
+	}
+
 	// Fast path for a message already in the store on a label backend (the
 	// common case of a legacy->engine migration re-ingesting the whole mailbox):
-	// its attachments, headers and filter-rule tags were applied on first ingest
+	// its attachments and filter-rule tags were applied on first ingest
 	// and its content is unchanged, so only the labels need re-mirroring. Skip
 	// the heavy re-processing — that is what makes the transition sync fast.
 	if !created && opts.LabelsAsTags {
@@ -251,14 +260,6 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 			ContentID:   att.ContentID,
 		}); err != nil {
 			return "", false, fmt.Errorf("insert attachment %d: %w", i, err)
-		}
-	}
-
-	// Store selected headers for rule matching and analysis (builtin set plus
-	// user-added entries from config.pkl sync.indexed_headers).
-	for _, hdrName := range opts.headerSet() {
-		if v := parsed.Header.Get(hdrName); v != "" {
-			_ = db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v)
 		}
 	}
 

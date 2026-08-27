@@ -23,7 +23,7 @@ import (
 // Provider-specific additions like X-GitLab-NotificationReason,
 // X-Spam-Status, etc. belong in the user's indexed_headers config.
 var builtinSelectedHeaders = []string{
-	"List-Id", "List-Unsubscribe", "Precedence",
+	"Reply-To", "List-Id", "List-Unsubscribe", "Precedence",
 	"X-Mailer", "Return-Path", "X-GitHub-Reason",
 	"Authentication-Results",
 }

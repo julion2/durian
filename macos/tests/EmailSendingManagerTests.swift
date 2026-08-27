@@ -3,6 +3,12 @@ import XCTest
 
 final class EmailSendingManagerTests: XCTestCase {
 
+    func testReactionPaletteMatchesServerAllowlistAndHasAccessibleLabels() {
+        XCTAssertEqual(EmailSendingManager.reactionOptions.map(\.emoji), ["👍", "❤️", "😂", "😮", "😢"])
+        XCTAssertTrue(EmailSendingManager.reactionOptions.allSatisfy { !$0.label.isEmpty })
+        XCTAssertEqual(Set(EmailSendingManager.reactionOptions.map(\.id)).count, EmailSendingManager.reactionOptions.count)
+    }
+
     // MARK: - stripStyleTags
 
     func testStripsSingleStyleBlock() {

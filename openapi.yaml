@@ -348,6 +348,30 @@ paths:
                     description: Unix timestamp after which the worker may send the email (0 = immediate)
         '400':
           description: Invalid request (missing fields)
+  /messages/{message_id}/reactions:
+    post:
+      summary: Enqueue an account-scoped RFC 9078 emoji reply
+      parameters:
+        - name: message_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReactionRequest'
+      responses:
+        '200':
+          description: Reaction enqueued with the server-defined Undo Send delay
+        '400':
+          description: Invalid account, emoji, recipient, or threading headers
+        '404':
+          description: Message not found in the requested account
+        '409':
+          description: The same reaction is already pending
   /outbox:
     get:
       summary: List all outbox items
@@ -802,6 +826,8 @@ components:
       properties:
         id:
           type: string
+        account:
+          type: string
         from:
           type: string
         to:
@@ -898,6 +924,17 @@ components:
         - to
         - subject
         - body
+    ReactionRequest:
+      type: object
+      properties:
+        account:
+          type: string
+        emoji:
+          type: string
+          enum: [👍, ❤️, 😂, 😮, 😢]
+      required:
+        - account
+        - emoji
     OutboxAttachment:
       type: object
       properties:
@@ -944,6 +981,9 @@ components:
           type: string
         to:
           type: string
+        kind:
+          type: string
+          enum: [reaction]
     LocalDraft:
       type: object
       properties:

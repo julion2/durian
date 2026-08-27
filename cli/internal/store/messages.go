@@ -306,6 +306,27 @@ func (d *DB) GetByMessageID(messageID string) (*Message, error) {
 	return msg, nil
 }
 
+// GetByMessageIDAndAccount retrieves the exact account-scoped message row.
+func (d *DB) GetByMessageIDAndAccount(messageID, account string) (*Message, error) {
+	var accountID int64
+	if err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID); err == sql.ErrNoRows {
+		return nil, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("lookup account: %w", err)
+	}
+	row := d.db.QueryRow(`SELECT `+messageSelectColumns+`
+		`+messageSelectFrom+`
+		WHERE m.message_id = ? AND m.account_id = ? LIMIT 1`, messageID, accountID)
+	msg, err := d.scanMessageRow(row.Scan)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get by message_id and account: %w", err)
+	}
+	return msg, nil
+}
+
 // GetByThread retrieves all messages in a thread, ordered by date ascending.
 // When a message exists in multiple accounts, only the first row is kept.
 func (d *DB) GetByThread(threadID string) ([]*Message, error) {

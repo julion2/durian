@@ -45,9 +45,13 @@ type gmailSendResponse struct {
 // threads the reply from the In-Reply-To / References headers the MIME already
 // carries, delivers Bcc recipients (see below), and auto-saves a Sent copy.
 func (s *Sender) Send(ctx context.Context, m *mailsend.Message) error {
-	mime, err := smtp.FromMessage(m).Build()
-	if err != nil {
-		return &mailsend.Error{Kind: mailsend.KindPermanent, Err: fmt.Errorf("build message: %w", err)}
+	raw := m.RawMIME
+	if len(raw) == 0 {
+		var err error
+		raw, err = smtp.FromMessage(m).Build()
+		if err != nil {
+			return &mailsend.Error{Kind: mailsend.KindPermanent, Err: fmt.Errorf("build message: %w", err)}
+		}
 	}
 	// Build() omits Bcc (SMTP delivers it via the envelope, not the DATA). Gmail's
 	// raw send instead reads a Bcc header, delivers to it, and strips it from the
@@ -60,10 +64,10 @@ func (s *Sender) Send(ctx context.Context, m *mailsend.Message) error {
 				return &mailsend.Error{Kind: mailsend.KindPermanent, Err: fmt.Errorf("invalid Bcc %q: contains CR or LF", addr)}
 			}
 		}
-		mime = append([]byte("Bcc: "+strings.Join(m.BCC, ", ")+"\r\n"), mime...)
+		raw = append([]byte("Bcc: "+strings.Join(m.BCC, ", ")+"\r\n"), raw...)
 	}
 
-	body := map[string]string{"raw": base64.URLEncoding.EncodeToString(mime)}
+	body := map[string]string{"raw": base64.URLEncoding.EncodeToString(raw)}
 	var sent gmailSendResponse
 	if err := s.b.doJSON(ctx, http.MethodPost, s.b.baseURL+"/users/me/messages/send", body, &sent); err != nil {
 		return classifyGmailSendError(err)

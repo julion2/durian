@@ -193,6 +193,7 @@ func runServe(cmd *cobra.Command, args []string) {
 
 	// Outbox routes
 	r.HandleFunc("/api/v1/outbox/send", h.EnqueueOutboxHandler).Methods("POST")
+	r.HandleFunc("/api/v1/messages/{message_id}/reactions", h.EnqueueReactionHandler).Methods("POST")
 	r.HandleFunc("/api/v1/outbox", h.ListOutboxHandler).Methods("GET")
 	r.HandleFunc("/api/v1/outbox/{id}", h.DeleteOutboxHandler).Methods("DELETE")
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/mail"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,9 @@ import (
 
 // OutboxDraft is the JSON payload for enqueuing an email to the outbox.
 type OutboxDraft struct {
+	Kind         string             `json:"kind,omitempty"`
+	Account      string             `json:"account,omitempty"`
+	TargetID     string             `json:"target_message_id,omitempty"`
 	From         string             `json:"from"`
 	To           []string           `json:"to"`
 	CC           []string           `json:"cc"`
@@ -36,6 +40,16 @@ type OutboxDraft struct {
 	References   string             `json:"references"`
 	Attachments  []OutboxAttachment `json:"attachments"`
 	DelaySeconds int                `json:"delay_seconds"`
+}
+
+const (
+	outboxKindReaction = "reaction"
+	reactionSendDelay  = 10
+)
+
+type reactionRequest struct {
+	Account string `json:"account"`
+	Emoji   string `json:"emoji"`
 }
 
 // OutboxAttachment represents a base64-encoded attachment in the outbox payload.
@@ -85,6 +99,102 @@ func (h *Handler) EnqueueOutboxHandler(w http.ResponseWriter, r *http.Request) {
 
 	// ADR-0001 §6 redaction: do not log recipient list, subject or body content.
 	slog.Info("Enqueued outbox item", "module", "OUTBOX", "id", id, "recipient_count", len(draft.To), "is_html", draft.IsHTML, "body_len", len(draft.Body), "send_after", sendAfter) // encgrep:allow body_len + draft.To are length/count, not content
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id, "send_after": sendAfter})
+}
+
+// EnqueueReactionHandler handles POST /api/v1/messages/{message_id}/reactions.
+// The client supplies only target account and emoji; all mail fields are
+// derived from the exact stored message row.
+func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var request reactionRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if h.cfg == nil {
+		http.Error(w, "Mail configuration unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !mailsend.IsReactionEmoji(request.Emoji) {
+		http.Error(w, "Unsupported reaction emoji", http.StatusBadRequest)
+		return
+	}
+	account, err := h.cfg.GetAccountByIdentifier(request.Account)
+	if err != nil {
+		http.Error(w, "Unknown account", http.StatusBadRequest)
+		return
+	}
+	targetID := strings.Trim(mux.Vars(r)["message_id"], "<>")
+	target, err := h.store.GetByMessageIDAndAccount(targetID, account.AccountIdentifier())
+	if err != nil {
+		http.Error(w, "Failed to resolve target message", http.StatusInternalServerError)
+		return
+	}
+	if target == nil {
+		http.Error(w, "Message not found for account", http.StatusNotFound)
+		return
+	}
+
+	recipient := target.FromAddr
+	if replyTo, err := h.store.GetHeader(target.ID, "reply-to"); err != nil {
+		http.Error(w, "Failed to resolve Reply-To", http.StatusInternalServerError)
+		return
+	} else if strings.TrimSpace(replyTo) != "" {
+		recipient = replyTo
+	}
+	parsedRecipients, err := mail.ParseAddressList(recipient)
+	if err != nil || len(parsedRecipients) != 1 {
+		http.Error(w, "Message has no single valid reply recipient", http.StatusBadRequest)
+		return
+	}
+	recipient = parsedRecipients[0].String()
+
+	references, err := mailsend.ReactionReferences(target.Refs, target.MessageID)
+	if err != nil {
+		http.Error(w, "Message has invalid threading headers", http.StatusBadRequest)
+		return
+	}
+	draft := OutboxDraft{
+		Kind:       outboxKindReaction,
+		Account:    account.AccountIdentifier(),
+		TargetID:   target.MessageID,
+		From:       account.Email,
+		To:         []string{recipient},
+		Subject:    mailsend.ReplySubject(target.Subject),
+		Body:       request.Emoji,
+		InReplyTo:  target.MessageID,
+		References: references,
+	}
+
+	items, err := h.store.ListOutbox()
+	if err != nil {
+		http.Error(w, "Failed to inspect outbox", http.StatusInternalServerError)
+		return
+	}
+	for _, item := range items {
+		var pending OutboxDraft
+		if json.Unmarshal([]byte(item.DraftJSON), &pending) == nil &&
+			pending.Kind == outboxKindReaction && pending.Account == draft.Account &&
+			pending.TargetID == draft.TargetID && pending.Body == draft.Body {
+			http.Error(w, "Reaction is already pending", http.StatusConflict)
+			return
+		}
+	}
+
+	draftJSON, err := json.Marshal(draft)
+	if err != nil {
+		http.Error(w, "Failed to encode reaction", http.StatusInternalServerError)
+		return
+	}
+	sendAfter := time.Now().Unix() + reactionSendDelay
+	id, err := h.store.Enqueue(string(draftJSON), sendAfter)
+	if err != nil {
+		http.Error(w, "Failed to enqueue reaction", http.StatusInternalServerError)
+		return
+	}
+	slog.Info("Enqueued reaction", "module", "OUTBOX", "id", id, "account", draft.Account, "send_after", sendAfter)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id, "send_after": sendAfter})
 }
@@ -204,13 +314,19 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 		return true
 	}
 
-	// Look up account config by sender email
-	account := w.findAccount(draft.From)
+	// Reactions carry the exact target account; legacy compose payloads keep
+	// resolving by sender address for backward compatibility.
+	var account *config.AccountConfig
+	if draft.Kind == outboxKindReaction {
+		account, _ = w.cfg.GetAccountByIdentifier(draft.Account)
+	} else {
+		account = w.findAccount(draft.From)
+	}
 	if account == nil {
 		errMsg := fmt.Sprintf("no account found for sender: %s", draft.From)
 		slog.Error(errMsg, "module", "OUTBOX", "id", item.ID)
 		w.store.PoisonOutboxItem(item.ID, errMsg)
-		w.broadcastStatus(item.ID, "failed", errMsg, draft.Subject, strings.Join(draft.To, ", "))
+		w.broadcastStatus(item.ID, "failed", errMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 		return true
 	}
 
@@ -232,6 +348,16 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 		InReplyTo:  draft.InReplyTo,
 		References: draft.References,
 	}
+	if draft.Kind == outboxKindReaction {
+		var err error
+		msg.RawMIME, err = mailsend.BuildReaction(msg, time.Now())
+		if err != nil {
+			safeMsg := sanitizeOutboxError(err)
+			w.store.PoisonOutboxItem(item.ID, safeMsg)
+			w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
+			return true
+		}
+	}
 
 	// Decode base64 attachments
 	for _, att := range draft.Attachments {
@@ -242,7 +368,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 			w.store.MarkAttempted(item.ID, safeMsg)
 			// Drop the filename from the SSE broadcast too — it's
 			// user-supplied content that may carry sensitive metadata.
-			w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
+			w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 			return true
 		}
 		msg.Attachments = append(msg.Attachments, mailsend.Attachment{
@@ -260,7 +386,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 		safeMsg := "auth: " + sanitizeOutboxError(err)
 		slog.Error("Sender setup failed for outbox item", "module", "OUTBOX", "id", item.ID, "err", safeMsg)
 		w.store.MarkAttempted(item.ID, safeMsg)
-		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
+		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 		return true
 	}
 
@@ -289,7 +415,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 			slog.Error("Send failed", "module", "OUTBOX", "id", item.ID, "err", err)
 			w.store.MarkAttempted(item.ID, safeMsg)
 		}
-		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
+		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 		return true
 	}
 
@@ -300,7 +426,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 	// Save to local store so the Sent view shows the mail immediately.
 	w.saveToLocalStore(account, msg, &draft)
 
-	w.broadcastStatus(item.ID, "sent", "", draft.Subject, strings.Join(draft.To, ", "))
+	w.broadcastStatus(item.ID, "sent", "", draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 
 	// Append to IMAP Sent folder (best-effort; providers that auto-save skip it).
 	w.appendToSent(account, msg, mailSender.SavesSentCopy())
@@ -413,7 +539,7 @@ func (w *OutboxWorker) appendToSent(account *config.AccountConfig, msg *mailsend
 }
 
 // broadcastStatus sends an outbox_update SSE event.
-func (w *OutboxWorker) broadcastStatus(itemID int64, status, errMsg, subject, to string) {
+func (w *OutboxWorker) broadcastStatus(itemID int64, status, errMsg, subject, to, kind string) {
 	if w.eventHub == nil {
 		return
 	}
@@ -423,5 +549,6 @@ func (w *OutboxWorker) broadcastStatus(itemID int64, status, errMsg, subject, to
 		Error:   errMsg,
 		Subject: subject,
 		To:      to,
+		Kind:    kind,
 	})
 }

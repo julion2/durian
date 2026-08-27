@@ -28,6 +28,10 @@ type Message struct {
 	InReplyTo   string // Message-ID of the message being replied to
 	References  string // Space-separated list of Message-IDs in the thread
 	Attachments []Attachment
+	// RawMIME bypasses the normal composer when a caller has already built the
+	// exact wire message (RFC 9078 reactions). Envelope fields still come from
+	// From/To/CC/BCC.
+	RawMIME []byte
 	// GeneratedMessageID is populated by Build() on first call and reused on
 	// subsequent calls so that SMTP send and IMAP append share the same ID.
 	GeneratedMessageID string
@@ -62,6 +66,9 @@ func LoadAttachment(path string) (*Attachment, error) {
 
 // Build constructs the RFC 5322 compliant email message
 func (m *Message) Build() ([]byte, error) {
+	if len(m.RawMIME) > 0 {
+		return append([]byte(nil), m.RawMIME...), nil
+	}
 	var buf bytes.Buffer
 
 	// Generate Message-ID using sender's domain (reuse on subsequent calls)

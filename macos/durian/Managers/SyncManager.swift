@@ -518,11 +518,15 @@ class SyncManager: ObservableObject {
         case "sent":
             // If undo countdown is still active for this item, let it handle cleanup
             // instead of showing a duplicate "Sent" banner.
-            if EmailSendingManager.shared.isUndoActive(itemId: event.item_id) {
-                EmailSendingManager.shared.handleSentEvent(itemId: event.item_id)
-            } else {
-                let subject = event.subject ?? "Email"
-                BannerManager.shared.showSuccess(title: "Sent Successfully", message: "\(subject) has been delivered.")
+            let undoWasActive = EmailSendingManager.shared.isUndoActive(itemId: event.item_id)
+            EmailSendingManager.shared.handleSentEvent(itemId: event.item_id)
+            if !undoWasActive {
+                if event.kind == "reaction" {
+                    BannerManager.shared.showSuccess(title: "Reaction Sent", message: "Your emoji reply has been delivered.")
+                } else {
+                    let subject = event.subject ?? "Email"
+                    BannerManager.shared.showSuccess(title: "Sent Successfully", message: "\(subject) has been delivered.")
+                }
             }
             // Refresh email list so Sent folder shows the new message
             Task {
@@ -530,9 +534,14 @@ class SyncManager: ObservableObject {
                 await AccountManager.shared.refreshFolderCounts()
             }
         case "failed":
+            EmailSendingManager.shared.handleFailedEvent(itemId: event.item_id)
             let detail = event.error ?? "Unknown error"
-            let subject = event.subject ?? "Email"
-            BannerManager.shared.showWarning(title: "\(subject) Not Sent", message: detail)
+            if event.kind == "reaction" {
+                BannerManager.shared.showWarning(title: "Reaction Not Sent", message: detail)
+            } else {
+                let subject = event.subject ?? "Email"
+                BannerManager.shared.showWarning(title: "\(subject) Not Sent", message: detail)
+            }
         default:
             break
         }

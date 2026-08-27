@@ -66,6 +66,29 @@ func TestSenderSendsRawWithBccAndAdoptsID(t *testing.T) {
 	}
 }
 
+func TestSenderPreservesCanonicalRawMIME(t *testing.T) {
+	want := []byte("From: me@example.com\r\nTo: you@example.com\r\nContent-Disposition: reaction\r\n\r\nemoji\r\n")
+	var got []byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("/users/me/messages/send", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Raw string `json:"raw"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		got, _ = base64.URLEncoding.DecodeString(body.Raw)
+		writeJSON(t, w, map[string]string{"id": "sent1"})
+	})
+	mux.HandleFunc("/users/me/messages/sent1", func(w http.ResponseWriter, _ *http.Request) { writeJSON(t, w, map[string]any{}) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	if err := (&Sender{b: newTestBackend(t, srv)}).Send(t.Context(), &mailsend.Message{RawMIME: want}); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("raw MIME changed:\n got %q\nwant %q", got, want)
+	}
+}
+
 func TestClassifyGmailSendError(t *testing.T) {
 	cases := []struct {
 		status int
