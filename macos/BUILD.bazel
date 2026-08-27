@@ -258,7 +258,10 @@ macos_application(
     entitlements = "durian/Durian.entitlements",
     infoplists = [":StampedInfoPlist"],
     minimum_os_version = "26.0",
-    resources = ["//schema:pkl_schemas"] + select({
+    resources = [
+        "//:LICENSE",
+        "//schema:pkl_schemas",
+    ] + select({
         ":ci": glob(["durian/CompiledIcons/release/**"]),
         "//conditions:default": [],
     }),
