@@ -90,6 +90,7 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 			Date:      time.Unix(msg.Date, 0).Format(time.RFC1123Z),
 			Timestamp: msg.Date,
 			MessageID: msg.MessageID,
+			Account:   msg.Account,
 			Body:      sanitize.StripQuotedTextContent(msg.BodyText),
 		}
 		if !light {
