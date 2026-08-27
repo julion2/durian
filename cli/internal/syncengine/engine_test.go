@@ -3,9 +3,11 @@ package syncengine
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -1264,7 +1266,7 @@ func TestEngineSyncIngests(t *testing.T) {
 				MessageID: "seen-msg@example.com",
 				Ref:       backend.RemoteRef{Folder: "Archive", ID: "201"},
 				Raw:       rawMessage("seen-msg@example.com", "bob@example.com", testAccount, "Old news", "archived body"),
-				Flags:     backend.Flags{Seen: true},
+				Flags:     backend.Flags{Seen: true, Flagged: true},
 			}},
 			Cursor: backend.Cursor("archive-c1"),
 		}},
@@ -1334,6 +1336,12 @@ func TestEngineSyncIngests(t *testing.T) {
 	}
 	if slices.Contains(archTags, "unread") {
 		t.Errorf("archive msg tags = %v, must not contain %q (Seen=true)", archTags, "unread")
+	}
+	if !slices.Contains(archTags, "flagged") {
+		t.Errorf("archive msg tags = %v, want to contain %q", archTags, "flagged")
+	}
+	if got := strings.Fields(archMsg.Flags); !slices.Contains(got, `\Seen`) || !slices.Contains(got, `\Flagged`) {
+		t.Errorf("archive msg flags = %q, want Seen and Flagged to round-trip", archMsg.Flags)
 	}
 
 	// Cursors persisted per folder.
@@ -1801,16 +1809,68 @@ func TestEngineLabelsAsTags(t *testing.T) {
 }
 
 func TestEngineSeedsMigratedFlagBaseline(t *testing.T) {
-	db := newTestDB(t)
-	// A legacy-migrated read message: is_seen=true (via the \Seen flag) but no
-	// synced_flags baseline yet — the shape that made the whole mailbox a false
-	// flag-fetch candidate.
+	dbPath := filepath.Join(t.TempDir(), "v25-flags.db")
+	kr, err := dbcrypto.NewKeyring(bytes.Repeat([]byte{0x42}, dbcrypto.MasterKeyLen))
+	if err != nil {
+		t.Fatalf("test keyring: %v", err)
+	}
+	db, err := store.Open(dbPath, kr)
+	if err != nil {
+		t.Fatalf("open seed: %v", err)
+	}
+	if err := db.Init(); err != nil {
+		t.Fatalf("init seed: %v", err)
+	}
 	if err := db.InsertMessage(&store.Message{
 		MessageID: "mig@example.com", Subject: "x", Date: 1, CreatedAt: 1,
 		Mailbox: "ALL", Account: testAccount, RemoteRef: "r1",
-		Flags: `\Seen`, SyncedFlags: "", FetchedBody: true,
+		SyncedFlags: "", FetchedBody: true,
 	}); err != nil {
 		t.Fatalf("insert: %v", err)
+	}
+	if err := db.ModifyTagsByMessageIDAndAccount("mig@example.com", testAccount, []string{"flagged"}, nil); err != nil {
+		t.Fatalf("seed flag-derived tag: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close seed: %v", err)
+	}
+
+	// Reproduce the exact v25 corruption from the old insert path: the standard
+	// flags remained comma-joined inside encrypted flags_other while both
+	// boolean columns and synced_flags stayed false/empty.
+	legacyCT, err := kr.EncryptMeta([]byte(`\Seen,\Flagged`))
+	if err != nil {
+		t.Fatalf("encrypt legacy flags: %v", err)
+	}
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw v25 db: %v", err)
+	}
+	if _, err := rawDB.Exec(`UPDATE messages SET is_seen = 0, is_flagged = 0,
+		is_deleted = 0, flags_other = ? WHERE message_id = 'mig@example.com'`, legacyCT); err != nil {
+		t.Fatalf("write old on-disk row: %v", err)
+	}
+	if _, err := rawDB.Exec("UPDATE schema_version SET version = 25 WHERE rowid = 1"); err != nil {
+		t.Fatalf("set v25: %v", err)
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close raw v25 db: %v", err)
+	}
+
+	db, err = store.Open(dbPath, kr)
+	if err != nil {
+		t.Fatalf("reopen v25 db: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.Init(); err != nil {
+		t.Fatalf("migrate v25 db: %v", err)
+	}
+	migrated, err := db.GetByMessageID("mig@example.com")
+	if err != nil {
+		t.Fatalf("get migrated message: %v", err)
+	}
+	if got, want := migrated.Flags, `\Seen \Flagged`; got != want {
+		t.Fatalf("migrated flags = %q, want %q", got, want)
 	}
 
 	folders := []backend.Folder{{Name: "ALL", Role: backend.RoleInbox, Selectable: true}}
@@ -1822,7 +1882,7 @@ func TestEngineSeedsMigratedFlagBaseline(t *testing.T) {
 		t.Fatalf("sync: %v", err)
 	}
 
-	// The read message must be seeded, not fetched: no FetchFlags request for it.
+	// The read+flagged message must be seeded, not fetched.
 	for _, c := range fake.fetchFlagsCalls {
 		for _, r := range c.refs {
 			if r.ID == "r1" {
@@ -1831,10 +1891,17 @@ func TestEngineSeedsMigratedFlagBaseline(t *testing.T) {
 		}
 	}
 	// Its baseline is now the stored server flag state.
+	found := false
 	for _, r := range mustFlagRows(t, db) {
-		if r.MessageID == "mig@example.com" && r.SyncedFlags != `\Seen` {
-			t.Errorf("synced_flags = %q, want \\Seen (seeded from the server flags)", r.SyncedFlags)
+		if r.MessageID == "mig@example.com" {
+			found = true
+			if r.SyncedFlags != `\Seen,\Flagged` {
+				t.Errorf("synced_flags = %q, want \\Seen,\\Flagged (seeded from migrated flags)", r.SyncedFlags)
+			}
 		}
+	}
+	if !found {
+		t.Fatal("migrated message is missing from folder flag state")
 	}
 }
 

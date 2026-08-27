@@ -352,7 +352,7 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mail
 		Refs:        draft.References,
 		Date:        now,
 		CreatedAt:   now,
-		Flags:       "Seen",
+		Flags:       `\Seen`,
 		FetchedBody: true,
 		Account:     account.AccountIdentifier(),
 	}

@@ -1072,6 +1072,91 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 26 {
+		if err := d.migrateLegacyCommaFlags(); err != nil {
+			return fmt.Errorf("migrate v25→v26 repair comma-separated flags: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// migrateLegacyCommaFlags repairs rows written before message inserts parsed
+// comma-separated flag lists, plus the bare "Seen" value formerly written for
+// locally sent messages. Those inserts encrypted the complete value in
+// flags_other and left the boolean columns false. Only the known bare value or
+// ciphertext containing a comma-delimited standard flag is changed; unrelated
+// keywords, including comma-bearing keywords, are left byte-for-byte untouched.
+// Once a standard flag identifies the historical representation, commas are
+// necessarily ambiguous (RFC atoms may contain them), so every non-standard
+// component is retained in order and normalized to the store's space-separated
+// form.
+//
+// The row updates and schema-version bump share one transaction. A decrypt,
+// encrypt, or write failure therefore leaves both the data and version at v25
+// so the next Init can retry the complete migration.
+func (d *DB) migrateLegacyCommaFlags() error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	rows, err := tx.Query(`SELECT id, is_seen, is_flagged, is_deleted, flags_other
+		FROM messages WHERE flags_other IS NOT NULL ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("select rows: %w", err)
+	}
+	type pending struct {
+		id                           int64
+		isSeen, isFlagged, isDeleted bool
+		flagsOther                   []byte
+	}
+	var batch []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.isSeen, &p.isFlagged, &p.isDeleted, &p.flagsOther); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan row: %w", err)
+		}
+		batch = append(batch, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate rows: %w", err)
+	}
+
+	stmt, err := tx.Prepare(`UPDATE messages
+		SET is_seen = ?, is_flagged = ?, is_deleted = ?, flags_other = ?
+		WHERE id = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare update: %w", err)
+	}
+	defer stmt.Close()
+	for _, p := range batch {
+		plain, err := d.decryptMeta("", p.flagsOther)
+		if err != nil {
+			return fmt.Errorf("decrypt id=%d: %w", p.id, err)
+		}
+		seen, flagged, deleted, other, affected := parseLegacyCommaFlags(plain)
+		if !affected {
+			continue
+		}
+		otherCT, err := d.encryptMeta(other)
+		if err != nil {
+			return fmt.Errorf("encrypt id=%d: %w", p.id, err)
+		}
+		if _, err := stmt.Exec(p.isSeen || seen, p.isFlagged || flagged,
+			p.isDeleted || deleted, otherCT, p.id); err != nil {
+			return fmt.Errorf("update id=%d: %w", p.id, err)
+		}
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version = 26 WHERE rowid = 1"); err != nil {
+		return fmt.Errorf("bump version: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
 	return nil
 }
 
@@ -1882,8 +1967,64 @@ func (d *DB) decryptMeta(plain string, ct []byte) (string, error) {
 	return string(out), nil
 }
 
-// flagsOtherForEncryption returns the subset of a space-separated IMAP
-// flags string that ADR-0001 §3 marks for meta_key encryption: everything
+// splitMessageFlags accepts both the comma-separated representation written by
+// the legacy IMAP syncer and the whitespace-separated representation returned
+// by store reads.
+func splitMessageFlags(flags string) []string {
+	fields := strings.Fields(flags)
+	parts := make([]string, 0, len(fields))
+	for _, field := range fields {
+		_, _, _, _, commaSeparated := parseLegacyCommaFlags(field)
+		if !commaSeparated {
+			parts = append(parts, field)
+			continue
+		}
+		for _, part := range strings.Split(field, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				parts = append(parts, part)
+			}
+		}
+	}
+	return parts
+}
+
+// parseLegacyCommaFlags recognizes corrupted flags_other forms produced by old
+// insert paths: the outbox's bare "Seen" value and comma-joined lists. Apart
+// from that known bare value, a standard flag must be present as a complete
+// comma-delimited component before the row is treated as affected, avoiding
+// reinterpretation of unrelated comma-bearing keywords.
+func parseLegacyCommaFlags(flags string) (seen, flagged, deleted bool, other string, affected bool) {
+	if flags == "Seen" {
+		return true, false, false, "", true
+	}
+	if !strings.Contains(flags, ",") {
+		return false, false, false, flags, false
+	}
+	parts := strings.Split(flags, ",")
+	remaining := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		switch part {
+		case `\Seen`:
+			seen, affected = true, true
+		case `\Flagged`:
+			flagged, affected = true, true
+		case `\Deleted`:
+			deleted, affected = true, true
+		default:
+			if part != "" {
+				remaining = append(remaining, part)
+			}
+		}
+	}
+	if !affected {
+		return false, false, false, flags, false
+	}
+	return seen, flagged, deleted, strings.Join(remaining, " "), true
+}
+
+// flagsOtherForEncryption returns the subset of a serialized IMAP flags string
+// that ADR-0001 §3 marks for meta_key encryption: everything
 // except the three boolean-tracked standard flags (\Seen, \Flagged,
 // \Deleted) that already live as O(1) integer columns. The remaining
 // flags include \Answered, \Draft, \Recent, $Sensitive and any
@@ -1892,7 +2033,7 @@ func flagsOtherForEncryption(flags string) string {
 	if flags == "" {
 		return ""
 	}
-	parts := strings.Fields(flags)
+	parts := splitMessageFlags(flags)
 	out := parts[:0]
 	for _, p := range parts {
 		switch p {

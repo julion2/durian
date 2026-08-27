@@ -50,6 +50,44 @@ func TestInsertAndGetMessage(t *testing.T) {
 	}
 }
 
+func TestInsertMessageParsesCommaAndWhitespaceSeparatedFlags(t *testing.T) {
+	tests := []struct {
+		flags string
+		want  string
+	}{
+		{flags: `\Seen,\Flagged,\Answered`, want: `\Seen \Flagged \Answered`},
+		{flags: `\Seen \Flagged \Answered`, want: `\Seen \Flagged \Answered`},
+		{flags: `$Label,X`, want: `$Label,X`},
+		{flags: `\Answered,\Draft`, want: `\Answered,\Draft`},
+		// Once a standard flag identifies a comma-joined legacy list, commas
+		// inside keywords are irreducibly ambiguous and split as components.
+		{flags: `\Seen,$Label,X`, want: `\Seen $Label X`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.flags, func(t *testing.T) {
+			db := newTestDB(t)
+			msg := &Message{
+				MessageID: "flags@example.com",
+				Subject:   "Flags",
+				Date:      time.Now().Unix(),
+				Mailbox:   "INBOX",
+				Account:   "work",
+				Flags:     tc.flags,
+			}
+			if err := db.InsertMessage(msg); err != nil {
+				t.Fatalf("insert: %v", err)
+			}
+			got, err := db.GetByMessageID("flags@example.com")
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			if got.Flags != tc.want {
+				t.Errorf("flags = %q, want %q", got.Flags, tc.want)
+			}
+		})
+	}
+}
+
 func TestSyncedLabelsRoundTrip(t *testing.T) {
 	db := newTestDB(t)
 	now := time.Now().Unix()

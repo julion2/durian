@@ -81,7 +81,7 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 	// ADR-0001 step 7f: split msg.Flags into the three boolean columns
 	// + flags_other (everything else, encrypted under meta_key). Inverse
 	// of flagsFromParts on the read path.
-	parts := strings.Fields(msg.Flags)
+	parts := splitMessageFlags(msg.Flags)
 	var isSeen, isFlagged, isDeleted int
 	for _, p := range parts {
 		switch p {

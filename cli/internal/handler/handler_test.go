@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/dbcrypto"
+	"github.com/julion2/durian/cli/internal/mailsend"
 	"github.com/julion2/durian/cli/internal/protocol"
 	"github.com/julion2/durian/cli/internal/store"
 )
@@ -41,6 +43,23 @@ func newTestStore(t *testing.T) *store.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+func TestOutboxSaveToLocalStoreMarksMessageSeen(t *testing.T) {
+	db := newTestStore(t)
+	worker := NewOutboxWorker(db, nil, nil)
+	account := &config.AccountConfig{Name: "work", Email: "sender@example.com"}
+	worker.saveToLocalStore(account,
+		&mailsend.Message{MessageID: "<sent@example.com>"},
+		&OutboxDraft{To: []string{"recipient@example.com"}, Subject: "Sent"})
+
+	msg, err := db.GetByMessageID("sent@example.com")
+	if err != nil {
+		t.Fatalf("GetByMessageID: %v", err)
+	}
+	if msg == nil || msg.Flags != `\Seen` {
+		t.Fatalf("saved message = %+v, want \\Seen", msg)
+	}
 }
 
 func seedStoreData(t *testing.T, db *store.DB) {
