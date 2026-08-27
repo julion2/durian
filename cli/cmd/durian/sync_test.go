@@ -15,6 +15,15 @@ import (
 	"github.com/julion2/durian/cli/internal/tagsync"
 )
 
+func TestSyncProgressIsDisabledForRedirectedStderr(t *testing.T) {
+	previousQuiet := syncQuiet
+	syncQuiet = false
+	t.Cleanup(func() { syncQuiet = previousQuiet })
+	if shouldShowSyncProgress() {
+		t.Fatal("progress enabled while test stderr is redirected")
+	}
+}
+
 func TestSyncRemoteTagsDryRunDoesNotWrite(t *testing.T) {
 	keyring, err := dbcrypto.NewKeyring(bytes.Repeat([]byte{0x42}, dbcrypto.MasterKeyLen))
 	if err != nil {

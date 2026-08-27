@@ -7,6 +7,15 @@ import (
 	"testing"
 )
 
+func TestNoInputDisablesPrompts(t *testing.T) {
+	previous := noInput
+	noInput = true
+	t.Cleanup(func() { noInput = previous })
+	if canPrompt() {
+		t.Fatal("prompting enabled with --no-input")
+	}
+}
+
 func TestLoadStartupConfigRejectsMissingExplicitPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.pkl")
 	loaded, err := loadStartupConfig(path)
