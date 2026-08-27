@@ -8,6 +8,11 @@ jobs:
   cli:
     name: CLI (Go)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # golangci-lint reads the PR diff through the API to scope itself to
+      # newly written code (see the lint step below).
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
 
@@ -51,6 +56,27 @@ jobs:
             echo "no Bazel files to check"; exit 0
           fi
           "$(go env GOPATH)/bin/buildifier" --mode=check $tracked
+
+      - name: Stage embedded Pkl schemas
+        run: |
+          # config/pkl.go embeds schema/*.pkl from its own package directory,
+          # but the sources live at //schema and Bazel's copy_schemas genrule
+          # stages them at build time (cli/internal/config/BUILD.bazel). Any
+          # tool that type-checks outside Bazel — golangci-lint here — sees a
+          # broken //go:embed without this copy.
+          mkdir -p cli/internal/config/schema
+          cp schema/*.pkl cli/internal/config/schema/
+
+      - name: Lint CLI
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.1
+          working-directory: cli
+          # The gate applies to code this PR writes. The pre-existing
+          # findings are tracked separately and burned down out of band;
+          # scoping to the diff means the gate lands now instead of after
+          # that cleanup.
+          only-new-issues: true
 
       - name: Test CLI
         run: bazel test //cli/... --test_output=errors
@@ -98,7 +124,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/bazel-disk
-          key: bazel-gui-${{ hashFiles('MODULE.bazel', 'gui/BUILD.bazel') }}
+          key: bazel-gui-${{ hashFiles('MODULE.bazel', 'macos/BUILD.bazel') }}
           restore-keys: bazel-gui-
 
       - name: Check SwiftFormat
