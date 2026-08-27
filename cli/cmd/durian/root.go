@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -107,6 +108,12 @@ func loadStartupConfig(path string) (*config.Config, error) {
 // This is useful for subcommands that need access to config
 func GetConfig() *config.Config {
 	return cfg
+}
+
+func writeJSON(value any) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(value)
 }
 
 // initLogger configures the default slog logger.

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -68,7 +67,11 @@ func runTagList(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonOutput {
-		return json.NewEncoder(os.Stdout).Encode(resp)
+		tags := resp.Tags
+		if tags == nil {
+			tags = []string{}
+		}
+		return writeJSON(tags)
 	}
 
 	for _, tag := range resp.Tags {
@@ -113,9 +116,29 @@ func runTag(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonOutput {
-		return json.NewEncoder(os.Stdout).Encode(resp)
+		return writeJSON(struct {
+			MatchedThreads int      `json:"matched_threads"`
+			ChangedThreads int      `json:"changed_threads"`
+			AddedTags      []string `json:"added_tags"`
+			RemovedTags    []string `json:"removed_tags"`
+		}{
+			MatchedThreads: *resp.MatchedThreads,
+			ChangedThreads: *resp.ChangedThreads,
+			AddedTags:      tagsWithPrefix(tags, "+"),
+			RemovedTags:    tagsWithPrefix(tags, "-"),
+		})
 	}
 
 	fmt.Printf("Updated %d of %d matching threads\n", *resp.ChangedThreads, *resp.MatchedThreads)
 	return nil
+}
+
+func tagsWithPrefix(tags []string, prefix string) []string {
+	out := make([]string, 0)
+	for _, tag := range tags {
+		if strings.HasPrefix(tag, prefix) {
+			out = append(out, strings.TrimPrefix(tag, prefix))
+		}
+	}
+	return out
 }
