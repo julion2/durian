@@ -54,6 +54,125 @@ func TestInsertAndGetMessage(t *testing.T) {
 	}
 }
 
+func TestStableIdentityKeepsDuplicateMessageIDsDistinct(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	first := &Message{
+		StableID: "email-1", MessageID: "duplicate@example.com", Subject: "First",
+		Date: now, CreatedAt: now, Mailbox: "ALL", Account: "work", RemoteRef: "email-1",
+	}
+	second := &Message{
+		StableID: "email-2", MessageID: "duplicate@example.com", Subject: "Second",
+		Date: now + 1, CreatedAt: now + 1, Mailbox: "ALL", Account: "work", RemoteRef: "email-2",
+	}
+	if err := db.InsertMessage(first); err != nil {
+		t.Fatalf("insert first: %v", err)
+	}
+	if err := db.InsertMessage(second); err != nil {
+		t.Fatalf("insert second: %v", err)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("duplicate Message-IDs collapsed to row %d", first.ID)
+	}
+	if _, err := db.GetByMessageID(first.MessageID); err == nil {
+		t.Fatal("ambiguous stable Message-ID selected an arbitrary row")
+	}
+	thread, err := db.GetByThread(first.ThreadID)
+	if err != nil || len(thread) != 2 {
+		t.Fatalf("thread rows = %d, err=%v; want 2", len(thread), err)
+	}
+	if err := db.SetSyncedFlagsByDBID(first.ID, `\Seen`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetSyncedLabelsByDBID(second.ID, "project"); err != nil {
+		t.Fatal(err)
+	}
+	flagRows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil || len(flagRows) != 2 {
+		t.Fatalf("flag rows = %+v, err=%v", flagRows, err)
+	}
+	byRef := make(map[string]FolderFlagRow, len(flagRows))
+	for _, row := range flagRows {
+		byRef[row.RemoteRef] = row
+	}
+	if byRef["email-1"].SyncedFlags != `\Seen` || byRef["email-2"].SyncedFlags != "" {
+		t.Fatalf("row-specific flags = %+v", byRef)
+	}
+	labelRows, err := db.GetLabelState("work")
+	if err != nil || len(labelRows) != 2 {
+		t.Fatalf("label rows = %+v, err=%v", labelRows, err)
+	}
+	for _, row := range labelRows {
+		if row.RemoteRef == "email-2" && row.SyncedLabels != "project" {
+			t.Errorf("second label baseline = %q", row.SyncedLabels)
+		}
+	}
+	if err := db.DeleteByDBID(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := db.GetByRemoteRef("work", "ALL", "email-2")
+	if err != nil || remaining == nil || remaining.ID != second.ID {
+		t.Fatalf("second row after deleting first = %+v, err=%v", remaining, err)
+	}
+}
+
+func TestGetByRemoteRefScopesIMAPUIDToMailbox(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	inbox := &Message{
+		MessageID: "inbox@example.com", Date: now, CreatedAt: now,
+		Mailbox: "INBOX", Account: "work", RemoteRef: "1",
+	}
+	archive := &Message{
+		MessageID: "archive@example.com", Date: now, CreatedAt: now,
+		Mailbox: "Archive", Account: "work", RemoteRef: "1",
+	}
+	if err := db.InsertMessage(inbox); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessage(archive); err != nil {
+		t.Fatal(err)
+	}
+	gotInbox, err := db.GetByRemoteRef("work", "INBOX", "1")
+	if err != nil || gotInbox == nil || gotInbox.ID != inbox.ID {
+		t.Fatalf("inbox ref = %+v, err=%v", gotInbox, err)
+	}
+	gotArchive, err := db.GetByRemoteRef("work", "Archive", "1")
+	if err != nil || gotArchive == nil || gotArchive.ID != archive.ID {
+		t.Fatalf("archive ref = %+v, err=%v", gotArchive, err)
+	}
+}
+
+func TestStableIdentityClaimsMatchingLegacyRow(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	legacy := &Message{
+		MessageID: "legacy@example.com", Subject: "Legacy", Date: now, CreatedAt: now,
+		Mailbox: "ALL", Account: "work", RemoteRef: "email-1",
+	}
+	if err := db.InsertMessage(legacy); err != nil {
+		t.Fatal(err)
+	}
+	exists, err := db.MessageIdentityExistsForAccount("email-1", legacy.MessageID, legacy.RemoteRef, legacy.Account)
+	if err != nil || !exists {
+		t.Fatalf("stable identity did not recognize claimable legacy row: exists=%v err=%v", exists, err)
+	}
+	stable := &Message{
+		StableID: "email-1", MessageID: legacy.MessageID, Subject: "Hydrated", Date: now,
+		CreatedAt: now, Mailbox: "ALL", Account: "work", RemoteRef: "email-1",
+	}
+	if err := db.InsertMessage(stable); err != nil {
+		t.Fatal(err)
+	}
+	if stable.ID != legacy.ID {
+		t.Fatalf("stable identity created row %d instead of claiming legacy row %d", stable.ID, legacy.ID)
+	}
+	claimed, err := db.GetByDBID(legacy.ID)
+	if err != nil || claimed == nil || claimed.StableID != "email-1" {
+		t.Fatalf("claimed row = %+v, err=%v", claimed, err)
+	}
+}
+
 func TestInsertMessageParsesCommaAndWhitespaceSeparatedFlags(t *testing.T) {
 	tests := []struct {
 		flags string
@@ -980,6 +1099,29 @@ func TestGetByThread_Dedup(t *testing.T) {
 	}
 	if len(msgs) != 1 {
 		t.Errorf("got %d messages, want 1 (dedup across accounts)", len(msgs))
+	}
+}
+
+func TestGetByThreadDoesNotDedupStableObjectsAcrossAccounts(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	work := &Message{
+		StableID: "work-email", MessageID: "stable-cross-account@x", Subject: "Stable objects",
+		FromAddr: "a@x", Date: now, CreatedAt: now, FetchedBody: true, Account: "work",
+	}
+	personal := &Message{
+		StableID: "personal-email", MessageID: work.MessageID, Subject: work.Subject,
+		FromAddr: "a@x", Date: now, CreatedAt: now, FetchedBody: true, Account: "personal",
+	}
+	if err := db.InsertMessage(work); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessage(personal); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := db.GetByThread(work.ThreadID)
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("stable thread rows = %d, err=%v; want both provider objects", len(msgs), err)
 	}
 }
 

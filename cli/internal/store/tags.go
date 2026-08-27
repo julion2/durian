@@ -56,6 +56,17 @@ func (d *DB) UntagThread(threadID, tag string) error {
 
 // ModifyTagsByThread atomically adds and removes tags for all messages in a thread.
 func (d *DB) ModifyTagsByThread(threadID string, addTags, removeTags []string) error {
+	return d.modifyTagsByThread(threadID, addTags, removeTags, 0)
+}
+
+// ModifyTagsByThreadAndJournal applies a user mutation and records the final
+// intent per local message row in the same transaction. Provider sync consumes
+// this journal independently of the optional cross-device tag_journal.
+func (d *DB) ModifyTagsByThreadAndJournal(threadID string, addTags, removeTags []string, timestamp int64) error {
+	return d.modifyTagsByThread(threadID, addTags, removeTags, timestamp)
+}
+
+func (d *DB) modifyTagsByThread(threadID string, addTags, removeTags []string, timestamp int64) error {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -70,6 +81,11 @@ func (d *DB) ModifyTagsByThread(threadID string, addTags, removeTags []string) e
 		if err != nil {
 			return fmt.Errorf("add tag %q: %w", tag, err)
 		}
+		if timestamp > 0 {
+			if err := journalProviderTagMutationTx(tx, threadID, tag, "add", timestamp); err != nil {
+				return err
+			}
+		}
 	}
 
 	for _, tag := range removeTags {
@@ -80,9 +96,85 @@ func (d *DB) ModifyTagsByThread(threadID string, addTags, removeTags []string) e
 		if err != nil {
 			return fmt.Errorf("remove tag %q: %w", tag, err)
 		}
+		if timestamp > 0 {
+			if err := journalProviderTagMutationTx(tx, threadID, tag, "remove", timestamp); err != nil {
+				return err
+			}
+		}
 	}
 
 	return tx.Commit()
+}
+
+func journalProviderTagMutationTx(tx *sql.Tx, threadID, tag, action string, timestamp int64) error {
+	if tag != "unread" && tag != "flagged" && tag != "replied" {
+		return nil
+	}
+	// Only the latest user intent for one row/tag matters. Replacing it keeps the
+	// queue bounded when a user toggles a tag repeatedly while offline.
+	if _, err := tx.Exec(`DELETE FROM provider_tag_mutations
+		WHERE tag = ? AND message_db_id IN (SELECT id FROM messages WHERE thread_id = ?)`, tag, threadID); err != nil {
+		return fmt.Errorf("replace provider tag mutation %q: %w", tag, err)
+	}
+	if _, err := tx.Exec(`INSERT INTO provider_tag_mutations (message_db_id, tag, action, created_at)
+		SELECT id, ?, ?, ? FROM messages WHERE thread_id = ?`, tag, action, timestamp, threadID); err != nil {
+		return fmt.Errorf("journal provider tag mutation %q: %w", tag, err)
+	}
+	return nil
+}
+
+// ModifyTagsByMessageDBID applies tag changes to exactly one local row.
+func (d *DB) ModifyTagsByMessageDBID(messageDBID int64, addTags, removeTags []string) error {
+	return d.modifyTagsByMessageDBID(messageDBID, addTags, removeTags, 0)
+}
+
+// ModifyTagsByMessageDBIDAndJournal applies an explicit local mutation to one
+// row and records provider-native flag intent in the same transaction.
+func (d *DB) ModifyTagsByMessageDBIDAndJournal(messageDBID int64, addTags, removeTags []string, timestamp int64) error {
+	return d.modifyTagsByMessageDBID(messageDBID, addTags, removeTags, timestamp)
+}
+
+func (d *DB) modifyTagsByMessageDBID(messageDBID int64, addTags, removeTags []string, timestamp int64) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+	for _, tag := range addTags {
+		if _, err := tx.Exec("INSERT OR IGNORE INTO tags (message_id, tag) VALUES (?, ?)", messageDBID, tag); err != nil {
+			return fmt.Errorf("add tag %q: %w", tag, err)
+		}
+		if timestamp > 0 {
+			if err := journalProviderTagMutationForMessageTx(tx, messageDBID, tag, "add", timestamp); err != nil {
+				return err
+			}
+		}
+	}
+	for _, tag := range removeTags {
+		if _, err := tx.Exec("DELETE FROM tags WHERE message_id = ? AND tag = ?", messageDBID, tag); err != nil {
+			return fmt.Errorf("remove tag %q: %w", tag, err)
+		}
+		if timestamp > 0 {
+			if err := journalProviderTagMutationForMessageTx(tx, messageDBID, tag, "remove", timestamp); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
+}
+
+func journalProviderTagMutationForMessageTx(tx *sql.Tx, messageDBID int64, tag, action string, timestamp int64) error {
+	if tag != "unread" && tag != "flagged" && tag != "replied" {
+		return nil
+	}
+	if _, err := tx.Exec("DELETE FROM provider_tag_mutations WHERE message_db_id = ? AND tag = ?", messageDBID, tag); err != nil {
+		return fmt.Errorf("replace provider tag mutation %q: %w", tag, err)
+	}
+	if _, err := tx.Exec(`INSERT INTO provider_tag_mutations (message_db_id, tag, action, created_at)
+		VALUES (?, ?, ?, ?)`, messageDBID, tag, action, timestamp); err != nil {
+		return fmt.Errorf("journal provider tag mutation %q: %w", tag, err)
+	}
+	return nil
 }
 
 // GetMessageTagsBatch returns tags for multiple messages in a single query.
@@ -228,6 +320,16 @@ func (d *DB) ModifyTagsByMessageID(messageID string, addTags, removeTags []strin
 // ModifyTagsByMessageIDAndAccount adds and removes tags for a message scoped
 // to a specific account. No-op if the (message_id, account) pair is not in the store.
 func (d *DB) ModifyTagsByMessageIDAndAccount(messageID, account string, addTags, removeTags []string) error {
+	return d.modifyTagsByMessageIDAndAccount(messageID, account, addTags, removeTags, 0)
+}
+
+// ModifyTagsByMessageIDAndAccountAndJournal applies a cross-device user
+// mutation and records provider-native flag intent in the same transaction.
+func (d *DB) ModifyTagsByMessageIDAndAccountAndJournal(messageID, account string, addTags, removeTags []string, timestamp int64) error {
+	return d.modifyTagsByMessageIDAndAccount(messageID, account, addTags, removeTags, timestamp)
+}
+
+func (d *DB) modifyTagsByMessageIDAndAccount(messageID, account string, addTags, removeTags []string, timestamp int64) error {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -253,6 +355,11 @@ func (d *DB) ModifyTagsByMessageIDAndAccount(messageID, account string, addTags,
 			dbID, tag); err != nil {
 			return fmt.Errorf("add tag %q: %w", tag, err)
 		}
+		if timestamp > 0 {
+			if err := journalProviderTagMutationForMessageTx(tx, dbID, tag, "add", timestamp); err != nil {
+				return err
+			}
+		}
 	}
 
 	for _, tag := range removeTags {
@@ -260,6 +367,11 @@ func (d *DB) ModifyTagsByMessageIDAndAccount(messageID, account string, addTags,
 			"DELETE FROM tags WHERE message_id = ? AND tag = ?",
 			dbID, tag); err != nil {
 			return fmt.Errorf("remove tag %q: %w", tag, err)
+		}
+		if timestamp > 0 {
+			if err := journalProviderTagMutationForMessageTx(tx, dbID, tag, "remove", timestamp); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -384,8 +496,11 @@ func (d *DB) GetTagsByMessageID(messageID string) ([]string, error) {
 
 // GetAccountsByThread returns all distinct accounts that have messages in a thread.
 func (d *DB) GetAccountsByThread(threadID string) ([]string, error) {
-	rows, err := d.db.Query(
-		"SELECT DISTINCT account FROM messages WHERE thread_id = ?", threadID)
+	rows, err := d.db.Query(`
+		SELECT DISTINCT a.name_ct
+		FROM messages m
+		JOIN accounts a ON a.id = m.account_id
+		WHERE m.thread_id = ?`, threadID)
 	if err != nil {
 		return nil, fmt.Errorf("get accounts by thread: %w", err)
 	}
@@ -393,9 +508,13 @@ func (d *DB) GetAccountsByThread(threadID string) ([]string, error) {
 
 	var accounts []string
 	for rows.Next() {
-		var account string
-		if err := rows.Scan(&account); err != nil {
+		var accountCT []byte
+		if err := rows.Scan(&accountCT); err != nil {
 			return nil, fmt.Errorf("scan account: %w", err)
+		}
+		account, err := d.decryptMeta("", accountCT)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt account name: %w", err)
 		}
 		accounts = append(accounts, account)
 	}
@@ -443,6 +562,61 @@ func (d *DB) ReadTagJournal() ([]struct {
 func (d *DB) ClearTagJournal(upToID int64) error {
 	_, err := d.db.Exec("DELETE FROM tag_journal WHERE id <= ?", upToID)
 	return err
+}
+
+// ProviderTagMutation is one durable user intent awaiting provider upload.
+type ProviderTagMutation struct {
+	ID        int64
+	MessageID string
+	RowID     int64
+	RemoteRef string
+	Tag       string
+	Action    string
+}
+
+// ReadProviderTagMutations returns pending user intents for one account.
+func (d *DB) ReadProviderTagMutations(account string) ([]ProviderTagMutation, error) {
+	rows, err := d.db.Query(`SELECT p.id, m.id, m.message_id, m.remote_ref, p.tag, p.action
+		FROM provider_tag_mutations p
+		JOIN messages m ON m.id = p.message_db_id
+		WHERE m.account_id = (SELECT id FROM accounts WHERE name = ?)
+		ORDER BY p.id`, account)
+	if err != nil {
+		return nil, fmt.Errorf("read provider tag mutations: %w", err)
+	}
+	defer rows.Close()
+	var result []ProviderTagMutation
+	for rows.Next() {
+		var mutation ProviderTagMutation
+		if err := rows.Scan(&mutation.ID, &mutation.RowID, &mutation.MessageID,
+			&mutation.RemoteRef, &mutation.Tag, &mutation.Action); err != nil {
+			return nil, fmt.Errorf("scan provider tag mutation: %w", err)
+		}
+		result = append(result, mutation)
+	}
+	return result, rows.Err()
+}
+
+// ClearProviderTagMutation removes one successfully applied intent.
+func (d *DB) ClearProviderTagMutation(id int64) error {
+	if _, err := d.db.Exec("DELETE FROM provider_tag_mutations WHERE id = ?", id); err != nil {
+		return fmt.Errorf("clear provider tag mutation: %w", err)
+	}
+	return nil
+}
+
+// ClearProviderTagMutationsForAccount discards intents for a backend that does
+// not support native property patches; its existing baseline merge remains the
+// owner of those flag changes.
+func (d *DB) ClearProviderTagMutationsForAccount(account string) error {
+	if _, err := d.db.Exec(`DELETE FROM provider_tag_mutations
+		WHERE message_db_id IN (
+			SELECT id FROM messages
+			WHERE account_id = (SELECT id FROM accounts WHERE name = ?)
+		)`, account); err != nil {
+		return fmt.Errorf("clear account provider tag mutations: %w", err)
+	}
+	return nil
 }
 
 // GetMeta reads an integer value from the metadata table.
