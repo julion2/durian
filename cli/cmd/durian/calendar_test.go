@@ -25,6 +25,14 @@ func TestParseHexColor(t *testing.T) {
 	}
 }
 
+func TestNormalizeEventReference(t *testing.T) {
+	for _, input := range []string{"uid-1", "event:uid-1", "EVENT:uid-1"} {
+		if got := normalizeEventReference(input); got != "uid-1" {
+			t.Errorf("normalizeEventReference(%q) = %q", input, got)
+		}
+	}
+}
+
 func TestGUIOperationAllowsOnlyMatchingPlannerActions(t *testing.T) {
 	tests := []struct {
 		operation string
@@ -331,23 +339,17 @@ func TestTargetLabel(t *testing.T) {
 	}
 }
 
-// Two accounts can each have a calendar named "Calendar", so the account is
-// prefixed — but only when more than one is in play, to keep the far more
-// common single-account output unchanged.
-func TestCalendarLabelPrefixesOnlyWhenAmbiguous(t *testing.T) {
+// The account has its own output column, so the calendar label stays stable
+// regardless of how many accounts are shown.
+func TestCalendarLabelDoesNotIncludeAccount(t *testing.T) {
 	cal := calendar.LocalCalendar{Name: "Calendar", Account: "h"}
 
-	if got := calendarLabel(cal, false); !strings.HasSuffix(got, "Calendar") || strings.Contains(got, "h/") {
-		t.Errorf("single-account label = %q, want no account prefix", got)
-	}
-	if got := calendarLabel(cal, true); !strings.HasSuffix(got, "h/Calendar") {
-		t.Errorf("multi-account label = %q, want the account prefixed", got)
+	if got := calendarLabel(cal); !strings.HasSuffix(got, "Calendar") || strings.Contains(got, "h/") {
+		t.Errorf("calendar label = %q, want no account prefix", got)
 	}
 
-	// A calendar with no account (the plain ReadCalendars path) is never
-	// prefixed with an empty segment.
 	plain := calendar.LocalCalendar{Name: "Calendar"}
-	if got := calendarLabel(plain, true); strings.Contains(got, "/") {
+	if got := calendarLabel(plain); strings.Contains(got, "/") {
 		t.Errorf("account-less label = %q, want no prefix", got)
 	}
 }
