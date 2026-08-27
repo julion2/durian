@@ -23,6 +23,11 @@ func completeAccounts(_ *cobra.Command, _ []string, _ string) ([]string, cobra.S
 	return cfg.ListAccountIdentifiers(), cobra.ShellCompDirectiveNoFileComp
 }
 
+func completeCalendarAccounts(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	accounts, directive := completeAccounts(cmd, args, toComplete)
+	return append(accounts, "local"), directive
+}
+
 func resolveAccountStoreKeys(identifiers []string) ([]string, error) {
 	cfg := GetConfig()
 	if cfg == nil {
