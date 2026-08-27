@@ -25,6 +25,9 @@ const (
 	maxSessionBytes      = 4 << 20
 	maxMethodBytes       = 64 << 20
 	maxMessageBytes      = 100 << 20
+	maxJSONSafeInteger   = int64(1<<53 - 1)
+	maxClientAPIRequests = 16
+	maxClientUploads     = 4
 )
 
 type session struct {
@@ -44,6 +47,65 @@ type sessionAccount struct {
 	AccountCapabilities map[string]json.RawMessage `json:"accountCapabilities"`
 }
 
+type coreLimits struct {
+	MaxSizeUpload         int64
+	MaxConcurrentUpload   int
+	MaxSizeRequest        int64
+	MaxConcurrentRequests int
+	MaxCallsInRequest     int
+	MaxObjectsInGet       int
+	MaxObjectsInSet       int
+	CollationAlgorithms   []string
+}
+
+func (l *coreLimits) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		MaxSizeUpload         *int64    `json:"maxSizeUpload"`
+		MaxConcurrentUpload   *int64    `json:"maxConcurrentUpload"`
+		MaxSizeRequest        *int64    `json:"maxSizeRequest"`
+		MaxConcurrentRequests *int64    `json:"maxConcurrentRequests"`
+		MaxCallsInRequest     *int64    `json:"maxCallsInRequest"`
+		MaxObjectsInGet       *int64    `json:"maxObjectsInGet"`
+		MaxObjectsInSet       *int64    `json:"maxObjectsInSet"`
+		CollationAlgorithms   *[]string `json:"collationAlgorithms"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	limits := []struct {
+		name  string
+		value *int64
+	}{
+		{"maxSizeUpload", wire.MaxSizeUpload},
+		{"maxConcurrentUpload", wire.MaxConcurrentUpload},
+		{"maxSizeRequest", wire.MaxSizeRequest},
+		{"maxConcurrentRequests", wire.MaxConcurrentRequests},
+		{"maxCallsInRequest", wire.MaxCallsInRequest},
+		{"maxObjectsInGet", wire.MaxObjectsInGet},
+		{"maxObjectsInSet", wire.MaxObjectsInSet},
+	}
+	for _, limit := range limits {
+		if limit.value == nil {
+			return fmt.Errorf("missing required %s", limit.name)
+		}
+		if *limit.value < 0 || *limit.value > maxJSONSafeInteger {
+			return fmt.Errorf("%s is outside the JMAP UnsignedInt range", limit.name)
+		}
+	}
+	if wire.CollationAlgorithms == nil {
+		return errors.New("missing required collationAlgorithms")
+	}
+	l.MaxSizeUpload = *wire.MaxSizeUpload
+	l.MaxConcurrentUpload = int(*wire.MaxConcurrentUpload)
+	l.MaxSizeRequest = *wire.MaxSizeRequest
+	l.MaxConcurrentRequests = int(*wire.MaxConcurrentRequests)
+	l.MaxCallsInRequest = int(*wire.MaxCallsInRequest)
+	l.MaxObjectsInGet = int(*wire.MaxObjectsInGet)
+	l.MaxObjectsInSet = int(*wire.MaxObjectsInSet)
+	l.CollationAlgorithms = *wire.CollationAlgorithms
+	return nil
+}
+
 type credential struct {
 	mode     string
 	username string
@@ -56,6 +118,9 @@ type client struct {
 	credential credential
 	session    session
 	accountID  string
+	limits     coreLimits
+	apiSem     chan struct{}
+	uploadSem  chan struct{}
 }
 
 type methodEnvelope struct {
@@ -101,6 +166,16 @@ func (c *client) discover(ctx context.Context) error {
 	if _, ok := c.session.Capabilities[coreCapability]; !ok {
 		return errors.New("JMAP server does not advertise the core capability")
 	}
+	if err := json.Unmarshal(c.session.Capabilities[coreCapability], &c.limits); err != nil {
+		return fmt.Errorf("decode JMAP core limits: %w", err)
+	}
+	if c.limits.MaxCallsInRequest == 0 || c.limits.MaxObjectsInGet == 0 ||
+		c.limits.MaxObjectsInSet == 0 || c.limits.MaxConcurrentRequests == 0 ||
+		c.limits.MaxConcurrentUpload == 0 || c.limits.MaxSizeRequest == 0 || c.limits.MaxSizeUpload == 0 {
+		return errors.New("JMAP core capability does not permit the required client operations")
+	}
+	c.apiSem = make(chan struct{}, min(c.limits.MaxConcurrentRequests, maxClientAPIRequests))
+	c.uploadSem = make(chan struct{}, min(c.limits.MaxConcurrentUpload, maxClientUploads))
 	accountID := c.session.PrimaryAccounts[mailCapability]
 	account, primaryOK := c.session.Accounts[accountID]
 	_, primaryHasMail := account.AccountCapabilities[mailCapability]
@@ -164,6 +239,18 @@ func (c *client) call(ctx context.Context, using []string, method string, args, 
 	if err != nil {
 		return fmt.Errorf("encode %s request: %w", method, err)
 	}
+	requestLimit := int64(maxMethodBytes)
+	if c.limits.MaxSizeRequest > 0 && c.limits.MaxSizeRequest < requestLimit {
+		requestLimit = c.limits.MaxSizeRequest
+	}
+	if int64(len(body)) > requestLimit {
+		return fmt.Errorf("%s request is %d bytes, exceeds JMAP maxSizeRequest %d", method, len(body), requestLimit)
+	}
+	release, err := acquire(ctx, c.apiSem)
+	if err != nil {
+		return err
+	}
+	defer release()
 	safeToRetry := strings.HasSuffix(method, "/get") || strings.HasSuffix(method, "/query") || strings.HasSuffix(method, "/changes")
 	resp, err := c.doHTTP(ctx, http.MethodPost, c.session.APIURL, body, "application/json", safeToRetry)
 	if err != nil {
@@ -335,6 +422,14 @@ func (c *client) upload(ctx context.Context, data []byte, contentType string) (s
 	if c.session.UploadURL == "" {
 		return "", errors.New("JMAP session has no uploadUrl")
 	}
+	if c.limits.MaxSizeUpload > 0 && int64(len(data)) > c.limits.MaxSizeUpload {
+		return "", fmt.Errorf("JMAP upload is %d bytes, exceeds maxSizeUpload %d", len(data), c.limits.MaxSizeUpload)
+	}
+	release, err := acquire(ctx, c.uploadSem)
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	u := expandTemplate(c.session.UploadURL, map[string]string{"accountId": c.accountID})
 	resp, err := c.doHTTP(ctx, http.MethodPost, u, data, contentType, false)
 	if err != nil {
@@ -351,6 +446,28 @@ func (c *client) upload(ctx context.Context, data []byte, contentType string) (s
 		return "", errors.New("JMAP upload returned no blobId")
 	}
 	return result.BlobID, nil
+}
+
+func acquire(ctx context.Context, sem chan struct{}) (func(), error) {
+	if sem == nil {
+		return func() {}, nil
+	}
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (c *client) maxObjectsInGet(fallback int) int {
+	if fallback <= 0 {
+		fallback = 1
+	}
+	if c.limits.MaxObjectsInGet > 0 && c.limits.MaxObjectsInGet < fallback {
+		return c.limits.MaxObjectsInGet
+	}
+	return fallback
 }
 
 func (c *client) download(ctx context.Context, blobID, name, mediaType string) (io.ReadCloser, error) {

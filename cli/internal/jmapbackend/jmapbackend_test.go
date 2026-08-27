@@ -27,6 +27,7 @@ type testJMAPServer struct {
 	uploaded []byte
 	events   string
 	extra    []interface{}
+	limits   map[string]interface{}
 }
 
 type testMethodResponse struct {
@@ -49,8 +50,21 @@ func (s *testJMAPServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.URL.Path == "/session":
+		limits := map[string]interface{}{
+			"maxSizeUpload":         50_000_000,
+			"maxConcurrentUpload":   4,
+			"maxSizeRequest":        10_000_000,
+			"maxConcurrentRequests": 4,
+			"maxCallsInRequest":     16,
+			"maxObjectsInGet":       500,
+			"maxObjectsInSet":       500,
+			"collationAlgorithms":   []string{},
+		}
+		for name, value := range s.limits {
+			limits[name] = value
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"capabilities":    map[string]interface{}{coreCapability: map[string]interface{}{}, mailCapability: map[string]interface{}{}, submissionCapability: map[string]interface{}{}},
+			"capabilities":    map[string]interface{}{coreCapability: limits, mailCapability: map[string]interface{}{}, submissionCapability: map[string]interface{}{}},
 			"accounts":        map[string]interface{}{"a1": map[string]interface{}{"name": "Test", "isPersonal": true, "isReadOnly": false, "accountCapabilities": map[string]interface{}{mailCapability: map[string]interface{}{}, submissionCapability: map[string]interface{}{}}}},
 			"primaryAccounts": map[string]string{mailCapability: "a1", submissionCapability: "a1"},
 			"apiUrl":          s.server.URL + "/api", "downloadUrl": s.server.URL + "/download/{accountId}/{blobId}/{name}?accept={type}",
@@ -413,7 +427,7 @@ func TestCannotCalculateChangesStartsReplacementSnapshot(t *testing.T) {
 		case "Email/changes":
 			return testMethodResponse{name: "error", value: methodError{Type: "cannotCalculateChanges"}}
 		case "Email/query":
-			return map[string]interface{}{"ids": []string{"e1"}, "total": 1}
+			return map[string]interface{}{"queryState": "q1", "position": 0, "ids": []string{"e1"}, "total": 1}
 		case "Email/get":
 			ids, _ := args["ids"].([]interface{})
 			if len(ids) == 0 {
@@ -431,6 +445,178 @@ func TestCannotCalculateChangesStartsReplacementSnapshot(t *testing.T) {
 	}
 	if !result.FullSnapshot || len(result.Messages) != 0 || len(result.Present) != 1 {
 		t.Fatalf("replacement result = %#v", result)
+	}
+}
+
+func TestReplacementSnapshotIsPagedWithoutPersistingRemoteIDSet(t *testing.T) {
+	s := newTestJMAPServer(t)
+	queryCalls := 0
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+		case "Email/changes":
+			return testMethodResponse{name: "error", value: methodError{Type: "cannotCalculateChanges"}}
+		case "Email/get":
+			return map[string]interface{}{"state": "new-state", "list": []interface{}{}, "notFound": []interface{}{}}
+		case "Email/query":
+			queryCalls++
+			if queryCalls == 1 {
+				if args["position"] != float64(0) || args["limit"] != float64(2) {
+					t.Errorf("first replacement query args = %#v", args)
+				}
+				return map[string]interface{}{"queryState": "q1", "position": 0, "ids": []string{"e1", "e2"}, "total": 3}
+			}
+			if args["anchor"] != "e2" || args["anchorOffset"] != float64(1) {
+				t.Errorf("second replacement query args = %#v", args)
+			}
+			return map[string]interface{}{"queryState": "q1", "position": 2, "ids": []string{"e3"}, "total": 3}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	b := s.backend(t)
+	first, err := b.FetchMessages(t.Context(), allMailStream, encodeCursor(jmapCursor{EmailState: "expired"}), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := decodeCursor(first.Cursor)
+	if !first.FullSnapshot || !first.HasMore || len(first.Present) != 2 || !state.Replacement ||
+		state.QueryAnchor != "e2" || state.QuerySeen != 2 || state.QueryTotal != 3 || len(state.PendingIDs) != 0 {
+		t.Fatalf("first replacement page = %#v, cursor=%+v", first, state)
+	}
+	second, err := b.FetchMessages(t.Context(), allMailStream, first.Cursor, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.FullSnapshot || second.HasMore || len(second.Present) != 1 || decodeCursor(second.Cursor).EmailState != "new-state" {
+		t.Fatalf("second replacement page = %#v", second)
+	}
+}
+
+func TestCoreLimitsBoundGetBatchesAndPayloadSizes(t *testing.T) {
+	s := newTestJMAPServer(t)
+	s.limits = map[string]interface{}{
+		"maxObjectsInGet": 2,
+		"maxSizeRequest":  300,
+		"maxSizeUpload":   3,
+	}
+	getCalls := 0
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		if method != "Email/get" {
+			t.Fatalf("unexpected method %s", method)
+		}
+		getCalls++
+		ids := args["ids"].([]interface{})
+		list := make([]interface{}, 0, len(ids))
+		for _, rawID := range ids {
+			id := rawID.(string)
+			list = append(list, emailObject(id, nil, nil))
+		}
+		return map[string]interface{}{"state": "s1", "list": list, "notFound": []interface{}{}}
+	}
+	b := s.backend(t)
+	objects, _, _, err := b.getEmailObjects(t.Context(), []string{"e1", "e2", "e3", "e4", "e5"})
+	if err != nil || len(objects) != 5 || getCalls != 3 {
+		t.Fatalf("get objects=%d calls=%d err=%v", len(objects), getCalls, err)
+	}
+	if _, err := b.client.upload(t.Context(), []byte("four"), "text/plain"); err == nil || !strings.Contains(err.Error(), "maxSizeUpload 3") {
+		t.Fatalf("oversized upload error = %v", err)
+	}
+	largeArgs := map[string]interface{}{"accountId": b.client.accountID, "value": strings.Repeat("x", 400)}
+	if err := b.client.call(t.Context(), []string{coreCapability}, "Core/echo", largeArgs, nil); err == nil || !strings.Contains(err.Error(), "maxSizeRequest 300") {
+		t.Fatalf("oversized request error = %v", err)
+	}
+}
+
+func TestCoreLimitsRequireCompleteUsableCapability(t *testing.T) {
+	complete := `{
+		"maxSizeUpload": 1,
+		"maxConcurrentUpload": 1,
+		"maxSizeRequest": 1,
+		"maxConcurrentRequests": 1,
+		"maxCallsInRequest": 1,
+		"maxObjectsInGet": 1,
+		"maxObjectsInSet": 1,
+		"collationAlgorithms": []
+	}`
+	var limits coreLimits
+	if err := json.Unmarshal([]byte(complete), &limits); err != nil {
+		t.Fatalf("complete core capability: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"maxSizeUpload":1}`), &limits); err == nil || !strings.Contains(err.Error(), "missing required") {
+		t.Fatalf("incomplete core capability error = %v", err)
+	}
+
+	s := newTestJMAPServer(t)
+	s.limits = map[string]interface{}{"maxCallsInRequest": 0}
+	original := getCredential
+	getCredential = func(_, _ string) (string, error) { return "secret", nil }
+	t.Cleanup(func() { getCredential = original })
+	b, err := New(&config.AccountConfig{
+		Name: "Test", Email: "me@example.test", Alias: "test", SyncEngine: "jmap",
+		JMAP: &config.JMAPConfig{SessionURL: s.server.URL + "/session", Auth: "password"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.FetchFolders(t.Context()); err == nil || !strings.Contains(err.Error(), "does not permit") {
+		t.Fatalf("zero-limit discovery error = %v", err)
+	}
+}
+
+func TestJMAPKeywordRoundTripAndPropertyPatches(t *testing.T) {
+	keyword, err := encodeDurianKeyword("Project/Alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag, ok := decodeDurianKeyword(keyword); !ok || tag != "Project/Alpha" {
+		t.Fatalf("decode %q = %q, %v", keyword, tag, ok)
+	}
+	b := &Backend{mailboxToTag: map[string]string{"inbox-id": "inbox"}}
+	labels := b.labelsFor(map[string]bool{"inbox-id": true}, map[string]bool{
+		keyword: true, "custom": true, "$forwarded": true,
+	})
+	if want := []string{"Project/Alpha", "inbox", "jmap-keyword/custom"}; !slices.Equal(labels, want) {
+		t.Fatalf("labels = %v, want %v", labels, want)
+	}
+	if _, err := keywordForTag("jmap-keyword/$seen"); err == nil {
+		t.Fatal("reserved system keyword accepted as a label tag")
+	}
+	if _, err := keywordForTag("jmap-keyword/Uppercase"); err == nil {
+		t.Fatal("invalid uppercase JMAP keyword accepted")
+	}
+	if _, err := encodeDurianKeyword(""); err == nil {
+		t.Fatal("empty tag accepted as a Durian keyword")
+	}
+	if b.ManagesLabelTag("jmap-keyword/Uppercase") || b.ManagesLabelTag("") {
+		t.Fatal("invalid keyword-backed tag reported as provider-managed")
+	}
+
+	s := newTestJMAPServer(t)
+	var patches []map[string]interface{}
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+		case "Email/get":
+			return map[string]interface{}{"state": "s1", "list": []interface{}{emailObject("e1", nil, map[string]bool{"inbox-id": true})}, "notFound": []interface{}{}}
+		case "Email/set":
+			patches = append(patches, args["update"].(map[string]interface{})["e1"].(map[string]interface{}))
+			return map[string]interface{}{"updated": map[string]interface{}{"e1": nil}, "notUpdated": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	remote := s.backend(t)
+	if err := remote.ApplyLabels(t.Context(), backend.RemoteRef{ID: "e1"}, []string{"Project/Alpha"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.ApplyTagMutation(t.Context(), backend.RemoteRef{ID: "e1"}, "unread", true); err != nil {
+		t.Fatal(err)
+	}
+	if len(patches) != 2 || patches[0]["keywords/"+keyword] != true || patches[1]["keywords/$seen"] != nil {
+		t.Fatalf("keyword patches = %#v", patches)
 	}
 }
 
@@ -496,7 +682,8 @@ func TestFlagsLabelsAndAppend(t *testing.T) {
 	if err := b.ApplyLabels(t.Context(), backend.RemoteRef{ID: "e1"}, []string{"archive"}, []string{"inbox"}); err != nil {
 		t.Fatal(err)
 	}
-	if len(patches) != 2 || patches[0]["keywords/$flagged"] != true || patches[0]["keywords/$seen"] != nil || patches[1]["mailboxIds/archive-id"] != true {
+	seenPatch, hasSeenPatch := patches[0]["keywords/$seen"]
+	if len(patches) != 2 || patches[0]["keywords/$flagged"] != true || !hasSeenPatch || seenPatch != nil || patches[1]["mailboxIds/archive-id"] != true {
 		t.Fatalf("patches = %#v", patches)
 	}
 	ref, err := b.Append(t.Context(), "drafts-id", backend.Flags{Seen: true}, []byte(testRaw))
