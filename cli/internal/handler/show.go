@@ -10,6 +10,7 @@ import (
 	"net/mail"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,10 +54,11 @@ func (h *Handler) ShowThread(threadID string) protocol.Response {
 	return protocol.SuccessWithThread(thread)
 }
 
-// ShowMessageBody returns the full (unstripped) body of a single message by Message-ID.
+// ShowMessageBody returns the full (unstripped) body of a single message by its
+// opaque local identifier or, for older clients, by Message-ID.
 // Used for reply quoting where the conversation chain must be preserved.
-func (h *Handler) ShowMessageBody(messageID string) protocol.Response {
-	msg, err := h.store.GetByMessageID(messageID)
+func (h *Handler) ShowMessageBody(identifier string) protocol.Response {
+	msg, err := h.store.GetByIdentifier(identifier)
 	if err != nil {
 		return protocol.Fail(protocol.ErrBackendError, err)
 	}
@@ -82,8 +84,12 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 	var subject string
 
 	for _, msg := range msgs {
+		identifier := msg.MessageID
+		if msg.StableID != "" {
+			identifier = "local:" + strconv.FormatInt(msg.ID, 10)
+		}
 		info := internmail.MessageInfo{
-			ID:        msg.MessageID,
+			ID:        identifier,
 			From:      msg.FromAddr,
 			To:        msg.ToAddrs,
 			CC:        msg.CCAddrs,
@@ -191,9 +197,17 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 
 // DownloadAttachment streams a raw attachment part, setting Content-Type and
 // Content-Disposition headers from server-derived metadata.
-func (h *Handler) DownloadAttachment(messageID string, partID int, w http.ResponseWriter) error {
-	// Get attachment metadata from store
-	storeAtts, err := h.store.GetAttachmentsByMessageID(messageID)
+func (h *Handler) DownloadAttachment(identifier string, partID int, w http.ResponseWriter) error {
+	msg, err := h.store.GetByIdentifier(identifier)
+	if err != nil {
+		return fmt.Errorf("lookup message: %w", err)
+	}
+	if msg == nil {
+		return errors.New("message not found")
+	}
+
+	// Get attachment metadata from the exact local row.
+	storeAtts, err := h.store.GetAttachmentsByMessage(msg.ID)
 	if err != nil {
 		return err
 	}
@@ -212,14 +226,6 @@ func (h *Handler) DownloadAttachment(messageID string, partID int, w http.Respon
 	w.Header().Set("Content-Type", storeAtt.ContentType)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+sanitizeFilename(storeAtt.Filename)+`"`)
 
-	msg, err := h.store.GetByMessageID(messageID)
-	if err != nil {
-		return fmt.Errorf("lookup message: %w", err)
-	}
-	if msg == nil {
-		return errors.New("message not found")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -236,7 +242,7 @@ func (h *Handler) DownloadAttachment(messageID string, partID int, w http.Respon
 			_, werr := w.Write(data)
 			return werr
 		}
-		slog.Warn("Backend attachment fetch failed, falling back to IMAP", "module", "HANDLER", "message_id", messageID, "err", berr)
+		slog.Warn("Backend attachment fetch failed, falling back to IMAP", "module", "HANDLER", "message_id", msg.MessageID, "err", berr)
 	}
 
 	// Legacy path: break-IDLE IMAP fetch by UID.
@@ -247,7 +253,7 @@ func (h *Handler) DownloadAttachment(messageID string, partID int, w http.Respon
 		return errors.New("message missing IMAP metadata for attachment fetch")
 	}
 	return h.fetcher.FetchAttachment(ctx, msg.Account, msg.Mailbox,
-		msg.UID, messageID, storeAtt.Filename, storeAtt.ContentType, storeAtt.PartID, w)
+		msg.UID, msg.MessageID, storeAtt.Filename, storeAtt.ContentType, storeAtt.PartID, w)
 }
 
 // fetchAttachmentViaBackend fetches the message's raw body through the account's

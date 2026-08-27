@@ -68,6 +68,49 @@ func TestConvertThread_OrdersNewestFirst(t *testing.T) {
 	}
 }
 
+func TestConvertThreadKeepsDuplicateMessageIDsAddressable(t *testing.T) {
+	db := newTestStore(t)
+	now := time.Now().Unix()
+	first := &store.Message{
+		StableID: "email-1", MessageID: "duplicate@example.com", Subject: "Duplicate",
+		Date: now, CreatedAt: now, BodyText: "first body", Mailbox: "ALL", Account: "work",
+	}
+	second := &store.Message{
+		StableID: "email-2", MessageID: "duplicate@example.com", Subject: "Duplicate",
+		Date: now + 1, CreatedAt: now + 1, BodyText: "second body", Mailbox: "ALL", Account: "work",
+	}
+	if err := db.InsertMessage(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessage(second); err != nil {
+		t.Fatal(err)
+	}
+	h := New(db, nil)
+	response := h.ShowThread(first.ThreadID)
+	if !response.OK || response.Thread == nil || len(response.Thread.Messages) != 2 {
+		t.Fatalf("thread response = %+v", response)
+	}
+	seenBodies := map[string]bool{}
+	seenIDs := map[string]bool{}
+	for _, message := range response.Thread.Messages {
+		if !strings.HasPrefix(message.ID, "local:") || message.MessageID != "duplicate@example.com" {
+			t.Errorf("message identity = id %q, Message-ID %q", message.ID, message.MessageID)
+		}
+		if seenIDs[message.ID] {
+			t.Errorf("duplicate opaque id %q", message.ID)
+		}
+		seenIDs[message.ID] = true
+		bodyResponse := h.ShowMessageBody(message.ID)
+		if !bodyResponse.OK || bodyResponse.MessageBody == nil {
+			t.Fatalf("body %q response = %+v", message.ID, bodyResponse)
+		}
+		seenBodies[bodyResponse.MessageBody.Body] = true
+	}
+	if !seenBodies["first body"] || !seenBodies["second body"] {
+		t.Fatalf("opaque identifiers resolved bodies %v", seenBodies)
+	}
+}
+
 // --- Subject inheritance ---
 
 func TestConvertThread_SubjectFromFirstMessage(t *testing.T) {

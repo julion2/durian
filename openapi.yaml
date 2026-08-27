@@ -76,14 +76,14 @@ paths:
       summary: Get the full unstripped body of a single message
       description: >
         Returns the raw plain-text body and optional HTML body of the
-        message identified by its RFC Message-ID. Used by the compose
+        message identified by the opaque id returned in ThreadMessage.id. Used by the compose
         window for reply quoting — the sync path stores stripped bodies
         to save space, but replies need the original.
       parameters:
         - name: id
           in: query
           required: true
-          description: RFC Message-ID of the message (including angle brackets)
+          description: Opaque message identifier returned in ThreadMessage.id
           schema:
             type: string
       responses:
@@ -230,7 +230,8 @@ paths:
       summary: Download a message attachment
       description: >
         Streams the raw bytes of a MIME part. Content-Type and Content-Disposition
-        headers are derived server-side from stored message metadata.
+        headers are derived server-side from stored message metadata. The
+        message_id path component is the opaque ThreadMessage.id value.
       parameters:
         - name: message_id
           in: path
@@ -802,6 +803,10 @@ components:
       properties:
         id:
           type: string
+          description: Opaque local message identifier; do not interpret it as an RFC Message-ID
+        message_id:
+          type: string
+          description: RFC 5322 Message-ID metadata; optional and not guaranteed unique
         from:
           type: string
         to:

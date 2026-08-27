@@ -573,7 +573,7 @@ struct ThreadMessageCardView: View {
             }
 
             // Message-ID (from message)
-            detailRow(label: "Message-ID", value: message.id)
+            detailRow(label: "Message-ID", value: message.message_id ?? message.id)
         }
         .padding(.leading, 52)
         .padding(.top, 8)

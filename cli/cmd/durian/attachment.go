@@ -19,10 +19,11 @@ import (
 )
 
 var attachmentCmd = &cobra.Command{
-	Use:   "attachment <message-id>",
+	Use:   "attachment <message-identifier>",
 	Short: "List or download attachments",
 	Long:  "List attachments for a message, or download a specific part with --save.",
-	Example: `  durian attachment msg-id@example.com
+	Example: `  durian attachment local:42
+  durian attachment msg-id@example.com
   durian attachment msg-id@example.com --save 1
   durian attachment msg-id@example.com --save 1 --output ~/Downloads/`,
 	Args: cobra.ExactArgs(1),
@@ -41,7 +42,7 @@ func init() {
 }
 
 func runAttachment(cmd *cobra.Command, args []string) error {
-	messageID := args[0]
+	identifier := args[0]
 
 	emailDB, err := openEmailDB()
 	if err != nil {
@@ -49,7 +50,14 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 	}
 	defer emailDB.Close()
 
-	atts, err := emailDB.GetAttachmentsByMessageID(messageID)
+	msg, err := emailDB.GetByIdentifier(identifier)
+	if err != nil {
+		return fmt.Errorf("get message: %w", err)
+	}
+	if msg == nil {
+		return fmt.Errorf("message not found in store")
+	}
+	atts, err := emailDB.GetAttachmentsByMessage(msg.ID)
 	if err != nil {
 		return fmt.Errorf("get attachments: %w", err)
 	}
@@ -82,10 +90,6 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("part %d not found", attachSavePart)
 	}
 
-	msg, err := emailDB.GetByMessageID(messageID)
-	if err != nil || msg == nil {
-		return fmt.Errorf("message not found in store")
-	}
 	account, err := cfg.GetAccountByIdentifier(msg.Account)
 	if err != nil {
 		return fmt.Errorf("account %q not found in config", msg.Account)
