@@ -10,17 +10,19 @@ import (
 	"github.com/julion2/durian/cli/internal/mailsend"
 )
 
-func TestSenderImportsAndSubmits(t *testing.T) {
+func TestSenderCreatesStructuredEmailAndSubmits(t *testing.T) {
 	s := newTestJMAPServer(t)
 	var submitted bool
+	var createdDraft map[string]interface{}
 	s.handler = func(method string, args map[string]interface{}) interface{} {
 		switch method {
 		case "Mailbox/get":
 			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
 		case "Identity/get":
 			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
-		case "Email/import":
-			return map[string]interface{}{"accountId": "a1", "oldState": "s1", "newState": "s2", "created": map[string]interface{}{"0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
+		case "Email/set":
+			createdDraft = args["create"].(map[string]interface{})["e0"].(map[string]interface{})
+			return map[string]interface{}{"accountId": "a1", "oldState": "s1", "newState": "s2", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
 		case "EmailSubmission/set":
 			submitted = true
 			// onSuccessUpdateEmail produces this second, implicit response on
@@ -42,8 +44,10 @@ func TestSenderImportsAndSubmits(t *testing.T) {
 	b := s.backend(t)
 	sender := &Sender{b: b}
 	message := &mailsend.Message{
-		From: "me@example.test", To: []string{"you@example.test"}, BCC: []string{"hidden@example.test"},
-		Subject: "JMAP test", Body: "hello", MessageID: "jmap-send@example.test",
+		From: "Me <me@example.test>", To: []string{"you@example.test"}, BCC: []string{"hidden@example.test"},
+		Subject: "JMAP test", Body: "<b>hello</b>", IsHTML: true, MessageID: "<jmap-send@example.test>",
+		InReplyTo: "<parent@example.test>", References: "<root@example.test> <parent@example.test>",
+		Attachments: []mailsend.Attachment{{Filename: "note.txt", MIMEType: "text/plain", Data: []byte("attachment")}},
 	}
 	if err := sender.Send(t.Context(), message); err != nil {
 		t.Fatal(err)
@@ -51,8 +55,22 @@ func TestSenderImportsAndSubmits(t *testing.T) {
 	if !submitted {
 		t.Fatal("EmailSubmission/set was not called")
 	}
-	if !strings.Contains(string(s.uploaded), "Bcc: hidden@example.test") || !strings.Contains(string(s.uploaded), "Subject: JMAP test") {
-		t.Fatalf("uploaded MIME missing headers:\n%s", s.uploaded)
+	if string(s.uploaded) != "attachment" {
+		t.Fatalf("uploaded attachment = %q", s.uploaded)
+	}
+	if createdDraft["subject"] != "JMAP test" || createdDraft["messageId"].([]interface{})[0] != "jmap-send@example.test" {
+		t.Fatalf("structured draft headers = %#v", createdDraft)
+	}
+	if createdDraft["bodyValues"].(map[string]interface{})["body"].(map[string]interface{})["value"] != "<b>hello</b>" {
+		t.Fatalf("structured body = %#v", createdDraft["bodyValues"])
+	}
+	structure := createdDraft["bodyStructure"].(map[string]interface{})
+	parts := structure["subParts"].([]interface{})
+	if structure["type"] != "multipart/mixed" || len(parts) != 2 || parts[1].(map[string]interface{})["blobId"] != "uploaded-blob" {
+		t.Fatalf("body structure = %#v", structure)
+	}
+	if createdDraft["bcc"].([]interface{})[0].(map[string]interface{})["email"] != "hidden@example.test" {
+		t.Fatalf("structured Bcc = %#v", createdDraft["bcc"])
 	}
 }
 
@@ -109,9 +127,9 @@ func TestSenderRejectsHeaderInjection(t *testing.T) {
 	}
 }
 
-// A failed submission must not leave the imported copy in Drafts: the outbox
+// A failed submission must not leave the created copy in Drafts: the outbox
 // retries, so every attempt would otherwise add another draft.
-func TestSenderDestroysImportedDraftWhenSubmissionFails(t *testing.T) {
+func TestSenderDestroysCreatedDraftWhenSubmissionFails(t *testing.T) {
 	s := newTestJMAPServer(t)
 	var destroyed []string
 	s.handler = func(method string, args map[string]interface{}) interface{} {
@@ -120,17 +138,18 @@ func TestSenderDestroysImportedDraftWhenSubmissionFails(t *testing.T) {
 			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
 		case "Identity/get":
 			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
-		case "Email/import":
-			return map[string]interface{}{"accountId": "a1", "oldState": "s1", "newState": "s2", "created": map[string]interface{}{"0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
-		case "EmailSubmission/set":
-			return map[string]interface{}{"accountId": "a1", "oldState": "sub1", "newState": "sub1", "created": map[string]interface{}{}, "notCreated": map[string]interface{}{
-				"s0": map[string]interface{}{"type": "forbiddenFrom", "description": "identity not allowed"},
-			}}
 		case "Email/set":
+			if _, creating := args["create"]; creating {
+				return map[string]interface{}{"accountId": "a1", "oldState": "s1", "newState": "s2", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
+			}
 			for _, id := range args["destroy"].([]interface{}) {
 				destroyed = append(destroyed, id.(string))
 			}
 			return map[string]interface{}{"accountId": "a1", "oldState": "s2", "newState": "s3", "destroyed": []string{"draft-1"}, "notDestroyed": map[string]interface{}{}}
+		case "EmailSubmission/set":
+			return map[string]interface{}{"accountId": "a1", "oldState": "sub1", "newState": "sub1", "created": map[string]interface{}{}, "notCreated": map[string]interface{}{
+				"s0": map[string]interface{}{"type": "forbiddenFrom", "description": "identity not allowed"},
+			}}
 		}
 		t.Fatalf("unexpected method %s", method)
 		return nil
@@ -170,8 +189,8 @@ func TestSenderCreatesSentMailboxWhenMissing(t *testing.T) {
 			return map[string]interface{}{"accountId": "a1", "oldState": "mb1", "newState": "mb2", "created": map[string]interface{}{"sent": map[string]string{"id": "sent-id"}}, "notCreated": map[string]interface{}{}}
 		case "Identity/get":
 			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
-		case "Email/import":
-			return map[string]interface{}{"accountId": "a1", "oldState": "s1", "newState": "s2", "created": map[string]interface{}{"0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
+		case "Email/set":
+			return map[string]interface{}{"accountId": "a1", "oldState": "s1", "newState": "s2", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
 		case "EmailSubmission/set":
 			s.extra = []interface{}{[]interface{}{"Email/set", map[string]interface{}{"updated": map[string]interface{}{"draft-1": nil}}, "0"}}
 			updates, ok := args["onSuccessUpdateEmail"].(map[string]interface{})["#s0"].(map[string]interface{})
