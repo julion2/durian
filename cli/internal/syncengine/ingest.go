@@ -222,14 +222,10 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		return "", false, fmt.Errorf("insert message: %w", err)
 	}
 
-	// Store selected headers before the label-backend fast path. This also lets
-	// an existing Gmail/JMAP row acquire newly indexed headers such as Reply-To
-	// on its next re-delivery without forcing body/attachment re-processing.
-	for _, hdrName := range opts.headerSet() {
-		if v := parsed.Header.Get(hdrName); v != "" {
-			_ = db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v)
-		}
-	}
+	// Reply-To is send-critical, so persist an empty marker as well as a value.
+	// Existing label-backed rows acquire the marker on re-delivery without
+	// rewriting every indexed header before the fast path.
+	_ = db.InsertHeader(storeMsg.ID, "reply-to", parsed.Header.Get("Reply-To"))
 
 	// Fast path for a message already in the store on a label backend (the
 	// common case of a legacy->engine migration re-ingesting the whole mailbox):
@@ -241,6 +237,14 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 			return "", false, fmt.Errorf("reconcile labels: %w", err)
 		}
 		return messageID, created, nil
+	}
+
+	// Store selected headers for new or fully processed messages. Empty values
+	// are omitted except for the Reply-To marker written above.
+	for _, hdrName := range opts.headerSet() {
+		if v := parsed.Header.Get(hdrName); v != "" {
+			_ = db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v)
+		}
 	}
 
 	// Clear old attachments on upsert, then re-insert

@@ -48,6 +48,7 @@ class EmailSendingManager: ObservableObject {
     private(set) var pendingUndoInfo: PendingUndo?
     @Published private(set) var pendingReactionKeys: Set<String> = []
     private var reactionKeyByItem: [Int64: String] = [:]
+    private var reactionMonitors: [Int64: Task<Void, Never>] = [:]
 
     private init() {}
 
@@ -106,7 +107,7 @@ class EmailSendingManager: ObservableObject {
                     pending.onConfirmedSent()
                 } else {
                     let message = pending.kind == "reaction"
-                        ? "Sending reaction in \(pending.secondsLeft)s..."
+                        ? "Sending reaction in \(pending.secondsLeft)s to \(pending.recipient)..."
                         : "Sending email in \(pending.secondsLeft)s to \(pending.recipient)..."
                     BannerManager.shared.updateMessage(message)
                 }
@@ -127,7 +128,7 @@ class EmailSendingManager: ObservableObject {
 
         // Show the initial countdown banner with Undo button
         let message = kind == "reaction"
-            ? "Sending reaction in \(secondsLeft)s..."
+            ? "Sending reaction in \(secondsLeft)s to \(recipient)..."
             : "Sending email in \(secondsLeft)s to \(recipient)..."
         BannerManager.shared.showPersistentInfo(
             title: kind == "reaction" ? "Sending Reaction" : "Sending Email",
@@ -194,11 +195,12 @@ class EmailSendingManager: ObservableObject {
             return
         }
         reactionKeyByItem[itemId] = key
+        monitorReaction(itemId: itemId, sendAfter: result.sendAfter, backend: backend)
         OutboxManager.shared.refresh()
         startCountdown(
             itemId: itemId,
             draftId: UUID(),
-            recipient: "",
+            recipient: result.recipient ?? "recipient",
             threadId: threadId,
             kind: "reaction",
             onUndo: {},
@@ -211,8 +213,32 @@ class EmailSendingManager: ObservableObject {
     }
 
     private func finishReaction(itemId: Int64) {
+        reactionMonitors.removeValue(forKey: itemId)?.cancel()
         guard let key = reactionKeyByItem.removeValue(forKey: itemId) else { return }
         pendingReactionKeys.remove(key)
+    }
+
+    private func monitorReaction(itemId: Int64, sendAfter: Int64?, backend: EmailBackend) {
+        reactionMonitors[itemId]?.cancel()
+        let now = Int64(Date().timeIntervalSince1970)
+        let initialDelay = max((sendAfter ?? now) - now + 5, 5)
+        reactionMonitors[itemId] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(initialDelay) * 1_000_000_000)
+            while !Task.isCancelled {
+                if let items = await backend.listOutboxIfAvailable() {
+                    if Self.isReactionTerminal(itemId: itemId, outbox: items) {
+                        self?.finishReaction(itemId: itemId)
+                        return
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+            }
+        }
+    }
+
+    nonisolated static func isReactionTerminal(itemId: Int64, outbox: [OutboxEntry]) -> Bool {
+        guard let item = outbox.first(where: { $0.id == itemId }) else { return true }
+        return item.attempts >= 5
     }
 
     /// Send email by enqueuing to the outbox via HTTP API.

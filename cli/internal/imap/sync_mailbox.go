@@ -16,10 +16,9 @@ import (
 // listing; the runtime set is the case-insensitive union of these
 // built-ins and the user additions (see (*Syncer).headerSet).
 //
-// These seven cover ~90% of inbox-zero rule patterns: mailing-list
-// identification (List-Id, List-Unsubscribe, Precedence), automation
-// markers (X-Mailer, Return-Path), GitHub notification routing
-// (X-GitHub-Reason), and sender verification (Authentication-Results).
+// These defaults cover reply routing (Reply-To), common inbox-zero rule
+// patterns, mailing-list identification, automation markers, GitHub
+// notification routing, and sender verification.
 // Provider-specific additions like X-GitLab-NotificationReason,
 // X-Spam-Status, etc. belong in the user's indexed_headers config.
 var builtinSelectedHeaders = []string{
@@ -154,7 +153,7 @@ func (s *Syncer) storeHeadersForUID(uid uint32, rawHeader []byte, mboxState *Mai
 		return false
 	}
 	for _, hdrName := range s.headerSet() {
-		if v := parsed.Header.Get(hdrName); v != "" {
+		if v := parsed.Header.Get(hdrName); v != "" || strings.EqualFold(hdrName, "Reply-To") {
 			if err := s.store.InsertHeader(dbID, strings.ToLower(hdrName), v); err != nil {
 				slog.Debug("InsertHeader failed", "module", "SYNC", "uid", uid, "header", hdrName, "err", err) // encgrep:allow word "header" in message text, no header value logged
 			}

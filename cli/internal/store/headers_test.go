@@ -68,6 +68,21 @@ func TestHasHeaders(t *testing.T) {
 	}
 }
 
+func TestHasHeaderDistinguishesIndexedEmptyValue(t *testing.T) {
+	db := newTestDB(t)
+	msgID := insertTestMessage(t, db, "empty-reply-to@x")
+
+	if has, err := db.HasHeader(msgID, "reply-to"); err != nil || has {
+		t.Fatalf("HasHeader before insert = %v, %v", has, err)
+	}
+	if err := db.InsertHeader(msgID, "reply-to", ""); err != nil {
+		t.Fatal(err)
+	}
+	if has, err := db.HasHeader(msgID, "reply-to"); err != nil || !has {
+		t.Fatalf("HasHeader after empty insert = %v, %v", has, err)
+	}
+}
+
 func TestGetMessageDBID(t *testing.T) {
 	db := newTestDB(t)
 	insertTestMessage(t, db, "dbid@x")

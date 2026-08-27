@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -328,7 +329,8 @@ func (d *DB) GetByMessageIDAndAccount(messageID, account string) (*Message, erro
 }
 
 // GetByThread retrieves all messages in a thread, ordered by date ascending.
-// When a message exists in multiple accounts, only the first row is kept.
+// When a message exists in multiple accounts, one content row is returned with
+// every owning account recorded in Message.Accounts.
 func (d *DB) GetByThread(threadID string) ([]*Message, error) {
 	rows, err := d.db.Query(`SELECT `+messageSelectColumns+`
 		`+messageSelectFrom+`
@@ -344,16 +346,24 @@ func (d *DB) GetByThread(threadID string) ([]*Message, error) {
 		return nil, err
 	}
 
-	// Dedup: same message_id across accounts appears once in thread view.
-	// Arbitrary account is fine — tags are fetched separately and content is identical.
-	seen := make(map[string]bool, len(all))
+	// Dedup content while preserving every account that can act on the message.
+	seen := make(map[string]int, len(all))
 	deduped := make([]*Message, 0, len(all))
 	for _, msg := range all {
-		if seen[msg.MessageID] {
+		if index, ok := seen[msg.MessageID]; ok {
+			if msg.Account != "" {
+				deduped[index].Accounts = append(deduped[index].Accounts, msg.Account)
+			}
 			continue
 		}
-		seen[msg.MessageID] = true
+		seen[msg.MessageID] = len(deduped)
+		if msg.Account != "" {
+			msg.Accounts = []string{msg.Account}
+		}
 		deduped = append(deduped, msg)
+	}
+	for _, msg := range deduped {
+		sort.Strings(msg.Accounts)
 	}
 	return deduped, nil
 }

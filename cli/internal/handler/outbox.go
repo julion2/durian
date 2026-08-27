@@ -2,8 +2,10 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -110,50 +112,59 @@ func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request)
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var request reactionRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		writeReactionError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 	if h.cfg == nil {
-		http.Error(w, "Mail configuration unavailable", http.StatusServiceUnavailable)
+		writeReactionError(w, http.StatusServiceUnavailable, "Mail configuration unavailable")
 		return
 	}
 	if !mailsend.IsReactionEmoji(request.Emoji) {
-		http.Error(w, "Unsupported reaction emoji", http.StatusBadRequest)
+		writeReactionError(w, http.StatusBadRequest, "Unsupported reaction emoji")
 		return
 	}
 	account, err := h.cfg.GetAccountByIdentifier(request.Account)
 	if err != nil {
-		http.Error(w, "Unknown account", http.StatusBadRequest)
+		writeReactionError(w, http.StatusBadRequest, "Unknown account")
 		return
 	}
 	targetID := strings.Trim(mux.Vars(r)["message_id"], "<>")
 	target, err := h.store.GetByMessageIDAndAccount(targetID, account.AccountIdentifier())
 	if err != nil {
-		http.Error(w, "Failed to resolve target message", http.StatusInternalServerError)
+		writeReactionError(w, http.StatusInternalServerError, "Failed to resolve target message")
 		return
 	}
 	if target == nil {
-		http.Error(w, "Message not found for account", http.StatusNotFound)
+		writeReactionError(w, http.StatusNotFound, "Message not found for account")
+		return
+	}
+	replyToIndexed, err := h.store.HasHeader(target.ID, "reply-to")
+	if err != nil {
+		writeReactionError(w, http.StatusInternalServerError, "Failed to inspect Reply-To status")
+		return
+	}
+	if !replyToIndexed {
+		writeReactionError(w, http.StatusConflict, "Reply-To status is unavailable; sync this message before reacting")
 		return
 	}
 
 	recipient := target.FromAddr
 	if replyTo, err := h.store.GetHeader(target.ID, "reply-to"); err != nil {
-		http.Error(w, "Failed to resolve Reply-To", http.StatusInternalServerError)
+		writeReactionError(w, http.StatusInternalServerError, "Failed to resolve Reply-To")
 		return
 	} else if strings.TrimSpace(replyTo) != "" {
 		recipient = replyTo
 	}
 	parsedRecipients, err := mail.ParseAddressList(recipient)
 	if err != nil || len(parsedRecipients) != 1 {
-		http.Error(w, "Message has no single valid reply recipient", http.StatusBadRequest)
+		writeReactionError(w, http.StatusBadRequest, "Message has no single valid reply recipient")
 		return
 	}
 	recipient = parsedRecipients[0].String()
 
 	references, err := mailsend.ReactionReferences(target.Refs, target.MessageID)
 	if err != nil {
-		http.Error(w, "Message has invalid threading headers", http.StatusBadRequest)
+		writeReactionError(w, http.StatusBadRequest, "Message has invalid threading headers")
 		return
 	}
 	draft := OutboxDraft{
@@ -168,35 +179,31 @@ func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request)
 		References: references,
 	}
 
-	items, err := h.store.ListOutbox()
-	if err != nil {
-		http.Error(w, "Failed to inspect outbox", http.StatusInternalServerError)
-		return
-	}
-	for _, item := range items {
-		var pending OutboxDraft
-		if json.Unmarshal([]byte(item.DraftJSON), &pending) == nil &&
-			pending.Kind == outboxKindReaction && pending.Account == draft.Account &&
-			pending.TargetID == draft.TargetID && pending.Body == draft.Body {
-			http.Error(w, "Reaction is already pending", http.StatusConflict)
-			return
-		}
-	}
-
 	draftJSON, err := json.Marshal(draft)
 	if err != nil {
-		http.Error(w, "Failed to encode reaction", http.StatusInternalServerError)
+		writeReactionError(w, http.StatusInternalServerError, "Failed to encode reaction")
 		return
 	}
 	sendAfter := time.Now().Unix() + reactionSendDelay
-	id, err := h.store.Enqueue(string(draftJSON), sendAfter)
+	dedupeKey := sha256.Sum256([]byte(draft.Account + "\x00" + draft.TargetID + "\x00" + draft.Body))
+	id, err := h.store.EnqueueUnique(string(draftJSON), sendAfter, fmt.Sprintf("%x", dedupeKey))
+	if errors.Is(err, store.ErrOutboxDuplicate) {
+		writeReactionError(w, http.StatusConflict, "Reaction is already pending")
+		return
+	}
 	if err != nil {
-		http.Error(w, "Failed to enqueue reaction", http.StatusInternalServerError)
+		writeReactionError(w, http.StatusInternalServerError, "Failed to enqueue reaction")
 		return
 	}
 	slog.Info("Enqueued reaction", "module", "OUTBOX", "id", id, "account", draft.Account, "send_after", sendAfter)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id, "send_after": sendAfter})
+	json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id, "send_after": sendAfter, "recipient": recipient})
+}
+
+func writeReactionError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": message})
 }
 
 // ListOutboxHandler handles GET /api/v1/outbox.
@@ -492,6 +499,16 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mail
 	if err := w.store.InsertMessage(storeMsg); err != nil {
 		slog.Warn("Failed to save sent email to local store", "module", "OUTBOX", "err", err) // encgrep:allow message text, no PII attr
 		return
+	}
+	// An empty row records that Reply-To was inspected and absent. This keeps
+	// reactions to locally sent normal messages eligible without guessing.
+	if err := w.store.InsertHeader(storeMsg.ID, "reply-to", ""); err != nil {
+		slog.Warn("Failed to mark sent message Reply-To status", "module", "OUTBOX", "err", err)
+	}
+	if draft.Kind == outboxKindReaction {
+		if err := w.store.InsertHeader(storeMsg.ID, "content-disposition", "reaction"); err != nil {
+			slog.Warn("Failed to mark sent reaction", "module", "OUTBOX", "err", err)
+		}
 	}
 	if err := w.store.AddTag(storeMsg.ID, "sent"); err != nil {
 		slog.Warn("Failed to tag sent email", "module", "OUTBOX", "err", err) // encgrep:allow message text, no PII attr

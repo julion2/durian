@@ -156,6 +156,42 @@ func TestConvertThread_AllFieldsMapped(t *testing.T) {
 	}
 }
 
+func TestShowThreadExposesAllOwningAccountsWithoutChoosingOne(t *testing.T) {
+	db := newTestStore(t)
+	for _, account := range []string{"work", "personal"} {
+		if err := db.InsertMessage(&store.Message{
+			MessageID: "shared@test", Subject: "Shared", FromAddr: "sender@test",
+			Account: account, Date: 1, CreatedAt: 1, BodyText: "same",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target, _ := db.GetByMessageIDAndAccount("shared@test", "work")
+	response := New(db, nil).ShowThread(target.ThreadID)
+	if !response.OK || len(response.Thread.Messages) != 1 {
+		t.Fatalf("response = %+v", response)
+	}
+	message := response.Thread.Messages[0]
+	if message.Account != "" || strings.Join(message.Accounts, ",") != "personal,work" {
+		t.Fatalf("account selection = %q, accounts = %v", message.Account, message.Accounts)
+	}
+}
+
+func TestShowThreadMarksLocallyStoredReaction(t *testing.T) {
+	db := newTestStore(t)
+	message := seedThreadMessage(t, db, &store.Message{
+		MessageID: "reaction@test", Subject: "Re: Hello", FromAddr: "me@test",
+		Account: "work", Date: 1, CreatedAt: 1, BodyText: "👍",
+	})
+	if err := db.InsertHeader(message.ID, "content-disposition", "reaction"); err != nil {
+		t.Fatal(err)
+	}
+	response := New(db, nil).ShowThread(message.ThreadID)
+	if !response.OK || len(response.Thread.Messages) != 1 || !response.Thread.Messages[0].IsReaction {
+		t.Fatalf("reaction response = %+v", response)
+	}
+}
+
 // --- Quote stripping is applied ---
 
 func TestConvertThread_StripsQuotedHTML(t *testing.T) {

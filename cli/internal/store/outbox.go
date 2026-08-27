@@ -2,23 +2,52 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
+
+// ErrOutboxDuplicate means an item with the same non-empty deduplication key
+// is already queued.
+var ErrOutboxDuplicate = errors.New("outbox item already queued")
 
 // Enqueue adds a draft to the outbox for sending.
 // sendAfter is a Unix timestamp before which the worker will not dequeue this item.
 // Use 0 for immediate sending.
 func (d *DB) Enqueue(draftJSON string, sendAfter int64) (int64, error) {
+	return d.enqueue(draftJSON, sendAfter, "")
+}
+
+// EnqueueUnique atomically adds an item unless dedupeKey is already present.
+func (d *DB) EnqueueUnique(draftJSON string, sendAfter int64, dedupeKey string) (int64, error) {
+	if dedupeKey == "" {
+		return 0, fmt.Errorf("enqueue unique: empty dedupe key")
+	}
+	return d.enqueue(draftJSON, sendAfter, dedupeKey)
+}
+
+func (d *DB) enqueue(draftJSON string, sendAfter int64, dedupeKey string) (int64, error) {
 	ct, err := d.encryptDraftJSON(draftJSON)
 	if err != nil {
 		return 0, fmt.Errorf("encrypt draft_json: %w", err)
 	}
-	result, err := d.db.Exec(
-		"INSERT INTO outbox (draft_json_ct, created_at, send_after) VALUES (?, ?, ?)",
-		ct, time.Now().Unix(), sendAfter)
+	var result sql.Result
+	if dedupeKey == "" {
+		result, err = d.db.Exec(
+			"INSERT INTO outbox (draft_json_ct, created_at, send_after) VALUES (?, ?, ?)",
+			ct, time.Now().Unix(), sendAfter)
+	} else {
+		result, err = d.db.Exec(
+			"INSERT OR IGNORE INTO outbox (draft_json_ct, created_at, send_after, dedupe_key) VALUES (?, ?, ?, ?)",
+			ct, time.Now().Unix(), sendAfter, dedupeKey)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("enqueue: %w", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		return 0, fmt.Errorf("enqueue rows affected: %w", err)
+	} else if rows == 0 {
+		return 0, ErrOutboxDuplicate
 	}
 	return result.LastInsertId()
 }

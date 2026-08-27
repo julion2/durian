@@ -24,7 +24,7 @@ struct ThreadMessageCardView: View {
     let onForward: () -> Void
     var onEditDraft: (() -> Void)? = nil
 
-    @StateObject private var sendingManager = EmailSendingManager.shared
+    @ObservedObject private var sendingManager = EmailSendingManager.shared
 
     // Each card manages its own expanded state
     @State private var isDetailsExpanded: Bool = false
@@ -165,7 +165,7 @@ struct ThreadMessageCardView: View {
                 .foregroundColor(Color.Detail.textTertiary)
                 .lineLimit(1)
 
-            if !message.isDraft {
+            if !message.isDraft, !message.isReaction {
                 reactionMenu
             }
         }
@@ -605,19 +605,14 @@ struct ThreadMessageCardView: View {
     @ViewBuilder
     private var reactionMenu: some View {
         Menu {
-            ForEach(EmailSendingManager.reactionOptions) { option in
-                Button("\(option.label) \(option.emoji)") {
-                    guard let account = message.account else { return }
-                    Task {
-                        await sendingManager.sendReaction(
-                            messageId: message.id,
-                            account: account,
-                            emoji: option.emoji,
-                            threadId: email.id
-                        )
+            if message.reactionAccounts.count == 1, let account = message.reactionAccounts.first {
+                reactionButtons(account: account, includeAccountInLabel: false)
+            } else {
+                ForEach(message.reactionAccounts, id: \.self) { account in
+                    Menu(accountLabel(account)) {
+                        reactionButtons(account: account, includeAccountInLabel: true)
                     }
                 }
-                .accessibilityLabel("React with \(option.label)")
             }
         } label: {
             Image(systemName: "face.smiling")
@@ -627,14 +622,43 @@ struct ThreadMessageCardView: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
-        .disabled(message.account == nil || reactionPending)
+        .disabled(message.reactionAccounts.isEmpty || reactionPending)
         .help(reactionPending ? "Reaction pending" : "React with emoji")
         .accessibilityLabel("React to this message")
     }
 
     private var reactionPending: Bool {
-        guard let account = message.account else { return false }
-        return sendingManager.isReactionPending(messageId: message.id, account: account)
+        message.reactionAccounts.contains {
+            sendingManager.isReactionPending(messageId: message.id, account: $0)
+        }
+    }
+
+    @ViewBuilder
+    private func reactionButtons(account: String, includeAccountInLabel: Bool) -> some View {
+        ForEach(EmailSendingManager.reactionOptions) { option in
+            Button("\(option.label) \(option.emoji)") {
+                Task {
+                    await sendingManager.sendReaction(
+                        messageId: message.id,
+                        account: account,
+                        emoji: option.emoji,
+                        threadId: email.id
+                    )
+                }
+            }
+            .accessibilityLabel(
+                includeAccountInLabel
+                    ? "React with \(option.label) from \(accountLabel(account))"
+                    : "React with \(option.label)"
+            )
+        }
+    }
+
+    private func accountLabel(_ identifier: String) -> String {
+        guard let account = ConfigManager.shared.getAccounts().first(where: {
+            $0.name.caseInsensitiveCompare(identifier) == .orderedSame
+        }) else { return identifier }
+        return "\(account.name) (\(account.email))"
     }
 
     @ViewBuilder

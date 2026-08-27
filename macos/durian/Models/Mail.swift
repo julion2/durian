@@ -26,6 +26,8 @@ struct AttachmentInfo: Decodable, Equatable {
 struct ThreadMessage: Decodable, Identifiable, Equatable {
     let id: String
     let account: String?
+    let accounts: [String]?
+    let is_reaction: Bool?
     let from: String
     let to: String?
     let cc: String?
@@ -43,6 +45,14 @@ struct ThreadMessage: Decodable, Identifiable, Equatable {
     var isDraft: Bool {
         tags?.contains("draft") ?? false
     }
+
+    var reactionAccounts: [String] {
+        if let accounts, !accounts.isEmpty { return accounts }
+        if let account, !account.isEmpty { return [account] }
+        return []
+    }
+
+    var isReaction: Bool { is_reaction ?? false }
 }
 
 // MARK: - Email Body State

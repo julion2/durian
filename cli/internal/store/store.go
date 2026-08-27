@@ -1072,6 +1072,24 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 26 {
+		has, err := hasColumn(d.db, "outbox", "dedupe_key")
+		if err != nil {
+			return fmt.Errorf("migrate v25→v26 inspect dedupe_key: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE outbox ADD COLUMN dedupe_key TEXT"); err != nil {
+				return fmt.Errorf("migrate v25→v26 add dedupe_key: %w", err)
+			}
+		}
+		if _, err := d.db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_dedupe_key ON outbox(dedupe_key) WHERE dedupe_key IS NOT NULL"); err != nil {
+			return fmt.Errorf("migrate v25→v26 index dedupe_key: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 26 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v25→v26 bump: %w", err)
+		}
+	}
+
 	return nil
 }
 

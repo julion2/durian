@@ -366,12 +366,20 @@ paths:
       responses:
         '200':
           description: Reaction enqueued with the server-defined Undo Send delay
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReactionEnqueueResponse'
         '400':
           description: Invalid account, emoji, recipient, or threading headers
         '404':
           description: Message not found in the requested account
         '409':
-          description: The same reaction is already pending
+          description: The same reaction is pending or Reply-To was never indexed
+        '500':
+          description: Target resolution or enqueue failed
+        '503':
+          description: Mail configuration is unavailable
   /outbox:
     get:
       summary: List all outbox items
@@ -828,6 +836,14 @@ components:
           type: string
         account:
           type: string
+          description: Present for backward compatibility when exactly one account owns the message
+        accounts:
+          type: array
+          items:
+            type: string
+          description: All accounts that own this Message-ID
+        is_reaction:
+          type: boolean
         from:
           type: string
         to:
@@ -935,6 +951,24 @@ components:
       required:
         - account
         - emoji
+    ReactionEnqueueResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        id:
+          type: integer
+          format: int64
+        send_after:
+          type: integer
+          format: int64
+        recipient:
+          type: string
+      required:
+        - ok
+        - id
+        - send_after
+        - recipient
     OutboxAttachment:
       type: object
       properties:

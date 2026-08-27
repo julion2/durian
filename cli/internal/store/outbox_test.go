@@ -1,6 +1,8 @@
 package store
 
 import (
+	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -181,6 +183,59 @@ func TestDeleteOutboxItemNotFound(t *testing.T) {
 	err := db.DeleteOutboxItem(999)
 	if err == nil {
 		t.Error("expected error for nonexistent item")
+	}
+}
+
+func TestEnqueueUniqueRejectsDuplicateUntilDeleted(t *testing.T) {
+	db := newTestDB(t)
+
+	id, err := db.EnqueueUnique(`{"kind":"reaction"}`, 0, "reaction-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnqueueUnique(`{"kind":"reaction"}`, 0, "reaction-key"); !errors.Is(err, ErrOutboxDuplicate) {
+		t.Fatalf("duplicate error = %v, want ErrOutboxDuplicate", err)
+	}
+	if err := db.DeleteOutboxItem(id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnqueueUnique(`{"kind":"reaction"}`, 0, "reaction-key"); err != nil {
+		t.Fatalf("enqueue after delete: %v", err)
+	}
+}
+
+func TestEnqueueUniqueIsAtomicAcrossConcurrentRequests(t *testing.T) {
+	db := newTestDB(t)
+	const requests = 12
+	start := make(chan struct{})
+	results := make(chan error, requests)
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := db.EnqueueUnique(`{"kind":"reaction"}`, 0, "concurrent-key")
+			results <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var inserted, duplicates int
+	for err := range results {
+		switch {
+		case err == nil:
+			inserted++
+		case errors.Is(err, ErrOutboxDuplicate):
+			duplicates++
+		default:
+			t.Fatalf("unexpected enqueue error: %v", err)
+		}
+	}
+	if inserted != 1 || duplicates != requests-1 {
+		t.Fatalf("inserted=%d duplicates=%d", inserted, duplicates)
 	}
 }
 

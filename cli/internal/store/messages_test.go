@@ -1,6 +1,7 @@
 package store
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -339,6 +340,29 @@ func TestGetByThread(t *testing.T) {
 	// Should be ordered by date ascending
 	if msgs[0].MessageID != "t-root@x" {
 		t.Errorf("first message = %q, want t-root@x", msgs[0].MessageID)
+	}
+}
+
+func TestGetByThreadPreservesAllOwningAccounts(t *testing.T) {
+	db := newTestDB(t)
+	for _, account := range []string{"work", "personal"} {
+		if err := db.InsertMessage(&Message{
+			MessageID: "shared@x", Subject: "Shared", FromAddr: "a@x",
+			Account: account, Date: 1, CreatedAt: 1, FetchedBody: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	message, err := db.GetByMessageIDAndAccount("shared@x", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages, err := db.GetByThread(message.ThreadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || strings.Join(messages[0].Accounts, ",") != "personal,work" {
+		t.Fatalf("deduplicated accounts = %#v", messages)
 	}
 }
 

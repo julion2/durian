@@ -855,6 +855,25 @@ func TestEngineReplacementSkipsPermanentHydratedIngestFailure(t *testing.T) {
 	}
 }
 
+func TestIngestRecordsAbsentReplyToAsIndexed(t *testing.T) {
+	db := newTestDB(t)
+	message := backend.Message{
+		MessageID: "reply-marker@example.com",
+		Ref:       backend.RemoteRef{Folder: "INBOX", ID: "reply-marker"},
+		Raw:       rawMessage("reply-marker@example.com", "a@example.com", testAccount, "Marker", "body"),
+	}
+	if _, _, err := Ingest(db, message, "INBOX", backend.RoleInbox, IngestOptions{Account: testAccount}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.GetByMessageIDAndAccount(message.MessageID, testAccount)
+	if err != nil || stored == nil {
+		t.Fatalf("stored message = %v, %v", stored, err)
+	}
+	if has, err := db.HasHeader(stored.ID, "reply-to"); err != nil || !has {
+		t.Fatalf("Reply-To marker = %v, %v", has, err)
+	}
+}
+
 func TestEngineReplacementPreservesExistingRefAfterPermanentIngestFailure(t *testing.T) {
 	db := newTestDB(t)
 	cursors := newMemCursorStore()

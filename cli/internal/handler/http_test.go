@@ -466,7 +466,8 @@ func TestReactionEnqueueDerivesAccountScopedReply(t *testing.T) {
 		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
 	}
 	var response struct {
-		SendAfter int64 `json:"send_after"`
+		SendAfter int64  `json:"send_after"`
+		Recipient string `json:"recipient"`
 	}
 	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
 		t.Fatal(err)
@@ -474,6 +475,9 @@ func TestReactionEnqueueDerivesAccountScopedReply(t *testing.T) {
 	delay := response.SendAfter - time.Now().Unix()
 	if delay < reactionSendDelay-1 || delay > reactionSendDelay {
 		t.Errorf("reaction delay = %ds, want %ds", delay, reactionSendDelay)
+	}
+	if response.Recipient != `"Replies" <reply@test>` {
+		t.Errorf("response recipient = %q", response.Recipient)
 	}
 	items, err := db.ListOutbox()
 	if err != nil || len(items) != 1 {
@@ -499,27 +503,41 @@ func TestReactionRejectsUnsupportedDuplicateAndWrongAccount(t *testing.T) {
 	h := New(db, nil)
 	h.SetConfig(&config.Config{Accounts: []config.AccountConfig{{Name: "Work", Email: "me@work.test"}, {Name: "Personal", Email: "me@personal.test"}}})
 	r := newTestRouter(h, nil)
-	post := func(body string) int {
+	post := func(body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("POST", "/api/v1/messages/target@test/reactions", strings.NewReader(body))
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
-		return w.Code
+		return w
 	}
-	if got := post(`{"account":"work","emoji":"🔥"}`); got != http.StatusBadRequest {
-		t.Errorf("unsupported emoji status = %d", got)
+	if got := post(`{"account":"work","emoji":"🔥"}`); got.Code != http.StatusBadRequest {
+		t.Errorf("unsupported emoji status = %d", got.Code)
 	}
-	if got := post(`{"account":"personal","emoji":"👍"}`); got != http.StatusNotFound {
-		t.Errorf("wrong account status = %d", got)
+	if got := post(`{"account":"personal","emoji":"👍"}`); got.Code != http.StatusNotFound {
+		t.Errorf("wrong account status = %d", got.Code)
 	}
-	if got := post(`{"account":"work","emoji":"👍"}`); got != http.StatusOK {
-		t.Fatalf("first status = %d", got)
+	if got := post(`{"account":"work","emoji":"👍"}`); got.Code != http.StatusConflict || !strings.Contains(got.Body.String(), "sync this message") {
+		t.Fatalf("unindexed Reply-To response = %d %s", got.Code, got.Body.String())
 	}
-	if got := post(`{"account":"work","emoji":"👍"}`); got != http.StatusConflict {
-		t.Errorf("duplicate status = %d", got)
+	target, _ := db.GetByMessageIDAndAccount("target@test", "work")
+	if err := db.InsertHeader(target.ID, "reply-to", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := post(`{"account":"work","emoji":"👍"}`); got.Code != http.StatusOK {
+		t.Fatalf("first status = %d", got.Code)
+	}
+	if got := post(`{"account":"work","emoji":"👍"}`); got.Code != http.StatusConflict || !strings.Contains(got.Body.String(), "already pending") {
+		t.Errorf("duplicate response = %d %s", got.Code, got.Body.String())
 	}
 	items, err := db.ListOutbox()
 	if err != nil || len(items) != 1 {
 		t.Fatalf("outbox = %v err=%v", items, err)
+	}
+	var fallbackDraft OutboxDraft
+	if err := json.Unmarshal([]byte(items[0].DraftJSON), &fallbackDraft); err != nil {
+		t.Fatal(err)
+	}
+	if len(fallbackDraft.To) != 1 || fallbackDraft.To[0] != "<author@test>" {
+		t.Fatalf("From fallback recipient = %v", fallbackDraft.To)
 	}
 	req := httptest.NewRequest("DELETE", fmt.Sprintf("/api/v1/outbox/%d", items[0].ID), nil)
 	w := httptest.NewRecorder()
@@ -527,8 +545,8 @@ func TestReactionRejectsUnsupportedDuplicateAndWrongAccount(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("undo status = %d", w.Code)
 	}
-	if got := post(`{"account":"work","emoji":"👍"}`); got != http.StatusOK {
-		t.Errorf("status after undo = %d, want 200", got)
+	if got := post(`{"account":"work","emoji":"👍"}`); got.Code != http.StatusOK {
+		t.Errorf("status after undo = %d, want 200", got.Code)
 	}
 }
 

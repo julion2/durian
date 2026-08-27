@@ -9,6 +9,14 @@ final class EmailSendingManagerTests: XCTestCase {
         XCTAssertEqual(Set(EmailSendingManager.reactionOptions.map(\.id)).count, EmailSendingManager.reactionOptions.count)
     }
 
+    func testReactionReconciliationRecognizesSentAndPoisonedItems() {
+        let pending = OutboxEntry(id: 1, subject: "Re: Hi", to: "to@test", attempts: 1, last_error: nil, created_at: 1)
+        let poisoned = OutboxEntry(id: 2, subject: "Re: Hi", to: "to@test", attempts: 5, last_error: "failed", created_at: 1)
+        XCTAssertFalse(EmailSendingManager.isReactionTerminal(itemId: 1, outbox: [pending]))
+        XCTAssertTrue(EmailSendingManager.isReactionTerminal(itemId: 2, outbox: [poisoned]))
+        XCTAssertTrue(EmailSendingManager.isReactionTerminal(itemId: 3, outbox: [pending]))
+    }
+
     // MARK: - stripStyleTags
 
     func testStripsSingleStyleBlock() {

@@ -30,6 +30,9 @@ type Message struct {
 	// Account is the account identifier for this message (e.g. "work").
 	// Each account has its own row — UNIQUE(message_id, account).
 	Account string
+	// Accounts contains every account that owns this Message-ID when a thread
+	// query deduplicates otherwise-identical rows. It is not persisted.
+	Accounts []string
 }
 
 // Attachment represents file metadata attached to a message.

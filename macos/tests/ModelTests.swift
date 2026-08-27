@@ -7,12 +7,20 @@ final class ModelTests: XCTestCase {
         let data = Data(#"{"id":"message@test","account":"work","from":"sender@test","date":"Thu, 27 Aug 2026 12:00:00 +0000","timestamp":1,"body":"Hello"}"#.utf8)
         let message = try JSONDecoder().decode(ThreadMessage.self, from: data)
         XCTAssertEqual(message.account, "work")
+        XCTAssertEqual(message.reactionAccounts, ["work"])
     }
 
     func testThreadMessageAccountIsBackwardCompatible() throws {
         let data = Data(#"{"id":"message@test","from":"sender@test","date":"Thu, 27 Aug 2026 12:00:00 +0000","timestamp":1,"body":"Hello"}"#.utf8)
         let message = try JSONDecoder().decode(ThreadMessage.self, from: data)
         XCTAssertNil(message.account)
+    }
+
+    func testThreadMessagePreservesMultipleReactionAccounts() throws {
+        let data = Data(#"{"id":"message@test","accounts":["personal","work"],"is_reaction":true,"from":"sender@test","date":"Thu, 27 Aug 2026 12:00:00 +0000","timestamp":1,"body":"👍"}"#.utf8)
+        let message = try JSONDecoder().decode(ThreadMessage.self, from: data)
+        XCTAssertEqual(message.reactionAccounts, ["personal", "work"])
+        XCTAssertTrue(message.isReaction)
     }
 
     // MARK: - MailFolder (tag init)

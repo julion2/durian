@@ -82,9 +82,13 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 	var subject string
 
 	for _, msg := range msgs {
+		accounts := msg.Accounts
+		if len(accounts) == 0 && msg.Account != "" {
+			accounts = []string{msg.Account}
+		}
 		info := internmail.MessageInfo{
 			ID:        msg.MessageID,
-			Account:   msg.Account,
+			Accounts:  accounts,
 			From:      msg.FromAddr,
 			To:        msg.ToAddrs,
 			CC:        msg.CCAddrs,
@@ -93,10 +97,16 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 			MessageID: msg.MessageID,
 			Body:      sanitize.StripQuotedTextContent(msg.BodyText),
 		}
+		if len(accounts) == 1 {
+			info.Account = accounts[0]
+		}
 		if !light {
 			info.InReplyTo = msg.InReplyTo
 			info.References = msg.Refs
 			info.HTML = sanitize.StripQuotedContent(msg.BodyHTML)
+			if disposition, err := h.store.GetHeader(msg.ID, "content-disposition"); err == nil {
+				info.IsReaction = strings.EqualFold(strings.TrimSpace(disposition), "reaction")
+			}
 		}
 
 		if subject == "" {

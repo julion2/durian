@@ -748,17 +748,18 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
 
     /// Enqueue an account-scoped RFC 9078 reaction. Recipients and MIME are
     /// deliberately derived by the CLI, never supplied by the GUI.
-    func enqueueReaction(messageId: String, account: String, emoji: String) async -> (ok: Bool, id: Int64?, sendAfter: Int64?, error: String?) {
+    func enqueueReaction(messageId: String, account: String, emoji: String) async -> (ok: Bool, id: Int64?, sendAfter: Int64?, recipient: String?, error: String?) {
         struct EnqueueResponse: Decodable {
             let ok: Bool
             let id: Int64?
             let send_after: Int64?
+            let recipient: String?
             let error: String?
         }
         var allowed = CharacterSet.urlPathAllowed
         allowed.remove(charactersIn: "/")
         guard let encodedId = messageId.addingPercentEncoding(withAllowedCharacters: allowed) else {
-            return (false, nil, nil, "Invalid message identifier")
+            return (false, nil, nil, nil, "Invalid message identifier")
         }
         let response: EnqueueResponse? = await request(
             endpoint: "/messages/\(encodedId)/reactions",
@@ -766,15 +767,20 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
             body: ReactionPayload(account: account, emoji: emoji)
         )
         if let response, response.ok {
-            return (true, response.id, response.send_after, nil)
+            return (true, response.id, response.send_after, response.recipient, nil)
         }
-        return (false, nil, nil, response?.error ?? "Failed to enqueue reaction")
+        return (false, nil, nil, nil, response?.error ?? "Failed to enqueue reaction")
     }
 
     /// List all outbox items.
     func listOutbox() async -> [OutboxEntry] {
-        let results: [OutboxEntry]? = await request(endpoint: "/outbox")
-        return results ?? []
+        await listOutboxIfAvailable() ?? []
+    }
+
+    /// Returns nil when the server cannot be reached or decoded, so callers
+    /// can distinguish an empty outbox from a failed reconciliation request.
+    func listOutboxIfAvailable() async -> [OutboxEntry]? {
+        await request(endpoint: "/outbox")
     }
 
     /// Delete an outbox item by ID.
