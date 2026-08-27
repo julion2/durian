@@ -64,6 +64,28 @@ func TestMessageBuild(t *testing.T) {
 	}
 }
 
+func TestMessageBuildDraftRetainsBcc(t *testing.T) {
+	msg := &Message{
+		From: "sender@example.com", To: []string{"recipient@example.com"},
+		BCC: []string{"hidden@example.com"}, Subject: "Draft", Body: "Body",
+	}
+
+	transport, err := msg.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(transport), "Bcc:") {
+		t.Fatal("transport message contains Bcc header")
+	}
+	draft, err := msg.BuildDraft()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(draft), "Bcc: hidden@example.com") {
+		t.Fatal("persisted draft is missing Bcc header")
+	}
+}
+
 func TestMessageBuildWithAttachment(t *testing.T) {
 	msg := &Message{
 		From:    "sender@example.com",
