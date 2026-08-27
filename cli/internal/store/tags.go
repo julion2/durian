@@ -55,34 +55,49 @@ func (d *DB) UntagThread(threadID, tag string) error {
 }
 
 // ModifyTagsByThread atomically adds and removes tags for all messages in a thread.
-func (d *DB) ModifyTagsByThread(threadID string, addTags, removeTags []string) error {
+// It reports whether any stored tag changed.
+func (d *DB) ModifyTagsByThread(threadID string, addTags, removeTags []string) (bool, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+		return false, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
+	changed := false
 	for _, tag := range addTags {
-		_, err := tx.Exec(`
+		result, err := tx.Exec(`
 			INSERT OR IGNORE INTO tags (message_id, tag)
 			SELECT id, ? FROM messages WHERE thread_id = ?`,
 			tag, threadID)
 		if err != nil {
-			return fmt.Errorf("add tag %q: %w", tag, err)
+			return false, fmt.Errorf("add tag %q: %w", tag, err)
 		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("count added tag %q: %w", tag, err)
+		}
+		changed = changed || rows > 0
 	}
 
 	for _, tag := range removeTags {
-		_, err := tx.Exec(`
+		result, err := tx.Exec(`
 			DELETE FROM tags WHERE tag = ? AND message_id IN (
 				SELECT id FROM messages WHERE thread_id = ?
 			)`, tag, threadID)
 		if err != nil {
-			return fmt.Errorf("remove tag %q: %w", tag, err)
+			return false, fmt.Errorf("remove tag %q: %w", tag, err)
 		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("count removed tag %q: %w", tag, err)
+		}
+		changed = changed || rows > 0
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return changed, nil
 }
 
 // GetMessageTagsBatch returns tags for multiple messages in a single query.
