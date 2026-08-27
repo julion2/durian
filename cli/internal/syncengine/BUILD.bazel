@@ -29,7 +29,6 @@ go_test(
     deps = [
         "//cli/internal/backend",
         "//cli/internal/dbcrypto",
-        "//cli/internal/imap",
         "//cli/internal/store",
     ],
 )

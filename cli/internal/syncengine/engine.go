@@ -69,8 +69,8 @@ type Options struct {
 	// cursors.
 	DryRun bool
 	// NoFlags skips the per-folder flag reconciliation pass entirely (parity
-	// with the legacy --no-flags). Messages still get their flag-derived tags
-	// at ingest time; only the three-way upload/download pass is disabled.
+	// with the legacy --no-flags). Delta-carried flag work is retained for the
+	// next sync that enables reconciliation.
 	NoFlags bool
 	// OnProgress, if set, is called after each fetched page with the running
 	// count of messages ingested this run — for a live progress line during a
@@ -753,8 +753,13 @@ type flagReconcileResult struct {
 func (r flagReconcileResult) failed() bool { return r.fetchFailed || r.reconcileFailed }
 
 func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, folder backend.Folder, deltaFlags map[string]backend.Flags, pendingFlags PendingFlags, result *Result) flagReconcileResult {
-	if e.opts.NoFlags || e.opts.DryRun {
+	if e.opts.DryRun {
 		return flagReconcileResult{pendingFlags: pendingFlags}
+	}
+	if e.opts.NoFlags {
+		return flagReconcileResult{
+			pendingFlags: mergePendingFlags(pendingFlags, pendingFlagsFromMap(deltaFlags)),
+		}
 	}
 	if ctx.Err() != nil {
 		return flagReconcileResult{

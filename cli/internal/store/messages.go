@@ -3,7 +3,9 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
+	"unicode"
 )
 
 const syncedFlagsEmpty = "$DurianEmpty"
@@ -39,18 +41,35 @@ func nullableID(id int64) any {
 
 // InsertMessage inserts or upserts a single message, resolving its thread ID.
 func (d *DB) InsertMessage(msg *Message) error {
-	_, err := d.upsertMessage(msg)
-	return err
+	_, err := d.upsertMessage(msg, nil)
+	if err != nil {
+		return fmt.Errorf("insert message: %w", err)
+	}
+	return nil
 }
 
 // UpsertMessage inserts or updates a message and reports whether this call
 // created the row. The result is determined inside the write transaction, so
 // it remains authoritative when multiple Durian processes ingest concurrently.
 func (d *DB) UpsertMessage(msg *Message) (bool, error) {
-	return d.upsertMessage(msg)
+	created, err := d.upsertMessage(msg, nil)
+	if err != nil {
+		return false, fmt.Errorf("upsert message: %w", err)
+	}
+	return created, nil
 }
 
-func (d *DB) upsertMessage(msg *Message) (bool, error) {
+// UpsertMessageWithInitialTags atomically seeds tags when this call creates the
+// message. Existing rows are updated without touching their local tags.
+func (d *DB) UpsertMessageWithInitialTags(msg *Message, initialTags []string) (bool, error) {
+	created, err := d.upsertMessage(msg, initialTags)
+	if err != nil {
+		return false, fmt.Errorf("upsert message with initial tags: %w", err)
+	}
+	return created, nil
+}
+
+func (d *DB) upsertMessage(msg *Message, initialTags []string) (bool, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return false, fmt.Errorf("begin transaction: %w", err)
@@ -59,10 +78,19 @@ func (d *DB) upsertMessage(msg *Message) (bool, error) {
 
 	var created bool
 	if err := d.insertMessageTx(tx, msg, &created); err != nil {
-		return false, err
+		return false, fmt.Errorf("write message: %w", err)
+	}
+	if created {
+		for _, tag := range initialTags {
+			if _, err := tx.Exec(
+				"INSERT OR IGNORE INTO tags (message_id, tag) VALUES (?, ?)",
+				msg.ID, tag); err != nil {
+				return false, fmt.Errorf("add initial tag %q: %w", tag, err)
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
-		return false, err
+		return false, fmt.Errorf("commit message upsert: %w", err)
 	}
 	return created, nil
 }
@@ -82,7 +110,10 @@ func (d *DB) InsertBatch(msgs []*Message) error {
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit message batch: %w", err)
+	}
+	return nil
 }
 
 // insertMessageTx inserts a message within an existing transaction.
@@ -146,11 +177,10 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 		return fmt.Errorf("resolve account: %w", err)
 	}
 
-	// getOrCreateMailbox/account have already performed writes in this
-	// transaction, serializing this existence check with competing Durian
-	// processes. Besides producing an authoritative created result, this is the
-	// only point that can capture the old provider flags before the upsert below
-	// overwrites them.
+	// Open configures BEGIN IMMEDIATE, so competing Durian processes serialize
+	// before this existence check even when mailbox and account are empty. This
+	// is the only point that can capture the old provider flags before the upsert
+	// below overwrites them.
 	var existingID int64
 	var storedBaseline string
 	err = tx.QueryRow(`SELECT id, synced_flags FROM messages
@@ -179,7 +209,12 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 		// ingest. A legacy row crosses this transition exactly once.
 		flagsOther, err := d.decryptMeta("", flagsOtherCT)
 		if err != nil {
-			return fmt.Errorf("decrypt flag baseline before image: %w", err)
+			// The plaintext boolean columns still provide a useful baseline. Do
+			// not permanently block this row (or roll back healthy batch siblings)
+			// because encrypted auxiliary flags were already damaged.
+			slog.Warn("Could not decrypt legacy baseline; capturing provider booleans only",
+				"module", "STORE", "err", err)
+			flagsOther = ""
 		}
 		captured := syncedFlagBaseline(isSeen, isFlagged, isDeleted, flagsOther)
 		if _, err := tx.Exec(`UPDATE messages SET synced_flags = ?
@@ -309,7 +344,9 @@ func syncedFlagBaseline(isSeen, isFlagged, isDeleted bool, flagsOther string) st
 	if isDeleted {
 		present[`\Deleted`] = true
 	}
-	for _, flag := range strings.Fields(flagsOther) {
+	for _, flag := range strings.FieldsFunc(flagsOther, func(r rune) bool {
+		return r == ',' || unicode.IsSpace(r)
+	}) {
 		switch flag {
 		case `\Answered`, "$Completed":
 			present[flag] = true

@@ -179,6 +179,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	// byte-identical with rows written by the legacy syncer.
 	flagState := flagStateFromBackend(msg.Flags)
 	flagStr := strings.Join(flagState.ToIMAPFlags(), ",")
+	flagAdd, _ := flagState.ToTagOps()
 
 	storeMsg := &store.Message{
 		MessageID: messageID,
@@ -210,7 +211,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		SyncedFlagsInitialized: true,
 	}
 
-	created, err := db.UpsertMessage(storeMsg)
+	created, err := db.UpsertMessageWithInitialTags(storeMsg, flagAdd)
 	if err != nil {
 		return "", false, fmt.Errorf("insert message: %w", err)
 	}
@@ -266,18 +267,6 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		for _, tag := range mapping.addTags {
 			if err := db.AddTag(storeMsg.ID, tag); err != nil {
 				return "", false, fmt.Errorf("add folder tag %q: %w", tag, err)
-			}
-		}
-	}
-
-	// Seed flag-derived tags only for a row this transaction created. Existing
-	// rows belong to the three-way reconciliation: applying the server's add
-	// half here would erase a concurrent local mutation before it can be merged.
-	if created {
-		flagAdd, _ := flagState.ToTagOps()
-		for _, tag := range flagAdd {
-			if err := db.AddTag(storeMsg.ID, tag); err != nil {
-				return "", false, fmt.Errorf("add flag tag %q: %w", tag, err)
 			}
 		}
 	}

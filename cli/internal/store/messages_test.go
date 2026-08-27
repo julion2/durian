@@ -1,7 +1,9 @@
 package store
 
 import (
+	"fmt"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -272,6 +274,38 @@ func TestUpsertMessageCapturesLegacyFlagBeforeImage(t *testing.T) {
 	}
 }
 
+func TestUpsertMessageCapturesCommaSeparatedOtherFlags(t *testing.T) {
+	db := newTestDB(t)
+	msg := &Message{
+		MessageID: "legacy-other-flags@example.com", Subject: "legacy", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1", FetchedBody: true,
+	}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatal(err)
+	}
+	legacyCT, err := db.encryptMeta(`\Answered,$Completed,keyword,with,commas`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("UPDATE messages SET flags_other = ? WHERE id = ?", legacyCT, msg.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertMessage(&Message{
+		MessageID: msg.MessageID, Subject: "delta", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1",
+		SyncedFlagsInitialized: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows=%+v err=%v", rows, err)
+	}
+	if got, want := rows[0].SyncedFlags, `\Answered,$Completed`; got != want {
+		t.Fatalf("captured baseline=%q, want %q", got, want)
+	}
+}
+
 func TestExplicitEmptySyncedFlagsUsesStoreSentinel(t *testing.T) {
 	db := newTestDB(t)
 	msg := &Message{
@@ -327,6 +361,85 @@ func TestInitializedUpsertDoesNotDecryptStoredFlags(t *testing.T) {
 	}
 }
 
+func TestCorruptLegacyFlagsDoNotBlockBatchIngest(t *testing.T) {
+	db := newTestDB(t)
+	corrupt := &Message{
+		MessageID: "corrupt@example.com", Subject: "before", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1", Flags: `\Seen`, FetchedBody: true,
+	}
+	if err := db.InsertMessage(corrupt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("UPDATE messages SET flags_other = X'010203' WHERE id = ?", corrupt.ID); err != nil {
+		t.Fatal(err)
+	}
+	healthy := &Message{
+		MessageID: "healthy@example.com", Subject: "healthy", Date: 2, CreatedAt: 2,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r2", FetchedBody: true,
+		SyncedFlagsInitialized: true,
+	}
+	corruptUpdate := &Message{
+		MessageID: corrupt.MessageID, Subject: "after", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1", FetchedBody: true,
+		SyncedFlagsInitialized: true,
+	}
+	if err := db.InsertBatch([]*Message{corruptUpdate, healthy}); err != nil {
+		t.Fatalf("batch ingest: %v", err)
+	}
+	if got, err := db.GetByMessageID(corrupt.MessageID); err != nil || got.Subject != "after" {
+		t.Fatalf("corrupt row after ingest=%+v err=%v", got, err)
+	}
+	if got, err := db.GetByMessageID(healthy.MessageID); err != nil || got == nil {
+		t.Fatalf("healthy sibling=%+v err=%v", got, err)
+	}
+	rows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, row := range rows {
+		if row.MessageID == corrupt.MessageID {
+			found = true
+			if row.SyncedFlags != `\Seen` || !row.SyncedFlagsInitialized {
+				t.Fatalf("degraded baseline=%q initialized=%v, want Seen", row.SyncedFlags, row.SyncedFlagsInitialized)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("corrupt row missing from flag state")
+	}
+}
+
+func TestUpsertMessageWithInitialTagsRollsBackTogether(t *testing.T) {
+	db := newTestDB(t)
+	if _, err := db.db.Exec(`CREATE TRIGGER fail_initial_tag BEFORE INSERT ON tags
+		BEGIN SELECT RAISE(ABORT, 'tag failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	msg := &Message{
+		MessageID: "atomic-tags@example.com", Subject: "atomic", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1",
+		SyncedFlagsInitialized: true,
+	}
+	if _, err := db.UpsertMessageWithInitialTags(msg, []string{"unread"}); err == nil {
+		t.Fatal("upsert succeeded despite tag failure")
+	}
+	if exists, err := db.MessageExistsForAccount(msg.MessageID, msg.Account); err != nil || exists {
+		t.Fatalf("message survived failed initial tags: exists=%v err=%v", exists, err)
+	}
+	if _, err := db.db.Exec("DROP TRIGGER fail_initial_tag"); err != nil {
+		t.Fatal(err)
+	}
+	created, err := db.UpsertMessageWithInitialTags(msg, []string{"unread"})
+	if err != nil || !created {
+		t.Fatalf("retry created=%v err=%v", created, err)
+	}
+	rows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil || len(rows) != 1 || !slices.Contains(rows[0].Tags, "unread") {
+		t.Fatalf("retry rows=%+v err=%v", rows, err)
+	}
+}
+
 func TestConcurrentUpsertReportsSingleCreatorAndCapturesOnce(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "concurrent.db")
 	kr := testKeyring(t)
@@ -348,63 +461,69 @@ func TestConcurrentUpsertReportsSingleCreatorAndCapturesOnce(t *testing.T) {
 	created := make([]bool, len(dbs))
 	errs := make([]error, len(dbs))
 	var wg sync.WaitGroup
-	for i, db := range dbs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			created[i], errs[i] = db.UpsertMessage(&Message{
-				MessageID: "concurrent@example.com", Subject: "same", Date: 1, CreatedAt: 1,
-				Mailbox: "ALL", Account: "work", RemoteRef: "r1",
-				SyncedFlagsInitialized: true,
-			})
-		}()
-	}
-	wg.Wait()
-	if errs[0] != nil || errs[1] != nil {
-		t.Fatalf("concurrent errors=%v", errs)
-	}
-	if created[0] == created[1] {
-		t.Fatalf("created results=%v, want exactly one creator", created)
-	}
+	for round := 0; round < 40; round++ {
+		messageID := fmt.Sprintf("concurrent-%d@example.com", round)
+		for i, db := range dbs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				created[i], errs[i] = db.UpsertMessage(&Message{
+					MessageID: messageID, Subject: "same", Date: 1, CreatedAt: 1,
+					Mailbox: "ALL", Account: "work", RemoteRef: messageID,
+					SyncedFlagsInitialized: true,
+				})
+			}()
+		}
+		wg.Wait()
+		if errs[0] != nil || errs[1] != nil {
+			t.Fatalf("round %d concurrent errors=%v", round, errs)
+		}
+		if created[0] == created[1] {
+			t.Fatalf("round %d created results=%v, want exactly one creator", round, created)
+		}
 
-	if err := first.InsertMessage(&Message{
-		MessageID: "legacy-concurrent@example.com", Subject: "legacy", Date: 1, CreatedAt: 1,
-		Mailbox: "ALL", Account: "work", RemoteRef: "r2",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	updates := []string{`\Seen`, `\Flagged`}
-	for i, db := range dbs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, errs[i] = db.UpsertMessage(&Message{
-				MessageID: "legacy-concurrent@example.com", Subject: "delta", Date: 1, CreatedAt: 1,
-				Mailbox: "ALL", Account: "work", RemoteRef: "r2", Flags: updates[i],
-				SyncedFlagsInitialized: true,
-			})
-		}()
-	}
-	wg.Wait()
-	if errs[0] != nil || errs[1] != nil {
-		t.Fatalf("concurrent capture errors=%v", errs)
-	}
-	rows, err := first.GetFolderFlagState("work", "ALL")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, row := range rows {
-		if row.MessageID == "legacy-concurrent@example.com" {
-			if row.SyncedFlags != "" || !row.SyncedFlagsInitialized {
-				t.Fatalf("captured baseline=%q initialized=%v, want explicit empty before-image", row.SyncedFlags, row.SyncedFlagsInitialized)
+		legacyID := fmt.Sprintf("legacy-concurrent-%d@example.com", round)
+		if err := first.InsertMessage(&Message{
+			MessageID: legacyID, Subject: "legacy", Date: 1, CreatedAt: 1,
+			Mailbox: "ALL", Account: "work", RemoteRef: legacyID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for i, db := range dbs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, errs[i] = db.UpsertMessage(&Message{
+					MessageID: legacyID, Subject: "delta", Date: 1, CreatedAt: 1,
+					Mailbox: "ALL", Account: "work", RemoteRef: legacyID,
+					Flags: `\Seen,\Flagged`, SyncedFlagsInitialized: true,
+				})
+			}()
+		}
+		wg.Wait()
+		if errs[0] != nil || errs[1] != nil {
+			t.Fatalf("round %d concurrent capture errors=%v", round, errs)
+		}
+		rows, err := first.GetFolderFlagState("work", "ALL")
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, row := range rows {
+			if row.MessageID == legacyID {
+				found = true
+				if row.SyncedFlags != "" || !row.SyncedFlagsInitialized {
+					t.Fatalf("round %d captured baseline=%q initialized=%v, want explicit empty before-image", round, row.SyncedFlags, row.SyncedFlagsInitialized)
+				}
+				if !row.IsSeen || !row.IsFlagged {
+					t.Fatalf("round %d final provider columns are half-updated: seen=%v flagged=%v", round, row.IsSeen, row.IsFlagged)
+				}
 			}
-			if row.IsSeen == row.IsFlagged {
-				t.Fatalf("final provider columns are half-updated: seen=%v flagged=%v", row.IsSeen, row.IsFlagged)
-			}
-			return
+		}
+		if !found {
+			t.Fatalf("round %d legacy concurrent row missing", round)
 		}
 	}
-	t.Fatal("legacy concurrent row missing")
 }
 
 func TestUpsert_HeadersOnlyThenBody(t *testing.T) {
