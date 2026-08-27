@@ -1,8 +1,11 @@
 name: Test
 
 on:
+  # No branch filter. A stacked PR targets the branch below it rather than
+  # main, and a `branches: [main]` filter silently gives those PRs no CI at
+  # all — not a red check, no check. Every PR runs here regardless of base;
+  # the required contexts on main still decide what can merge.
   pull_request:
-    branches: [main]
 
 jobs:
   cli:
