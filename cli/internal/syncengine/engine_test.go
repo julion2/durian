@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -56,11 +58,15 @@ func rawMessage(msgID, from, to, subject, body string) []byte {
 // memCursorStore is a map-backed CursorStore so the tests avoid the
 // filesystem/flock machinery of FileCursorStore.
 type memCursorStore struct {
-	cursors map[string]backend.Cursor
+	cursors             map[string]backend.Cursor
+	pending             map[string]PendingFlags
+	stateReads          int
+	commits             int
+	serializedRefCounts []int
 }
 
 func newMemCursorStore() *memCursorStore {
-	return &memCursorStore{cursors: make(map[string]backend.Cursor)}
+	return &memCursorStore{cursors: make(map[string]backend.Cursor), pending: make(map[string]PendingFlags)}
 }
 
 func (m *memCursorStore) key(account, folder string) string { return account + "\x00" + folder }
@@ -69,8 +75,27 @@ func (m *memCursorStore) Get(account, folder string) (backend.Cursor, error) {
 	return m.cursors[m.key(account, folder)], nil
 }
 
+func (m *memCursorStore) GetState(account, folder string) (FolderState, error) {
+	m.stateReads++
+	key := m.key(account, folder)
+	return FolderState{Cursor: m.cursors[key], PendingFlags: m.pending[key]}, nil
+}
+
 func (m *memCursorStore) Set(account, folder string, cursor backend.Cursor) error {
 	m.cursors[m.key(account, folder)] = cursor
+	return nil
+}
+
+func (m *memCursorStore) GetPendingFlags(account, folder string) (PendingFlags, error) {
+	return m.pending[m.key(account, folder)], nil
+}
+
+func (m *memCursorStore) Commit(account, folder string, cursor backend.Cursor, pending PendingFlags) error {
+	key := m.key(account, folder)
+	m.cursors[key] = cursor
+	m.pending[key] = pending
+	m.commits++
+	m.serializedRefCounts = append(m.serializedRefCounts, len(pending.Refs))
 	return nil
 }
 
@@ -92,10 +117,14 @@ type applyFlagsCall struct {
 // the script is exhausted it reports an unchanged folder (prior cursor, no
 // changes, HasMore false).
 type fakeBackend struct {
-	folders     []backend.Folder
-	scripts     map[string][]backend.FetchResult
-	calls       map[string]int
-	seenCursors map[string][]backend.Cursor // cursor argument of each FetchMessages call
+	folders []backend.Folder
+	scripts map[string][]backend.FetchResult
+	// fetchByCursor, when set, models a provider state machine whose response
+	// is selected by the persisted opaque cursor rather than call order.
+	fetchByCursor    func(folder string, cursor backend.Cursor) backend.FetchResult
+	fetchErrByCursor map[string]error
+	calls            map[string]int
+	seenCursors      map[string][]backend.Cursor // cursor argument of each FetchMessages call
 
 	// flagsByRef scripts the server flag state FetchFlags reports per
 	// RemoteRef.ID. Empty by default, so unrelated tests see "not on server"
@@ -137,6 +166,11 @@ type delayedBackend struct {
 	calls  int
 }
 
+type delayedFlagsBackend struct {
+	backend.Backend
+	delay time.Duration
+}
+
 func (b *delayedBackend) FetchMessages(ctx context.Context, folder string, cursor backend.Cursor, limit int) (backend.FetchResult, error) {
 	if b.calls < len(b.delays) && b.delays[b.calls] > 0 {
 		timer := time.NewTimer(b.delays[b.calls])
@@ -149,6 +183,17 @@ func (b *delayedBackend) FetchMessages(ctx context.Context, folder string, curso
 	}
 	b.calls++
 	return b.Backend.FetchMessages(ctx, folder, cursor, limit)
+}
+
+func (b *delayedFlagsBackend) FetchFlags(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
+	timer := time.NewTimer(b.delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return b.Backend.FetchFlags(ctx, folder, refs)
+	}
 }
 
 type labelCall struct {
@@ -180,6 +225,13 @@ func (f *fakeBackend) FetchMessages(ctx context.Context, folder string, cursor b
 	idx := f.calls[folder]
 	f.calls[folder]++
 	f.seenCursors[folder] = append(f.seenCursors[folder], cursor)
+	if err := f.fetchErrByCursor[string(cursor)]; err != nil {
+		delete(f.fetchErrByCursor, string(cursor))
+		return backend.FetchResult{}, err
+	}
+	if f.fetchByCursor != nil {
+		return f.fetchByCursor(folder, cursor), nil
+	}
 	script := f.scripts[folder]
 	if idx < len(script) {
 		return script[idx], nil
@@ -584,6 +636,153 @@ func TestEngineRefreshesExistingSnapshotMetadata(t *testing.T) {
 	}
 }
 
+func TestEngineAdvancesReplacementAfterRepeatedFlagFetchFailure(t *testing.T) {
+	db := newTestDB(t)
+	folder := backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true}
+	message := backend.Message{
+		MessageID: "pending@example.com", Ref: backend.RemoteRef{Folder: "ALL", ID: "r1"},
+		Raw: rawMessage("pending@example.com", "a@example.com", testAccount, "Pending", "body"),
+	}
+	fake := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+		"ALL": {
+			{Messages: []backend.Message{message}, Cursor: backend.Cursor("old")},
+			{Cursor: backend.Cursor("replacement-1"), FullSnapshot: true, Present: []backend.RemoteRef{message.Ref}},
+			{Cursor: backend.Cursor("replacement-2"), FullSnapshot: true, Present: []backend.RemoteRef{message.Ref}},
+			{Cursor: backend.Cursor("delta-1")},
+			{Cursor: backend.Cursor("delta-2")},
+		},
+	})
+	fake.flagsByRef["r1"] = backend.Flags{}
+	cursors := newMemCursorStore()
+	engine := newTestEngine(db, cursors)
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("seed result=%+v err=%v", result, err)
+	}
+	fake.fetchFlagsErr = errors.New("permanent flag endpoint failure")
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) == 0 {
+		t.Fatalf("first failed replacement result=%+v err=%v", result, err)
+	}
+	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "old" {
+		t.Fatalf("cursor after first failure = %q, want old", got)
+	}
+	pending, _ := cursors.GetPendingFlags(testAccount, "ALL")
+	if !slices.Equal(pending.Refs, []string{"r1"}) || pending.ReplayCount != 1 {
+		t.Fatalf("pending after first failure = %+v", pending)
+	}
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) == 0 {
+		t.Fatalf("second failed replacement result=%+v err=%v", result, err)
+	}
+	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "replacement-2" {
+		t.Fatalf("cursor after repeated failure = %q, want replacement-2", got)
+	}
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) == 0 {
+		t.Fatalf("pending retry result=%+v err=%v", result, err)
+	}
+	if got := fake.seenCursors["ALL"]; len(got) != 4 || string(got[1]) != "old" || string(got[2]) != "old" || string(got[3]) != "replacement-2" {
+		t.Fatalf("FetchMessages cursors = %q, want one replay then progress", got)
+	}
+	fake.fetchFlagsErr = nil
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("successful pending retry result=%+v err=%v", result, err)
+	}
+	pending, _ = cursors.GetPendingFlags(testAccount, "ALL")
+	if len(pending.Refs) != 0 || pending.ReplayCount != 0 {
+		t.Fatalf("pending flags were not cleared: %+v", pending)
+	}
+}
+
+func TestEngineCursorDrivenReplacementEpisodesSurviveUploadOnlyPasses(t *testing.T) {
+	db := newTestDB(t)
+	folder := backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true}
+	message := backend.Message{
+		MessageID: "cursor-driven@example.com", Ref: backend.RemoteRef{Folder: "ALL", ID: "r1"},
+		Raw: rawMessage("cursor-driven@example.com", "a@example.com", testAccount, "Cursor", "body"),
+	}
+	fake := newFakeBackend([]backend.Folder{folder}, nil)
+	fake.caps.FlagChangesInDelta = true
+	fake.flagsByRef["r1"] = backend.Flags{}
+	replacements := 0
+	fake.fetchByCursor = func(_ string, cursor backend.Cursor) backend.FetchResult {
+		switch string(cursor) {
+		case "":
+			return backend.FetchResult{Messages: []backend.Message{message}, Cursor: backend.Cursor("steady-0")}
+		case "steady-0", "replacement-2":
+			replacements++
+			return backend.FetchResult{
+				Cursor: backend.Cursor(fmt.Sprintf("replacement-%d", replacements)), FullSnapshot: true,
+				Present: []backend.RemoteRef{message.Ref},
+			}
+		case "replacement-4":
+			return backend.FetchResult{Cursor: backend.Cursor("steady-5")}
+		default:
+			return backend.FetchResult{Cursor: cursor}
+		}
+	}
+
+	cursors := newMemCursorStore()
+	download := newTestEngine(db, cursors)
+	upload := New(Options{
+		Store: db, Cursors: cursors, Account: testAccount, Mode: UploadOnly,
+		Ingest: IngestOptions{Account: testAccount},
+	})
+	if result, err := download.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("seed result=%+v err=%v", result, err)
+	}
+	fake.fetchFlagsErr = errors.New("flag endpoint unavailable")
+
+	for episode := 0; episode < 2; episode++ {
+		if result, err := download.Sync(t.Context(), fake); err != nil || len(result.Errors) == 0 {
+			t.Fatalf("episode %d first replacement result=%+v err=%v", episode, result, err)
+		}
+		state, _ := cursors.GetState(testAccount, "ALL")
+		if state.PendingFlags.ReplayCount != 1 || !slices.Equal(state.PendingFlags.Refs, []string{"r1"}) {
+			t.Fatalf("episode %d held state = %+v", episode, state)
+		}
+
+		// The watcher runs upload-only after local mutations. Neither the
+		// mutation nor this unrelated pass may reset the replacement replay.
+		add, remove := []string{"flagged"}, []string(nil)
+		if episode == 1 {
+			add, remove = nil, []string{"flagged"}
+		}
+		if err := db.ModifyTagsByMessageIDAndAccount(message.MessageID, testAccount, add, remove); err != nil {
+			t.Fatal(err)
+		}
+		if result, err := upload.Sync(t.Context(), fake); err != nil || len(result.Errors) == 0 {
+			t.Fatalf("episode %d upload-only result=%+v err=%v", episode, result, err)
+		}
+		state, _ = cursors.GetState(testAccount, "ALL")
+		if state.PendingFlags.ReplayCount != 1 || len(state.PendingFlags.Refs) != 1 {
+			t.Fatalf("episode %d state after upload-only = %+v", episode, state)
+		}
+
+		if result, err := download.Sync(t.Context(), fake); err != nil || len(result.Errors) == 0 {
+			t.Fatalf("episode %d replay result=%+v err=%v", episode, result, err)
+		}
+	}
+
+	fake.fetchFlagsErr = nil
+	if result, err := download.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("recovery result=%+v err=%v", result, err)
+	}
+	state, _ := cursors.GetState(testAccount, "ALL")
+	if string(state.Cursor) != "steady-5" || len(state.PendingFlags.Refs) != 0 || state.PendingFlags.ReplayCount != 0 {
+		t.Fatalf("recovered state = %+v", state)
+	}
+	wantCursors := []backend.Cursor{
+		backend.Cursor(""), backend.Cursor("steady-0"), backend.Cursor("steady-0"),
+		backend.Cursor("replacement-2"), backend.Cursor("replacement-2"), backend.Cursor("replacement-4"),
+	}
+	if got := fake.seenCursors["ALL"]; !slices.EqualFunc(got, wantCursors, func(a, b backend.Cursor) bool { return bytes.Equal(a, b) }) {
+		t.Fatalf("FetchMessages cursors = %q, want %q", got, wantCursors)
+	}
+	for _, count := range cursors.serializedRefCounts {
+		if count > 1 {
+			t.Fatalf("duplicate pending queue growth: serialized ref counts = %v", cursors.serializedRefCounts)
+		}
+	}
+}
+
 func TestEngineAdvancesFinalDeltaWhenFlagFetchFails(t *testing.T) {
 	db := newTestDB(t)
 	cursors := newMemCursorStore()
@@ -620,6 +819,226 @@ func TestEngineAdvancesFinalDeltaWhenFlagFetchFails(t *testing.T) {
 	}
 	if got := fake.seenCursors["INBOX"]; len(got) != 3 || string(got[1]) != "c1" || string(got[2]) != "c2" {
 		t.Fatalf("FetchMessages cursors = %q, want forward progress despite flag failures", got)
+	}
+}
+
+func TestEngineDeltaCommitPreservesReplacementReplay(t *testing.T) {
+	db := newTestDB(t)
+	message := backend.Message{
+		MessageID: "delta-interleave@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "m1"},
+		Raw: rawMessage("delta-interleave@example.com", "a@example.com", testAccount, "Delta", "body"),
+	}
+	if _, _, err := Ingest(db, message, "INBOX", backend.RoleInbox, IngestOptions{Account: testAccount}); err != nil {
+		t.Fatal(err)
+	}
+	cursors := newMemCursorStore()
+	key := cursors.key(testAccount, "INBOX")
+	cursors.cursors[key] = backend.Cursor("c1")
+	cursors.pending[key] = PendingFlags{Refs: []string{"m1"}, ReplayCount: 1}
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}}, map[string][]backend.FetchResult{
+		"INBOX": {{Messages: []backend.Message{message}, Cursor: backend.Cursor("c2")}},
+	})
+	fake.caps.FlagChangesInDelta = true
+	fake.fetchFlagsErr = errors.New("flag endpoint unavailable")
+
+	result, err := newTestEngine(db, cursors).Sync(t.Context(), fake)
+	if err != nil || len(result.Errors) == 0 {
+		t.Fatalf("delta result=%+v err=%v", result, err)
+	}
+	state, _ := cursors.GetState(testAccount, "INBOX")
+	if string(state.Cursor) != "c2" || state.PendingFlags.ReplayCount != 1 || !slices.Equal(state.PendingFlags.Refs, []string{"m1"}) {
+		t.Fatalf("state after unrelated delta = %+v", state)
+	}
+}
+
+func TestEngineCheckpointsMultiPageDeltaWithoutUnboundedPendingRefs(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	folder := backend.Folder{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}
+	message := func(n int) backend.Message {
+		id := fmt.Sprintf("page-%d@example.com", n)
+		ref := fmt.Sprintf("ref-%d", n)
+		return backend.Message{
+			MessageID: id, Ref: backend.RemoteRef{Folder: "INBOX", ID: ref},
+			Raw: rawMessage(id, "a@example.com", testAccount, "Checkpoint", "body"),
+		}
+	}
+	fake := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+		"INBOX": {
+			{Messages: []backend.Message{message(1)}, Cursor: backend.Cursor("page-1"), HasMore: true},
+			{Messages: []backend.Message{message(2)}, Cursor: backend.Cursor("page-2"), HasMore: true},
+			{Messages: []backend.Message{message(3)}, Cursor: backend.Cursor("final")},
+		},
+	})
+	fake.caps.FlagChangesInDelta = true
+	for n := 1; n <= 3; n++ {
+		fake.flagsByRef[fmt.Sprintf("ref-%d", n)] = backend.Flags{}
+	}
+	engine := newTestEngine(db, cursors)
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("multi-page sync result=%+v err=%v", result, err)
+	}
+	if got, want := cursors.stateReads, 1; got != want {
+		t.Fatalf("state reads = %d, want %d", got, want)
+	}
+	if got, want := cursors.commits, 3; got != want {
+		t.Fatalf("commits = %d, want %d", got, want)
+	}
+	if got, want := cursors.serializedRefCounts, []int{1, 2, 0}; !slices.Equal(got, want) {
+		t.Fatalf("serialized pending refs per commit = %v, want %v", got, want)
+	}
+
+	// A quiet pass and an upload-only pass with no local mutations read the
+	// state once each but do not rewrite an unchanged cursor file.
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("quiet sync result=%+v err=%v", result, err)
+	}
+	upload := New(Options{
+		Store: db, Cursors: cursors, Account: testAccount, Mode: UploadOnly,
+		Ingest: IngestOptions{Account: testAccount},
+	})
+	if result, err := upload.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("upload-only sync result=%+v err=%v", result, err)
+	}
+	if got, want := cursors.stateReads, 3; got != want {
+		t.Fatalf("state reads after quiet passes = %d, want %d", got, want)
+	}
+	if got, want := cursors.commits, 3; got != want {
+		t.Fatalf("commits after quiet passes = %d, want %d", got, want)
+	}
+}
+
+func TestEngineCheckpointsOrdinaryPageBeforeLaterFailure(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	folder := backend.Folder{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}
+	message := backend.Message{
+		MessageID: "checkpoint@example.com",
+		Ref:       backend.RemoteRef{Folder: "INBOX", ID: "r1"},
+		Raw:       rawMessage("checkpoint@example.com", "a@example.com", testAccount, "Checkpoint", "body"),
+	}
+	fake := newFakeBackend([]backend.Folder{folder}, nil)
+	fake.caps.FlagChangesInDelta = true
+	fake.flagsByRef["r1"] = backend.Flags{}
+	fake.fetchErrByCursor = map[string]error{"page-1": errors.New("page 2 unavailable")}
+	fake.fetchByCursor = func(_ string, cursor backend.Cursor) backend.FetchResult {
+		if len(cursor) == 0 {
+			return backend.FetchResult{Messages: []backend.Message{message}, Cursor: backend.Cursor("page-1"), HasMore: true}
+		}
+		return backend.FetchResult{Cursor: backend.Cursor("final")}
+	}
+	engine := newTestEngine(db, cursors)
+
+	result, err := engine.Sync(t.Context(), fake)
+	if err != nil || len(result.Errors) == 0 {
+		t.Fatalf("first sync result=%+v err=%v, want later-page error", result, err)
+	}
+	state, _ := cursors.GetState(testAccount, "INBOX")
+	if string(state.Cursor) != "page-1" || !slices.Equal(state.PendingFlags.Refs, []string{"r1"}) {
+		t.Fatalf("state after later-page failure = %+v", state)
+	}
+	if err := db.ModifyTagsByMessageIDAndAccount(message.MessageID, testAccount, nil, []string{"unread", "inbox"}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err = engine.Sync(t.Context(), fake)
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("retry result=%+v err=%v", result, err)
+	}
+	if got := fake.seenCursors["INBOX"]; len(got) != 3 || string(got[2]) != "page-1" {
+		t.Fatalf("FetchMessages cursors = %q, want retry from page-1", got)
+	}
+	rows, err := db.GetFolderFlagState(testAccount, "INBOX")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("flag rows = %+v, %v", rows, err)
+	}
+	if tagsContain(rows[0].Tags, "unread") || tagsContain(rows[0].Tags, "inbox") {
+		t.Fatalf("replay restored local read/archive tags: %v", rows[0].Tags)
+	}
+	if len(fake.applyFlagsCalls) != 1 || !fake.applyFlagsCalls[0].add.Seen {
+		t.Fatalf("read mutation upload calls = %+v", fake.applyFlagsCalls)
+	}
+}
+
+func TestPendingFlagOverflowUsesBoundedFullScan(t *testing.T) {
+	refs := make([]string, 200_000)
+	for i := range refs {
+		refs[i] = fmt.Sprintf("provider-ref-%06d", i)
+	}
+	pending := pendingFlagsFromRefs(refs)
+	if !pending.FullScan || len(pending.Refs) != 0 {
+		t.Fatalf("200k pending refs = %+v, want compact full-scan marker", pending)
+	}
+	encoded, err := json.Marshal(pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > 64 {
+		t.Fatalf("full-scan marker JSON = %d bytes, want <= 64: %s", len(encoded), encoded)
+	}
+
+	oversized := pendingFlagsFromRefs([]string{strings.Repeat("x", maxPendingFlagRefBytes+1)})
+	if !oversized.FullScan || len(oversized.Refs) != 0 {
+		t.Fatalf("oversized ref did not use full-scan marker: %+v", oversized)
+	}
+}
+
+func TestEngineFullScanReconciliationUsesBoundedFetchBatches(t *testing.T) {
+	db := newTestDB(t)
+	const rowCount = maxPendingFlagRefs + 17
+	deltaFlags := make(map[string]backend.Flags, rowCount)
+	for i := 0; i < rowCount; i++ {
+		id := fmt.Sprintf("batch-%04d@example.com", i)
+		ref := fmt.Sprintf("ref-%04d", i)
+		if err := db.InsertMessage(&store.Message{
+			MessageID: id, Subject: "batch", Date: 1, CreatedAt: int64(i + 1),
+			Mailbox: "ALL", Account: testAccount, RemoteRef: ref,
+			Flags: `\Seen`, SyncedFlags: `\Seen`, FetchedBody: true,
+		}); err != nil {
+			t.Fatalf("insert row %d: %v", i, err)
+		}
+		deltaFlags[ref] = backend.Flags{Seen: true}
+	}
+
+	folder := backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true}
+	fake := newFakeBackend([]backend.Folder{folder}, nil)
+	fake.caps.FlagChangesInDelta = true
+	fake.fetchFlagsErr = errors.New("systemic flag outage")
+	engine := newTestEngine(db, newMemCursorStore())
+	failed := engine.reconcileFolderFlags(t.Context(), fake, folder, deltaFlags, PendingFlags{}, &Result{})
+	if !failed.fetchFailed || !failed.pendingFlags.FullScan || len(failed.pendingFlags.Refs) > maxPendingFlagRefs {
+		t.Fatalf("failed reconciliation = %+v, want bounded full scan", failed)
+	}
+	if len(fake.fetchFlagsCalls) != 1 || len(fake.fetchFlagsCalls[0].refs) != flagFetchBatchSize {
+		t.Fatalf("outage fetch calls = %+v, want one %d-ref request", fake.fetchFlagsCalls, flagFetchBatchSize)
+	}
+
+	fake.fetchFlagsErr = nil
+	fake.fetchFlagsCalls = nil
+	for ref, flags := range deltaFlags {
+		fake.flagsByRef[ref] = flags
+	}
+	progressed := engine.reconcileFolderFlags(t.Context(), fake, folder, nil, failed.pendingFlags, &Result{})
+	if progressed.reconciled || progressed.failed() || !progressed.pendingFlags.FullScan || progressed.pendingFlags.ScanAfterID == 0 {
+		t.Fatalf("first recovery = %+v, want persisted full-scan progress", progressed)
+	}
+	wantCalls := maxFullScanRowsPerSync / flagFetchBatchSize
+	if len(fake.fetchFlagsCalls) != wantCalls {
+		t.Fatalf("first recovery fetch calls = %d, want %d", len(fake.fetchFlagsCalls), wantCalls)
+	}
+	for i, call := range fake.fetchFlagsCalls {
+		if len(call.refs) > flagFetchBatchSize {
+			t.Fatalf("first recovery call %d has %d refs, limit %d", i, len(call.refs), flagFetchBatchSize)
+		}
+	}
+
+	fake.fetchFlagsCalls = nil
+	recovered := engine.reconcileFolderFlags(t.Context(), fake, folder, nil, progressed.pendingFlags, &Result{})
+	if !recovered.reconciled || recovered.failed() || recovered.pendingFlags.FullScan || len(recovered.pendingFlags.Refs) != 0 {
+		t.Fatalf("second recovery = %+v, want completed reconciliation", recovered)
+	}
+	if len(fake.fetchFlagsCalls) != 1 || len(fake.fetchFlagsCalls[0].refs) != rowCount-maxFullScanRowsPerSync {
+		t.Fatalf("second recovery fetch calls = %+v, want one %d-ref request", fake.fetchFlagsCalls, rowCount-maxFullScanRowsPerSync)
 	}
 }
 
@@ -672,6 +1091,33 @@ func TestEngineAllowsDeltaToReplacementRestart(t *testing.T) {
 		if got, _ := db.GetByMessageID(id); got == nil {
 			t.Fatalf("message %s was not retained", id)
 		}
+	}
+}
+
+func TestEngineUsesLatestOrdinaryCheckpointAsReplacementReplayBase(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	_ = cursors.Set(testAccount, "ALL", backend.Cursor("old"))
+	message := backend.Message{
+		MessageID: "transition@example.com", Ref: backend.RemoteRef{Folder: "ALL", ID: "r1"},
+		Raw: rawMessage("transition@example.com", "a@example.com", testAccount, "Transition", "body"),
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Selectable: true}}, map[string][]backend.FetchResult{
+		"ALL": {
+			{Messages: []backend.Message{message}, Cursor: backend.Cursor("ordinary-page"), HasMore: true},
+			{Messages: []backend.Message{message}, Present: []backend.RemoteRef{message.Ref}, Cursor: backend.Cursor("replacement"), FullSnapshot: true},
+		},
+	})
+	fake.caps.FlagChangesInDelta = true
+	fake.fetchFlagsErr = errors.New("flag endpoint unavailable")
+
+	result, err := newTestEngine(db, cursors).Sync(t.Context(), fake)
+	if err != nil || len(result.Errors) == 0 {
+		t.Fatalf("Sync result=%+v err=%v, want flag error", result, err)
+	}
+	state, _ := cursors.GetState(testAccount, "ALL")
+	if string(state.Cursor) != "ordinary-page" || state.PendingFlags.ReplayCount != 1 {
+		t.Fatalf("replacement replay base = %+v, want ordinary-page with replay count 1", state)
 	}
 }
 
@@ -950,6 +1396,50 @@ func TestEngineLetsReplacementFinishBeyondOrdinaryTimeout(t *testing.T) {
 	}
 	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "final" {
 		t.Fatalf("cursor = %q, want final", got)
+	}
+}
+
+func TestEngineReplacementFlagDeadlineMakesBoundedProgress(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	message := backend.Message{
+		MessageID: "deadline@example.com", Ref: backend.RemoteRef{Folder: "ALL", ID: "r1"},
+		Raw: rawMessage("deadline@example.com", "a@example.com", testAccount, "Deadline", "body"),
+	}
+	if _, _, err := Ingest(db, message, "ALL", backend.RoleAll, IngestOptions{Account: testAccount}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cursors.Set(testAccount, "ALL", backend.Cursor("old")); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Role: backend.RoleAll, Selectable: true}}, nil)
+	replacements := 0
+	fake.fetchByCursor = func(_ string, _ backend.Cursor) backend.FetchResult {
+		replacements++
+		return backend.FetchResult{
+			Cursor: backend.Cursor(fmt.Sprintf("replacement-%d", replacements)), FullSnapshot: true,
+			Messages: []backend.Message{message}, Present: []backend.RemoteRef{message.Ref},
+		}
+	}
+	delayed := &delayedFlagsBackend{Backend: fake, delay: 100 * time.Millisecond}
+	engine := New(Options{
+		Store: db, Cursors: cursors, Account: testAccount,
+		Timeout: 5 * time.Millisecond, RecoveryTimeout: 20 * time.Millisecond,
+		Ingest: IngestOptions{Account: testAccount},
+	})
+
+	for pass := 0; pass < 2; pass++ {
+		result, err := engine.Sync(t.Context(), delayed)
+		if !errors.Is(err, context.DeadlineExceeded) || len(result.Errors) == 0 {
+			t.Fatalf("pass %d result=%+v err=%v, want recorded flag deadline", pass, result, err)
+		}
+	}
+	state, _ := cursors.GetState(testAccount, "ALL")
+	if string(state.Cursor) != "replacement-2" || state.PendingFlags.ReplayCount != 0 || !slices.Equal(state.PendingFlags.Refs, []string{"r1"}) {
+		t.Fatalf("state after two deadline passes = %+v", state)
+	}
+	if got, want := fake.seenCursors["ALL"], []backend.Cursor{backend.Cursor("old"), backend.Cursor("old")}; !slices.EqualFunc(got, want, func(a, b backend.Cursor) bool { return bytes.Equal(a, b) }) {
+		t.Fatalf("FetchMessages cursors = %q, want one bounded replay %q", got, want)
 	}
 }
 
@@ -2080,6 +2570,123 @@ func TestFileCursorStoreRoundTrip(t *testing.T) {
 	}
 	if unknown != nil {
 		t.Errorf("unknown folder cursor = %q, want nil", unknown)
+	}
+}
+
+func TestFileCursorStorePersistsPendingFlagsAndLoadsLegacyFiles(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	fcs := NewFileCursorStore(testAccount)
+	pending := PendingFlags{Refs: []string{"r1", "r2"}, ReplayCount: 1}
+	if err := fcs.Commit(testAccount, "INBOX", backend.Cursor("cursor"), pending); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	fresh := NewFileCursorStore(testAccount)
+	got, err := fresh.GetPendingFlags(testAccount, "INBOX")
+	if err != nil || !slices.Equal(got.Refs, pending.Refs) || got.ReplayCount != pending.ReplayCount {
+		t.Fatalf("pending round trip = %+v, %v", got, err)
+	}
+	if err := fresh.Set(testAccount, "INBOX", backend.Cursor("updated")); err != nil {
+		t.Fatalf("set cursor: %v", err)
+	}
+	got, _ = fresh.GetPendingFlags(testAccount, "INBOX")
+	if !slices.Equal(got.Refs, pending.Refs) {
+		t.Fatalf("Set erased pending state: %+v", got)
+	}
+
+	// A pre-366 binary reads the file as map[string][]byte. It must see the
+	// provider cursor unchanged and preserve the unknown pending-state entry
+	// when it performs its own read-modify-write.
+	data, err := os.ReadFile(fcs.path(testAccount))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyView := make(map[string][]byte)
+	if err := json.Unmarshal(data, &legacyView); err != nil {
+		t.Fatalf("pre-366 decode failed: %v\n%s", err, data)
+	}
+	if string(legacyView["INBOX"]) != "updated" || len(legacyView[pendingFlagsKey]) == 0 {
+		t.Fatalf("pre-366 view = %#v", legacyView)
+	}
+	legacyView["INBOX"] = []byte("downgraded")
+	data, err = json.MarshalIndent(legacyView, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fcs.path(testAccount), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := fresh.GetState(testAccount, "INBOX")
+	if err != nil || string(state.Cursor) != "downgraded" || !slices.Equal(state.PendingFlags.Refs, pending.Refs) {
+		t.Fatalf("state after pre-366 rewrite = %+v, %v", state, err)
+	}
+
+	envelopeAccount := "envelope@example.com"
+	envelopeStore := NewFileCursorStore(envelopeAccount)
+	envelopeData, err := json.Marshal(cursorFile{Version: 1, Folders: map[string]FolderState{
+		"ALL": {Cursor: backend.Cursor("c327-cursor"), PendingFlags: pending},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envelopeStore.path(envelopeAccount), envelopeData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := envelopeStore.GetState(envelopeAccount, "ALL"); err != nil {
+		t.Fatalf("migrate c327 envelope: %v", err)
+	}
+	migratedData, err := os.ReadFile(envelopeStore.path(envelopeAccount))
+	if err != nil {
+		t.Fatal(err)
+	}
+	migratedLegacyView := make(map[string][]byte)
+	if err := json.Unmarshal(migratedData, &migratedLegacyView); err != nil || string(migratedLegacyView["ALL"]) != "c327-cursor" {
+		t.Fatalf("migrated c327 file is not downgrade-compatible: %v\n%s", err, migratedData)
+	}
+
+	corruptAccount := "corrupt-pending@example.com"
+	corruptStore := NewFileCursorStore(corruptAccount)
+	corruptData, err := json.Marshal(map[string][]byte{
+		"ALL":           []byte("durable-cursor"),
+		pendingFlagsKey: []byte("{invalid"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(corruptStore.path(corruptAccount), corruptData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	corruptState, err := corruptStore.GetState(corruptAccount, "ALL")
+	if err != nil || string(corruptState.Cursor) != "durable-cursor" || !corruptState.PendingFlags.FullScan {
+		t.Fatalf("corrupt pending recovery = %+v, %v", corruptState, err)
+	}
+	repairedData, err := os.ReadFile(corruptStore.path(corruptAccount))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairedView := make(map[string][]byte)
+	if err := json.Unmarshal(repairedData, &repairedView); err != nil {
+		t.Fatalf("decode repaired cursor file: %v", err)
+	}
+	var repairedPending map[string]PendingFlags
+	if err := json.Unmarshal(repairedView[pendingFlagsKey], &repairedPending); err != nil || !repairedPending["ALL"].FullScan {
+		t.Fatalf("persisted pending recovery = %+v, %v", repairedPending, err)
+	}
+
+	legacyAccount := "legacy@example.com"
+	legacyStore := NewFileCursorStore(legacyAccount)
+	if err := os.MkdirAll(legacyStore.cacheDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	data, err = json.Marshal(map[string][]byte{"ALL": []byte("legacy-cursor")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyStore.path(legacyAccount), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	legacyCursor, err := legacyStore.Get(legacyAccount, "ALL")
+	if err != nil || string(legacyCursor) != "legacy-cursor" {
+		t.Fatalf("legacy cursor = %q, %v", legacyCursor, err)
 	}
 }
 
