@@ -108,9 +108,10 @@ func runTag(cmd *cobra.Command, args []string) error {
 		os.Exit(1)
 	}
 
-	if !jsonOutput {
-		fmt.Println("Tags applied successfully")
+	if jsonOutput {
+		return json.NewEncoder(os.Stdout).Encode(resp)
 	}
 
+	fmt.Printf("Updated %d of %d matching threads\n", *resp.ChangedThreads, *resp.MatchedThreads)
 	return nil
 }

@@ -25,28 +25,29 @@ func (h *Handler) Tag(query string, tags string) protocol.Response {
 		return protocol.FailWithMessage(protocol.ErrBackendError, "expand groups: "+err.Error())
 	}
 
-	// Collect thread IDs to modify
-	var threadIDs []string
-	if strings.HasPrefix(expanded, "thread:") {
-		threadIDs = []string{strings.TrimPrefix(expanded, "thread:")}
-	} else {
-		// Search for matching threads
-		results, err := h.store.Search(expanded, 1000000)
-		if err != nil {
-			return protocol.Fail(protocol.ErrBackendError, err)
-		}
-		for _, r := range results {
-			threadIDs = append(threadIDs, r.Thread)
-		}
+	// Resolve every selector through the shared query parser so searches,
+	// counts, and mutations enforce the same field semantics.
+	results, err := h.store.Search(expanded, 1000000)
+	if err != nil {
+		return protocol.Fail(protocol.ErrBackendError, err)
+	}
+	threadIDs := make([]string, 0, len(results))
+	for _, r := range results {
+		threadIDs = append(threadIDs, r.Thread)
 	}
 
 	if len(threadIDs) == 0 {
-		return protocol.Success()
+		return protocol.FailWithMessage(protocol.ErrNotFound, "query matched no threads; no tags were changed")
 	}
 
+	changedThreads := 0
 	for _, threadID := range threadIDs {
-		if err := h.store.ModifyTagsByThread(threadID, add, remove); err != nil {
+		changed, err := h.store.ModifyTagsByThread(threadID, add, remove)
+		if err != nil {
 			return protocol.Fail(protocol.ErrBackendError, err)
+		}
+		if changed {
+			changedThreads++
 		}
 		if h.tagSync != nil || h.tagSyncEnabled {
 			h.journalTagChanges(threadID, add, remove)
@@ -65,8 +66,8 @@ func (h *Handler) Tag(query string, tags string) protocol.Response {
 		}
 	}
 
-	slog.Info("Tag operation complete", "module", "TAG", "threads", len(threadIDs), "add", add, "remove", remove)
-	return protocol.Success()
+	slog.Info("Tag operation complete", "module", "TAG", "matched_threads", len(threadIDs), "changed_threads", changedThreads, "add", add, "remove", remove)
+	return protocol.SuccessWithTagChanges(len(threadIDs), changedThreads)
 }
 
 // journalTagChanges records tag changes in the local journal for later sync.

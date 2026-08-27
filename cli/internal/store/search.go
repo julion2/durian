@@ -805,6 +805,9 @@ func (d *DB) fieldToSQL(f *fieldExpr) (string, []interface{}, error) {
 		}
 		return "1=1", nil, nil
 
+	case "thread":
+		return "m.thread_id = ?", []interface{}{f.value}, nil
+
 	case "has":
 		val := strings.ToLower(f.value)
 		if val == "attachment" {
@@ -817,8 +820,8 @@ func (d *DB) fieldToSQL(f *fieldExpr) (string, []interface{}, error) {
 		}
 		return "", nil, fmt.Errorf("unknown has: value %q (try: attachment, attachment:pdf)", f.value)
 
-	case "folder", "thread", "id", "mimetype":
-		return "1=1", nil, nil
+	case "folder", "id", "mimetype":
+		return "", nil, fmt.Errorf("query field %q is not supported", f.field)
 
 	case "group":
 		return "", nil, fmt.Errorf("group:%s was not expanded — check groups.pkl", f.value)
