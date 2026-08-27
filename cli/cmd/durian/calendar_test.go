@@ -339,6 +339,25 @@ func TestTargetLabel(t *testing.T) {
 	}
 }
 
+func TestValidateCalendarListWindowFlags(t *testing.T) {
+	previousToday, previousWeek, previousMonth := calListToday, calListWeek, calListMonth
+	previousFrom, previousTo := calListFrom, calListTo
+	t.Cleanup(func() {
+		calListToday, calListWeek, calListMonth = previousToday, previousWeek, previousMonth
+		calListFrom, calListTo = previousFrom, previousTo
+	})
+
+	calListToday, calListWeek, calListMonth = true, true, false
+	if err := validateCalendarListWindowFlags(); err == nil {
+		t.Fatal("multiple presets were accepted")
+	}
+	calListToday, calListWeek = false, true
+	calListFrom = "2026-08-01"
+	if err := validateCalendarListWindowFlags(); err == nil {
+		t.Fatal("preset plus explicit range was accepted")
+	}
+}
+
 // The account has its own output column, so the calendar label stays stable
 // regardless of how many accounts are shown.
 func TestCalendarLabelDoesNotIncludeAccount(t *testing.T) {
