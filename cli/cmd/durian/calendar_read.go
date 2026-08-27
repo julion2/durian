@@ -36,7 +36,7 @@ the selected window (the next 7 days by default).`,
   durian calendar list --from 2026-08-01 --to 2026-08-31
   durian calendar list --calendar "Team" --json`,
 	Args:              cobra.ArbitraryArgs,
-	ValidArgsFunction: completeAccounts,
+	ValidArgsFunction: completeCalendarAccounts,
 	RunE:              runCalendarList,
 }
 
@@ -101,7 +101,7 @@ func init() {
 	for _, c := range []*cobra.Command{calendarListCmd, calendarSearchCmd, calendarShowCmd} {
 		c.Flags().StringArrayVar(&calAccounts, "account", nil,
 			"Only this account (repeatable; default: every account plus the local calendars)")
-		_ = c.RegisterFlagCompletionFunc("account", completeAccounts)
+		_ = c.RegisterFlagCompletionFunc("account", completeCalendarAccounts)
 	}
 	calendarShowCmd.Flags().StringVar(&calShowCalendar, "calendar", "", "Only this calendar (by display name)")
 }

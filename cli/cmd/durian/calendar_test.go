@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,16 @@ func TestNormalizeEventReference(t *testing.T) {
 		if got := normalizeEventReference(input); got != "uid-1" {
 			t.Errorf("normalizeEventReference(%q) = %q", input, got)
 		}
+	}
+}
+
+func TestCompleteCalendarAccountsIncludesLocal(t *testing.T) {
+	previousConfig := cfg
+	cfg = &config.Config{Accounts: []config.AccountConfig{{Name: "Work", Alias: "work"}}}
+	t.Cleanup(func() { cfg = previousConfig })
+	got, _ := completeCalendarAccounts(nil, nil, "")
+	if !slices.Contains(got, "work") || !slices.Contains(got, "local") {
+		t.Fatalf("calendar account completions = %v", got)
 	}
 }
 

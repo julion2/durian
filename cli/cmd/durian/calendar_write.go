@@ -30,7 +30,7 @@ Microsoft account, Google Meet for a Google account).`,
 	Example: `  durian calendar new work --calendar "Calendar" -s "Lunch" --start "2026-08-01 12:00" --duration 1h
   durian calendar new work --calendar "Calendar" -s "Review" --start "2026-08-02 09:00" --attendee a@x.com --online-meeting`,
 	Args:              cobra.ExactArgs(1),
-	ValidArgsFunction: completeAccounts,
+	ValidArgsFunction: completeCalendarAccounts,
 	RunE:              runCalendarNew,
 }
 
@@ -46,7 +46,7 @@ notification preview when the event has attendees.`,
   durian calendar modify work 1A2B3C --subject "Planning" --location "Room 2"
   durian calendar modify work 1A2B3C --description ""`,
 	Args:              cobra.ExactArgs(2),
-	ValidArgsFunction: completeAccounts,
+	ValidArgsFunction: completeCalendarAccounts,
 	RunE:              runCalendarModify,
 }
 
@@ -60,7 +60,7 @@ are an attendee (not the organizer).`,
 	Example: `  durian calendar rsvp work standup accept
   durian calendar rsvp work "team sync" decline`,
 	Args:              cobra.ExactArgs(3),
-	ValidArgsFunction: completeAccounts,
+	ValidArgsFunction: completeCalendarAccounts,
 	RunE:              runCalendarRsvp,
 }
 
@@ -73,7 +73,7 @@ declining it if you are only an attendee (the sync previews this first).`,
 	Example: `  durian calendar delete work standup
   durian calendar delete work 1A2B3C --yes`,
 	Args:              cobra.ExactArgs(2),
-	ValidArgsFunction: completeAccounts,
+	ValidArgsFunction: completeCalendarAccounts,
 	RunE:              runCalendarDelete,
 }
 
@@ -191,6 +191,9 @@ func runCalendarNew(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if jsonOutput {
+		return writeCalendarMutationJSON("created", event, label, calNewCalendar)
+	}
 
 	fmt.Println(okLine("Created %q in %q", calNewSubject, calNewCalendar))
 	fmt.Fprintf(os.Stderr, "  %s\n", styDim(path))
@@ -239,6 +242,9 @@ func runCalendarModify(cmd *cobra.Command, args []string) error {
 	}
 	if err := calendar.WriteFileAtomic(path, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write %s: %w", path, err)
+	}
+	if jsonOutput {
+		return writeCalendarMutationJSON("modified", updated, args[0], calName)
 	}
 
 	fmt.Println(okLine("Modified %q in %q locally", orDash(updated.Subject), calName))
@@ -389,6 +395,9 @@ func runCalendarRsvp(cmd *cobra.Command, args []string) error {
 	if err := calendar.WriteFileAtomic(path, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write %s: %w", path, err)
 	}
+	if jsonOutput {
+		return writeCalendarMutationJSON("rsvp", event, label, calName)
+	}
 
 	fmt.Println(okLine("RSVP %q set to %q in %q", orDash(event.Subject), rsvpVerbLabel(response), calName))
 	printSyncReminder(label, true)
@@ -440,10 +449,26 @@ func runCalendarDelete(cmd *cobra.Command, args []string) error {
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("failed to delete %s: %w", path, err)
 	}
+	if jsonOutput {
+		return writeCalendarMutationJSON("deleted", event, label, calName)
+	}
 
 	fmt.Println(okLine("Deleted %q from %q locally", orDash(event.Subject), calName))
 	printSyncReminder(label, len(event.Attendees) > 0)
 	return nil
+}
+
+func writeCalendarMutationJSON(action string, event calendar.Event, account, calendarName string) error {
+	return writeJSON(struct {
+		Action   string `json:"action"`
+		Event    string `json:"event"`
+		Account  string `json:"account"`
+		Calendar string `json:"calendar"`
+		Subject  string `json:"subject"`
+	}{
+		Action: action, Event: "event:" + event.ICalUID, Account: account,
+		Calendar: calendarName, Subject: event.Subject,
+	})
 }
 
 // confirmPrompt writes a [y/N] prompt to stderr and reads one line from stdin;
