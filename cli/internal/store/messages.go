@@ -306,6 +306,24 @@ func (d *DB) GetByMessageID(messageID string) (*Message, error) {
 	return msg, nil
 }
 
+// GetAllByMessageID retrieves every account-specific row for a Message-ID.
+func (d *DB) GetAllByMessageID(messageID string) ([]*Message, error) {
+	rows, err := d.db.Query(`SELECT `+messageSelectColumns+`
+		`+messageSelectFrom+`
+		WHERE m.message_id = ?
+		ORDER BY m.id`, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("get all by message_id: %w", err)
+	}
+	defer rows.Close()
+
+	messages, err := d.scanMessages(rows)
+	if err != nil {
+		return nil, fmt.Errorf("get all by message_id: %w", err)
+	}
+	return messages, nil
+}
+
 // GetByThread retrieves all messages in a thread, ordered by date ascending.
 // When a message exists in multiple accounts, only the first row is kept.
 func (d *DB) GetByThread(threadID string) ([]*Message, error) {

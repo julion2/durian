@@ -447,6 +447,13 @@ func TestUpsert_CrossAccount(t *testing.T) {
 	if msg == nil {
 		t.Fatal("GetByMessageID returned nil")
 	}
+	candidates, err := db.GetAllByMessageID("cross@x")
+	if err != nil {
+		t.Fatalf("GetAllByMessageID: %v", err)
+	}
+	if len(candidates) != 2 {
+		t.Fatalf("GetAllByMessageID returned %d rows, want 2", len(candidates))
+	}
 }
 
 func TestGetByThread_Dedup(t *testing.T) {
