@@ -127,10 +127,14 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 			remote_ref, synced_flags
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id, IFNULL(account_id, 0)) DO UPDATE SET
-			subject_ct = excluded.subject_ct,
-			from_addr = excluded.from_addr,
-			to_addrs = excluded.to_addrs,
-			cc_addrs = excluded.cc_addrs,
+			subject_ct = CASE WHEN excluded.fetched_body = 1
+			                  THEN excluded.subject_ct ELSE messages.subject_ct END,
+			from_addr = CASE WHEN excluded.fetched_body = 1
+			                 THEN excluded.from_addr ELSE messages.from_addr END,
+			to_addrs = CASE WHEN excluded.fetched_body = 1
+			                THEN excluded.to_addrs ELSE messages.to_addrs END,
+			cc_addrs = CASE WHEN excluded.fetched_body = 1
+			                THEN excluded.cc_addrs ELSE messages.cc_addrs END,
 			body_text_ct = CASE WHEN excluded.fetched_body = 1 AND messages.fetched_body = 0
 			                 THEN excluded.body_text_ct ELSE messages.body_text_ct END,
 			body_html_ct = CASE WHEN excluded.fetched_body = 1 AND messages.fetched_body = 0
@@ -164,12 +168,40 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 		return fmt.Errorf("upsert message: %w", err)
 	}
 
-	// ADR-0001 step 7 (a+b): maintain the parallel blind FTS5 row. The
-	// old messages_fts trigger-pair still fires for the plaintext columns
-	// — step 7c flips reads to messages_blind_fts and step 7e drops the
-	// old triggers. DELETE+INSERT (vs UPDATE) because contentless FTS5
-	// columns can't be updated in place.
-	sTok, fTok, tTok, bTok := d.blindTokens(msg.Subject, msg.FromAddr, msg.ToAddrs, msg.BodyText)
+	// Metadata-only updates preserve every indexed value. Keep an existing FTS
+	// row untouched so flag/reference refreshes do not decrypt and retokenize
+	// the full stored body. A first insert or a missing FTS row still needs one.
+	if !msg.FetchedBody {
+		var ftsExists bool
+		if err := tx.QueryRow(`SELECT EXISTS(
+			SELECT 1 FROM messages_blind_fts WHERE rowid = ?
+		)`, msg.ID).Scan(&ftsExists); err != nil {
+			return fmt.Errorf("check blind FTS row: %w", err)
+		}
+		if ftsExists {
+			return nil
+		}
+	}
+
+	// Read back after the SQL upsert so FTS always reflects the effective stored
+	// values. In particular, a full reingest updates metadata but retains an
+	// already-fetched body, which can differ from the incoming body.
+	var storedSubjectCT, storedBodyCT []byte
+	var ftsFrom, ftsTo string
+	if err := tx.QueryRow(`SELECT subject_ct, COALESCE(from_addr, ''), COALESCE(to_addrs, ''), body_text_ct
+		FROM messages WHERE id = ?`, msg.ID).Scan(&storedSubjectCT, &ftsFrom, &ftsTo, &storedBodyCT); err != nil {
+		return fmt.Errorf("fetch message for blind FTS refresh: %w", err)
+	}
+	ftsSubject, err := d.decryptSubject("", storedSubjectCT)
+	if err != nil {
+		return fmt.Errorf("decrypt subject for blind FTS refresh: %w", err)
+	}
+	ftsBody, err := d.decryptBody("", storedBodyCT)
+	if err != nil {
+		return fmt.Errorf("decrypt body for blind FTS refresh: %w", err)
+	}
+
+	sTok, fTok, tTok, bTok := d.blindTokens(ftsSubject, ftsFrom, ftsTo, ftsBody)
 	if _, err := tx.Exec("DELETE FROM messages_blind_fts WHERE rowid = ?", msg.ID); err != nil {
 		return fmt.Errorf("blind fts delete: %w", err)
 	}
