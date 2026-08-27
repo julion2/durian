@@ -78,6 +78,7 @@ go_test(
         "attachment_test.go",
         "auth_test.go",
         "calendar_test.go",
+        "json_output_test.go",
         "root_test.go",
         "show_test.go",
         "sync_test.go",

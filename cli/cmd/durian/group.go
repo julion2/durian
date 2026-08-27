@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -65,9 +64,21 @@ func runGroupList(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonOutput {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(groups)
+		type groupJSON struct {
+			Name        string     `json:"name"`
+			Description string     `json:"description,omitempty"`
+			Members     [][]string `json:"members"`
+		}
+		out := make([]groupJSON, 0, len(groups))
+		for name, group := range groups {
+			members := group.Members
+			if members == nil {
+				members = [][]string{}
+			}
+			out = append(out, groupJSON{Name: name, Description: group.Description, Members: members})
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+		return writeJSON(out)
 	}
 
 	if len(groups) == 0 {
@@ -116,9 +127,15 @@ func runGroupMembers(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonOutput {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(group)
+		members := group.Members
+		if members == nil {
+			members = [][]string{}
+		}
+		return writeJSON(struct {
+			Name        string     `json:"name"`
+			Description string     `json:"description,omitempty"`
+			Members     [][]string `json:"members"`
+		}{Name: name, Description: group.Description, Members: members})
 	}
 
 	if group.Description != "" {

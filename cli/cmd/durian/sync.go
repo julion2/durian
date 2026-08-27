@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 
@@ -167,7 +166,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 			DurationSecs float64 `json:"duration_secs"`
 			Error        string  `json:"error,omitempty"`
 		}
-		var out []syncJSON
+		out := make([]syncJSON, 0, len(results))
 		for _, r := range results {
 			s := syncJSON{
 				Account:      r.Account,
@@ -184,7 +183,9 @@ func runSync(cmd *cobra.Command, args []string) error {
 			}
 			out = append(out, s)
 		}
-		json.NewEncoder(os.Stdout).Encode(out)
+		if err := writeJSON(out); err != nil {
+			return err
+		}
 	}
 
 	// Check for errors
