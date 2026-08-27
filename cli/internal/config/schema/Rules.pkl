@@ -1,0 +1,14 @@
+/// Durian rules schema.
+/// Usage: import "schema/Rules.pkl" as R
+module schema.Rules
+
+class RuleConfig {
+  name: String
+  match: String
+  add_tags: Listing<String> = new {}
+  remove_tags: Listing<String> = new {}
+  accounts: Listing<String>?
+  exec: String?
+  exec_timeout: Int(this > 0) = 10
+  allowed_tags: Listing<String>?
+}

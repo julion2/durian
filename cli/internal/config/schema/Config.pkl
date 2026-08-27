@@ -1,0 +1,217 @@
+/// Durian main configuration schema.
+/// Usage: import "schema/Config.pkl" as C
+module schema.Config
+
+// ── Settings ───────────────────────────────────────────────
+
+class SettingsConfig {
+  theme: "light"|"dark"|"system" = "system"
+  notifications_enabled: Boolean = true
+  load_remote_images: Boolean = false
+  accent_color: String?
+}
+
+class SyncConfig {
+  gui_auto_sync: Boolean = true
+  auto_fetch_interval: Int(this > 0) = 120
+  full_sync_interval: Int(this > 0) = 7200
+  tag_sync: TagSyncConfig?
+  attachment_cache: AttachmentCacheConfig?
+  /// Extra MIME header names to fetch and index on top of the built-in
+  /// set (List-Id, List-Unsubscribe, Precedence, X-Mailer, Return-Path,
+  /// X-GitHub-Reason, Authentication-Results). Use this when you want
+  /// rules.pkl to match against provider-specific headers like
+  /// X-GitLab-NotificationReason or X-Spam-Status. After changing the
+  /// list, run `durian sync --backfill-headers` once to populate
+  /// existing messages.
+  indexed_headers: Listing<String>?
+}
+
+class AttachmentCacheConfig {
+  max_size_mb: Int(this > 0) = 100
+  ttl_days: Int(this > 0) = 7
+}
+
+class TagSyncConfig {
+  url: String
+  api_key: String
+}
+
+class ContactsConfig {
+  db_path: String?
+}
+
+class CalendarConfig {
+  /// Base directory for exported vdir calendars (khal/vdirsyncer layout:
+  /// <vdir_path>/<account-dir>/<calendar>/<event>.ics).
+  vdir_path: String = "~/.local/share/durian/calendars"
+  /// Background calendar sync in `durian serve`: remote changes are pulled
+  /// into the local vdir periodically. With the default autosync_upload
+  /// "none", it never writes to the remote calendar — uploads, remote
+  /// deletes, conflicts and RSVPs stay behind the interactive
+  /// `durian calendar sync` confirmation. Per-account override:
+  /// accounts[*].calendar.autosync.
+  autosync: Boolean = true
+  /// Autosync interval in seconds (minimum 60, default 600).
+  autosync_interval: Int(this >= 60) = 600
+  /// What autosync may push to the remote calendar: "none" (default) keeps
+  /// autosync strictly download-only; "safe" additionally auto-applies
+  /// provably non-notifying local changes — creates and edits of events
+  /// without attendees. Remote deletes, conflicts, RSVPs and anything that
+  /// could make the provider send email always wait for the interactive
+  /// `durian calendar sync`. Per-account override:
+  /// accounts[*].calendar.autosync_upload.
+  autosync_upload: "none"|"safe" = "none"
+  /// Two-way sync conflict policy when an event changed on both sides:
+  /// "newer" (default) keeps the side modified last, "remote" keeps the
+  /// remote version, "local" keeps the local file. The losing local file is
+  /// always backed up to <file>.conflict-<timestamp> first. Per-account
+  /// override: accounts[*].calendar.conflict.
+  conflict: "remote"|"local"|"newer" = "newer"
+  /// Calendars that exist only on disk. Each entry points at one directory
+  /// of .ics files — a vdir collection, so an existing khal or vdirsyncer
+  /// folder can be listed here as-is.
+  ///
+  /// They belong to no account and no provider, so the sync engine never
+  /// sees them: nothing is uploaded, nothing is pruned, and no invitation
+  /// can ever be sent for an event in them. Addressed as the reserved
+  /// account "local" (`durian calendar list local`).
+  ///
+  /// Named local_calendars because `local` is a Pkl keyword. Entries must be
+  /// written as `new C.LocalCalendar { ... }` — a bare `new { ... }` inside a
+  /// typed Listing evaluates to Dynamic and is rejected.
+  local_calendars: Listing<LocalCalendar> = new Listing {}
+}
+
+class LocalCalendar {
+  /// Display name, and how the calendar is addressed with --calendar.
+  /// Must be unique across the local calendars.
+  name: String(!isEmpty)
+  /// Directory holding the .ics files. Created on first write if missing.
+  path: String(!isEmpty)
+  /// "#RRGGBB" display color; falls back to the collection's `color` meta
+  /// file, then to no color.
+  color: String?
+  /// Refuse every write to this calendar — for a folder another tool owns,
+  /// so durian can show it without ever editing it.
+  read_only: Boolean = false
+}
+
+class AccountCalendarConfig {
+  /// Whether this account participates in calendar reads and sync. Disable it
+  /// for mail-only accounts whose provider also exposes calendars.
+  enabled: Boolean = true
+  /// Subdirectory name under vdir_path (default: account alias, else lowercased name).
+  dir: String?
+  /// Calendar display names to export and sync (empty = all calendars).
+  include: Listing<String> = new {}
+  /// Per-account override of the global calendar.conflict policy
+  /// ("remote"|"local"|"newer"; null = use the global setting).
+  conflict: ("remote"|"local"|"newer")?
+  /// Per-account override of the global calendar.autosync toggle
+  /// (null = use the global setting).
+  autosync: Boolean?
+  /// Per-account override of the global calendar.autosync_upload mode
+  /// (null = use the global setting).
+  autosync_upload: ("none"|"safe")?
+}
+
+// ── Account ────────────────────────────────────────────────
+
+class SMTPConfig {
+  host: String = ""
+  port: Int(this == 465 || this == 587) = 587
+  auth: "password"|"oauth2" = "password"
+  max_attachment_size: String = "25MB"
+}
+
+class IMAPConfig {
+  host: String = ""
+  port: Int = 993
+  auth: "password"|"oauth2" = "password"
+  max_messages: Int = 5000
+  batch_size: Int(this > 0) = 100
+  mailboxes: Listing<String>?
+}
+
+class JMAPConfig {
+  /// Absolute JMAP session URL, normally the provider's /.well-known/jmap endpoint.
+  session_url: String(!isEmpty)
+  /// Password uses HTTP Basic auth; bearer uses an API token. The secret is
+  /// always read from the OS keychain by `durian auth login`.
+  auth: "password"|"bearer" = "password"
+}
+
+class AuthConfig {
+  username: String
+}
+
+class OAuthConfig {
+  provider: "google"|"microsoft"
+  client_id: String?
+  client_secret: String?
+  tenant: String = "common"
+}
+
+class AccountConfig {
+  name: String
+  email: String
+  display_name: String?
+  auth_email: String?
+  alias: String
+  default: Boolean = false
+  default_signature: String?
+  notifications: Boolean?
+  /// SMTP and IMAP are optional for native API backends such as JMAP.
+  smtp: SMTPConfig = new {}
+  imap: IMAPConfig = new {}
+  jmap: JMAPConfig?
+  auth: AuthConfig?
+  oauth: OAuthConfig?
+  /// Vdir calendar sync settings (Microsoft and Google accounts).
+  calendar: AccountCalendarConfig?
+  /// Sync implementation: "legacy" (default for IMAP accounts) uses the classic
+  /// IMAP syncer; "engine" uses the provider-agnostic engine on the IMAP
+  /// backend; "graph" uses the Microsoft Graph backend; "gmail" uses the Gmail
+  /// REST backend; "jmap" uses the configured JMAP server. Gmail labels and
+  /// JMAP mailbox memberships become Durian tags. The microsoft365 template
+  /// sets "graph" and the gmail template sets "gmail"; for those providers the
+  /// IMAP paths are rejected. "graph" requires Microsoft, "gmail" requires Google,
+  /// and "jmap" requires a jmap block.
+  sync_engine: "legacy"|"engine"|"graph"|"gmail"|"jmap" = "legacy"
+}
+
+// ── Defaults ───────────────────────────────────────────────
+
+/// Default calendar export settings. Use in config.pkl:
+///   calendar: C.CalendarConfig = (C.calendar) { vdir_path = "~/calendars" }
+calendar: CalendarConfig = new {}
+
+// ── Provider Templates ─────────────────────────────────────
+
+/// Microsoft 365 account (OAuth). Use: (C.microsoft365) { name = ...; email = ...; alias = ... }
+/// Microsoft accounts sync (and send) via the Graph backend; the IMAP path is
+/// not supported for them.
+microsoft365: AccountConfig = new {
+  smtp { host = "smtp.office365.com"; port = 587; auth = "oauth2" }
+  imap { host = "outlook.office365.com"; port = 993; auth = "oauth2" }
+  oauth { provider = "microsoft" }
+  sync_engine = "graph"
+}
+
+/// Microsoft 365 shared mailbox. Use: (C.microsoft365Shared) { name = ...; email = ...; auth_email = ...; alias = ... }
+microsoft365Shared: AccountConfig = (microsoft365) {
+  notifications = false
+}
+
+/// Gmail account (OAuth). Use: (C.gmail) { name = ...; email = ...; alias = ...; oauth { client_id = ...; client_secret = ... } }
+/// Gmail accounts sync via the Gmail REST backend (labels become tags); set
+/// sync_engine = "legacy" to fall back to the classic IMAP syncer.
+gmail: AccountConfig = new {
+  smtp { host = "smtp.gmail.com"; port = 587; auth = "oauth2" }
+  // max_messages = 0 syncs the whole mailbox (local-first, full offline); the
+  // Gmail backend paginates through everything. Set a positive cap to limit it.
+  imap { host = "imap.gmail.com"; port = 993; auth = "oauth2"; max_messages = 0 }
+  oauth { provider = "google" }
+  sync_engine = "gmail"
+}

@@ -1,0 +1,40 @@
+/// Durian profiles schema.
+/// Usage: import "schema/Profiles.pkl" as P
+module schema.Profiles
+
+class FolderConfig {
+  name: String
+  icon: String?
+  query: String?
+}
+
+class ProfileConfig {
+  name: String
+  accounts: Listing<String>
+  default: Boolean = false
+  color: String?
+  folders: Listing<FolderConfig>
+}
+
+// ── Reusable Folder Sets ───────────────────────────────────
+
+/// Standard folder set (Inbox, Unread, Sent, Drafts, Spam, Archive, Trash).
+/// Use: folders = P.standardFolders
+standardFolders: Listing<FolderConfig> = new {
+  new { name = "Inbox";   icon = "tray";           query = "tag:inbox AND NOT tag:sent AND NOT tag:draft" }
+  new { name = "Unread";  icon = "envelope.badge";  query = "tag:unread" }
+  new { name = "Sent";    icon = "paperplane";      query = "tag:sent" }
+  new { name = "Drafts";  icon = "doc.text";        query = "tag:draft" }
+  new { name = "Spam";    icon = "xmark.bin";       query = "tag:spam" }
+  new { name = "Archive"; icon = "archivebox";      query = "tag:archive" }
+  new { name = "Trash";   icon = "trash";           query = "tag:trash" }
+}
+
+/// System folders section (Sent, Archive, Spam, Trash with section header).
+systemFolders: Listing<FolderConfig> = new {
+  new { name = "System" }
+  new { name = "Sent";    icon = "paperplane"; query = "tag:sent" }
+  new { name = "Archive"; icon = "archivebox"; query = "tag:archive" }
+  new { name = "Spam";    icon = "xmark.bin";  query = "tag:spam" }
+  new { name = "Trash";   icon = "trash";      query = "tag:trash" }
+}
