@@ -68,6 +68,9 @@ func init() {
 }
 
 func runAuthLogin(cmd *cobra.Command, args []string) error {
+	if noInput {
+		return errors.New("authentication requires input; remove --no-input")
+	}
 	identifier := args[0]
 
 	// Get config
@@ -190,6 +193,9 @@ var stdinPromptReader = bufio.NewReader(os.Stdin)
 
 // promptPassword securely prompts for a password (hides input)
 func promptPassword(prompt string) (string, error) {
+	if noInput {
+		return "", errors.New("password input is disabled by --no-input")
+	}
 	fmt.Fprint(os.Stderr, prompt)
 
 	// Check if stdin is a terminal

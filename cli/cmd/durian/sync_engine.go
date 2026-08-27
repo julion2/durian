@@ -12,6 +12,7 @@ import (
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/imap"
 	"github.com/julion2/durian/cli/internal/syncengine"
+	"golang.org/x/term"
 )
 
 // runEngineSync syncs accounts through the provider-agnostic sync engine
@@ -69,7 +70,7 @@ func syncOneWithEngine(ctx context.Context, account *config.AccountConfig, optio
 		progDone    chan struct{}
 		progStopped chan struct{}
 	)
-	if !syncQuiet {
+	if shouldShowSyncProgress() {
 		onProgress = func(n int) { synced.Store(int64(n)) }
 		progDone = make(chan struct{})
 		progStopped = make(chan struct{})
@@ -133,6 +134,10 @@ func syncOneWithEngine(ctx context.Context, account *config.AccountConfig, optio
 		result.Error = fmt.Errorf("%d folder error(s), first: %w", len(res.Errors), res.Errors[0])
 	}
 	return result
+}
+
+func shouldShowSyncProgress() bool {
+	return !syncQuiet && term.IsTerminal(int(os.Stderr.Fd()))
 }
 
 // engineMode maps the legacy imap.SyncMode to the engine's Mode.
