@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,6 +35,51 @@ func newTestBackend(t *testing.T, srv *httptest.Server) *Backend {
 	b.httpClient = srv.Client()
 	b.tokenFn = func(context.Context) (string, error) { return "test-token", nil }
 	return b
+}
+
+type fakeFlagRetryClock struct {
+	mu     sync.Mutex
+	now    time.Time
+	sleeps []time.Duration
+}
+
+func newFakeFlagRetryClock() *fakeFlagRetryClock {
+	return &fakeFlagRetryClock{now: time.Date(2026, time.August, 27, 9, 0, 0, 0, time.UTC)}
+}
+
+func (c *fakeFlagRetryClock) advance(d time.Duration) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+	return c.now
+}
+
+func (c *fakeFlagRetryClock) current() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeFlagRetryClock) recorded() []time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Duration(nil), c.sleeps...)
+}
+
+func (c *fakeFlagRetryClock) policy() flagRetryPolicy {
+	return flagRetryPolicy{
+		now: c.current,
+		sleep: func(ctx context.Context, delay time.Duration) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.sleeps = append(c.sleeps, delay)
+			c.now = c.now.Add(delay)
+			return nil
+		},
+	}
 }
 
 // writeJSON encodes v as the response body.
@@ -587,12 +633,17 @@ func TestFetchFlagsReturnsErrorAfterTransientRetriesExhausted(t *testing.T) {
 	}))
 	defer srv.Close()
 	b := newTestBackend(t, srv)
+	clock := newFakeFlagRetryClock()
+	b.flagRetries = clock.policy()
 	_, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{{Folder: "folder1", ID: "msg1"}})
 	if !errors.Is(err, backend.ErrPartialFlags) || !strings.Contains(err.Error(), "remain unavailable") {
 		t.Fatalf("FetchFlags() error = %v, want exhausted transient error", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 4 {
 		t.Fatalf("batch calls = %d, want initial request plus 3 retries", got)
+	}
+	if got := fmt.Sprint(clock.recorded()); got != "[1s 2s 4s]" {
+		t.Fatalf("retry sleeps = %s, want [1s 2s 4s]", got)
 	}
 }
 
@@ -621,6 +672,8 @@ func TestFetchFlagsPreservesHealthyRefsWhenOneExhaustsRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 	b := newTestBackend(t, srv)
+	clock := newFakeFlagRetryClock()
+	b.flagRetries = clock.policy()
 	flags, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{
 		{Folder: "folder1", ID: "healthy"},
 		{Folder: "folder1", ID: "poisoned"},
@@ -636,6 +689,317 @@ func TestFetchFlagsPreservesHealthyRefsWhenOneExhaustsRetries(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 4 {
 		t.Fatalf("batch calls = %d, want initial request plus 3 poisoned-ref retries", got)
+	}
+}
+
+func TestFetchFlagsRetriesEveryTransientChunkInSharedRounds(t *testing.T) {
+	var calls int32
+	attempts := make(map[string]int)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		var request struct {
+			Requests []batchRequest `json:"requests"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		responses := make([]map[string]any, 0, len(request.Requests))
+		for _, item := range request.Requests {
+			id := strings.TrimPrefix(item.URL, "/me/messages/")
+			id = strings.SplitN(id, "?", 2)[0]
+			attempts[id]++
+			if strings.HasPrefix(id, "retry-") && attempts[id] <= 3 {
+				responses = append(responses, map[string]any{
+					"id": item.ID, "status": 503,
+				})
+			} else {
+				responses = append(responses, map[string]any{
+					"id": item.ID, "status": 200, "body": map[string]any{"isRead": true},
+				})
+			}
+		}
+		writeJSON(t, w, map[string]any{"responses": responses})
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	clock := newFakeFlagRetryClock()
+	b.flagRetries = clock.policy()
+	refs := make([]backend.RemoteRef, 0, 240)
+	for i := 0; i < 240; i++ {
+		id := fmt.Sprintf("healthy-%d", i)
+		if i%20 == 19 {
+			id = fmt.Sprintf("retry-%d", i)
+		}
+		refs = append(refs, backend.RemoteRef{Folder: "folder1", ID: id})
+	}
+
+	flags, err := b.FetchFlags(t.Context(), "folder1", refs)
+	if err != nil {
+		t.Fatalf("FetchFlags() error = %v", err)
+	}
+	if len(flags) != 240 {
+		t.Fatalf("resolved flags = %d, want all 240 refs", len(flags))
+	}
+	if got := atomic.LoadInt32(&calls); got != 15 {
+		t.Fatalf("batch calls = %d, want 12 initial chunks plus 3 regrouped retries", got)
+	}
+	if got := fmt.Sprint(clock.recorded()); got != "[1s 2s 4s]" {
+		t.Fatalf("retry sleeps = %s, want one shared [1s 2s 4s] budget", got)
+	}
+}
+
+func TestFetchFlagsOuterBatchThrottlesUseSharedRetryBudget(t *testing.T) {
+	var mu sync.Mutex
+	var calls int
+	attempts := make(map[string]int)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Requests []batchRequest `json:"requests"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		chunk := request.Requests[0].URL
+		mu.Lock()
+		calls++
+		attempts[chunk]++
+		throttle := attempts[chunk] == 1
+		mu.Unlock()
+		if throttle {
+			w.Header().Set("Retry-After", "3")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		responses := make([]map[string]any, 0, len(request.Requests))
+		for _, item := range request.Requests {
+			responses = append(responses, map[string]any{
+				"id": item.ID, "status": 200, "body": map[string]any{"isRead": true},
+			})
+		}
+		writeJSON(t, w, map[string]any{"responses": responses})
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	clock := newFakeFlagRetryClock()
+	b.flagRetries = clock.policy()
+	refs := make([]backend.RemoteRef, 45)
+	for i := range refs {
+		refs[i] = backend.RemoteRef{Folder: "folder1", ID: fmt.Sprintf("msg-%d", i)}
+	}
+
+	flags, err := b.FetchFlags(t.Context(), "folder1", refs)
+	if err != nil || len(flags) != len(refs) {
+		t.Fatalf("FetchFlags() = (%d flags, %v), want all %d refs", len(flags), err, len(refs))
+	}
+	mu.Lock()
+	gotCalls := calls
+	mu.Unlock()
+	if gotCalls != 6 {
+		t.Fatalf("batch calls = %d, want three initial chunks plus three shared retries", gotCalls)
+	}
+	if got := fmt.Sprint(clock.recorded()); got != "[3s]" {
+		t.Fatalf("retry sleeps = %s, want one shared [3s] budget", got)
+	}
+}
+
+func TestFetchFlagsOuterBatchThrottleExhaustionIsSystemic(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Retry-After", "20")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	clock := newFakeFlagRetryClock()
+	b.flagRetries = clock.policy()
+	refs := make([]backend.RemoteRef, 60)
+	for i := range refs {
+		refs[i] = backend.RemoteRef{Folder: "folder1", ID: fmt.Sprintf("msg-%d", i)}
+	}
+
+	flags, err := b.FetchFlags(t.Context(), "folder1", refs)
+	if err == nil || errors.Is(err, backend.ErrPartialFlags) {
+		t.Fatalf("FetchFlags() error = %v, want systemic non-partial error", err)
+	}
+	if flags != nil {
+		t.Fatalf("FetchFlags() returned %d flags after systemic throttle, want nil", len(flags))
+	}
+	if got := atomic.LoadInt32(&calls); got != 6 {
+		t.Fatalf("batch calls = %d, want three initial chunks plus three shared retries", got)
+	}
+	if got := fmt.Sprint(clock.recorded()); got != "[7s]" {
+		t.Fatalf("retry sleeps = %s, want shared budget [7s]", got)
+	}
+}
+
+func TestFetchFlagsPermanentFailuresUseOneSharedSleepBudget(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		var request struct {
+			Requests []batchRequest `json:"requests"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		responses := make([]map[string]any, 0, len(request.Requests))
+		for _, item := range request.Requests {
+			id := strings.TrimPrefix(strings.SplitN(item.URL, "?", 2)[0], "/me/messages/")
+			if strings.HasPrefix(id, "retry-") {
+				responses = append(responses, map[string]any{"id": item.ID, "status": 503})
+			} else {
+				responses = append(responses, map[string]any{
+					"id": item.ID, "status": 200, "body": map[string]any{"isRead": true},
+				})
+			}
+		}
+		writeJSON(t, w, map[string]any{"responses": responses})
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	clock := newFakeFlagRetryClock()
+	b.flagRetries = clock.policy()
+	refs := make([]backend.RemoteRef, 0, 900)
+	for i := 0; i < 900; i++ {
+		id := fmt.Sprintf("healthy-%d", i)
+		if i%20 == 19 {
+			id = fmt.Sprintf("retry-%d", i)
+		}
+		refs = append(refs, backend.RemoteRef{Folder: "folder1", ID: id})
+	}
+
+	flags, err := b.FetchFlags(t.Context(), "folder1", refs)
+	if !errors.Is(err, backend.ErrPartialFlags) {
+		t.Fatalf("FetchFlags() error = %v, want ErrPartialFlags", err)
+	}
+	if len(flags) != 855 {
+		t.Fatalf("resolved flags = %d, want 855 healthy refs", len(flags))
+	}
+	if got := atomic.LoadInt32(&calls); got != 54 {
+		t.Fatalf("batch calls = %d, want 45 initial chunks plus 3 chunks in each of 3 regrouped retries", got)
+	}
+	if got := fmt.Sprint(clock.recorded()); got != "[1s 2s 4s]" {
+		t.Fatalf("retry sleeps = %s, want about 7s total", got)
+	}
+}
+
+func TestFetchFlagsNetworkLatencyDoesNotConsumeRetrySleepBudget(t *testing.T) {
+	clock := newFakeFlagRetryClock()
+	var mu sync.Mutex
+	attempts := make(map[string]int)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Second)
+		var request struct {
+			Requests []batchRequest `json:"requests"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		responses := make([]map[string]any, 0, len(request.Requests))
+		for _, item := range request.Requests {
+			id := strings.TrimPrefix(strings.SplitN(item.URL, "?", 2)[0], "/me/messages/")
+			mu.Lock()
+			attempts[id]++
+			attempt := attempts[id]
+			mu.Unlock()
+			if strings.HasPrefix(id, "retry-") && attempt == 1 {
+				responses = append(responses, map[string]any{"id": item.ID, "status": 503})
+			} else {
+				responses = append(responses, map[string]any{
+					"id": item.ID, "status": 200, "body": map[string]any{"isRead": true},
+				})
+			}
+		}
+		writeJSON(t, w, map[string]any{"responses": responses})
+	}))
+	defer srv.Close()
+	b := newTestBackend(t, srv)
+	b.flagRetries = clock.policy()
+	refs := make([]backend.RemoteRef, 0, 160)
+	for i := 0; i < 160; i++ {
+		id := fmt.Sprintf("healthy-%d", i)
+		if i == 19 || i == 159 {
+			id = fmt.Sprintf("retry-%d", i)
+		}
+		refs = append(refs, backend.RemoteRef{Folder: "folder1", ID: id})
+	}
+
+	flags, err := b.FetchFlags(t.Context(), "folder1", refs)
+	if err != nil || len(flags) != len(refs) {
+		t.Fatalf("FetchFlags() = (%d flags, %v), want all %d refs", len(flags), err, len(refs))
+	}
+	if got := fmt.Sprint(clock.recorded()); got != "[1s]" {
+		t.Fatalf("retry sleeps = %s after 8s network latency, want [1s]", got)
+	}
+}
+
+func TestFetchFlagsRetryDelayPolicy(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		retryAfter func(time.Time) string
+		wantSleep  time.Duration
+	}{
+		{name: "429 seconds", status: 429, retryAfter: func(time.Time) string { return "3" }, wantSleep: 3 * time.Second},
+		{name: "503 seconds", status: 503, retryAfter: func(time.Time) string { return "3" }, wantSleep: 3 * time.Second},
+		{name: "HTTP date", status: 429, retryAfter: func(now time.Time) string { return now.Add(5 * time.Second).Format(http.TimeFormat) }, wantSleep: 5 * time.Second},
+		{name: "clamp", status: 429, retryAfter: func(time.Time) string { return "30" }, wantSleep: flagRetryBudget},
+		{name: "zero fallback", status: 429, retryAfter: func(time.Time) string { return "0" }, wantSleep: time.Second},
+		{name: "invalid fallback", status: 429, retryAfter: func(time.Time) string { return "later" }, wantSleep: time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := newFakeFlagRetryClock()
+			var calls int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				call := atomic.AddInt32(&calls, 1)
+				response := map[string]any{"id": "0", "status": 200, "body": map[string]any{"isRead": true}}
+				if call == 1 {
+					response = map[string]any{
+						"id": "0", "status": tc.status,
+						"headers": map[string]string{"Retry-After": tc.retryAfter(clock.current())},
+					}
+				}
+				writeJSON(t, w, map[string]any{"responses": []map[string]any{response}})
+			}))
+			defer srv.Close()
+			b := newTestBackend(t, srv)
+			b.flagRetries = clock.policy()
+
+			flags, err := b.FetchFlags(t.Context(), "folder1", []backend.RemoteRef{{Folder: "folder1", ID: "msg1"}})
+			if err != nil || len(flags) != 1 {
+				t.Fatalf("FetchFlags() = (%v, %v), want resolved flags", flags, err)
+			}
+			sleeps := clock.recorded()
+			if len(sleeps) != 1 || sleeps[0] != tc.wantSleep {
+				t.Fatalf("retry sleeps = %v, want [%v]", sleeps, tc.wantSleep)
+			}
+		})
+	}
+}
+
+func TestBatchRetryAfter(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 9, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		value  string
+		want   time.Duration
+		wantOK bool
+	}{
+		{name: "seconds", value: "3", want: 3 * time.Second, wantOK: true},
+		{name: "HTTP date", value: now.Add(5 * time.Second).Format(http.TimeFormat), want: 5 * time.Second, wantOK: true},
+		{name: "clamped", value: "30", want: flagRetryBudget, wantOK: true},
+		{name: "zero uses fallback", value: "0"},
+		{name: "invalid uses fallback", value: "later"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := batchRetryAfter(map[string]string{"retry-after": tc.value}, now)
+			if got != tc.want || ok != tc.wantOK {
+				t.Fatalf("batchRetryAfter(%q) = (%v, %v), want (%v, %v)", tc.value, got, ok, tc.want, tc.wantOK)
+			}
+		})
 	}
 }
 
