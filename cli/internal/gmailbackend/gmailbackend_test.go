@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
@@ -100,6 +101,36 @@ func TestDecodeJSONLimitedRejectsOversizedResponse(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("decodeJSONLimited() error = %v", err)
 	}
+}
+
+func TestDecodeJSONLimitedPreservesWholeDocumentSemantics(t *testing.T) {
+	if maxJSONBytes != 96<<20 {
+		t.Fatalf("maxJSONBytes = %d, want 96 MiB of headroom above Gmail's 50 MB receive limit", maxJSONBytes)
+	}
+	t.Run("exact limit", func(t *testing.T) {
+		input := `{"ok":true}`
+		var out map[string]bool
+		if err := decodeJSONLimited(strings.NewReader(input), int64(len(input)), &out); err != nil {
+			t.Fatalf("decodeJSONLimited() error = %v", err)
+		}
+		if !out["ok"] {
+			t.Fatalf("decoded value = %v", out)
+		}
+	})
+	t.Run("trailing whitespace", func(t *testing.T) {
+		input := "{\"ok\":true}\n\t"
+		var out map[string]bool
+		if err := decodeJSONLimited(strings.NewReader(input), int64(len(input)), &out); err != nil {
+			t.Fatalf("decodeJSONLimited() error = %v", err)
+		}
+	})
+	t.Run("second value", func(t *testing.T) {
+		input := `{"ok":true} {"other":true}`
+		var out map[string]bool
+		if err := decodeJSONLimited(strings.NewReader(input), int64(len(input)), &out); err == nil {
+			t.Fatal("decodeJSONLimited() accepted multiple JSON values")
+		}
+	})
 }
 
 func TestApplyFlagsRetriesReplaySafeModify(t *testing.T) {
@@ -319,6 +350,141 @@ func rawMsgResp(id, raw string, labels []string) map[string]any {
 		"historyId":    "150",
 		"internalDate": "1710000000000",
 		"raw":          base64.URLEncoding.EncodeToString([]byte(raw)),
+	}
+}
+
+func TestFetchManyBoundsRawConcurrencyAndPreservesResults(t *testing.T) {
+	const maxRawConcurrency = 3
+	if rawFetchConcurrency != maxRawConcurrency {
+		t.Fatalf("rawFetchConcurrency = %d, want measured memory bound %d", rawFetchConcurrency, maxRawConcurrency)
+	}
+	ids := []string{"m5", "m1", "missing", "m4", "m2", "m3"}
+	release := make(chan struct{})
+	started := make(chan struct{}, len(ids))
+	var inFlight, peak atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for previous := peak.Load(); current > previous && !peak.CompareAndSwap(previous, current); previous = peak.Load() {
+		}
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/users/me/messages/")
+		if id == "missing" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writeJSON(t, w, rawMsgResp(id, "raw-"+id, nil))
+	}))
+	defer srv.Close()
+
+	b := newTestBackend(t, srv)
+	type fetchResult struct {
+		messages []backend.Message
+		missing  []string
+		err      error
+	}
+	done := make(chan fetchResult, 1)
+	go func() {
+		messages, missing, err := b.fetchMany(t.Context(), allMailStream, ids)
+		done <- fetchResult{messages: messages, missing: missing, err: err}
+	}()
+
+	for range maxRawConcurrency {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("RAW fetches did not reach the expected concurrency")
+		}
+	}
+	tooManyStarted := false
+	select {
+	case <-started:
+		tooManyStarted = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if tooManyStarted {
+		t.Fatalf("more than %d RAW fetches started while the first requests were blocked", maxRawConcurrency)
+	}
+
+	result := <-done
+	if result.err != nil {
+		t.Fatalf("fetchMany() error = %v", result.err)
+	}
+	if got := peak.Load(); got != maxRawConcurrency {
+		t.Fatalf("peak RAW concurrency = %d, want %d", got, maxRawConcurrency)
+	}
+	if !slices.Equal(result.missing, []string{"missing"}) {
+		t.Fatalf("missing = %v, want [missing]", result.missing)
+	}
+	wantIDs := []string{"m5", "m1", "m4", "m2", "m3"}
+	if len(result.messages) != len(wantIDs) {
+		t.Fatalf("messages = %d, want %d", len(result.messages), len(wantIDs))
+	}
+	for i, wantID := range wantIDs {
+		if result.messages[i].Ref.ID != wantID || string(result.messages[i].Raw) != "raw-"+wantID {
+			t.Errorf("messages[%d] = id %q raw %q, want id %q raw %q", i, result.messages[i].Ref.ID, result.messages[i].Raw, wantID, "raw-"+wantID)
+		}
+	}
+}
+
+func TestFetchManyReturnsNonNotFoundError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"bad request"}`))
+	}))
+	defer srv.Close()
+
+	messages, missing, err := newTestBackend(t, srv).fetchMany(t.Context(), allMailStream, []string{"m1"})
+	if err == nil || !strings.Contains(err.Error(), "fetch message: gmail request failed: status 400") {
+		t.Fatalf("fetchMany() error = %v, want wrapped status error", err)
+	}
+	if messages != nil || missing != nil {
+		t.Fatalf("fetchMany() returned messages %v, missing %v with an error", messages, missing)
+	}
+}
+
+func TestFetchManyCancellationStopsQueuedRawFetches(t *testing.T) {
+	started := make(chan struct{}, rawFetchConcurrency+1)
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	b := newTestBackend(t, srv)
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := b.fetchMany(ctx, allMailStream, []string{"m1", "m2", "m3", "m4", "m5"})
+		done <- err
+	}()
+	for range rawFetchConcurrency {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("RAW fetches did not reach the concurrency cap")
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("fetchMany() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fetchMany() did not return after cancellation")
+	}
+	select {
+	case <-started:
+		t.Fatal("queued RAW fetch started after cancellation")
+	default:
 	}
 }
 

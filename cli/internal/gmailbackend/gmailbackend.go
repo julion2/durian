@@ -45,7 +45,7 @@ const (
 	// RAW messages are base64url-encoded inside JSON; leave room for Gmail's
 	// largest accepted messages plus encoding overhead while still bounding
 	// every response allocation.
-	maxJSONBytes = 128 << 20
+	maxJSONBytes = 96 << 20
 	// allMailStream is the single synthetic folder the engine iterates: Gmail is
 	// folderless, so all messages flow through one stream and their labels become
 	// tags. "me" is Gmail's alias for the authenticated user in message queries.
@@ -495,7 +495,7 @@ func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.Remo
 	missing := make([]bool, len(refs))
 
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, fetchConcurrency)
+	sem := make(chan struct{}, metadataFetchConcurrency)
 	for i := range refs {
 		select {
 		case sem <- struct{}{}:
@@ -631,11 +631,17 @@ func (b *Backend) fetchOne(ctx context.Context, folder, id string) (fetched, err
 	}, nil
 }
 
-// fetchConcurrency bounds simultaneous message.get RAW downloads. Gmail caps a
-// user at ~250 quota units/sec and messages.get costs 5 (~50 msgs/sec), so this
-// is sized to saturate that ceiling — turning a serial full sync (minutes) into
-// a quota-bound one — while do() backs off on the 429s that steady state hits.
-const fetchConcurrency = 20
+const (
+	// metadataFetchConcurrency keeps cheap MINIMAL snapshot refreshes parallel.
+	// These responses do not carry the base64-encoded MIME body.
+	metadataFetchConcurrency = 20
+	// rawFetchConcurrency limits the much larger RAW responses independently.
+	// A maximum-size response overlaps large JSON, encoded-string, and decoded
+	// MIME allocations, so the old limit of 20 allowed a multi-GiB peak. Three
+	// requests retain useful overlap at the cost of lower full-sync throughput
+	// while keeping Gmail quota use below the previous cap.
+	rawFetchConcurrency = 3
+)
 
 // fetchMany downloads the raw MIME for each id concurrently, preserving order.
 // A 404 (message deleted since it was listed) is skipped; any other error fails
@@ -646,7 +652,7 @@ func (b *Backend) fetchMany(ctx context.Context, folder string, ids []string) ([
 	missing := make([]bool, len(ids))
 
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, fetchConcurrency)
+	sem := make(chan struct{}, rawFetchConcurrency)
 	for i := range ids {
 		select {
 		case sem <- struct{}{}:
