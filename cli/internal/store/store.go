@@ -19,8 +19,15 @@ import (
 // decrypt the ADR-0001 §3 sensitive columns. Nil is not allowed — every
 // caller must derive a keyring from the master key at startup.
 type DB struct {
-	db      *sql.DB
-	keyring *dbcrypto.Keyring
+	db             *sql.DB
+	keyring        *dbcrypto.Keyring
+	accountAliases map[string]string
+}
+
+// SetAccountAliases configures user-facing account identifiers (aliases,
+// names, and email addresses) to resolve to canonical store account names.
+func (d *DB) SetAccountAliases(aliases map[string]string) {
+	d.accountAliases = aliases
 }
 
 // Open opens or creates an email store database at the given path.

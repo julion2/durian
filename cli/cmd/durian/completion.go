@@ -1,6 +1,10 @@
 package main
 
 import (
+	"fmt"
+	"strconv"
+	"strings"
+
 	"github.com/spf13/cobra"
 )
 
@@ -17,4 +21,40 @@ func completeAccounts(_ *cobra.Command, _ []string, _ string) ([]string, cobra.S
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
 	return cfg.ListAccountIdentifiers(), cobra.ShellCompDirectiveNoFileComp
+}
+
+func resolveAccountStoreKeys(identifiers []string) ([]string, error) {
+	cfg := GetConfig()
+	if cfg == nil {
+		return nil, fmt.Errorf("no configuration loaded")
+	}
+	keys := make([]string, 0, len(identifiers))
+	seen := make(map[string]bool, len(identifiers))
+	for _, identifier := range identifiers {
+		account, err := cfg.GetAccountByIdentifier(identifier)
+		if err != nil {
+			return nil, fmt.Errorf("account not found: %s\navailable accounts: %s", identifier, strings.Join(cfg.ListAccountIdentifiers(), ", "))
+		}
+		key := account.AccountIdentifier()
+		if !seen[key] {
+			seen[key] = true
+			keys = append(keys, key)
+		}
+	}
+	return keys, nil
+}
+
+func scopeQueryByAccounts(query string, identifiers []string) (string, error) {
+	if len(identifiers) == 0 {
+		return query, nil
+	}
+	keys, err := resolveAccountStoreKeys(identifiers)
+	if err != nil {
+		return "", err
+	}
+	clauses := make([]string, len(keys))
+	for i, key := range keys {
+		clauses[i] = "path:" + strconv.Quote(key)
+	}
+	return "(" + query + ") AND (" + strings.Join(clauses, " OR ") + ")", nil
 }

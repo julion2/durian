@@ -666,6 +666,34 @@ func TestSearch_AccountFilter(t *testing.T) {
 	}
 }
 
+func TestSearch_AccountFilterResolvesAlias(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	if err := db.InsertMessage(&Message{
+		MessageID: "alias@x", Subject: "From work", FromAddr: "a@x",
+		Date: now, CreatedAt: now, FetchedBody: true, Account: "work mail",
+	}); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+	db.SetAccountAliases(map[string]string{"office": "work mail"})
+
+	results, err := db.Search("path:office", 10)
+	if err != nil {
+		t.Fatalf("search by account alias: %v", err)
+	}
+	if len(results) != 1 {
+		t.Errorf("got %d results for path:office, want 1", len(results))
+	}
+
+	results, err = db.Search(`path:"work mail"`, 10)
+	if err != nil {
+		t.Fatalf("search by quoted account name: %v", err)
+	}
+	if len(results) != 1 {
+		t.Errorf("got %d results for quoted account name, want 1", len(results))
+	}
+}
+
 func TestExtractAccountFromPath(t *testing.T) {
 	tests := []struct {
 		input string
