@@ -23,7 +23,7 @@ var (
 )
 
 var syncCmd = &cobra.Command{
-	Use:   "sync [account] [mailbox]",
+	Use:   "sync [account] [mailbox...]",
 	Short: "Sync email to the local store",
 	Long:  "Sync email from IMAP or a native provider API to local SQLite. Bidirectional by default.",
 	Example: `  durian sync
@@ -56,6 +56,12 @@ func init() {
 }
 
 func runSync(cmd *cobra.Command, args []string) error {
+	if syncDownloadOnly && syncUploadOnly {
+		return fmt.Errorf("--download-only and --upload-only cannot be used together")
+	}
+	if syncBackfillHeadersForce && !syncBackfillHeaders {
+		return fmt.Errorf("--force requires --backfill-headers")
+	}
 	// Load config
 	cfg, err := config.Load(cfgFile)
 	if err != nil {

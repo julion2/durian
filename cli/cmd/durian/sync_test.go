@@ -24,6 +24,24 @@ func TestSyncProgressIsDisabledForRedirectedStderr(t *testing.T) {
 	}
 }
 
+func TestSyncRejectsConflictingModesBeforeConfigLoad(t *testing.T) {
+	previousDownload, previousUpload := syncDownloadOnly, syncUploadOnly
+	syncDownloadOnly, syncUploadOnly = true, true
+	t.Cleanup(func() { syncDownloadOnly, syncUploadOnly = previousDownload, previousUpload })
+	if err := runSync(syncCmd, nil); err == nil {
+		t.Fatal("conflicting sync modes were accepted")
+	}
+}
+
+func TestSyncRejectsForceWithoutBackfillBeforeConfigLoad(t *testing.T) {
+	previousForce, previousBackfill := syncBackfillHeadersForce, syncBackfillHeaders
+	syncBackfillHeadersForce, syncBackfillHeaders = true, false
+	t.Cleanup(func() { syncBackfillHeadersForce, syncBackfillHeaders = previousForce, previousBackfill })
+	if err := runSync(syncCmd, nil); err == nil {
+		t.Fatal("--force without --backfill-headers was accepted")
+	}
+}
+
 func TestSyncRemoteTagsDryRunDoesNotWrite(t *testing.T) {
 	keyring, err := dbcrypto.NewKeyring(bytes.Repeat([]byte{0x42}, dbcrypto.MasterKeyLen))
 	if err != nil {
