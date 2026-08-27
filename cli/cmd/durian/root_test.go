@@ -16,6 +16,19 @@ func TestNoInputDisablesPrompts(t *testing.T) {
 	}
 }
 
+func TestConceptualHelpTopicsAreDiscoverable(t *testing.T) {
+	for _, name := range []string{"query", "identifiers", "accounts", "output", "calendar-time"} {
+		cmd, _, err := rootCmd.Find([]string{name})
+		if err != nil || cmd.Name() != name {
+			t.Errorf("help topic %q not found: command=%v err=%v", name, cmd, err)
+			continue
+		}
+		if !cmd.IsAdditionalHelpTopicCommand() {
+			t.Errorf("%q is not classified as an additional help topic", name)
+		}
+	}
+}
+
 func TestLoadStartupConfigRejectsMissingExplicitPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.pkl")
 	loaded, err := loadStartupConfig(path)
