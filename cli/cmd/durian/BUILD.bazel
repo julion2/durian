@@ -76,6 +76,7 @@ go_test(
     srcs = [
         "auth_test.go",
         "calendar_test.go",
+        "root_test.go",
         "sync_test.go",
     ],
     embed = [":durian_lib"],
