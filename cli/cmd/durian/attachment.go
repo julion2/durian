@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -23,7 +25,7 @@ var attachmentCmd = &cobra.Command{
 	Short: "List or download attachments",
 	Long:  "List attachments for a message, or download a specific part with --save.",
 	Example: `  durian attachment msg-id@example.com
-  durian attachment msg-id@example.com --save 1
+  durian attachment msg-id@example.com --account work --save 1
   durian attachment msg-id@example.com --save 1 --output ~/Downloads/`,
 	Args: cobra.ExactArgs(1),
 	RunE: runAttachment,
@@ -32,16 +34,21 @@ var attachmentCmd = &cobra.Command{
 var (
 	attachSavePart int
 	attachOutput   string
+	attachAccount  string
+	attachForce    bool
 )
 
 func init() {
 	attachmentCmd.Flags().IntVar(&attachSavePart, "save", 0, "download part ID (0 = list only)")
 	attachmentCmd.Flags().StringVarP(&attachOutput, "output", "o", ".", "output directory for download")
+	attachmentCmd.Flags().StringVarP(&attachAccount, "account", "a", "", "account containing the message")
+	attachmentCmd.Flags().BoolVar(&attachForce, "force", false, "overwrite an existing file")
+	_ = attachmentCmd.RegisterFlagCompletionFunc("account", completeAccounts)
 	rootCmd.AddCommand(attachmentCmd)
 }
 
 func runAttachment(cmd *cobra.Command, args []string) error {
-	messageID := args[0]
+	messageID := normalizeMessageReference(args[0])
 
 	emailDB, err := openEmailDB()
 	if err != nil {
@@ -49,7 +56,11 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 	}
 	defer emailDB.Close()
 
-	atts, err := emailDB.GetAttachmentsByMessageID(messageID)
+	msg, err := resolveAttachmentMessage(emailDB, cfg, messageID, attachAccount)
+	if err != nil {
+		return err
+	}
+	atts, err := emailDB.GetAttachmentsByMessage(msg.ID)
 	if err != nil {
 		return fmt.Errorf("get attachments: %w", err)
 	}
@@ -82,10 +93,6 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("part %d not found", attachSavePart)
 	}
 
-	msg, err := emailDB.GetByMessageID(messageID)
-	if err != nil || msg == nil {
-		return fmt.Errorf("message not found in store")
-	}
 	account, err := cfg.GetAccountByIdentifier(msg.Account)
 	if err != nil {
 		return fmt.Errorf("account %q not found in config", msg.Account)
@@ -96,6 +103,13 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 		safeFilename = "attachment"
 	}
 	outPath := filepath.Join(attachOutput, safeFilename)
+	if !attachForce {
+		if _, err := os.Lstat(outPath); err == nil {
+			return fmt.Errorf("output file already exists: %s (use --force to overwrite)", outPath)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("check output file: %w", err)
+		}
+	}
 
 	// Backend-neutral path for engine/Graph-synced messages, which carry a
 	// provider handle (remote_ref) rather than an IMAP UID: fetch the raw body
@@ -105,8 +119,18 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("download failed: %w", err)
 		}
-		if err := os.WriteFile(outPath, data, 0o644); err != nil {
+		f, err := createAttachmentFile(outPath, attachForce)
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(data); err != nil {
+			f.Close()
+			os.Remove(outPath)
 			return fmt.Errorf("write file: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			os.Remove(outPath)
+			return fmt.Errorf("close file: %w", err)
 		}
 		fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(len(data)))
 		return nil
@@ -127,9 +151,9 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 	if _, err := client.SelectMailbox(msg.Mailbox); err != nil {
 		return err
 	}
-	f, err := os.Create(outPath)
+	f, err := createAttachmentFile(outPath, attachForce)
 	if err != nil {
-		return fmt.Errorf("create file: %w", err)
+		return err
 	}
 	defer f.Close()
 	if err := client.FetchDecodedAttachment(msg.UID, att.Filename, att.PartID, f); err != nil {
@@ -139,6 +163,69 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 	fi, _ := f.Stat()
 	fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(int(fi.Size())))
 	return nil
+}
+
+func normalizeMessageReference(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if len(ref) >= len("message:") && strings.EqualFold(ref[:len("message:")], "message:") {
+		ref = strings.TrimSpace(ref[len("message:"):])
+	}
+	ref = strings.TrimPrefix(ref, "<")
+	return strings.TrimSuffix(ref, ">")
+}
+
+func resolveAttachmentMessage(emailDB *store.DB, cfg *config.Config, messageID, accountIdentifier string) (*store.Message, error) {
+	messages, err := emailDB.GetAllByMessageID(messageID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve message: %w", err)
+	}
+	if len(messages) == 0 {
+		return nil, fmt.Errorf("message %q not found in store", messageID)
+	}
+
+	if accountIdentifier != "" {
+		account, err := cfg.GetAccountByIdentifier(accountIdentifier)
+		if err != nil {
+			return nil, fmt.Errorf("account %q not found in config", accountIdentifier)
+		}
+		for _, message := range messages {
+			if strings.EqualFold(message.Account, account.AccountIdentifier()) {
+				return message, nil
+			}
+		}
+		return nil, fmt.Errorf("message %q was not found in account %q", messageID, account.GetAliasOrName())
+	}
+
+	if len(messages) > 1 {
+		accounts := make([]string, 0, len(messages))
+		for _, message := range messages {
+			name := message.Account
+			if account, err := cfg.GetAccountByIdentifier(message.Account); err == nil {
+				name = account.GetAliasOrName()
+			}
+			accounts = append(accounts, name)
+		}
+		sort.Strings(accounts)
+		return nil, fmt.Errorf("message %q exists in multiple accounts (%s); add --account", messageID, strings.Join(accounts, ", "))
+	}
+	return messages[0], nil
+}
+
+func createAttachmentFile(path string, force bool) (*os.File, error) {
+	flags := os.O_WRONLY | os.O_CREATE
+	if force {
+		flags |= os.O_TRUNC
+	} else {
+		flags |= os.O_EXCL
+	}
+	f, err := os.OpenFile(path, flags, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil, fmt.Errorf("output file already exists: %s (use --force to overwrite)", path)
+		}
+		return nil, fmt.Errorf("create file: %w", err)
+	}
+	return f, nil
 }
 
 // fetchAttachmentPartViaBackend fetches msg's raw body through the account's
