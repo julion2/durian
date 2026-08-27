@@ -74,7 +74,7 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 		}
 		for _, a := range atts {
 			size := formatSize(a.Size)
-			fmt.Fprintf(os.Stdout, "  [%d] %s (%s, %s)\n", a.PartID, a.Filename, a.ContentType, size)
+			fmt.Fprintf(os.Stdout, "  [%d] %s (%s, %s)\n", a.PartID, humanText(a.Filename, false), humanText(a.ContentType, false), size)
 		}
 		return nil
 	}

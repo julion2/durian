@@ -252,7 +252,7 @@ func warnMisconfiguredCollections(cols []calendar.Collection, calendars []calend
 // calendarLabel renders the calendar cell of a row. Account is a separate
 // column so the calendar name remains stable in single- and multi-account output.
 func calendarLabel(cal calendar.LocalCalendar) string {
-	return calSwatch(cal.HexColor, cal.Name)
+	return calSwatch(cal.HexColor, humanText(cal.Name, false))
 }
 
 // occurrence pairs an expanded event with its calendar for sorting/printing.
@@ -483,11 +483,11 @@ func runCalendarShow(cmd *cobra.Command, args []string) error {
 
 // printEventDetail renders one event as a labeled block (see show.go's style).
 func printEventDetail(e calendar.Event, calName, account string) {
-	fmt.Println(styAccent(orDash(e.Subject)))
+	fmt.Println(styAccent(humanText(orDash(e.Subject), false)))
 	fmt.Println(strings.Repeat("─", 50))
 	field := func(label, value string) {
 		if value != "" {
-			fmt.Printf("%s %s\n", styDim(fmt.Sprintf("%-11s", label+":")), value)
+			fmt.Printf("%s %s\n", styDim(fmt.Sprintf("%-11s", label+":")), humanText(value, false))
 		}
 	}
 
@@ -512,11 +512,11 @@ func printEventDetail(e calendar.Event, calName, account string) {
 	if len(e.Attendees) > 0 {
 		fmt.Printf("\n%s\n", styDim(fmt.Sprintf("Attendees (%d):", len(e.Attendees))))
 		for _, a := range e.Attendees {
-			fmt.Printf("  %-12s %s\n", styDim(partStatLabel(a.Response)), attendeeLabel(a))
+			fmt.Printf("  %-12s %s\n", styDim(partStatLabel(a.Response)), humanText(attendeeLabel(a), false))
 		}
 	}
 	if e.Description != "" {
-		fmt.Printf("\n%s\n%s\n", styDim("Description:"), strings.TrimSpace(e.Description))
+		fmt.Printf("\n%s\n%s\n", styDim("Description:"), humanText(strings.TrimSpace(e.Description), true))
 	}
 }
 

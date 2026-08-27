@@ -102,7 +102,7 @@ func runGroupList(cmd *cobra.Command, args []string) error {
 		if desc == "" {
 			desc = "-"
 		}
-		fmt.Fprintf(w, "%s\t%d\t%s\n", name, len(group.Members), desc)
+		fmt.Fprintf(w, "%s\t%d\t%s\n", humanText(name, false), len(group.Members), humanText(desc, false))
 	}
 	w.Flush()
 
@@ -139,9 +139,9 @@ func runGroupMembers(cmd *cobra.Command, args []string) error {
 	}
 
 	if group.Description != "" {
-		fmt.Printf("%s — %s\n", name, group.Description)
+		fmt.Printf("%s — %s\n", humanText(name, false), humanText(group.Description, false))
 	} else {
-		fmt.Println(name)
+		fmt.Println(humanText(name, false))
 	}
 
 	if len(group.Members) == 0 {
@@ -151,9 +151,9 @@ func runGroupMembers(cmd *cobra.Command, args []string) error {
 
 	for _, person := range group.Members {
 		if len(person) == 1 {
-			fmt.Printf("  %s\n", person[0])
+			fmt.Printf("  %s\n", humanText(person[0], false))
 		} else {
-			fmt.Printf("  %s\n", strings.Join(person, ", "))
+			fmt.Printf("  %s\n", humanText(strings.Join(person, ", "), false))
 		}
 	}
 
