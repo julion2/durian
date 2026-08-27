@@ -160,6 +160,28 @@ type fakeBackend struct {
 // so tests can exercise Graph/IMAP-style full-body replacement snapshots.
 type backendOnly struct{ backend.Backend }
 
+type arbitraryLabelBackend struct{ *fakeBackend }
+
+func (b *arbitraryLabelBackend) ManagesLabelTag(tag string) bool {
+	return tag != "unread" && tag != "flagged" && tag != "replied"
+}
+
+type tagMutationCall struct {
+	ref backend.RemoteRef
+	tag string
+	add bool
+}
+
+type nativeTagPatchBackend struct {
+	*fakeBackend
+	tagMutationCalls []tagMutationCall
+}
+
+func (b *nativeTagPatchBackend) ApplyTagMutation(_ context.Context, ref backend.RemoteRef, tag string, add bool) error {
+	b.tagMutationCalls = append(b.tagMutationCalls, tagMutationCall{ref: ref, tag: tag, add: add})
+	return nil
+}
+
 type delayedBackend struct {
 	backend.Backend
 	delays []time.Duration
@@ -423,8 +445,8 @@ func TestEngineReportsNewInboxArrivals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first sync: %v", err)
 	}
-	if got, want := res.NewMessageIDs, []string{"arrived@example.com"}; !slices.Equal(got, want) {
-		t.Errorf("NewMessageIDs = %v, want %v (only inbox arrivals notify)", got, want)
+	if got, want := res.NewMessageIdentifiers, []string{"arrived@example.com"}; !slices.Equal(got, want) {
+		t.Errorf("NewMessageIdentifiers = %v, want %v (only inbox arrivals notify)", got, want)
 	}
 
 	// Second sync: nothing new, so nothing to notify about — a re-delivered
@@ -433,8 +455,8 @@ func TestEngineReportsNewInboxArrivals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second sync: %v", err)
 	}
-	if len(res.NewMessageIDs) != 0 {
-		t.Errorf("NewMessageIDs = %v on a no-change sync, want none", res.NewMessageIDs)
+	if len(res.NewMessageIdentifiers) != 0 {
+		t.Errorf("NewMessageIdentifiers = %v on a no-change sync, want none", res.NewMessageIdentifiers)
 	}
 }
 
@@ -443,6 +465,7 @@ func TestEngineReportsInboxLabelArrivalFromAllMailStream(t *testing.T) {
 	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Role: backend.RoleAll, Selectable: true}}, map[string][]backend.FetchResult{
 		"ALL": {{
 			Messages: []backend.Message{{
+				StableID:  "j1",
 				MessageID: "jmap-arrival@example.com",
 				Ref:       backend.RemoteRef{Folder: "ALL", ID: "j1"},
 				Raw:       rawMessage("jmap-arrival@example.com", "a@example.com", testAccount, "Hello", "body"),
@@ -456,8 +479,51 @@ func TestEngineReportsInboxLabelArrivalFromAllMailStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := res.NewMessageIDs, []string{"jmap-arrival@example.com"}; !slices.Equal(got, want) {
-		t.Fatalf("NewMessageIDs = %v, want %v", got, want)
+	if len(res.NewMessageIdentifiers) != 1 || !strings.HasPrefix(res.NewMessageIdentifiers[0], "local:") {
+		t.Fatalf("NewMessageIdentifiers = %v, want one exact local identifier", res.NewMessageIdentifiers)
+	}
+	msg, err := db.GetByIdentifier(res.NewMessageIdentifiers[0])
+	if err != nil || msg == nil || msg.StableID != "j1" {
+		t.Fatalf("notification identifier resolved message = %+v, err = %v", msg, err)
+	}
+}
+
+func TestEngineReportsDistinctStableArrivalsWithDuplicateMessageIDs(t *testing.T) {
+	db := newTestDB(t)
+	messages := []backend.Message{
+		{
+			StableID: "email-1", MessageID: "duplicate@example.com",
+			Ref:    backend.RemoteRef{Folder: "ALL", ID: "email-1"},
+			Raw:    rawMessage("duplicate@example.com", "a@example.com", testAccount, "First", "body"),
+			Labels: []string{"inbox"},
+		},
+		{
+			StableID: "email-2", MessageID: "duplicate@example.com",
+			Ref:    backend.RemoteRef{Folder: "ALL", ID: "email-2"},
+			Raw:    rawMessage("duplicate@example.com", "b@example.com", testAccount, "Second", "body"),
+			Labels: []string{"inbox"},
+		},
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Role: backend.RoleAll, Selectable: true}}, map[string][]backend.FetchResult{
+		"ALL": {{Messages: messages, Cursor: backend.Cursor("c1")}},
+	})
+	fake.caps.LabelsAreTags = true
+
+	res, err := newTestEngine(db, newMemCursorStore()).Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.NewMessageIdentifiers) != 2 || res.NewMessageIdentifiers[0] == res.NewMessageIdentifiers[1] {
+		t.Fatalf("NewMessageIdentifiers = %v, want two distinct identifiers", res.NewMessageIdentifiers)
+	}
+	for i, identifier := range res.NewMessageIdentifiers {
+		msg, err := db.GetByIdentifier(identifier)
+		if err != nil || msg == nil {
+			t.Fatalf("resolve %q: message=%+v err=%v", identifier, msg, err)
+		}
+		if got, want := msg.StableID, messages[i].StableID; got != want {
+			t.Errorf("identifier %q stable ID = %q, want %q", identifier, got, want)
+		}
 	}
 }
 
@@ -828,7 +894,7 @@ func TestEngineDeltaCommitPreservesReplacementReplay(t *testing.T) {
 		MessageID: "delta-interleave@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "m1"},
 		Raw: rawMessage("delta-interleave@example.com", "a@example.com", testAccount, "Delta", "body"),
 	}
-	if _, _, err := Ingest(db, message, "INBOX", backend.RoleInbox, IngestOptions{Account: testAccount}); err != nil {
+	if _, _, _, err := Ingest(db, message, "INBOX", backend.RoleInbox, IngestOptions{Account: testAccount}); err != nil {
 		t.Fatal(err)
 	}
 	cursors := newMemCursorStore()
@@ -1279,7 +1345,7 @@ func TestEngineReplacementSkipsPermanentHydratedIngestFailure(t *testing.T) {
 		MessageID: "broken@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "prior"},
 		Raw: rawMessage("broken@example.com", "a@example.com", testAccount, "Prior", "body"),
 	}
-	if _, _, err := Ingest(db, prior, "INBOX", backend.RoleNone, IngestOptions{Account: testAccount}); err != nil {
+	if _, _, _, err := Ingest(db, prior, "INBOX", backend.RoleNone, IngestOptions{Account: testAccount}); err != nil {
 		t.Fatalf("seed prior copy: %v", err)
 	}
 	ref := backend.RemoteRef{Folder: "INBOX", ID: "broken"}
@@ -1406,7 +1472,7 @@ func TestEngineReplacementFlagDeadlineMakesBoundedProgress(t *testing.T) {
 		MessageID: "deadline@example.com", Ref: backend.RemoteRef{Folder: "ALL", ID: "r1"},
 		Raw: rawMessage("deadline@example.com", "a@example.com", testAccount, "Deadline", "body"),
 	}
-	if _, _, err := Ingest(db, message, "ALL", backend.RoleAll, IngestOptions{Account: testAccount}); err != nil {
+	if _, _, _, err := Ingest(db, message, "ALL", backend.RoleAll, IngestOptions{Account: testAccount}); err != nil {
 		t.Fatal(err)
 	}
 	if err := cursors.Set(testAccount, "ALL", backend.Cursor("old")); err != nil {
@@ -2860,6 +2926,196 @@ func TestEngineSeedsEmptyLabelBaseline(t *testing.T) {
 	}
 }
 
+func TestEngineUploadsArbitraryLabelWithEmptyBaseline(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	message := &store.Message{
+		StableID: "email-1", MessageID: "arbitrary@example.com", Date: now, CreatedAt: now,
+		Mailbox: "ALL", Account: testAccount, RemoteRef: "email-1",
+	}
+	if err := db.InsertMessage(message); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddTag(message.ID, "project"); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeBackend(nil, nil)
+	fake.caps.LabelsAreTags = true
+	backendWithKeywords := &arbitraryLabelBackend{fakeBackend: fake}
+	engine := newTestEngine(db, newMemCursorStore())
+	result := &Result{}
+	engine.uploadLabelChanges(t.Context(), backendWithKeywords, result)
+	if len(fake.labelCalls) != 1 || !sameSet(fake.labelCalls[0].add, []string{"project"}) || len(fake.labelCalls[0].remove) != 0 {
+		t.Fatalf("label calls = %+v", fake.labelCalls)
+	}
+	baseline, err := db.GetSyncedLabelsByDBID(message.ID)
+	if err != nil || baseline != "project" {
+		t.Fatalf("baseline = %q, err=%v", baseline, err)
+	}
+}
+
+func TestEngineRemovesFinalArbitraryLabelFromBaseline(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	message := &store.Message{
+		StableID: "email-1", MessageID: "remove-arbitrary@example.com", Date: now, CreatedAt: now,
+		Mailbox: "ALL", Account: testAccount, RemoteRef: "email-1",
+	}
+	if err := db.InsertMessage(message); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetSyncedLabelsByDBID(message.ID, "project"); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeBackend(nil, nil)
+	fake.caps.LabelsAreTags = true
+	engine := newTestEngine(db, newMemCursorStore())
+	result := &Result{}
+	engine.uploadLabelChanges(t.Context(), &arbitraryLabelBackend{fakeBackend: fake}, result)
+	if len(fake.labelCalls) != 1 || len(fake.labelCalls[0].add) != 0 || !sameSet(fake.labelCalls[0].remove, []string{"project"}) {
+		t.Fatalf("label calls = %+v, want final project removal", fake.labelCalls)
+	}
+	baseline, err := db.GetSyncedLabelsByDBID(message.ID)
+	if err != nil || baseline != "" {
+		t.Fatalf("baseline = %q, err=%v", baseline, err)
+	}
+}
+
+func TestEngineNativeTagIntentUsesPropertyPatchWithoutBaselineUpload(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	message := &store.Message{
+		StableID: "email-1", MessageID: "native-patch@example.com", Date: now, CreatedAt: now,
+		Mailbox: "ALL", Account: testAccount, RemoteRef: "email-1",
+	}
+	if err := db.InsertMessage(message); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddTag(message.ID, "unread"); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Role: backend.RoleAll, Selectable: true}}, nil)
+	fake.caps.FlagChangesInDelta = true
+	mutated := false
+	fake.fetchByCursor = func(_ string, cursor backend.Cursor) backend.FetchResult {
+		if !mutated {
+			mutated = true
+			if err := db.ModifyTagsByMessageDBIDAndJournal(message.ID, nil, []string{"unread"}, time.Now().Unix()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return backend.FetchResult{Cursor: cursor}
+	}
+	native := &nativeTagPatchBackend{fakeBackend: fake}
+	result, err := newTestEngine(db, newMemCursorStore()).Sync(t.Context(), native)
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("sync result=%+v err=%v", result, err)
+	}
+	if len(native.tagMutationCalls) != 1 {
+		t.Fatalf("tag mutation calls = %+v, want one", native.tagMutationCalls)
+	}
+	call := native.tagMutationCalls[0]
+	if call.ref.ID != message.RemoteRef || call.tag != "unread" || call.add {
+		t.Fatalf("tag mutation = %+v, want unread removal for %s", call, message.RemoteRef)
+	}
+	if len(fake.applyFlagsCalls) != 0 {
+		t.Fatalf("ApplyFlags calls = %+v, native backend must not reconstruct baseline uploads", fake.applyFlagsCalls)
+	}
+	mutations, err := db.ReadProviderTagMutations(testAccount)
+	if err != nil || len(mutations) != 0 {
+		t.Fatalf("pending mutations = %+v, err=%v", mutations, err)
+	}
+}
+
+func TestEngineNativeFlagDownloadDoesNotResurrectAmbientLocalState(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	message := &store.Message{
+		StableID: "email-1", MessageID: "native-server-wins@example.com", Date: now, CreatedAt: now,
+		Mailbox: "ALL", Account: testAccount, RemoteRef: "email-1",
+	}
+	if err := db.InsertMessage(message); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeBackend(nil, nil)
+	fake.caps.FlagChangesInDelta = true
+	fake.flagsByRef[message.RemoteRef] = backend.Flags{}
+	native := &nativeTagPatchBackend{fakeBackend: fake}
+	engine := newTestEngine(db, newMemCursorStore())
+	result := &Result{}
+	reconciled := engine.reconcileFolderFlags(t.Context(), native,
+		backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true},
+		map[string]backend.Flags{message.RemoteRef: {}}, PendingFlags{}, result)
+	if reconciled.failed() || len(result.Errors) != 0 {
+		t.Fatalf("flag reconcile = %+v, errors=%v", reconciled, result.Errors)
+	}
+	tags, err := db.GetMessageTags(message.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(tags, "unread") {
+		t.Fatalf("downloaded native server tags = %v, want unread", tags)
+	}
+}
+
+func TestEngineNoFlagsRetainsNativeTagIntent(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	message := &store.Message{
+		StableID: "email-1", MessageID: "no-native-flags@example.com", Date: now, CreatedAt: now,
+		Mailbox: "ALL", Account: testAccount, RemoteRef: "email-1",
+	}
+	if err := db.InsertMessage(message); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ModifyTagsByMessageDBIDAndJournal(message.ID, []string{"flagged"}, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Role: backend.RoleAll, Selectable: true}}, nil)
+	native := &nativeTagPatchBackend{fakeBackend: fake}
+	engine := New(Options{
+		Store: db, Cursors: newMemCursorStore(), Account: testAccount, NoFlags: true,
+		Ingest: IngestOptions{Account: testAccount},
+	})
+	if _, err := engine.Sync(t.Context(), native); err != nil {
+		t.Fatal(err)
+	}
+	if len(native.tagMutationCalls) != 0 {
+		t.Fatalf("tag mutations uploaded with NoFlags: %+v", native.tagMutationCalls)
+	}
+	mutations, err := db.ReadProviderTagMutations(testAccount)
+	if err != nil || len(mutations) != 1 {
+		t.Fatalf("pending mutations = %+v, err=%v, want retained intent", mutations, err)
+	}
+}
+
+func TestEngineDryRunRetainsTagIntentForGenericBackend(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	message := &store.Message{
+		MessageID: "dry-run-intent@example.com", Date: now, CreatedAt: now,
+		Mailbox: "INBOX", Account: testAccount, RemoteRef: "1",
+	}
+	if err := db.InsertMessage(message); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ModifyTagsByMessageDBIDAndJournal(message.ID, []string{"flagged"}, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}}, nil)
+	engine := New(Options{
+		Store: db, Cursors: newMemCursorStore(), Account: testAccount, DryRun: true,
+		Ingest: IngestOptions{Account: testAccount},
+	})
+	if _, err := engine.Sync(t.Context(), fake); err != nil {
+		t.Fatal(err)
+	}
+	mutations, err := db.ReadProviderTagMutations(testAccount)
+	if err != nil || len(mutations) != 1 {
+		t.Fatalf("pending mutations = %+v, err=%v, want retained dry-run intent", mutations, err)
+	}
+}
+
 // TestEngineAnsweredFlagNoPingPong proves the fix for the replied/Answered
 // ping-pong: on a backend that can't persist \Answered (Capabilities
 // .AnsweredUnsupported, e.g. Gmail), a local "replied" tag must survive repeated
@@ -2965,7 +3221,7 @@ func TestEngineReplacementPreservesPriorCopyWhenHydratorOmitsMessageID(t *testin
 		MessageID: "shared@example.com", Ref: backend.RemoteRef{Folder: "INBOX", ID: "prior"},
 		Raw: rawMessage("shared@example.com", "a@example.com", testAccount, "Prior", "body"),
 	}
-	if _, _, err := Ingest(db, prior, "INBOX", backend.RoleNone, IngestOptions{Account: testAccount}); err != nil {
+	if _, _, _, err := Ingest(db, prior, "INBOX", backend.RoleNone, IngestOptions{Account: testAccount}); err != nil {
 		t.Fatalf("seed prior copy: %v", err)
 	}
 	ref := backend.RemoteRef{Folder: "INBOX", ID: "broken"}

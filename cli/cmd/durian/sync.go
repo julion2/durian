@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -186,11 +187,11 @@ func runSync(cmd *cobra.Command, args []string) error {
 			for _, c := range changes {
 				switch c.Action {
 				case "add":
-					if err := emailDB.ModifyTagsByMessageIDAndAccount(c.MessageID, c.Account, []string{c.Tag}, nil); err == nil {
+					if err := emailDB.ModifyTagsByMessageIDAndAccountAndJournal(c.MessageID, c.Account, []string{c.Tag}, nil, time.Now().Unix()); err == nil {
 						applied++
 					}
 				case "remove":
-					if err := emailDB.ModifyTagsByMessageIDAndAccount(c.MessageID, c.Account, nil, []string{c.Tag}); err == nil {
+					if err := emailDB.ModifyTagsByMessageIDAndAccountAndJournal(c.MessageID, c.Account, nil, []string{c.Tag}, time.Now().Unix()); err == nil {
 						applied++
 					}
 				}

@@ -45,7 +45,7 @@ func (h *Handler) Tag(query string, tags string) protocol.Response {
 	}
 
 	for _, threadID := range threadIDs {
-		if err := h.store.ModifyTagsByThread(threadID, add, remove); err != nil {
+		if err := h.store.ModifyTagsByThreadAndJournal(threadID, add, remove, time.Now().Unix()); err != nil {
 			return protocol.Fail(protocol.ErrBackendError, err)
 		}
 		if h.tagSync != nil || h.tagSyncEnabled {
