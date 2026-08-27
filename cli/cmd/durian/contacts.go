@@ -213,7 +213,7 @@ func runContactsList(cmd *cobra.Command, args []string) error {
 		if name == "" {
 			name = "-"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", c.Email, name, c.UsageCount, c.Source)
+		fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", humanText(c.Email, false), humanText(name, false), c.UsageCount, humanText(c.Source, false))
 	}
 	w.Flush()
 
@@ -250,7 +250,7 @@ func runContactsSearch(cmd *cobra.Command, args []string) error {
 	}
 
 	for _, c := range contactList {
-		fmt.Println(c.FormatDisplay())
+		fmt.Println(humanText(c.FormatDisplay(), false))
 	}
 
 	return nil

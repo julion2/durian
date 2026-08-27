@@ -247,7 +247,7 @@ func printHeadersResult(msgs []*store.Message, headersByID map[int64]map[string]
 		if i > 0 {
 			fmt.Println()
 		}
-		fmt.Printf("[%d/%d] %s\n", i+1, len(msgs), m.MessageID)
+		fmt.Printf("[%d/%d] %s\n", i+1, len(msgs), humanText(m.MessageID, false))
 		if len(h) == 0 {
 			if filterName != "" {
 				fmt.Printf("  (no %s header)\n", filterName)
@@ -263,7 +263,7 @@ func printHeadersResult(msgs []*store.Message, headersByID map[int64]map[string]
 		sort.Strings(names)
 		for _, name := range names {
 			for _, v := range h[name] {
-				fmt.Printf("%s: %s\n", name, v)
+				fmt.Printf("%s: %s\n", humanText(name, false), humanText(v, false))
 			}
 		}
 	}
@@ -284,7 +284,7 @@ func filterHeaders(h map[string][]string, filterName string) map[string][]string
 
 func outputThreadFormatted(w io.Writer, t *mail.ThreadContent) error {
 	fmt.Fprintf(w, "Thread: thread:%s\n", t.ThreadID)
-	fmt.Fprintf(w, "Subject: %s\n", t.Subject)
+	fmt.Fprintf(w, "Subject: %s\n", humanText(t.Subject, false))
 	fmt.Fprintf(w, "Messages: %d\n", len(t.Messages))
 	fmt.Fprintln(w, strings.Repeat("=", 60))
 
@@ -294,9 +294,9 @@ func outputThreadFormatted(w io.Writer, t *mail.ThreadContent) error {
 		if msg.Account != "" {
 			fmt.Fprintf(w, "Account: %s\n", displayAccountIdentifier(msg.Account))
 		}
-		fmt.Fprintf(w, "From: %s\n", msg.From)
+		fmt.Fprintf(w, "From: %s\n", humanText(msg.From, false))
 		if msg.To != "" {
-			fmt.Fprintf(w, "To:   %s\n", msg.To)
+			fmt.Fprintf(w, "To:   %s\n", humanText(msg.To, false))
 		}
 		if len(msg.Tags) > 0 {
 			fmt.Fprintf(w, "Tags: %s\n", strings.Join(msg.Tags, ", "))
@@ -304,7 +304,7 @@ func outputThreadFormatted(w io.Writer, t *mail.ThreadContent) error {
 		if len(msg.Attachments) > 0 {
 			fmt.Fprintln(w, "Attachments:")
 			for _, attachment := range msg.Attachments {
-				fmt.Fprintf(w, "  [%d] %s (%s, %s)\n", attachment.PartID, attachment.Filename, attachment.ContentType, formatSize(attachment.Size))
+				fmt.Fprintf(w, "  [%d] %s (%s, %s)\n", attachment.PartID, humanText(attachment.Filename, false), humanText(attachment.ContentType, false), formatSize(attachment.Size))
 				accountArg := ""
 				if msg.Account != "" {
 					accountArg = " --account " + shellQuote(displayAccountIdentifier(msg.Account))
@@ -316,9 +316,9 @@ func outputThreadFormatted(w io.Writer, t *mail.ThreadContent) error {
 		fmt.Fprintln(w, strings.Repeat("-", 40))
 
 		if showHTML && msg.HTML != "" {
-			fmt.Fprintln(w, msg.HTML)
+			fmt.Fprintln(w, humanText(msg.HTML, true))
 		} else if msg.Body != "" {
-			fmt.Fprintln(w, msg.Body)
+			fmt.Fprintln(w, humanText(msg.Body, true))
 		} else if msg.HTML != "" {
 			fmt.Fprintln(w, "[HTML-only message - use --html to view]")
 		} else {
