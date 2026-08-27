@@ -74,6 +74,7 @@ go_test(
     name = "durian_test",
     size = "small",
     srcs = [
+        "account_scope_test.go",
         "attachment_test.go",
         "auth_test.go",
         "calendar_test.go",

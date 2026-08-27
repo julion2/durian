@@ -240,6 +240,9 @@ func (d *DB) queryTokens(value string, phrase bool) string {
 func (d *DB) resolveAccountIDs(names []string) ([]int64, error) {
 	out := make([]int64, 0, len(names))
 	for _, name := range names {
+		if canonical, ok := d.accountAliases[strings.ToLower(strings.TrimSpace(name))]; ok {
+			name = canonical
+		}
 		var id int64
 		err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", name).Scan(&id)
 		if err == sql.ErrNoRows {

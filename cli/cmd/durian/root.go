@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/redact"
@@ -132,5 +133,24 @@ func openEmailDB() (*store.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("init email store: %w", err)
 	}
+	configureStoreAccounts(db, GetConfig())
 	return db, nil
+}
+
+func configureStoreAccounts(db *store.DB, cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	aliases := make(map[string]string, len(cfg.Accounts)*3)
+	for i := range cfg.Accounts {
+		account := &cfg.Accounts[i]
+		canonical := account.AccountIdentifier()
+		for _, identifier := range []string{account.Name, account.Alias, account.Email} {
+			identifier = strings.TrimSpace(identifier)
+			if identifier != "" {
+				aliases[strings.ToLower(identifier)] = canonical
+			}
+		}
+	}
+	db.SetAccountAliases(aliases)
 }
