@@ -198,6 +198,82 @@ func TestModifyTagsByMessageID_NotFound(t *testing.T) {
 	}
 }
 
+func TestModifyTagsByThreadJournalsLatestProviderIntentPerRow(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	first := &Message{
+		StableID: "email-1", MessageID: "duplicate@example.com", Date: now, CreatedAt: now,
+		Mailbox: "ALL", Account: "work", RemoteRef: "email-1",
+	}
+	second := &Message{
+		StableID: "email-2", MessageID: "duplicate@example.com", Date: now + 1, CreatedAt: now + 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "email-2",
+	}
+	if err := db.InsertMessage(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessage(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ModifyTagsByThreadAndJournal(first.ThreadID, []string{"flagged", "project"}, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ModifyTagsByThreadAndJournal(first.ThreadID, nil, []string{"flagged"}, now+1); err != nil {
+		t.Fatal(err)
+	}
+	mutations, err := db.ReadProviderTagMutations("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mutations) != 2 {
+		t.Fatalf("mutations = %+v, want one per row", mutations)
+	}
+	seenRows := map[int64]bool{}
+	for _, mutation := range mutations {
+		if mutation.Tag != "flagged" || mutation.Action != "remove" {
+			t.Errorf("mutation = %+v, want latest flagged remove", mutation)
+		}
+		seenRows[mutation.RowID] = true
+	}
+	if !seenRows[first.ID] || !seenRows[second.ID] {
+		t.Fatalf("journal did not preserve row identity: %+v", mutations)
+	}
+	for _, row := range []*Message{first, second} {
+		tags, err := db.GetMessageTags(row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(tags) != 1 || tags[0] != "project" {
+			t.Errorf("row %d tags = %v, want [project]", row.ID, tags)
+		}
+	}
+}
+
+func TestModifyTagsByMessageDBIDAndAccountJournalProviderIntent(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	message := &Message{
+		StableID: "email-1", MessageID: "journal@example.com", Date: now, CreatedAt: now,
+		Mailbox: "ALL", Account: "work", RemoteRef: "email-1",
+	}
+	if err := db.InsertMessage(message); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ModifyTagsByMessageDBIDAndJournal(message.ID, []string{"unread", "project"}, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ModifyTagsByMessageIDAndAccountAndJournal(message.MessageID, message.Account, nil, []string{"unread"}, now+1); err != nil {
+		t.Fatal(err)
+	}
+	mutations, err := db.ReadProviderTagMutations(message.Account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mutations) != 1 || mutations[0].RowID != message.ID || mutations[0].Tag != "unread" || mutations[0].Action != "remove" {
+		t.Fatalf("mutations = %+v, want latest unread remove for row %d", mutations, message.ID)
+	}
+}
+
 func TestGetTagsByMessageID(t *testing.T) {
 	db := newTestDB(t)
 	id := insertTestMessage(t, db, "get-mid@x")

@@ -1,9 +1,9 @@
 // Package backend defines the provider-agnostic mail sync abstraction.
 //
 // IMAP, Microsoft Graph, Gmail REST, and JMAP backends implement Backend, so the
-// sync engine, store, tags and search stay provider-neutral. Message identity is
-// always the RFC822 Message-ID plus the account; RemoteRef is only the provider's
-// own transient handle for follow-up operations and is never used as a primary key.
+// sync engine, store, tags and search stay provider-neutral. Backends that expose
+// an immutable object identifier populate Message.StableID; RFC822 Message-ID is
+// retained as message metadata and as the fallback identity for older protocols.
 package backend
 
 import (
@@ -41,11 +41,10 @@ type Folder struct {
 	Selectable bool
 }
 
-// RemoteRef is a provider-specific, non-durable handle to one message inside a
-// folder. IMAP: Folder is the mailbox, ID is the decimal UID. Graph: Folder is
-// the folder id, ID is the message id. A ref MAY become invalid across syncs
-// (e.g. an IMAP UIDVALIDITY reset), so it is never persisted as a key — the
-// durable key is (Message.MessageID, account).
+// RemoteRef is a provider-specific handle to one message inside a folder. IMAP:
+// Folder is the mailbox, ID is the decimal UID. Graph: Folder is the folder id,
+// ID is the message id. A ref MAY become invalid across syncs (e.g. an IMAP
+// UIDVALIDITY reset), so it is used for follow-up operations, not as identity.
 type RemoteRef struct {
 	Folder string
 	ID     string
@@ -85,7 +84,13 @@ type Flags struct {
 
 // Message is a fetched message in Durian's neutral model.
 type Message struct {
-	// MessageID is the RFC822 Message-ID header — the stable cross-provider key.
+	// StableID is an immutable, provider-owned object identifier when the
+	// protocol supplies one (for example JMAP Email.id). It is unique within the
+	// account and takes precedence over MessageID for local row identity.
+	StableID string
+	// MessageID is the RFC822 Message-ID header. It is optional and may be
+	// duplicated; it remains the fallback identity for protocols without a
+	// provider-owned stable object id.
 	MessageID string
 	// Ref is the provider handle for follow-up body/flag/move operations.
 	Ref RemoteRef
@@ -114,8 +119,8 @@ type Deletion struct {
 // in a folder since the caller's cursor, plus a fresh cursor to persist.
 type FetchResult struct {
 	// Messages are the new or updated messages, with bodies unless the backend
-	// fetches metadata-first; the engine writes them to the store keyed by
-	// (MessageID, account).
+	// fetches metadata-first; the engine writes them to the store by StableID
+	// when present and otherwise by (MessageID, account).
 	Messages []Message
 	// Deleted are messages the source no longer holds in this folder; the engine
 	// resolves each to (MessageID, account) and untags/removes it.
@@ -233,6 +238,22 @@ type LabelWriter interface {
 	// to the deterministic (local tags ∩ LabelTags) set itself, so ApplyLabels
 	// returns only an error.
 	ApplyLabels(ctx context.Context, ref RemoteRef, add, remove []string) error
+}
+
+// ArbitraryLabelWriter extends LabelWriter for a provider that can represent
+// Durian-local tags without first creating server containers. JMAP implements
+// this with custom Email keywords. The engine includes every tag accepted by
+// ManagesLabelTag in the normal durable label-baseline reconciliation.
+type ArbitraryLabelWriter interface {
+	LabelWriter
+	ManagesLabelTag(tag string) bool
+}
+
+// TagMutationWriter applies an explicit user tag intent as a provider-native
+// property patch. It is used for flag tags whose inverse semantics (notably
+// unread ↔ $seen) should not be reconstructed from ambient local state.
+type TagMutationWriter interface {
+	ApplyTagMutation(ctx context.Context, ref RemoteRef, tag string, add bool) error
 }
 
 // SnapshotHydrator is implemented by metadata-first backends. A replacement
