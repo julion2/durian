@@ -372,6 +372,21 @@ func TestStoreTagNoMatchesFails(t *testing.T) {
 	}
 }
 
+func TestPreviewTagReportsEffectWithoutChanges(t *testing.T) {
+	db := newTestStore(t)
+	seedStoreData(t, db)
+	h := New(db, nil)
+
+	resp := h.PreviewTag("tag:inbox", "+todo")
+	if !resp.OK || resp.MatchedThreads == nil || resp.ChangedThreads == nil || *resp.ChangedThreads == 0 {
+		t.Fatalf("preview effect = %+v", resp)
+	}
+	search := h.Search("tag:todo", 10, 0)
+	if !search.OK || len(search.Results) != 0 {
+		t.Fatalf("preview modified tags: %+v", search)
+	}
+}
+
 func TestStoreListTags(t *testing.T) {
 	db := newTestStore(t)
 	seedStoreData(t, db)

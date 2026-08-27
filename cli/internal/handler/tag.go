@@ -11,6 +11,15 @@ import (
 
 // Tag handles the "tag" command.
 func (h *Handler) Tag(query string, tags string) protocol.Response {
+	return h.tag(query, tags, false)
+}
+
+// PreviewTag validates and resolves a tag operation without modifying data.
+func (h *Handler) PreviewTag(query string, tags string) protocol.Response {
+	return h.tag(query, tags, true)
+}
+
+func (h *Handler) tag(query string, tags string, dryRun bool) protocol.Response {
 	tagList := strings.Fields(tags)
 	if len(tagList) == 0 {
 		return protocol.FailWithMessage(protocol.ErrInvalidJSON, "no tags provided")
@@ -42,17 +51,22 @@ func (h *Handler) Tag(query string, tags string) protocol.Response {
 
 	changedThreads := 0
 	for _, threadID := range threadIDs {
-		changed, err := h.store.ModifyTagsByThread(threadID, add, remove)
+		var changed bool
+		if dryRun {
+			changed, err = h.store.PreviewTagChangesByThread(threadID, add, remove)
+		} else {
+			changed, err = h.store.ModifyTagsByThread(threadID, add, remove)
+		}
 		if err != nil {
 			return protocol.Fail(protocol.ErrBackendError, err)
 		}
 		if changed {
 			changedThreads++
 		}
-		if h.tagSync != nil || h.tagSyncEnabled {
+		if !dryRun && (h.tagSync != nil || h.tagSyncEnabled) {
 			h.journalTagChanges(threadID, add, remove)
 		}
-		if h.syncTrigger != nil {
+		if !dryRun && h.syncTrigger != nil {
 			accounts, err := h.store.GetAccountsByThread(threadID)
 			if err != nil {
 				slog.Debug("Failed to get accounts for sync trigger", "module", "TAG", "thread", threadID, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
@@ -61,12 +75,12 @@ func (h *Handler) Tag(query string, tags string) protocol.Response {
 				h.syncTrigger.TriggerSync(account)
 			}
 		}
-		if h.tagSync != nil {
+		if !dryRun && h.tagSync != nil {
 			go h.pushTagChanges(threadID, add, remove)
 		}
 	}
 
-	slog.Info("Tag operation complete", "module", "TAG", "matched_threads", len(threadIDs), "changed_threads", changedThreads, "add", add, "remove", remove)
+	slog.Info("Tag operation complete", "module", "TAG", "dry_run", dryRun, "matched_threads", len(threadIDs), "changed_threads", changedThreads, "add", add, "remove", remove)
 	return protocol.SuccessWithTagChanges(len(threadIDs), changedThreads)
 }
 

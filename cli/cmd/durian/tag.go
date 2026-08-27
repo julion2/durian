@@ -10,7 +10,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var tagAccountFilter []string
+var (
+	tagAccountFilter []string
+	tagAccounts      []string
+	tagDryRun        bool
+	tagAll           bool
+)
 
 var tagListCmd = &cobra.Command{
 	Use:   "list",
@@ -27,7 +32,7 @@ var tagCmd = &cobra.Command{
 	Long:  "Add or remove tags. Tags must be prefixed with + (add) or - (remove).",
 	Example: `  durian tag "thread:00000000000022ca" +read
   durian tag "thread:00000000000022ca" +read -unread
-  durian tag "tag:inbox" +archived -inbox
+  durian tag --account work --dry-run "tag:inbox" +archived -inbox
   durian tag "from:alice@example.com" +important`,
 	Args: cobra.MinimumNArgs(2),
 	RunE: runTag,
@@ -35,7 +40,11 @@ var tagCmd = &cobra.Command{
 
 func init() {
 	tagCmd.Flags().SetInterspersed(false)
+	tagCmd.Flags().StringArrayVarP(&tagAccounts, "account", "a", nil, "limit the mutation to an account (repeatable)")
+	tagCmd.Flags().BoolVar(&tagDryRun, "dry-run", false, "show the effect without changing tags")
+	tagCmd.Flags().BoolVar(&tagAll, "all", false, "allow an unbounded '*' selector")
 	tagListCmd.Flags().StringSliceVarP(&tagAccountFilter, "account", "a", nil, "filter by account (repeatable or comma-separated)")
+	_ = tagCmd.RegisterFlagCompletionFunc("account", completeAccounts)
 	_ = tagListCmd.RegisterFlagCompletionFunc("account", completeAccounts)
 	tagCmd.AddCommand(tagListCmd)
 	rootCmd.AddCommand(tagCmd)
@@ -83,6 +92,14 @@ func runTagList(cmd *cobra.Command, args []string) error {
 func runTag(cmd *cobra.Command, args []string) error {
 	query := args[0]
 	tags := args[1:]
+	if strings.TrimSpace(query) == "*" && !tagAll {
+		return fmt.Errorf("an unbounded tag selector requires --all")
+	}
+	var err error
+	query, err = scopeQueryByAccounts(query, tagAccounts)
+	if err != nil {
+		return err
+	}
 
 	// Validate tags
 	for _, tag := range tags {
@@ -108,7 +125,12 @@ func runTag(cmd *cobra.Command, args []string) error {
 
 	// Join tags back to string for handler (current interface expects string)
 	tagsStr := strings.Join(tags, " ")
-	resp := h.Tag(query, tagsStr)
+	var resp protocol.Response
+	if tagDryRun {
+		resp = h.PreviewTag(query, tagsStr)
+	} else {
+		resp = h.Tag(query, tagsStr)
+	}
 
 	if !resp.OK {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
@@ -121,14 +143,20 @@ func runTag(cmd *cobra.Command, args []string) error {
 			ChangedThreads int      `json:"changed_threads"`
 			AddedTags      []string `json:"added_tags"`
 			RemovedTags    []string `json:"removed_tags"`
+			DryRun         bool     `json:"dry_run"`
 		}{
 			MatchedThreads: *resp.MatchedThreads,
 			ChangedThreads: *resp.ChangedThreads,
 			AddedTags:      tagsWithPrefix(tags, "+"),
 			RemovedTags:    tagsWithPrefix(tags, "-"),
+			DryRun:         tagDryRun,
 		})
 	}
 
+	if tagDryRun {
+		fmt.Printf("Would update %d of %d matching threads\nNo changes applied.\n", *resp.ChangedThreads, *resp.MatchedThreads)
+		return nil
+	}
 	fmt.Printf("Updated %d of %d matching threads\n", *resp.ChangedThreads, *resp.MatchedThreads)
 	return nil
 }

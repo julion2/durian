@@ -57,6 +57,16 @@ func (d *DB) UntagThread(threadID, tag string) error {
 // ModifyTagsByThread atomically adds and removes tags for all messages in a thread.
 // It reports whether any stored tag changed.
 func (d *DB) ModifyTagsByThread(threadID string, addTags, removeTags []string) (bool, error) {
+	return d.modifyTagsByThread(threadID, addTags, removeTags, true)
+}
+
+// PreviewTagChangesByThread reports whether a tag operation would change a
+// thread, rolling the transaction back without modifying the store.
+func (d *DB) PreviewTagChangesByThread(threadID string, addTags, removeTags []string) (bool, error) {
+	return d.modifyTagsByThread(threadID, addTags, removeTags, false)
+}
+
+func (d *DB) modifyTagsByThread(threadID string, addTags, removeTags []string, commit bool) (bool, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return false, fmt.Errorf("begin transaction: %w", err)
@@ -94,8 +104,10 @@ func (d *DB) ModifyTagsByThread(threadID string, addTags, removeTags []string) (
 		changed = changed || rows > 0
 	}
 
-	if err := tx.Commit(); err != nil {
-		return false, err
+	if commit {
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
 	}
 	return changed, nil
 }

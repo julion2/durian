@@ -148,6 +148,29 @@ func TestModifyTagsByThread(t *testing.T) {
 	}
 }
 
+func TestPreviewTagChangesByThreadDoesNotWrite(t *testing.T) {
+	db := newTestDB(t)
+	msg := &Message{MessageID: "preview-tag@x", Account: "work"}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := db.PreviewTagChangesByThread(msg.ThreadID, []string{"todo"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("preview reported no change")
+	}
+	tags, err := db.GetTagsByMessageID(msg.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tags) != 0 {
+		t.Fatalf("preview persisted tags: %v", tags)
+	}
+}
+
 func TestListTags(t *testing.T) {
 	db := newTestDB(t)
 	id1 := insertTestMessage(t, db, "lt1@x")
