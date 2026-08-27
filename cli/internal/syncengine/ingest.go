@@ -166,15 +166,6 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 			"ref", msg.Ref.ID, "folder", folderName, "synthetic_id", messageID)
 	}
 
-	// A genuinely new message vs. an update of one already stored (a delta
-	// re-delivers a message when its flags change): the caller reports the two
-	// separately so "new" counts arrivals, not re-syncs.
-	existed, err := db.MessageExistsForAccount(messageID, opts.Account)
-	if err != nil {
-		return "", false, fmt.Errorf("check message existence: %w", err)
-	}
-	created := !existed
-
 	var dateUnix int64
 	if t, err := mail.ParseDate(content.Date); err == nil {
 		dateUnix = t.Unix()
@@ -215,10 +206,12 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		// baseline: the first post-ingest flag pass is then a no-op unless
 		// the user changed something locally. joinFlags (not flagStr) so the
 		// baseline round-trips $Completed and avoids per-sync download churn.
-		SyncedFlags: joinFlags(flagState),
+		SyncedFlags:            joinFlags(flagState),
+		SyncedFlagsInitialized: true,
 	}
 
-	if err := db.InsertMessage(storeMsg); err != nil {
+	created, err := db.UpsertMessage(storeMsg)
+	if err != nil {
 		return "", false, fmt.Errorf("insert message: %w", err)
 	}
 
@@ -277,14 +270,15 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		}
 	}
 
-	// Flag-based tags (unread, flagged, replied). Like the legacy insert path
-	// this only applies the add half; the engine's per-folder flag
-	// reconciliation pass applies removals so re-fetched (updated) messages
-	// shed stale flag tags.
-	flagAdd, _ := flagState.ToTagOps()
-	for _, tag := range flagAdd {
-		if err := db.AddTag(storeMsg.ID, tag); err != nil {
-			return "", false, fmt.Errorf("add flag tag %q: %w", tag, err)
+	// Seed flag-derived tags only for a row this transaction created. Existing
+	// rows belong to the three-way reconciliation: applying the server's add
+	// half here would erase a concurrent local mutation before it can be merged.
+	if created {
+		flagAdd, _ := flagState.ToTagOps()
+		for _, tag := range flagAdd {
+			if err := db.AddTag(storeMsg.ID, tag); err != nil {
+				return "", false, fmt.Errorf("add flag tag %q: %w", tag, err)
+			}
 		}
 	}
 

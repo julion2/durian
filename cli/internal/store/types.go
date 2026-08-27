@@ -27,6 +27,10 @@ type Message struct {
 	// SyncedFlags is the last-synced flag baseline as a comma-joined
 	// IMAP-style flag string (same format as Flags, e.g. `\Seen,\Flagged`).
 	SyncedFlags string
+	// SyncedFlagsInitialized distinguishes an explicit empty baseline from a
+	// legacy row that has never established one. Non-empty baselines are always
+	// initialized regardless of this field.
+	SyncedFlagsInitialized bool
 	// Account is the account identifier for this message (e.g. "work").
 	// Each account has its own row — UNIQUE(message_id, account).
 	Account string

@@ -17,6 +17,7 @@ import (
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/dbcrypto"
+	"github.com/julion2/durian/cli/internal/imap"
 	"github.com/julion2/durian/cli/internal/store"
 )
 
@@ -2249,6 +2250,199 @@ func TestEngineFlagUpload(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no folder flag row for flagup@example.com")
+	}
+}
+
+func TestEngineDeltaReadDoesNotBecomeFalseLocalUnread(t *testing.T) {
+	tests := []struct {
+		name string
+		caps backend.Capabilities
+	}{
+		{name: "Graph", caps: backend.Capabilities{FlagChangesInDelta: true}},
+		{name: "Gmail", caps: backend.Capabilities{FlagChangesInDelta: true, LabelsAreTags: true, AnsweredUnsupported: true}},
+		{name: "JMAP", caps: backend.Capabilities{FlagChangesInDelta: true, LabelsAreTags: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := newTestDB(t)
+			cursors := newMemCursorStore()
+			folder := backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true}
+			unread := backend.Message{
+				MessageID: "remote-read@example.com",
+				Ref:       backend.RemoteRef{Folder: folder.Name, ID: "r1"},
+				Raw:       rawMessage("remote-read@example.com", "a@example.com", testAccount, "Subject", "body"),
+			}
+			read := unread
+			read.Flags = backend.Flags{Seen: true}
+			fake := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+				folder.Name: {
+					{Messages: []backend.Message{unread}, Cursor: backend.Cursor("c1")},
+					{Messages: []backend.Message{read}, Cursor: backend.Cursor("c2")},
+				},
+			})
+			fake.caps = tt.caps
+			engine := newTestEngine(db, cursors)
+
+			fake.flagsByRef["r1"] = backend.Flags{}
+			if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+				t.Fatalf("first pass result=%+v err=%v", result, err)
+			}
+			rows, err := db.GetFolderFlagState(testAccount, folder.Name)
+			if err != nil || len(rows) != 1 || !tagsContain(rows[0].Tags, "unread") || rows[0].SyncedFlags != "" {
+				t.Fatalf("first pass rows=%+v err=%v, want unread with logical empty baseline", rows, err)
+			}
+
+			fake.flagsByRef["r1"] = backend.Flags{Seen: true}
+			if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+				t.Fatalf("second pass result=%+v err=%v", result, err)
+			}
+			rows, err = db.GetFolderFlagState(testAccount, folder.Name)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("second pass rows=%+v err=%v", rows, err)
+			}
+			if tagsContain(rows[0].Tags, "unread") || rows[0].SyncedFlags != `\Seen` {
+				t.Fatalf("second pass row=%+v, want read tag state and Seen baseline", rows[0])
+			}
+			if len(fake.applyFlagsCalls) != 0 {
+				t.Fatalf("server read was uploaded as a local unread mutation: %+v", fake.applyFlagsCalls)
+			}
+
+			if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+				t.Fatalf("quiet pass result=%+v err=%v", result, err)
+			}
+			if len(fake.applyFlagsCalls) != 0 {
+				t.Fatalf("quiet pass did not converge: %+v", fake.applyFlagsCalls)
+			}
+		})
+	}
+}
+
+func TestEngineLegacyDeltaTransitionsUseCapturedBeforeImage(t *testing.T) {
+	tests := []struct {
+		name         string
+		storedFlags  string
+		localRead    bool
+		serverFlags  backend.Flags
+		wantUnread   bool
+		wantBaseline string
+		wantUpload   backend.Flags
+	}{
+		{
+			name:        "server marks legacy read message unread",
+			storedFlags: `\Seen`, serverFlags: backend.Flags{},
+			wantUnread: true, wantBaseline: "",
+		},
+		{
+			name:      "local read survives legacy unread redelivery",
+			localRead: true, serverFlags: backend.Flags{},
+			wantBaseline: `\Seen`, wantUpload: backend.Flags{Seen: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := newTestDB(t)
+			const messageID = "legacy-transition@example.com"
+			seed := &store.Message{
+				MessageID: messageID, Subject: "legacy", Date: 1, CreatedAt: 1,
+				Mailbox: "ALL", Account: testAccount, RemoteRef: "r1",
+				Flags: tt.storedFlags, FetchedBody: true,
+			}
+			if err := db.InsertMessage(seed); err != nil {
+				t.Fatal(err)
+			}
+			if tt.localRead {
+				if err := db.AddTag(seed.ID, "unread"); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.ModifyTagsByMessageIDAndAccount(messageID, testAccount, nil, []string{"unread"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			folder := backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true}
+			message := backend.Message{
+				MessageID: messageID, Ref: backend.RemoteRef{Folder: folder.Name, ID: "r1"},
+				Raw:   rawMessage(messageID, "a@example.com", testAccount, "delta", "body"),
+				Flags: tt.serverFlags,
+			}
+			fake := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+				folder.Name: {{Messages: []backend.Message{message}, Cursor: backend.Cursor("c1")}},
+			})
+			fake.caps.FlagChangesInDelta = true
+			fake.flagsByRef["r1"] = tt.serverFlags
+			result, err := newTestEngine(db, newMemCursorStore()).Sync(t.Context(), fake)
+			if err != nil || len(result.Errors) != 0 {
+				t.Fatalf("sync result=%+v err=%v", result, err)
+			}
+			rows, err := db.GetFolderFlagState(testAccount, folder.Name)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("rows=%+v err=%v", rows, err)
+			}
+			if got := tagsContain(rows[0].Tags, "unread"); got != tt.wantUnread {
+				t.Errorf("unread=%v, want %v; tags=%v", got, tt.wantUnread, rows[0].Tags)
+			}
+			if rows[0].SyncedFlags != tt.wantBaseline || !rows[0].SyncedFlagsInitialized {
+				t.Errorf("baseline=%q initialized=%v, want %q initialized", rows[0].SyncedFlags, rows[0].SyncedFlagsInitialized, tt.wantBaseline)
+			}
+			if tt.wantUpload == (backend.Flags{}) {
+				if len(fake.applyFlagsCalls) != 0 {
+					t.Errorf("unexpected uploads: %+v", fake.applyFlagsCalls)
+				}
+			} else if len(fake.applyFlagsCalls) != 1 || fake.applyFlagsCalls[0].add != tt.wantUpload {
+				t.Errorf("uploads=%+v, want add=%+v", fake.applyFlagsCalls, tt.wantUpload)
+			}
+		})
+	}
+}
+
+func TestEngineDeltaCompoundFlagsReconcileFromExplicitEmptyBaseline(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	folder := backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true}
+	message := backend.Message{
+		MessageID: "compound@example.com", Ref: backend.RemoteRef{Folder: folder.Name, ID: "r1"},
+		Raw: rawMessage("compound@example.com", "a@example.com", testAccount, "compound", "body"),
+	}
+	readFlagged := message
+	readFlagged.Flags = backend.Flags{Seen: true, Flagged: true}
+	fake := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+		folder.Name: {
+			{Messages: []backend.Message{message}, Cursor: backend.Cursor("c1")},
+			{Messages: []backend.Message{readFlagged}, Cursor: backend.Cursor("c2")},
+		},
+	})
+	fake.caps.FlagChangesInDelta = true
+	fake.flagsByRef["r1"] = backend.Flags{}
+	engine := newTestEngine(db, cursors)
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("first pass result=%+v err=%v", result, err)
+	}
+	fake.flagsByRef["r1"] = readFlagged.Flags
+	if result, err := engine.Sync(t.Context(), fake); err != nil || len(result.Errors) != 0 {
+		t.Fatalf("second pass result=%+v err=%v", result, err)
+	}
+	rows, err := db.GetFolderFlagState(testAccount, folder.Name)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows=%+v err=%v", rows, err)
+	}
+	if tagsContain(rows[0].Tags, "unread") || !tagsContain(rows[0].Tags, "flagged") || rows[0].SyncedFlags != `\Seen,\Flagged` {
+		t.Fatalf("compound reconciliation row=%+v", rows[0])
+	}
+	if len(fake.applyFlagsCalls) != 0 {
+		t.Fatalf("compound server change produced upload: %+v", fake.applyFlagsCalls)
+	}
+}
+
+func TestEmptyBaselineSentinelCannotBecomeBackendFlag(t *testing.T) {
+	state := imap.FlagStateFromIMAP(splitFlags("$DurianEmpty"))
+	if !state.IsEmpty() {
+		t.Fatalf("sentinel parsed as flag state: %+v", state)
+	}
+	if got := joinFlags(state); got != "" {
+		t.Fatalf("sentinel round trip=%q, want logical empty baseline", got)
+	}
+	if got := backendFlagsFromState(state); got != (backend.Flags{}) {
+		t.Fatalf("sentinel reached backend flags: %+v", got)
 	}
 }
 

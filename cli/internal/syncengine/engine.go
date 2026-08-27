@@ -796,18 +796,16 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 	seeded := 0
 	for i := range rows {
 		row := rows[i]
-		// A legacy-migrated row carries no flag baseline (the legacy syncer kept
-		// it in its own state file; the engine upsert deliberately never writes
-		// synced_flags). An empty baseline parses to "unread/unflagged", so a read
-		// or flagged migrated message looks locally changed and becomes a false
-		// upload candidate — turning the first engine sync of a whole migrated
-		// mailbox into one FetchFlags request per message. Seed the baseline from
-		// the stored server flags (adopting server state, like the legacy
-		// first-sync branch). Only seed a NON-empty state: an empty seed is a
-		// no-op, and skipping it would swallow a genuine local read/flag change
-		// on a message whose baseline is legitimately empty. After seeding, fall
-		// through to the normal candidate check against the seeded baseline.
-		if row.SyncedFlags == "" {
+		// A legacy-migrated row may carry no flag baseline because the legacy
+		// syncer kept it in its own state file. An uninitialized baseline parses
+		// as "unread/unflagged", so a stored read or flagged message would look
+		// locally changed and become a false upload candidate. Seed that non-empty
+		// state from the stored server columns (adopting server state, like the
+		// legacy first-sync branch). Leave a logically empty legacy row alone:
+		// its candidate comparison is already correct, and avoiding an eager
+		// sentinel write prevents an otherwise unnecessary mailbox-wide sweep.
+		// A delta reingest initializes it atomically from the old row in Store.
+		if !row.SyncedFlagsInitialized {
 			seededBaseline := joinFlags(imap.FlagState{Seen: row.IsSeen, Flagged: row.IsFlagged})
 			if seededBaseline != "" {
 				if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, seededBaseline); err != nil {
@@ -823,7 +821,9 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 				// and the backing slice element (so the merge loop, which re-ranges
 				// rows, reads the seeded baseline instead of the empty original).
 				row.SyncedFlags = seededBaseline
+				row.SyncedFlagsInitialized = true
 				rows[i].SyncedFlags = seededBaseline
+				rows[i].SyncedFlagsInitialized = true
 				seeded++
 			}
 		}

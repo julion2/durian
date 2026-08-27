@@ -1,6 +1,8 @@
 package store
 
 import (
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -240,6 +242,171 @@ func TestFolderFlagState_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestUpsertMessageCapturesLegacyFlagBeforeImage(t *testing.T) {
+	db := newTestDB(t)
+	legacy := &Message{
+		MessageID: "legacy-flags@example.com", Subject: "legacy", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1", FetchedBody: true,
+		Flags: `\Seen,\Flagged,\Answered,\Deleted,$Completed,$Other`,
+	}
+	if err := db.InsertMessage(legacy); err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+	created, err := db.UpsertMessage(&Message{
+		MessageID: legacy.MessageID, Subject: "delta", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1", FetchedBody: true,
+		SyncedFlagsInitialized: true,
+	})
+	if err != nil || created {
+		t.Fatalf("delta upsert created=%v err=%v, want existing row", created, err)
+	}
+	rows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("flag rows=%+v err=%v", rows, err)
+	}
+	if got, want := rows[0].SyncedFlags, `\Seen,\Flagged,\Answered,\Deleted,$Completed`; got != want {
+		t.Fatalf("captured baseline=%q, want %q", got, want)
+	}
+	if !rows[0].SyncedFlagsInitialized {
+		t.Fatal("captured baseline remains uninitialized")
+	}
+}
+
+func TestExplicitEmptySyncedFlagsUsesStoreSentinel(t *testing.T) {
+	db := newTestDB(t)
+	msg := &Message{
+		MessageID: "empty-baseline@example.com", Subject: "empty", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1",
+		SyncedFlagsInitialized: true,
+	}
+	created, err := db.UpsertMessage(msg)
+	if err != nil || !created {
+		t.Fatalf("upsert created=%v err=%v", created, err)
+	}
+	var stored string
+	if err := db.db.QueryRow("SELECT synced_flags FROM messages WHERE id = ?", msg.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != syncedFlagsEmpty {
+		t.Fatalf("stored baseline=%q, want sentinel %q", stored, syncedFlagsEmpty)
+	}
+	rows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil || len(rows) != 1 || rows[0].SyncedFlags != "" || !rows[0].SyncedFlagsInitialized {
+		t.Fatalf("decoded flag rows=%+v err=%v", rows, err)
+	}
+	if err := db.SetSyncedFlags(msg.MessageID, msg.Account, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRow("SELECT synced_flags FROM messages WHERE id = ?", msg.ID).Scan(&stored); err != nil || stored != syncedFlagsEmpty {
+		t.Fatalf("SetSyncedFlags empty stored=%q err=%v", stored, err)
+	}
+}
+
+func TestInitializedUpsertDoesNotDecryptStoredFlags(t *testing.T) {
+	db := newTestDB(t)
+	msg := &Message{
+		MessageID: "hot-path@example.com", Subject: "full", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1", FetchedBody: true,
+		SyncedFlagsInitialized: true,
+	}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatal(err)
+	}
+	// Invalid ciphertext makes any attempted before-image decrypt fail. An
+	// initialized row must bypass that work and replace the provider metadata.
+	if _, err := db.db.Exec("UPDATE messages SET flags_other = X'010203' WHERE id = ?", msg.ID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := db.UpsertMessage(&Message{
+		MessageID: msg.MessageID, Subject: "metadata", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1",
+		SyncedFlagsInitialized: true,
+	})
+	if err != nil || created {
+		t.Fatalf("initialized metadata upsert created=%v err=%v", created, err)
+	}
+}
+
+func TestConcurrentUpsertReportsSingleCreatorAndCapturesOnce(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "concurrent.db")
+	kr := testKeyring(t)
+	first, err := Open(dbPath, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if err := first.Init(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(dbPath, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	dbs := []*DB{first, second}
+	created := make([]bool, len(dbs))
+	errs := make([]error, len(dbs))
+	var wg sync.WaitGroup
+	for i, db := range dbs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			created[i], errs[i] = db.UpsertMessage(&Message{
+				MessageID: "concurrent@example.com", Subject: "same", Date: 1, CreatedAt: 1,
+				Mailbox: "ALL", Account: "work", RemoteRef: "r1",
+				SyncedFlagsInitialized: true,
+			})
+		}()
+	}
+	wg.Wait()
+	if errs[0] != nil || errs[1] != nil {
+		t.Fatalf("concurrent errors=%v", errs)
+	}
+	if created[0] == created[1] {
+		t.Fatalf("created results=%v, want exactly one creator", created)
+	}
+
+	if err := first.InsertMessage(&Message{
+		MessageID: "legacy-concurrent@example.com", Subject: "legacy", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updates := []string{`\Seen`, `\Flagged`}
+	for i, db := range dbs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = db.UpsertMessage(&Message{
+				MessageID: "legacy-concurrent@example.com", Subject: "delta", Date: 1, CreatedAt: 1,
+				Mailbox: "ALL", Account: "work", RemoteRef: "r2", Flags: updates[i],
+				SyncedFlagsInitialized: true,
+			})
+		}()
+	}
+	wg.Wait()
+	if errs[0] != nil || errs[1] != nil {
+		t.Fatalf("concurrent capture errors=%v", errs)
+	}
+	rows, err := first.GetFolderFlagState("work", "ALL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.MessageID == "legacy-concurrent@example.com" {
+			if row.SyncedFlags != "" || !row.SyncedFlagsInitialized {
+				t.Fatalf("captured baseline=%q initialized=%v, want explicit empty before-image", row.SyncedFlags, row.SyncedFlagsInitialized)
+			}
+			if row.IsSeen == row.IsFlagged {
+				t.Fatalf("final provider columns are half-updated: seen=%v flagged=%v", row.IsSeen, row.IsFlagged)
+			}
+			return
+		}
+	}
+	t.Fatal("legacy concurrent row missing")
+}
+
 func TestUpsert_HeadersOnlyThenBody(t *testing.T) {
 	db := newTestDB(t)
 	now := time.Now().Unix()
@@ -325,19 +492,20 @@ func TestUpsert_MetadataOnlyPreservesFullTextSearch(t *testing.T) {
 	db := newTestDB(t)
 	now := time.Now().Unix()
 	full := &Message{
-		MessageID:   "metadata-search@x",
-		Subject:     "Quarterly narwhal report",
-		FromAddr:    "sender@example.com",
-		ToAddrs:     "recipient@example.com",
-		CCAddrs:     "copy@example.com",
-		Date:        now,
-		CreatedAt:   now,
-		BodyText:    "the aardvark body text",
-		BodyHTML:    "<p>the aardvark body text</p>",
-		Mailbox:     "INBOX",
-		Account:     "work",
-		RemoteRef:   "old-ref",
-		FetchedBody: true,
+		MessageID:              "metadata-search@x",
+		Subject:                "Quarterly narwhal report",
+		FromAddr:               "sender@example.com",
+		ToAddrs:                "recipient@example.com",
+		CCAddrs:                "copy@example.com",
+		Date:                   now,
+		CreatedAt:              now,
+		BodyText:               "the aardvark body text",
+		BodyHTML:               "<p>the aardvark body text</p>",
+		Mailbox:                "INBOX",
+		Account:                "work",
+		RemoteRef:              "old-ref",
+		FetchedBody:            true,
+		SyncedFlagsInitialized: true,
 	}
 	if err := db.InsertMessage(full); err != nil {
 		t.Fatalf("insert full message: %v", err)
