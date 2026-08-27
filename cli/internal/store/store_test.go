@@ -46,8 +46,15 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 26 {
-		t.Errorf("version = %d, want 26", version)
+	if version != 27 {
+		t.Errorf("version = %d, want 27", version)
+	}
+	var indexSQL string
+	if err := db.db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_outbox_dedupe_key'").Scan(&indexSQL); err != nil {
+		t.Fatalf("read outbox dedupe index: %v", err)
+	}
+	if !strings.Contains(indexSQL, "attempts < 5") {
+		t.Errorf("outbox dedupe index is not scoped to active attempts: %s", indexSQL)
 	}
 }
 
@@ -383,14 +390,14 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	}
 	db := sd.db
 
-	// Schema version must be at the latest migration (v26: atomic outbox
+	// Schema version must be at the latest migration (v27: active outbox
 	// deduplication) after Init runs every migration forward from a fresh DB.
 	var version int
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 26 {
-		t.Fatalf("version = %d, want 26", version)
+	if version != 27 {
+		t.Fatalf("version = %d, want 27", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).

@@ -27,6 +27,7 @@ struct ThreadMessage: Decodable, Identifiable, Equatable {
     let id: String
     let account: String?
     let accounts: [String]?
+    let reaction_accounts: [String]?
     let is_reaction: Bool?
     let reply_to_indexed: Bool?
     let from: String
@@ -47,10 +48,15 @@ struct ThreadMessage: Decodable, Identifiable, Equatable {
         tags?.contains("draft") ?? false
     }
 
-    var reactionAccounts: [String] {
+    var owningAccounts: [String] {
         if let accounts, !accounts.isEmpty { return accounts }
         if let account, !account.isEmpty { return [account] }
         return []
+    }
+
+    var reactionAccounts: [String] {
+        if let reaction_accounts { return reaction_accounts }
+        return owningAccounts
     }
 
     var isReaction: Bool { is_reaction ?? false }

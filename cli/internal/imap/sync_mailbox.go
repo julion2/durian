@@ -2,6 +2,7 @@ package imap
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,6 +29,8 @@ var builtinSelectedHeaders = []string{
 }
 
 var markerSelectedHeaders = []string{"Reply-To", "Content-Disposition"}
+
+const requiredHeaderBackfillVersion int64 = 1
 
 func selectedHeaderNeedsMarker(name string) bool {
 	for _, required := range markerSelectedHeaders {
@@ -68,27 +71,44 @@ func (s *Syncer) headerSet() []string {
 	return out
 }
 
-// backfillHeaders fetches headers from the IMAP server for messages that
-// are already in the store but don't have entries in message_headers yet.
+// backfillHeaders fetches required headers once per account and mailbox.
+// --backfill-headers explicitly reruns discovery; --force still controls
+// whether already-complete messages are fetched again.
 func (s *Syncer) backfillHeaders(mailboxes []string) {
-	fmt.Fprintf(s.output, "  Backfilling headers...\n")
+	var pending []string
 	for _, mboxName := range mailboxes {
-		s.backfillHeadersForMailbox(mboxName)
+		if s.options.BackfillHeaders || s.store.GetMeta(s.requiredHeaderBackfillKey(mboxName)) < requiredHeaderBackfillVersion {
+			pending = append(pending, mboxName)
+		}
 	}
+	if len(pending) == 0 {
+		return
+	}
+	fmt.Fprintf(s.output, "  Backfilling reaction headers...\n")
+	for _, mboxName := range pending {
+		if s.backfillHeadersForMailbox(mboxName) {
+			s.store.SetMeta(s.requiredHeaderBackfillKey(mboxName), requiredHeaderBackfillVersion)
+		}
+	}
+}
+
+func (s *Syncer) requiredHeaderBackfillKey(mailbox string) string {
+	digest := sha256.Sum256([]byte(s.accountName() + "\x00" + mailbox))
+	return fmt.Sprintf("reaction_header_backfill_v1:%x", digest)
 }
 
 // backfillHeadersForMailbox fetches and stores raw headers for messages in a
 // single mailbox that don't yet have their selected headers populated.
-func (s *Syncer) backfillHeadersForMailbox(mboxName string) {
+func (s *Syncer) backfillHeadersForMailbox(mboxName string) bool {
 	mboxState := s.state.GetMailboxState(mboxName)
 	if _, err := s.client.SelectMailbox(mboxName); err != nil {
 		slog.Debug("Backfill: skip mailbox", "module", "SYNC", "mailbox", mboxName, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-		return
+		return false
 	}
 
 	uidsToFetch := s.uidsNeedingHeaderBackfill(mboxState)
 	if len(uidsToFetch) == 0 {
-		return
+		return true
 	}
 
 	fmt.Fprintf(s.output, "    %s: fetching headers for %d messages...\n", mboxName, len(uidsToFetch))
@@ -100,10 +120,15 @@ func (s *Syncer) backfillHeadersForMailbox(mboxName string) {
 		if end > len(uidsToFetch) {
 			end = len(uidsToFetch)
 		}
-		stored += s.backfillHeaderBatch(mboxName, mboxState, uidsToFetch[i:end])
+		batchStored, ok := s.backfillHeaderBatch(mboxName, mboxState, uidsToFetch[i:end])
+		if !ok {
+			return false
+		}
+		stored += batchStored
 	}
 
 	fmt.Fprintf(s.output, "    ✓ %d messages backfilled\n", stored)
+	return true
 }
 
 // uidsNeedingHeaderBackfill returns UIDs in the given mailbox whose messages
@@ -144,11 +169,11 @@ func (s *Syncer) uidsNeedingHeaderBackfill(mboxState *MailboxState) []uint32 {
 // backfillHeaderBatch fetches headers for a batch of UIDs and writes the
 // selected headers to the store. Returns the number of messages that had
 // headers stored.
-func (s *Syncer) backfillHeaderBatch(mboxName string, mboxState *MailboxState, batch []uint32) int {
+func (s *Syncer) backfillHeaderBatch(mboxName string, mboxState *MailboxState, batch []uint32) (int, bool) {
 	headers, err := s.client.FetchHeadersOnly(batch)
 	if err != nil {
 		slog.Debug("Backfill fetch failed", "module", "SYNC", "mailbox", mboxName, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-		return 0
+		return 0, false
 	}
 	stored := 0
 	for uid, rawHeader := range headers {
@@ -156,7 +181,7 @@ func (s *Syncer) backfillHeaderBatch(mboxName string, mboxState *MailboxState, b
 			stored++
 		}
 	}
-	return stored
+	return stored, true
 }
 
 // storeHeadersForUID parses raw headers for one message and inserts the

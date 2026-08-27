@@ -842,6 +842,11 @@ components:
           items:
             type: string
           description: All accounts that own this Message-ID
+        reaction_accounts:
+          type: array
+          items:
+            type: string
+          description: Owning accounts whose Reply-To status is indexed and can send a reaction
         is_reaction:
           type: boolean
           description: True for a top-level RFC 9078 Content-Disposition reaction

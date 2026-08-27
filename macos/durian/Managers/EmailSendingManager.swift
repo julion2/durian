@@ -237,7 +237,13 @@ class EmailSendingManager: ObservableObject {
                     guard !Task.isCancelled else { return }
                 }
             }
-            self?.finishReaction(itemId: itemId)
+            if let items = await backend.listOutboxIfAvailable(),
+               Self.isReactionTerminal(itemId: itemId, outbox: items)
+            {
+                self?.finishReaction(itemId: itemId)
+            } else {
+                self?.reactionMonitors.removeValue(forKey: itemId)
+            }
         }
     }
 

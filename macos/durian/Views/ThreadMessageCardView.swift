@@ -605,13 +605,14 @@ struct ThreadMessageCardView: View {
     @ViewBuilder
     private var reactionMenu: some View {
         Menu {
-            if message.reactionAccounts.count == 1, let account = message.reactionAccounts.first {
+            if message.owningAccounts.count == 1, let account = message.owningAccounts.first {
                 reactionButtons(account: account, includeAccountInLabel: false)
             } else {
-                ForEach(message.reactionAccounts, id: \.self) { account in
+                ForEach(message.owningAccounts, id: \.self) { account in
                     Menu(accountLabel(account)) {
                         reactionButtons(account: account, includeAccountInLabel: true)
                     }
+                    .disabled(!message.reactionAccounts.contains(account))
                 }
             }
         } label: {
@@ -622,7 +623,7 @@ struct ThreadMessageCardView: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
-        .disabled(message.reactionAccounts.isEmpty || !message.replyToIndexed || reactionPending)
+        .disabled(message.reactionAccounts.isEmpty || reactionPending)
         .help(reactionHelp)
         .accessibilityLabel("React to this message")
     }

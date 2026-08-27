@@ -211,6 +211,23 @@ func TestEnqueueUniqueRejectsDuplicateUntilDeleted(t *testing.T) {
 	}
 }
 
+func TestEnqueueUniqueAllowsRetryAfterAttemptLimit(t *testing.T) {
+	db := newTestDB(t)
+
+	id, err := db.EnqueueUnique(`{"kind":"reaction"}`, 0, "reaction-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if err := db.MarkAttempted(id, "transient failure"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.EnqueueUnique(`{"kind":"reaction"}`, 0, "reaction-key"); err != nil {
+		t.Fatalf("retry after attempt limit: %v", err)
+	}
+}
+
 func TestEnqueueUniqueIsAtomicAcrossConcurrentRequests(t *testing.T) {
 	db := newTestDB(t)
 	const requests = 12

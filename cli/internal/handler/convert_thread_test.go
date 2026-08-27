@@ -181,13 +181,20 @@ func TestShowThreadExposesAllOwningAccountsWithoutChoosingOne(t *testing.T) {
 	if message.ReplyToIndexed {
 		t.Fatal("ReplyToIndexed = true with one unindexed owning account")
 	}
+	if strings.Join(message.ReactionAccounts, ",") != "work" {
+		t.Fatalf("eligible reaction accounts = %v, want [work]", message.ReactionAccounts)
+	}
 	personal, _ := db.GetByMessageIDAndAccount("shared@test", "personal")
 	if err := db.InsertHeader(personal.ID, "reply-to", ""); err != nil {
 		t.Fatal(err)
 	}
 	response = New(db, nil).ShowThread(target.ThreadID)
-	if !response.Thread.Messages[0].ReplyToIndexed {
+	message = response.Thread.Messages[0]
+	if !message.ReplyToIndexed {
 		t.Fatal("ReplyToIndexed = false after every owning account was indexed")
+	}
+	if strings.Join(message.ReactionAccounts, ",") != "personal,work" {
+		t.Fatalf("eligible reaction accounts = %v, want [personal work]", message.ReactionAccounts)
 	}
 }
 
@@ -450,6 +457,7 @@ func TestConvertThread_LightOmitsHTMLAndReplyHeaders(t *testing.T) {
 		BodyText: "plain body",
 		BodyHTML: "<p>html body</p>",
 		Mailbox:  "INBOX",
+		Account:  "work",
 	})
 
 	m, _ := db.GetByMessageID("light@test")

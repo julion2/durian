@@ -89,23 +89,24 @@ func (h *Handler) convertThreadWithHeaders(threadID string, msgs []*store.Messag
 	var subject string
 
 	for _, msg := range msgs {
-		isReaction, replyToIndexed := reactionHeaderMetadata(msg, headerMap)
+		isReaction, reactionAccounts := reactionHeaderMetadata(msg, headerMap)
 		accounts := msg.Accounts
 		if len(accounts) == 0 && msg.Account != "" {
 			accounts = []string{msg.Account}
 		}
 		info := internmail.MessageInfo{
-			ID:             msg.MessageID,
-			Accounts:       accounts,
-			IsReaction:     isReaction,
-			ReplyToIndexed: replyToIndexed,
-			From:           msg.FromAddr,
-			To:             msg.ToAddrs,
-			CC:             msg.CCAddrs,
-			Date:           time.Unix(msg.Date, 0).Format(time.RFC1123Z),
-			Timestamp:      msg.Date,
-			MessageID:      msg.MessageID,
-			Body:           sanitize.StripQuotedTextContent(msg.BodyText),
+			ID:               msg.MessageID,
+			Accounts:         accounts,
+			ReactionAccounts: reactionAccounts,
+			IsReaction:       isReaction,
+			ReplyToIndexed:   len(accounts) > 0 && len(reactionAccounts) == len(accounts),
+			From:             msg.FromAddr,
+			To:               msg.ToAddrs,
+			CC:               msg.CCAddrs,
+			Date:             time.Unix(msg.Date, 0).Format(time.RFC1123Z),
+			Timestamp:        msg.Date,
+			MessageID:        msg.MessageID,
+			Body:             sanitize.StripQuotedTextContent(msg.BodyText),
 		}
 		if len(accounts) == 1 {
 			info.Account = accounts[0]
@@ -210,8 +211,10 @@ func (h *Handler) convertThreadWithHeaders(threadID string, msgs []*store.Messag
 func threadMessageRowIDs(msgs []*store.Message) []int64 {
 	var ids []int64
 	for _, msg := range msgs {
-		if len(msg.AccountRowIDs) > 0 {
-			ids = append(ids, msg.AccountRowIDs...)
+		if len(msg.AccountRows) > 0 {
+			for _, id := range msg.AccountRows {
+				ids = append(ids, id)
+			}
 		} else {
 			ids = append(ids, msg.ID)
 		}
@@ -219,16 +222,16 @@ func threadMessageRowIDs(msgs []*store.Message) []int64 {
 	return ids
 }
 
-func reactionHeaderMetadata(msg *store.Message, headerMap map[int64]map[string][]string) (isReaction, replyToIndexed bool) {
-	ids := msg.AccountRowIDs
-	if len(ids) == 0 {
-		ids = []int64{msg.ID}
+func reactionHeaderMetadata(msg *store.Message, headerMap map[int64]map[string][]string) (isReaction bool, eligibleAccounts []string) {
+	eligibleAccounts = make([]string, 0, len(msg.AccountRows))
+	rows := msg.AccountRows
+	if len(rows) == 0 && msg.Account != "" {
+		rows = map[string]int64{msg.Account: msg.ID}
 	}
-	replyToIndexed = len(ids) > 0
-	for _, id := range ids {
+	for account, id := range rows {
 		headers := headerMap[id]
-		if _, ok := headers["Reply-To"]; !ok {
-			replyToIndexed = false
+		if _, ok := headers["Reply-To"]; ok {
+			eligibleAccounts = append(eligibleAccounts, account)
 		}
 		for _, disposition := range headers["Content-Disposition"] {
 			disposition = strings.TrimSpace(disposition)
@@ -241,7 +244,8 @@ func reactionHeaderMetadata(msg *store.Message, headerMap map[int64]map[string][
 			}
 		}
 	}
-	return isReaction, replyToIndexed
+	sort.Strings(eligibleAccounts)
+	return isReaction, eligibleAccounts
 }
 
 // DownloadAttachment streams a raw attachment part, setting Content-Type and

@@ -52,22 +52,23 @@ type MessageBody struct {
 
 // MessageInfo represents a single message within a thread
 type MessageInfo struct {
-	ID              string           `json:"id"`
-	Account         string           `json:"account,omitempty"`
-	Accounts        []string         `json:"accounts,omitempty"`
-	IsReaction      bool             `json:"is_reaction,omitempty"`
-	ReplyToIndexed  bool             `json:"reply_to_indexed"`
-	From            string           `json:"from"`
-	To              string           `json:"to,omitempty"`
-	CC              string           `json:"cc,omitempty"`
-	Date            string           `json:"date"`
-	Timestamp       int64            `json:"timestamp"`
-	MessageID       string           `json:"message_id,omitempty"`
-	InReplyTo       string           `json:"in_reply_to,omitempty"`
-	References      string           `json:"references,omitempty"`
-	Body            string           `json:"body"`
-	HTML            string           `json:"html,omitempty"`
-	HiddenSignature string           `json:"hidden_signature,omitempty"`
-	Attachments     []AttachmentInfo `json:"attachments,omitempty"`
-	Tags            []string         `json:"tags,omitempty"`
+	ID               string           `json:"id"`
+	Account          string           `json:"account,omitempty"`
+	Accounts         []string         `json:"accounts,omitempty"`
+	ReactionAccounts []string         `json:"reaction_accounts"`
+	IsReaction       bool             `json:"is_reaction,omitempty"`
+	ReplyToIndexed   bool             `json:"reply_to_indexed"`
+	From             string           `json:"from"`
+	To               string           `json:"to,omitempty"`
+	CC               string           `json:"cc,omitempty"`
+	Date             string           `json:"date"`
+	Timestamp        int64            `json:"timestamp"`
+	MessageID        string           `json:"message_id,omitempty"`
+	InReplyTo        string           `json:"in_reply_to,omitempty"`
+	References       string           `json:"references,omitempty"`
+	Body             string           `json:"body"`
+	HTML             string           `json:"html,omitempty"`
+	HiddenSignature  string           `json:"hidden_signature,omitempty"`
+	Attachments      []AttachmentInfo `json:"attachments,omitempty"`
+	Tags             []string         `json:"tags,omitempty"`
 }

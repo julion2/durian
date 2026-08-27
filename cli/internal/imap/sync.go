@@ -56,7 +56,7 @@ type SyncOptions struct {
 	Store                *store.DB                    // SQLite store (required)
 	FilterRules          []config.RuleConfig          // User-defined filter rules applied at insert time
 	Groups               map[string]config.GroupEntry // Contact groups for group: expansion in rules
-	BackfillHeaders      bool                         // Fetch headers for existing messages missing required markers
+	BackfillHeaders      bool                         // Explicitly rerun required-header discovery
 	BackfillHeadersForce bool                         // With BackfillHeaders, re-fetch every message even if it already has rows in message_headers — needed after sync.indexed_headers changes
 	IndexedHeaders       []string                     // User-added MIME header names to index on top of builtinSelectedHeaders (see sync_mailbox.go)
 }
@@ -253,8 +253,8 @@ func (s *Syncer) Sync() (*SyncResult, error) {
 		}
 	}
 
-	// Backfill headers for existing messages (one-time operation)
-	if s.options.BackfillHeaders && !s.options.DryRun {
+	// Automatically backfill reaction-critical headers once per mailbox.
+	if !s.options.DryRun {
 		s.backfillHeaders(mailboxes)
 	}
 

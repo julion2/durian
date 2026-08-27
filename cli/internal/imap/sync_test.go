@@ -3,6 +3,7 @@ package imap
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -465,4 +466,11 @@ func TestHeaderBackfillDoesNotTreatUnrelatedHeaderAsComplete(t *testing.T) {
 	if got := syncer.uidsNeedingHeaderBackfill(state); len(got) != 0 {
 		t.Fatalf("backfill UIDs after required markers = %v, want none", got)
 	}
+	key := syncer.requiredHeaderBackfillKey("INBOX")
+	if strings.Contains(key, "work") || strings.Contains(key, "INBOX") {
+		t.Fatalf("backfill metadata key exposes account or mailbox: %q", key)
+	}
+	db.SetMeta(key, requiredHeaderBackfillVersion)
+	// A completed mailbox must return before touching the nil test client.
+	syncer.backfillHeaders([]string{"INBOX"})
 }

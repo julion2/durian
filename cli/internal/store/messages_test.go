@@ -365,8 +365,8 @@ func TestGetByThreadPreservesAllOwningAccounts(t *testing.T) {
 	if len(messages) != 1 || strings.Join(messages[0].Accounts, ",") != "personal,work" {
 		t.Fatalf("deduplicated accounts = %#v", messages)
 	}
-	if len(messages[0].AccountRowIDs) != 2 {
-		t.Fatalf("deduplicated account row IDs = %v, want two", messages[0].AccountRowIDs)
+	if len(messages[0].AccountRows) != 2 {
+		t.Fatalf("deduplicated account rows = %v, want two", messages[0].AccountRows)
 	}
 }
 

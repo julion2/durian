@@ -33,9 +33,9 @@ type Message struct {
 	// Accounts contains every account that owns this Message-ID when a thread
 	// query deduplicates otherwise-identical rows. It is not persisted.
 	Accounts []string
-	// AccountRowIDs contains every store row merged by GetByThread. It lets
-	// callers batch account-specific metadata without selecting it per message.
-	AccountRowIDs []int64
+	// AccountRows maps each owning account to the store row merged by
+	// GetByThread. It lets callers batch account-specific metadata.
+	AccountRows map[string]int64
 }
 
 // Attachment represents file metadata attached to a message.

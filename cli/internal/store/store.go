@@ -1090,6 +1090,18 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 27 {
+		if _, err := d.db.Exec("DROP INDEX IF EXISTS idx_outbox_dedupe_key"); err != nil {
+			return fmt.Errorf("migrate v26→v27 drop outbox dedupe index: %w", err)
+		}
+		if _, err := d.db.Exec("CREATE UNIQUE INDEX idx_outbox_dedupe_key ON outbox(dedupe_key) WHERE dedupe_key IS NOT NULL AND attempts < 5"); err != nil {
+			return fmt.Errorf("migrate v26→v27 create active outbox dedupe index: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 27 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v26→v27 bump: %w", err)
+		}
+	}
+
 	return nil
 }
 
