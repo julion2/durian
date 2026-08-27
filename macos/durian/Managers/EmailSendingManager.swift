@@ -18,6 +18,20 @@ class EmailSendingManager: ObservableObject {
     @Published var sendingProgress = ""
     @Published var lastError: EmailSendingError?
 
+    struct ReactionOption: Identifiable, Equatable, Sendable {
+        let emoji: String
+        let label: String
+        var id: String { emoji }
+    }
+
+    nonisolated static let reactionOptions = [
+        ReactionOption(emoji: "👍", label: "Thumbs up"),
+        ReactionOption(emoji: "❤️", label: "Heart"),
+        ReactionOption(emoji: "😂", label: "Laughing"),
+        ReactionOption(emoji: "😮", label: "Surprised"),
+        ReactionOption(emoji: "😢", label: "Sad"),
+    ]
+
     /// Tracks a pending send that can still be undone.
     struct PendingUndo {
         let itemId: Int64
@@ -28,9 +42,12 @@ class EmailSendingManager: ObservableObject {
         var secondsLeft: Int
         let onUndo: () -> Void
         let onConfirmedSent: () -> Void
+        let kind: String
     }
 
     private(set) var pendingUndoInfo: PendingUndo?
+    @Published private(set) var pendingReactionKeys: Set<String> = []
+    private var reactionKeyByItem: [Int64: String] = [:]
 
     private init() {}
 
@@ -44,14 +61,27 @@ class EmailSendingManager: ObservableObject {
     /// Called by SyncManager when an SSE "sent" event arrives for an item
     /// that may still be in the undo window. Cleans up the timer.
     func handleSentEvent(itemId: Int64) {
+        finishReaction(itemId: itemId)
         guard let pending = pendingUndoInfo, pending.itemId == itemId else { return }
         pending.timer.invalidate()
         pendingUndoInfo = nil
         BannerManager.shared.dismiss()
     }
 
+    func handleFailedEvent(itemId: Int64) {
+        finishReaction(itemId: itemId)
+        guard let pending = pendingUndoInfo, pending.itemId == itemId else { return }
+        pending.timer.invalidate()
+        pendingUndoInfo = nil
+        BannerManager.shared.dismiss()
+    }
+
+    func isReactionPending(messageId: String, account: String) -> Bool {
+        pendingReactionKeys.contains(reactionKey(messageId: messageId, account: account))
+    }
+
     /// Starts the undo countdown banner after a successful enqueue.
-    func startCountdown(itemId: Int64, draftId: UUID, recipient: String, threadId: String?, onUndo: @escaping () -> Void, onConfirmedSent: @escaping () -> Void) {
+    func startCountdown(itemId: Int64, draftId: UUID, recipient: String, threadId: String?, kind: String = "email", onUndo: @escaping () -> Void, onConfirmedSent: @escaping () -> Void) {
         // Cancel any existing countdown
         pendingUndoInfo?.timer.invalidate()
 
@@ -75,7 +105,10 @@ class EmailSendingManager: ObservableObject {
                     BannerManager.shared.dismiss()
                     pending.onConfirmedSent()
                 } else {
-                    BannerManager.shared.updateMessage("Sending in \(pending.secondsLeft)s to \(pending.recipient)...")
+                    let message = pending.kind == "reaction"
+                        ? "Sending reaction in \(pending.secondsLeft)s..."
+                        : "Sending email in \(pending.secondsLeft)s to \(pending.recipient)..."
+                    BannerManager.shared.updateMessage(message)
                 }
             }
         }
@@ -88,13 +121,17 @@ class EmailSendingManager: ObservableObject {
             timer: timer,
             secondsLeft: secondsLeft,
             onUndo: onUndo,
-            onConfirmedSent: onConfirmedSent
+            onConfirmedSent: onConfirmedSent,
+            kind: kind
         )
 
         // Show the initial countdown banner with Undo button
+        let message = kind == "reaction"
+            ? "Sending reaction in \(secondsLeft)s..."
+            : "Sending email in \(secondsLeft)s to \(recipient)..."
         BannerManager.shared.showPersistentInfo(
-            title: "Sending Email",
-            message: "Sending in \(secondsLeft)s to \(recipient)...",
+            title: kind == "reaction" ? "Sending Reaction" : "Sending Email",
+            message: message,
             actions: [
                 BannerAction("Undo") { [weak self] in
                     Task { @MainActor in
@@ -124,8 +161,58 @@ class EmailSendingManager: ObservableObject {
                     Log.warning("EMAIL", "Failed to delete outbox item \(itemId) on undo")
                 }
             }
-            await MainActor.run { undoCb() }
+            await MainActor.run {
+                self.finishReaction(itemId: itemId)
+                undoCb()
+            }
         }
+    }
+
+    // MARK: - Reactions
+
+    func sendReaction(messageId: String, account: String, emoji: String, threadId: String) async {
+        let key = reactionKey(messageId: messageId, account: account)
+        guard !pendingReactionKeys.contains(key) else { return }
+        guard Self.reactionOptions.contains(where: { $0.emoji == emoji }) else {
+            BannerManager.shared.showWarning(title: "Reaction Not Sent", message: "Unsupported emoji.")
+            return
+        }
+        guard pendingUndoInfo == nil else {
+            BannerManager.shared.showWarning(title: "Reaction Not Queued", message: "Finish or undo the current send first.")
+            return
+        }
+        guard let backend = AccountManager.shared.emailBackend else {
+            BannerManager.shared.showCritical(title: "Cannot Send Reaction", message: "Mail server not connected.")
+            return
+        }
+
+        pendingReactionKeys.insert(key)
+        let result = await backend.enqueueReaction(messageId: messageId, account: account, emoji: emoji)
+        guard result.ok, let itemId = result.id else {
+            pendingReactionKeys.remove(key)
+            BannerManager.shared.showWarning(title: "Reaction Not Queued", message: result.error ?? "Unknown error")
+            return
+        }
+        reactionKeyByItem[itemId] = key
+        OutboxManager.shared.refresh()
+        startCountdown(
+            itemId: itemId,
+            draftId: UUID(),
+            recipient: "",
+            threadId: threadId,
+            kind: "reaction",
+            onUndo: {},
+            onConfirmedSent: {}
+        )
+    }
+
+    private func reactionKey(messageId: String, account: String) -> String {
+        "\(account.lowercased())\u{0}\(messageId)"
+    }
+
+    private func finishReaction(itemId: Int64) {
+        guard let key = reactionKeyByItem.removeValue(forKey: itemId) else { return }
+        pendingReactionKeys.remove(key)
     }
 
     /// Send email by enqueuing to the outbox via HTTP API.

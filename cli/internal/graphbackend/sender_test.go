@@ -74,6 +74,28 @@ func TestSenderCreatesDraftAndSends(t *testing.T) {
 	}
 }
 
+func TestSenderSendsCanonicalRawMIME(t *testing.T) {
+	want := []byte("From: me@example.com\r\nTo: you@example.com\r\nContent-Disposition: reaction\r\n\r\nemoji\r\n")
+	var got []byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/sendMail", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Content-Type") != "text/plain" {
+			t.Errorf("Content-Type = %q", r.Header.Get("Content-Type"))
+		}
+		encoded, _ := io.ReadAll(r.Body)
+		got, _ = base64.StdEncoding.DecodeString(string(encoded))
+		w.WriteHeader(http.StatusAccepted)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	if err := (&Sender{b: newTestBackend(t, srv)}).Send(t.Context(), &mailsend.Message{RawMIME: want}); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("raw MIME changed:\n got %q\nwant %q", got, want)
+	}
+}
+
 func TestSenderUploadsLargeAttachment(t *testing.T) {
 	// A file ≥ uploadThreshold must go through an upload session in chunks,
 	// never inline in the draft.

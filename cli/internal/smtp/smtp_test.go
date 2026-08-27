@@ -64,6 +64,22 @@ func TestMessageBuild(t *testing.T) {
 	}
 }
 
+func TestMessageBuildPreservesRawMIME(t *testing.T) {
+	want := []byte("From: me@example.com\r\nContent-Disposition: reaction\r\n\r\nemoji\r\n")
+	msg := &Message{RawMIME: want}
+	got, err := msg.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("raw MIME changed: got %q want %q", got, want)
+	}
+	got[0] = 'X'
+	if string(msg.RawMIME) != string(want) {
+		t.Fatal("Build returned an alias instead of a copy")
+	}
+}
+
 func TestMessageBuildWithAttachment(t *testing.T) {
 	msg := &Message{
 		From:    "sender@example.com",

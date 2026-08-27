@@ -35,9 +35,13 @@ func NewSender(account *config.AccountConfig) (*Sender, error) {
 }
 
 func (s *Sender) Send(ctx context.Context, message *mailsend.Message) error {
-	raw, err := smtp.FromMessage(message).Build()
-	if err != nil {
-		return &mailsend.Error{Kind: mailsend.KindPermanent, Err: fmt.Errorf("build message: %w", err)}
+	raw := message.RawMIME
+	if len(raw) == 0 {
+		var err error
+		raw, err = smtp.FromMessage(message).Build()
+		if err != nil {
+			return &mailsend.Error{Kind: mailsend.KindPermanent, Err: fmt.Errorf("build message: %w", err)}
+		}
 	}
 	if len(message.BCC) > 0 {
 		for _, address := range message.BCC {

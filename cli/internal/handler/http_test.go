@@ -12,7 +12,9 @@ import (
 
 	"github.com/gorilla/mux"
 
+	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/contacts"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 // newTestRouter sets up a mux.Router with all routes, mirroring serve.go.
@@ -39,6 +41,7 @@ func newTestRouter(h *Handler, hub *EventHub) *mux.Router {
 	r.HandleFunc("/api/v1/calendars/sync/event", h.CalendarSyncEventHandler).Methods("POST")
 	r.HandleFunc("/api/v1/calendars", h.CalendarsHandler).Methods("GET")
 	r.HandleFunc("/api/v1/outbox/send", h.EnqueueOutboxHandler).Methods("POST")
+	r.HandleFunc("/api/v1/messages/{message_id}/reactions", h.EnqueueReactionHandler).Methods("POST")
 	r.HandleFunc("/api/v1/outbox", h.ListOutboxHandler).Methods("GET")
 	r.HandleFunc("/api/v1/outbox/{id}", h.DeleteOutboxHandler).Methods("DELETE")
 	return r
@@ -435,6 +438,97 @@ func TestOutboxEnqueueWithDelay(t *testing.T) {
 	sendAfter := int64(resp["send_after"].(float64))
 	if sendAfter <= time.Now().Unix() {
 		t.Error("send_after should be in the future")
+	}
+}
+
+func TestReactionEnqueueDerivesAccountScopedReply(t *testing.T) {
+	db := newTestStore(t)
+	for _, msg := range []*store.Message{
+		{MessageID: "target@test", Account: "work", FromAddr: "Author <author@test>", Subject: "Meeting", Refs: "<root@test>", Date: 1, CreatedAt: 1},
+		{MessageID: "target@test", Account: "personal", FromAddr: "wrong@test", Subject: "Wrong", Date: 1, CreatedAt: 1},
+	} {
+		if err := db.InsertMessage(msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target, _ := db.GetByMessageIDAndAccount("target@test", "work")
+	if err := db.InsertHeader(target.ID, "reply-to", "Replies <reply@test>"); err != nil {
+		t.Fatal(err)
+	}
+	h := New(db, nil)
+	h.SetConfig(&config.Config{Accounts: []config.AccountConfig{{Name: "Work", Email: "me@work.test"}, {Name: "Personal", Email: "me@personal.test"}}})
+	r := newTestRouter(h, nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/messages/target@test/reactions", strings.NewReader(`{"account":"work","emoji":"👍"}`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	var response struct {
+		SendAfter int64 `json:"send_after"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	delay := response.SendAfter - time.Now().Unix()
+	if delay < reactionSendDelay-1 || delay > reactionSendDelay {
+		t.Errorf("reaction delay = %ds, want %ds", delay, reactionSendDelay)
+	}
+	items, err := db.ListOutbox()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("outbox = %v err=%v", items, err)
+	}
+	var draft OutboxDraft
+	if err := json.Unmarshal([]byte(items[0].DraftJSON), &draft); err != nil {
+		t.Fatal(err)
+	}
+	if draft.Account != "work" || draft.From != "me@work.test" || len(draft.To) != 1 || draft.To[0] != `"Replies" <reply@test>` {
+		t.Errorf("account-derived fields = %+v", draft)
+	}
+	if draft.Subject != "Re: Meeting" || draft.InReplyTo != "target@test" || draft.References != "<root@test> <target@test>" {
+		t.Errorf("thread fields = %+v", draft)
+	}
+}
+
+func TestReactionRejectsUnsupportedDuplicateAndWrongAccount(t *testing.T) {
+	db := newTestStore(t)
+	if err := db.InsertMessage(&store.Message{MessageID: "target@test", Account: "work", FromAddr: "author@test", Subject: "Hi", Date: 1, CreatedAt: 1}); err != nil {
+		t.Fatal(err)
+	}
+	h := New(db, nil)
+	h.SetConfig(&config.Config{Accounts: []config.AccountConfig{{Name: "Work", Email: "me@work.test"}, {Name: "Personal", Email: "me@personal.test"}}})
+	r := newTestRouter(h, nil)
+	post := func(body string) int {
+		req := httptest.NewRequest("POST", "/api/v1/messages/target@test/reactions", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+	if got := post(`{"account":"work","emoji":"🔥"}`); got != http.StatusBadRequest {
+		t.Errorf("unsupported emoji status = %d", got)
+	}
+	if got := post(`{"account":"personal","emoji":"👍"}`); got != http.StatusNotFound {
+		t.Errorf("wrong account status = %d", got)
+	}
+	if got := post(`{"account":"work","emoji":"👍"}`); got != http.StatusOK {
+		t.Fatalf("first status = %d", got)
+	}
+	if got := post(`{"account":"work","emoji":"👍"}`); got != http.StatusConflict {
+		t.Errorf("duplicate status = %d", got)
+	}
+	items, err := db.ListOutbox()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("outbox = %v err=%v", items, err)
+	}
+	req := httptest.NewRequest("DELETE", fmt.Sprintf("/api/v1/outbox/%d", items[0].ID), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("undo status = %d", w.Code)
+	}
+	if got := post(`{"account":"work","emoji":"👍"}`); got != http.StatusOK {
+		t.Errorf("status after undo = %d, want 200", got)
 	}
 }
 

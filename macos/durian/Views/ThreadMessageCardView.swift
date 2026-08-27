@@ -24,6 +24,8 @@ struct ThreadMessageCardView: View {
     let onForward: () -> Void
     var onEditDraft: (() -> Void)? = nil
 
+    @StateObject private var sendingManager = EmailSendingManager.shared
+
     // Each card manages its own expanded state
     @State private var isDetailsExpanded: Bool = false
     @State private var downloadStates: [Int: AttachmentDownloadState] = [:]
@@ -162,6 +164,10 @@ struct ThreadMessageCardView: View {
                 .font(.system(size: 14))
                 .foregroundColor(Color.Detail.textTertiary)
                 .lineLimit(1)
+
+            if !message.isDraft {
+                reactionMenu
+            }
         }
     }
 
@@ -594,7 +600,42 @@ struct ThreadMessageCardView: View {
         }
     }
 
-    // MARK: - Action Footer
+    // MARK: - Message Actions
+
+    @ViewBuilder
+    private var reactionMenu: some View {
+        Menu {
+            ForEach(EmailSendingManager.reactionOptions) { option in
+                Button("\(option.label) \(option.emoji)") {
+                    guard let account = message.account else { return }
+                    Task {
+                        await sendingManager.sendReaction(
+                            messageId: message.id,
+                            account: account,
+                            emoji: option.emoji,
+                            threadId: email.id
+                        )
+                    }
+                }
+                .accessibilityLabel("React with \(option.label)")
+            }
+        } label: {
+            Image(systemName: "face.smiling")
+                .font(.system(size: 16))
+                .foregroundColor(Color.Detail.textTertiary)
+                .frame(width: 28, height: 28)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .disabled(message.account == nil || reactionPending)
+        .help(reactionPending ? "Reaction pending" : "React with emoji")
+        .accessibilityLabel("React to this message")
+    }
+
+    private var reactionPending: Bool {
+        guard let account = message.account else { return false }
+        return sendingManager.isReactionPending(messageId: message.id, account: account)
+    }
 
     @ViewBuilder
     private var actionFooter: some View {

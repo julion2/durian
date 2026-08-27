@@ -84,6 +84,7 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 	for _, msg := range msgs {
 		info := internmail.MessageInfo{
 			ID:        msg.MessageID,
+			Account:   msg.Account,
 			From:      msg.FromAddr,
 			To:        msg.ToAddrs,
 			CC:        msg.CCAddrs,

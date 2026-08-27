@@ -25,6 +25,7 @@ struct AttachmentInfo: Decodable, Equatable {
 
 struct ThreadMessage: Decodable, Identifiable, Equatable {
     let id: String
+    let account: String?
     let from: String
     let to: String?
     let cc: String?

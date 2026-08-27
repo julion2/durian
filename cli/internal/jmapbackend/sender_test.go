@@ -56,6 +56,31 @@ func TestSenderImportsAndSubmits(t *testing.T) {
 	}
 }
 
+func TestSenderPreservesCanonicalRawMIME(t *testing.T) {
+	s := newTestJMAPServer(t)
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		case "Email/import":
+			return map[string]interface{}{"created": map[string]interface{}{"0": map[string]string{"id": "draft-1"}}}
+		case "EmailSubmission/set":
+			return map[string]interface{}{"created": map[string]interface{}{"s0": map[string]string{"id": "submission-1"}}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	want := []byte("From: me@example.test\r\nContent-Disposition: reaction\r\n\r\nemoji\r\n")
+	if err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{RawMIME: want}); err != nil {
+		t.Fatal(err)
+	}
+	if string(s.uploaded) != string(want) {
+		t.Fatalf("uploaded MIME changed:\n got %q\nwant %q", s.uploaded, want)
+	}
+}
+
 func TestClassifySendErrorTreatsLocalJMAPPreconditionsAsPermanent(t *testing.T) {
 	for _, err := range []error{errNoDraftsMailbox, errSubmissionUnavailable, errNoSubmissionIdentity} {
 		t.Run(err.Error(), func(t *testing.T) {

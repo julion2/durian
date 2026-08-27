@@ -51,6 +51,7 @@ func FromMessage(m *mailsend.Message) *Message {
 		InReplyTo:          m.InReplyTo,
 		References:         m.References,
 		Attachments:        toSMTPAttachments(m.Attachments),
+		RawMIME:            m.RawMIME,
 	}
 }
 

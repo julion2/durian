@@ -53,6 +53,7 @@ type MessageBody struct {
 // MessageInfo represents a single message within a thread
 type MessageInfo struct {
 	ID              string           `json:"id"`
+	Account         string           `json:"account"`
 	From            string           `json:"from"`
 	To              string           `json:"to,omitempty"`
 	CC              string           `json:"cc,omitempty"`
