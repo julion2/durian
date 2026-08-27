@@ -1036,6 +1036,14 @@ func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
 		PushWatch:          false,
 		FlagChangesInDelta: true,
+		// Graph has no answered flag on the message resource. ApplyFlags
+		// translates only isRead and flagStatus, and flagsFromGraph can never
+		// report Answered, so a local "replied" tag would be uploaded into
+		// nothing, recorded in the baseline, and then removed on the next sync
+		// when the server reports the message as un-answered. Declaring this
+		// keeps Answered out of the three-way merge, which is what the code
+		// here has always actually supported.
+		AnsweredUnsupported: true,
 	}
 }
 

@@ -25,9 +25,12 @@ var ProfileIMAP = Capabilities{
 
 // ProfileGraph is Microsoft Graph: a delta stream that carries flag changes, so
 // the engine reconciles from the delta instead of polling. Folder roles drive
-// tags and \Answered round-trips, as with IMAP. No local push transport.
+// tags. Graph has no answered flag — ApplyFlags translates only isRead and
+// flagStatus — so it shares Gmail's Answered suppression despite being
+// folder-based. No local push transport.
 var ProfileGraph = Capabilities{
-	FlagChangesInDelta: true,
+	FlagChangesInDelta:  true,
+	AnsweredUnsupported: true,
 }
 
 // ProfileJMAP is JMAP: delta-carried flag changes plus keyword-as-tag

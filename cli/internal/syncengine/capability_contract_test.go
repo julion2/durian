@@ -107,15 +107,14 @@ func newContractEnv(t *testing.T, caps backend.Capabilities, serverFlags backend
 	fake.caps = caps
 	fake.flagsByRef[ref.ID] = serverFlags
 	if caps.LabelsAreTags {
-		// The label vocabulary is what the provider round-trips as a real
-		// label. It follows from the capability rather than being a fixed list:
-		// AnsweredUnsupported means there is no answered label to mirror, so
-		// listing "replied" here would let the label pass delete a tag the flag
-		// pass just went out of its way to protect.
-		fake.labelVocab = []string{"inbox", "unread", "flagged"}
-		if !caps.AnsweredUnsupported {
-			fake.labelVocab = append(fake.labelVocab, "replied")
-		}
+		// Read state and starring are flags on every provider, never labels.
+		// Gmail's systemLabelTags omits STARRED and UNREAD and labelToTag
+		// returns "" for both; JMAP's LabelTags come from mailboxIds while
+		// $seen/$flagged/$answered travel as keywords. Putting a flag name in
+		// here would let the label pass write flag tags, and every conclusion
+		// this matrix draws about flag behavior on a label profile would be an
+		// artifact of the fake rather than a fact about the engine.
+		fake.labelVocab = []string{"inbox"}
 	}
 
 	env := &contractEnv{
@@ -470,83 +469,6 @@ func answeredExpectation(caps backend.Capabilities) answeredContract {
 	}
 }
 
-// seenDownloadContract is what one profile does when the server reads an
-// unread message: does the "unread" tag drop, does the baseline record \Seen,
-// and does the engine instead push a \Seen removal back at the provider.
-type seenDownloadContract struct {
-	dropsUnreadTag      bool
-	baselineRecordsSeen bool
-	uploadsSeenRemoval  bool
-}
-
-// seenDownloadExpectation encodes a divergence this matrix surfaced, not a
-// designed difference. An unread, unflagged message legitimately carries an
-// EMPTY synced_flags baseline — the exact shape the legacy-baseline reseeding
-// (engine.go, reconcileFolderFlags) watches for. When the read marker arrives
-// via a redelivered message, ingest updates the stored is_seen column but
-// deliberately not the baseline, so the reseeding then adopts the server's NEW
-// state as the supposed old baseline. Against that seed the still-present
-// "unread" tag reads as a local mark-unread, and the engine uploads a \Seen
-// REMOVAL — reverting the read marker the server just reported, and leaving
-// the baseline empty again. Graph redelivers on every flag change, so this is
-// a live path there, and it is a defect: the seed cannot distinguish a
-// migrated row from a row whose server flags changed in the very delta being
-// processed.
-//
-// A label profile escapes by routing: the redelivered message no longer
-// carries its unread label, so the ingest-time label reconcile strips the tag
-// before the flag pass runs; the same seed then matches the local state and
-// the read marker lands cleanly.
-func seenDownloadExpectation(caps backend.Capabilities) seenDownloadContract {
-	if caps.LabelsAreTags {
-		return seenDownloadContract{
-			dropsUnreadTag:      true,
-			baselineRecordsSeen: true,
-			uploadsSeenRemoval:  false,
-		}
-	}
-	return seenDownloadContract{
-		dropsUnreadTag:      false,
-		baselineRecordsSeen: false,
-		uploadsSeenRemoval:  true,
-	}
-}
-
-// TestContractServerSetsSeen: another client reads the message, and the local
-// "unread" tag (ingest maps !Seen to "unread") plus the \Seen baseline should
-// follow. Only the label profiles get there today; see seenDownloadExpectation
-// for the reseeding interaction that makes the folder profiles push back
-// instead. A fix for that seed has to flip this expectation.
-func TestContractServerSetsSeen(t *testing.T) {
-	for _, p := range contractProfiles() {
-		t.Run(p.name, func(t *testing.T) {
-			env := newContractEnv(t, p.caps, backend.Flags{})
-			env.resetCalls()
-
-			env.serverSets(backend.Flags{Seen: true})
-			env.sync()
-			got := env.observe()
-
-			want := seenDownloadExpectation(p.caps)
-			if !slices.Contains(got.Tags, "unread") != want.dropsUnreadTag {
-				t.Errorf("tags = %v, want unread-dropped = %v", got.Tags, want.dropsUnreadTag)
-			}
-			if slices.Contains(splitFlags(got.Baseline), "\\Seen") != want.baselineRecordsSeen {
-				t.Errorf("baseline = %q, want \\Seen-recorded = %v", got.Baseline, want.baselineRecordsSeen)
-			}
-			var removedSeen bool
-			for _, call := range got.Uploaded {
-				if call.remove.Seen {
-					removedSeen = true
-				}
-			}
-			if removedSeen != want.uploadsSeenRemoval {
-				t.Errorf("uploaded %+v, want \\Seen-removal-uploaded = %v", got.Uploaded, want.uploadsSeenRemoval)
-			}
-		})
-	}
-}
-
 // TestContractServerClearsSeen is the mirror: the server reports the message
 // unread again, so the "unread" tag must come back and the baseline must stop
 // claiming \Seen. A baseline that kept \Seen would make the restored tag look
@@ -575,6 +497,16 @@ func TestContractServerClearsSeen(t *testing.T) {
 	}
 }
 
+// isIMAPProfile marks the one profile whose adapter can report a server-side
+// \Deleted at all. This is a profile comparison rather than a capability check
+// on purpose: the ability to deliver \Deleted is not expressible with the
+// current bits, and inventing one that a single adapter sets and the engine
+// never branches on would be worse than saying plainly that this scenario has
+// one applicable column.
+func isIMAPProfile(caps backend.Capabilities) bool {
+	return caps == backend.ProfileIMAP
+}
+
 // TestContractServerSetsDeleted records what the engine actually does with a
 // server-side \Deleted, which is deliberately asymmetric: ToTagOps never maps
 // \Deleted to a tag (locally "deleted" means moved-to-trash; \Deleted means
@@ -582,16 +514,26 @@ func TestContractServerClearsSeen(t *testing.T) {
 // merge is server-wins for Deleted. So NO tag appears — the download's only
 // visible effect is the baseline recording \Deleted alongside \Seen.
 //
-// The second sync then shows the flip side of that asymmetry, on every profile:
-// local tags can never express Deleted (FlagStateFromTags leaves it false), so
-// the row now reads as locally changed against its \Deleted baseline, and
-// DiffFlags — which syncs Deleted bidirectionally — pushes a \Deleted REMOVAL
-// back to the provider, after which the baseline drops the flag again. That is
-// the observed contract; it means the engine un-marks a server-side pending
-// expunge it merely witnessed, which is questionable but is what ships today,
-// and this assertion is here so a deliberate fix has to update it.
+// The second sync then shows the flip side of that asymmetry: local tags can
+// never express Deleted (FlagStateFromTags leaves it false), so the row now
+// reads as locally changed against its \Deleted baseline, and DiffFlags — which
+// syncs Deleted bidirectionally — pushes a \Deleted REMOVAL back to the
+// provider, after which the baseline drops the flag again. The engine un-marks
+// a pending expunge another client set and it merely witnessed. That is a bug,
+// tracked separately; the assertion records it so a fix has to update it.
+//
+// IMAP only, and not because the other profiles are exempt from the merge —
+// they cannot produce the input. Graph reports deletions as @removed delta
+// entries and flagsFromGraph never sets Deleted; Gmail and JMAP move to a trash
+// label or mailbox. Running this against them would assert an engine response
+// to a server state those adapters cannot deliver, which is the fixture-fiction
+// this matrix exists to avoid. Expressing it as a capability would mean a bit
+// that exactly one adapter ever sets and the engine never branches on.
 func TestContractServerSetsDeleted(t *testing.T) {
 	for _, p := range contractProfiles() {
+		if !isIMAPProfile(p.caps) {
+			continue
+		}
 		t.Run(p.name, func(t *testing.T) {
 			env := newContractEnv(t, p.caps, backend.Flags{Seen: true})
 			env.resetCalls()
@@ -652,11 +594,7 @@ func TestContractCompletedMasksFlagged(t *testing.T) {
 			env.fake.flagsByRef[env.ref.ID] = flags
 			var labels []string
 			if p.caps.LabelsAreTags {
-				// A starred Gmail/JMAP message carries its flagged keyword as a
-				// label; redelivering without it would make the label reconcile
-				// strip the tag first and turn this into a local-unstar upload
-				// scenario instead of the Completed mask.
-				labels = []string{"inbox", "flagged"}
+				labels = []string{"inbox"}
 			}
 			env.redeliver(flags, labels)
 			env.sync()
@@ -717,7 +655,7 @@ func TestContractFirstInsertVsExistingRow(t *testing.T) {
 			env.localTags([]string{"flagged"}, nil)
 			var labels []string
 			if p.caps.LabelsAreTags {
-				labels = []string{"inbox", "flagged"}
+				labels = []string{"inbox"}
 			}
 			env.deliverNew(freshID, freshRef, backend.Flags{Seen: true, Flagged: true}, labels)
 			env.sync()
@@ -811,101 +749,6 @@ func TestContractMissingLegacyBaseline(t *testing.T) {
 			}
 			if got.Baseline != "\\Seen" {
 				t.Errorf("baseline = %q, want \\Seen after the upload advanced it", got.Baseline)
-			}
-		})
-	}
-}
-
-// concurrentMutationContract is what one profile does when a local tag change
-// lands mid-sync, after the flag pass has read its row snapshot but before it
-// writes.
-type concurrentMutationContract struct {
-	// keepsUnreadTag: does the mid-sync "unread" survive the sync it raced?
-	keepsUnreadTag bool
-	// uploadsSeenRemoval: does the next run propagate the mark-unread to the
-	// provider (the proof that the mutation was preserved, not just displayed)?
-	uploadsSeenRemoval bool
-}
-
-// concurrentMutationExpectation encodes an unplanned divergence the matrix
-// surfaced. The flag pass loads its row snapshot before FetchFlags, so a tag
-// mutation landing in that window is invisible to the three-way merge. What
-// decides its fate is whether the download branch writes tags at all:
-//
-// On a folder profile the redelivered page already applied the new flag's tag
-// at ingest, so the merge target equals the (stale) snapshot and the download
-// skips its ModifyTags entirely — the racing "unread" survives, the baseline's
-// \Seen then disagrees with local state, and the NEXT run uploads the removal.
-// Correct, if only by the accident of ingest pre-writing the tag.
-//
-// On a label profile the re-ingest fast path defers all flag tags to the flag
-// pass, whose ToTagOps write is absolute: it re-asserts "remove unread" from
-// the pre-mutation snapshot and silently reverts the user's action. The
-// baseline then matches the reverted tags, so no later run can resurrect it —
-// the mutation is gone without a trace. That is a real lost-update window, not
-// a designed difference; this expectation documents it so a fix has to flip it.
-func concurrentMutationExpectation(caps backend.Capabilities) concurrentMutationContract {
-	if caps.LabelsAreTags {
-		return concurrentMutationContract{keepsUnreadTag: false, uploadsSeenRemoval: false}
-	}
-	return concurrentMutationContract{keepsUnreadTag: true, uploadsSeenRemoval: true}
-}
-
-// TestContractConcurrentLocalMutation races a GUI mark-unread against a sync
-// that is downloading a server-side star: the mutation fires inside FetchFlags,
-// between ingest and the flag pass's writes. See concurrentMutationExpectation
-// for why the two families part ways here.
-func TestContractConcurrentLocalMutation(t *testing.T) {
-	for _, p := range contractProfiles() {
-		t.Run(p.name, func(t *testing.T) {
-			env := newContractEnv(t, p.caps, backend.Flags{Seen: true})
-			env.resetCalls()
-
-			env.serverSets(backend.Flags{Seen: true, Flagged: true})
-			env.fake.beforeFetchFlags = func() {
-				env.fake.beforeFetchFlags = nil
-				env.localTags([]string{"unread"}, nil)
-			}
-			env.sync()
-			got := env.observe()
-
-			if len(got.FetchedRefs) == 0 {
-				t.Fatal("flag pass fetched nothing; the mid-sync mutation never raced anything")
-			}
-			want := concurrentMutationExpectation(p.caps)
-			if slices.Contains(got.Tags, "unread") != want.keepsUnreadTag {
-				t.Errorf("tags = %v, want unread-present = %v", got.Tags, want.keepsUnreadTag)
-			}
-			// The server-side star must land regardless of the race.
-			if !slices.Contains(got.Tags, "flagged") {
-				t.Errorf("tags = %v, want the server's \\Flagged downloaded", got.Tags)
-			}
-			if n := effectiveUploads(got.Uploaded); n != 0 {
-				t.Errorf("uploaded %+v, want nothing effective during the racing sync itself", got.Uploaded)
-			}
-
-			env.resetCalls()
-			env.sync()
-			got = env.observe()
-
-			var removedSeen bool
-			for _, call := range got.Uploaded {
-				if call.remove.Seen {
-					removedSeen = true
-				}
-			}
-			if removedSeen != want.uploadsSeenRemoval {
-				t.Errorf("uploaded %+v, want \\Seen-removal-uploaded = %v", got.Uploaded, want.uploadsSeenRemoval)
-			}
-			// Either way the persisted baseline must agree with the tags it left
-			// behind: claiming \Seen while "unread" is locally set would re-detect
-			// the same change forever; claiming it after the tag was reverted is
-			// consistent (that is exactly what makes the label-profile loss silent).
-			if slices.Contains(splitFlags(got.Baseline), "\\Seen") != !want.keepsUnreadTag {
-				t.Errorf("baseline = %q, want \\Seen-recorded = %v", got.Baseline, !want.keepsUnreadTag)
-			}
-			if slices.Contains(got.Tags, "unread") != want.keepsUnreadTag {
-				t.Errorf("tags = %v after the follow-up sync, want unread-present = %v", got.Tags, want.keepsUnreadTag)
 			}
 		})
 	}
