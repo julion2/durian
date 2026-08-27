@@ -72,6 +72,7 @@ type Backend struct {
 	clientID     string
 	clientSecret string
 	tenant       string
+	flagRetries  flagRetryPolicy
 
 	httpClient *http.Client
 	// baseURL is the Graph API root without trailing slash. Defaults to
@@ -115,6 +116,7 @@ func New(account *config.AccountConfig) (*Backend, error) {
 		tenant:       account.OAuth.Tenant,
 		baseURL:      defaultBaseURL,
 		mailbox:      mailbox,
+		flagRetries:  defaultFlagRetryPolicy(),
 	}
 	b.httpClient = &http.Client{
 		Timeout: 60 * time.Second,
@@ -701,7 +703,20 @@ func (b *Backend) FetchBody(ctx context.Context, ref backend.RemoteRef, w io.Wri
 // MARK: - Flags
 
 // batchLimit is Graph's maximum number of sub-requests per $batch call.
-const batchLimit = 20
+const (
+	batchLimit                = 20
+	maxFlagSubresponseRetries = 3
+	flagRetryBudget           = 7 * time.Second
+)
+
+type flagRetryPolicy struct {
+	now   func() time.Time
+	sleep func(context.Context, time.Duration) error
+}
+
+func defaultFlagRetryPolicy() flagRetryPolicy {
+	return flagRetryPolicy{now: time.Now, sleep: sleepCtx}
+}
 
 // batchRequest is one sub-request of a Graph $batch call. URL is a
 // Graph-relative path (starting with the mailbox segment, e.g. /me/...), not a
@@ -715,9 +730,10 @@ type batchRequest struct {
 // batchResponseItem is one sub-response of a Graph $batch call, carrying the
 // sub-request's id and its own HTTP status.
 type batchResponseItem struct {
-	ID     string          `json:"id"`
-	Status int             `json:"status"`
-	Body   json.RawMessage `json:"body"`
+	ID      string            `json:"id"`
+	Status  int               `json:"status"`
+	Body    json.RawMessage   `json:"body"`
+	Headers map[string]string `json:"headers"`
 }
 
 // flagFields is the flag subset of a Graph message resource.
@@ -734,28 +750,6 @@ type flagFields struct {
 // only used for error context.
 func (b *Backend) FetchFlags(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
 	flags := make(map[string]backend.Flags, len(refs))
-	var partialErr error
-	for start := 0; start < len(refs); start += batchLimit {
-		chunk := refs[start:min(start+batchLimit, len(refs))]
-		chunkFlags, err := b.fetchFlagChunk(ctx, folder, chunk)
-		for id, state := range chunkFlags {
-			flags[id] = state
-		}
-		if err != nil {
-			if !errors.Is(err, backend.ErrPartialFlags) {
-				return nil, err
-			}
-			partialErr = errors.Join(partialErr, err)
-		}
-	}
-
-	slog.Debug("Fetched flags", "module", "GRAPHBACKEND", "folder", folder, // encgrep:allow logs folder name and flag counts, not flag values or message content
-		"requested", len(refs), "resolved", len(flags))
-	return flags, partialErr
-}
-
-func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
-	const maxSubresponseRetries = 3
 	requests := make([]batchRequest, len(refs))
 	refIDByRequestID := make(map[string]string, len(refs))
 	for i, ref := range refs {
@@ -768,76 +762,172 @@ func (b *Backend) fetchFlagChunk(ctx context.Context, folder string, refs []back
 		refIDByRequestID[requestID] = ref.ID
 	}
 
-	flags := make(map[string]backend.Flags, len(refs))
-	var forbidden []string
+	policy := b.flagRetries
+	pending := requests
+	forbidden := 0
+	slept := time.Duration(0)
 	for attempt := 0; ; attempt++ {
-		var envelope struct {
-			Responses []batchResponseItem `json:"responses"`
-		}
-		// The outer request is POST, but every subrequest is GET, so replaying
-		// this particular batch is safe even though generic mutations are not.
-		if err := b.doJSONWithRetry(ctx, http.MethodPost, b.baseURL+"/$batch",
-			map[string]any{"requests": requests}, &envelope, true); err != nil {
-			return nil, fmt.Errorf("failed to batch-fetch flags in %s: %w", folder, err)
+		transient := make([]batchRequest, 0)
+		var retryAfterDelay time.Duration
+		outerThrottled := false
+		for start := 0; start < len(pending); start += batchLimit {
+			chunk := pending[start:min(start+batchLimit, len(pending))]
+			chunkTransient, chunkForbidden, chunkRetryAfter, chunkOuterThrottled, err := b.fetchFlagBatch(ctx, folder, chunk, refIDByRequestID, flags, policy.now)
+			if err != nil {
+				return nil, err
+			}
+			transient = append(transient, chunkTransient...)
+			forbidden += chunkForbidden
+			outerThrottled = outerThrottled || chunkOuterThrottled
+			if chunkRetryAfter > retryAfterDelay {
+				retryAfterDelay = chunkRetryAfter
+			}
 		}
 
-		seen := make(map[string]struct{}, len(requests))
-		transient := make([]batchRequest, 0)
-		for _, item := range envelope.Responses {
-			refID, ok := refIDByRequestID[item.ID]
-			if !ok {
-				return nil, fmt.Errorf("batch flag fetch returned unknown request id %q", item.ID)
-			}
-			seen[item.ID] = struct{}{}
-			switch {
-			case item.Status >= 200 && item.Status < 300:
-				var msg flagFields
-				if err := json.Unmarshal(item.Body, &msg); err != nil {
-					return nil, fmt.Errorf("failed to decode batched flags for %s: %w", refID, err)
-				}
-				flags[refID] = flagsFromGraph(msg.IsRead, msg.Flag)
-			case item.Status == http.StatusNotFound:
-				// Message moved or disappeared after the delta; absence is the
-				// FetchFlags contract for a dead ref.
-			case item.Status == http.StatusForbidden:
-				// Unresolved, NOT dead: unlike the 404 above, absence here means
-				// "we were not allowed to read it", so the caller must be able to
-				// tell the two apart. Recorded and surfaced as ErrPartialFlags so
-				// the engine falls back to what the delta carried instead of
-				// treating the omission as a deletion.
-				forbidden = append(forbidden, refID)
-				slog.Warn("Graph flags are not accessible for message, skipping item", "module", "GRAPHBACKEND", // encgrep:allow folder/id are remote operational metadata, not message content
-					"folder", folder, "id", refID, "status", item.Status)
-			case item.Status == http.StatusTooManyRequests || item.Status >= http.StatusInternalServerError:
-				transient = append(transient, batchRequest{
-					ID: item.ID, Method: http.MethodGet,
-					URL: b.mailbox + "/messages/" + url.PathEscape(refID) + "?$select=id,isRead,flag",
-				})
-			default:
-				return nil, fmt.Errorf("batch flag fetch for %s failed with status %d", refID, item.Status)
-			}
-		}
-		if len(seen) != len(requests) {
-			return nil, fmt.Errorf("batch flag fetch returned %d of %d responses", len(seen), len(requests))
-		}
 		if len(transient) == 0 {
-			if len(forbidden) > 0 {
-				return flags, fmt.Errorf("%w: Graph denied flag access for %d message(s) in %s",
-					backend.ErrPartialFlags, len(forbidden), folder)
+			var partialErr error
+			if forbidden > 0 {
+				partialErr = fmt.Errorf("%w: Graph denied flag access for %d message(s) in %s",
+					backend.ErrPartialFlags, forbidden, folder)
 			}
-			return flags, nil
+			slog.Debug("Fetched flags", "module", "GRAPHBACKEND", "folder", folder, // encgrep:allow logs folder name and flag counts, not flag values or message content
+				"requested", len(refs), "resolved", len(flags))
+			return flags, partialErr
 		}
-		if attempt >= maxSubresponseRetries {
+		if attempt >= maxFlagSubresponseRetries || slept >= flagRetryBudget {
+			if outerThrottled {
+				// An outer $batch throttle provides no per-message result. Do not
+				// expose flags from other chunks as a usable partial response: the
+				// sync engine would otherwise advance past every message in this
+				// chunk. A systemic error keeps the folder cursor for a later pass.
+				return nil, fmt.Errorf("Graph flag batch remains throttled after %d retries in %s", attempt, folder)
+			}
 			return flags, fmt.Errorf("%w: Graph flags remain unavailable after %d retries in %s", backend.ErrPartialFlags, attempt, folder)
 		}
+
 		delay := time.Second << attempt
-		slog.Warn("Graph batch subrequest throttled, backing off", "module", "GRAPHBACKEND",
-			"folder", folder, "retry", attempt+1, "delay", delay)
-		if err := sleepCtx(ctx, delay); err != nil {
+		if retryAfterDelay > 0 {
+			delay = retryAfterDelay
+		}
+		if remaining := flagRetryBudget - slept; delay > remaining {
+			delay = remaining
+		}
+		slog.Warn("Graph batch subrequests throttled, backing off", "module", "GRAPHBACKEND",
+			"folder", folder, "retry", attempt+1, "delay", delay, "unresolved", len(transient))
+		if err := policy.sleep(ctx, delay); err != nil {
 			return nil, err
 		}
-		requests = transient
+		slept += delay
+		pending = transient
 	}
+}
+
+func (b *Backend) fetchFlagBatch(
+	ctx context.Context,
+	folder string,
+	requests []batchRequest,
+	refIDByRequestID map[string]string,
+	flags map[string]backend.Flags,
+	now func() time.Time,
+) ([]batchRequest, int, time.Duration, bool, error) {
+	var envelope struct {
+		Responses []batchResponseItem `json:"responses"`
+	}
+	payload, err := json.Marshal(map[string]any{"requests": requests})
+	if err != nil {
+		return nil, 0, 0, false, fmt.Errorf("failed to marshal flag batch in %s: %w", folder, err)
+	}
+	// Disable the generic HTTP retry loop here. Outer 429/5xx responses join
+	// the same global rounds as transient subresponses below, so every sleep
+	// across every chunk is charged to the one flagRetryBudget.
+	resp, err := b.doWithRetry(ctx, http.MethodPost, b.baseURL+"/$batch", payload, false)
+	if err != nil {
+		return nil, 0, 0, false, fmt.Errorf("failed to batch-fetch flags in %s: %w", folder, err)
+	}
+	defer drainClose(resp)
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
+		delay, _ := batchRetryAfter(map[string]string{"Retry-After": resp.Header.Get("Retry-After")}, now())
+		return requests, 0, delay, true, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, 0, 0, false, fmt.Errorf("failed to batch-fetch flags in %s: %w", folder, newStatusError(resp))
+	}
+	if err := decodeJSONLimited(resp.Body, maxJSONBytes, &envelope); err != nil {
+		return nil, 0, 0, false, fmt.Errorf("failed to decode flag batch in %s: %w", folder, err)
+	}
+
+	seen := make(map[string]struct{}, len(requests))
+	transient := make([]batchRequest, 0)
+	var retryAfterDelay time.Duration
+	forbidden := 0
+	for _, item := range envelope.Responses {
+		refID, ok := refIDByRequestID[item.ID]
+		if !ok {
+			return nil, 0, 0, false, fmt.Errorf("batch flag fetch returned unknown request id %q", item.ID)
+		}
+		seen[item.ID] = struct{}{}
+		switch {
+		case item.Status >= 200 && item.Status < 300:
+			var msg flagFields
+			if err := json.Unmarshal(item.Body, &msg); err != nil {
+				return nil, 0, 0, false, fmt.Errorf("failed to decode batched flags for %s: %w", refID, err)
+			}
+			flags[refID] = flagsFromGraph(msg.IsRead, msg.Flag)
+		case item.Status == http.StatusNotFound:
+			// Message moved or disappeared after the delta; absence is the
+			// FetchFlags contract for a dead ref.
+		case item.Status == http.StatusForbidden:
+			// Unresolved, NOT dead: unlike the 404 above, absence here means
+			// "we were not allowed to read it", so the caller must be able to
+			// tell the two apart. Recorded and surfaced as ErrPartialFlags so
+			// the engine falls back to what the delta carried instead of
+			// treating the omission as a deletion.
+			forbidden++
+			slog.Warn("Graph flags are not accessible for message, skipping item", "module", "GRAPHBACKEND", // encgrep:allow folder/id are remote operational metadata, not message content
+				"folder", folder, "id", refID, "status", item.Status)
+		case item.Status == http.StatusTooManyRequests || item.Status >= http.StatusInternalServerError:
+			transient = append(transient, batchRequest{
+				ID: item.ID, Method: http.MethodGet,
+				URL: b.mailbox + "/messages/" + url.PathEscape(refID) + "?$select=id,isRead,flag",
+			})
+			if delay, ok := batchRetryAfter(item.Headers, now()); ok && delay > retryAfterDelay {
+				retryAfterDelay = delay
+			}
+		default:
+			return nil, 0, 0, false, fmt.Errorf("batch flag fetch for %s failed with status %d", refID, item.Status)
+		}
+	}
+	if len(seen) != len(requests) {
+		return nil, 0, 0, false, fmt.Errorf("batch flag fetch returned %d of %d responses", len(seen), len(requests))
+	}
+	return transient, forbidden, retryAfterDelay, false, nil
+}
+
+func batchRetryAfter(headers map[string]string, now time.Time) (time.Duration, bool) {
+	for name, value := range headers {
+		if !strings.EqualFold(name, "Retry-After") {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if seconds, err := strconv.Atoi(value); err == nil {
+			if seconds <= 0 {
+				return 0, false
+			}
+			if seconds >= int(flagRetryBudget/time.Second) {
+				return flagRetryBudget, true
+			}
+			return time.Duration(seconds) * time.Second, true
+		}
+		if retryAt, err := http.ParseTime(value); err == nil {
+			delay := retryAt.Sub(now)
+			if delay <= 0 {
+				return 0, false
+			}
+			return min(delay, flagRetryBudget), true
+		}
+		return 0, false
+	}
+	return 0, false
 }
 
 // ApplyFlags pushes flag changes to Graph by PATCHing only the message fields

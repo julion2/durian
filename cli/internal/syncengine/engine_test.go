@@ -100,8 +100,9 @@ type fakeBackend struct {
 	// flagsByRef scripts the server flag state FetchFlags reports per
 	// RemoteRef.ID. Empty by default, so unrelated tests see "not on server"
 	// for every message and the engine's flag pass no-ops.
-	flagsByRef    map[string]backend.Flags
-	fetchFlagsErr error
+	flagsByRef        map[string]backend.Flags
+	fetchFlagsErr     error
+	fetchFlagsPartial bool
 	// fetchFlagsCalls / applyFlagsCalls record the flag-pass invocations.
 	fetchFlagsCalls []fetchFlagsCall
 	applyFlagsCalls []applyFlagsCall
@@ -231,6 +232,9 @@ func (f *fakeBackend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add
 func (f *fakeBackend) FetchFlags(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
 	f.fetchFlagsCalls = append(f.fetchFlagsCalls, fetchFlagsCall{folder: folder, refs: slices.Clone(refs)})
 	if f.fetchFlagsErr != nil {
+		if f.fetchFlagsPartial {
+			return map[string]backend.Flags{}, f.fetchFlagsErr
+		}
 		return nil, f.fetchFlagsErr
 	}
 	result := make(map[string]backend.Flags)
@@ -2323,7 +2327,8 @@ func TestEngineAppliesDeltaFlagsWhenFlagFetchFails(t *testing.T) {
 	if _, err := engine.Sync(t.Context(), fake); err != nil {
 		t.Fatalf("seed sync: %v", err)
 	}
-	fake.fetchFlagsErr = errors.New("flag endpoint unavailable")
+	fake.fetchFlagsPartial = true
+	fake.fetchFlagsErr = fmt.Errorf("%w: flag endpoint partially unavailable", backend.ErrPartialFlags)
 
 	result, err := engine.Sync(t.Context(), fake)
 	if err != nil {
