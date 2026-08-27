@@ -351,6 +351,7 @@ func ResolveEventIn(cols []Collection, ref, calFilter string) (path string, ev E
 		path     string
 		event    Event
 		calendar string
+		account  string
 	}
 	var exact, prefix, subject []match
 	lowerRef := strings.ToLower(ref)
@@ -365,7 +366,7 @@ func ResolveEventIn(cols []Collection, ref, calFilter string) (path string, ev E
 			return "", Event{}, "", err
 		}
 		for _, it := range items {
-			m := match{path: it.Path, event: it.Event, calendar: calName}
+			m := match{path: it.Path, event: it.Event, calendar: calName, account: col.Account}
 			switch {
 			case it.Event.ICalUID == ref:
 				exact = append(exact, m)
@@ -384,13 +385,30 @@ func ResolveEventIn(cols []Collection, ref, calFilter string) (path string, ev E
 		if len(tier) > 1 {
 			var names []string
 			for _, m := range tier {
-				names = append(names, fmt.Sprintf("%q [%s]", m.event.Subject, m.calendar))
+				candidate := fmt.Sprintf("%q [event:%s, calendar:%s", m.event.Subject, m.event.ICalUID, m.calendar)
+				if m.account != "" {
+					candidate += ", account:" + m.account
+				}
+				names = append(names, candidate+"]")
 			}
 			return "", Event{}, "", fmt.Errorf("%q matches %d events, be more specific: %s",
 				ref, len(tier), strings.Join(names, ", "))
 		}
 	}
 	return "", Event{}, "", fmt.Errorf("no event matches %q", ref)
+}
+
+// CollectionAccountForPath returns the account owning an event file resolved
+// from cols. It returns an empty string when path is outside every collection.
+func CollectionAccountForPath(cols []Collection, path string) string {
+	path = filepath.Clean(path)
+	for _, col := range cols {
+		rel, err := filepath.Rel(filepath.Clean(col.Dir), path)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return col.Account
+		}
+	}
+	return ""
 }
 
 // ParseWhen parses the date/time inputs the CLI accepts, all interpreted as

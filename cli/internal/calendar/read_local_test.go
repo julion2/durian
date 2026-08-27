@@ -3,6 +3,7 @@ package calendar
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -201,6 +202,8 @@ func TestResolveLocalEvent(t *testing.T) {
 	// Ambiguous ("sprint" matches two).
 	if _, _, _, err := ResolveLocalEvent(dir, "", "sprint", ""); err == nil {
 		t.Fatal("ambiguous subject: want error, got nil")
+	} else if !strings.Contains(err.Error(), "event:uid-alpha") || !strings.Contains(err.Error(), "event:uid-beta") {
+		t.Fatalf("ambiguity error does not expose candidate UIDs: %v", err)
 	}
 	// None.
 	if _, _, _, err := ResolveLocalEvent(dir, "", "nonexistent", ""); err == nil {
@@ -215,6 +218,22 @@ func TestResolveLocalEvent(t *testing.T) {
 	// Personal, so filtering to Work finds nothing.
 	if _, _, _, err := ResolveLocalEvent(dir, "", "gamma", "Work"); err == nil {
 		t.Fatal("gamma filtered to Work should not match")
+	}
+}
+
+func TestCollectionAccountForPath(t *testing.T) {
+	base := t.TempDir()
+	work := filepath.Join(base, "work")
+	personal := filepath.Join(base, "personal")
+	cols := []Collection{
+		{Dir: work, Account: "office"},
+		{Dir: personal, Account: "personal"},
+	}
+	if got := CollectionAccountForPath(cols, filepath.Join(work, "event.ics")); got != "office" {
+		t.Fatalf("account = %q, want office", got)
+	}
+	if got := CollectionAccountForPath(cols, filepath.Join(base, "outside.ics")); got != "" {
+		t.Fatalf("outside account = %q, want empty", got)
 	}
 }
 
