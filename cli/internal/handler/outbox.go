@@ -144,7 +144,7 @@ func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if !replyToIndexed {
-		writeReactionError(w, http.StatusConflict, "Reply-To status is unavailable; sync this message before reacting")
+		writeReactionError(w, http.StatusConflict, "Reply-To status is unavailable; run a header backfill before reacting")
 		return
 	}
 
@@ -505,10 +505,12 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mail
 	if err := w.store.InsertHeader(storeMsg.ID, "reply-to", ""); err != nil {
 		slog.Warn("Failed to mark sent message Reply-To status", "module", "OUTBOX", "err", err)
 	}
+	contentDisposition := ""
 	if draft.Kind == outboxKindReaction {
-		if err := w.store.InsertHeader(storeMsg.ID, "content-disposition", "reaction"); err != nil {
-			slog.Warn("Failed to mark sent reaction", "module", "OUTBOX", "err", err)
-		}
+		contentDisposition = "reaction"
+	}
+	if err := w.store.InsertHeader(storeMsg.ID, "content-disposition", contentDisposition); err != nil {
+		slog.Warn("Failed to mark sent message Content-Disposition", "module", "OUTBOX", "err", err)
 	}
 	if err := w.store.AddTag(storeMsg.ID, "sent"); err != nil {
 		slog.Warn("Failed to tag sent email", "module", "OUTBOX", "err", err) // encgrep:allow message text, no PII attr

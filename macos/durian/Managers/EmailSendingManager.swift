@@ -106,9 +106,11 @@ class EmailSendingManager: ObservableObject {
                     BannerManager.shared.dismiss()
                     pending.onConfirmedSent()
                 } else {
-                    let message = pending.kind == "reaction"
-                        ? "Sending reaction in \(pending.secondsLeft)s to \(pending.recipient)..."
-                        : "Sending email in \(pending.secondsLeft)s to \(pending.recipient)..."
+                    let message = Self.countdownMessage(
+                        kind: pending.kind,
+                        secondsLeft: pending.secondsLeft,
+                        recipient: pending.recipient
+                    )
                     BannerManager.shared.updateMessage(message)
                 }
             }
@@ -127,9 +129,7 @@ class EmailSendingManager: ObservableObject {
         )
 
         // Show the initial countdown banner with Undo button
-        let message = kind == "reaction"
-            ? "Sending reaction in \(secondsLeft)s to \(recipient)..."
-            : "Sending email in \(secondsLeft)s to \(recipient)..."
+        let message = Self.countdownMessage(kind: kind, secondsLeft: secondsLeft, recipient: recipient)
         BannerManager.shared.showPersistentInfo(
             title: kind == "reaction" ? "Sending Reaction" : "Sending Email",
             message: message,
@@ -200,7 +200,7 @@ class EmailSendingManager: ObservableObject {
         startCountdown(
             itemId: itemId,
             draftId: UUID(),
-            recipient: result.recipient ?? "recipient",
+            recipient: result.recipient ?? "",
             threadId: threadId,
             kind: "reaction",
             onUndo: {},
@@ -224,16 +224,30 @@ class EmailSendingManager: ObservableObject {
         let initialDelay = max((sendAfter ?? now) - now + 5, 5)
         reactionMonitors[itemId] = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(initialDelay) * 1_000_000_000)
-            while !Task.isCancelled {
+            guard !Task.isCancelled else { return }
+            for attempt in 0..<20 {
                 if let items = await backend.listOutboxIfAvailable() {
                     if Self.isReactionTerminal(itemId: itemId, outbox: items) {
                         self?.finishReaction(itemId: itemId)
                         return
                     }
                 }
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                if attempt < 19 {
+                    try? await Task.sleep(nanoseconds: 15_000_000_000)
+                    guard !Task.isCancelled else { return }
+                }
             }
+            self?.finishReaction(itemId: itemId)
         }
+    }
+
+    nonisolated static func countdownMessage(kind: String, secondsLeft: Int, recipient: String) -> String {
+        if kind == "reaction" {
+            return recipient.isEmpty
+                ? "Sending reaction in \(secondsLeft)s..."
+                : "Sending reaction in \(secondsLeft)s to \(recipient)..."
+        }
+        return "Sending email in \(secondsLeft)s to \(recipient)..."
     }
 
     nonisolated static func isReactionTerminal(itemId: Int64, outbox: [OutboxEntry]) -> Bool {

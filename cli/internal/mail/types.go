@@ -56,6 +56,7 @@ type MessageInfo struct {
 	Account         string           `json:"account,omitempty"`
 	Accounts        []string         `json:"accounts,omitempty"`
 	IsReaction      bool             `json:"is_reaction,omitempty"`
+	ReplyToIndexed  bool             `json:"reply_to_indexed"`
 	From            string           `json:"from"`
 	To              string           `json:"to,omitempty"`
 	CC              string           `json:"cc,omitempty"`

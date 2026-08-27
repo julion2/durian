@@ -24,7 +24,7 @@ durian sync --debug                  # verbose logging to stderr
 durian sync --upload-only            # only push local tag/flag changes
 durian sync --download-only          # only fetch from server
 durian sync --no-flags               # skip flag sync (bodies only)
-durian sync --backfill-headers       # fetch headers for messages that don't have any yet
+durian sync --backfill-headers       # fetch headers for messages missing required markers
 durian sync --backfill-headers --force  # re-fetch headers for ALL messages (after editing sync.indexed_headers)
 durian sync --dry-run                # report what would happen, write nothing
 ```

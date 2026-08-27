@@ -515,7 +515,7 @@ func TestReactionRejectsUnsupportedDuplicateAndWrongAccount(t *testing.T) {
 	if got := post(`{"account":"personal","emoji":"👍"}`); got.Code != http.StatusNotFound {
 		t.Errorf("wrong account status = %d", got.Code)
 	}
-	if got := post(`{"account":"work","emoji":"👍"}`); got.Code != http.StatusConflict || !strings.Contains(got.Body.String(), "sync this message") {
+	if got := post(`{"account":"work","emoji":"👍"}`); got.Code != http.StatusConflict || !strings.Contains(got.Body.String(), "header backfill") {
 		t.Fatalf("unindexed Reply-To response = %d %s", got.Code, got.Body.String())
 	}
 	target, _ := db.GetByMessageIDAndAccount("target@test", "work")

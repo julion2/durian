@@ -22,9 +22,20 @@ import (
 // Provider-specific additions like X-GitLab-NotificationReason,
 // X-Spam-Status, etc. belong in the user's indexed_headers config.
 var builtinSelectedHeaders = []string{
-	"Reply-To", "List-Id", "List-Unsubscribe", "Precedence",
+	"Reply-To", "Content-Disposition", "List-Id", "List-Unsubscribe", "Precedence",
 	"X-Mailer", "Return-Path", "X-GitHub-Reason",
 	"Authentication-Results",
+}
+
+var markerSelectedHeaders = []string{"Reply-To", "Content-Disposition"}
+
+func selectedHeaderNeedsMarker(name string) bool {
+	for _, required := range markerSelectedHeaders {
+		if strings.EqualFold(name, required) {
+			return true
+		}
+	}
+	return false
 }
 
 // headerSet returns the deduped, case-insensitive union of the built-in
@@ -96,7 +107,8 @@ func (s *Syncer) backfillHeadersForMailbox(mboxName string) {
 }
 
 // uidsNeedingHeaderBackfill returns UIDs in the given mailbox whose messages
-// are in the store but don't yet have header rows.
+// lack a required header marker. Other indexed headers do not prove that
+// Reply-To or Content-Disposition was fetched.
 func (s *Syncer) uidsNeedingHeaderBackfill(mboxState *MailboxState) []uint32 {
 	var uids []uint32
 	for _, uid := range mboxState.SyncedUIDs {
@@ -108,12 +120,19 @@ func (s *Syncer) uidsNeedingHeaderBackfill(mboxState *MailboxState) []uint32 {
 		if err != nil || dbID == 0 {
 			continue
 		}
-		// Without --force, skip messages that already have at least one
-		// header row — incremental backfill. With --force, refetch
-		// everything; needed after the user changes sync.indexed_headers
-		// because the existing rows reflect the old configured set.
+		// Without --force, fetch each message once until every required marker
+		// exists. With --force, refetch everything, including user-indexed
+		// headers changed in config.pkl.
 		if !s.options.BackfillHeadersForce {
-			if has, _ := s.store.HasHeaders(dbID); has {
+			complete := true
+			for _, header := range markerSelectedHeaders {
+				has, err := s.store.HasHeader(dbID, strings.ToLower(header))
+				if err != nil || !has {
+					complete = false
+					break
+				}
+			}
+			if complete {
 				continue
 			}
 		}
@@ -153,7 +172,7 @@ func (s *Syncer) storeHeadersForUID(uid uint32, rawHeader []byte, mboxState *Mai
 		return false
 	}
 	for _, hdrName := range s.headerSet() {
-		if v := parsed.Header.Get(hdrName); v != "" || strings.EqualFold(hdrName, "Reply-To") {
+		if v := parsed.Header.Get(hdrName); v != "" || selectedHeaderNeedsMarker(hdrName) {
 			if err := s.store.InsertHeader(dbID, strings.ToLower(hdrName), v); err != nil {
 				slog.Debug("InsertHeader failed", "module", "SYNC", "uid", uid, "header", hdrName, "err", err) // encgrep:allow word "header" in message text, no header value logged
 			}

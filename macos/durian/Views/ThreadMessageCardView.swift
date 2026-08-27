@@ -622,9 +622,15 @@ struct ThreadMessageCardView: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
-        .disabled(message.reactionAccounts.isEmpty || reactionPending)
-        .help(reactionPending ? "Reaction pending" : "React with emoji")
+        .disabled(message.reactionAccounts.isEmpty || !message.replyToIndexed || reactionPending)
+        .help(reactionHelp)
         .accessibilityLabel("React to this message")
+    }
+
+    private var reactionHelp: String {
+        if reactionPending { return "Reaction pending" }
+        if !message.replyToIndexed { return "Backfill message headers before reacting" }
+        return "React with emoji"
     }
 
     private var reactionPending: Bool {

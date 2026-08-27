@@ -351,12 +351,14 @@ func (d *DB) GetByThread(threadID string) ([]*Message, error) {
 	deduped := make([]*Message, 0, len(all))
 	for _, msg := range all {
 		if index, ok := seen[msg.MessageID]; ok {
+			deduped[index].AccountRowIDs = append(deduped[index].AccountRowIDs, msg.ID)
 			if msg.Account != "" {
 				deduped[index].Accounts = append(deduped[index].Accounts, msg.Account)
 			}
 			continue
 		}
 		seen[msg.MessageID] = len(deduped)
+		msg.AccountRowIDs = []int64{msg.ID}
 		if msg.Account != "" {
 			msg.Accounts = []string{msg.Account}
 		}

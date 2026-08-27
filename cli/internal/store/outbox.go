@@ -95,10 +95,11 @@ func (d *DB) DeferOutboxItem(id int64, sendAfter int64, lastErr string) error {
 	return nil
 }
 
-// PoisonOutboxItem marks an item as permanently failed by setting attempts to 5.
+// PoisonOutboxItem marks an item as permanently failed and releases any
+// deduplication key so the user can retry it as a new outbox item.
 func (d *DB) PoisonOutboxItem(id int64, reason string) error {
 	_, err := d.db.Exec(
-		"UPDATE outbox SET attempts = 5, last_error = ? WHERE id = ?",
+		"UPDATE outbox SET attempts = 5, last_error = ?, dedupe_key = NULL WHERE id = ?",
 		reason, id)
 	if err != nil {
 		return fmt.Errorf("poison outbox item: %w", err)

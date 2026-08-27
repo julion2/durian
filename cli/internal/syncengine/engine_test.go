@@ -872,6 +872,31 @@ func TestIngestRecordsAbsentReplyToAsIndexed(t *testing.T) {
 	if has, err := db.HasHeader(stored.ID, "reply-to"); err != nil || !has {
 		t.Fatalf("Reply-To marker = %v, %v", has, err)
 	}
+	if has, err := db.HasHeader(stored.ID, "content-disposition"); err != nil || !has {
+		t.Fatalf("Content-Disposition marker = %v, %v", has, err)
+	}
+}
+
+func TestIngestIndexesIncomingRFC9078Reaction(t *testing.T) {
+	db := newTestDB(t)
+	raw := rawMessage("reaction@example.com", "a@example.com", testAccount, "Re: Hello", "👍")
+	raw = bytes.Replace(raw, []byte("MIME-Version: 1.0\r\n"), []byte("MIME-Version: 1.0\r\nContent-Disposition: reaction\r\n"), 1)
+	message := backend.Message{
+		MessageID: "reaction@example.com",
+		Ref:       backend.RemoteRef{Folder: "INBOX", ID: "reaction"},
+		Raw:       raw,
+	}
+	if _, _, err := Ingest(db, message, "INBOX", backend.RoleInbox, IngestOptions{Account: testAccount}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.GetByMessageIDAndAccount(message.MessageID, testAccount)
+	if err != nil || stored == nil {
+		t.Fatalf("stored message = %v, %v", stored, err)
+	}
+	disposition, err := db.GetHeader(stored.ID, "content-disposition")
+	if err != nil || disposition != "reaction" {
+		t.Fatalf("stored Content-Disposition = %q, %v", disposition, err)
+	}
 }
 
 func TestEngineReplacementPreservesExistingRefAfterPermanentIngestFailure(t *testing.T) {

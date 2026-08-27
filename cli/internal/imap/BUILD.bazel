@@ -44,6 +44,7 @@ go_test(
     embed = [":imap"],
     deps = [
         "//cli/internal/config",
+        "//cli/internal/dbcrypto",
         "//cli/internal/store",
         "@com_github_emersion_go_imap//:go-imap",
     ],

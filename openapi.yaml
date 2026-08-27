@@ -844,6 +844,10 @@ components:
           description: All accounts that own this Message-ID
         is_reaction:
           type: boolean
+          description: True for a top-level RFC 9078 Content-Disposition reaction
+        reply_to_indexed:
+          type: boolean
+          description: Whether Reply-To absence or value is known for every owning account
         from:
           type: string
         to:

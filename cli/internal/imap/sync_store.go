@@ -91,7 +91,7 @@ func (s *Syncer) storeInsertMessage(mailboxName string, imapMsg *goimap.Message,
 	// Store selected headers for rule matching and analysis (builtin set
 	// plus user-added entries from config.pkl sync.indexed_headers).
 	for _, hdrName := range s.headerSet() {
-		if v := parsed.Header.Get(hdrName); v != "" || strings.EqualFold(hdrName, "Reply-To") {
+		if v := parsed.Header.Get(hdrName); v != "" || selectedHeaderNeedsMarker(hdrName) {
 			_ = s.store.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v)
 		}
 	}

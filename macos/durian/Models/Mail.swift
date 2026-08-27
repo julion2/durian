@@ -28,6 +28,7 @@ struct ThreadMessage: Decodable, Identifiable, Equatable {
     let account: String?
     let accounts: [String]?
     let is_reaction: Bool?
+    let reply_to_indexed: Bool?
     let from: String
     let to: String?
     let cc: String?
@@ -53,6 +54,8 @@ struct ThreadMessage: Decodable, Identifiable, Equatable {
     }
 
     var isReaction: Bool { is_reaction ?? false }
+
+    var replyToIndexed: Bool { reply_to_indexed ?? false }
 }
 
 // MARK: - Email Body State

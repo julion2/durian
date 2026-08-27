@@ -346,10 +346,11 @@ func TestGetByThread(t *testing.T) {
 func TestGetByThreadPreservesAllOwningAccounts(t *testing.T) {
 	db := newTestDB(t)
 	for _, account := range []string{"work", "personal"} {
-		if err := db.InsertMessage(&Message{
+		message := &Message{
 			MessageID: "shared@x", Subject: "Shared", FromAddr: "a@x",
 			Account: account, Date: 1, CreatedAt: 1, FetchedBody: true,
-		}); err != nil {
+		}
+		if err := db.InsertMessage(message); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -363,6 +364,9 @@ func TestGetByThreadPreservesAllOwningAccounts(t *testing.T) {
 	}
 	if len(messages) != 1 || strings.Join(messages[0].Accounts, ",") != "personal,work" {
 		t.Fatalf("deduplicated accounts = %#v", messages)
+	}
+	if len(messages[0].AccountRowIDs) != 2 {
+		t.Fatalf("deduplicated account row IDs = %v, want two", messages[0].AccountRowIDs)
 	}
 }
 

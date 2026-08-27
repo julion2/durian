@@ -167,6 +167,9 @@ func TestShowThreadExposesAllOwningAccountsWithoutChoosingOne(t *testing.T) {
 		}
 	}
 	target, _ := db.GetByMessageIDAndAccount("shared@test", "work")
+	if err := db.InsertHeader(target.ID, "reply-to", ""); err != nil {
+		t.Fatal(err)
+	}
 	response := New(db, nil).ShowThread(target.ThreadID)
 	if !response.OK || len(response.Thread.Messages) != 1 {
 		t.Fatalf("response = %+v", response)
@@ -174,6 +177,17 @@ func TestShowThreadExposesAllOwningAccountsWithoutChoosingOne(t *testing.T) {
 	message := response.Thread.Messages[0]
 	if message.Account != "" || strings.Join(message.Accounts, ",") != "personal,work" {
 		t.Fatalf("account selection = %q, accounts = %v", message.Account, message.Accounts)
+	}
+	if message.ReplyToIndexed {
+		t.Fatal("ReplyToIndexed = true with one unindexed owning account")
+	}
+	personal, _ := db.GetByMessageIDAndAccount("shared@test", "personal")
+	if err := db.InsertHeader(personal.ID, "reply-to", ""); err != nil {
+		t.Fatal(err)
+	}
+	response = New(db, nil).ShowThread(target.ThreadID)
+	if !response.Thread.Messages[0].ReplyToIndexed {
+		t.Fatal("ReplyToIndexed = false after every owning account was indexed")
 	}
 }
 
@@ -439,6 +453,12 @@ func TestConvertThread_LightOmitsHTMLAndReplyHeaders(t *testing.T) {
 	})
 
 	m, _ := db.GetByMessageID("light@test")
+	if err := db.InsertHeader(m.ID, "reply-to", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertHeader(m.ID, "content-disposition", "reaction"); err != nil {
+		t.Fatal(err)
+	}
 	msgs, _ := db.GetByThread(m.ThreadID)
 	h := New(db, nil)
 
@@ -462,6 +482,9 @@ func TestConvertThread_LightOmitsHTMLAndReplyHeaders(t *testing.T) {
 	}
 	if msg.References != "" {
 		t.Errorf("References should be empty in light mode, got %q", msg.References)
+	}
+	if !msg.IsReaction || !msg.ReplyToIndexed {
+		t.Errorf("light mode reaction metadata = isReaction %v, replyToIndexed %v", msg.IsReaction, msg.ReplyToIndexed)
 	}
 }
 

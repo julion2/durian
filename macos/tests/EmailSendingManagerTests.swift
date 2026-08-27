@@ -17,6 +17,17 @@ final class EmailSendingManagerTests: XCTestCase {
         XCTAssertTrue(EmailSendingManager.isReactionTerminal(itemId: 3, outbox: [pending]))
     }
 
+    func testReactionCountdownOmitsUnknownRecipientPlaceholder() {
+        XCTAssertEqual(
+            EmailSendingManager.countdownMessage(kind: "reaction", secondsLeft: 10, recipient: ""),
+            "Sending reaction in 10s..."
+        )
+        XCTAssertEqual(
+            EmailSendingManager.countdownMessage(kind: "reaction", secondsLeft: 10, recipient: "reply@test"),
+            "Sending reaction in 10s to reply@test..."
+        )
+    }
+
     // MARK: - stripStyleTags
 
     func testStripsSingleStyleBlock() {

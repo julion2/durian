@@ -139,9 +139,12 @@ func TestDequeueSkipsPoisoned(t *testing.T) {
 func TestPoisonOutboxItem(t *testing.T) {
 	db := newTestDB(t)
 
-	id, _ := db.Enqueue(`{"subject":"bad"}`, 0)
+	id, err := db.EnqueueUnique(`{"kind":"reaction"}`, 0, "reaction-key")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	err := db.PoisonOutboxItem(id, "permanent failure")
+	err = db.PoisonOutboxItem(id, "permanent failure")
 	if err != nil {
 		t.Fatalf("poison: %v", err)
 	}
@@ -158,6 +161,10 @@ func TestPoisonOutboxItem(t *testing.T) {
 	item, _ := db.Dequeue()
 	if item != nil {
 		t.Error("poisoned item should not be dequeued")
+	}
+
+	if _, err := db.EnqueueUnique(`{"kind":"reaction"}`, 0, "reaction-key"); err != nil {
+		t.Fatalf("retry after permanent failure: %v", err)
 	}
 }
 

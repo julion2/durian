@@ -23,10 +23,12 @@ var parser = durianmail.NewParser()
 // constraint of touching no existing files). Keep the two lists in sync until
 // the legacy syncer is retired.
 var builtinIndexedHeaders = []string{
-	"Reply-To", "List-Id", "List-Unsubscribe", "Precedence",
+	"Reply-To", "Content-Disposition", "List-Id", "List-Unsubscribe", "Precedence",
 	"X-Mailer", "Return-Path", "X-GitHub-Reason",
 	"Authentication-Results",
 }
+
+var markerIndexedHeaders = []string{"Reply-To", "Content-Disposition"}
 
 // folderTagMapping defines which tags to add/remove when a message is found in
 // a folder (mirror of imap.FolderTagMapping, keyed by backend.Role instead of
@@ -222,10 +224,12 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		return "", false, fmt.Errorf("insert message: %w", err)
 	}
 
-	// Reply-To is send-critical, so persist an empty marker as well as a value.
-	// Existing label-backed rows acquire the marker on re-delivery without
-	// rewriting every indexed header before the fast path.
-	_ = db.InsertHeader(storeMsg.ID, "reply-to", parsed.Header.Get("Reply-To"))
+	// Reply-To and Content-Disposition affect reaction eligibility and display,
+	// so persist empty markers as well as values. Existing label-backed rows
+	// acquire them on re-delivery without rewriting every indexed header.
+	for _, hdrName := range markerIndexedHeaders {
+		_ = db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), parsed.Header.Get(hdrName))
+	}
 
 	// Fast path for a message already in the store on a label backend (the
 	// common case of a legacy->engine migration re-ingesting the whole mailbox):
@@ -240,8 +244,11 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	}
 
 	// Store selected headers for new or fully processed messages. Empty values
-	// are omitted except for the Reply-To marker written above.
+	// are omitted except for the required markers written above.
 	for _, hdrName := range opts.headerSet() {
+		if strings.EqualFold(hdrName, "Reply-To") || strings.EqualFold(hdrName, "Content-Disposition") {
+			continue
+		}
 		if v := parsed.Header.Get(hdrName); v != "" {
 			_ = db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v)
 		}

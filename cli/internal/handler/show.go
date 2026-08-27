@@ -70,32 +70,42 @@ func (h *Handler) ShowMessageBody(messageID string) protocol.Response {
 	})
 }
 
-// convertThread converts store messages into ThreadContent format, sorted
+// convertThread converts store messages into ThreadContent and batch-loads
+// the indexed headers needed for reaction metadata.
+func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bool, tagMap map[int64][]string, attMap map[int64][]store.Attachment) *internmail.ThreadContent {
+	headerMap, _ := h.store.HeadersByMessageDBIDs(threadMessageRowIDs(msgs))
+	return h.convertThreadWithHeaders(threadID, msgs, light, tagMap, attMap, headerMap)
+}
+
+// convertThreadWithHeaders converts store messages into ThreadContent, sorted
 // newest-first. When light=true, HTML and reply headers (InReplyTo,
 // References) are omitted — used by search enrichment to keep response
 // size small; the full thread is loaded on demand via /threads/{id}.
 //
-// When tagMap/attMap are provided, tags and attachments are looked up from
-// the pre-fetched maps instead of querying per message (batch optimization).
-func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bool, tagMap map[int64][]string, attMap map[int64][]store.Attachment) *internmail.ThreadContent {
+// The maps are pre-fetched across enriched search results to avoid per-message
+// queries. A full thread request uses convertThread to fetch its headers once.
+func (h *Handler) convertThreadWithHeaders(threadID string, msgs []*store.Message, light bool, tagMap map[int64][]string, attMap map[int64][]store.Attachment, headerMap map[int64]map[string][]string) *internmail.ThreadContent {
 	messages := make([]internmail.MessageInfo, 0, len(msgs))
 	var subject string
 
 	for _, msg := range msgs {
+		isReaction, replyToIndexed := reactionHeaderMetadata(msg, headerMap)
 		accounts := msg.Accounts
 		if len(accounts) == 0 && msg.Account != "" {
 			accounts = []string{msg.Account}
 		}
 		info := internmail.MessageInfo{
-			ID:        msg.MessageID,
-			Accounts:  accounts,
-			From:      msg.FromAddr,
-			To:        msg.ToAddrs,
-			CC:        msg.CCAddrs,
-			Date:      time.Unix(msg.Date, 0).Format(time.RFC1123Z),
-			Timestamp: msg.Date,
-			MessageID: msg.MessageID,
-			Body:      sanitize.StripQuotedTextContent(msg.BodyText),
+			ID:             msg.MessageID,
+			Accounts:       accounts,
+			IsReaction:     isReaction,
+			ReplyToIndexed: replyToIndexed,
+			From:           msg.FromAddr,
+			To:             msg.ToAddrs,
+			CC:             msg.CCAddrs,
+			Date:           time.Unix(msg.Date, 0).Format(time.RFC1123Z),
+			Timestamp:      msg.Date,
+			MessageID:      msg.MessageID,
+			Body:           sanitize.StripQuotedTextContent(msg.BodyText),
 		}
 		if len(accounts) == 1 {
 			info.Account = accounts[0]
@@ -104,9 +114,6 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 			info.InReplyTo = msg.InReplyTo
 			info.References = msg.Refs
 			info.HTML = sanitize.StripQuotedContent(msg.BodyHTML)
-			if disposition, err := h.store.GetHeader(msg.ID, "content-disposition"); err == nil {
-				info.IsReaction = strings.EqualFold(strings.TrimSpace(disposition), "reaction")
-			}
 		}
 
 		if subject == "" {
@@ -198,6 +205,43 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 		Subject:  subject,
 		Messages: messages,
 	}
+}
+
+func threadMessageRowIDs(msgs []*store.Message) []int64 {
+	var ids []int64
+	for _, msg := range msgs {
+		if len(msg.AccountRowIDs) > 0 {
+			ids = append(ids, msg.AccountRowIDs...)
+		} else {
+			ids = append(ids, msg.ID)
+		}
+	}
+	return ids
+}
+
+func reactionHeaderMetadata(msg *store.Message, headerMap map[int64]map[string][]string) (isReaction, replyToIndexed bool) {
+	ids := msg.AccountRowIDs
+	if len(ids) == 0 {
+		ids = []int64{msg.ID}
+	}
+	replyToIndexed = len(ids) > 0
+	for _, id := range ids {
+		headers := headerMap[id]
+		if _, ok := headers["Reply-To"]; !ok {
+			replyToIndexed = false
+		}
+		for _, disposition := range headers["Content-Disposition"] {
+			disposition = strings.TrimSpace(disposition)
+			if separator := strings.IndexByte(disposition, ';'); separator >= 0 {
+				disposition = disposition[:separator]
+			}
+			if strings.EqualFold(strings.TrimSpace(disposition), "reaction") {
+				isReaction = true
+				break
+			}
+		}
+	}
+	return isReaction, replyToIndexed
 }
 
 // DownloadAttachment streams a raw attachment part, setting Content-Type and
