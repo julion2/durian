@@ -39,15 +39,32 @@ var rootCmd = &cobra.Command{
 	Short: "Durian Mail CLI",
 	Long:  `Durian is a macOS email client. CLI backend for provider mail sync, sending, and SQLite storage.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		if cmd == validateCmd {
-			return nil
+		if cmd != validateCmd && configErr != nil {
+			return configErr
 		}
-		return configErr
+		if jsonOutput && !commandSupportsJSON(cmd) {
+			return fmt.Errorf("--json is not supported by %q", cmd.CommandPath())
+		}
+		return nil
 	},
 	// Show help when called without subcommands
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()
 	},
+}
+
+func commandSupportsJSON(cmd *cobra.Command) bool {
+	switch cmd.CommandPath() {
+	case "durian search", "durian count", "durian show", "durian attachment", "durian tag", "durian tag list",
+		"durian sync", "durian auth status", "durian contacts init", "durian contacts import",
+		"durian contacts list", "durian contacts search", "durian contacts add", "durian contacts delete",
+		"durian group list", "durian group members", "durian draft save", "durian draft delete",
+		"durian calendar list", "durian calendar search", "durian calendar show", "durian calendar new",
+		"durian calendar modify", "durian calendar rsvp", "durian calendar delete":
+		return true
+	default:
+		return false
+	}
 }
 
 // Execute runs the root command
