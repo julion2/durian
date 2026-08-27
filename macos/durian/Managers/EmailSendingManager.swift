@@ -237,12 +237,17 @@ class EmailSendingManager: ObservableObject {
                     guard !Task.isCancelled else { return }
                 }
             }
-            if let items = await backend.listOutboxIfAvailable(),
-               Self.isReactionTerminal(itemId: itemId, outbox: items)
-            {
-                self?.finishReaction(itemId: itemId)
-            } else {
-                self?.reactionMonitors.removeValue(forKey: itemId)
+            // Offline sends remain queued with attempts == 0. Keep reconciling
+            // from the server, but back off after the initial five-minute window.
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 300_000_000_000)
+                guard !Task.isCancelled else { return }
+                if let items = await backend.listOutboxIfAvailable(),
+                   Self.isReactionTerminal(itemId: itemId, outbox: items)
+                {
+                    self?.finishReaction(itemId: itemId)
+                    return
+                }
             }
         }
     }

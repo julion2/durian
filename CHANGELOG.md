@@ -4,6 +4,16 @@ All notable changes to Durian are documented here. Format follows [Keep a Change
 
 The release body on GitHub Releases mirrors the corresponding section of this file.
 
+## [Unreleased]
+
+### Added
+
+- One-click RFC 9078 emoji replies with account-scoped recipient resolution and Undo Send.
+
+### Migration
+
+- The first IMAP sync after upgrading performs a one-time header-only backfill for messages missing reaction-routing markers. Large mailboxes may make this first sync noticeably longer; subsequent syncs skip completed account/mailbox pairs.
+
 ## [v0.4.0] - 2026-06-02
 
 The headline of this release is **at-rest encryption** of the local SQLite store. Mail bodies, subjects, headers, addresses, drafts, attachment metadata, and contact entries are now AES-256-GCM encrypted in `email.db` and `contacts.db`, with the master key in your OS keychain. Full-text search continues to work against a blind-token FTS5 index — no plaintext leaves the encryption layer. See the new [Encryption at rest](https://julion2.github.io/durian/docs/cli/encryption-at-rest/) walkthrough and [ADR-0001](https://julion2.github.io/durian/docs/developers/design/0001-mail-content-encryption-at-rest/).

@@ -630,7 +630,9 @@ struct ThreadMessageCardView: View {
 
     private var reactionHelp: String {
         if reactionPending { return "Reaction pending" }
-        if !message.replyToIndexed { return "Backfill message headers before reacting" }
+        if message.reactionAccounts.isEmpty, !message.replyToIndexed {
+            return "Backfill message headers before reacting"
+        }
         return "React with emoji"
     }
 

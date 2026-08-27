@@ -1094,6 +1094,9 @@ func (d *DB) migrate() error {
 		if _, err := d.db.Exec("DROP INDEX IF EXISTS idx_outbox_dedupe_key"); err != nil {
 			return fmt.Errorf("migrate v26→v27 drop outbox dedupe index: %w", err)
 		}
+		// The key is unique only while the worker can dequeue the row. A future
+		// retry feature must not reset attempts below 5 while another active row
+		// has the same key; clear or reconcile the newer row first.
 		if _, err := d.db.Exec("CREATE UNIQUE INDEX idx_outbox_dedupe_key ON outbox(dedupe_key) WHERE dedupe_key IS NOT NULL AND attempts < 5"); err != nil {
 			return fmt.Errorf("migrate v26→v27 create active outbox dedupe index: %w", err)
 		}
