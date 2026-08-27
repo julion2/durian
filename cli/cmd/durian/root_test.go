@@ -29,6 +29,15 @@ func TestConceptualHelpTopicsAreDiscoverable(t *testing.T) {
 	}
 }
 
+func TestJSONSupportIsExplicit(t *testing.T) {
+	if !commandSupportsJSON(searchCmd) || !commandSupportsJSON(calendarNewCmd) {
+		t.Fatal("JSON command reported unsupported")
+	}
+	if commandSupportsJSON(sendCmd) || commandSupportsJSON(validateCmd) {
+		t.Fatal("text-only command reported JSON support")
+	}
+}
+
 func TestLoadStartupConfigRejectsMissingExplicitPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.pkl")
 	loaded, err := loadStartupConfig(path)
