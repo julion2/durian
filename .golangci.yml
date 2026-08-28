@@ -2,13 +2,20 @@
 # handled by the gofmt CI gate in test.yml, so we don't duplicate them
 # here. The enabled set is the proven-useful subset for catching real
 # bugs in a small Go codebase.
+#
+# Schema version 2. The linter is pinned to a matching release in
+# test.yml; v2 refuses to parse a config without this key, so the pin and
+# this file move together.
+version: "2"
 
 run:
-  timeout: 3m
+  # The cli module is the only Go module with production code. sync/ is
+  # Bazel-only (no go.mod) and docs/ carries tooling deps but no sources,
+  # so neither is reachable from a package pattern here.
   go: "1.25"
 
 linters:
-  disable-all: true
+  default: none
   enable:
     - govet         # reports suspicious constructs (printf-style, shadowing, atomic alignment)
     - ineffassign   # detects ineffectual assignments — common copy-paste error
@@ -16,20 +23,29 @@ linters:
     - staticcheck   # broad set of correctness checks (dead branches, stdlib misuse)
     - unused        # dead code at function/type/var/const granularity
 
-linters-settings:
-  errcheck:
-    # Functions whose error is conventionally ignored or whose failure
-    # is intentionally non-fatal in this codebase.
-    exclude-functions:
-      - (io.Closer).Close
-      - (*database/sql.Rows).Close
-      - (*database/sql.Stmt).Close
-      - fmt.Fprintf
-      - fmt.Fprintln
-      - fmt.Fprint
-      - os.Unsetenv
+  settings:
+    errcheck:
+      # Functions whose error is conventionally ignored or whose failure
+      # is intentionally non-fatal in this codebase.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*database/sql.Rows).Close
+        - (*database/sql.Stmt).Close
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Fprint
+        - os.Unsetenv
 
-issues:
-  exclude-dirs:
-    - bazel-*
-    - .build
+  exclusions:
+    generated: lax
+    # The stock exclusion presets. These were on by default under the v1
+    # schema (exclude-use-default), so listing them keeps the enforced set
+    # identical to what the config described before the v2 migration.
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - bazel-*
+      - .build
