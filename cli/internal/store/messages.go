@@ -510,35 +510,31 @@ func (d *DB) BackfillUID(messageID, account string, uid uint32, mailbox string) 
 // rows require an opaque identifier when the header is ambiguous; silently
 // selecting one would defeat their provider-native identity.
 func (d *DB) GetByMessageID(messageID string) (*Message, error) {
+	// Ambiguity is a property of the stored rows, not of their identity kind.
+	// Counting only stable rows would return the single stable match while an
+	// IMAP fallback row carrying the same RFC Message-ID sits beside it — the
+	// caller asked for that row and would silently receive the other object's
+	// body and attachments. A Message-ID lookup may only succeed when it
+	// identifies exactly one stored row.
 	rows, err := d.db.Query(`SELECT `+messageSelectColumns+`
 		`+messageSelectFrom+`
-		WHERE m.message_id = ? AND m.stable_id != '' ORDER BY m.id LIMIT 2`, messageID)
+		WHERE m.message_id = ? ORDER BY m.id LIMIT 2`, messageID)
 	if err != nil {
-		return nil, fmt.Errorf("query stable rows by message_id: %w", err)
+		return nil, fmt.Errorf("query rows by message_id: %w", err)
 	}
-	stable, err := d.scanMessages(rows)
+	matches, err := d.scanMessages(rows)
 	rows.Close()
 	if err != nil {
 		return nil, err
 	}
-	if len(stable) > 1 {
+	switch len(matches) {
+	case 0:
+		return nil, nil
+	case 1:
+		return matches[0], nil
+	default:
 		return nil, fmt.Errorf("message-ID %q is ambiguous; use the opaque message identifier", messageID)
 	}
-	if len(stable) == 1 {
-		return stable[0], nil
-	}
-
-	row := d.db.QueryRow(`SELECT `+messageSelectColumns+`
-		`+messageSelectFrom+`
-		WHERE m.message_id = ? AND m.stable_id = '' LIMIT 1`, messageID)
-	msg, err := d.scanMessageRow(row.Scan)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get by message_id: %w", err)
-	}
-	return msg, nil
 }
 
 // GetByDBID retrieves one message by Durian's local row identity.

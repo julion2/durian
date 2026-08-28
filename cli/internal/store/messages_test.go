@@ -1069,10 +1069,11 @@ func TestUpsert_CrossAccount(t *testing.T) {
 		t.Errorf("got %d rows, want 2 (one per account)", count)
 	}
 
-	// GetByMessageID returns one (LIMIT 1)
-	msg, _ := db.GetByMessageID("cross@x")
-	if msg == nil {
-		t.Fatal("GetByMessageID returned nil")
+	// Two accounts hold this Message-ID and the lookup takes no account, so it
+	// cannot name one of them. Returning either — as it used to, with LIMIT 1 —
+	// hands the caller a row it did not ask for.
+	if _, err := db.GetByMessageID("cross@x"); err == nil {
+		t.Error("GetByMessageID picked one of two accounts instead of reporting ambiguity")
 	}
 }
 
@@ -1081,19 +1082,25 @@ func TestGetByThread_Dedup(t *testing.T) {
 	now := time.Now().Unix()
 
 	// Same message in two accounts → same thread
-	db.InsertMessage(&Message{
+	work := &Message{
 		MessageID: "td-root@x", Subject: "Thread dedup",
 		FromAddr: "a@x", Date: now, CreatedAt: now, FetchedBody: true,
 		Account: "work",
-	})
-	db.InsertMessage(&Message{
+	}
+	if err := db.InsertMessage(work); err != nil {
+		t.Fatalf("insert work: %v", err)
+	}
+	if err := db.InsertMessage(&Message{
 		MessageID: "td-root@x", Subject: "Thread dedup",
 		FromAddr: "a@x", Date: now, CreatedAt: now, FetchedBody: true,
 		Account: "personal",
-	})
+	}); err != nil {
+		t.Fatalf("insert personal: %v", err)
+	}
 
-	root, _ := db.GetByMessageID("td-root@x")
-	msgs, err := db.GetByThread(root.ThreadID)
+	// Read the thread id off the insert: a Message-ID shared by two accounts is
+	// ambiguous by design, and this test is about the thread, not the lookup.
+	msgs, err := db.GetByThread(work.ThreadID)
 	if err != nil {
 		t.Fatalf("get by thread: %v", err)
 	}
@@ -1150,6 +1157,61 @@ func TestDeleteByMessageIDAndAccount(t *testing.T) {
 	db.db.QueryRow("SELECT COUNT(*) FROM messages WHERE message_id = ?", "del-acct@x").Scan(&count)
 	if count != 1 {
 		t.Errorf("got %d rows after delete, want 1", count)
+	}
+}
+
+// TestMixedStableAndFallbackIdentityIsAmbiguous covers the store that a real
+// multi-account setup produces: a JMAP object carrying a stable id beside an
+// IMAP row that has none, both holding the same RFC Message-ID.
+//
+// Ambiguity here is a property of the stored rows, not of their identity kind.
+// Resolving to the single stable row would hand the caller the wrong object's
+// body and attachments whenever it meant the IMAP one — and the IMAP row would
+// have no working Message-ID lookup at all. Both must stay reachable by their
+// row id, and the raw lookup must refuse to guess.
+func TestMixedStableAndFallbackIdentityIsAmbiguous(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+
+	stable := &Message{
+		StableID: "jmap-obj", MessageID: "mixed@example.com", Subject: "From JMAP",
+		Date: now, CreatedAt: now, Mailbox: "ALL", Account: "work",
+		RemoteRef: "jmap-obj", FetchedBody: true, BodyText: "jmap body",
+	}
+	fallback := &Message{
+		MessageID: "mixed@example.com", Subject: "From IMAP",
+		Date: now + 1, CreatedAt: now + 1, Mailbox: "INBOX", Account: "personal",
+		RemoteRef: "42", FetchedBody: true, BodyText: "imap body",
+	}
+	if err := db.InsertMessage(stable); err != nil {
+		t.Fatalf("insert stable: %v", err)
+	}
+	if err := db.InsertMessage(fallback); err != nil {
+		t.Fatalf("insert fallback: %v", err)
+	}
+	if stable.ID == fallback.ID {
+		t.Fatalf("both identities collapsed to row %d", stable.ID)
+	}
+
+	if _, err := db.GetByMessageID("mixed@example.com"); err == nil {
+		t.Error("raw Message-ID lookup resolved a shared id instead of reporting ambiguity")
+	}
+
+	// Each row still has to be reachable by its own identity, or the ambiguity
+	// guard would just have made the messages unopenable.
+	gotStable, err := db.GetByDBID(stable.ID)
+	if err != nil || gotStable == nil {
+		t.Fatalf("get stable row: %+v err=%v", gotStable, err)
+	}
+	if gotStable.BodyText != "jmap body" {
+		t.Errorf("stable row body = %q, want the JMAP object's", gotStable.BodyText)
+	}
+	gotFallback, err := db.GetByDBID(fallback.ID)
+	if err != nil || gotFallback == nil {
+		t.Fatalf("get fallback row: %+v err=%v", gotFallback, err)
+	}
+	if gotFallback.BodyText != "imap body" {
+		t.Errorf("fallback row body = %q, want the IMAP row's", gotFallback.BodyText)
 	}
 }
 
