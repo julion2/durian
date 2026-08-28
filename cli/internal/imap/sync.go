@@ -107,6 +107,10 @@ type Syncer struct {
 	ownsClient      bool                  // true = syncer manages connection lifecycle
 	store           *store.DB             // SQLite store for messages and tags
 	parser          *durianmail.Parser    // Email parser for store writes
+	// flagTransportOverride substitutes the IMAP calls the flag pass makes.
+	// Nil in production; set by tests that exercise the reconciliation
+	// decisions, which is where this pass has historically gone wrong.
+	flagTransportOverride flagTransport
 }
 
 // NewSyncer creates a new syncer for an account

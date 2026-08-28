@@ -1022,7 +1022,7 @@ func (e *Engine) reconcileFlagRows(
 		// (Seen/Flagged/Answered/Deleted), never the server-only $Completed
 		// keyword — same as the legacy upload path.
 		// Which halves of target actually reached their side. The baseline may
-		// only record what one of these carried out — see advanceBaseline.
+		// only record what one of these carried out — see imap.AdvanceBaseline.
 		var pushed, pulled bool
 
 		if upload && imap.NeedsUpload(local, baseline) {
@@ -1095,7 +1095,7 @@ func (e *Engine) reconcileFlagRows(
 		// next run would read the local absence as the user removing it and
 		// delete it from the provider.
 		if pushed || pulled {
-			next := advanceBaseline(baseline, local, serverState, target, pushed, pulled)
+			next := imap.AdvanceBaseline(baseline, local, serverState, target, pushed, pulled)
 			if !next.Equal(baseline) {
 				if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, joinFlags(next)); err != nil {
 					result.Errors = append(result.Errors, fmt.Errorf("flag baseline for %s: %w", row.MessageID, err))
@@ -1105,43 +1105,6 @@ func (e *Engine) reconcileFlagRows(
 		}
 	}
 	return uploaded, downloaded, failed
-}
-
-// advanceBaseline records the resolved state for the flags this run actually
-// settled, and leaves the rest at the old before-image.
-//
-// A baseline field is a claim that both sides agreed on that value at some
-// point. Advancing one whose change only travelled in a direction the run did
-// not take turns that claim into a lie, and the lie is consumed as a user
-// action next time: the local side is missing a flag the baseline says was
-// reconciled, so the next upload removes it from the provider. UploadOnly is
-// the live case — the watcher uses it after a local tag change.
-//
-// So each flag advances only via the direction that owns its change: pushed
-// carries the ones the local side moved, pulled the ones the server moved. A
-// flag both sides moved is carried by either, since ResolveFlags gives them the
-// same value. Deleted and Completed are server-owned and only ever pulled.
-func advanceBaseline(baseline, local, server, target imap.FlagState, pushed, pulled bool) imap.FlagState {
-	next := baseline
-	advance := func(field func(imap.FlagState) bool, set func(*imap.FlagState, bool)) {
-		if pushed && field(local) != field(baseline) {
-			set(&next, field(target))
-		}
-		if pulled && field(server) != field(baseline) {
-			set(&next, field(target))
-		}
-	}
-	advance(func(f imap.FlagState) bool { return f.Seen },
-		func(f *imap.FlagState, v bool) { f.Seen = v })
-	advance(func(f imap.FlagState) bool { return f.Flagged },
-		func(f *imap.FlagState, v bool) { f.Flagged = v })
-	advance(func(f imap.FlagState) bool { return f.Answered },
-		func(f *imap.FlagState, v bool) { f.Answered = v })
-	if pulled {
-		next.Deleted = target.Deleted
-		next.Completed = target.Completed
-	}
-	return next
 }
 
 // flagTagsOf narrows a row's tags to the ones a flag decision depends on, so a

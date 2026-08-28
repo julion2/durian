@@ -193,61 +193,6 @@ func TestFlagStateToTagOps(t *testing.T) {
 	}
 }
 
-func TestFlagStateMerge(t *testing.T) {
-	tests := []struct {
-		name     string
-		local    FlagState
-		server   FlagState
-		expected FlagState
-	}{
-		{
-			name:     "both empty",
-			local:    FlagState{},
-			server:   FlagState{},
-			expected: FlagState{},
-		},
-		{
-			name:     "local seen, server not",
-			local:    FlagState{Seen: true},
-			server:   FlagState{},
-			expected: FlagState{Seen: true},
-		},
-		{
-			name:     "server seen, local not",
-			local:    FlagState{},
-			server:   FlagState{Seen: true},
-			expected: FlagState{Seen: true},
-		},
-		{
-			name:     "merge flags from both",
-			local:    FlagState{Seen: true, Flagged: true},
-			server:   FlagState{Answered: true},
-			expected: FlagState{Seen: true, Flagged: true, Answered: true},
-		},
-		{
-			name:     "server wins for deleted",
-			local:    FlagState{Deleted: false},
-			server:   FlagState{Deleted: true},
-			expected: FlagState{Deleted: true},
-		},
-		{
-			name:     "local deleted ignored",
-			local:    FlagState{Deleted: true},
-			server:   FlagState{Deleted: false},
-			expected: FlagState{Deleted: false},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.local.Merge(tt.server)
-			if got != tt.expected {
-				t.Errorf("Merge() = %+v, want %+v", got, tt.expected)
-			}
-		})
-	}
-}
-
 func TestDiffFlags(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -325,10 +270,16 @@ func TestNeedsUpload(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "deleted changed - now synced",
+			// Deleted is server-owned. This local state is unreachable in
+			// production — FlagStateFromTags never sets Deleted, deliberately,
+			// because Durian's "deleted" means moved-to-trash while \Deleted
+			// means pending expunge. Treating a difference as a local change
+			// made every row with a \Deleted baseline a permanent upload
+			// candidate.
+			name:     "deleted never counts as a local change",
 			local:    FlagState{Deleted: true},
 			stored:   FlagState{Deleted: false},
-			expected: true, // Deleted changes are now uploaded for trash workflow
+			expected: false,
 		},
 		{
 			name:     "completed suppresses flagged upload",

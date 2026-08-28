@@ -9,6 +9,27 @@ import (
 	goimap "github.com/emersion/go-imap"
 )
 
+// flagTransport is the slice of the IMAP client the flag pass actually uses.
+// The pass reads server flags and writes flag deltas; everything else it does
+// is decision-making against the store and the state file. Naming that slice
+// lets those decisions be exercised without a live server — which matters here,
+// because the defects this reconciliation has had were all decisions, never
+// protocol.
+type flagTransport interface {
+	FetchFlags(uids []uint32) (map[uint32][]string, error)
+	AddFlags(uid uint32, flags []string) error
+	RemoveFlags(uid uint32, flags []string) error
+}
+
+// flags returns the transport the flag pass should use. Production always gets
+// the real client; tests substitute a scripted one.
+func (s *Syncer) flags() flagTransport {
+	if s.flagTransportOverride != nil {
+		return s.flagTransportOverride
+	}
+	return s.client
+}
+
 // getFolderTagMapping returns the tag mapping for a mailbox based on SPECIAL-USE attributes
 // Returns tags to add and remove when a mail is found in this folder
 // Used for both new downloads and deduplication (updating tags for existing mails)
@@ -117,7 +138,7 @@ func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs 
 	}
 
 	// 2. Fetch current flags from server for ALL UIDs
-	serverFlags, err := s.client.FetchFlags(allUIDs)
+	serverFlags, err := s.flags().FetchFlags(allUIDs)
 	if err != nil {
 		fmt.Fprintf(s.output, "    Warning: failed to fetch flags: %v\n", err)
 		return 0, 0, 0
@@ -166,66 +187,84 @@ func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs 
 		storedState, hasStoredState := mboxState.GetMessageFlags(uid)
 
 		if !hasStoredState {
-			// First sync for this message - server is authoritative (no baseline to detect local changes)
-			// Only download server flags to local; don't upload stale local state
-			if !s.options.DryRun {
-				mboxState.SetMessageFlags(uid, serverState)
+			// First sync for this message: no baseline exists, so a local
+			// difference cannot be told apart from a flag the user never set.
+			// The server is authoritative here — but the baseline may only
+			// record that once the local side actually holds it. Writing it up
+			// front, as this did, banked a reconciliation that had not happened:
+			// an UploadOnly run recorded server state it never applied locally,
+			// and the next run read the local absence as a user change and
+			// pushed it back.
+			if s.options.Mode == SyncUploadOnly && !localState.Equal(serverState) {
+				continue
 			}
-
-			if !localState.Equal(serverState) && s.options.Mode != SyncUploadOnly {
-				if err := s.downloadFlagChanges(messageID, localState, serverState); err != nil {
-					slog.Debug("Error downloading flags", "module", "SYNC", "uid", uid, "err", err) // encgrep:allow word "flags" in message text, no flag value logged
-					flagErrors++
-				} else {
+			applied, err := s.downloadFlagChanges(messageID, tags, localState, serverState)
+			switch {
+			case err != nil:
+				slog.Debug("Error downloading flags", "module", "SYNC", "uid", uid, "err", err) // encgrep:allow word "flags" in message text, no flag value logged
+				flagErrors++
+			case !applied:
+				// The tags moved under this run; leave the baseline unset so the
+				// next poll resolves against what the user actually did.
+				slog.Debug("First-sync flag write refused", "module", "SYNC", "uid", uid)
+			default:
+				if !localState.Equal(serverState) {
 					downloaded++
 					slog.Debug("First-sync downloaded flags", "module", "SYNC", "uid", uid, "message_id", messageID, "flags", serverState) // encgrep:allow flags value redacted at runtime by redact.SensitiveSlogKeys ("flags")
+				}
+				if !s.options.DryRun {
+					mboxState.SetMessageFlags(uid, serverState)
 				}
 			}
 			continue
 		}
 
-		// Check for local changes (local differs from stored)
+		// One resolved state for both directions, decided per flag against the
+		// baseline. Whichever side differs from it moved that flag; when both
+		// differ they moved a boolean to the same value, so there is nothing to
+		// arbitrate and no rule about who wins. Deleted and Completed stay
+		// server-owned because no tag can express them.
+		targetState := ResolveFlags(storedState, localState, serverState)
+
+		// Which halves actually reached their side. The baseline may only record
+		// what one of these carried out.
+		var pushed, pulled bool
+
 		if NeedsUpload(localState, storedState) && s.options.Mode != SyncDownloadOnly {
-			if err := s.uploadFlagChanges(uid, localState, serverState); err != nil {
+			if err := s.uploadFlagChanges(uid, targetState, serverState); err != nil {
 				slog.Debug("Error uploading flags", "module", "SYNC", "uid", uid, "err", err) // encgrep:allow word "flags" in message text, no flag value logged
 				flagErrors++
 			} else {
+				pushed = true
 				uploaded++
-				slog.Debug("Uploaded flags", "module", "SYNC", "uid", uid, "from", storedState, "to", localState) // encgrep:allow IMAP flag-state transition for sync debug; from/to here are state directions, not addresses
-				// Update stored state (skip in dry-run)
-				if !s.options.DryRun {
-					mboxState.SetMessageFlags(uid, localState)
-				}
+				slog.Debug("Uploaded flags", "module", "SYNC", "uid", uid, "from", storedState, "to", targetState) // encgrep:allow IMAP flag-state transition for sync debug; from/to here are state directions, not addresses
 			}
 		}
 
-		// Check for server changes (server differs from stored)
 		if NeedsDownload(serverState, storedState) && s.options.Mode != SyncUploadOnly {
-			// Check if local was also changed (conflict scenario)
-			localChanged := NeedsUpload(localState, storedState)
-
-			var targetState FlagState
-			if localChanged {
-				// Conflict: both local and server changed - merge (local wins)
-				targetState = localState.Merge(serverState)
-				slog.Debug("Flag conflict, merging", "module", "SYNC", "uid", uid)
-			} else {
-				// No local change - server wins (allows server to remove flags)
-				targetState = serverState
-			}
-
-			if !targetState.Equal(localState) {
-				if err := s.downloadFlagChanges(messageID, localState, targetState); err != nil {
-					slog.Debug("Error downloading flags", "module", "SYNC", "uid", uid, "err", err) // encgrep:allow word "flags" in message text, no flag value logged
-					flagErrors++
-				} else {
+			applied, err := s.downloadFlagChanges(messageID, tags, localState, targetState)
+			switch {
+			case err != nil:
+				slog.Debug("Error downloading flags", "module", "SYNC", "uid", uid, "err", err) // encgrep:allow word "flags" in message text, no flag value logged
+				flagErrors++
+			case !applied:
+				slog.Debug("Flag write refused, local state moved", "module", "SYNC", "uid", uid)
+			default:
+				pulled = true
+				if !targetState.Equal(localState) {
 					downloaded++
 					slog.Debug("Downloaded flags", "module", "SYNC", "uid", uid, "from", localState, "to", targetState) // encgrep:allow IMAP flag-state transition for sync debug; from/to here are state directions, not addresses
 				}
 			}
-			// Update stored state (skip in dry-run)
-			if !s.options.DryRun {
-				mboxState.SetMessageFlags(uid, targetState)
+		}
+
+		// A refused download does not cancel a successful upload: the pushed
+		// fields reached the server and must advance, only the pulled half
+		// waits for the next poll.
+		if (pushed || pulled) && !s.options.DryRun {
+			next := AdvanceBaseline(storedState, localState, serverState, targetState, pushed, pulled)
+			if !next.Equal(storedState) {
+				mboxState.SetMessageFlags(uid, next)
 			}
 		}
 	}
@@ -501,86 +540,74 @@ func (s *Syncer) uploadFolderMoves(mboxState *MailboxState, localMessages map[st
 	return moved
 }
 
-// uploadFlagChanges uploads flag changes to the IMAP server
-// For deleted messages: copies to Trash, sets \Deleted flag, and expunges
-func (s *Syncer) uploadFlagChanges(uid uint32, local, server FlagState) error {
-	// Check if this is a delete operation (deleted locally but not on server)
-	isDelete := local.Deleted && !server.Deleted
-
-	if isDelete {
-		// Find and cache trash mailbox
-		if s.trashMailbox == "" {
-			trash, err := s.client.FindTrashMailbox()
-			if err != nil {
-				slog.Debug("Could not find trash mailbox", "module", "SYNC", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-				// Continue without copy - just set flag
-			} else {
-				s.trashMailbox = trash
-				slog.Debug("Found trash mailbox", "module", "SYNC", "mailbox", trash) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-			}
-		}
-
-		if s.options.DryRun {
-			if s.trashMailbox != "" {
-				slog.Debug("[dry-run] Would copy to trash, set \\Deleted, and expunge", "module", "SYNC", "uid", uid, "trash", s.trashMailbox) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-			} else {
-				slog.Debug("[dry-run] Would set \\Deleted and expunge (no trash mailbox)", "module", "SYNC", "uid", uid) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-			}
-			return nil
-		}
-
-		// Copy to trash first (if trash mailbox found)
-		if s.trashMailbox != "" {
-			if err := s.client.CopyToMailbox(uid, s.trashMailbox); err != nil {
-				slog.Debug("Copy to trash failed", "module", "SYNC", "uid", uid, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-				return fmt.Errorf("copy to trash failed for UID %d: %w", uid, err)
-			}
-			slog.Debug("Copied to trash", "module", "SYNC", "uid", uid, "trash", s.trashMailbox) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-		}
-
-		// Set \Deleted flag (use AddFlags to preserve server-only keywords like $Completed)
-		if err := s.client.AddFlags(uid, []string{goimap.DeletedFlag}); err != nil {
-			return err
-		}
-
-		// Expunge to permanently remove from current mailbox
-		if err := s.client.Expunge(); err != nil {
-			slog.Debug("Expunge failed", "module", "SYNC", "err", err)
-		}
-
+// uploadFlagChanges moves the server to the resolved state.
+//
+// It used to carry a delete path here — copy to trash, set \Deleted, expunge —
+// gated on local.Deleted && !server.Deleted. That gate can never open:
+// FlagStateFromTags never sets Deleted, deliberately, because Durian's
+// "deleted" tag means moved-to-trash while \Deleted means pending expunge. The
+// branch was unreachable, and an unreachable expunge is not something to leave
+// standing. Deletes travel through uploadFolderMoves, which copies to the trash
+// mailbox explicitly.
+func (s *Syncer) uploadFlagChanges(uid uint32, target, server FlagState) error {
+	// Use AddFlags/RemoveFlags rather than a full store, to preserve
+	// server-only keywords like $Completed that ToIMAPFlags() doesn't include.
+	toAdd, toRemove := DiffFlags(target, server)
+	if len(toAdd) == 0 && len(toRemove) == 0 {
+		// NeedsUpload can fire with nothing to send. Skipping the call matters
+		// here: this client reconnects and re-selects the mailbox for it.
 		return nil
 	}
-
-	// Regular flag update — use AddFlags/RemoveFlags to preserve server-only
-	// keywords like $Completed that ToIMAPFlags() doesn't include
-	toAdd, toRemove := DiffFlags(local, server)
 
 	if s.options.DryRun {
 		slog.Debug("[dry-run] Would upload flags", "module", "SYNC", "uid", uid, "add", toAdd, "remove", toRemove) // encgrep:allow word "flags" in message text, no flag value logged
 		return nil
 	}
 
-	if err := s.client.AddFlags(uid, toAdd); err != nil {
+	if err := s.flags().AddFlags(uid, toAdd); err != nil {
 		return err
 	}
-	return s.client.RemoveFlags(uid, toRemove)
+	return s.flags().RemoveFlags(uid, toRemove)
 }
 
-// downloadFlagChanges downloads flag changes to store
-func (s *Syncer) downloadFlagChanges(messageID string, current, target FlagState) error {
+// downloadFlagChanges writes the resolved state to the message's tags, but only
+// while the tags the decision was read from still hold. snapshotTags is what
+// this run read before talking to the server; a change landing in that window
+// is invisible to the merge, and ToTagOps writes absolutely, so an unguarded
+// write would revert it and the baseline advanced afterwards would agree with
+// the reverted tags — leaving nothing for a later run to detect.
+//
+// Reports whether the write happened. A refusal is not an error: the caller
+// leaves the pulled half of its baseline alone and the next poll reconciles
+// against fresh state.
+func (s *Syncer) downloadFlagChanges(messageID string, snapshotTags []string, current, target FlagState) (bool, error) {
 	if current.Equal(target) {
-		return nil
+		return true, nil
 	}
 
 	addTags, removeTags := target.ToTagOps()
 
 	if s.options.DryRun {
 		slog.Debug("[dry-run] Would update tags", "module", "SYNC", "message_id", messageID, "add", addTags, "remove", removeTags)
-		return nil
+		return true, nil
 	}
 
-	if err := s.store.ModifyTagsByMessageIDAndAccount(messageID, s.accountName(), addTags, removeTags); err != nil {
-		return fmt.Errorf("store flag tag write: %w", err)
+	applied, err := s.store.ModifyFlagTagsIfUnchanged(messageID, s.accountName(),
+		FlagTagVocabulary(), flagTagsOf(snapshotTags), addTags, removeTags)
+	if err != nil {
+		return false, fmt.Errorf("store flag tag write: %w", err)
 	}
-	return nil
+	return applied, nil
+}
+
+// flagTagsOf narrows a message's tags to the ones a flag decision depends on,
+// so an unrelated tag arriving mid-sync does not read as a conflict.
+func flagTagsOf(tags []string) []string {
+	var out []string
+	for _, tag := range tags {
+		if slices.Contains(FlagTagVocabulary(), tag) {
+			out = append(out, tag)
+		}
+	}
+	return out
 }
