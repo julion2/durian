@@ -152,10 +152,14 @@ func (e *contractEnv) sync() {
 // hiding it would make the delta profiles pass for the wrong reason.
 func (e *contractEnv) redeliver(serverFlags backend.Flags, labels []string) {
 	e.t.Helper()
-	// The fake indexes its script by call count, so a new page has to be
-	// appended; replacing the slice would leave the index past the end and the
-	// folder would report itself unchanged.
-	e.fake.scripts[e.folder.Name] = append(e.fake.scripts[e.folder.Name], backend.FetchResult{
+	// The fake indexes its script by call count. A sync that ran past the end
+	// of the script still advanced that counter, so appending alone can file
+	// this page behind the index, where no call will ever reach it — and a
+	// delta profile then sees no change while a polling one still finds the row
+	// on its own. Point the counter at the new page.
+	script := e.fake.scripts[e.folder.Name]
+	e.fake.calls[e.folder.Name] = len(script)
+	e.fake.scripts[e.folder.Name] = append(script, backend.FetchResult{
 		Messages: []backend.Message{{
 			MessageID: contractMsgID,
 			Ref:       e.ref,
@@ -329,15 +333,14 @@ func TestContractServerSetsFlagged(t *testing.T) {
 			if !slices.Contains(splitFlags(got.Baseline), "\\Flagged") {
 				t.Errorf("baseline = %q, want to record \\Flagged", got.Baseline)
 			}
-			// A server-side change must not travel back as a local one. The
-			// engine may still issue an ApplyFlags whose add and remove are both
-			// empty: on a folder profile the redelivered page writes the new flag
-			// tags at ingest, so the flag pass reads the row as locally changed
-			// against a baseline that predates the page, and computes an empty
-			// diff against the server. Harmless on the wire, but a wasted round
-			// trip; the contract here is only that nothing effective is pushed.
-			if n := effectiveUploads(got.Uploaded); n != 0 {
-				t.Errorf("uploaded %+v, want no effective upload for a server-side change", got.Uploaded)
+			// A server-side change must not travel back as a local one, and must
+			// not cost a round trip either. A folder profile reads the row as
+			// locally changed here — the redelivered page wrote the new flag
+			// tags at ingest, against a baseline that predates it — but the diff
+			// against the server is empty, so the call is skipped rather than
+			// sent empty.
+			if len(got.Uploaded) != 0 {
+				t.Errorf("uploaded %+v, want no ApplyFlags at all for a server-side change", got.Uploaded)
 			}
 		})
 	}
@@ -548,6 +551,13 @@ func TestContractServerClearsSeen(t *testing.T) {
 // that this scenario has one applicable column.
 var deliversServerDeleted = map[string]bool{"imap": true}
 
+// deliversCompleted names the profiles whose adapter can report $Completed.
+// IMAP carries the keyword, Graph maps flagStatus "complete" onto it and JMAP
+// reads $completed from its keywords. Gmail has no equivalent and never sets
+// the field, so a Gmail cell here would assert an engine response to a state
+// that adapter cannot produce.
+var deliversCompleted = map[string]bool{"imap": true, "graph": true, "jmap": true}
+
 // TestContractServerSetsDeleted records what the engine actually does with a
 // server-side \Deleted, which is deliberately asymmetric: ToTagOps never maps
 // \Deleted to a tag (locally "deleted" means moved-to-trash; \Deleted means
@@ -555,15 +565,13 @@ var deliversServerDeleted = map[string]bool{"imap": true}
 // merge is server-wins for Deleted. So NO tag appears — the download's only
 // visible effect is the baseline recording \Deleted alongside \Seen.
 //
-// The second sync then shows the flip side of that asymmetry: local tags can
-// never express Deleted (FlagStateFromTags leaves it false), so the row now
-// reads as locally changed against its \Deleted baseline, and DiffFlags — which
-// syncs Deleted bidirectionally — pushes a \Deleted REMOVAL back to the
-// provider, after which the baseline drops the flag again. The engine un-marks
-// a pending expunge another client set and it merely witnessed.
-//
-// This asserts what ships today, not what should. The bug is issue #399; the
-// assertion exists so a fix has to update it rather than flip a green cell.
+// The second sync is where that asymmetry used to bite (issue #399). Local tags
+// can never express Deleted, so the row read as locally changed against its
+// \Deleted baseline and the engine pushed a removal back — un-marking a pending
+// expunge another client had set and it had only witnessed. Resolving each flag
+// against the baseline keeps Deleted server-owned precisely because a local
+// false is an absent representation rather than a decision, so nothing is
+// pushed and the baseline keeps the flag.
 //
 // IMAP only, and not because the other profiles are exempt from the merge —
 // they cannot produce the input. Graph reports deletions as @removed delta
@@ -601,17 +609,21 @@ func TestContractServerSetsDeleted(t *testing.T) {
 			env.sync()
 			got = env.observe()
 
-			var removedDeleted bool
-			for _, call := range got.Uploaded {
-				if call.remove.Deleted {
-					removedDeleted = true
-				}
+			// Not merely "nothing effective": no call at all. NeedsUpload still
+			// counts Deleted, which no tag can express, so this row stays an
+			// upload candidate forever and every run would otherwise send an
+			// empty ApplyFlags. The IMAP adapter reconnects and re-selects the
+			// mailbox even for that, and can fail doing it — so the skipped call
+			// is part of the contract, and effectiveUploads would not see it.
+			if len(got.Uploaded) != 0 {
+				t.Errorf("uploaded %+v, want no ApplyFlags at all for a server-owned \\Deleted", got.Uploaded)
 			}
-			if !removedDeleted {
-				t.Errorf("uploaded %+v, want the next run to push a \\Deleted removal (tag-derived local state cannot express it)", got.Uploaded)
+			if !slices.Contains(splitFlags(got.Baseline), "\\Deleted") {
+				t.Errorf("baseline = %q, want \\Deleted kept: the server owns it", got.Baseline)
 			}
-			if slices.Contains(splitFlags(got.Baseline), "\\Deleted") {
-				t.Errorf("baseline = %q, want \\Deleted dropped again after the removal upload", got.Baseline)
+			if !env.fake.flagsByRef[env.ref.ID].Deleted {
+				t.Errorf("provider state = %+v, want the pending expunge left alone",
+					env.fake.flagsByRef[env.ref.ID])
 			}
 		})
 	}
@@ -629,6 +641,9 @@ func TestContractServerSetsDeleted(t *testing.T) {
 // the row out of candidacy entirely, so no flags are fetched at all.
 func TestContractCompletedMasksFlagged(t *testing.T) {
 	for _, p := range contractProfiles() {
+		if !deliversCompleted[p.name] {
+			continue
+		}
 		t.Run(p.name, func(t *testing.T) {
 			env := newContractEnv(t, p.caps, backend.Flags{Seen: true, Flagged: true})
 			env.resetCalls()
@@ -674,6 +689,41 @@ func TestContractCompletedMasksFlagged(t *testing.T) {
 			}
 			if slices.Contains(got.Tags, "flagged") {
 				t.Errorf("tags = %v, want \"flagged\" to stay absent", got.Tags)
+			}
+
+			// The follow-up is reopened: the server clears $Completed and the
+			// star it never dropped becomes visible again. The local side still
+			// reports Flagged=false, but only because the mask suppressed the
+			// tag — it is not the user unstarring, and resolving it as one would
+			// lose the star both here and, once the mask lifts, on the provider.
+			env.resetCalls()
+			env.serverSets(backend.Flags{Seen: true, Flagged: true})
+			env.sync()
+			got = env.observe()
+
+			if !slices.Contains(got.Tags, "flagged") {
+				t.Errorf("tags = %v, want the server-owned star restored once $Completed cleared", got.Tags)
+			}
+			if b := splitFlags(got.Baseline); !slices.Contains(b, "\\Flagged") || slices.Contains(b, "$Completed") {
+				t.Errorf("baseline = %q, want \\Flagged kept and $Completed dropped", got.Baseline)
+			}
+			for _, call := range got.Uploaded {
+				if call.remove.Flagged {
+					t.Errorf("uploaded %+v: read the masked local absence as a user unstar", got.Uploaded)
+				}
+			}
+
+			// And the run after that, with the mask no longer in the baseline,
+			// must not rediscover the absence as a change either.
+			env.resetCalls()
+			env.sync()
+			got = env.observe()
+			if n := effectiveUploads(got.Uploaded); n != 0 {
+				t.Errorf("uploaded %+v, want nothing once the star is back in sync", got.Uploaded)
+			}
+			if !env.fake.flagsByRef[env.ref.ID].Flagged {
+				t.Errorf("provider state = %+v, want the star left alone",
+					env.fake.flagsByRef[env.ref.ID])
 			}
 		})
 	}
@@ -803,9 +853,106 @@ func TestContractMissingLegacyBaseline(t *testing.T) {
 	}
 }
 
-// TestContractNoFlagsSkipsFlagPass: Options.NoFlags disables only the three-way
-// flag pass, not the sync. Ingest must still run — a fresh unread arrival still
-// gets its row, its topology tag and its flag-derived "unread" tag — while
+// TestContractConcurrentLocalMutation races a GUI mark-unread against a sync
+// that is downloading a server-side star: the mutation fires inside FetchFlags,
+// after the flag pass read its row snapshot and before it writes.
+//
+// One contract for all four profiles, because a user's action does not become
+// discardable depending on which provider they use. The mutation survives, and
+// the sync it raced leaves the baseline alone so the next run can merge it
+// against the server properly and upload it.
+//
+// The failure this guards against is silent. ToTagOps writes the merged state
+// absolutely, so a blind write reverts the mark-unread — and the baseline
+// written immediately after would then agree with the reverted tags, leaving
+// nothing for a later run to detect. The user's click disappears with no error
+// anywhere.
+func TestContractConcurrentLocalMutation(t *testing.T) {
+	for _, p := range contractProfiles() {
+		t.Run(p.name, func(t *testing.T) {
+			env := newContractEnv(t, p.caps, backend.Flags{Seen: true})
+			env.resetCalls()
+
+			env.serverSets(backend.Flags{Seen: true, Flagged: true})
+			env.fake.beforeFetchFlags = func() {
+				env.fake.beforeFetchFlags = nil
+				env.localTags([]string{"unread"}, nil)
+			}
+			env.sync()
+			got := env.observe()
+
+			if len(got.FetchedRefs) == 0 {
+				t.Fatal("flag pass fetched nothing; the mid-sync mutation never raced anything")
+			}
+			if !slices.Contains(got.Tags, "unread") {
+				t.Errorf("tags = %v, want the mid-sync \"unread\" preserved", got.Tags)
+			}
+			// The refused write has to leave a trace. Without the ref queued,
+			// this scenario would still pass on the strength of the local tag
+			// making the row an upload candidate again — the queue would be
+			// broken and nothing here would notice.
+			if !slices.Contains(got.Pending.Refs, env.ref.ID) {
+				t.Errorf("pending refs = %v, want %q queued after the refused write",
+					got.Pending.Refs, env.ref.ID)
+			}
+			if n := effectiveUploads(got.Uploaded); n != 0 {
+				t.Errorf("uploaded %+v, want nothing effective during the racing sync itself", got.Uploaded)
+			}
+
+			// The racing sync must not advance the baseline past the state it
+			// failed to apply. Leaving it at the pre-sync \Seen is what makes
+			// the preserved "unread" readable as a pending local change on the
+			// next run instead of as already-reconciled.
+			if !slices.Contains(splitFlags(got.Baseline), "\\Seen") {
+				t.Errorf("baseline = %q, want the pre-race \\Seen left untouched", got.Baseline)
+			}
+
+			// The deferred work has to actually happen: the next run sees the
+			// preserved mutation as a local change and pushes it.
+			env.resetCalls()
+			env.sync()
+			got = env.observe()
+
+			var removedSeen bool
+			for _, call := range got.Uploaded {
+				if call.remove.Seen {
+					removedSeen = true
+				}
+				// Nothing here touched the star. It changed on the server and
+				// nowhere else, so an upload that removes it is the engine
+				// deleting a change it was supposed to be receiving.
+				if call.remove.Flagged {
+					t.Errorf("uploaded %+v: removed the server's own \\Flagged", got.Uploaded)
+				}
+			}
+			if !removedSeen {
+				t.Errorf("uploaded %+v, want the next run to propagate the mark-unread", got.Uploaded)
+			}
+
+			// Both changes survive. Seen moved only locally and Flagged only on
+			// the server, so each field has exactly one claimant and there is
+			// nothing to arbitrate.
+			for _, tag := range []string{"unread", "flagged"} {
+				if !slices.Contains(got.Tags, tag) {
+					t.Errorf("tags = %v, want %q kept: it was changed on exactly one side", got.Tags, tag)
+				}
+			}
+			if b := splitFlags(got.Baseline); slices.Contains(b, "\\Seen") || !slices.Contains(b, "\\Flagged") {
+				t.Errorf("baseline = %q, want the resolved state (no \\Seen, \\Flagged)", got.Baseline)
+			}
+			if final := env.fake.flagsByRef[env.ref.ID]; final.Seen || !final.Flagged {
+				t.Errorf("provider state = %+v, want seen cleared and flagged kept", final)
+			}
+			if len(got.Pending.Refs) != 0 {
+				t.Errorf("pending refs = %v, want the queue drained once the retry succeeded", got.Pending.Refs)
+			}
+		})
+	}
+}
+
+// TestContractNoFlagsSkipsFlagPass: Options.NoFlags disables only the flag
+// pass, not the sync. Ingest must still run — a fresh unread arrival still gets
+// its row, its topology tag and its flag-derived "unread" tag — while
 // FetchFlags and ApplyFlags are never called on any profile. A NoFlags run that
 // still fetched flags would defeat the option's point (parity with the legacy
 // --no-flags escape hatch for providers with broken flag endpoints).
@@ -907,6 +1054,170 @@ func TestContractPartialFlagFetch(t *testing.T) {
 			}
 			if len(got.Pending.Refs) != 0 || got.Pending.FullScan {
 				t.Errorf("pending = %+v after the retry, want drained", got.Pending)
+			}
+		})
+	}
+}
+
+// TestContractUploadOnlyDoesNotBankUndownloadedServerFlags: the watcher's
+// upload-only pass pushes a local mark-unread while the server holds a star
+// this run is forbidden to download. The push itself is the easy half — the
+// contract under test is the baseline it leaves behind. A baseline field is a
+// claim that both sides agreed on that value, and an upload-only run never
+// wrote \Flagged locally, so a baseline that records it is a false claim. The
+// second sync is where the lie is consumed: the banked star makes the
+// locally-absent "flagged" read as the user un-starring, and the next
+// upload-only pass deletes from the provider a change it only ever witnessed.
+func TestContractUploadOnlyDoesNotBankUndownloadedServerFlags(t *testing.T) {
+	for _, p := range contractProfiles() {
+		t.Run(p.name, func(t *testing.T) {
+			env := newContractEnv(t, p.caps, backend.Flags{Seen: true})
+			env.resetCalls()
+
+			env.localTags([]string{"unread"}, nil)
+			env.serverSets(backend.Flags{Seen: true, Flagged: true})
+			env.opts.Mode = UploadOnly
+			env.sync()
+			got := env.observe()
+
+			// The upload touches only the flag the user moved. Seen goes down
+			// because it changed locally; Flagged changed only on the server, and
+			// diffing without the baseline is what once made its local absence
+			// read as a removal to push.
+			if final := env.fake.flagsByRef[env.ref.ID]; final.Seen || !final.Flagged {
+				t.Errorf("provider state = %+v, want the mark-unread pushed and the server's star untouched", final)
+			}
+			// UploadOnly skips ingest and the download branch entirely, so the
+			// local side must be exactly as the user left it.
+			if !slices.Contains(got.Tags, "unread") {
+				t.Errorf("tags = %v, want \"unread\" kept — no download ran to reconcile it", got.Tags)
+			}
+			if slices.Contains(splitFlags(got.Baseline), "\\Flagged") {
+				t.Errorf("baseline = %q, banked \\Flagged that was never applied locally", got.Baseline)
+			}
+
+			// The regression run. With an honest baseline the second pass finds
+			// local == baseline and pushes nothing; with the star banked it
+			// pushes a \Flagged removal and the provider loses the change.
+			env.resetCalls()
+			env.sync()
+			if final := env.fake.flagsByRef[env.ref.ID]; !final.Flagged {
+				t.Errorf("provider state = %+v after second upload-only run, want the star still set", final)
+			}
+		})
+	}
+}
+
+// TestContractDownloadOnlyDoesNotBankUnuploadedLocalFlags is the mirror: the
+// download-only pass brings the server's star down while the local mark-unread
+// is forbidden to travel up. The baseline may advance Flagged — that change was
+// carried out — but not Seen, whose change went nowhere. Banking the un-upload
+// would erase the only record that the mark-unread is still owed to the server:
+// the next bidirectional run would find local == baseline, read the server's
+// unchanged Seen=true as fresh, and quietly re-read the message under the user.
+func TestContractDownloadOnlyDoesNotBankUnuploadedLocalFlags(t *testing.T) {
+	for _, p := range contractProfiles() {
+		t.Run(p.name, func(t *testing.T) {
+			env := newContractEnv(t, p.caps, backend.Flags{Seen: true})
+			env.resetCalls()
+
+			env.localTags([]string{"unread"}, nil)
+			env.serverSets(backend.Flags{Seen: true, Flagged: true})
+			env.opts.Mode = DownloadOnly
+			env.sync()
+			got := env.observe()
+
+			// The star comes down, and the download writes the resolved state —
+			// which keeps the local mark-unread, because Seen moved only locally
+			// and the merge has no reason to take the server's value.
+			for _, tag := range []string{"flagged", "unread"} {
+				if !slices.Contains(got.Tags, tag) {
+					t.Errorf("tags = %v, want %q after the download-only run", got.Tags, tag)
+				}
+			}
+			// Seen must stay at the server's word: nothing was uploaded, so the
+			// mark-unread is still pending and the baseline is the only place
+			// that knows.
+			if !slices.Contains(splitFlags(got.Baseline), "\\Seen") {
+				t.Errorf("baseline = %q, banked the un-uploaded mark-unread as reconciled", got.Baseline)
+			}
+
+			// The owed upload happens on the next full sync. If the first run
+			// had banked Seen=false, this run would instead see a server-side
+			// "change" to Seen=true and revert the user's mark-unread locally.
+			env.opts.Mode = Bidirectional
+			env.resetCalls()
+			env.sync()
+			got = env.observe()
+
+			if !slices.Contains(got.Tags, "unread") {
+				t.Errorf("tags = %v, want \"unread\" kept — the local change must win, not vanish", got.Tags)
+			}
+			var removedSeen bool
+			for _, call := range got.Uploaded {
+				if call.remove.Seen {
+					removedSeen = true
+				}
+			}
+			if !removedSeen {
+				t.Errorf("uploaded %+v, want the deferred mark-unread pushed as a \\Seen removal", got.Uploaded)
+			}
+		})
+	}
+}
+
+// TestContractUploadSucceedsThenLocalWriteRefused splits one row's sync down
+// the middle: the upload of the local mark-unread succeeds, then a mid-sync
+// reply makes the CAS refuse the download of the server's star. pushed and
+// pulled are now different answers for the same row, and the baseline must
+// follow them per flag — Seen advanced (its change reached the server),
+// Flagged did not (its change never reached the local tags). A single
+// wholesale write of the resolved state can only get one of them wrong: it
+// would bank \Flagged, and the retry the pending queue schedules would find
+// local == baseline and never deliver the star.
+func TestContractUploadSucceedsThenLocalWriteRefused(t *testing.T) {
+	for _, p := range contractProfiles() {
+		t.Run(p.name, func(t *testing.T) {
+			env := newContractEnv(t, p.caps, backend.Flags{Seen: true})
+			env.resetCalls()
+
+			env.localTags([]string{"unread"}, nil)
+			env.serverSets(backend.Flags{Seen: true, Flagged: true})
+			env.fake.beforeFetchFlags = func() {
+				env.fake.beforeFetchFlags = nil
+				env.localTags([]string{"replied"}, nil)
+			}
+			env.sync()
+			got := env.observe()
+
+			if len(got.FetchedRefs) == 0 {
+				t.Fatal("flag pass fetched nothing; the mid-sync mutation never raced anything")
+			}
+			// The upload half went through before the race mattered: the
+			// mark-unread reached the provider and the star was left alone.
+			if final := env.fake.flagsByRef[env.ref.ID]; final.Seen || !final.Flagged {
+				t.Errorf("provider state = %+v, want \\Seen removed and the star untouched", final)
+			}
+			// The download half was refused. ToTagOps is absolute — its write
+			// would have stripped the mid-sync "replied" — so the refusal is
+			// visible as both local changes surviving and the star's tag absent.
+			for _, tag := range []string{"unread", "replied"} {
+				if !slices.Contains(got.Tags, tag) {
+					t.Errorf("tags = %v, want %q to survive the refused write", got.Tags, tag)
+				}
+			}
+			if slices.Contains(got.Tags, "flagged") {
+				t.Errorf("tags = %v, want no \"flagged\" — the download was refused, not applied", got.Tags)
+			}
+			// The half-run baseline: only the pushed flag advances. Recording
+			// \Flagged here would mark the refused download as done and starve
+			// the retry below of any difference to act on.
+			if slices.Contains(splitFlags(got.Baseline), "\\Flagged") {
+				t.Errorf("baseline = %q, banked a server change the refused write never applied", got.Baseline)
+			}
+			if !slices.Contains(got.Pending.Refs, env.ref.ID) {
+				t.Errorf("pending refs = %v, want %q queued so the refused download is retried",
+					got.Pending.Refs, env.ref.ID)
 			}
 		})
 	}

@@ -2,7 +2,9 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -262,6 +264,98 @@ func (d *DB) ModifyTagsByMessageIDAndAccount(messageID, account string, addTags,
 	}
 
 	return tx.Commit()
+}
+
+// ModifyFlagTagsIfUnchanged is ModifyTagsByMessageIDAndAccount for a caller
+// that decided what to write from a snapshot it read earlier, and must not
+// overwrite a change that landed in between.
+//
+// watch names the tags the caller's decision depended on, and expected is the
+// subset of those the snapshot held. Both the comparison and the write happen
+// in one transaction, so with immediate transactions the pair is atomic against
+// another process as well as another goroutine.
+//
+// Returns false and writes nothing when the current state disagrees. The caller
+// is expected to leave its own before-image alone and retry, rather than force
+// a decision computed against a state that no longer exists.
+func (d *DB) ModifyFlagTagsIfUnchanged(messageID, account string, watch, expected, addTags, removeTags []string) (bool, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// A missing row is a genuine no-op, but any other failure is not: reporting
+	// it as an applied write would let the caller advance a before-image over a
+	// change it never made.
+	var accountID int64
+	switch err := tx.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID); {
+	case errors.Is(err, sql.ErrNoRows):
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("resolve account %q: %w", account, err)
+	}
+	var dbID int64
+	switch err := tx.QueryRow(
+		"SELECT id FROM messages WHERE message_id = ? AND account_id = ?",
+		messageID, accountID).Scan(&dbID); {
+	case errors.Is(err, sql.ErrNoRows):
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("resolve message %q: %w", messageID, err)
+	}
+
+	rows, err := tx.Query("SELECT tag FROM tags WHERE message_id = ?", dbID)
+	if err != nil {
+		return false, fmt.Errorf("read current tags: %w", err)
+	}
+	watched := make(map[string]bool, len(watch))
+	for _, tag := range watch {
+		watched[tag] = true
+	}
+	var current []string
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			rows.Close()
+			return false, fmt.Errorf("scan tag: %w", err)
+		}
+		if watched[tag] {
+			current = append(current, tag)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return false, fmt.Errorf("read current tags: %w", err)
+	}
+	rows.Close()
+
+	want := slices.Clone(expected)
+	slices.Sort(want)
+	slices.Sort(current)
+	if !slices.Equal(current, want) {
+		return false, nil
+	}
+
+	for _, tag := range addTags {
+		if _, err := tx.Exec(
+			"INSERT OR IGNORE INTO tags (message_id, tag) VALUES (?, ?)",
+			dbID, tag); err != nil {
+			return false, fmt.Errorf("add tag %q: %w", tag, err)
+		}
+	}
+	for _, tag := range removeTags {
+		if _, err := tx.Exec(
+			"DELETE FROM tags WHERE message_id = ? AND tag = ?",
+			dbID, tag); err != nil {
+			return false, fmt.Errorf("remove tag %q: %w", tag, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	return true, nil
 }
 
 // GetTagsByMessageID returns all tags for a message identified by its

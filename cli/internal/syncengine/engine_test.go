@@ -287,7 +287,32 @@ func (f *fakeBackend) FetchSnapshotMetadata(_ context.Context, refs []backend.Re
 
 func (f *fakeBackend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, remove backend.Flags) error {
 	f.applyFlagsCalls = append(f.applyFlagsCalls, applyFlagsCall{ref: ref, add: add, remove: remove})
-	return f.applyFlagsErr
+	if f.applyFlagsErr != nil {
+		return f.applyFlagsErr
+	}
+	// A real provider stores what it is told, so a later FetchFlags reports it
+	// back. Without this the scripted state is frozen and a test cannot tell an
+	// upload that converged from one that undid the server's own change.
+	state := f.flagsByRef[ref.ID]
+	for _, m := range []struct {
+		field *bool
+		add   bool
+		rm    bool
+	}{
+		{&state.Seen, add.Seen, remove.Seen},
+		{&state.Flagged, add.Flagged, remove.Flagged},
+		{&state.Answered, add.Answered, remove.Answered},
+		{&state.Deleted, add.Deleted, remove.Deleted},
+		{&state.Completed, add.Completed, remove.Completed},
+	} {
+		if m.add {
+			*m.field = true
+		} else if m.rm {
+			*m.field = false
+		}
+	}
+	f.flagsByRef[ref.ID] = state
+	return nil
 }
 
 func (f *fakeBackend) FetchFlags(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {

@@ -27,7 +27,58 @@ func (f FlagState) IsEmpty() bool {
 	return !f.Seen && !f.Flagged && !f.Answered && !f.Deleted && !f.Completed
 }
 
-// Merge combines two FlagStates using OR logic (except Deleted which uses server value)
+// ResolveFlags decides the post-sync state of every flag from all three sides.
+//
+// Merge below cannot do this: it ORs local and server without consulting the
+// baseline, so a flag the user cleared can never win — it looks identical to a
+// flag the user never set. The baseline is what tells those apart, and for a
+// boolean it settles every field on its own:
+//
+//	local == baseline   only the server moved, take the server
+//	server == baseline  only the local side moved, take local
+//	otherwise           both moved, and for a boolean that means both moved to
+//	                    !baseline, so they already agree
+//
+// There is no conflict to arbitrate, which is why this needs no rule about
+// which side wins.
+//
+// Deleted and Completed stay server-owned. FlagStateFromTags can never report
+// either one — no tag maps to them — so a local false is the absence of a
+// representation rather than a user's decision, and reading it as "the user
+// cleared this" is what made the engine un-mark pending expunges it had only
+// witnessed.
+func ResolveFlags(baseline, local, server FlagState) FlagState {
+	// While the baseline records $Completed, ToTagOps deliberately suppresses
+	// the "flagged" tag, so the local side reports Flagged=false no matter what
+	// the user wants. That absence is the mask's doing, not a decision, and
+	// resolving it as a local change loses the star: clearing $Completed on the
+	// server would leave the still-flagged message untagged here, and the next
+	// run — with the mask no longer active — would upload the absence as a real
+	// unstar. Normalize it to the baseline, which is the mask NeedsUpload
+	// already applies for the same reason.
+	if baseline.Completed {
+		local.Flagged = baseline.Flagged
+	}
+
+	return FlagState{
+		Seen:      resolveFlag(baseline.Seen, local.Seen, server.Seen),
+		Flagged:   resolveFlag(baseline.Flagged, local.Flagged, server.Flagged),
+		Answered:  resolveFlag(baseline.Answered, local.Answered, server.Answered),
+		Deleted:   server.Deleted,
+		Completed: server.Completed,
+	}
+}
+
+func resolveFlag(baseline, local, server bool) bool {
+	if local == baseline {
+		return server
+	}
+	return local
+}
+
+// Merge combines two FlagStates using OR logic (except Deleted which uses
+// server value). Superseded by ResolveFlags on the sync engine's path, but
+// still live in the legacy imap.Syncer.
 func (f FlagState) Merge(server FlagState) FlagState {
 	return FlagState{
 		Seen:      f.Seen || server.Seen,
@@ -74,6 +125,14 @@ func FlagStateFromIMAP(flags []string) FlagState {
 		}
 	}
 	return state
+}
+
+// FlagTagVocabulary is the set of tags FlagStateFromTags reads and ToTagOps
+// writes. A caller that needs to know whether a flag decision is still valid
+// compares only these: a rule adding an unrelated tag mid-sync says nothing
+// about the flag state and must not invalidate the decision.
+func FlagTagVocabulary() []string {
+	return []string{"unread", "flagged", "replied"}
 }
 
 // FlagStateFromTags creates a FlagState from local tags.
