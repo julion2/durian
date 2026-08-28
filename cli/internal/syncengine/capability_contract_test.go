@@ -469,6 +469,48 @@ func answeredExpectation(caps backend.Capabilities) answeredContract {
 	}
 }
 
+// TestContractServerSetsSeen: another client reads the message, so the local
+// "unread" tag drops, the baseline records \Seen, and nothing goes back to the
+// provider. One contract for all four profiles — no capability makes a
+// server-side read marker mean something different.
+//
+// This is the scenario that motivated the initialized flag. A message that
+// arrives unread has a legitimately empty baseline. On redelivery the upsert
+// updated is_seen while leaving synced_flags alone, and ingest applies only the
+// add half of the flag tags by design (ingest.go), so "unread" stayed. The old
+// seed then read is_seen — already advanced by this same sync — as the
+// before-image, the stale tag looked like a local mark-unread, and the engine
+// uploaded a \Seen removal: it told the server to un-read a message the user
+// had just read elsewhere. Every profile did this, and on a delta backend it
+// happened on every flag change.
+//
+// Distinguishing "no baseline" from "empty baseline" is what stops the seed
+// firing on a row whose emptiness is the truth.
+func TestContractServerSetsSeen(t *testing.T) {
+	for _, p := range contractProfiles() {
+		t.Run(p.name, func(t *testing.T) {
+			env := newContractEnv(t, p.caps, backend.Flags{})
+			env.resetCalls()
+
+			env.serverSets(backend.Flags{Seen: true})
+			env.sync()
+			got := env.observe()
+
+			if slices.Contains(got.Tags, "unread") {
+				t.Errorf("tags = %v, want \"unread\" dropped after the server read it", got.Tags)
+			}
+			if !slices.Contains(splitFlags(got.Baseline), "\\Seen") {
+				t.Errorf("baseline = %q, want to record \\Seen", got.Baseline)
+			}
+			for _, call := range got.Uploaded {
+				if call.remove.Seen {
+					t.Errorf("uploaded %+v: pushed a \\Seen removal for a server-side read", got.Uploaded)
+				}
+			}
+		})
+	}
+}
+
 // TestContractServerClearsSeen is the mirror: the server reports the message
 // unread again, so the "unread" tag must come back and the baseline must stop
 // claiming \Seen. A baseline that kept \Seen would make the restored tag look
@@ -719,8 +761,14 @@ func TestContractMissingLegacyBaseline(t *testing.T) {
 			if n := effectiveUploads(got.Uploaded); n != 0 {
 				t.Errorf("uploaded %+v, want none — a re-seeded row is not a local change", got.Uploaded)
 			}
-			if p.caps.FlagChangesInDelta && len(got.FetchedRefs) != 0 {
-				t.Errorf("fetched %v, want none: seeding runs before candidacy, so the row must not be selected", got.FetchedRefs)
+			// A row whose baseline was never initialized is reconciled against
+			// the provider rather than seeded blind from its stored columns.
+			// Those columns hold whatever an earlier sync happened to write;
+			// only the provider knows the current state. Delta profiles
+			// therefore do fetch it — which is the point of tracking
+			// initialization separately from emptiness.
+			if p.caps.FlagChangesInDelta && len(got.FetchedRefs) == 0 {
+				t.Errorf("fetched nothing, want the uninitialized row reconciled against the provider")
 			}
 
 			// Initialized-empty: the message arrived unread with no flags, so the

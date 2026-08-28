@@ -118,6 +118,25 @@ func TestMigrateV25RepairsLegacyCommaFlags(t *testing.T) {
 	if !bytes.Equal(secondCT, repairedCT) {
 		t.Error("second Init changed migrated ciphertext")
 	}
+
+	// Init completes v26 before any sync ingest can run. The first subsequent
+	// upsert must therefore capture the repaired before-image, independent of
+	// the old comma representation that existed on disk.
+	created, err := db.UpsertMessage(&Message{
+		MessageID: "affected@example.com", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1",
+		SyncedFlagsInitialized: true,
+	})
+	if err != nil || created {
+		t.Fatalf("post-migration upsert created=%v err=%v", created, err)
+	}
+	rows, err = db.GetFolderFlagState("work", "ALL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := rows[0].SyncedFlags, `\Seen,\Flagged,\Answered,\Deleted`; got != want || !rows[0].SyncedFlagsInitialized {
+		t.Fatalf("post-v26 captured baseline=%q initialized=%v, want %q", got, rows[0].SyncedFlagsInitialized, want)
+	}
 }
 
 func TestMigrateV25RollsBackOnDecryptFailure(t *testing.T) {
