@@ -29,6 +29,7 @@ go_test(
     name = "store_test",
     srcs = [
         "attachments_test.go",
+        "concurrency_test.go",
         "headers_test.go",
         "local_drafts_test.go",
         "messages_test.go",

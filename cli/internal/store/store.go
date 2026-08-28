@@ -51,7 +51,35 @@ func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	// Every explicit transaction in this package writes before it commits, and
+	// several read first — resolving a row id, capturing a before-image. Those
+	// are the ones at risk: under a deferred BEGIN two Durian processes both
+	// take a shared read lock, and the second to write has to upgrade one the
+	// other still holds. SQLite answers that with SQLITE_BUSY without
+	// consulting the busy handler, since both sides waiting would deadlock
+	// rather than resolve, so the busy_timeout pragma set below cannot cover it.
+	//
+	// Taking the writer lock at BEGIN instead makes the second process wait on
+	// the busy handler like any other writer, and makes a read-then-write
+	// transaction atomic against a competing process rather than merely
+	// against a competing goroutine. Transactions that write first (UpdateBody,
+	// InsertAttachment) are unaffected either way; applying this per connection
+	// rather than per call site is the smaller change and needs no judgement at
+	// each Begin.
+	//
+	// One case gets slower rather than safer. The schema backfills in migrate()
+	// scan and rewrite whole tables, so on the single upgrade where one runs,
+	// it now reserves WAL's one writer slot from BEGIN for the duration instead
+	// of from its first write. Readers are unaffected; a competing writer waits
+	// out busy_timeout and can still fail after it. That is a different loser
+	// rather than a new failure — under deferred, the migration itself is the
+	// one that dies on its lock upgrade. Steady state is unaffected: each
+	// backfill is guarded by its schema_version check and does not run again.
+	separator := "?"
+	if strings.Contains(dbPath, "?") {
+		separator = "&"
+	}
+	db, err := sql.Open("sqlite", dbPath+separator+"_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
