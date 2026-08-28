@@ -219,8 +219,13 @@ func syncRemoteTags(emailDB *store.DB, tagConfig *config.TagSyncConfig, dryRun b
 			fmt.Fprintf(os.Stderr, "Would push %d tag changes\n", len(changes))
 		} else if err := client.Push(changes); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: tag sync push failed: %v\n", err)
+		} else if err := emailDB.ClearTagJournal(maxID); err != nil {
+			// The push succeeded but the journal still holds the entries. Keep
+			// them: the next run re-pushes the same changes, which is
+			// idempotent, and reporting success here would claim a cleanup that
+			// did not happen. Tag-sync failures are deliberately non-fatal.
+			fmt.Fprintf(os.Stderr, "Warning: tag sync journal cleanup failed: %v\n", err)
 		} else {
-			emailDB.ClearTagJournal(maxID)
 			fmt.Fprintf(os.Stderr, "✓ Pushed %d tag changes\n", len(changes))
 		}
 	}
