@@ -132,6 +132,15 @@ type fakeBackend struct {
 	flagsByRef        map[string]backend.Flags
 	fetchFlagsErr     error
 	fetchFlagsPartial bool
+	// fetchFlagsResolvable narrows a partial result to a genuine subset: when
+	// fetchFlagsPartial is set, only refs listed here resolve, and the rest are
+	// omitted alongside the error. Nil means nothing resolves, which is the
+	// degenerate partial (empty map + error) the older tests rely on.
+	fetchFlagsResolvable map[string]bool
+	// beforeFetchFlags runs at the top of FetchFlags, between ingest and the
+	// flag pass of the same Sync call. It is the seam for modelling a local
+	// mutation that lands mid-sync rather than between two syncs.
+	beforeFetchFlags func()
 	// fetchFlagsCalls / applyFlagsCalls record the flag-pass invocations.
 	fetchFlagsCalls []fetchFlagsCall
 	applyFlagsCalls []applyFlagsCall
@@ -282,10 +291,22 @@ func (f *fakeBackend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add
 }
 
 func (f *fakeBackend) FetchFlags(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
+	if f.beforeFetchFlags != nil {
+		f.beforeFetchFlags()
+	}
 	f.fetchFlagsCalls = append(f.fetchFlagsCalls, fetchFlagsCall{folder: folder, refs: slices.Clone(refs)})
 	if f.fetchFlagsErr != nil {
 		if f.fetchFlagsPartial {
-			return map[string]backend.Flags{}, f.fetchFlagsErr
+			resolved := make(map[string]backend.Flags)
+			for _, ref := range refs {
+				if !f.fetchFlagsResolvable[ref.ID] {
+					continue
+				}
+				if flags, ok := f.flagsByRef[ref.ID]; ok {
+					resolved[ref.ID] = flags
+				}
+			}
+			return resolved, f.fetchFlagsErr
 		}
 		return nil, f.fetchFlagsErr
 	}
