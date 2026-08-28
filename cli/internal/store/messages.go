@@ -204,9 +204,22 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 	// below overwrites them.
 	var existingID int64
 	var storedBaseline string
-	err = tx.QueryRow(`SELECT id, synced_flags FROM messages
-		WHERE message_id = ? AND IFNULL(account_id, 0) = ?`,
-		msg.MessageID, accountID).Scan(&existingID, &storedBaseline)
+	if msg.StableID != "" {
+		// A provider with stable identities may hold several objects sharing one
+		// Message-ID. Keying this on the Message-ID would match the first of
+		// them, report the second as already existing, and capture a before-image
+		// belonging to the wrong row — so the new object would silently skip its
+		// initial tags and its arrival notification. The claim above has already
+		// upgraded a legacy row to this stable id if one was eligible, so a miss
+		// here genuinely means "not stored yet".
+		err = tx.QueryRow(`SELECT id, synced_flags FROM messages
+			WHERE stable_id = ? AND IFNULL(account_id, 0) = ?`,
+			msg.StableID, accountKey).Scan(&existingID, &storedBaseline)
+	} else {
+		err = tx.QueryRow(`SELECT id, synced_flags FROM messages
+			WHERE message_id = ? AND IFNULL(account_id, 0) = ?`,
+			msg.MessageID, accountID).Scan(&existingID, &storedBaseline)
+	}
 	switch err {
 	case nil:
 	case sql.ErrNoRows:
@@ -870,7 +883,12 @@ func (d *DB) SetSyncedFlags(messageID, account, syncedFlags string) error {
 // SetSyncedFlagsByDBID updates one row without relying on a duplicable
 // Message-ID. Provider-engine reconciliation should prefer this method.
 func (d *DB) SetSyncedFlagsByDBID(id int64, syncedFlags string) error {
-	result, err := d.db.Exec("UPDATE messages SET synced_flags = ? WHERE id = ?", syncedFlags, id)
+	// Same sentinel encoding as SetSyncedFlags. Writing the raw value would
+	// store an initialized-but-empty baseline as "", which decodeSyncedFlags
+	// reads back as "never initialized" — the distinction the flag reconciler
+	// depends on to tell a legitimately empty before-image from a missing one.
+	result, err := d.db.Exec("UPDATE messages SET synced_flags = ? WHERE id = ?",
+		encodeSyncedFlags(syncedFlags), id)
 	if err != nil {
 		return fmt.Errorf("set synced flags by row: %w", err)
 	}

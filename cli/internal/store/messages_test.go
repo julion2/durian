@@ -1152,3 +1152,99 @@ func TestDeleteByMessageIDAndAccount(t *testing.T) {
 		t.Errorf("got %d rows after delete, want 1", count)
 	}
 }
+
+// TestUpsertReportsSecondStableObjectAsCreated covers the interaction between
+// stable identities and the created/before-image detection. The detection used
+// to key on (Message-ID, account), which matches the FIRST object when a
+// provider holds several sharing one Message-ID: the second would be reported
+// as already stored, so its initial tags would never be seeded and its arrival
+// would not be announced, while the before-image captured belonged to the other
+// row entirely.
+func TestUpsertReportsSecondStableObjectAsCreated(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+
+	first := &Message{
+		StableID: "obj-1", MessageID: "shared@example.com", Subject: "First",
+		Date: now, CreatedAt: now, Mailbox: "ALL", Account: "work", RemoteRef: "obj-1",
+		SyncedFlags: `\Seen`, SyncedFlagsInitialized: true,
+	}
+	created, err := db.UpsertMessageWithInitialTags(first, []string{"inbox"})
+	if err != nil {
+		t.Fatalf("upsert first: %v", err)
+	}
+	if !created {
+		t.Fatal("first object: created = false, want true")
+	}
+
+	second := &Message{
+		StableID: "obj-2", MessageID: "shared@example.com", Subject: "Second",
+		Date: now + 1, CreatedAt: now + 1, Mailbox: "ALL", Account: "work", RemoteRef: "obj-2",
+		SyncedFlags: "", SyncedFlagsInitialized: true,
+	}
+	created, err = db.UpsertMessageWithInitialTags(second, []string{"inbox", "unread"})
+	if err != nil {
+		t.Fatalf("upsert second: %v", err)
+	}
+	if !created {
+		t.Fatal("second object: created = false — the Message-ID it shares with the first is not its identity")
+	}
+	if first.ID == second.ID {
+		t.Fatalf("both objects landed on row %d", first.ID)
+	}
+
+	// The seeding is the visible consequence: a row reported as existing skips
+	// it, and nothing later puts those tags back.
+	tags, err := db.GetMessageTags(second.ID)
+	if err != nil {
+		t.Fatalf("get tags: %v", err)
+	}
+	if !slices.Contains(tags, "unread") {
+		t.Errorf("second object tags = %v, want the initial tags seeded", tags)
+	}
+}
+
+// TestSetSyncedFlagsByDBIDKeepsEmptyBaselineInitialized guards the row-addressed
+// setter against the same ambiguity SetSyncedFlags encodes around: an
+// initialized-but-empty baseline stored raw reads back as "never initialized",
+// which sends the reconciler down the legacy seeding path on a row whose
+// emptiness is the truth.
+func TestSetSyncedFlagsByDBIDKeepsEmptyBaselineInitialized(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+
+	msg := &Message{
+		StableID: "obj-empty", MessageID: "empty-baseline@example.com", Subject: "Empty",
+		Date: now, CreatedAt: now, Mailbox: "ALL", Account: "work", RemoteRef: "obj-empty",
+		SyncedFlags: `\Seen`, SyncedFlagsInitialized: true,
+	}
+	if _, err := db.UpsertMessage(msg); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	// The server clears every flag: a real, initialized, empty baseline.
+	if err := db.SetSyncedFlagsByDBID(msg.ID, ""); err != nil {
+		t.Fatalf("set synced flags: %v", err)
+	}
+
+	rows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil {
+		t.Fatalf("flag state: %v", err)
+	}
+	var found bool
+	for _, row := range rows {
+		if row.RowID != msg.ID {
+			continue
+		}
+		found = true
+		if row.SyncedFlags != "" {
+			t.Errorf("baseline = %q, want empty", row.SyncedFlags)
+		}
+		if !row.SyncedFlagsInitialized {
+			t.Error("baseline reads as uninitialized after an explicit empty write")
+		}
+	}
+	if !found {
+		t.Fatalf("row %d missing from folder flag state", msg.ID)
+	}
+}
