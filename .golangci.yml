@@ -31,6 +31,11 @@ linters:
         - (io.Closer).Close
         - (*database/sql.Rows).Close
         - (*database/sql.Stmt).Close
+        # Every transaction in the store package is written as
+        # `defer tx.Rollback()` after a Commit on the happy path, where it
+        # returns sql.ErrTxDone by design. Twenty existing sites do this; the
+        # list simply never recorded the convention, because nothing linted it.
+        - (*database/sql.Tx).Rollback
         - fmt.Fprintf
         - fmt.Fprintln
         - fmt.Fprint

@@ -729,9 +729,13 @@ func (e *Engine) reconcileFullSnapshot(folder backend.Folder, present map[string
 // message it compares the flag state implied by local tags and the current
 // server flags (Backend.FetchFlags) against the store's last-synced baseline
 // (synced_flags). Local changes vs the baseline are uploaded via ApplyFlags;
-// server changes are downloaded into tags via ToTagOps; conflicts merge with
-// local winning for Seen/Flagged/Answered and the server winning for
-// Deleted/Completed. Keeping the merge here makes it provider-neutral: a
+// server changes are downloaded into tags via ToTagOps. Each flag is settled on
+// its own by ResolveFlags — whichever side differs from the baseline moved it,
+// and when both did they moved a boolean to the same value — so there is no
+// side that "wins" and no rule about who does. Deleted and Completed stay
+// server-owned, because no tag can express them and a local false is an absent
+// representation rather than a decision. Keeping the merge here makes it
+// provider-neutral: a
 // backend only reports and applies flags, so cursors (e.g. a Graph deltaLink)
 // never need to carry per-message baselines.
 //
@@ -1000,56 +1004,156 @@ func (e *Engine) reconcileFlagRows(
 			serverState.Answered = baseline.Answered
 		}
 
-		// Local changed vs the baseline: push the local-vs-server diff so the
-		// server converges on local. DiffFlags only ever emits the user flags
-		// ToIMAPFlags covers (Seen/Flagged/Answered/Deleted), never the
-		// server-only $Completed keyword — same as the legacy upload path.
-		// Note: imap.FlagStateFromTags never sets Deleted, so the legacy
-		// copy-to-trash delete branch cannot fire on this path.
+		// The state both sides should end up in, decided per flag against the
+		// baseline. Both branches below drive towards this one value: the upload
+		// moves the server to it and the download moves the local tags to it,
+		// so neither can undo what the other is converging on.
+		//
+		// Computing the upload from local-vs-server instead is what made a
+		// server-side change look like a local removal. A star set remotely is
+		// absent locally for the same reason it was absent before — nobody
+		// touched it here — and diffing without the baseline read that as the
+		// user un-starring, so the next upload deleted the new star.
+		target := imap.ResolveFlags(baseline, local, serverState)
+
+		// Local changed vs the baseline: push the difference between the
+		// resolved state and the server so the server converges on it.
+		// DiffFlags only ever emits the user flags ToIMAPFlags covers
+		// (Seen/Flagged/Answered/Deleted), never the server-only $Completed
+		// keyword — same as the legacy upload path.
+		// Which halves of target actually reached their side. The baseline may
+		// only record what one of these carried out — see advanceBaseline.
+		var pushed, pulled bool
+
 		if upload && imap.NeedsUpload(local, baseline) {
 			ref := backend.RemoteRef{Folder: folder.Name, ID: row.RemoteRef}
-			toAdd, toRemove := imap.DiffFlags(local, serverState)
+			toAdd, toRemove := imap.DiffFlags(target, serverState)
 			add := backendFlagsFromState(imap.FlagStateFromIMAP(toAdd))
 			remove := backendFlagsFromState(imap.FlagStateFromIMAP(toRemove))
-			if err := b.ApplyFlags(ctx, ref, add, remove); err != nil {
-				// Continue with the remaining messages (legacy behavior); the
-				// baseline stays put so the upload is retried next sync.
-				slog.Warn("Flag upload failed", "module", "SYNCENGINE",
-					"folder", folder.Name, "message_id", row.MessageID, "err", err)
-				result.Errors = append(result.Errors, fmt.Errorf("flag upload for %s: %w", row.MessageID, err))
-				continue
-			} else {
-				if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, joinFlags(local)); err != nil {
-					result.Errors = append(result.Errors, fmt.Errorf("flag baseline for %s: %w", row.MessageID, err))
+			switch {
+			case len(toAdd) == 0 && len(toRemove) == 0:
+				// NeedsUpload can fire with nothing to send: it compares local
+				// against the baseline, and a server-owned flag the local side
+				// cannot express (\Deleted) reads as a local change forever.
+				// The server already holds the resolved state, so treat it as
+				// pushed, but do not make the call — the IMAP adapter
+				// reconnects and re-selects the mailbox even for an empty one.
+				pushed = true
+			default:
+				if err := b.ApplyFlags(ctx, ref, add, remove); err != nil {
+					// Continue with the remaining messages (legacy behavior); the
+					// baseline stays put so the upload is retried next sync.
+					slog.Warn("Flag upload failed", "module", "SYNCENGINE",
+						"folder", folder.Name, "message_id", row.MessageID, "err", err)
+					result.Errors = append(result.Errors, fmt.Errorf("flag upload for %s: %w", row.MessageID, err))
+					continue
 				}
+				pushed = true
 				uploaded++
 			}
 		}
 
-		// Server changed vs the baseline: bring the change down. When both
-		// sides changed (conflict), merge with local winning for
-		// Seen/Flagged/Answered and the server winning for Deleted/Completed.
+		// Server changed vs the baseline: bring the change down to the same
+		// resolved state the upload above pushed.
 		if download && imap.NeedsDownload(serverState, baseline) {
-			target := serverState
-			if imap.NeedsUpload(local, baseline) {
-				target = local.Merge(serverState)
-			}
+			pulled = true
 			if !target.Equal(local) {
 				add, remove := target.ToTagOps()
-				if err := e.opts.Store.ModifyTagsByMessageIDAndAccount(row.MessageID, e.opts.Account, add, remove); err != nil {
+				// target was computed from a row snapshot taken before
+				// FetchFlags. A tag change landing in that window is invisible
+				// to the merge, and ToTagOps is absolute — writing it blind
+				// would revert whatever the user did mid-sync, and the baseline
+				// written below would then agree with the reverted tags, so no
+				// later run could tell anything was lost. Write only while the
+				// snapshot still holds.
+				applied, err := e.opts.Store.ModifyFlagTagsIfUnchanged(
+					row.MessageID, e.opts.Account, imap.FlagTagVocabulary(),
+					flagTagsOf(row.Tags), add, remove)
+				switch {
+				case err != nil:
 					result.Errors = append(result.Errors, fmt.Errorf("flag tags for %s: %w", row.MessageID, err))
 					failed = append(failed, row.RemoteRef)
-					continue // Baseline stays put so the download is retried next sync.
+					pulled = false
+				case !applied:
+					// The local side moved under us. The download did not
+					// happen, so the baseline must not record it; the next sync
+					// re-reads both sides and merges properly.
+					failed = append(failed, row.RemoteRef)
+					pulled = false
+				default:
+					downloaded++
+				}
+			} else {
+				downloaded++
+			}
+		}
+
+		// One write, covering only what actually happened. Writing target
+		// wholesale — as both branches used to, independently — records the
+		// other side's change as reconciled when the run never carried it out:
+		// UploadOnly would bank a server flag it never wrote locally, and the
+		// next run would read the local absence as the user removing it and
+		// delete it from the provider.
+		if pushed || pulled {
+			next := advanceBaseline(baseline, local, serverState, target, pushed, pulled)
+			if !next.Equal(baseline) {
+				if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, joinFlags(next)); err != nil {
+					result.Errors = append(result.Errors, fmt.Errorf("flag baseline for %s: %w", row.MessageID, err))
+					failed = append(failed, row.RemoteRef)
 				}
 			}
-			if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, joinFlags(target)); err != nil {
-				result.Errors = append(result.Errors, fmt.Errorf("flag baseline for %s: %w", row.MessageID, err))
-				failed = append(failed, row.RemoteRef)
-			}
-			downloaded++
 		}
 	}
 	return uploaded, downloaded, failed
+}
+
+// advanceBaseline records the resolved state for the flags this run actually
+// settled, and leaves the rest at the old before-image.
+//
+// A baseline field is a claim that both sides agreed on that value at some
+// point. Advancing one whose change only travelled in a direction the run did
+// not take turns that claim into a lie, and the lie is consumed as a user
+// action next time: the local side is missing a flag the baseline says was
+// reconciled, so the next upload removes it from the provider. UploadOnly is
+// the live case — the watcher uses it after a local tag change.
+//
+// So each flag advances only via the direction that owns its change: pushed
+// carries the ones the local side moved, pulled the ones the server moved. A
+// flag both sides moved is carried by either, since ResolveFlags gives them the
+// same value. Deleted and Completed are server-owned and only ever pulled.
+func advanceBaseline(baseline, local, server, target imap.FlagState, pushed, pulled bool) imap.FlagState {
+	next := baseline
+	advance := func(field func(imap.FlagState) bool, set func(*imap.FlagState, bool)) {
+		if pushed && field(local) != field(baseline) {
+			set(&next, field(target))
+		}
+		if pulled && field(server) != field(baseline) {
+			set(&next, field(target))
+		}
+	}
+	advance(func(f imap.FlagState) bool { return f.Seen },
+		func(f *imap.FlagState, v bool) { f.Seen = v })
+	advance(func(f imap.FlagState) bool { return f.Flagged },
+		func(f *imap.FlagState, v bool) { f.Flagged = v })
+	advance(func(f imap.FlagState) bool { return f.Answered },
+		func(f *imap.FlagState, v bool) { f.Answered = v })
+	if pulled {
+		next.Deleted = target.Deleted
+		next.Completed = target.Completed
+	}
+	return next
+}
+
+// flagTagsOf narrows a row's tags to the ones a flag decision depends on, so a
+// concurrent change to an unrelated tag does not look like a conflict.
+func flagTagsOf(tags []string) []string {
+	var out []string
+	for _, tag := range tags {
+		if slices.Contains(imap.FlagTagVocabulary(), tag) {
+			out = append(out, tag)
+		}
+	}
+	return out
 }
 
 func folderStateEqual(a, b FolderState) bool {
