@@ -497,15 +497,14 @@ func TestContractServerClearsSeen(t *testing.T) {
 	}
 }
 
-// isIMAPProfile marks the one profile whose adapter can report a server-side
-// \Deleted at all. This is a profile comparison rather than a capability check
-// on purpose: the ability to deliver \Deleted is not expressible with the
-// current bits, and inventing one that a single adapter sets and the engine
-// never branches on would be worse than saying plainly that this scenario has
-// one applicable column.
-func isIMAPProfile(caps backend.Capabilities) bool {
-	return caps == backend.ProfileIMAP
-}
+// deliversServerDeleted names the profiles whose adapter can report a
+// server-side \Deleted at all. It matches on the profile's identity rather than
+// its capability tuple: the bits do not encode this, so comparing them would
+// silently adopt any future adapter that happened to declare the same three
+// flags. The ability is not expressible as a capability either — a bit that one
+// adapter sets and the engine never branches on is worse than saying plainly
+// that this scenario has one applicable column.
+var deliversServerDeleted = map[string]bool{"imap": true}
 
 // TestContractServerSetsDeleted records what the engine actually does with a
 // server-side \Deleted, which is deliberately asymmetric: ToTagOps never maps
@@ -519,8 +518,10 @@ func isIMAPProfile(caps backend.Capabilities) bool {
 // reads as locally changed against its \Deleted baseline, and DiffFlags — which
 // syncs Deleted bidirectionally — pushes a \Deleted REMOVAL back to the
 // provider, after which the baseline drops the flag again. The engine un-marks
-// a pending expunge another client set and it merely witnessed. That is a bug,
-// tracked separately; the assertion records it so a fix has to update it.
+// a pending expunge another client set and it merely witnessed.
+//
+// This asserts what ships today, not what should. The bug is issue #399; the
+// assertion exists so a fix has to update it rather than flip a green cell.
 //
 // IMAP only, and not because the other profiles are exempt from the merge —
 // they cannot produce the input. Graph reports deletions as @removed delta
@@ -531,7 +532,7 @@ func isIMAPProfile(caps backend.Capabilities) bool {
 // that exactly one adapter ever sets and the engine never branches on.
 func TestContractServerSetsDeleted(t *testing.T) {
 	for _, p := range contractProfiles() {
-		if !isIMAPProfile(p.caps) {
+		if !deliversServerDeleted[p.name] {
 			continue
 		}
 		t.Run(p.name, func(t *testing.T) {

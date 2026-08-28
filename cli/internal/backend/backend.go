@@ -158,12 +158,14 @@ type Capabilities struct {
 	// folder-role tag mapping. Durian-local tags (rules, flags) are left intact.
 	LabelsAreTags bool
 	// AnsweredUnsupported reports that the backend cannot persist the \Answered
-	// flag (Gmail has no answered label). The engine then excludes Answered from
-	// the three-way flag merge for this backend: a local "replied" tag would
-	// otherwise be uploaded (silently dropped by the provider), recorded in the
-	// baseline, then removed on the next sync when the server reports the message
-	// as un-answered — a ping-pong that flips the tag every sync. Default false
-	// keeps the full merge for IMAP/Graph, which do round-trip \Answered.
+	// flag — Gmail has no answered label, and Graph's message resource has no
+	// answered property, so its ApplyFlags translates only isRead and
+	// flagStatus. The engine then excludes Answered from the three-way flag
+	// merge for this backend: a local "replied" tag would otherwise be uploaded
+	// (silently dropped by the provider), recorded in the baseline, then removed
+	// on the next sync when the server reports the message as un-answered — a
+	// ping-pong that flips the tag every sync. Default false keeps the full
+	// merge for IMAP and JMAP, which do round-trip \Answered.
 	AnsweredUnsupported bool
 }
 

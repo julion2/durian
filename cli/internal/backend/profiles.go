@@ -44,7 +44,7 @@ var ProfileJMAP = Capabilities{
 
 // ProfileGmail is the Gmail API: delta-carried flag changes, labels as tags,
 // and no \Answered equivalent. It is the only profile that sets all three flag
-// bits, and the only one where the engine suppresses Answered in the merge.
+// bits; Graph suppresses Answered too, for its own reason.
 var ProfileGmail = Capabilities{
 	FlagChangesInDelta:  true,
 	LabelsAreTags:       true,
