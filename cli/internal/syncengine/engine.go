@@ -1018,9 +1018,9 @@ func (e *Engine) reconcileFlagRows(
 
 		// Local changed vs the baseline: push the difference between the
 		// resolved state and the server so the server converges on it.
-		// DiffFlags only ever emits the user flags ToIMAPFlags covers
-		// (Seen/Flagged/Answered/Deleted), never the server-only $Completed
-		// keyword — same as the legacy upload path.
+		// DiffFlags emits only the locally-owned flags (Seen/Flagged/Answered);
+		// Deleted and the server-only $Completed keyword never travel upward.
+		//
 		// Which halves of target actually reached their side. The baseline may
 		// only record what one of these carried out — see imap.AdvanceBaseline.
 		var pushed, pulled bool
@@ -1032,12 +1032,11 @@ func (e *Engine) reconcileFlagRows(
 			remove := backendFlagsFromState(imap.FlagStateFromIMAP(toRemove))
 			switch {
 			case len(toAdd) == 0 && len(toRemove) == 0:
-				// NeedsUpload can fire with nothing to send: it compares local
-				// against the baseline, and a server-owned flag the local side
-				// cannot express (\Deleted) reads as a local change forever.
-				// The server already holds the resolved state, so treat it as
-				// pushed, but do not make the call — the IMAP adapter
-				// reconnects and re-selects the mailbox even for an empty one.
+				// NeedsUpload compares local against the baseline, so it can
+				// fire while the resolved state already matches the server —
+				// the $Completed mask over Flagged is the live case. Nothing to
+				// send, but the server does hold the resolved state, so the
+				// locally-owned fields have converged and may advance.
 				pushed = true
 			default:
 				if err := b.ApplyFlags(ctx, ref, add, remove); err != nil {

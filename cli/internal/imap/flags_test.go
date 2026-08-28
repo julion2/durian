@@ -270,15 +270,16 @@ func TestNeedsUpload(t *testing.T) {
 			expected: true,
 		},
 		{
-			// Deleted is server-owned. This local state is unreachable in
-			// production — FlagStateFromTags never sets Deleted, deliberately,
-			// because Durian's "deleted" means moved-to-trash while \Deleted
-			// means pending expunge. Treating a difference as a local change
-			// made every row with a \Deleted baseline a permanent upload
-			// candidate.
-			name:     "deleted never counts as a local change",
-			local:    FlagState{Deleted: true},
-			stored:   FlagState{Deleted: false},
+			// The production shape: a prior download recorded \Deleted in the
+			// baseline, and the local side reports false because no tag maps to
+			// it — FlagStateFromTags never sets Deleted, deliberately, since
+			// Durian's "deleted" means moved-to-trash while \Deleted means
+			// pending expunge. Counting that as a local change made every such
+			// row a permanent upload candidate, and before the diff stopped
+			// carrying Deleted, pushed a removal that un-marked the expunge.
+			name:     "deleted baseline is not a local change",
+			local:    FlagState{Deleted: false},
+			stored:   FlagState{Deleted: true},
 			expected: false,
 		},
 		{

@@ -554,8 +554,8 @@ func (s *Syncer) uploadFlagChanges(uid uint32, target, server FlagState) error {
 	// server-only keywords like $Completed that ToIMAPFlags() doesn't include.
 	toAdd, toRemove := DiffFlags(target, server)
 	if len(toAdd) == 0 && len(toRemove) == 0 {
-		// NeedsUpload can fire with nothing to send. Skipping the call matters
-		// here: this client reconnects and re-selects the mailbox for it.
+		// NeedsUpload compares local against the baseline, so it can fire with
+		// nothing to send.
 		return nil
 	}
 
@@ -564,10 +564,21 @@ func (s *Syncer) uploadFlagChanges(uid uint32, target, server FlagState) error {
 		return nil
 	}
 
-	if err := s.flags().AddFlags(uid, toAdd); err != nil {
-		return err
+	// Each half only when it has something to say. Naming which half failed
+	// matters because the two are not equivalent to recover from: a failed add
+	// leaves the server missing a flag, a failed remove leaves one set, and the
+	// baseline stays behind either way so the next fetch resolves it.
+	if len(toAdd) > 0 {
+		if err := s.flags().AddFlags(uid, toAdd); err != nil {
+			return fmt.Errorf("add flags on UID %d: %w", uid, err)
+		}
 	}
-	return s.flags().RemoveFlags(uid, toRemove)
+	if len(toRemove) > 0 {
+		if err := s.flags().RemoveFlags(uid, toRemove); err != nil {
+			return fmt.Errorf("remove flags on UID %d: %w", uid, err)
+		}
+	}
+	return nil
 }
 
 // downloadFlagChanges writes the resolved state to the message's tags, but only

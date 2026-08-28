@@ -51,6 +51,12 @@ func (f *fakeFlagTransport) FetchFlags(uids []uint32) (map[uint32][]string, erro
 }
 
 func (f *fakeFlagTransport) AddFlags(uid uint32, flags []string) error {
+	// Client.AddFlags returns before issuing UID STORE when the list is empty.
+	// Mirroring that keeps a recorded call meaning what it means in production:
+	// something was actually sent.
+	if len(flags) == 0 {
+		return nil
+	}
 	if f.onUpload != nil {
 		f.onUpload()
 	}
@@ -64,6 +70,9 @@ func (f *fakeFlagTransport) AddFlags(uid uint32, flags []string) error {
 }
 
 func (f *fakeFlagTransport) RemoveFlags(uid uint32, flags []string) error {
+	if len(flags) == 0 {
+		return nil
+	}
 	if f.onUpload != nil {
 		f.onUpload()
 	}
