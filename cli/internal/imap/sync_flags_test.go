@@ -114,10 +114,10 @@ func newFlagTestDB(t *testing.T) *store.DB {
 	return db
 }
 
-// seedFlagMessage inserts a message with the given tags. Every message gets at
-// least one tag on purpose: syncFlags reads the local side via
-// GetAllMessagesWithTags, which joins on the tags table, so a tagless message
-// is invisible to the pass and its test would assert against a no-op.
+// seedFlagMessage inserts a message with the given tags, of which there may be
+// none: GetAllMessagesWithTags reports a tagless message too, so the pass sees
+// it. Most cases here still pass a tag because they need a specific local flag
+// state, not because a tag is required.
 func seedFlagMessage(t *testing.T, db *store.DB, messageID string, tags ...string) {
 	t.Helper()
 	msg := &store.Message{
@@ -157,6 +157,39 @@ func messageTags(t *testing.T, db *store.DB, messageID string) []string {
 		t.Fatalf("get tags for %s: %v", messageID, err)
 	}
 	return tags
+}
+
+// TestSyncFlags_UntaggedMessageStillReconciles covers the message the pass used
+// to never see. A read, unflagged, unanswered message in a folder with no role
+// mapping carries no tags at all — ToTagOps emits only removals for that state
+// — and GetAllMessagesWithTags dropped it, so the pass read "not in this
+// folder" and skipped it. Its flags then stopped moving in either direction,
+// silently and permanently.
+//
+// Starring it on another client must still arrive here.
+func TestSyncFlags_UntaggedMessageStillReconciles(t *testing.T) {
+	db := newFlagTestDB(t)
+	seedFlagMessage(t, db, "no-tags@test")
+
+	if tags := messageTags(t, db, "no-tags@test"); len(tags) != 0 {
+		t.Fatalf("fixture carries tags %v; this case is only meaningful without any", tags)
+	}
+
+	fake := &fakeFlagTransport{serverFlags: map[uint32][]string{
+		1: {goimap.SeenFlag, goimap.FlaggedFlag},
+	}}
+	s, mbox := newFlagSyncer(db, fake, SyncBidirectional)
+	mbox.SetMessageID(1, "no-tags@test")
+	mbox.SetMessageFlags(1, FlagState{Seen: true})
+
+	s.syncFlags(flagSyncMailbox, mbox, []uint32{1})
+
+	if tags := messageTags(t, db, "no-tags@test"); !slices.Contains(tags, "flagged") {
+		t.Errorf("tags = %v, want the server-side star downloaded", tags)
+	}
+	if _, ok := mbox.GetMessageFlags(1); !ok {
+		t.Error("baseline was never written; the message was skipped entirely")
+	}
 }
 
 func TestSyncFlags_LocalMarkUnreadRemovesSeenOnServer(t *testing.T) {
