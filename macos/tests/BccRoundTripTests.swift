@@ -89,9 +89,12 @@ final class BccRoundTripTests: XCTestCase {
     /// The path that actually breaks in daily use. A draft is loaded once, a
     /// search or auto-sync then rebuilds the MailMessage list, and rehydration
     /// restores the loaded state from the cache. That restored state is what
-    /// "Edit Draft" reads. Rehydration projects a different message than
-    /// applyThread does (last rather than newest), so it needs its own test —
-    /// the applyThread test never reaches this code.
+    /// "Edit Draft" reads.
+    ///
+    /// Rehydration is a second, independent consumer of the shared projection:
+    /// it reaches it from its own call site with its own message list, so the
+    /// applyThread test says nothing about whether this path calls it at all.
+    ///
     /// The thread has two messages, which is the case that distinguishes a
     /// correct projection from an accidental one: with a single message,
     /// `.first` and `.last` are the same element and any choice passes.
