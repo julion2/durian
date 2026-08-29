@@ -609,12 +609,11 @@ func TestContractServerSetsDeleted(t *testing.T) {
 			env.sync()
 			got = env.observe()
 
-			// Not merely "nothing effective": no call at all. NeedsUpload still
-			// counts Deleted, which no tag can express, so this row stays an
-			// upload candidate forever and every run would otherwise send an
-			// empty ApplyFlags. The IMAP adapter reconnects and re-selects the
-			// mailbox even for that, and can fail doing it — so the skipped call
-			// is part of the contract, and effectiveUploads would not see it.
+			// Not merely "nothing effective": no call at all, which
+			// effectiveUploads would not distinguish. Deleted is now excluded
+			// from NeedsUpload, so a \Deleted baseline no longer makes the row
+			// an upload candidate at all — before that it was one on every run,
+			// each sending an empty ApplyFlags.
 			if len(got.Uploaded) != 0 {
 				t.Errorf("uploaded %+v, want no ApplyFlags at all for a server-owned \\Deleted", got.Uploaded)
 			}

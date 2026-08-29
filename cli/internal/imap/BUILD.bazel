@@ -39,11 +39,13 @@ go_test(
         "gmail_test.go",
         "rules_test.go",
         "state_test.go",
+        "sync_flags_test.go",
         "sync_test.go",
     ],
     embed = [":imap"],
     deps = [
         "//cli/internal/config",
+        "//cli/internal/dbcrypto",
         "//cli/internal/store",
         "@com_github_emersion_go_imap//:go-imap",
     ],
