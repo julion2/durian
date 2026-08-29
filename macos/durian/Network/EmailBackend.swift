@@ -935,8 +935,14 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
             if email.threadMessages != nil { continue }
             if let cached = threadCache[email.id] {
                 emails[index].threadMessages = cached.messages
-                if let lastMessage = cached.messages.last {
-                    emails[index].applyFields(from: lastMessage)
+                // Newest first, matching the fresh-load path. The API sorts
+                // the thread newest-first and this function's own preview
+                // already takes `.first`; projecting `.last` meant a
+                // rehydrated multi-message thread showed the oldest message's
+                // sender, body and recipients, and reset a draft's Bcc to the
+                // originating mail's (absent) one.
+                if let newestMessage = cached.messages.first {
+                    emails[index].applyFields(from: newestMessage)
                 }
                 // Restore attachment metadata from cached messages
                 let allAttachments = cached.messages.flatMap { msg in

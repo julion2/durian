@@ -92,8 +92,16 @@ final class BccRoundTripTests: XCTestCase {
     /// "Edit Draft" reads. Rehydration projects a different message than
     /// applyThread does (last rather than newest), so it needs its own test —
     /// the applyThread test never reaches this code.
+    /// The thread has two messages, which is the case that distinguishes a
+    /// correct projection from an accidental one: with a single message,
+    /// `.first` and `.last` are the same element and any choice passes.
+    ///
+    /// The API sorts newest first, so the draft is `.first` and the mail it
+    /// replies to is `.last`. Projecting the wrong end restores the
+    /// originating message — whose Bcc is absent, because a received message
+    /// never has one.
     @MainActor
-    func testCacheRehydrationRestoresBcc() throws {
+    func testCacheRehydrationRestoresBccFromTheNewestMessage() throws {
         let backend = EmailBackend()
         var email = makeDraftMessage()
         // A freshly built list entry: not yet loaded, so rehydration applies.
@@ -101,7 +109,10 @@ final class BccRoundTripTests: XCTestCase {
         email.bcc = nil
         backend.emails = [email]
         backend.threadCache[email.id] = EmailBackend.CachedThread(
-            messages: [try decodeThreadMessage(bcc: "blind@example.com")],
+            messages: [
+                try decodeThreadMessage(id: "draft@example.com", bcc: "blind@example.com", body: "my draft"),
+                try decodeThreadMessage(id: "original@example.com", bcc: nil, body: "the original"),
+            ],
             timestamp: Date()
         )
 
@@ -109,6 +120,72 @@ final class BccRoundTripTests: XCTestCase {
 
         XCTAssertEqual(backend.emails[0].bcc, "blind@example.com",
                        "a draft edited after a sync must still carry its blind recipients")
+        XCTAssertEqual(backend.emails[0].body, "my draft",
+                       "rehydration must project the same message the fresh load does")
+        XCTAssertEqual(backend.emails[0].messageId, "draft@example.com")
+    }
+
+    /// Rehydration must be a no-op on the projected fields: what the user sees
+    /// and edits cannot depend on whether a sync happened in between.
+    @MainActor
+    func testCacheRehydrationMatchesTheFreshLoad() throws {
+        let messages = [
+            try decodeThreadMessage(id: "draft@example.com", bcc: "blind@example.com", body: "my draft"),
+            try decodeThreadMessage(id: "original@example.com", bcc: nil, body: "the original"),
+        ]
+
+        var freshlyLoaded = makeDraftMessage()
+        EmailBackend().applyThread(
+            ThreadContent(thread_id: "thread-1", subject: "Quarterly numbers", messages: messages),
+            to: &freshlyLoaded
+        )
+
+        let backend = EmailBackend()
+        var rehydrated = makeDraftMessage()
+        rehydrated.threadMessages = nil
+        rehydrated.bcc = nil
+        backend.emails = [rehydrated]
+        backend.threadCache[rehydrated.id] = EmailBackend.CachedThread(messages: messages, timestamp: Date())
+        backend.restoreCachedThreads()
+
+        XCTAssertEqual(backend.emails[0].bcc, freshlyLoaded.bcc)
+        XCTAssertEqual(backend.emails[0].to, freshlyLoaded.to)
+        XCTAssertEqual(backend.emails[0].cc, freshlyLoaded.cc)
+        XCTAssertEqual(backend.emails[0].body, freshlyLoaded.body)
+        XCTAssertEqual(backend.emails[0].messageId, freshlyLoaded.messageId)
+    }
+
+    /// A draft is not always the newest message in its thread: one reply
+    /// arriving after the save is enough. The card the user clicked knows
+    /// which message it renders, and that message — not the thread aggregate —
+    /// is what the compose window has to open.
+    func testCreateFromDraftPrefersTheClickedMessage() throws {
+        var aggregate = makeDraftMessage()
+        // The aggregate describes the newest message, a reply with no Bcc.
+        aggregate.bcc = nil
+        aggregate.body = "the reply"
+        aggregate.messageId = "reply@example.com"
+
+        let clickedDraft = try decodeThreadMessage(
+            id: "draft@example.com", bcc: "blind@example.com", body: "my draft")
+
+        let draft = EmailDraft.createFromDraft(message: aggregate, draftMessage: clickedDraft)
+
+        XCTAssertEqual(draft.bcc, ["blind@example.com"],
+                       "editing a draft that is not the newest message must use that draft's recipients")
+        XCTAssertEqual(draft.body, "my draft")
+        XCTAssertEqual(draft.messageId, "draft@example.com")
+    }
+
+    /// Without a named message — the whole-email footer — the aggregate stays
+    /// the source, so the existing behaviour is unchanged.
+    func testCreateFromDraftFallsBackToTheAggregate() {
+        var aggregate = makeDraftMessage()
+        aggregate.bcc = "blind@example.com"
+
+        let draft = EmailDraft.createFromDraft(message: aggregate, draftMessage: nil)
+
+        XCTAssertEqual(draft.bcc, ["blind@example.com"])
     }
 
     // MARK: - Draft projection
@@ -136,17 +213,23 @@ final class BccRoundTripTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func decodeThreadMessage(bcc: String) throws -> ThreadMessage {
+    private func decodeThreadMessage(
+        id: String = "draft@example.com",
+        bcc: String?,
+        body: String = "body"
+    ) throws -> ThreadMessage {
+        let bccField = bcc.map { "\"bcc\": \"\($0)\"," } ?? ""
         let json = """
         {
-            "id": "draft@example.com",
+            "id": "\(id)",
             "from": "author@example.com",
             "to": "to@example.com",
             "cc": "cc@example.com",
-            "bcc": "\(bcc)",
+            \(bccField)
+            "message_id": "\(id)",
             "date": "Mon, 01 Jan 2024 00:00:00 +0000",
             "timestamp": 1704067200,
-            "body": "body"
+            "body": "\(body)"
         }
         """.data(using: .utf8)!
         return try JSONDecoder().decode(ThreadMessage.self, from: json)

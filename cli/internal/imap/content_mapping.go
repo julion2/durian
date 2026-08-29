@@ -11,11 +11,11 @@ import (
 //
 // Both ingest paths share this deliberately. The legacy syncer and the
 // provider-neutral engine each used to spell the field list out for
-// themselves, so a field added to one silently stayed missing from the other
-// — Bcc reached the engine path first and the legacy path not at all, which is
-// invisible until someone runs an account that has not opted into the engine.
-// One mapper means a field can only be present for both paths or neither, and
-// a single test can hold that line.
+// themselves, so nothing but care kept them in step: when Bcc was added, both
+// copies happened to get it, but only the engine path had a test, and a
+// regression on the legacy path would have stayed green. One mapper means a
+// field can only be present for both paths or neither, and a single test
+// holds that line for both.
 func StoreMessageFromContent(messageID string, content *durianmail.MailContent, dateUnix, createdAt int64) *store.Message {
 	return &store.Message{
 		MessageID: messageID,
