@@ -187,6 +187,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		FromAddr:  content.From,
 		ToAddrs:   content.To,
 		CCAddrs:   content.CC,
+		BCCAddrs:  content.BCC,
 		InReplyTo: content.InReplyTo,
 		Refs:      content.References,
 		BodyText:  content.Body,

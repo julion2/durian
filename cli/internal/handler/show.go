@@ -87,6 +87,7 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 			From:      msg.FromAddr,
 			To:        msg.ToAddrs,
 			CC:        msg.CCAddrs,
+			BCC:       msg.BCCAddrs,
 			Date:      time.Unix(msg.Date, 0).Format(time.RFC1123Z),
 			Timestamp: msg.Date,
 			MessageID: msg.MessageID,

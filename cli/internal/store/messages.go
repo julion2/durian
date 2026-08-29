@@ -232,17 +232,25 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 	// plaintext (substring-search UX, addresses already public on the
 	// wire). No *_ct columns written for the addrs columns — v17
 	// migration drops them.
+	// bcc_ct is the exception: blind recipients are the addresses that
+	// deliberately do not travel to the other recipients, so the rationale
+	// above does not cover them. Encrypted-only, no plaintext twin.
+	bccCT, err := d.encryptMeta(msg.BCCAddrs)
+	if err != nil {
+		return fmt.Errorf("encrypt bcc: %w", err)
+	}
+
 	err = tx.QueryRow(`
 		INSERT INTO messages (
 			message_id, thread_id, in_reply_to, refs, subject_ct,
-			from_addr, to_addrs, cc_addrs,
+			from_addr, to_addrs, cc_addrs, bcc_ct,
 			date, created_at,
 			body_text_ct, body_html_ct,
 			mailbox_id, account_id,
 			is_seen, is_flagged, is_deleted, flags_other,
 			uid, size, fetched_body,
 			remote_ref, synced_flags
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id, IFNULL(account_id, 0)) DO UPDATE SET
 			subject_ct = CASE WHEN excluded.fetched_body = 1
 			                  THEN excluded.subject_ct ELSE messages.subject_ct END,
@@ -252,6 +260,8 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 			                THEN excluded.to_addrs ELSE messages.to_addrs END,
 			cc_addrs = CASE WHEN excluded.fetched_body = 1
 			                THEN excluded.cc_addrs ELSE messages.cc_addrs END,
+			bcc_ct = CASE WHEN excluded.fetched_body = 1
+			              THEN excluded.bcc_ct ELSE messages.bcc_ct END,
 			body_text_ct = CASE WHEN excluded.fetched_body = 1 AND messages.fetched_body = 0
 			                 THEN excluded.body_text_ct ELSE messages.body_text_ct END,
 			body_html_ct = CASE WHEN excluded.fetched_body = 1 AND messages.fetched_body = 0
@@ -274,7 +284,7 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 			-- the three-way merge and revert that change.
 		RETURNING id`,
 		msg.MessageID, threadID, msg.InReplyTo, msg.Refs, subjectCT,
-		msg.FromAddr, msg.ToAddrs, msg.CCAddrs,
+		msg.FromAddr, msg.ToAddrs, msg.CCAddrs, bccCT,
 		msg.Date, msg.CreatedAt,
 		bodyTextCT, bodyHTMLCT,
 		nullableID(mailboxID), nullableID(accountID),
@@ -928,7 +938,7 @@ func (d *DB) GetRecipientAddresses() ([]string, error) {
 // name_ct) and the flags string is reconstructed from is_*  + the
 // decrypted flags_other BLOB.
 const messageSelectColumns = `m.id, m.message_id, m.thread_id, m.in_reply_to, m.refs, m.subject_ct,
-		m.from_addr, m.to_addrs, m.cc_addrs, m.date, m.created_at,
+		m.from_addr, m.to_addrs, m.cc_addrs, m.bcc_ct, m.date, m.created_at,
 		m.body_text_ct, m.body_html_ct,
 		mb.name_ct, ac.name_ct,
 		m.is_seen, m.is_flagged, m.is_deleted, m.flags_other,
@@ -945,11 +955,11 @@ const messageSelectFrom = `FROM messages m
 func (d *DB) scanMessageRow(scan func(...any) error) (*Message, error) {
 	msg := &Message{}
 	var fetchedBody int
-	var subjectCT, bodyTextCT, bodyHTMLCT, flagsOtherCT, mailboxNameCT, accountNameCT []byte
+	var subjectCT, bodyTextCT, bodyHTMLCT, flagsOtherCT, mailboxNameCT, accountNameCT, bccCT []byte
 	var isSeen, isFlagged, isDeleted int
 	if err := scan(
 		&msg.ID, &msg.MessageID, &msg.ThreadID, &msg.InReplyTo, &msg.Refs, &subjectCT,
-		&msg.FromAddr, &msg.ToAddrs, &msg.CCAddrs, &msg.Date, &msg.CreatedAt,
+		&msg.FromAddr, &msg.ToAddrs, &msg.CCAddrs, &bccCT, &msg.Date, &msg.CreatedAt,
 		&bodyTextCT, &bodyHTMLCT,
 		&mailboxNameCT, &accountNameCT,
 		&isSeen, &isFlagged, &isDeleted, &flagsOtherCT,
@@ -967,6 +977,9 @@ func (d *DB) scanMessageRow(scan func(...any) error) (*Message, error) {
 	}
 	if msg.BodyHTML, err = d.decryptBody("", bodyHTMLCT); err != nil {
 		return nil, err
+	}
+	if msg.BCCAddrs, err = d.decryptMeta("", bccCT); err != nil {
+		return nil, fmt.Errorf("decrypt bcc: %w", err)
 	}
 	if msg.Mailbox, err = d.decryptMeta("", mailboxNameCT); err != nil {
 		return nil, fmt.Errorf("decrypt mailbox name: %w", err)

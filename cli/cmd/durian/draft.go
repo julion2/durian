@@ -278,6 +278,7 @@ func saveDraftToLocalStore(account *config.AccountConfig, messageID string, msg 
 		FromAddr:    fromAddr,
 		ToAddrs:     strings.Join(msg.To, ", "),
 		CCAddrs:     strings.Join(msg.CC, ", "),
+		BCCAddrs:    strings.Join(msg.BCC, ", "),
 		InReplyTo:   msg.InReplyTo,
 		Refs:        msg.References,
 		Date:        now,
