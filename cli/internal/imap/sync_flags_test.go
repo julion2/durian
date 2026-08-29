@@ -187,8 +187,13 @@ func TestSyncFlags_UntaggedMessageStillReconciles(t *testing.T) {
 	if tags := messageTags(t, db, "no-tags@test"); !slices.Contains(tags, "flagged") {
 		t.Errorf("tags = %v, want the server-side star downloaded", tags)
 	}
-	if _, ok := mbox.GetMessageFlags(1); !ok {
-		t.Error("baseline was never written; the message was skipped entirely")
+
+	// The exact advanced baseline, not merely its presence: this test seeds one
+	// itself, so "a baseline exists" would hold even if the pass had skipped
+	// the message entirely.
+	want := FlagState{Seen: true, Flagged: true}
+	if got, ok := mbox.GetMessageFlags(1); !ok || got != want {
+		t.Errorf("baseline = %+v, present=%v; want %+v", got, ok, want)
 	}
 }
 
