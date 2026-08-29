@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/julion2/durian/cli/internal/protocol"
+	"github.com/julion2/durian/cli/internal/store"
 	"github.com/julion2/durian/cli/internal/tagsync"
 )
 
@@ -40,8 +41,21 @@ func (h *Handler) tag(query string, tags string, dryRun bool) protocol.Response 
 	if err != nil {
 		return protocol.Fail(protocol.ErrBackendError, err)
 	}
+	// The accounts the query restricted itself to. The filter narrows the
+	// search; everything derived from the results afterwards has to be narrowed
+	// by the same set, or the operation escapes the scope the user asked for.
+	// It used to escape: the search found only the selected account's threads,
+	// and the mutation then ran thread-wide, writing tags into accounts that
+	// were never selected.
+	accounts := h.store.QueryAccounts(expanded)
+
 	threadIDs := make([]string, 0, len(results))
+	seenThread := make(map[string]bool, len(results))
 	for _, r := range results {
+		if seenThread[r.Thread] {
+			continue
+		}
+		seenThread[r.Thread] = true
 		threadIDs = append(threadIDs, r.Thread)
 	}
 
@@ -51,11 +65,28 @@ func (h *Handler) tag(query string, tags string, dryRun bool) protocol.Response 
 
 	changedThreads := 0
 	for _, threadID := range threadIDs {
+		// One resolved set of rows per thread, feeding every effect below.
+		// Each of them working out "which messages" for itself is how they
+		// drifted apart in the first place.
+		target, err := h.store.ThreadTagTarget(threadID, accounts)
+		if err != nil {
+			return protocol.Fail(protocol.ErrBackendError, err)
+		}
+		if len(target) == 0 {
+			// The thread matched, but none of its messages are in scope.
+			continue
+		}
+
+		ids := make([]int64, 0, len(target))
+		for _, row := range target {
+			ids = append(ids, row.DBID)
+		}
+
 		var changed bool
 		if dryRun {
-			changed, err = h.store.PreviewTagChangesByThread(threadID, add, remove)
+			changed, err = h.store.PreviewTagChangesByDBIDs(ids, add, remove)
 		} else {
-			changed, err = h.store.ModifyTagsByThread(threadID, add, remove)
+			changed, err = h.store.ModifyTagsByDBIDs(ids, add, remove)
 		}
 		if err != nil {
 			return protocol.Fail(protocol.ErrBackendError, err)
@@ -64,19 +95,15 @@ func (h *Handler) tag(query string, tags string, dryRun bool) protocol.Response 
 			changedThreads++
 		}
 		if !dryRun && (h.tagSync != nil || h.tagSyncEnabled) {
-			h.journalTagChanges(threadID, add, remove)
+			h.journalTagChanges(target, add, remove)
 		}
 		if !dryRun && h.syncTrigger != nil {
-			accounts, err := h.store.GetAccountsByThread(threadID)
-			if err != nil {
-				slog.Debug("Failed to get accounts for sync trigger", "module", "TAG", "thread", threadID, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-			}
-			for _, account := range accounts {
+			for _, account := range targetAccounts(target) {
 				h.syncTrigger.TriggerSync(account)
 			}
 		}
 		if !dryRun && h.tagSync != nil {
-			go h.pushTagChanges(threadID, add, remove)
+			go h.pushTagChanges(target, add, remove)
 		}
 	}
 
@@ -84,40 +111,48 @@ func (h *Handler) tag(query string, tags string, dryRun bool) protocol.Response 
 	return protocol.SuccessWithTagChanges(len(threadIDs), changedThreads)
 }
 
-// journalTagChanges records tag changes in the local journal for later sync.
-// Uses GetAccountsByThread instead of GetByThread to avoid dedup dropping
-// multi-account entries.
-func (h *Handler) journalTagChanges(threadID string, add, remove []string) {
-	// Get all (message_id, account) pairs without dedup
-	msgs, err := h.store.GetAllByThread(threadID)
-	if err != nil || len(msgs) == 0 {
-		return
+// targetAccounts returns the distinct accounts a resolved target spans, in
+// first-seen order. The sync trigger reads them from the target rather than
+// asking the store again: a second query is a second chance to disagree with
+// what was actually written.
+func targetAccounts(target []store.TagTargetRow) []string {
+	seen := make(map[string]bool, len(target))
+	out := make([]string, 0, len(target))
+	for _, row := range target {
+		if row.Account == "" || seen[row.Account] {
+			continue
+		}
+		seen[row.Account] = true
+		out = append(out, row.Account)
 	}
+	return out
+}
+
+// journalTagChanges records tag changes in the local journal for later sync.
+// It journals exactly the rows that were written — re-querying the thread would
+// record entries for messages the operation deliberately left alone.
+func (h *Handler) journalTagChanges(target []store.TagTargetRow, add, remove []string) {
 	now := time.Now().Unix()
-	for _, msg := range msgs {
+	for _, row := range target {
 		for _, tag := range add {
-			h.store.JournalTagChange(msg.MessageID, msg.Account, tag, "add", now)
+			h.store.JournalTagChange(row.MessageID, row.Account, tag, "add", now)
 		}
 		for _, tag := range remove {
-			h.store.JournalTagChange(msg.MessageID, msg.Account, tag, "remove", now)
+			h.store.JournalTagChange(row.MessageID, row.Account, tag, "remove", now)
 		}
 	}
 }
 
-// pushTagChanges sends tag changes for a thread to the remote sync server.
-func (h *Handler) pushTagChanges(threadID string, add, remove []string) {
-	msgs, err := h.store.GetAllByThread(threadID)
-	if err != nil || len(msgs) == 0 {
-		return
-	}
-
+// pushTagChanges sends tag changes to the remote sync server for exactly the
+// rows that were written, for the same reason the journal does.
+func (h *Handler) pushTagChanges(target []store.TagTargetRow, add, remove []string) {
 	var changes []tagsync.TagChange
 	now := time.Now().Unix()
-	for _, msg := range msgs {
+	for _, row := range target {
 		for _, tag := range add {
 			changes = append(changes, tagsync.TagChange{
-				MessageID: msg.MessageID,
-				Account:   msg.Account,
+				MessageID: row.MessageID,
+				Account:   row.Account,
 				Tag:       tag,
 				Action:    "add",
 				Timestamp: now,
@@ -125,13 +160,16 @@ func (h *Handler) pushTagChanges(threadID string, add, remove []string) {
 		}
 		for _, tag := range remove {
 			changes = append(changes, tagsync.TagChange{
-				MessageID: msg.MessageID,
-				Account:   msg.Account,
+				MessageID: row.MessageID,
+				Account:   row.Account,
 				Tag:       tag,
 				Action:    "remove",
 				Timestamp: now,
 			})
 		}
+	}
+	if len(changes) == 0 {
+		return
 	}
 
 	if err := h.tagSync.Push(changes); err != nil {

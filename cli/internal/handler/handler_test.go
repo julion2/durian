@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -562,5 +563,66 @@ func TestStoreDownloadAttachmentNotFound(t *testing.T) {
 	err := h.DownloadAttachment("nonexistent@test", 1, w)
 	if err == nil {
 		t.Error("expected error for nonexistent attachment")
+	}
+}
+
+// TestTagAccountScopeStaysWithinSelectedAccounts is the contract the account
+// filter used to break. It narrowed the thread search only: the mutation then
+// ran thread-wide, so tagging in one account wrote into every other account
+// sharing that thread — and the journal recorded those writes too, so the
+// change propagated on the next sync.
+//
+// One resolved set of rows feeds the mutation, the journal and the trigger, so
+// there is no second place for the scope to be decided differently.
+func TestTagAccountScopeStaysWithinSelectedAccounts(t *testing.T) {
+	db := newTestStore(t)
+	now := time.Now().Unix()
+
+	// The same conversation in two accounts: one thread, rows in both.
+	for _, account := range []string{"work", "personal"} {
+		if err := db.InsertMessage(&store.Message{
+			MessageID: "shared-" + account + "@test", Subject: "Shared thread",
+			FromAddr: "a@example.com", ToAddrs: "b@example.com",
+			Refs: "<root@test>", InReplyTo: "<root@test>",
+			Date: now, CreatedAt: now, Mailbox: "INBOX",
+			Account: account, FetchedBody: true,
+		}); err != nil {
+			t.Fatalf("insert %s message: %v", account, err)
+		}
+	}
+
+	work, err := db.GetByMessageID("shared-work@test")
+	if err != nil || work == nil {
+		t.Fatalf("get work message: %+v err=%v", work, err)
+	}
+	personal, err := db.GetByMessageID("shared-personal@test")
+	if err != nil || personal == nil {
+		t.Fatalf("get personal message: %+v err=%v", personal, err)
+	}
+	if work.ThreadID != personal.ThreadID {
+		t.Fatalf("fixture threads differ (%q vs %q); this case needs one shared thread",
+			work.ThreadID, personal.ThreadID)
+	}
+
+	h := New(db, nil)
+	resp := h.Tag("thread:"+work.ThreadID+" path:work", "+archived")
+	if !resp.OK {
+		t.Fatalf("Tag failed: %s", resp.Error)
+	}
+
+	workTags, err := db.GetMessageTags(work.ID)
+	if err != nil {
+		t.Fatalf("get work tags: %v", err)
+	}
+	if !slices.Contains(workTags, "archived") {
+		t.Errorf("work tags = %v, want the tag applied", workTags)
+	}
+
+	personalTags, err := db.GetMessageTags(personal.ID)
+	if err != nil {
+		t.Fatalf("get personal tags: %v", err)
+	}
+	if slices.Contains(personalTags, "archived") {
+		t.Errorf("personal tags = %v: the mutation escaped the selected account", personalTags)
 	}
 }

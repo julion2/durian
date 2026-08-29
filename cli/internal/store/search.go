@@ -983,6 +983,15 @@ func parseDateEnd(s string) (int64, error) {
 	return 0, fmt.Errorf("unsupported date format: %q", s)
 }
 
+// QueryAccounts reports the accounts a query restricts itself to, or nil when
+// it names none. A caller that mutates what a query matched needs this: the
+// filter narrows the search, and anything derived from the results afterwards
+// has to be narrowed by the same set or it silently escapes the scope the user
+// asked for.
+func (d *DB) QueryAccounts(query string) []string {
+	return extractAccounts(query)
+}
+
 // extractAccounts parses the query and collects account names from path: filters.
 func extractAccounts(query string) []string {
 	tokens := lex(query)
