@@ -95,7 +95,14 @@ func runTag(cmd *cobra.Command, args []string) error {
 	if strings.TrimSpace(query) == "*" && !tagAll {
 		return fmt.Errorf("an unbounded tag selector requires --all")
 	}
-	var err error
+	// The flag narrows the search through the query, and is also handed to the
+	// handler as the mutation scope. Both, not either: the query form cannot be
+	// told apart from a user writing path: themselves, so the handler must be
+	// given the scope rather than left to infer it.
+	accountScope, err := resolveAccountStoreKeys(tagAccounts)
+	if err != nil {
+		return err
+	}
 	query, err = scopeQueryByAccounts(query, tagAccounts)
 	if err != nil {
 		return err
@@ -127,9 +134,9 @@ func runTag(cmd *cobra.Command, args []string) error {
 	tagsStr := strings.Join(tags, " ")
 	var resp protocol.Response
 	if tagDryRun {
-		resp = h.PreviewTag(query, tagsStr)
+		resp = h.PreviewTag(query, tagsStr, accountScope)
 	} else {
-		resp = h.Tag(query, tagsStr)
+		resp = h.Tag(query, tagsStr, accountScope)
 	}
 
 	if !resp.OK {

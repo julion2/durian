@@ -215,6 +215,6 @@ func (h *Handler) TagThreadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := h.Tag("thread:"+threadID, tagRequest.Tags)
+	response := h.Tag("thread:"+threadID, tagRequest.Tags, nil)
 	writeJSON(w, response)
 }

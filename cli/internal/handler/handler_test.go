@@ -296,7 +296,7 @@ func TestStoreTag(t *testing.T) {
 	m1, _ := db.GetByMessageID("msg1@test")
 	h := New(db, nil)
 
-	resp := h.Tag("thread:"+m1.ThreadID, "+archived -unread")
+	resp := h.Tag("thread:"+m1.ThreadID, "+archived -unread", nil)
 
 	if !resp.OK {
 		t.Fatalf("Tag failed: %s", resp.Error)
@@ -330,7 +330,7 @@ func TestStoreTagBySearchQuery(t *testing.T) {
 	seedStoreData(t, db)
 
 	h := New(db, nil)
-	resp := h.Tag("tag:inbox", "+archived")
+	resp := h.Tag("tag:inbox", "+archived", nil)
 
 	if !resp.OK {
 		t.Errorf("tag by search query should succeed, got error: %s", resp.Error)
@@ -342,7 +342,7 @@ func TestStoreTagRejectsUnsupportedQueryWithoutChanges(t *testing.T) {
 	seedStoreData(t, db)
 	h := New(db, nil)
 
-	resp := h.Tag("folder:INBOX", "+todo")
+	resp := h.Tag("folder:INBOX", "+todo", nil)
 	if resp.OK {
 		t.Fatal("tag with unsupported query field succeeded")
 	}
@@ -364,7 +364,7 @@ func TestStoreTagNoMatchesFails(t *testing.T) {
 	seedStoreData(t, db)
 	h := New(db, nil)
 
-	resp := h.Tag("from:nobody@example.com", "+todo")
+	resp := h.Tag("from:nobody@example.com", "+todo", nil)
 	if resp.OK {
 		t.Fatal("tag with no matches succeeded")
 	}
@@ -378,7 +378,7 @@ func TestPreviewTagReportsEffectWithoutChanges(t *testing.T) {
 	seedStoreData(t, db)
 	h := New(db, nil)
 
-	resp := h.PreviewTag("tag:inbox", "+todo")
+	resp := h.PreviewTag("tag:inbox", "+todo", nil)
 	if !resp.OK || resp.MatchedThreads == nil || resp.ChangedThreads == nil || *resp.ChangedThreads == 0 {
 		t.Fatalf("preview effect = %+v", resp)
 	}
@@ -605,7 +605,7 @@ func TestTagAccountScopeStaysWithinSelectedAccounts(t *testing.T) {
 	}
 
 	h := New(db, nil)
-	resp := h.Tag("thread:"+work.ThreadID+" path:work", "+archived")
+	resp := h.Tag("thread:"+work.ThreadID, "+archived", []string{"work"})
 	if !resp.OK {
 		t.Fatalf("Tag failed: %s", resp.Error)
 	}
@@ -674,7 +674,7 @@ func TestTagAccountScopeGovernsEveryEffect(t *testing.T) {
 	h.SetSyncTrigger(trigger)
 	h.EnableTagJournal()
 
-	resp := h.Tag("thread:"+thread+" path:work", "+archived")
+	resp := h.Tag("thread:"+thread, "+archived", []string{"work"})
 	if !resp.OK {
 		t.Fatalf("Tag failed: %s", resp.Error)
 	}
@@ -705,6 +705,24 @@ func TestTagAccountScopeGovernsEveryEffect(t *testing.T) {
 	if !slices.Equal(trigger.accounts, []string{"work"}) {
 		t.Errorf("sync triggered for %v, want only [work]", trigger.accounts)
 	}
+
+	// The fifth consumer. The push itself runs in a goroutine against a
+	// concrete client, but its payload is a pure function of the same target,
+	// so the scope is assertable without the network.
+	target, err := db.ThreadTagTarget(thread, []string{"work"})
+	if err != nil {
+		t.Fatalf("resolve target: %v", err)
+	}
+	changes := tagChangesFor(target, []string{"archived"}, nil, 0)
+	if len(changes) == 0 {
+		t.Fatal("no changes built; the loop below would assert nothing")
+	}
+	for _, change := range changes {
+		if change.Account != "work" {
+			t.Errorf("remote push carries account %q (message %q): the unselected account would be tagged on the server",
+				change.Account, change.MessageID)
+		}
+	}
 }
 
 // TestTagWithoutAccountScopeSpansTheThread pins the other half of the contract:
@@ -718,7 +736,7 @@ func TestTagWithoutAccountScopeSpansTheThread(t *testing.T) {
 	h := New(db, nil)
 	h.SetSyncTrigger(trigger)
 
-	resp := h.Tag("thread:"+msgs["work"].ThreadID, "+archived")
+	resp := h.Tag("thread:"+msgs["work"].ThreadID, "+archived", nil)
 	if !resp.OK {
 		t.Fatalf("Tag failed: %s", resp.Error)
 	}
@@ -745,7 +763,7 @@ func TestTagMultipleAccountScopeIsTheUnion(t *testing.T) {
 	msgs := seedSharedThread(t, db, "work", "personal", "archive")
 
 	h := New(db, nil)
-	resp := h.Tag("thread:"+msgs["work"].ThreadID+" (path:work or path:personal)", "+archived")
+	resp := h.Tag("thread:"+msgs["work"].ThreadID, "+archived", []string{"work", "personal"})
 	if !resp.OK {
 		t.Fatalf("Tag failed: %s", resp.Error)
 	}
@@ -783,7 +801,7 @@ func TestTagPreviewSharesTheScopeAndWritesNothing(t *testing.T) {
 	}
 
 	h := New(db, nil)
-	resp := h.PreviewTag("thread:"+msgs["work"].ThreadID+" path:work", "+archived")
+	resp := h.PreviewTag("thread:"+msgs["work"].ThreadID, "+archived", []string{"work"})
 	if !resp.OK {
 		t.Fatalf("PreviewTag failed: %s", resp.Error)
 	}
@@ -819,21 +837,20 @@ func TestTagPreviewSharesTheScopeAndWritesNothing(t *testing.T) {
 	}
 }
 
-// TestTagNamingAnAbsentAccountChangesNothing covers a filter that selects an
-// account the thread has no messages in. The search and the target resolution
-// use the same account set, so this is refused at the search — the empty-target
-// skip in the handler is a guard for the case where they ever disagree again,
-// not a path this reaches.
+// TestTagNamingAnAbsentAccountChangesNothing covers a scope that selects an
+// account the thread has no messages in. The search still matches the thread —
+// it is reached through the accounts that do hold it — so this is the case the
+// empty-target skip exists for: matched by the query, empty after scoping.
 //
-// What matters to the user is the same either way: nothing is written and
-// nothing is journalled.
+// Nothing may be written, nothing journalled, and the thread must not be
+// counted as matched.
 func TestTagNamingAnAbsentAccountChangesNothing(t *testing.T) {
 	db := newTestStore(t)
 	msgs := seedSharedThread(t, db, "work", "personal")
 
 	h := New(db, nil)
 	h.EnableTagJournal()
-	resp := h.Tag("thread:"+msgs["work"].ThreadID+" path:archive", "+archived")
+	resp := h.Tag("thread:"+msgs["work"].ThreadID, "+archived", []string{"archive"})
 
 	if resp.OK && resp.MatchedThreads != nil && *resp.MatchedThreads != 0 {
 		t.Errorf("matched threads = %v, want 0: no message was in scope", resp.MatchedThreads)

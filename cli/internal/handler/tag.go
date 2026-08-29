@@ -10,17 +10,28 @@ import (
 	"github.com/julion2/durian/cli/internal/tagsync"
 )
 
-// Tag handles the "tag" command.
-func (h *Handler) Tag(query string, tags string) protocol.Response {
-	return h.tag(query, tags, false)
+// Tag handles the "tag" command. accounts is the explicit account scope the
+// caller resolved — nil means the operation spans whichever accounts the
+// matched threads reach.
+func (h *Handler) Tag(query string, tags string, accounts []string) protocol.Response {
+	return h.tag(query, tags, accounts, false)
 }
 
 // PreviewTag validates and resolves a tag operation without modifying data.
-func (h *Handler) PreviewTag(query string, tags string) protocol.Response {
-	return h.tag(query, tags, true)
+func (h *Handler) PreviewTag(query string, tags string, accounts []string) protocol.Response {
+	return h.tag(query, tags, accounts, true)
 }
 
-func (h *Handler) tag(query string, tags string, dryRun bool) protocol.Response {
+// tag applies a tag operation.
+//
+// accounts arrives already resolved, separately from query, and that separation
+// is the point. It was briefly recovered from the query's AST instead, which
+// cannot work: "path:work" written as a search term is indistinguishable from
+// the same clause produced by --account, so a plain search silently narrowed
+// the mutation. Worse, the AST walk ignored NOT, so "NOT path:personal"
+// collected personal as a scope and let the write back into the very account
+// the user excluded. A scope has to be carried, not reconstructed.
+func (h *Handler) tag(query string, tags string, accounts []string, dryRun bool) protocol.Response {
 	tagList := strings.Fields(tags)
 	if len(tagList) == 0 {
 		return protocol.FailWithMessage(protocol.ErrInvalidJSON, "no tags provided")
@@ -41,14 +52,6 @@ func (h *Handler) tag(query string, tags string, dryRun bool) protocol.Response 
 	if err != nil {
 		return protocol.Fail(protocol.ErrBackendError, err)
 	}
-	// The accounts the query restricted itself to. The filter narrows the
-	// search; everything derived from the results afterwards has to be narrowed
-	// by the same set, or the operation escapes the scope the user asked for.
-	// It used to escape: the search found only the selected account's threads,
-	// and the mutation then ran thread-wide, writing tags into accounts that
-	// were never selected.
-	accounts := h.store.QueryAccounts(expanded)
-
 	threadIDs := make([]string, 0, len(results))
 	seenThread := make(map[string]bool, len(results))
 	for _, r := range results {
@@ -149,11 +152,12 @@ func (h *Handler) journalTagChanges(target []store.TagTargetRow, add, remove []s
 	}
 }
 
-// pushTagChanges sends tag changes to the remote sync server for exactly the
-// rows that were written, for the same reason the journal does.
-func (h *Handler) pushTagChanges(target []store.TagTargetRow, add, remove []string) {
+// tagChangesFor builds the remote payload from a resolved target. Separated
+// from the push so the scope can be asserted directly: the network call runs in
+// a goroutine against a concrete client, but what it would carry is a pure
+// function of the rows the mutation touched.
+func tagChangesFor(target []store.TagTargetRow, add, remove []string, now int64) []tagsync.TagChange {
 	var changes []tagsync.TagChange
-	now := time.Now().Unix()
 	for _, row := range target {
 		for _, tag := range add {
 			changes = append(changes, tagsync.TagChange{
@@ -174,6 +178,13 @@ func (h *Handler) pushTagChanges(target []store.TagTargetRow, add, remove []stri
 			})
 		}
 	}
+	return changes
+}
+
+// pushTagChanges sends tag changes to the remote sync server for exactly the
+// rows that were written, for the same reason the journal does.
+func (h *Handler) pushTagChanges(target []store.TagTargetRow, add, remove []string) {
+	changes := tagChangesFor(target, add, remove, time.Now().Unix())
 	if len(changes) == 0 {
 		return
 	}
