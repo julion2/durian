@@ -63,6 +63,11 @@ func (h *Handler) tag(query string, tags string, dryRun bool) protocol.Response 
 		return protocol.FailWithMessage(protocol.ErrNotFound, "query matched no threads; no tags were changed")
 	}
 
+	// Counted from the resolved targets, not from the search. A thread the
+	// search found but whose messages are all outside the account scope is not
+	// something this operation matched — reporting it would tell the user work
+	// happened where none did.
+	matchedThreads := 0
 	changedThreads := 0
 	for _, threadID := range threadIDs {
 		// One resolved set of rows per thread, feeding every effect below.
@@ -73,9 +78,10 @@ func (h *Handler) tag(query string, tags string, dryRun bool) protocol.Response 
 			return protocol.Fail(protocol.ErrBackendError, err)
 		}
 		if len(target) == 0 {
-			// The thread matched, but none of its messages are in scope.
+			// The search matched it, but none of its messages are in scope.
 			continue
 		}
+		matchedThreads++
 
 		ids := make([]int64, 0, len(target))
 		for _, row := range target {
@@ -107,8 +113,8 @@ func (h *Handler) tag(query string, tags string, dryRun bool) protocol.Response 
 		}
 	}
 
-	slog.Info("Tag operation complete", "module", "TAG", "dry_run", dryRun, "matched_threads", len(threadIDs), "changed_threads", changedThreads, "add", add, "remove", remove)
-	return protocol.SuccessWithTagChanges(len(threadIDs), changedThreads)
+	slog.Info("Tag operation complete", "module", "TAG", "dry_run", dryRun, "matched_threads", matchedThreads, "changed_threads", changedThreads, "add", add, "remove", remove)
+	return protocol.SuccessWithTagChanges(matchedThreads, changedThreads)
 }
 
 // targetAccounts returns the distinct accounts a resolved target spans, in
