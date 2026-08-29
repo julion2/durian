@@ -104,17 +104,25 @@ func TestJSONOutputKeepsRemoteValuesVerbatim(t *testing.T) {
 	})
 
 	t.Run("ical uid", func(t *testing.T) {
-		event := calendar.Event{ICalUID: "uid" + hostile + "@example.com", Subject: "Standup"}
-		encoded, err := json.Marshal(event)
+		// Through ToCalendarEvent, which is what the CLI actually marshals.
+		// Asserting calendar.Event would leave the projection itself
+		// unguarded — that is where a stray sanitization would sit.
+		uid := "uid" + hostile + "@example.com"
+		dto := calendar.ToCalendarEvent("Work", calendar.Event{
+			ICalUID: uid,
+			Subject: "Standup",
+		}, true)
+
+		encoded, err := json.Marshal(dto)
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
-		var decoded calendar.Event
+		var decoded calendar.CalendarEvent
 		if err := json.Unmarshal(encoded, &decoded); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
-		if decoded.ICalUID != event.ICalUID {
-			t.Errorf("ical uid = %q, want %q", decoded.ICalUID, event.ICalUID)
+		if decoded.UID != uid {
+			t.Errorf("uid = %q, want %q", decoded.UID, uid)
 		}
 		assertNoTerminalMarker(t, encoded)
 	})
