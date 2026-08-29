@@ -266,23 +266,17 @@ func commitAttachmentFile(tmp *os.File, path string, force bool) error {
 		return nil
 	case os.IsExist(err):
 		return fmt.Errorf("output file already exists: %s (use --force to overwrite)", path)
+	default:
+		// No fallback. Reserving the name with O_EXCL and renaming onto it
+		// would work on a filesystem without hardlinks, but it reintroduces
+		// exactly the window this function exists to close — an empty
+		// destination between the two steps — and it would do so for every
+		// link failure, not only the unsupported ones. An attachment can be
+		// downloaded again; a file replaced by a zero-byte one cannot be
+		// recovered. Report it and let the caller pass --force or another
+		// path.
+		return fmt.Errorf("link download into place (use --force, or choose another --output): %w", err)
 	}
-
-	// Some filesystems do not support hardlinks. Fall back to reserving the
-	// name and renaming onto it: the crash window returns, but refusing to save
-	// the download at all would be worse.
-	reserved, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		if os.IsExist(err) {
-			return fmt.Errorf("output file already exists: %s (use --force to overwrite)", path)
-		}
-		return fmt.Errorf("create file: %w", err)
-	}
-	reserved.Close()
-	if err := os.Rename(name, path); err != nil {
-		return fmt.Errorf("move download into place: %w", err)
-	}
-	return nil
 }
 
 // discardAttachmentFile drops a partial download. The destination is untouched
