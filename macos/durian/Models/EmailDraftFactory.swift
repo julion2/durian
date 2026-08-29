@@ -16,11 +16,17 @@ extension EmailDraft {
     static func createFromDraft(message: MailMessage) -> EmailDraft {
         let toAddresses = message.to.map { parseEmailList($0) } ?? []
         let ccAddresses = message.cc.map { parseEmailList($0) } ?? []
+        // Blind recipients only survive inside our own Drafts mailbox — the
+        // sending server strips the header on delivery. Losing them here means
+        // saving the reopened draft mails it to fewer people than the user
+        // addressed, with nothing on screen to say so.
+        let bccAddresses = message.bcc.map { parseEmailList($0) } ?? []
 
         var draft = EmailDraft(
             from: message.from,
             to: toAddresses,
             cc: ccAddresses,
+            bcc: bccAddresses,
             subject: message.subject,
             body: message.body ?? "",
             isHTML: message.htmlBody != nil && !(message.htmlBody?.isEmpty ?? true),

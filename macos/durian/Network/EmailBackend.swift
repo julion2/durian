@@ -874,6 +874,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
             email.htmlBody = newestMessage.html
             email.to = newestMessage.to
             email.cc = newestMessage.cc
+            email.bcc = newestMessage.bcc
             email.messageId = newestMessage.message_id
             email.inReplyTo = newestMessage.in_reply_to
             email.references = newestMessage.references

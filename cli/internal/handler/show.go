@@ -87,7 +87,6 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 			From:      msg.FromAddr,
 			To:        msg.ToAddrs,
 			CC:        msg.CCAddrs,
-			BCC:       msg.BCCAddrs,
 			Date:      time.Unix(msg.Date, 0).Format(time.RFC1123Z),
 			Timestamp: msg.Date,
 			MessageID: msg.MessageID,
@@ -98,6 +97,10 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 			info.InReplyTo = msg.InReplyTo
 			info.References = msg.Refs
 			info.HTML = sanitize.StripQuotedContent(msg.BodyHTML)
+			// Only the full view reopens a draft for editing, which is the
+			// one caller that needs the blind recipients. Enriched search
+			// results would otherwise decrypt and ship them on every hit.
+			info.BCC = msg.BCCAddrs
 		}
 
 		if subject == "" {

@@ -65,6 +65,13 @@ swift_test(
 )
 
 swift_test(
+    name = "bcc_round_trip_test",
+    size = "small",
+    srcs = ["tests/BccRoundTripTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
     name = "model_test",
     size = "small",
     srcs = ["tests/ModelTests.swift"],

@@ -28,6 +28,11 @@ struct ThreadMessage: Decodable, Identifiable, Equatable {
     let from: String
     let to: String?
     let cc: String?
+    /// Blind recipients. Only populated for a draft the user saved themselves,
+    /// and only by the full thread view — a received message has no Bcc header
+    /// and search enrichment deliberately omits the field. Dropping it here
+    /// means a reopened draft is saved without its blind recipients.
+    let bcc: String?
     let date: String
     let timestamp: Int
     let message_id: String?
@@ -202,6 +207,7 @@ struct MailMessage: Identifiable, Hashable {
     var from: String
     var to: String?
     var cc: String?
+    var bcc: String?
     var date: String
     let timestamp: Int  // Unix timestamp for grouping
     var tags: String?
