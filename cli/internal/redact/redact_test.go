@@ -106,10 +106,15 @@ func TestSanitizeStripsURLUserinfo(t *testing.T) {
 			secrets: []string{"pa(ss)"},
 		},
 		{
-			name:    "every sub-delim at once",
-			in:      `https://alice:a,b;c'd(e)f@host.example/x`,
+			// The complete sub-delims production from RFC 3986 §2.2, not just
+			// the five that used to terminate the authority. Written against
+			// the grammar rather than against examples: the earlier version of
+			// this scan looked correct precisely because every fixture used an
+			// alphanumeric password.
+			name:    "every RFC 3986 sub-delim in the password",
+			in:      `https://alice:!$&'()*+,;=@host.example/x`,
 			want:    `https://[REDACTED]@host.example/x`,
-			secrets: []string{"a,b;c'd(e)f"},
+			secrets: []string{`!$&'()*+,;=`},
 		},
 	}
 
