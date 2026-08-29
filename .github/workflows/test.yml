@@ -123,6 +123,17 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_26.4.1.app
 
+      - name: Install Pkl 0.31.1
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl --fail --silent --show-error --location \
+            https://github.com/apple/pkl/releases/download/0.31.1/pkl-macos-aarch64 \
+            --output "$RUNNER_TEMP/bin/pkl"
+          chmod +x "$RUNNER_TEMP/bin/pkl"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          echo "PKL_EXEC=$RUNNER_TEMP/bin/pkl" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/bin/pkl" --version | grep -F "Pkl 0.31.1"
+
       - name: Mount Bazel cache
         uses: actions/cache@v4
         with:
@@ -136,7 +147,7 @@ jobs:
           swiftformat --lint macos/
 
       - name: Test
-        run: bazel test //macos:all --build_tests_only --test_output=errors
+        run: bazel test //macos:all --build_tests_only --test_output=errors --test_env=DURIAN_REQUIRE_PKL_TESTS=1 --test_env=PKL_EXEC
 
   linux:
     name: Linux GUI (Qt)

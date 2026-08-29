@@ -5,37 +5,86 @@ class SettingsManager: ObservableObject {
     static let shared = SettingsManager()
 
     @Published var settings: AppSettings = AppSettings()
+    @Published private(set) var isReady = false
     private var cancellables = Set<AnyCancellable>()
+    private var loadTask: Task<Void, Never>?
+    private let configManager: ConfigManager
+    private let autoSaveDelay: TimeInterval
+    private let saveHandler: ((AppSettings) -> Void)?
 
-    private init() {
-        loadSettings()
+    init(
+        configManager: ConfigManager = .shared,
+        autoSaveDelay: TimeInterval = 0.5,
+        saveHandler: ((AppSettings) -> Void)? = nil
+    ) {
+        self.configManager = configManager
+        self.autoSaveDelay = autoSaveDelay
+        self.saveHandler = saveHandler
         setupAutoSave()
     }
 
-    private func loadSettings() {
-        settings = ConfigManager.shared.getSettings()
+    /// Load settings once for startup. Concurrent callers join the same task.
+    @MainActor
+    func prepareSettings() async {
+        guard !isReady else { return }
+        await loadSettings()
+    }
+
+    @MainActor
+    private func loadSettings() async {
+        if let loadTask {
+            await loadTask.value
+            return
+        }
+
+        await startSettingsLoad()
+    }
+
+    @MainActor
+    private func startSettingsLoad() async {
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await configManager.reloadConfig()
+            settings = configManager.getSettings()
+            isReady = true
+            loadTask = nil
+        }
+        loadTask = task
+        await task.value
+    }
+
+    @MainActor
+    func applyEvaluatedConfig(_ config: AppConfig) {
+        configManager.applyEvaluatedConfig(config)
+        settings = config.settings
+        isReady = true
     }
 
     private func setupAutoSave() {
         // Auto-save when settings change
         $settings
             .dropFirst() // Skip initial value
-            .debounce(for: .seconds(0.5), scheduler: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.saveSettings()
+            .filter { [weak self] _ in self?.isReady == true }
+            .debounce(for: .seconds(autoSaveDelay), scheduler: DispatchQueue.main)
+            .sink { [weak self] settings in
+                self?.saveSettings(settings)
             }
             .store(in: &cancellables)
     }
 
-    private func saveSettings() {
-        ConfigManager.shared.updateSettings(settings)
+    private func saveSettings(_ settings: AppSettings) {
+        if let saveHandler {
+            saveHandler(settings)
+        } else {
+            configManager.updateSettings(settings)
+        }
     }
 
     // MARK: - Sync Settings (read from [sync] section)
 
     /// Sync settings are read-only from config.pkl [sync] section
     var syncSettings: SyncSettings {
-        ConfigManager.shared.getSyncSettings()
+        configManager.getSyncSettings()
     }
 
     /// Whether GUI auto-sync is enabled
@@ -66,9 +115,11 @@ class SettingsManager: ObservableObject {
     }
 
     @MainActor
-    func reloadSettings() {
-        ConfigManager.shared.reloadConfig()
-        settings = ConfigManager.shared.getSettings()
+    func reloadSettings() async {
+        if let loadTask {
+            await loadTask.value
+        }
+        await startSettingsLoad()
         Log.info("SETTINGS", "Reloaded from config file")
         Log.info("SETTINGS", "Sync - guiAutoSync=\(guiAutoSync), autoFetchInterval=\(autoFetchInterval)s, fullSyncInterval=\(fullSyncInterval)s")
 
