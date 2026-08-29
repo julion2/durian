@@ -53,18 +53,44 @@ var rootCmd = &cobra.Command{
 	},
 }
 
+// jsonCapableCommands names every command that writes a machine-readable
+// document under --json. A command absent from it rejects the flag rather than
+// printing human text a caller would then try to parse.
+//
+// Keyed by command path, so a renamed or mistyped entry matches nothing and
+// silently withdraws JSON support from a command that has it.
+// TestJSONCapableCommandsAllExist walks the command tree and fails on any
+// entry that resolves to no command.
+var jsonCapableCommands = map[string]bool{
+	"durian search":          true,
+	"durian count":           true,
+	"durian show":            true,
+	"durian attachment":      true,
+	"durian tag":             true,
+	"durian tag list":        true,
+	"durian sync":            true,
+	"durian auth status":     true,
+	"durian contacts init":   true,
+	"durian contacts import": true,
+	"durian contacts list":   true,
+	"durian contacts search": true,
+	"durian contacts add":    true,
+	"durian contacts delete": true,
+	"durian group list":      true,
+	"durian group members":   true,
+	"durian draft save":      true,
+	"durian draft delete":    true,
+	"durian calendar list":   true,
+	"durian calendar search": true,
+	"durian calendar show":   true,
+	"durian calendar new":    true,
+	"durian calendar modify": true,
+	"durian calendar rsvp":   true,
+	"durian calendar delete": true,
+}
+
 func commandSupportsJSON(cmd *cobra.Command) bool {
-	switch cmd.CommandPath() {
-	case "durian search", "durian count", "durian show", "durian attachment", "durian tag", "durian tag list",
-		"durian sync", "durian auth status", "durian contacts init", "durian contacts import",
-		"durian contacts list", "durian contacts search", "durian contacts add", "durian contacts delete",
-		"durian group list", "durian group members", "durian draft save", "durian draft delete",
-		"durian calendar list", "durian calendar search", "durian calendar show", "durian calendar new",
-		"durian calendar modify", "durian calendar rsvp", "durian calendar delete":
-		return true
-	default:
-		return false
-	}
+	return jsonCapableCommands[cmd.CommandPath()]
 }
 
 // Execute runs the root command

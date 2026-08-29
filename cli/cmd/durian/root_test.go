@@ -5,7 +5,32 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
+
+// TestJSONCapableCommandsAllExist keeps the allowlist honest. It is keyed by
+// command path, so a rename or a typo does not fail loudly — the entry simply
+// stops matching, and the command quietly loses JSON support. That surfaces
+// only when a user passes --json to a command that does emit JSON and is told
+// the flag is unsupported.
+func TestJSONCapableCommandsAllExist(t *testing.T) {
+	paths := map[string]bool{}
+	var walk func(*cobra.Command)
+	walk = func(cmd *cobra.Command) {
+		paths[cmd.CommandPath()] = true
+		for _, child := range cmd.Commands() {
+			walk(child)
+		}
+	}
+	walk(rootCmd)
+
+	for listed := range jsonCapableCommands {
+		if !paths[listed] {
+			t.Errorf("jsonCapableCommands names %q, which is not a registered command — that command rejects --json", listed)
+		}
+	}
+}
 
 func TestNoInputDisablesPrompts(t *testing.T) {
 	previous := noInput
