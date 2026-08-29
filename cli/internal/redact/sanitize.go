@@ -71,7 +71,8 @@ func sanitizeText(s string) string {
 // punctuation ("...: connection refused"), wraps URLs in quotes, and truncates
 // them, none of which parse. This scan only needs to find the authority and
 // whether it has an "@", and it leaves anything it cannot read alone.
-// It scans the raw string rather than whitespace-separated fields, and keeps
+//
+// It walks the raw string rather than whitespace-separated fields, and keeps
 // going after each match. Splitting on whitespace saw only the first URL in a
 // field, so a comma-joined pair — "https://ok.example,https://u:p@host/x" —
 // left the second one's credentials intact; scanning the raw bytes also means
@@ -112,13 +113,21 @@ func stripURLUserinfo(s string) string {
 }
 
 // authorityEnd returns the offset of the first byte in s that cannot belong to
-// a URL authority. Besides the path, query and fragment delimiters this counts
-// whitespace and the punctuation error text wraps URLs in, which is what stops
-// one URL's authority from swallowing the next.
+// a URL authority: the path, query and fragment delimiters, whitespace, and the
+// characters RFC 3986 excludes from userinfo entirely.
+//
+// The set is deliberately narrow. Comma, semicolon, apostrophe and parentheses
+// are sub-delims — legal, unencoded, in a userinfo — so ending the authority at
+// them made a password containing one invisible: the scan stopped before the
+// "@", found no userinfo, and logged the whole credential.
+//
+// Nothing is lost by dropping them. Two URLs run together are still separated
+// by the "/" inside the following "://", which ends the first authority; the
+// loop then finds the next marker on its own.
 func authorityEnd(s string) int {
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
-		case '/', '?', '#', ' ', '\t', '\n', '\r', ',', ';', '"', '\'', '<', '>', '(', ')', '[', ']', '{', '}':
+		case '/', '?', '#', ' ', '\t', '\n', '\r', '"', '<', '>', '[', ']', '{', '}':
 			return i
 		}
 	}

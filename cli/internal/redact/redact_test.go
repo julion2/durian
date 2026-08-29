@@ -78,6 +78,39 @@ func TestSanitizeStripsURLUserinfo(t *testing.T) {
 			want:    `[https://one.example|https://[REDACTED]@two.example|https://three.example]`,
 			secrets: []string{"u:p"},
 		},
+		// RFC 3986 sub-delims are legal unencoded in a userinfo. Treating any
+		// of them as the end of the authority made the scan stop before the
+		// "@" and find nothing, so a password containing one was logged whole.
+		{
+			name:    "comma in the password",
+			in:      `https://alice:pa,ss@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"pa,ss"},
+		},
+		{
+			name:    "semicolon in the password",
+			in:      `https://alice:pa;ss@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"pa;ss"},
+		},
+		{
+			name:    "apostrophe in the password",
+			in:      `https://alice:pa'ss@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"pa'ss"},
+		},
+		{
+			name:    "parentheses in the password",
+			in:      `https://alice:pa(ss)@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"pa(ss)"},
+		},
+		{
+			name:    "every sub-delim at once",
+			in:      `https://alice:a,b;c'd(e)f@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"a,b;c'd(e)f"},
+		},
 	}
 
 	for _, tt := range tests {
