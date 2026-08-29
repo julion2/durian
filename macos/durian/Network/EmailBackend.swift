@@ -866,7 +866,11 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     // MARK: - Thread Application Helper
 
     /// Applies a ThreadContent to a MailMessage, populating body, metadata, and attachments.
-    private func applyThread(_ thread: ThreadContent, to email: inout MailMessage, isEnrichment: Bool = false) {
+    /// Internal rather than private so the field-by-field projection can be
+    /// tested directly: it is the only place a decoded ThreadMessage becomes a
+    /// MailMessage, and a field silently missing here is invisible everywhere
+    /// else.
+    func applyThread(_ thread: ThreadContent, to email: inout MailMessage, isEnrichment: Bool = false) {
         email.threadMessages = thread.messages
         if let newestMessage = thread.messages.first {
             email.from = newestMessage.from

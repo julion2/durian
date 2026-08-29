@@ -51,6 +51,41 @@ final class BccRoundTripTests: XCTestCase {
         XCTAssertNil(message.bcc)
     }
 
+    // MARK: - Thread application
+
+    /// applyThread is the only place a decoded ThreadMessage becomes the
+    /// MailMessage the compose window later reads. A field missing from this
+    /// projection decodes fine and reaches the factory as nil, so neither the
+    /// decoding nor the factory test would notice.
+    @MainActor
+    func testApplyThreadCarriesBccToMailMessage() throws {
+        let json = """
+        {
+            "thread_id": "thread-1",
+            "subject": "Quarterly numbers",
+            "messages": [{
+                "id": "draft@example.com",
+                "from": "author@example.com",
+                "to": "to@example.com",
+                "cc": "cc@example.com",
+                "bcc": "blind@example.com",
+                "date": "Mon, 01 Jan 2024 00:00:00 +0000",
+                "timestamp": 1704067200,
+                "body": "body"
+            }]
+        }
+        """.data(using: .utf8)!
+
+        let thread = try JSONDecoder().decode(ThreadContent.self, from: json)
+        var message = makeDraftMessage()
+        message.bcc = nil
+
+        EmailBackend().applyThread(thread, to: &message)
+
+        XCTAssertEqual(message.bcc, "blind@example.com")
+        XCTAssertEqual(message.cc, "cc@example.com")
+    }
+
     // MARK: - Draft projection
 
     /// Reopening a draft for editing must restore the blind recipients, or the
