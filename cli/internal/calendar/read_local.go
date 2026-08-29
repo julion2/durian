@@ -328,25 +328,18 @@ func ResolveLocalEvent(accountDir, owner, ref, calFilter string) (path string, e
 // caller whose calendars do not live under one account directory — the
 // configured local calendars — resolves references the same way.
 func ResolveEventIn(cols []Collection, ref, calFilter string) (path string, ev Event, calendar string, err error) {
-	// Fast path: an exact UID whose file follows the "<uid>.ics" naming scheme
-	// (every synced or `new`-created event does) — read just that one file
-	// instead of parsing the whole vdir.
-	for _, col := range cols {
-		calDir := col.Dir
-		calName := collectionName(col)
-		if calFilter != "" && !strings.EqualFold(calName, calFilter) {
-			continue
-		}
-		p := filepath.Join(calDir, SanitizeName(ref)+".ics")
-		data, readErr := os.ReadFile(p)
-		if readErr != nil {
-			continue
-		}
-		if e, parseErr := ICalToEvent(data, col.Owner); parseErr == nil && e.ICalUID == ref {
-			return p, e, calName, nil
-		}
-	}
-
+	// There used to be a fast path here: read "<uid>.ics" directly and return
+	// the first collection where it parsed with a matching UID. It contradicted
+	// the contract this resolver exists to keep — the same UID in two accounts
+	// returned whichever collection came first, and the ambiguity check below
+	// was never reached.
+	//
+	// It cannot be repaired by collecting the hits either. A file named
+	// anything else can carry the same UID, so proving a single "<uid>.ics"
+	// match is unambiguous requires reading the other files anyway. An
+	// optimisation that has to do the work it exists to avoid is not one.
+	//
+	// The scan below is the whole resolution, for every kind of reference.
 	type match struct {
 		path     string
 		event    Event
