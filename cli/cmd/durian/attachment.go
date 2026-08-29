@@ -119,18 +119,16 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("download failed: %w", err)
 		}
-		f, err := createAttachmentFile(outPath, attachForce)
+		f, err := createAttachmentFile(outPath)
 		if err != nil {
 			return err
 		}
 		if _, err := f.Write(data); err != nil {
-			f.Close()
-			os.Remove(outPath)
+			discardAttachmentFile(f)
 			return fmt.Errorf("write file: %w", err)
 		}
-		if err := f.Close(); err != nil {
-			os.Remove(outPath)
-			return fmt.Errorf("close file: %w", err)
+		if err := commitAttachmentFile(f, outPath, attachForce); err != nil {
+			return err
 		}
 		fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(len(data)))
 		return nil
@@ -151,16 +149,22 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 	if _, err := client.SelectMailbox(msg.Mailbox); err != nil {
 		return err
 	}
-	f, err := createAttachmentFile(outPath, attachForce)
+	f, err := createAttachmentFile(outPath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	if err := client.FetchDecodedAttachment(msg.UID, att.Filename, att.PartID, f); err != nil {
-		os.Remove(outPath)
+		discardAttachmentFile(f)
 		return fmt.Errorf("download failed: %w", err)
 	}
-	fi, _ := f.Stat()
+	fi, err := f.Stat()
+	if err != nil {
+		discardAttachmentFile(f)
+		return fmt.Errorf("stat downloaded attachment: %w", err)
+	}
+	if err := commitAttachmentFile(f, outPath, attachForce); err != nil {
+		return err
+	}
 	fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(int(fi.Size())))
 	return nil
 }
@@ -211,21 +215,82 @@ func resolveAttachmentMessage(emailDB *store.DB, cfg *config.Config, messageID, 
 	return messages[0], nil
 }
 
-func createAttachmentFile(path string, force bool) (*os.File, error) {
-	flags := os.O_WRONLY | os.O_CREATE
-	if force {
-		flags |= os.O_TRUNC
-	} else {
-		flags |= os.O_EXCL
-	}
-	f, err := os.OpenFile(path, flags, 0o644)
+// createAttachmentFile opens a temporary file next to path to download into.
+//
+// Never the destination itself. Opening that with O_TRUNC — which --force did —
+// empties the user's existing file before the download has produced a single
+// byte, and the cleanup on failure then removes what is left: a failed download
+// destroyed the file it was meant to replace, leaving nothing. The temporary
+// lives in the same directory so the commit below is a rename within one
+// filesystem, which is atomic.
+func createAttachmentFile(path string) (*os.File, error) {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".partial-*")
 	if err != nil {
-		if os.IsExist(err) {
-			return nil, fmt.Errorf("output file already exists: %s (use --force to overwrite)", path)
-		}
-		return nil, fmt.Errorf("create file: %w", err)
+		return nil, fmt.Errorf("create temporary file: %w", err)
+	}
+	if err := f.Chmod(0o644); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return nil, fmt.Errorf("set permissions: %w", err)
 	}
 	return f, nil
+}
+
+// commitAttachmentFile moves a completed download onto path.
+//
+// With force, a rename: it replaces whatever is there, atomically, and only now
+// that the content exists.
+//
+// Without force, a hardlink. Link fails if the name is taken, which is the
+// no-clobber guarantee, and unlike reserving the name with O_EXCL and renaming
+// over it there is no moment where an empty destination exists — a crash
+// between those two steps would leave the user with a zero-byte file where
+// their data was.
+func commitAttachmentFile(tmp *os.File, path string, force bool) error {
+	name := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return fmt.Errorf("close download: %w", err)
+	}
+	defer os.Remove(name) // no-op once a rename has consumed it
+
+	if force {
+		if err := os.Rename(name, path); err != nil {
+			return fmt.Errorf("move download into place: %w", err)
+		}
+		return nil
+	}
+
+	switch err := os.Link(name, path); {
+	case err == nil:
+		return nil
+	case os.IsExist(err):
+		return fmt.Errorf("output file already exists: %s (use --force to overwrite)", path)
+	}
+
+	// Some filesystems do not support hardlinks. Fall back to reserving the
+	// name and renaming onto it: the crash window returns, but refusing to save
+	// the download at all would be worse.
+	reserved, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("output file already exists: %s (use --force to overwrite)", path)
+		}
+		return fmt.Errorf("create file: %w", err)
+	}
+	reserved.Close()
+	if err := os.Rename(name, path); err != nil {
+		return fmt.Errorf("move download into place: %w", err)
+	}
+	return nil
+}
+
+// discardAttachmentFile drops a partial download. The destination is untouched
+// by construction — nothing has been written there.
+func discardAttachmentFile(tmp *os.File) {
+	name := tmp.Name()
+	tmp.Close()
+	os.Remove(name)
 }
 
 // fetchAttachmentPartViaBackend fetches msg's raw body through the account's

@@ -50,9 +50,13 @@ func TestCreateAttachmentFileDoesNotOverwriteByDefault(t *testing.T) {
 	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
 		t.Fatalf("seed file: %v", err)
 	}
-	if f, err := createAttachmentFile(path, false); err == nil {
-		f.Close()
-		t.Fatal("createAttachmentFile() overwrote existing file without force")
+
+	f, err := createAttachmentFile(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := commitAttachmentFile(f, path, false); err == nil {
+		t.Fatal("commit overwrote an existing file without force")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -62,15 +66,15 @@ func TestCreateAttachmentFileDoesNotOverwriteByDefault(t *testing.T) {
 		t.Fatalf("existing content = %q, want original", data)
 	}
 
-	f, err := createAttachmentFile(path, true)
+	f, err = createAttachmentFile(path)
 	if err != nil {
 		t.Fatalf("create with force: %v", err)
 	}
 	if _, err := f.WriteString("replacement"); err != nil {
 		t.Fatalf("write replacement: %v", err)
 	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close replacement: %v", err)
+	if err := commitAttachmentFile(f, path, true); err != nil {
+		t.Fatalf("commit with force: %v", err)
 	}
 	data, err = os.ReadFile(path)
 	if err != nil {
@@ -78,6 +82,82 @@ func TestCreateAttachmentFileDoesNotOverwriteByDefault(t *testing.T) {
 	}
 	if string(data) != "replacement" {
 		t.Fatalf("forced content = %q, want replacement", data)
+	}
+}
+
+// TestAttachmentDownloadFailureKeepsExistingFile is the contract --force used to
+// break. Opening the destination with O_TRUNC emptied the user's file before
+// the download had produced a byte, and the cleanup on failure then removed
+// what was left — a failed download destroyed the file it was meant to replace.
+//
+// The destination may only change once the content exists.
+func TestAttachmentDownloadFailureKeepsExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "report.pdf")
+	if err := os.WriteFile(path, []byte("irreplaceable"), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	// A download that starts, writes something, and then fails.
+	f, err := createAttachmentFile(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := f.WriteString("partial"); err != nil {
+		t.Fatalf("write partial: %v", err)
+	}
+	discardAttachmentFile(f)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("destination is gone after a failed download: %v", err)
+	}
+	if string(data) != "irreplaceable" {
+		t.Errorf("destination = %q, want the original content untouched", data)
+	}
+
+	// And nothing is left lying around next to it.
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 1 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("directory = %v, want only the destination", names)
+	}
+}
+
+// TestAttachmentCommitReservesTheNameWithoutForce covers the window between the
+// caller's early existence check and the rename. Without force the destination
+// is reserved with O_EXCL, so a file that appears in between is reported rather
+// than silently replaced.
+func TestAttachmentCommitReservesTheNameWithoutForce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "late.pdf")
+
+	f, err := createAttachmentFile(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := f.WriteString("downloaded"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Someone else gets there first, after the command's own check passed.
+	if err := os.WriteFile(path, []byte("someone else"), 0o600); err != nil {
+		t.Fatalf("seed racing file: %v", err)
+	}
+
+	if err := commitAttachmentFile(f, path, false); err == nil {
+		t.Fatal("commit replaced a file that appeared after the initial check")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(data) != "someone else" {
+		t.Errorf("destination = %q, want the racing content kept", data)
 	}
 }
 
