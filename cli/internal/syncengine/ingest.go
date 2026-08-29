@@ -181,36 +181,23 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	flagStr := strings.Join(flagState.ToIMAPFlags(), ",")
 	flagAdd, _ := flagState.ToTagOps()
 
-	storeMsg := &store.Message{
-		MessageID: messageID,
-		Subject:   content.Subject,
-		FromAddr:  content.From,
-		ToAddrs:   content.To,
-		CCAddrs:   content.CC,
-		BCCAddrs:  content.BCC,
-		InReplyTo: content.InReplyTo,
-		Refs:      content.References,
-		BodyText:  content.Body,
-		BodyHTML:  content.HTML,
-		Date:      dateUnix,
-		CreatedAt: time.Now().Unix(),
-		Mailbox:   folderName,
-		Flags:     flagStr,
-		// UID stays 0 on the engine path: the uint32 UID column is an IMAP
-		// implementation detail; the neutral RemoteRef column carries the
-		// provider handle instead.
-		UID:         0,
-		Size:        len(msg.Raw),
-		FetchedBody: true,
-		Account:     opts.Account,
-		RemoteRef:   msg.Ref.ID,
-		// The message's current server flags are the correct initial
-		// baseline: the first post-ingest flag pass is then a no-op unless
-		// the user changed something locally. joinFlags (not flagStr) so the
-		// baseline round-trips $Completed and avoids per-sync download churn.
-		SyncedFlags:            joinFlags(flagState),
-		SyncedFlagsInitialized: true,
-	}
+	storeMsg := imap.StoreMessageFromContent(messageID, content, dateUnix, time.Now().Unix())
+	storeMsg.Mailbox = folderName
+	storeMsg.Flags = flagStr
+	// UID stays 0 on the engine path: the uint32 UID column is an IMAP
+	// implementation detail; the neutral RemoteRef column carries the
+	// provider handle instead.
+	storeMsg.UID = 0
+	storeMsg.Size = len(msg.Raw)
+	storeMsg.FetchedBody = true
+	storeMsg.Account = opts.Account
+	storeMsg.RemoteRef = msg.Ref.ID
+	// The message's current server flags are the correct initial baseline: the
+	// first post-ingest flag pass is then a no-op unless the user changed
+	// something locally. joinFlags (not flagStr) so the baseline round-trips
+	// $Completed and avoids per-sync download churn.
+	storeMsg.SyncedFlags = joinFlags(flagState)
+	storeMsg.SyncedFlagsInitialized = true
 
 	created, err := db.UpsertMessageWithInitialTags(storeMsg, flagAdd)
 	if err != nil {

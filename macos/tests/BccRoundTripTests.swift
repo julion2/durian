@@ -86,6 +86,31 @@ final class BccRoundTripTests: XCTestCase {
         XCTAssertEqual(message.cc, "cc@example.com")
     }
 
+    /// The path that actually breaks in daily use. A draft is loaded once, a
+    /// search or auto-sync then rebuilds the MailMessage list, and rehydration
+    /// restores the loaded state from the cache. That restored state is what
+    /// "Edit Draft" reads. Rehydration projects a different message than
+    /// applyThread does (last rather than newest), so it needs its own test —
+    /// the applyThread test never reaches this code.
+    @MainActor
+    func testCacheRehydrationRestoresBcc() throws {
+        let backend = EmailBackend()
+        var email = makeDraftMessage()
+        // A freshly built list entry: not yet loaded, so rehydration applies.
+        email.threadMessages = nil
+        email.bcc = nil
+        backend.emails = [email]
+        backend.threadCache[email.id] = EmailBackend.CachedThread(
+            messages: [try decodeThreadMessage(bcc: "blind@example.com")],
+            timestamp: Date()
+        )
+
+        backend.restoreCachedThreads()
+
+        XCTAssertEqual(backend.emails[0].bcc, "blind@example.com",
+                       "a draft edited after a sync must still carry its blind recipients")
+    }
+
     // MARK: - Draft projection
 
     /// Reopening a draft for editing must restore the blind recipients, or the
@@ -110,6 +135,22 @@ final class BccRoundTripTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    private func decodeThreadMessage(bcc: String) throws -> ThreadMessage {
+        let json = """
+        {
+            "id": "draft@example.com",
+            "from": "author@example.com",
+            "to": "to@example.com",
+            "cc": "cc@example.com",
+            "bcc": "\(bcc)",
+            "date": "Mon, 01 Jan 2024 00:00:00 +0000",
+            "timestamp": 1704067200,
+            "body": "body"
+        }
+        """.data(using: .utf8)!
+        return try JSONDecoder().decode(ThreadMessage.self, from: json)
+    }
 
     private func makeDraftMessage() -> MailMessage {
         var message = MailMessage(

@@ -13,6 +13,7 @@ go_library(
         "sync_discovery.go",
         "sync_flags.go",
         "sync_mailbox.go",
+        "content_mapping.go",
         "sync_store.go",
     ],
     importpath = "github.com/julion2/durian/cli/internal/imap",

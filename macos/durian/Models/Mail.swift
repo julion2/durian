@@ -262,6 +262,28 @@ struct MailMessage: Identifiable, Hashable {
         return tags.split(separator: ",").contains("draft")
     }
 
+    /// The single projection from a decoded `ThreadMessage` onto the message
+    /// the UI reads.
+    ///
+    /// Two paths need it and they pick a different message from the thread: a
+    /// freshly loaded thread projects the newest one, cache rehydration after
+    /// a search or auto-sync projects the last one. What they must not differ
+    /// in is *which fields* they copy. When the field list was written out
+    /// twice, Bcc reached only the fresh path, so a draft opened straight from
+    /// the server kept its blind recipients while the same draft opened after
+    /// a sync silently lost them.
+    mutating func applyFields(from message: ThreadMessage) {
+        from = message.from
+        body = message.body
+        htmlBody = message.html
+        to = message.to
+        cc = message.cc
+        bcc = message.bcc
+        messageId = message.message_id
+        inReplyTo = message.in_reply_to
+        references = message.references
+    }
+
     /// Body preview for list view (first ~150 chars)
     var bodyPreview: String? {
         // Prefer enrichment preview (always available, no HTML)
