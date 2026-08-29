@@ -290,7 +290,11 @@ func outputThreadFormatted(w io.Writer, t *mail.ThreadContent) error {
 
 	for i, msg := range t.Messages {
 		fmt.Fprintf(w, "\n[%d/%d] %s\n", i+1, len(t.Messages), msg.Date)
-		fmt.Fprintf(w, "Message: message:%s\n", msg.MessageID)
+		// A Message-ID is whatever the sending system put in the header. It
+		// reaches a terminal here, so it goes through the same escaping as any
+		// other remote text — a raw OSC or bidi run would otherwise rewrite the
+		// lines around it.
+		fmt.Fprintf(w, "Message: message:%s\n", humanText(msg.MessageID, false))
 		if msg.Account != "" {
 			fmt.Fprintf(w, "Account: %s\n", displayAccountIdentifier(msg.Account))
 		}
@@ -299,7 +303,9 @@ func outputThreadFormatted(w io.Writer, t *mail.ThreadContent) error {
 			fmt.Fprintf(w, "To:   %s\n", humanText(msg.To, false))
 		}
 		if len(msg.Tags) > 0 {
-			fmt.Fprintf(w, "Tags: %s\n", strings.Join(msg.Tags, ", "))
+			// Tags are mostly Durian's own, but a label mirrored from a
+			// provider is the sender's text.
+			fmt.Fprintf(w, "Tags: %s\n", humanText(strings.Join(msg.Tags, ", "), false))
 		}
 		if len(msg.Attachments) > 0 {
 			fmt.Fprintln(w, "Attachments:")
@@ -309,8 +315,12 @@ func outputThreadFormatted(w io.Writer, t *mail.ThreadContent) error {
 				if msg.Account != "" {
 					accountArg = " --account " + shellQuote(displayAccountIdentifier(msg.Account))
 				}
+				// humanText before shellQuote, not after: shellQuote protects
+				// the shell from metacharacters, not the terminal from escape
+				// sequences, and it would happily quote an intact OSC run into
+				// a command the user is invited to paste.
 				fmt.Fprintf(w, "      Save: durian attachment %s%s --save %d\n",
-					shellQuote("message:"+msg.MessageID), accountArg, attachment.PartID)
+					shellQuote("message:"+humanText(msg.MessageID, false)), accountArg, attachment.PartID)
 			}
 		}
 		fmt.Fprintln(w, strings.Repeat("-", 40))

@@ -337,7 +337,9 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 			styDim(truncate(o.event.Location, 24)),
 			calendarLabel(o.cal) + eventMarkers(o.event),
 			styDim(o.cal.Account),
-			styDim("event:" + o.event.ICalUID),
+			// A UID comes from whoever produced the invitation, so it is
+			// remote text like any other cell here.
+			styDim("event:" + humanText(o.event.ICalUID, false)),
 		})
 	}
 	printColumns(os.Stdout, rows)
@@ -440,7 +442,7 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 	rows := [][]string{{styHeader("EVENT"), styHeader("ACCOUNT"), styHeader("DATE"), styHeader("SUBJECT"), styHeader("CALENDAR")}}
 	for _, o := range matches {
 		rows = append(rows, []string{
-			"event:" + o.event.ICalUID,
+			"event:" + humanText(o.event.ICalUID, false),
 			o.cal.Account,
 			o.event.Start.Format("2006-01-02 15:04"),
 			styAccent(truncate(orDash(o.event.Subject), 50)),

@@ -45,3 +45,38 @@ func TestOutputSearchJSONUsesEmptyArray(t *testing.T) {
 		t.Fatalf("empty result JSON = %s, %v", encoded, err)
 	}
 }
+
+// TestJSONOutputKeepsRemoteValuesVerbatim is the other half of the terminal
+// escaping. That escaping exists for a terminal; a JSON consumer needs the
+// value the provider actually sent, and rewriting it here would corrupt any
+// round-trip through the API — the filename would no longer match the one the
+// server holds.
+func TestJSONOutputKeepsRemoteValuesVerbatim(t *testing.T) {
+	const hostile = "report\x1b]0;pwned\x07‮.pdf"
+
+	encoded, err := json.Marshal(publicAttachments([]store.Attachment{{
+		PartID: 1, Filename: hostile, ContentType: "application/pdf", Size: 10,
+	}}))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded []struct {
+		Filename string `json:"filename"`
+	}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(decoded) != 1 {
+		t.Fatalf("decoded %d attachments, want 1", len(decoded))
+	}
+	if decoded[0].Filename != hostile {
+		t.Errorf("filename = %q, want the value verbatim (%q)", decoded[0].Filename, hostile)
+	}
+
+	// The marker belongs to the human renderer only; seeing it here would mean
+	// the escaping had leaked into the machine-readable path.
+	if strings.Contains(string(encoded), "U+001B") {
+		t.Errorf("JSON carries the terminal escape marker: %s", encoded)
+	}
+}
