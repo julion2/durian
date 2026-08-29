@@ -755,6 +755,35 @@ func TestTagWithoutAccountScopeSpansTheThread(t *testing.T) {
 	}
 }
 
+// TestTagAccountTermInQueryIsNotAScope is the case that distinguishes carrying
+// the scope from inferring it. "path:work" here is a search term the user
+// wrote, not the clause --account produces, and the two are textually
+// identical. With no scope passed, the operation stays thread-wide: the query
+// decides which threads match, never which messages are written.
+//
+// The other unscoped test uses a bare "thread:" selector, so it would keep
+// passing if query inference came back.
+func TestTagAccountTermInQueryIsNotAScope(t *testing.T) {
+	db := newTestStore(t)
+	msgs := seedSharedThread(t, db, "work", "personal")
+
+	h := New(db, nil)
+	resp := h.Tag("path:work", "+archived", nil)
+	if !resp.OK {
+		t.Fatalf("Tag failed: %s", resp.Error)
+	}
+
+	for account, msg := range msgs {
+		tags, err := db.GetMessageTags(msg.ID)
+		if err != nil {
+			t.Fatalf("get %s tags: %v", account, err)
+		}
+		if !slices.Contains(tags, "archived") {
+			t.Errorf("%s tags = %v: an account term in the query narrowed the mutation", account, tags)
+		}
+	}
+}
+
 // TestTagMultipleAccountScopeIsTheUnion covers the third row of the contract:
 // several accounts select their union, not their intersection and not the
 // first one.
@@ -852,8 +881,16 @@ func TestTagNamingAnAbsentAccountChangesNothing(t *testing.T) {
 	h.EnableTagJournal()
 	resp := h.Tag("thread:"+msgs["work"].ThreadID, "+archived", []string{"archive"})
 
-	if resp.OK && resp.MatchedThreads != nil && *resp.MatchedThreads != 0 {
+	// Demanded explicitly rather than guarded behind resp.OK: a failure
+	// response or absent counts would otherwise satisfy this by accident.
+	if !resp.OK {
+		t.Fatalf("Tag failed: %s", resp.Error)
+	}
+	if resp.MatchedThreads == nil || *resp.MatchedThreads != 0 {
 		t.Errorf("matched threads = %v, want 0: no message was in scope", resp.MatchedThreads)
+	}
+	if resp.ChangedThreads == nil || *resp.ChangedThreads != 0 {
+		t.Errorf("changed threads = %v, want 0", resp.ChangedThreads)
 	}
 	for account, msg := range msgs {
 		tags, err := db.GetMessageTags(msg.ID)

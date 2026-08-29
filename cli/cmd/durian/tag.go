@@ -95,17 +95,18 @@ func runTag(cmd *cobra.Command, args []string) error {
 	if strings.TrimSpace(query) == "*" && !tagAll {
 		return fmt.Errorf("an unbounded tag selector requires --all")
 	}
-	// The flag narrows the search through the query, and is also handed to the
-	// handler as the mutation scope. Both, not either: the query form cannot be
+	// Resolved once and used twice: the clause narrows the search, and the same
+	// keys are the mutation scope. Both, not either — the query form cannot be
 	// told apart from a user writing path: themselves, so the handler must be
 	// given the scope rather than left to infer it.
-	accountScope, err := resolveAccountStoreKeys(tagAccounts)
-	if err != nil {
-		return err
-	}
-	query, err = scopeQueryByAccounts(query, tagAccounts)
-	if err != nil {
-		return err
+	var accountScope []string
+	if len(tagAccounts) > 0 {
+		var err error
+		accountScope, err = resolveAccountStoreKeys(tagAccounts)
+		if err != nil {
+			return err
+		}
+		query = scopeQueryByAccountKeys(query, accountScope)
 	}
 
 	// Validate tags

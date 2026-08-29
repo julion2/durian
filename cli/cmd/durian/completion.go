@@ -52,9 +52,19 @@ func scopeQueryByAccounts(query string, identifiers []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return scopeQueryByAccountKeys(query, keys), nil
+}
+
+// scopeQueryByAccountKeys narrows a query to already-resolved store keys, for
+// callers that need the same keys for something else and should not resolve
+// them twice.
+func scopeQueryByAccountKeys(query string, keys []string) string {
+	if len(keys) == 0 {
+		return query
+	}
 	clauses := make([]string, len(keys))
 	for i, key := range keys {
 		clauses[i] = "path:" + strconv.Quote(key)
 	}
-	return "(" + query + ") AND (" + strings.Join(clauses, " OR ") + ")", nil
+	return "(" + query + ") AND (" + strings.Join(clauses, " OR ") + ")"
 }
