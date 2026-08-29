@@ -129,11 +129,12 @@ func TestAttachmentDownloadFailureKeepsExistingFile(t *testing.T) {
 	}
 }
 
-// TestAttachmentCommitReservesTheNameWithoutForce covers the window between the
-// caller's early existence check and the rename. Without force the destination
-// is reserved with O_EXCL, so a file that appears in between is reported rather
-// than silently replaced.
-func TestAttachmentCommitReservesTheNameWithoutForce(t *testing.T) {
+// TestAttachmentCommitDoesNotClobberLateArrival covers the window between the
+// caller's early existence check and the commit. Without force the download is
+// hardlinked into place, which fails if the name is taken, so a file that
+// appears in between is reported rather than silently replaced — and unlike
+// reserving the name first, no empty destination ever exists.
+func TestAttachmentCommitDoesNotClobberLateArrival(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "late.pdf")
 
 	f, err := createAttachmentFile(path)
