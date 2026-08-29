@@ -183,6 +183,20 @@ assert_jq "GET /threads/{id} message.tags is array" "$RESP" '.thread.messages[0]
 RESP=$(curl -sf "${AUTH[@]}" -X POST -H "Content-Type: application/json" \
     -d '{"tags":"+starred"}' "$BASE/threads/$THREAD_ID/tags")
 assert_jq "POST /threads/{id}/tags .ok is true" "$RESP" '.ok == true'
+# The counters are what a client reports back to the user, and they are the
+# reason a caller cannot just assume the mutation did something: a thread that
+# already carried the tag is matched but not changed.
+assert_jq "POST /threads/{id}/tags .matched_threads is number" "$RESP" '.matched_threads | type == "number"'
+assert_jq "POST /threads/{id}/tags .changed_threads is number" "$RESP" '.changed_threads | type == "number"'
+assert_jq "POST /threads/{id}/tags matched >= changed" "$RESP" '.matched_threads >= .changed_threads'
+assert_jq "POST /threads/{id}/tags matched the requested thread" "$RESP" '.matched_threads == 1'
+
+# Re-tagging the same thread matches it again but changes nothing — the case
+# that makes the two counters distinct rather than redundant.
+RESP=$(curl -sf "${AUTH[@]}" -X POST -H "Content-Type: application/json" \
+    -d '{"tags":"+starred"}' "$BASE/threads/$THREAD_ID/tags")
+assert_jq "POST /threads/{id}/tags repeat matches" "$RESP" '.matched_threads == 1'
+assert_jq "POST /threads/{id}/tags repeat changes nothing" "$RESP" '.changed_threads == 0'
 
 # Verify tag was applied
 RESP=$(curl -sf "${AUTH[@]}" "$BASE/tags")
