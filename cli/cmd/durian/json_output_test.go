@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/julion2/durian/cli/internal/contacts"
+	"github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/protocol"
 	"github.com/julion2/durian/cli/internal/store"
 )
@@ -48,35 +51,81 @@ func TestOutputSearchJSONUsesEmptyArray(t *testing.T) {
 
 // TestJSONOutputKeepsRemoteValuesVerbatim is the other half of the terminal
 // escaping. That escaping exists for a terminal; a JSON consumer needs the
-// value the provider actually sent, and rewriting it here would corrupt any
-// round-trip through the API — the filename would no longer match the one the
+// value the provider actually sent, and rewriting it would corrupt any
+// round-trip through the API — the value would no longer match the one the
 // server holds.
+//
+// The cases are the fields the human renderer now escapes: Message-ID, tags,
+// iCal UID, and the attachment filename. Asserting only the filename would
+// leave the three that changed unguarded.
 func TestJSONOutputKeepsRemoteValuesVerbatim(t *testing.T) {
-	const hostile = "report\x1b]0;pwned\x07‮.pdf"
+	const hostile = "\x1b]0;pwned\x07‮"
 
-	encoded, err := json.Marshal(publicAttachments([]store.Attachment{{
-		PartID: 1, Filename: hostile, ContentType: "application/pdf", Size: 10,
-	}}))
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
+	t.Run("attachment filename", func(t *testing.T) {
+		name := "report" + hostile + ".pdf"
+		encoded, err := json.Marshal(publicAttachments([]store.Attachment{{
+			PartID: 1, Filename: name, ContentType: "application/pdf", Size: 10,
+		}}))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var decoded []struct {
+			Filename string `json:"filename"`
+		}
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(decoded) != 1 || decoded[0].Filename != name {
+			t.Errorf("filename = %+v, want the value verbatim (%q)", decoded, name)
+		}
+		assertNoTerminalMarker(t, encoded)
+	})
 
-	var decoded []struct {
-		Filename string `json:"filename"`
-	}
-	if err := json.Unmarshal(encoded, &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(decoded) != 1 {
-		t.Fatalf("decoded %d attachments, want 1", len(decoded))
-	}
-	if decoded[0].Filename != hostile {
-		t.Errorf("filename = %q, want the value verbatim (%q)", decoded[0].Filename, hostile)
-	}
+	t.Run("message id and tags", func(t *testing.T) {
+		info := mail.MessageInfo{
+			MessageID: "evil" + hostile + "@example.com",
+			Tags:      []string{"inbox", "label" + hostile},
+		}
+		encoded, err := json.Marshal(info)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var decoded mail.MessageInfo
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if decoded.MessageID != info.MessageID {
+			t.Errorf("message id = %q, want %q", decoded.MessageID, info.MessageID)
+		}
+		if !slices.Equal(decoded.Tags, info.Tags) {
+			t.Errorf("tags = %v, want %v", decoded.Tags, info.Tags)
+		}
+		assertNoTerminalMarker(t, encoded)
+	})
 
-	// The marker belongs to the human renderer only; seeing it here would mean
-	// the escaping had leaked into the machine-readable path.
-	if strings.Contains(string(encoded), "U+001B") {
-		t.Errorf("JSON carries the terminal escape marker: %s", encoded)
+	t.Run("ical uid", func(t *testing.T) {
+		event := calendar.Event{ICalUID: "uid" + hostile + "@example.com", Subject: "Standup"}
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var decoded calendar.Event
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if decoded.ICalUID != event.ICalUID {
+			t.Errorf("ical uid = %q, want %q", decoded.ICalUID, event.ICalUID)
+		}
+		assertNoTerminalMarker(t, encoded)
+	})
+}
+
+// assertNoTerminalMarker fails when the human renderer's escape marker appears
+// in machine-readable output, which would mean the escaping had leaked out of
+// the terminal path.
+func assertNoTerminalMarker(t *testing.T, encoded []byte) {
+	t.Helper()
+	if strings.Contains(string(encoded), "U+001B") || strings.Contains(string(encoded), "U+202E") {
+		t.Errorf("JSON carries a terminal escape marker: %s", encoded)
 	}
 }

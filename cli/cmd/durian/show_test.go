@@ -60,10 +60,14 @@ func TestNormalizeThreadReference(t *testing.T) {
 }
 
 // TestOutputThreadFormattedEscapesRemoteControlSequences covers the fields the
-// human renderer used to print raw. A Message-ID, a provider-mirrored tag and
-// an attachment filename are all sender-controlled, so an OSC sequence or a
-// bidi override in any of them reaches the terminal and rewrites the lines
-// around it — including the copy-paste command this view offers.
+// human renderer used to print raw: the Message-ID and provider-mirrored tags.
+// Both are sender-controlled, so an OSC sequence or a bidi override in either
+// reaches the terminal and rewrites the lines around it — including the
+// copy-paste command this view offers.
+//
+// The attachment filename is here as a control, not as a fix: its visible
+// rendering already went through humanText, and it stays asserted so a
+// regression there is caught too.
 //
 // shellQuote is not a substitute: it protects the shell from metacharacters,
 // not the terminal from escapes, and would quote an intact sequence into a
@@ -115,5 +119,30 @@ func TestOutputThreadFormattedEscapesRemoteControlSequences(t *testing.T) {
 	}
 	if !strings.Contains(got, "U+202E") {
 		t.Errorf("the bidi override was removed rather than shown:\n%s", got)
+	}
+}
+
+// TestEventRefCellEscapesRemoteUIDs covers the calendar side. Both the list and
+// the search view write straight to stdout through printColumns, so the
+// reference column is rendered by one shared function and asserted here — the
+// thread test above exercises neither of them.
+func TestEventRefCellEscapesRemoteUIDs(t *testing.T) {
+	const (
+		osc  = "\x1b]0;pwned\x07"
+		bidi = "‮"
+	)
+	got := eventRefCell("uid" + osc + bidi + "@example.com")
+
+	if strings.Contains(got, "\x1b") {
+		t.Errorf("an escape character reached the terminal: %q", got)
+	}
+	if strings.Contains(got, bidi) {
+		t.Errorf("a bidi override reached the terminal: %q", got)
+	}
+	if !strings.Contains(got, "U+001B") || !strings.Contains(got, "U+202E") {
+		t.Errorf("the sequences were removed rather than shown: %q", got)
+	}
+	if !strings.HasPrefix(got, "event:") {
+		t.Errorf("cell = %q, want the event: prefix kept", got)
 	}
 }

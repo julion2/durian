@@ -142,12 +142,15 @@ func runShowRawHeaders(emailDB *store.DB, threadID, filterName string) error {
 	}
 	groups := make(map[groupKey]*groupEntry)
 	for _, m := range msgs {
+		// stderr is the same terminal. A warning is an easy sink to overlook,
+		// and it names the one field on this line the sender controls — the
+		// account and mailbox beside it go through %q, which already escapes.
 		if m.UID == 0 {
-			fmt.Fprintf(os.Stderr, "warning: message %s has no IMAP UID (synced before UID backfill?), skipping\n", m.MessageID)
+			fmt.Fprintf(os.Stderr, "warning: message %s has no IMAP UID (synced before UID backfill?), skipping\n", humanText(m.MessageID, false))
 			continue
 		}
 		if m.Account == "" || m.Mailbox == "" {
-			fmt.Fprintf(os.Stderr, "warning: message %s has no account/mailbox (%q/%q), skipping\n", m.MessageID, m.Account, m.Mailbox)
+			fmt.Fprintf(os.Stderr, "warning: message %s has no account/mailbox (%q/%q), skipping\n", humanText(m.MessageID, false), m.Account, m.Mailbox)
 			continue
 		}
 		k := groupKey{m.Account, m.Mailbox}

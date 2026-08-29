@@ -337,13 +337,21 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 			styDim(truncate(o.event.Location, 24)),
 			calendarLabel(o.cal) + eventMarkers(o.event),
 			styDim(o.cal.Account),
-			// A UID comes from whoever produced the invitation, so it is
-			// remote text like any other cell here.
-			styDim("event:" + humanText(o.event.ICalUID, false)),
+			styDim(eventRefCell(o.event.ICalUID)),
 		})
 	}
 	printColumns(os.Stdout, rows)
 	return nil
+}
+
+// eventRefCell renders the "event:<uid>" reference column.
+//
+// Shared by the list and search views so the escaping cannot be present in one
+// and missing in the other, and so it is reachable from a test — both callers
+// write straight to stdout through printColumns. A UID comes from whoever
+// produced the invitation, so it is remote text like any other cell.
+func eventRefCell(uid string) string {
+	return "event:" + humanText(uid, false)
 }
 
 // listWindow computes [from, to) from the list flags, relative to now, reusing
@@ -442,7 +450,7 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 	rows := [][]string{{styHeader("EVENT"), styHeader("ACCOUNT"), styHeader("DATE"), styHeader("SUBJECT"), styHeader("CALENDAR")}}
 	for _, o := range matches {
 		rows = append(rows, []string{
-			"event:" + humanText(o.event.ICalUID, false),
+			eventRefCell(o.event.ICalUID),
 			o.cal.Account,
 			o.event.Start.Format("2006-01-02 15:04"),
 			styAccent(truncate(orDash(o.event.Subject), 50)),
