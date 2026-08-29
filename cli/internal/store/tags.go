@@ -508,10 +508,17 @@ func (d *DB) GetAllMessagesWithTags(mailbox string, account ...string) (map[stri
 		}
 		return nil, fmt.Errorf("lookup mailbox id: %w", err)
 	}
+	// LEFT JOIN: a message with no tags still needs a row, or it is absent from
+	// the result and every caller reads that as "not stored here". The flag
+	// pass does exactly that and skips the message, so its flags never
+	// reconcile in either direction. The state is reachable — a read,
+	// unflagged, unanswered message gets no flag tag (ToTagOps emits only
+	// removals for it), and a custom folder with no SPECIAL-USE role and no
+	// name fallback contributes none either.
 	q := `
-		SELECT m.message_id, t.tag
+		SELECT m.message_id, IFNULL(t.tag, '')
 		FROM messages m
-		JOIN tags t ON t.message_id = m.id
+		LEFT JOIN tags t ON t.message_id = m.id
 		WHERE m.mailbox_id = ?`
 	params := []interface{}{mailboxID}
 
@@ -540,7 +547,15 @@ func (d *DB) GetAllMessagesWithTags(mailbox string, account ...string) (map[stri
 		if err := rows.Scan(&msgID, &tag); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
-		result[msgID] = append(result[msgID], tag)
+		// Presence in the map is what tells a caller the message is stored
+		// here, so the entry is created either way; the placeholder from the
+		// LEFT JOIN is not a tag and must not join the list.
+		if _, ok := result[msgID]; !ok {
+			result[msgID] = nil
+		}
+		if tag != "" {
+			result[msgID] = append(result[msgID], tag)
+		}
 	}
 	return result, rows.Err()
 }
