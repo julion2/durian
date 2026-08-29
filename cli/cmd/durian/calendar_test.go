@@ -383,3 +383,34 @@ func TestCalendarLabelDoesNotIncludeAccount(t *testing.T) {
 		t.Errorf("account-less label = %q, want no prefix", got)
 	}
 }
+
+// TestCalendarMutationDocReportsADeclinedDelete covers the --json contract for
+// the one outcome that changes nothing. Answering "no" printed a line to
+// stderr and returned, so stdout stayed empty on exit 0 — indistinguishable to
+// a consumer from a command that never ran, or from one whose output was lost.
+//
+// A declined delete is a successful no-op, so it stays exit 0, but it still
+// owes exactly one document. This asserts the document; that it is emitted
+// once follows from the single call on that path.
+func TestCalendarMutationDocReportsADeclinedDelete(t *testing.T) {
+	event := calendar.Event{ICalUID: "uid-1@example.com", Subject: "Standup"}
+
+	aborted := calendarMutationDoc("aborted", event, "work", "Work")
+	if aborted.Action != "aborted" {
+		t.Errorf("action = %q, want aborted", aborted.Action)
+	}
+	if aborted.Event != "event:uid-1@example.com" {
+		t.Errorf("event = %q, want the reference form", aborted.Event)
+	}
+
+	// Same shape as the delete that went through, so a consumer parses one
+	// document type and reads the action rather than guessing from presence.
+	deleted := calendarMutationDoc("deleted", event, "work", "Work")
+	if deleted.Event != aborted.Event || deleted.Subject != aborted.Subject ||
+		deleted.Account != aborted.Account || deleted.Calendar != aborted.Calendar {
+		t.Errorf("declined and completed documents differ beyond the action:\n%+v\n%+v", aborted, deleted)
+	}
+	if deleted.Action == aborted.Action {
+		t.Error("the action does not distinguish a declined delete from a completed one")
+	}
+}

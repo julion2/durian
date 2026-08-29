@@ -443,6 +443,13 @@ func runCalendarDelete(cmd *cobra.Command, args []string) error {
 		if !confirmPrompt(fmt.Sprintf("Delete %q (%s) from %q locally?",
 			orDash(event.Subject), event.Start.Format("2006-01-02 15:04"), calName)) {
 			fmt.Fprintln(os.Stderr, "aborted, nothing deleted")
+			// A declined delete is a successful no-op, not an error — but it
+			// still owes --json a document. Returning silently left stdout
+			// empty on exit 0, which a consumer cannot tell apart from a
+			// command that never ran.
+			if jsonOutput {
+				return writeCalendarMutationJSON("aborted", event, label, calName)
+			}
 			return nil
 		}
 	}
@@ -458,17 +465,26 @@ func runCalendarDelete(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func writeCalendarMutationJSON(action string, event calendar.Event, account, calendarName string) error {
-	return writeJSON(struct {
-		Action   string `json:"action"`
-		Event    string `json:"event"`
-		Account  string `json:"account"`
-		Calendar string `json:"calendar"`
-		Subject  string `json:"subject"`
-	}{
+// calendarMutationJSON is the document every calendar mutation reports,
+// including the ones that changed nothing. Built separately from writing it so
+// the shape is assertable — writeJSON goes straight to os.Stdout.
+type calendarMutationJSON struct {
+	Action   string `json:"action"`
+	Event    string `json:"event"`
+	Account  string `json:"account"`
+	Calendar string `json:"calendar"`
+	Subject  string `json:"subject"`
+}
+
+func calendarMutationDoc(action string, event calendar.Event, account, calendarName string) calendarMutationJSON {
+	return calendarMutationJSON{
 		Action: action, Event: "event:" + event.ICalUID, Account: account,
 		Calendar: calendarName, Subject: event.Subject,
-	})
+	}
+}
+
+func writeCalendarMutationJSON(action string, event calendar.Event, account, calendarName string) error {
+	return writeJSON(calendarMutationDoc(action, event, account, calendarName))
 }
 
 // confirmPrompt writes a [y/N] prompt to stderr and reads one line from stdin;

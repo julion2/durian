@@ -160,6 +160,11 @@ func runSync(cmd *cobra.Command, args []string) error {
 		syncRemoteTags(emailDB, cfg.Sync.TagSync, syncDryRun)
 	}
 
+	// Errors decide the exit before anything is written.
+	if err := firstSyncError(results); err != nil {
+		return err
+	}
+
 	if jsonOutput {
 		type syncJSON struct {
 			Account      string  `json:"account"`
@@ -170,7 +175,6 @@ func runSync(cmd *cobra.Command, args []string) error {
 			FlagsDown    int     `json:"flags_downloaded"`
 			Moved        int     `json:"moved"`
 			DurationSecs float64 `json:"duration_secs"`
-			Error        string  `json:"error,omitempty"`
 		}
 		out := make([]syncJSON, 0, len(results))
 		for _, r := range results {
@@ -184,9 +188,6 @@ func runSync(cmd *cobra.Command, args []string) error {
 				Moved:        r.TotalMoved,
 				DurationSecs: r.Duration.Seconds(),
 			}
-			if r.Error != nil {
-				s.Error = r.Error.Error()
-			}
 			out = append(out, s)
 		}
 		if err := writeJSON(out); err != nil {
@@ -194,13 +195,23 @@ func runSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Check for errors
+	return nil
+}
+
+// firstSyncError reports the failure that decides the command's exit status,
+// or nil when every account succeeded.
+//
+// It runs before any output is produced. `durian output` promises stdout is
+// empty on error, and the JSON document used to be written first: a consumer
+// parsing stdout got a complete-looking result while the command exited
+// nonzero, so the failure was visible only to whoever also checked the status.
+// One failed account is enough, however many succeeded before it.
+func firstSyncError(results []*imap.SyncResult) error {
 	for _, result := range results {
 		if result.Error != nil {
 			return fmt.Errorf("sync failed for %s: %w", result.Account, result.Error)
 		}
 	}
-
 	return nil
 }
 
