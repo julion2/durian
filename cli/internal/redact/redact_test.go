@@ -10,6 +10,157 @@ import (
 	"testing"
 )
 
+// TestSanitizeStripsURLUserinfo covers the credentials the length heuristic
+// cannot see. A URL carrying userinfo is usually well under maxSafeRun, so a
+// connection error quoting the URL it dialled logged the password verbatim.
+// Position, not length, is what makes userinfo sensitive.
+func TestSanitizeStripsURLUserinfo(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    string
+		secrets []string
+	}{
+		{
+			name:    "user and password in a dial error",
+			in:      `dial https://alice:hunter2@imap.example.com/x: refused`,
+			want:    `dial https://[REDACTED]@imap.example.com/x: refused`,
+			secrets: []string{"alice", "hunter2"},
+		},
+		{
+			name:    "user only",
+			in:      `get imaps://alice@mail.example.com failed`,
+			want:    `get imaps://[REDACTED]@mail.example.com failed`,
+			secrets: []string{"alice"},
+		},
+		{
+			name:    "at sign inside the password",
+			in:      `https://u:p@ss@host.example.com/path`,
+			want:    `https://[REDACTED]@host.example.com/path`,
+			secrets: []string{"p@ss"},
+		},
+		{
+			name: "no userinfo is left alone",
+			in:   `dial https://imap.example.com/x: refused`,
+			want: `dial https://imap.example.com/x: refused`,
+		},
+		{
+			// The "@" belongs to an address in the message, not to an
+			// authority, and must not be mistaken for userinfo.
+			name: "at sign after the path",
+			in:   `https://api.example.com/send?to=bob@example.com failed`,
+			want: `https://api.example.com/send?to=bob@example.com failed`,
+		},
+		{
+			name: "plain text untouched",
+			in:   `connection reset by peer`,
+			want: `connection reset by peer`,
+		},
+		{
+			// Two URLs in one whitespace-delimited field. Scanning fields and
+			// taking the first "://" per field stopped at the safe one and let
+			// the credentials behind it through untouched.
+			name:    "safe URL followed by a credential URL, no whitespace",
+			in:      `tried https://safe.example,https://alice:hunter2@imap.example/x`,
+			want:    `tried https://safe.example,https://[REDACTED]@imap.example/x`,
+			secrets: []string{"alice", "hunter2"},
+		},
+		{
+			// Every URL, not just the first one that matches.
+			name:    "two credential URLs, no whitespace",
+			in:      `https://a:b@h1.example/x,https://c:d@h2.example/y`,
+			want:    `https://[REDACTED]@h1.example/x,https://[REDACTED]@h2.example/y`,
+			secrets: []string{"a:b", "c:d"},
+		},
+		{
+			name:    "three URLs, credentials in the middle",
+			in:      `[https://one.example|https://u:p@two.example|https://three.example]`,
+			want:    `[https://one.example|https://[REDACTED]@two.example|https://three.example]`,
+			secrets: []string{"u:p"},
+		},
+		// RFC 3986 sub-delims are legal unencoded in a userinfo. Treating any
+		// of them as the end of the authority made the scan stop before the
+		// "@" and find nothing, so a password containing one was logged whole.
+		{
+			name:    "comma in the password",
+			in:      `https://alice:pa,ss@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"pa,ss"},
+		},
+		{
+			name:    "semicolon in the password",
+			in:      `https://alice:pa;ss@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"pa;ss"},
+		},
+		{
+			name:    "apostrophe in the password",
+			in:      `https://alice:pa'ss@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"pa'ss"},
+		},
+		{
+			name:    "parentheses in the password",
+			in:      `https://alice:pa(ss)@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"pa(ss)"},
+		},
+		{
+			// The complete sub-delims production from RFC 3986 §2.2, not just
+			// the five that used to terminate the authority. Written against
+			// the grammar rather than against examples: the earlier version of
+			// this scan looked correct precisely because every fixture used an
+			// alphanumeric password.
+			name:    "every RFC 3986 sub-delim in the password",
+			in:      `https://alice:!$&'()*+,;=@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{`!$&'()*+,;=`},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeText(tt.in)
+			if got != tt.want {
+				t.Errorf("sanitizeText() = %q, want %q", got, tt.want)
+			}
+			for _, secret := range tt.secrets {
+				if strings.Contains(got, secret) {
+					t.Errorf("output still contains %q: %q", secret, got)
+				}
+			}
+		})
+	}
+}
+
+// TestSanitizeStripsUserinfoPreservesWhitespace pins that the scan works on the
+// raw bytes. An earlier version split on whitespace and rejoined with single
+// spaces, which both hid the second URL in a field and rewrote the layout of
+// any multi-line error it touched.
+func TestSanitizeStripsUserinfoPreservesWhitespace(t *testing.T) {
+	in := "dial failed:\n\thttps://u:p@host.example/x\n\tretrying"
+	want := "dial failed:\n\thttps://[REDACTED]@host.example/x\n\tretrying"
+	if len(in) > maxSafeRun {
+		t.Fatalf("fixture is %d bytes; the length pass would collapse whitespace and mask what this asserts", len(in))
+	}
+	if got := sanitizeText(in); got != want {
+		t.Errorf("sanitizeText() = %q, want %q", got, want)
+	}
+}
+
+// TestSanitizeStripsUserinfoBeforeLengthCheck pins the ordering. The userinfo
+// pass has to run before the early return for short strings, or the case it
+// exists for — a short URL — never reaches it.
+func TestSanitizeStripsUserinfoBeforeLengthCheck(t *testing.T) {
+	short := `https://u:p@h.io/x`
+	if len(short) > maxSafeRun {
+		t.Fatalf("fixture is %d bytes, no longer under the %d-byte threshold", len(short), maxSafeRun)
+	}
+	if got := sanitizeText(short); strings.Contains(got, "u:p") {
+		t.Errorf("sanitizeText() = %q, want the userinfo stripped despite the short input", got)
+	}
+}
+
 // newTestLogger returns a logger writing to buf, wrapped with redact.
 func newTestLogger(buf *bytes.Buffer) *slog.Logger {
 	inner := slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
