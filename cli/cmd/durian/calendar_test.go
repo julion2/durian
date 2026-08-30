@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,16 @@ func TestNormalizeEventReference(t *testing.T) {
 		if got := normalizeEventReference(input); got != "uid-1" {
 			t.Errorf("normalizeEventReference(%q) = %q", input, got)
 		}
+	}
+}
+
+func TestCompleteCalendarAccountsIncludesLocal(t *testing.T) {
+	previousConfig := cfg
+	cfg = &config.Config{Accounts: []config.AccountConfig{{Name: "Work", Alias: "work"}}}
+	t.Cleanup(func() { cfg = previousConfig })
+	got, _ := completeCalendarAccounts(nil, nil, "")
+	if !slices.Contains(got, "work") || !slices.Contains(got, "local") {
+		t.Fatalf("calendar account completions = %v", got)
 	}
 }
 
@@ -339,6 +350,25 @@ func TestTargetLabel(t *testing.T) {
 	}
 }
 
+func TestValidateCalendarListWindowFlags(t *testing.T) {
+	previousToday, previousWeek, previousMonth := calListToday, calListWeek, calListMonth
+	previousFrom, previousTo := calListFrom, calListTo
+	t.Cleanup(func() {
+		calListToday, calListWeek, calListMonth = previousToday, previousWeek, previousMonth
+		calListFrom, calListTo = previousFrom, previousTo
+	})
+
+	calListToday, calListWeek, calListMonth = true, true, false
+	if err := validateCalendarListWindowFlags(); err == nil {
+		t.Fatal("multiple presets were accepted")
+	}
+	calListToday, calListWeek = false, true
+	calListFrom = "2026-08-01"
+	if err := validateCalendarListWindowFlags(); err == nil {
+		t.Fatal("preset plus explicit range was accepted")
+	}
+}
+
 // The account has its own output column, so the calendar label stays stable
 // regardless of how many accounts are shown.
 func TestCalendarLabelDoesNotIncludeAccount(t *testing.T) {
@@ -351,5 +381,36 @@ func TestCalendarLabelDoesNotIncludeAccount(t *testing.T) {
 	plain := calendar.LocalCalendar{Name: "Calendar"}
 	if got := calendarLabel(plain); strings.Contains(got, "/") {
 		t.Errorf("account-less label = %q, want no prefix", got)
+	}
+}
+
+// TestCalendarMutationDocReportsADeclinedDelete covers the --json contract for
+// the one outcome that changes nothing. Answering "no" printed a line to
+// stderr and returned, so stdout stayed empty on exit 0 — indistinguishable to
+// a consumer from a command that never ran, or from one whose output was lost.
+//
+// A declined delete is a successful no-op, so it stays exit 0, but it still
+// owes exactly one document. This asserts the document; that it is emitted
+// once follows from the single call on that path.
+func TestCalendarMutationDocReportsADeclinedDelete(t *testing.T) {
+	event := calendar.Event{ICalUID: "uid-1@example.com", Subject: "Standup"}
+
+	aborted := calendarMutationDoc("aborted", event, "work", "Work")
+	if aborted.Action != "aborted" {
+		t.Errorf("action = %q, want aborted", aborted.Action)
+	}
+	if aborted.Event != "event:uid-1@example.com" {
+		t.Errorf("event = %q, want the reference form", aborted.Event)
+	}
+
+	// Same shape as the delete that went through, so a consumer parses one
+	// document type and reads the action rather than guessing from presence.
+	deleted := calendarMutationDoc("deleted", event, "work", "Work")
+	if deleted.Event != aborted.Event || deleted.Subject != aborted.Subject ||
+		deleted.Account != aborted.Account || deleted.Calendar != aborted.Calendar {
+		t.Errorf("declined and completed documents differ beyond the action:\n%+v\n%+v", aborted, deleted)
+	}
+	if deleted.Action == aborted.Action {
+		t.Error("the action does not distinguish a declined delete from a completed one")
 	}
 }

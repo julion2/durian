@@ -24,11 +24,13 @@ go_test(
     srcs = [
         "capability_contract_test.go",
         "engine_test.go",
+        "ingest_bcc_test.go",
     ],
     embed = [":syncengine"],
     deps = [
         "//cli/internal/backend",
         "//cli/internal/dbcrypto",
+        "//cli/internal/smtp",
         "//cli/internal/store",
     ],
 )

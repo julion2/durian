@@ -143,10 +143,12 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     private var searchGeneration: Int = 0
 
     // Thread cache
-    private var threadCache: [String: CachedThread] = [:]
+    // Internal alongside restoreCachedThreads so a test can seed a loaded
+    // thread and assert what rehydration restores from it.
+    var threadCache: [String: CachedThread] = [:]
     private let maxCacheSize = 200
 
-    private struct CachedThread {
+    struct CachedThread {
         let messages: [ThreadMessage]
         let timestamp: Date
     }
@@ -866,17 +868,14 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     // MARK: - Thread Application Helper
 
     /// Applies a ThreadContent to a MailMessage, populating body, metadata, and attachments.
-    private func applyThread(_ thread: ThreadContent, to email: inout MailMessage, isEnrichment: Bool = false) {
+    /// Internal rather than private so the field-by-field projection can be
+    /// tested directly: it is the only place a decoded ThreadMessage becomes a
+    /// MailMessage, and a field silently missing here is invisible everywhere
+    /// else.
+    func applyThread(_ thread: ThreadContent, to email: inout MailMessage, isEnrichment: Bool = false) {
         email.threadMessages = thread.messages
         if let newestMessage = thread.messages.first {
-            email.from = newestMessage.from
-            email.body = newestMessage.body
-            email.htmlBody = newestMessage.html
-            email.to = newestMessage.to
-            email.cc = newestMessage.cc
-            email.messageId = newestMessage.message_id
-            email.inReplyTo = newestMessage.in_reply_to
-            email.references = newestMessage.references
+            email.applyFields(from: newestMessage)
         }
         let allAttachments = thread.messages.flatMap { msg in
             (msg.attachments ?? []).map { att in
@@ -924,22 +923,26 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         }
     }
 
-    private func restoreCachedThreads() {
+    /// Internal rather than private so the rehydration path can be tested. It
+    /// runs after every search and auto-sync and decides what a "loaded"
+    /// message contains from then on, which is exactly the state "Edit Draft"
+    /// reads — a field missing here is invisible until a user edits a draft
+    /// that happens to have been through a sync.
+    func restoreCachedThreads() {
         var restoredCount = 0
         for (index, email) in emails.enumerated() {
             // Skip emails already populated (e.g. from enriched search response)
             if email.threadMessages != nil { continue }
             if let cached = threadCache[email.id] {
                 emails[index].threadMessages = cached.messages
-                if let lastMessage = cached.messages.last {
-                    emails[index].from = lastMessage.from
-                    emails[index].body = lastMessage.body
-                    emails[index].htmlBody = lastMessage.html
-                    emails[index].to = lastMessage.to
-                    emails[index].cc = lastMessage.cc
-                    emails[index].messageId = lastMessage.message_id
-                    emails[index].inReplyTo = lastMessage.in_reply_to
-                    emails[index].references = lastMessage.references
+                // Newest first, matching the fresh-load path. The API sorts
+                // the thread newest-first and this function's own preview
+                // already takes `.first`; projecting `.last` meant a
+                // rehydrated multi-message thread showed the oldest message's
+                // sender, body and recipients, and reset a draft's Bcc to the
+                // originating mail's (absent) one.
+                if let newestMessage = cached.messages.first {
+                    emails[index].applyFields(from: newestMessage)
                 }
                 // Restore attachment metadata from cached messages
                 let allAttachments = cached.messages.flatMap { msg in

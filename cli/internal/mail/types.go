@@ -24,9 +24,14 @@ type Mail struct {
 
 // MailContent represents the full content of an email
 type MailContent struct {
-	From        string           `json:"from"`
-	To          string           `json:"to"`
-	CC          string           `json:"cc,omitempty"`
+	From string `json:"from"`
+	To   string `json:"to"`
+	CC   string `json:"cc,omitempty"`
+	// BCC carries the blind recipients of a draft the user is still editing.
+	// A received message never has them: the sending server strips the header
+	// before delivery, which is what makes the copy blind. They survive only
+	// on the round trip through our own Drafts mailbox.
+	BCC         string           `json:"bcc,omitempty"`
 	Subject     string           `json:"subject"`
 	Date        string           `json:"date"`
 	MessageID   string           `json:"message_id,omitempty"`
@@ -56,6 +61,7 @@ type MessageInfo struct {
 	From            string           `json:"from"`
 	To              string           `json:"to,omitempty"`
 	CC              string           `json:"cc,omitempty"`
+	BCC             string           `json:"bcc,omitempty"`
 	Date            string           `json:"date"`
 	Timestamp       int64            `json:"timestamp"`
 	MessageID       string           `json:"message_id,omitempty"`

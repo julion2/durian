@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "attachment.go",
         "client.go",
+        "content_mapping.go",
         "exec.go",
         "flags.go",
         "rules.go",

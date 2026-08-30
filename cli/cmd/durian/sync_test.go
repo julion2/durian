@@ -3,14 +3,17 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/dbcrypto"
+	"github.com/julion2/durian/cli/internal/imap"
 	"github.com/julion2/durian/cli/internal/store"
 	"github.com/julion2/durian/cli/internal/tagsync"
 )
@@ -21,6 +24,24 @@ func TestSyncProgressIsDisabledForRedirectedStderr(t *testing.T) {
 	t.Cleanup(func() { syncQuiet = previousQuiet })
 	if shouldShowSyncProgress() {
 		t.Fatal("progress enabled while test stderr is redirected")
+	}
+}
+
+func TestSyncRejectsConflictingModesBeforeConfigLoad(t *testing.T) {
+	previousDownload, previousUpload := syncDownloadOnly, syncUploadOnly
+	syncDownloadOnly, syncUploadOnly = true, true
+	t.Cleanup(func() { syncDownloadOnly, syncUploadOnly = previousDownload, previousUpload })
+	if err := runSync(syncCmd, nil); err == nil {
+		t.Fatal("conflicting sync modes were accepted")
+	}
+}
+
+func TestSyncRejectsForceWithoutBackfillBeforeConfigLoad(t *testing.T) {
+	previousForce, previousBackfill := syncBackfillHeadersForce, syncBackfillHeaders
+	syncBackfillHeadersForce, syncBackfillHeaders = true, false
+	t.Cleanup(func() { syncBackfillHeadersForce, syncBackfillHeaders = previousForce, previousBackfill })
+	if err := runSync(syncCmd, nil); err == nil {
+		t.Fatal("--force without --backfill-headers was accepted")
 	}
 }
 
@@ -106,4 +127,46 @@ func TestSyncRemoteTagsDryRunDoesNotWrite(t *testing.T) {
 	if got := db.GetMeta("tag_sync_at"); got != 100 {
 		t.Fatalf("tag sync cursor = %d, want 100", got)
 	}
+}
+
+// TestFirstSyncErrorDecidesBeforeOutput pins the ordering `durian output`
+// promises: on error, stdout is empty. The JSON document used to be written
+// first, so a consumer parsing stdout saw a complete-looking result while the
+// command exited nonzero — the failure was visible only to whoever also
+// checked the status.
+func TestFirstSyncErrorDecidesBeforeOutput(t *testing.T) {
+	t.Run("all succeeded", func(t *testing.T) {
+		results := []*imap.SyncResult{
+			{Account: "work"},
+			{Account: "personal"},
+		}
+		if err := firstSyncError(results); err != nil {
+			t.Errorf("firstSyncError = %v, want nil", err)
+		}
+	})
+
+	t.Run("a later account failed", func(t *testing.T) {
+		// The order matters: earlier successes must not suppress the failure,
+		// which is exactly what writing their results first amounted to.
+		results := []*imap.SyncResult{
+			{Account: "work"},
+			{Account: "personal", Error: errors.New("connection refused")},
+		}
+		err := firstSyncError(results)
+		if err == nil {
+			t.Fatal("firstSyncError = nil, want the failure of a later account")
+		}
+		if !strings.Contains(err.Error(), "personal") {
+			t.Errorf("error %q does not name the failed account", err)
+		}
+		if !strings.Contains(err.Error(), "connection refused") {
+			t.Errorf("error %q drops the cause", err)
+		}
+	})
+
+	t.Run("no accounts", func(t *testing.T) {
+		if err := firstSyncError(nil); err != nil {
+			t.Errorf("firstSyncError = %v, want nil", err)
+		}
+	})
 }

@@ -36,7 +36,7 @@ the selected window (the next 7 days by default).`,
   durian calendar list --from 2026-08-01 --to 2026-08-31
   durian calendar list --calendar "Team" --json`,
 	Args:              cobra.ArbitraryArgs,
-	ValidArgsFunction: completeAccounts,
+	ValidArgsFunction: completeCalendarAccounts,
 	RunE:              runCalendarList,
 }
 
@@ -101,7 +101,7 @@ func init() {
 	for _, c := range []*cobra.Command{calendarListCmd, calendarSearchCmd, calendarShowCmd} {
 		c.Flags().StringArrayVar(&calAccounts, "account", nil,
 			"Only this account (repeatable; default: every account plus the local calendars)")
-		_ = c.RegisterFlagCompletionFunc("account", completeAccounts)
+		_ = c.RegisterFlagCompletionFunc("account", completeCalendarAccounts)
 	}
 	calendarShowCmd.Flags().StringVar(&calShowCalendar, "calendar", "", "Only this calendar (by display name)")
 }
@@ -262,6 +262,9 @@ type occurrence struct {
 }
 
 func runCalendarList(cmd *cobra.Command, args []string) error {
+	if err := validateCalendarListWindowFlags(); err != nil {
+		return err
+	}
 	cols, _, err := calendarTargets(args)
 	if err != nil {
 		return err
@@ -362,10 +365,28 @@ func listWindow(now time.Time) (from, to time.Time, err error) {
 	switch {
 	case calListToday:
 		span = 24 * time.Hour
+	case calListWeek:
+		span = 7 * 24 * time.Hour
 	case calListMonth:
 		span = 30 * 24 * time.Hour
 	}
 	return calendar.CalendarWindow(calListFrom, calListTo, span, now)
+}
+
+func validateCalendarListWindowFlags() error {
+	presets := 0
+	for _, set := range []bool{calListToday, calListWeek, calListMonth} {
+		if set {
+			presets++
+		}
+	}
+	if presets > 1 {
+		return fmt.Errorf("use only one of --today, --week, or --month")
+	}
+	if presets > 0 && (calListFrom != "" || calListTo != "") {
+		return fmt.Errorf("date presets cannot be combined with --from or --to")
+	}
+	return nil
 }
 
 // eventTimeCol renders the time column: "all-day" or "HH:MM".

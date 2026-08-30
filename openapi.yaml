@@ -808,6 +808,14 @@ components:
           type: string
         cc:
           type: string
+        bcc:
+          type: string
+          description: >-
+            Blind recipients. Only ever present on a draft the user has saved
+            themselves: a received message has no Bcc header, because the
+            sending server strips it before delivery. A client reopening a
+            draft for editing must restore this field, or saving again drops
+            the recipients.
         date:
           type: string
         timestamp:

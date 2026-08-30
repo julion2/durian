@@ -1113,6 +1113,31 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 27 {
+		// Add messages.bcc_ct so a draft's blind recipients survive the round
+		// trip through the Drafts mailbox. Until now BuildDraft wrote the Bcc
+		// header into the appended RFC822, but the parser never read it back:
+		// reopening a draft returned an empty Bcc and the next save dropped the
+		// recipients silently.
+		//
+		// Encrypted-only, under the meta sub-key. The addrs columns are
+		// plaintext by the ADR-0001 §3 revision ("already public on the wire"),
+		// a rationale that does not extend to the one class of recipient no
+		// other recipient sees. No plaintext twin means no FTS exposure either.
+		has, err := hasColumn(d.db, "messages", "bcc_ct")
+		if err != nil {
+			return fmt.Errorf("migrate v26→v27 inspect bcc_ct: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN bcc_ct BLOB"); err != nil {
+				return fmt.Errorf("migrate v26→v27 add bcc_ct: %w", err)
+			}
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 27 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v26→v27 bump: %w", err)
+		}
+	}
+
 	return nil
 }
 
