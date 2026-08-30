@@ -174,6 +174,39 @@ func TestPutChunkRejectsInsecureRedirect(t *testing.T) {
 	}
 }
 
+func TestPutChunkFollowsCrossOriginHTTPSRedirect(t *testing.T) {
+	chunk := []byte("secret")
+	var uploaded []byte
+	destination := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("redirected upload Authorization = %q, want empty", got)
+		}
+		if r.Method != http.MethodPut {
+			t.Errorf("redirected method = %s, want PUT", r.Method)
+		}
+		uploaded, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer destination.Close()
+
+	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("initial upload Authorization = %q, want empty", got)
+		}
+		w.Header().Set("Location", destination.URL+"/chunk?sig=abc")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	s := &Sender{b: newTestBackend(t, source)}
+	if err := s.putChunk(t.Context(), source.URL+"/upload", chunk, 0, len(chunk), len(chunk)); err != nil {
+		t.Fatalf("putChunk() cross-origin HTTPS redirect: %v", err)
+	}
+	if !bytes.Equal(uploaded, chunk) {
+		t.Fatalf("redirected upload = %q, want %q", uploaded, chunk)
+	}
+}
+
 func TestSenderReplyUsesCreateReply(t *testing.T) {
 	createReplyCalled := false
 	sent := false
