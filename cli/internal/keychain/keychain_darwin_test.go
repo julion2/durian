@@ -271,7 +271,7 @@ func TestGetOrCreateKey_RejectsWrongLength(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for wrong-length stored key, got nil")
 	}
-	if !strings.Contains(err.Error(), "length 16, want 32") {
+	if !strings.Contains(err.Error(), "want 32 bytes") {
 		t.Errorf("error = %v, want length-mismatch message", err)
 	}
 }
