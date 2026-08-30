@@ -72,6 +72,7 @@ go_test(
         "//cli/internal/contacts",
         "//cli/internal/dbcrypto",
         "//cli/internal/protocol",
+        "//cli/internal/redact",
         "//cli/internal/smtp",
         "//cli/internal/store",
         "@com_github_gorilla_mux//:mux",

@@ -23,6 +23,7 @@ go_library(
         "//cli/internal/keychain",
         "//cli/internal/mail",
         "//cli/internal/oauth",
+        "//cli/internal/redact",
         "//cli/internal/store",
         "@com_github_emersion_go_imap//:go-imap",
         "@com_github_emersion_go_imap//client",
@@ -35,6 +36,7 @@ go_test(
     size = "small",
     srcs = [
         "attachment_test.go",
+        "client_redaction_test.go",
         "exec_test.go",
         "flags_test.go",
         "gmail_test.go",
@@ -47,6 +49,7 @@ go_test(
     deps = [
         "//cli/internal/config",
         "//cli/internal/dbcrypto",
+        "//cli/internal/redact",
         "//cli/internal/store",
         "@com_github_emersion_go_imap//:go-imap",
     ],

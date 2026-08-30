@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -45,11 +46,48 @@ func TestSanitizeStripsURLUserinfo(t *testing.T) {
 			want: `dial https://imap.example.com/x: refused`,
 		},
 		{
-			// The "@" belongs to an address in the message, not to an
-			// authority, and must not be mistaken for userinfo.
-			name: "at sign after the path",
-			in:   `https://api.example.com/send?to=bob@example.com failed`,
-			want: `https://api.example.com/send?to=bob@example.com failed`,
+			// The "@" belongs to a query value, not to authority userinfo.
+			// The complete value is still sensitive and must be removed.
+			name:    "at sign in a query value",
+			in:      `https://api.example.com/send?to=bob@example.com failed`,
+			want:    `https://api.example.com/send?to=[REDACTED] failed`,
+			secrets: []string{"bob@example.com"},
+		},
+		{
+			name:    "multiple query values and fragment",
+			in:      `Get "https://api.example.com/token?code=short-secret&state=also-secret#access-token": 401`,
+			want:    `Get "https://api.example.com/token?code=[REDACTED]&state=[REDACTED]#[REDACTED]": 401`,
+			secrets: []string{"short-secret", "also-secret", "access-token"},
+		},
+		{
+			name:    "query without equals",
+			in:      `https://api.example.com/callback?short-secret`,
+			want:    `https://api.example.com/callback?[REDACTED]`,
+			secrets: []string{"short-secret"},
+		},
+		{
+			name:    "fragment without query",
+			in:      `https://api.example.com/callback#access-token`,
+			want:    `https://api.example.com/callback#[REDACTED]`,
+			secrets: []string{"access-token"},
+		},
+		{
+			name:    "question mark inside fragment",
+			in:      `https://api.example.com/callback#access_token=short-secret?x=y`,
+			want:    `https://api.example.com/callback#[REDACTED]`,
+			secrets: []string{"short-secret", "x=y"},
+		},
+		{
+			name:    "IPv6 URL query",
+			in:      `Get "https://[::1]/callback?code=short-secret": refused`,
+			want:    `Get "https://[::1]/callback?code=[REDACTED]": refused`,
+			secrets: []string{"short-secret"},
+		},
+		{
+			name:    "query URL followed by adjacent safe URL",
+			in:      `https://a.test/c?code=short-secret,https://b.test/health`,
+			want:    `https://a.test/c?code=[REDACTED],https://b.test/health`,
+			secrets: []string{"short-secret"},
 		},
 		{
 			name: "plain text untouched",
@@ -374,6 +412,64 @@ func TestHandle_PreservesShortErrors(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "[redacted ") {
 		t.Errorf("short error should not be redacted:\n%s", buf.String())
+	}
+}
+
+type providerError struct {
+	secret string
+	target error
+}
+
+func (e *providerError) Error() string { return "provider response: " + e.secret }
+func (e *providerError) Unwrap() error { return e.target }
+
+func TestExternalErrorPreservesErrorAndRedactsOnlyTheLog(t *testing.T) {
+	sentinel := errors.New("retry classification sentinel")
+	providerErr := &providerError{secret: "short multiword response with token abc123", target: sentinel}
+	err := fmt.Errorf("fetch inbox: %w", ExternalError(providerErr, "provider request failed: status 401: response body "+Placeholder))
+
+	if got, want := err.Error(), "fetch inbox: "+providerErr.Error(); got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatal("ExternalError broke errors.Is through the provider error")
+	}
+	var gotProvider *providerError
+	if !errors.As(err, &gotProvider) || gotProvider != providerErr {
+		t.Fatal("ExternalError broke errors.As through the provider error")
+	}
+
+	var buf bytes.Buffer
+	newTestLogger(&buf).Warn("sync failed", "err", err)
+	out := buf.String()
+	for _, secret := range []string{"short multiword response", "abc123"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("provider-controlled text %q leaked:\n%s", secret, out)
+		}
+	}
+	for _, context := range []string{"fetch inbox", "status 401", Placeholder} {
+		if !strings.Contains(out, context) {
+			t.Errorf("safe context %q missing:\n%s", context, out)
+		}
+	}
+}
+
+func TestHandleSanitizesURLSecretsInUnmarkedErrorAndStringFallback(t *testing.T) {
+	for _, value := range []any{
+		errors.New(`Get "https://alice:hunter2@api.example.test/token?code=short-secret": unauthorized`),
+		`Get "https://alice:hunter2@api.example.test/token?code=short-secret": unauthorized`,
+	} {
+		var buf bytes.Buffer
+		newTestLogger(&buf).Warn("request failed", "err", value)
+		out := buf.String()
+		for _, secret := range []string{"alice", "hunter2", "short-secret"} {
+			if strings.Contains(out, secret) {
+				t.Errorf("URL secret %q leaked from %T:\n%s", secret, value, out)
+			}
+		}
+		if !strings.Contains(out, "api.example.test/token?code="+Placeholder) {
+			t.Errorf("safe URL context missing from %T:\n%s", value, out)
+		}
 	}
 }
 

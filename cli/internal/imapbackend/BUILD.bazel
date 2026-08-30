@@ -9,6 +9,7 @@ go_library(
         "//cli/internal/backend",
         "//cli/internal/config",
         "//cli/internal/imap",
+        "//cli/internal/redact",
         "@com_github_emersion_go_imap//:go-imap",
     ],
 )
@@ -21,5 +22,6 @@ go_test(
     deps = [
         "//cli/internal/backend",
         "//cli/internal/imap",
+        "//cli/internal/redact",
     ],
 )

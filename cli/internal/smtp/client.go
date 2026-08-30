@@ -10,12 +10,18 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 const (
 	// DefaultTimeout for SMTP operations
 	DefaultTimeout = 30 * time.Second
 )
+
+func smtpServerError(err error, operation string) error {
+	return redact.ExternalError(err, operation+": SMTP server response "+redact.Placeholder)
+}
 
 // Auth represents authentication credentials
 type Auth interface {
@@ -124,7 +130,7 @@ func (c *Client) Send(msg *Message) error {
 		client, err = smtp.NewClient(conn, c.Host)
 	}
 	if err != nil {
-		return fmt.Errorf("failed to create SMTP client: %w", err)
+		return smtpServerError(fmt.Errorf("failed to create SMTP client: %w", err), "create SMTP client failed")
 	}
 	defer client.Close()
 
@@ -136,7 +142,7 @@ func (c *Client) Send(msg *Message) error {
 		}
 	}
 	if err := client.Hello(ehloHost); err != nil {
-		return fmt.Errorf("HELO failed: %w", err)
+		return smtpServerError(fmt.Errorf("HELO failed: %w", err), "SMTP HELO failed")
 	}
 
 	// Require STARTTLS for all non-implicit-TLS connections
@@ -146,7 +152,7 @@ func (c *Client) Send(msg *Message) error {
 				ServerName: c.Host,
 			}
 			if err := client.StartTLS(config); err != nil {
-				return fmt.Errorf("STARTTLS failed: %w", err)
+				return smtpServerError(fmt.Errorf("STARTTLS failed: %w", err), "SMTP STARTTLS failed")
 			}
 			slog.Debug("STARTTLS negotiated", "module", "SMTP", "host", c.Host, "port", c.Port)
 		} else {
@@ -172,7 +178,7 @@ func (c *Client) Send(msg *Message) error {
 		}
 
 		if err := client.Auth(smtpAuth); err != nil {
-			return fmt.Errorf("authentication failed: %w", err)
+			return smtpServerError(fmt.Errorf("authentication failed: %w", err), "SMTP authentication failed")
 		}
 	}
 
@@ -194,7 +200,7 @@ func (c *Client) Send(msg *Message) error {
 	// base64 (always 7-bit clean) and our addresses are ASCII, so dropping
 	// both extension declarations is a no-op for content semantics.
 	if err := mailFromPlain(client, from); err != nil {
-		return fmt.Errorf("MAIL FROM failed: %w", err)
+		return smtpServerError(fmt.Errorf("MAIL FROM failed: %w", err), "SMTP MAIL FROM failed")
 	}
 
 	// Set recipients (extract bare email from "Name <email>" format)
@@ -204,14 +210,14 @@ func (c *Client) Send(msg *Message) error {
 			return fmt.Errorf("invalid recipient address %q: %w", to, err)
 		}
 		if err := client.Rcpt(rcpt); err != nil {
-			return fmt.Errorf("RCPT TO failed for %s: %w", rcpt, err)
+			return smtpServerError(fmt.Errorf("RCPT TO failed for %s: %w", rcpt, err), "SMTP RCPT TO failed")
 		}
 	}
 
 	// Send message data
 	wc, err := client.Data()
 	if err != nil {
-		return fmt.Errorf("DATA failed: %w", err)
+		return smtpServerError(fmt.Errorf("DATA failed: %w", err), "SMTP DATA failed")
 	}
 
 	// Build and write message
@@ -227,7 +233,7 @@ func (c *Client) Send(msg *Message) error {
 	}
 
 	if err := wc.Close(); err != nil {
-		return fmt.Errorf("failed to complete message: %w", err)
+		return smtpServerError(fmt.Errorf("failed to complete message: %w", err), "complete SMTP message failed")
 	}
 
 	// Quit gracefully

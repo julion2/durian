@@ -1,12 +1,16 @@
 package smtp
 
 import (
+	"errors"
+	"fmt"
 	"net"
 	"net/smtp"
 	"net/textproto"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 func TestSenderReportsServerSideSentBehavior(t *testing.T) {
@@ -15,6 +19,25 @@ func TestSenderReportsServerSideSentBehavior(t *testing.T) {
 	}
 	if !NewSender("smtp.gmail.com", 587, nil, true).SavesSentCopy() {
 		t.Fatal("provider-managed SMTP Sent copy was not reported")
+	}
+}
+
+func TestSMTPServerErrorPreservesCallerTextAndProvidesSafeLogText(t *testing.T) {
+	const response = "550 short multiword rejection echoing token abc123"
+	raw := errors.New(response)
+	err := smtpServerError(fmt.Errorf("RCPT TO failed for private@example.test: %w", raw), "SMTP RCPT TO failed")
+	if !strings.Contains(err.Error(), response) || !strings.Contains(err.Error(), "private@example.test") {
+		t.Fatalf("Error() lost caller-facing context: %q", err.Error())
+	}
+	if !errors.Is(err, raw) {
+		t.Fatal("SMTP redaction marker broke errors.Is")
+	}
+	var safeErr redact.SafeLogError
+	if !errors.As(err, &safeErr) {
+		t.Fatalf("error %T is not marked safe for logging", err)
+	}
+	if strings.Contains(safeErr.SafeLogText(), response) || strings.Contains(safeErr.SafeLogText(), "private@example.test") {
+		t.Fatalf("safe log text leaked SMTP data: %q", safeErr.SafeLogText())
 	}
 }
 

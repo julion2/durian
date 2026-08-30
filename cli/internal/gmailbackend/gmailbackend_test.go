@@ -34,6 +34,13 @@ func newTestBackend(t *testing.T, srv *httptest.Server) *Backend {
 	return b
 }
 
+func TestStatusErrorSafeLogTextOmitsResponseBody(t *testing.T) {
+	const body = "short multiword response echoing token abc123"
+	if got := (&statusError{status: http.StatusUnauthorized, body: body}).SafeLogText(); strings.Contains(got, body) {
+		t.Fatalf("SafeLogText() leaked response body: %q", got)
+	}
+}
+
 func writeJSON(t *testing.T, w http.ResponseWriter, v any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")

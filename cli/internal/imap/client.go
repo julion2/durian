@@ -18,12 +18,17 @@ import (
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/keychain"
 	"github.com/julion2/durian/cli/internal/oauth"
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 const (
 	// DefaultTimeout for IMAP operations
 	DefaultTimeout = 30 * time.Second
 )
+
+func imapServerError(err error, operation string) error {
+	return redact.ExternalError(err, operation+": IMAP server response "+redact.Placeholder)
+}
 
 // SpecialUseRole defines IMAP SPECIAL-USE mailbox roles (RFC 6154)
 type SpecialUseRole string
@@ -110,7 +115,7 @@ func (c *Client) Connect() error {
 	c.conn, err = client.New(tlsConn)
 	if err != nil {
 		conn.Close()
-		return fmt.Errorf("failed to create IMAP client: %w", err)
+		return imapServerError(fmt.Errorf("failed to create IMAP client: %w", err), "create IMAP client failed")
 	}
 
 	return nil
@@ -154,7 +159,7 @@ func (c *Client) authenticateOAuth2() error {
 
 	// Authenticate
 	if err := c.conn.Authenticate(saslClient); err != nil {
-		return fmt.Errorf("XOAUTH2 authentication failed: %w", err)
+		return imapServerError(fmt.Errorf("XOAUTH2 authentication failed: %w", err), "IMAP OAuth authentication failed")
 	}
 
 	return nil
@@ -177,14 +182,14 @@ func (c *Client) authenticatePassword() error {
 	if ok, _ := c.conn.Support("AUTH=PLAIN"); ok {
 		saslClient := sasl.NewPlainClient("", username, password)
 		if err := c.conn.Authenticate(saslClient); err != nil {
-			return fmt.Errorf("PLAIN authentication failed: %w", err)
+			return imapServerError(fmt.Errorf("PLAIN authentication failed: %w", err), "IMAP password authentication failed")
 		}
 		return nil
 	}
 
 	// Fall back to LOGIN
 	if err := c.conn.Login(username, password); err != nil {
-		return fmt.Errorf("LOGIN authentication failed: %w", err)
+		return imapServerError(fmt.Errorf("LOGIN authentication failed: %w", err), "IMAP password authentication failed")
 	}
 
 	return nil
@@ -209,7 +214,7 @@ func (c *Client) ListMailboxes() ([]*imap.MailboxInfo, error) {
 	}
 
 	if err := <-done; err != nil {
-		return nil, fmt.Errorf("failed to list mailboxes: %w", err)
+		return nil, imapServerError(fmt.Errorf("failed to list mailboxes: %w", err), "list IMAP mailboxes failed")
 	}
 
 	return result, nil
@@ -223,7 +228,7 @@ func (c *Client) SelectMailbox(name string) (*imap.MailboxStatus, error) {
 
 	status, err := c.conn.Select(name, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to select mailbox %s: %w", name, err)
+		return nil, imapServerError(fmt.Errorf("failed to select mailbox %s: %w", name, err), "select IMAP mailbox failed")
 	}
 
 	return status, nil
@@ -240,7 +245,7 @@ func (c *Client) SearchAll() ([]uint32, error) {
 
 	uids, err := c.conn.UidSearch(criteria)
 	if err != nil {
-		return nil, fmt.Errorf("failed to search messages: %w", err)
+		return nil, imapServerError(fmt.Errorf("failed to search messages: %w", err), "search IMAP messages failed")
 	}
 
 	return uids, nil
@@ -265,7 +270,7 @@ func (c *Client) SearchUIDRange(minUID, maxUID uint32) ([]uint32, error) {
 
 	uids, err := c.conn.UidSearch(criteria)
 	if err != nil {
-		return nil, fmt.Errorf("failed to search UIDs %d:*: %w", minUID, err)
+		return nil, imapServerError(fmt.Errorf("failed to search UIDs %d:*: %w", minUID, err), "search IMAP UIDs failed")
 	}
 
 	// IMAP UID range "minUID:*" always includes the highest UID even if it's
@@ -321,8 +326,9 @@ func (c *Client) FetchMessages(uids []uint32) ([]*imap.Message, error) {
 	}
 
 	if err := <-done; err != nil {
+		err = imapServerError(fmt.Errorf("failed to fetch messages: %w", err), "fetch IMAP messages failed")
 		slog.Debug("Fetch error", "module", "IMAP", "err", err)
-		return nil, fmt.Errorf("failed to fetch messages: %w", err)
+		return nil, err
 	}
 
 	slog.Debug("Fetch completed", "module", "IMAP", "count", len(result))
@@ -358,7 +364,7 @@ func (c *Client) Idle(stop <-chan struct{}, updates chan<- bool) error {
 				updates <- true
 			}
 		case err := <-done:
-			return err
+			return imapServerError(err, "IMAP IDLE failed")
 		}
 	}
 }
@@ -398,7 +404,7 @@ func (c *Client) FetchFlags(uids []uint32) (map[uint32][]string, error) {
 	}
 
 	if err := <-done; err != nil {
-		return nil, fmt.Errorf("failed to fetch flags: %w", err)
+		return nil, imapServerError(fmt.Errorf("failed to fetch flags: %w", err), "fetch IMAP flags failed")
 	}
 
 	return result, nil
@@ -457,7 +463,7 @@ func (c *Client) FetchGmailLabels(uids []uint32) (map[uint32][]string, error) {
 		}
 
 		if err := <-done; err != nil {
-			return nil, fmt.Errorf("failed to fetch gmail labels: %w", err)
+			return nil, imapServerError(fmt.Errorf("failed to fetch gmail labels: %w", err), "fetch IMAP Gmail labels failed")
 		}
 	}
 
@@ -530,7 +536,7 @@ func (c *Client) fetchEnvelopesBatch(uids []uint32) (map[uint32]string, error) {
 	}
 
 	if err := <-done; err != nil {
-		return nil, fmt.Errorf("failed to fetch envelopes: %w", err)
+		return nil, imapServerError(fmt.Errorf("failed to fetch envelopes: %w", err), "fetch IMAP envelopes failed")
 	}
 
 	return result, nil
@@ -566,7 +572,7 @@ func (c *Client) StoreFlags(uid uint32, flags []string) error {
 	}
 
 	if err := <-done; err != nil {
-		return fmt.Errorf("failed to store flags for UID %d: %w", uid, err)
+		return imapServerError(fmt.Errorf("failed to store flags for UID %d: %w", uid, err), "store IMAP flags failed")
 	}
 
 	return nil
@@ -605,7 +611,7 @@ func (c *Client) AddFlags(uid uint32, flags []string) error {
 	}
 
 	if err := <-done; err != nil {
-		return fmt.Errorf("failed to add flags for UID %d: %w", uid, err)
+		return imapServerError(fmt.Errorf("failed to add flags for UID %d: %w", uid, err), "add IMAP flags failed")
 	}
 
 	return nil
@@ -644,7 +650,7 @@ func (c *Client) RemoveFlags(uid uint32, flags []string) error {
 	}
 
 	if err := <-done; err != nil {
-		return fmt.Errorf("failed to remove flags for UID %d: %w", uid, err)
+		return imapServerError(fmt.Errorf("failed to remove flags for UID %d: %w", uid, err), "remove IMAP flags failed")
 	}
 
 	return nil
@@ -662,7 +668,7 @@ func (c *Client) Append(mailbox string, flags []string, date time.Time, message 
 	literal := bytes.NewReader(message)
 
 	if err := c.conn.Append(mailbox, flags, date, literal); err != nil {
-		return 0, fmt.Errorf("failed to append message to %s: %w", mailbox, err)
+		return 0, imapServerError(fmt.Errorf("failed to append message to %s: %w", mailbox, err), "append IMAP message failed")
 	}
 
 	return 0, nil
@@ -693,12 +699,12 @@ func (c *Client) Delete(uid uint32) error {
 	}
 
 	if err := <-done; err != nil {
-		return fmt.Errorf("failed to mark message %d as deleted: %w", uid, err)
+		return imapServerError(fmt.Errorf("failed to mark message %d as deleted: %w", uid, err), "mark IMAP message deleted failed")
 	}
 
 	// Expunge to permanently remove
 	if err := c.conn.Expunge(nil); err != nil {
-		return fmt.Errorf("failed to expunge message %d: %w", uid, err)
+		return imapServerError(fmt.Errorf("failed to expunge message %d: %w", uid, err), "expunge IMAP message failed")
 	}
 
 	return nil
@@ -738,7 +744,7 @@ func (c *Client) CopyToMailbox(uid uint32, destMailbox string) error {
 	seqSet.AddNum(uid)
 
 	if err := c.conn.UidCopy(seqSet, destMailbox); err != nil {
-		return fmt.Errorf("failed to copy UID %d to %s: %w", uid, destMailbox, err)
+		return imapServerError(fmt.Errorf("failed to copy UID %d to %s: %w", uid, destMailbox, err), "copy IMAP message failed")
 	}
 
 	return nil
@@ -751,7 +757,7 @@ func (c *Client) Expunge() error {
 	}
 
 	if err := c.conn.Expunge(nil); err != nil {
-		return fmt.Errorf("failed to expunge: %w", err)
+		return imapServerError(fmt.Errorf("failed to expunge: %w", err), "expunge IMAP messages failed")
 	}
 
 	return nil
@@ -772,7 +778,7 @@ func (c *Client) SearchByMessageID(messageID string) (uint32, error) {
 
 	uids, err := c.conn.UidSearch(criteria)
 	if err != nil {
-		return 0, fmt.Errorf("failed to search for Message-ID: %w", err)
+		return 0, imapServerError(fmt.Errorf("failed to search for Message-ID: %w", err), "search IMAP Message-ID failed")
 	}
 
 	if len(uids) == 0 {
@@ -889,7 +895,7 @@ func (c *Client) FetchBodyStructure(uid uint32) (*imap.BodyStructure, error) {
 	}
 
 	if err := <-done; err != nil {
-		return nil, fmt.Errorf("failed to fetch BODYSTRUCTURE for UID %d: %w", uid, err)
+		return nil, imapServerError(fmt.Errorf("failed to fetch BODYSTRUCTURE for UID %d: %w", uid, err), "fetch IMAP body structure failed")
 	}
 	if result == nil {
 		return nil, fmt.Errorf("no message found for UID %d", uid)
@@ -931,7 +937,7 @@ func (c *Client) FetchBodySection(uid uint32, sectionPath []int, w io.Writer) er
 	}
 
 	if err := <-done; err != nil {
-		return fmt.Errorf("failed to fetch BODY[%v] for UID %d: %w", sectionPath, uid, err)
+		return imapServerError(fmt.Errorf("failed to fetch BODY[%v] for UID %d: %w", sectionPath, uid, err), "fetch IMAP body section failed")
 	}
 	if msg == nil {
 		return fmt.Errorf("no message found for UID %d", uid)
@@ -998,7 +1004,7 @@ func (c *Client) FetchHeadersOnly(uids []uint32) (map[uint32][]byte, error) {
 	}
 
 	if err := <-done; err != nil {
-		return nil, fmt.Errorf("fetch headers: %w", err)
+		return nil, imapServerError(fmt.Errorf("fetch headers: %w", err), "fetch IMAP headers failed")
 	}
 	return result, nil
 }
@@ -1013,7 +1019,7 @@ func (c *Client) Close() error {
 	if err := c.conn.Logout(); err != nil {
 		// Still try to close the connection
 		c.conn.Close()
-		return err
+		return imapServerError(err, "IMAP logout failed")
 	}
 
 	return c.conn.Close()

@@ -31,6 +31,13 @@ func testClient(srv *httptest.Server) *Client {
 	}
 }
 
+func TestStatusErrorSafeLogTextOmitsResponseBody(t *testing.T) {
+	const body = "short multiword response echoing token abc123"
+	if got := (&statusError{status: http.StatusUnauthorized, body: body}).SafeLogText(); strings.Contains(got, body) {
+		t.Fatalf("SafeLogText() leaked response body: %q", got)
+	}
+}
+
 func TestMailboxRouting(t *testing.T) {
 	own, err := New(&config.AccountConfig{
 		Email: "me@example.com", OAuth: &config.OAuthConfig{Provider: "microsoft"},

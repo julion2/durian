@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 type fakeCalendarEventSyncer struct {
@@ -29,6 +32,15 @@ type fakeCalendarEventSyncer struct {
 func (f *fakeCalendarEventSyncer) SyncCalendarEvent(_ context.Context, account, calendar, uid, operation string) (bool, error) {
 	f.account, f.calendar, f.uid, f.operation = account, calendar, uid, operation
 	return f.applied, f.err
+}
+
+type calendarProviderError struct {
+	text string
+}
+
+func (e *calendarProviderError) Error() string { return e.text }
+func (e *calendarProviderError) SafeLogText() string {
+	return "calendar provider response " + redact.Placeholder
 }
 
 // newCalendarHandler builds a Handler whose config points at a temp vdir seeded
@@ -323,6 +335,31 @@ func TestCalendarSyncEventHandlerErrors(t *testing.T) {
 				t.Fatalf("status = %d, want %d: %s", w.Code, tt.want, w.Body.String())
 			}
 		})
+	}
+}
+
+func TestCalendarSyncEventHandlerKeepsProviderErrorTypedForLogging(t *testing.T) {
+	const providerText = "short multiword provider response echoing token abc123"
+	var logOutput bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(redact.Wrap(slog.NewTextHandler(&logOutput, nil))))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	h := New(nil, nil)
+	h.SetCalendarEventSyncer(&fakeCalendarEventSyncer{err: &calendarProviderError{text: providerText}})
+	r := newTestRouter(h, nil)
+	w := httptest.NewRecorder()
+	body := `{"account":"work","calendar":"Calendar","uid":"u","operation":"save"}`
+	r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/calendars/sync/event", strings.NewReader(body)))
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusBadGateway, w.Body.String())
+	}
+	if strings.Contains(logOutput.String(), providerText) {
+		t.Fatalf("provider response leaked into log:\n%s", logOutput.String())
+	}
+	if !strings.Contains(logOutput.String(), redact.Placeholder) {
+		t.Fatalf("redaction marker missing from log:\n%s", logOutput.String())
 	}
 }
 

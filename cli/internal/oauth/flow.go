@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"runtime"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 const (
@@ -71,7 +73,8 @@ func StartFlow(provider *Provider, clientID, redirectURI, loginHint string, pkce
 	select {
 	case result := <-resultChan:
 		if result.Error != "" {
-			return nil, fmt.Errorf("authorization error: %s", result.Error)
+			err := fmt.Errorf("authorization error: %s", result.Error)
+			return nil, redact.ExternalError(err, "OAuth authorization rejected: provider response "+redact.Placeholder)
 		}
 		return result, nil
 	case err := <-errChan:

@@ -19,6 +19,18 @@ import (
 
 const testRaw = "From: Alice <alice@example.test>\r\nTo: Me <me@example.test>\r\nSubject: hello\r\nMessage-ID: <m1@example.test>\r\nDate: Tue, 25 Aug 2026 12:00:00 +0000\r\n\r\nbody\r\n"
 
+func TestProviderErrorsSafeLogTextOmitsServerDetails(t *testing.T) {
+	const secret = "short multiword response echoing token abc123"
+	for name, err := range map[string]interface{ SafeLogText() string }{
+		"status": &statusError{Status: http.StatusUnauthorized, Body: secret},
+		"method": &methodError{Type: "custom-" + secret, Description: secret},
+	} {
+		if got := err.SafeLogText(); strings.Contains(got, secret) {
+			t.Errorf("%s SafeLogText() leaked server details: %q", name, got)
+		}
+	}
+}
+
 type testJMAPServer struct {
 	t      *testing.T
 	server *httptest.Server
