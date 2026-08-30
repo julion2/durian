@@ -107,10 +107,10 @@ type Syncer struct {
 	ownsClient      bool                  // true = syncer manages connection lifecycle
 	store           *store.DB             // SQLite store for messages and tags
 	parser          *durianmail.Parser    // Email parser for store writes
-	// flagTransportOverride substitutes the IMAP calls the flag pass makes.
-	// Nil in production; set by tests that exercise the reconciliation
-	// decisions, which is where this pass has historically gone wrong.
-	flagTransportOverride flagTransport
+	// Transport overrides are nil in production; tests substitute the narrow
+	// protocol slices used by flag reconciliation and folder moves.
+	flagTransportOverride       flagTransport
+	folderMoveTransportOverride folderMoveTransport
 }
 
 // NewSyncer creates a new syncer for an account
@@ -167,9 +167,13 @@ func (s *Syncer) Sync() (*SyncResult, error) {
 		Account: s.account.Email,
 	}
 
-	// Load state (acquires file lock to prevent concurrent syncs)
 	var err error
-	s.state, s.stateLock, err = s.stateMgr.Load(s.account.Email)
+	if s.options.DryRun {
+		s.state, err = s.stateMgr.LoadReadOnly(s.account.Email)
+	} else {
+		// A mutating sync holds the state lock for its full lifetime.
+		s.state, s.stateLock, err = s.stateMgr.Load(s.account.Email)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to load state: %w", err)
 	}
@@ -282,6 +286,8 @@ func SyncAccounts(accounts []*config.AccountConfig, options *SyncOptions) ([]*Sy
 				Account: account.Email,
 				Error:   err,
 			}
+		} else if result.Error != nil {
+			fmt.Fprintf(os.Stderr, "  ✗ %v\n", result.Error)
 		} else {
 			// Compact summary
 			parts := []string{}

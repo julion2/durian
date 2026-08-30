@@ -1398,6 +1398,7 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 	if err != nil {
 		slog.Warn("Folder-move upload: load inbox state failed", "module", "SYNCENGINE",
 			"account", e.opts.Account, "err", err)
+		result.Errors = append(result.Errors, fmt.Errorf("load inbox state for folder moves: %w", err))
 		return
 	}
 
@@ -1405,9 +1406,10 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 		if tagsContain(r.Tags, "inbox") {
 			continue // still in inbox — nothing to upload
 		}
-		dest, ok := moveDestination(r.Tags, folders)
+		dest, role, ok := moveDestination(r.Tags, folders)
 		if !ok {
-			continue // no resolvable destination (e.g. no Archive folder) — leave in place
+			result.Errors = append(result.Errors, fmt.Errorf("move %s: account has no %s folder", r.MessageID, role))
+			continue
 		}
 		if e.opts.DryRun {
 			slog.Debug("[dry-run] Would move message out of inbox", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
@@ -1415,7 +1417,7 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 			result.Moved++
 			continue
 		}
-		ref := backend.RemoteRef{Folder: inbox.Name, ID: r.RemoteRef}
+		ref := backend.RemoteRef{Folder: inbox.Name, ID: r.RemoteRef, MessageID: r.MessageID}
 		if _, err := b.Move(ctx, ref, dest); err != nil {
 			if errors.Is(err, backend.ErrRefGone) {
 				// The message already left INBOX on the server (archived from
@@ -1439,6 +1441,7 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 				if err := e.opts.Store.UpdateMailbox(r.MessageID, e.opts.Account, dest, 0); err != nil {
 					slog.Warn("Folder-move upload: reconcile gone message failed", "module", "SYNCENGINE", // encgrep:allow static message text only; message_id is plaintext and err carries no encrypted column
 						"message_id", r.MessageID, "err", err)
+					result.Errors = append(result.Errors, fmt.Errorf("reconcile moved message %s: %w", r.MessageID, err))
 				}
 				continue
 			}
@@ -1450,6 +1453,8 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 		if err := e.opts.Store.UpdateMailbox(r.MessageID, e.opts.Account, dest, 0); err != nil {
 			slog.Warn("Folder-move upload: update mailbox failed", "module", "SYNCENGINE", // encgrep:allow static message text mentions "mailbox"; only message_id (plaintext) and err are logged
 				"message_id", r.MessageID, "err", err)
+			result.Errors = append(result.Errors, fmt.Errorf("record moved message %s: %w", r.MessageID, err))
+			continue
 		}
 		result.Moved++
 		slog.Info("Moved message out of inbox", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
@@ -1512,11 +1517,12 @@ func (e *Engine) uploadLabelChanges(ctx context.Context, b backend.Backend, resu
 		// genuine local change is picked up next sync against the seeded baseline.
 		if r.SyncedLabels == "" {
 			_, _, seedBaseline := diffLabels(r.Tags, nil, vocab)
-			if len(seedBaseline) > 0 {
+			if len(seedBaseline) > 0 && !e.opts.DryRun {
 				if err := e.opts.Store.SetSyncedLabels(r.MessageID, e.opts.Account, strings.Join(seedBaseline, ",")); err != nil {
 					result.Errors = append(result.Errors, fmt.Errorf("seed label baseline for %s: %w", r.MessageID, err))
+				} else {
+					seeded++
 				}
-				seeded++
 			}
 			continue
 		}
@@ -1587,19 +1593,20 @@ func diffLabels(tags, baseline []string, vocab map[string]bool) (added, removed,
 
 // moveDestination decides where an INBOX message that lost the "inbox" tag
 // should go, from its remaining tags and the available server folders: a
-// message tagged "deleted" goes to Trash, otherwise to Archive. Returns
-// ("", false) — leave it in place — when the role has no folder on this
-// account, so a missing Archive/Trash never sends mail somewhere wrong.
-func moveDestination(tags []string, folders []backend.Folder) (string, bool) {
+// message tagged "trash" (or the legacy "deleted") goes to Trash, otherwise
+// to Archive. Returns ok=false — leave it in place — when the role has no folder
+// on this account, so a missing Archive/Trash never sends mail somewhere wrong.
+// The returned role identifies the unresolved intent for error reporting.
+func moveDestination(tags []string, folders []backend.Folder) (string, backend.Role, bool) {
 	role := backend.RoleArchive
-	if tagsContain(tags, "deleted") {
+	if tagsContain(tags, "trash") || tagsContain(tags, "deleted") {
 		role = backend.RoleTrash
 	}
 	dest := folderNameByRole(folders, role)
 	if dest == "" {
-		return "", false
+		return "", role, false
 	}
-	return dest, true
+	return dest, role, true
 }
 
 // folderNameByRole returns the name of the first folder with the given role, or

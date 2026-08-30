@@ -221,10 +221,11 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 		// Still run flag sync even if no new messages
 		// Flag sync runs even in dry-run mode to show what would happen
 		if !s.options.NoFlags {
-			uploaded, downloaded, movedMsgs := s.syncFlags(mailboxName, mboxState, allUIDs)
+			uploaded, downloaded, movedMsgs, syncErr := s.syncFlags(mailboxName, mboxState, allUIDs)
 			result.FlagsUploaded = uploaded
 			result.FlagsDownload = downloaded
 			result.MovedMsgs = movedMsgs
+			result.Error = syncErr
 		}
 		return result
 	}
@@ -249,10 +250,11 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 		if result.DeduplicatedMsgs > 0 || result.DeletedMsgs > 0 {
 			// Still run flag sync
 			if !s.options.NoFlags {
-				uploaded, downloaded, movedMsgs := s.syncFlags(mailboxName, mboxState, allUIDs)
+				uploaded, downloaded, movedMsgs, syncErr := s.syncFlags(mailboxName, mboxState, allUIDs)
 				result.FlagsUploaded = uploaded
 				result.FlagsDownload = downloaded
 				result.MovedMsgs = movedMsgs
+				result.Error = syncErr
 			}
 		}
 		return result
@@ -338,10 +340,11 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 	// Runs in all modes except when --no-flags is set
 	// The syncFlags function internally respects the sync mode and dry-run for upload/download
 	if !s.options.NoFlags {
-		uploaded, downloaded, movedMsgs := s.syncFlags(mailboxName, mboxState, allUIDs)
+		uploaded, downloaded, movedMsgs, syncErr := s.syncFlags(mailboxName, mboxState, allUIDs)
 		result.FlagsUploaded = uploaded
 		result.FlagsDownload = downloaded
 		result.MovedMsgs = movedMsgs
+		result.Error = syncErr
 	}
 
 	return result

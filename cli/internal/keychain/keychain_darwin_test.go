@@ -190,6 +190,16 @@ func scriptCommands(t *testing.T, responses []scriptedResponse) {
 	}
 }
 
+func TestGetKeyDoesNotCreateWhenMissing(t *testing.T) {
+	scriptCommands(t, []scriptedResponse{{mode: "exit44"}})
+	defer restoreCommandRunner()
+
+	_, err := GetKey(DBKeychainService, DBAccountMaster, 32)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetKey() error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestGetOrCreateKey_ReturnsExisting(t *testing.T) {
 	want := make([]byte, 32)
 	for i := range want {

@@ -3,6 +3,7 @@ package imap
 import (
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -40,6 +41,15 @@ const (
 	RoleJunk    SpecialUseRole = "\\Junk"
 	RoleArchive SpecialUseRole = "\\Archive"
 	RoleAll     SpecialUseRole = "\\All"
+)
+
+// ErrMailboxRoleNotFound reports that a successful mailbox listing contained
+// no mailbox for the requested SPECIAL-USE role or known fallback name.
+var (
+	ErrMailboxRoleNotFound      = errors.New("no mailbox found with role")
+	ErrMessageIdentityNotFound  = errors.New("message identity not found")
+	ErrMessageIdentityAmbiguous = errors.New("message identity is ambiguous")
+	ErrMessageIdentityChanged   = errors.New("message identity changed")
 )
 
 // defaultRoleFallbacks maps SPECIAL-USE roles to common folder names for fallback
@@ -232,6 +242,32 @@ func (c *Client) SelectMailbox(name string) (*imap.MailboxStatus, error) {
 	}
 
 	return status, nil
+}
+
+// ExamineMailbox selects a mailbox read-only for bounded diagnostics.
+func (c *Client) ExamineMailbox(name string) (*imap.MailboxStatus, error) {
+	if c.conn == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+
+	status, err := c.conn.Select(name, true)
+	if err != nil {
+		return nil, imapServerError(fmt.Errorf("failed to examine mailbox %s: %w", name, err), "examine IMAP mailbox failed")
+	}
+
+	return status, nil
+}
+
+// SupportsCapability reports whether the authenticated server advertises a capability.
+func (c *Client) SupportsCapability(capability string) (bool, error) {
+	if c.conn == nil {
+		return false, fmt.Errorf("not connected")
+	}
+	supported, err := c.conn.Support(capability)
+	if err != nil {
+		return false, imapServerError(fmt.Errorf("failed to check %s capability: %w", capability, err), "check IMAP capability failed")
+	}
+	return supported, nil
 }
 
 // SearchAll returns all message UIDs in the current mailbox
@@ -674,39 +710,40 @@ func (c *Client) Append(mailbox string, flags []string, date time.Time, message 
 	return 0, nil
 }
 
-// Delete marks a message as deleted and expunges it
-func (c *Client) Delete(uid uint32) error {
+// DeleteMessage permanently removes one identity-checked UID. UID EXPUNGE is
+// required so a draft deletion cannot expunge unrelated messages another
+// client has already marked \Deleted in the selected mailbox.
+func (c *Client) DeleteMessage(uid uint32, messageID string) error {
 	if c.conn == nil {
 		return fmt.Errorf("not connected")
+	}
+	if err := c.requireCapability("UIDPLUS", "safe message deletion"); err != nil {
+		return err
+	}
+	uids, err := c.SearchUIDsByMessageID(messageID)
+	if err != nil {
+		return err
+	}
+	if err := validateMessageIdentity(uids, uid); err != nil {
+		return err
+	}
+	if err := c.AddFlags(uid, []string{imap.DeletedFlag}); err != nil {
+		return fmt.Errorf("mark UID %d deleted: %w", uid, err)
 	}
 
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(uid)
-
-	// Add \Deleted flag
-	item := imap.FormatFlagsOp(imap.AddFlags, true)
-	ifaceFlags := []interface{}{imap.DeletedFlag}
-
-	messages := make(chan *imap.Message, 1)
-	done := make(chan error, 1)
-
-	go func() {
-		done <- c.conn.UidStore(seqSet, item, ifaceFlags, messages)
-	}()
-
-	// Drain messages
-	for range messages {
+	cmd := &imap.Command{
+		Name:      "UID",
+		Arguments: []interface{}{imap.RawString("EXPUNGE"), seqSet},
 	}
-
-	if err := <-done; err != nil {
-		return imapServerError(fmt.Errorf("failed to mark message %d as deleted: %w", uid, err), "mark IMAP message deleted failed")
+	status, err := c.conn.Execute(cmd, nil)
+	if err != nil {
+		return imapServerError(fmt.Errorf("failed to UID EXPUNGE message %d: %w", uid, err), "UID EXPUNGE IMAP message failed")
 	}
-
-	// Expunge to permanently remove
-	if err := c.conn.Expunge(nil); err != nil {
-		return imapServerError(fmt.Errorf("failed to expunge message %d: %w", uid, err), "expunge IMAP message failed")
+	if err := status.Err(); err != nil {
+		return imapServerError(fmt.Errorf("failed to UID EXPUNGE message %d: %w", uid, err), "UID EXPUNGE IMAP message failed")
 	}
-
 	return nil
 }
 
@@ -734,32 +771,69 @@ func (c *Client) FindArchiveMailbox() (string, error) {
 	return c.FindMailboxByRole(RoleArchive)
 }
 
-// CopyToMailbox copies a message to another mailbox by UID
-func (c *Client) CopyToMailbox(uid uint32, destMailbox string) error {
+// MoveMessageToMailbox verifies that uid still uniquely identifies messageID
+// in the selected mailbox immediately before issuing UID MOVE. IMAP UIDs can be
+// reused after UIDVALIDITY changes, so persisted UIDs are unsafe on their own.
+func (c *Client) MoveMessageToMailbox(uid uint32, messageID, destMailbox string) error {
 	if c.conn == nil {
 		return fmt.Errorf("not connected")
+	}
+	if err := c.requireMoveCapability(); err != nil {
+		return err
+	}
+	uids, err := c.SearchUIDsByMessageID(messageID)
+	if err != nil {
+		return err
+	}
+	if err := validateMessageIdentity(uids, uid); err != nil {
+		return err
 	}
 
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(uid)
-
-	if err := c.conn.UidCopy(seqSet, destMailbox); err != nil {
-		return imapServerError(fmt.Errorf("failed to copy UID %d to %s: %w", uid, destMailbox, err), "copy IMAP message failed")
+	if err := c.conn.UidMove(seqSet, destMailbox); err != nil {
+		return imapServerError(fmt.Errorf("failed to move UID %d to %s: %w", uid, destMailbox, err), "move IMAP message failed")
 	}
-
 	return nil
 }
 
-// Expunge permanently removes messages marked as \Deleted in the current mailbox
-func (c *Client) Expunge() error {
+func validateMessageIdentity(uids []uint32, expectedUID uint32) error {
+	switch len(uids) {
+	case 0:
+		return ErrMessageIdentityNotFound
+	case 1:
+		if uids[0] != expectedUID {
+			return ErrMessageIdentityChanged
+		}
+		return nil
+	default:
+		return ErrMessageIdentityAmbiguous
+	}
+}
+
+func (c *Client) requireMoveCapability() error {
+	return c.requireCapability("MOVE", "safe message moves")
+}
+
+func (c *Client) requireCapability(capability, operation string) error {
+	supported, err := c.conn.Support(capability)
+	if err != nil {
+		return imapServerError(fmt.Errorf("failed to check %s capability: %w", capability, err), "check IMAP capability failed")
+	}
+	if !supported {
+		return fmt.Errorf("IMAP server does not support %s (%s capability missing)", operation, capability)
+	}
+	return nil
+}
+
+// CreateMailbox creates a mailbox on the IMAP server.
+func (c *Client) CreateMailbox(name string) error {
 	if c.conn == nil {
 		return fmt.Errorf("not connected")
 	}
-
-	if err := c.conn.Expunge(nil); err != nil {
-		return imapServerError(fmt.Errorf("failed to expunge: %w", err), "expunge IMAP messages failed")
+	if err := c.conn.Create(name); err != nil {
+		return imapServerError(fmt.Errorf("failed to create mailbox %s: %w", name, err), "create IMAP mailbox failed")
 	}
-
 	return nil
 }
 
@@ -788,6 +862,24 @@ func (c *Client) SearchByMessageID(messageID string) (uint32, error) {
 	return uids[0], nil
 }
 
+// SearchUIDsByMessageID returns every matching UID in the selected mailbox.
+func (c *Client) SearchUIDsByMessageID(messageID string) ([]uint32, error) {
+	if c.conn == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+
+	messageID = strings.Trim(messageID, "<>")
+	criteria := imap.NewSearchCriteria()
+	criteria.Header.Add("Message-ID", "<"+messageID+">")
+
+	uids, err := c.conn.UidSearch(criteria)
+	if err != nil {
+		return nil, imapServerError(fmt.Errorf("failed to search for Message-ID: %w", err), "search IMAP Message-ID failed")
+	}
+
+	return uids, nil
+}
+
 // FindMailboxByRole finds a mailbox by SPECIAL-USE role (RFC 6154)
 // First checks for the SPECIAL-USE attribute, then falls back to common names
 func (c *Client) FindMailboxByRole(role SpecialUseRole) (string, error) {
@@ -799,7 +891,11 @@ func (c *Client) FindMailboxByRole(role SpecialUseRole) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return FindMailboxByRoleIn(mailboxes, role)
+}
 
+// FindMailboxByRoleIn resolves role from one caller-owned LIST snapshot.
+func FindMailboxByRoleIn(mailboxes []*imap.MailboxInfo, role SpecialUseRole) (string, error) {
 	// First pass: look for SPECIAL-USE attribute
 	roleStr := string(role)
 	for _, mbox := range mailboxes {
@@ -813,7 +909,7 @@ func (c *Client) FindMailboxByRole(role SpecialUseRole) (string, error) {
 	// Second pass: fallback to common names
 	fallbacks, ok := defaultRoleFallbacks[role]
 	if !ok {
-		return "", fmt.Errorf("no mailbox found with role %s", role)
+		return "", fmt.Errorf("%w %s", ErrMailboxRoleNotFound, role)
 	}
 
 	for _, name := range fallbacks {
@@ -824,13 +920,11 @@ func (c *Client) FindMailboxByRole(role SpecialUseRole) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("no mailbox found with role %s", role)
+	return "", fmt.Errorf("%w %s", ErrMailboxRoleNotFound, role)
 }
 
-// GetSyncMailboxes returns mail-relevant mailboxes to sync.
-// Uses LIST and filters out \Noselect containers and non-mail Exchange folders
-// (calendar, contacts, tasks, etc.) via the ExcludedIMAPMailboxes blacklist.
-func (c *Client) GetSyncMailboxes() ([]string, error) {
+// GetSyncMailboxInfos returns mail-relevant mailbox metadata from one LIST.
+func (c *Client) GetSyncMailboxInfos() ([]*imap.MailboxInfo, error) {
 	if c.conn == nil {
 		return nil, fmt.Errorf("not connected")
 	}
@@ -840,9 +934,8 @@ func (c *Client) GetSyncMailboxes() ([]string, error) {
 		return nil, err
 	}
 
-	var result []string
+	result := make([]*imap.MailboxInfo, 0, len(mailboxes))
 	for _, mbox := range mailboxes {
-		// Skip \Noselect folders (container folders, not real mailboxes)
 		isNoselect := false
 		for _, attr := range mbox.Attributes {
 			if strings.EqualFold(attr, "\\Noselect") {
@@ -850,16 +943,25 @@ func (c *Client) GetSyncMailboxes() ([]string, error) {
 				break
 			}
 		}
-		if isNoselect {
+		if isNoselect || config.IsIMAPMailboxExcluded(mbox.Name) {
 			continue
 		}
+		result = append(result, mbox)
+	}
+	return result, nil
+}
 
-		// Skip non-mail Exchange folders
-		if config.IsIMAPMailboxExcluded(mbox.Name) {
-			slog.Debug("Skipping excluded mailbox", "module", "IMAP", "mailbox", mbox.Name) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-			continue
-		}
+// GetSyncMailboxes returns mail-relevant mailboxes to sync.
+// Uses LIST and filters out \Noselect containers and non-mail Exchange folders
+// (calendar, contacts, tasks, etc.) via the ExcludedIMAPMailboxes blacklist.
+func (c *Client) GetSyncMailboxes() ([]string, error) {
+	mailboxes, err := c.GetSyncMailboxInfos()
+	if err != nil {
+		return nil, err
+	}
 
+	result := make([]string, 0, len(mailboxes))
+	for _, mbox := range mailboxes {
 		result = append(result, mbox.Name)
 	}
 

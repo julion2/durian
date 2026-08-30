@@ -128,6 +128,11 @@ func formatVersion() string {
 
 // initConfig loads configuration from file
 func initConfig() {
+	if syncDryRun {
+		// Configuration evaluation is read-only under sync --dry-run too; a
+		// cache miss must not materialize a new cache entry.
+		_ = os.Setenv(config.DisableCacheEnv, "1")
+	}
 	cfg, configErr = loadStartupConfig(cfgFile)
 	if cfg == nil {
 		cfg = config.Default()
@@ -189,6 +194,19 @@ func openEmailDB() (*store.DB, error) {
 	if err := db.Init(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init email store: %w", err)
+	}
+	configureStoreAccounts(db, GetConfig())
+	return db, nil
+}
+
+func openEmailDBReadOnly() (*store.DB, error) {
+	keyring, err := loadExistingKeyring()
+	if err != nil {
+		return nil, fmt.Errorf("load existing master key: %w", err)
+	}
+	db, err := store.OpenReadOnly(store.DefaultDBPath(), keyring)
+	if err != nil {
+		return nil, fmt.Errorf("open email store read-only: %w", err)
 	}
 	configureStoreAccounts(db, GetConfig())
 	return db, nil

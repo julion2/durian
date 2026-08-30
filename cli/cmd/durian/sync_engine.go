@@ -47,7 +47,10 @@ func syncOneWithEngine(ctx context.Context, account *config.AccountConfig, optio
 		err     error
 	)
 	b, err := backendfactory.New(account)
-	if suffix := backendfactory.CursorSuffix(account); suffix != "" {
+	suffix := backendfactory.CursorSuffix(account)
+	if options.DryRun {
+		cursors = syncengine.NewReadOnlyFileCursorStoreWithSuffix(account.AccountIdentifier(), suffix)
+	} else if suffix != "" {
 		cursors = syncengine.NewFileCursorStoreWithSuffix(account.AccountIdentifier(), suffix)
 	} else {
 		cursors = syncengine.NewFileCursorStore(account.AccountIdentifier())

@@ -75,7 +75,8 @@ type FileCursorStore struct {
 	// backend (e.g. an IMAP MailboxState) is never fed to a different backend
 	// (e.g. a Graph deltaLink) for the same account. Empty for IMAP, "-graph"
 	// for Graph, "-gmail" for Gmail, and "-jmap" for JMAP.
-	suffix string
+	suffix   string
+	readOnly bool
 }
 
 // NewFileCursorStore creates a cursor store for the given account (IMAP backend).
@@ -87,6 +88,16 @@ func NewFileCursorStore(account string) *FileCursorStore {
 // namespaced by suffix, so different backends for the same account keep separate
 // cursor files (their cursor payloads are not interchangeable).
 func NewFileCursorStoreWithSuffix(account, suffix string) *FileCursorStore {
+	return newFileCursorStore(account, suffix, false)
+}
+
+// NewReadOnlyFileCursorStoreWithSuffix reads cursor state without creating a
+// cache directory, lock, migration, or corruption backup. Commit fails closed.
+func NewReadOnlyFileCursorStoreWithSuffix(account, suffix string) *FileCursorStore {
+	return newFileCursorStore(account, suffix, true)
+}
+
+func newFileCursorStore(account, suffix string, readOnly bool) *FileCursorStore {
 	cacheDir := os.Getenv("XDG_CACHE_HOME")
 	if cacheDir == "" {
 		home, _ := os.UserHomeDir()
@@ -96,6 +107,7 @@ func NewFileCursorStoreWithSuffix(account, suffix string) *FileCursorStore {
 		cacheDir: filepath.Join(cacheDir, "durian"),
 		account:  account,
 		suffix:   suffix,
+		readOnly: readOnly,
 	}
 }
 
@@ -175,8 +187,10 @@ func (f *FileCursorStore) load(account string) (map[string]FolderState, error) {
 		// c327b9e briefly wrote a versioned envelope that pre-366 binaries could
 		// not decode. Rewrite it once under the caller's lock into the compatible
 		// representation before returning any state.
-		if err := f.save(account, envelope.Folders); err != nil {
-			return nil, fmt.Errorf("migrate versioned cursor file: %w", err)
+		if !f.readOnly {
+			if err := f.save(account, envelope.Folders); err != nil {
+				return nil, fmt.Errorf("migrate versioned cursor file: %w", err)
+			}
 		}
 		return envelope.Folders, nil
 	}
@@ -185,6 +199,9 @@ func (f *FileCursorStore) load(account string) (map[string]FolderState, error) {
 	// representation indefinitely so upgrades never force a full resync.
 	legacy := make(map[string][]byte)
 	if err := json.Unmarshal(data, &legacy); err != nil {
+		if f.readOnly {
+			return nil, fmt.Errorf("decode cursor file: %w", err)
+		}
 		backupPath := fmt.Sprintf("%s.corrupted.%d", path, time.Now().Unix())
 		if renameErr := os.Rename(path, backupPath); renameErr != nil {
 			slog.Warn("Corrupted cursor file, backup failed", "module", "SYNCENGINE", "path", path, "err", renameErr)
@@ -197,6 +214,9 @@ func (f *FileCursorStore) load(account string) (map[string]FolderState, error) {
 	pendingCorrupted := false
 	if pendingJSON, ok := legacy[pendingFlagsKey]; ok {
 		if err := json.Unmarshal(pendingJSON, &pendingByFolder); err != nil {
+			if f.readOnly {
+				return nil, fmt.Errorf("decode pending flag state: %w", err)
+			}
 			// The opaque cursors are still valid, but discarding unknown pending
 			// refs could lose flag changes already crossed by those cursors. Mark
 			// every real folder for a lossless full reconciliation instead.
@@ -232,6 +252,13 @@ func (f *FileCursorStore) Get(account, folder string) (backend.Cursor, error) {
 // GetState returns the cursor and pending work for (account, folder).
 func (f *FileCursorStore) GetState(account, folder string) (FolderState, error) {
 	account = f.resolveAccount(account)
+	if f.readOnly {
+		cursors, err := f.load(account)
+		if err != nil {
+			return FolderState{}, err
+		}
+		return cursors[folder], nil
+	}
 	lockFile, err := f.acquireLock(account)
 	if err != nil {
 		return FolderState{}, err
@@ -248,6 +275,9 @@ func (f *FileCursorStore) GetState(account, folder string) (FolderState, error) 
 // Set persists the cursor for (account, folder) with a read-modify-write under
 // the flock, then an atomic temp-file + rename.
 func (f *FileCursorStore) Set(account, folder string, cursor backend.Cursor) error {
+	if f.readOnly {
+		return fmt.Errorf("cursor store is read-only")
+	}
 	account = f.resolveAccount(account)
 	lockFile, err := f.acquireLock(account)
 	if err != nil {
@@ -274,6 +304,9 @@ func (f *FileCursorStore) GetPendingFlags(account, folder string) (PendingFlags,
 }
 
 func (f *FileCursorStore) Commit(account, folder string, cursor backend.Cursor, pending PendingFlags) error {
+	if f.readOnly {
+		return fmt.Errorf("cursor store is read-only")
+	}
 	account = f.resolveAccount(account)
 	lockFile, err := f.acquireLock(account)
 	if err != nil {

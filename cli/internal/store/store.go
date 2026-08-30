@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -129,6 +130,47 @@ func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
 		}
 	}
 
+	return &DB{db: db, keyring: kr}, nil
+}
+
+// OpenReadOnly opens an existing store without creating directories, changing
+// pragmas that write database metadata, vacuuming, or migrating. It is used by
+// sync dry-runs, where an attempted write should fail rather than alter the
+// inspected store.
+func OpenReadOnly(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
+	if kr == nil {
+		return nil, fmt.Errorf("store: OpenReadOnly requires a non-nil keyring (see ADR-0001)")
+	}
+	if dbPath == ":memory:" {
+		return nil, fmt.Errorf("store: OpenReadOnly requires an existing database file")
+	}
+	if strings.HasPrefix(dbPath, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("get home dir: %w", err)
+		}
+		dbPath = filepath.Join(home, dbPath[2:])
+	}
+
+	dsn := &url.URL{Scheme: "file", Path: dbPath}
+	query := dsn.Query()
+	query.Set("mode", "ro")
+	dsn.RawQuery = query.Encode()
+	db, err := sql.Open("sqlite", dsn.String())
+	if err != nil {
+		return nil, fmt.Errorf("open read-only database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	for _, pragma := range []string{
+		"PRAGMA query_only=ON",
+		"PRAGMA busy_timeout=30000",
+		"PRAGMA foreign_keys=ON",
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("set read-only pragma %q: %w", pragma, err)
+		}
+	}
 	return &DB{db: db, keyring: kr}, nil
 }
 

@@ -82,8 +82,14 @@ func runSync(cmd *cobra.Command, args []string) error {
 		mode = imap.SyncUploadOnly
 	}
 
-	// Open email store (required)
-	emailDB, err := openEmailDB()
+	// A dry-run opens the existing store query-only and does not initialize or
+	// migrate it. Any missed write guard therefore fails closed.
+	var emailDB *store.DB
+	if syncDryRun {
+		emailDB, err = openEmailDBReadOnly()
+	} else {
+		emailDB, err = openEmailDB()
+	}
 	if err != nil {
 		return fmt.Errorf("failed to open email store: %w", err)
 	}

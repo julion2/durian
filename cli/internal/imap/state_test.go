@@ -307,6 +307,23 @@ func TestStateManager_LoadSave(t *testing.T) {
 	}
 }
 
+func TestStateManagerLoadReadOnlyDoesNotCreateFiles(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "missing-cache")
+	sm := &StateManager{cacheDir: cacheDir}
+
+	state, err := sm.LoadReadOnly("test@example.com")
+	if err != nil {
+		t.Fatalf("LoadReadOnly: %v", err)
+	}
+	if state == nil || len(state.Mailboxes) != 0 {
+		t.Fatalf("state = %+v, want a new empty state", state)
+	}
+	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
+		t.Fatalf("read-only load created cache directory: %v", err)
+	}
+}
+
 func TestMailboxState_GetDeletedUIDs(t *testing.T) {
 	tests := []struct {
 		name       string

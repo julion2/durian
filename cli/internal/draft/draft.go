@@ -123,8 +123,9 @@ func (s *Service) deleteByMessageID(client *imapClient.Client, mailbox, messageI
 		return fmt.Errorf("message not found: %s", messageID)
 	}
 
-	// Delete the message
-	if err := client.Delete(uid); err != nil {
+	// Delete only the identity that was resolved above. The client requires
+	// UIDPLUS and uses targeted UID EXPUNGE rather than global EXPUNGE.
+	if err := client.DeleteMessage(uid, messageID); err != nil {
 		return fmt.Errorf("failed to delete message: %w", err)
 	}
 
