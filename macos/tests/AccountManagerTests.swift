@@ -101,6 +101,7 @@ final class AccountManagerTests: XCTestCase {
         let session = makeStartupSession()
         defer { session.invalidateAndCancel() }
         let connectionCount = StartupCounter()
+        let startupCompletions = StartupCompletions()
         let profileManager = makeWorkProfileManager()
         let backend = EmailBackend(
             session: session,
@@ -113,7 +114,8 @@ final class AccountManagerTests: XCTestCase {
         )
         let manager = AccountManager(
             emailBackend: backend,
-            profileManager: profileManager
+            profileManager: profileManager,
+            startupCompletion: { startupCompletions.append($0) }
         )
 
         async let firstConnection = manager.connectToAllAccounts()
@@ -125,6 +127,7 @@ final class AccountManagerTests: XCTestCase {
         XCTAssertTrue(results.0)
         XCTAssertTrue(results.1)
         XCTAssertEqual(connectionCount.value, 1)
+        XCTAssertEqual(startupCompletions.values, [true])
         XCTAssertEqual(searchRequests.count, 1)
         XCTAssertEqual(
             searchRequests.first.flatMap(searchQuery),
@@ -140,6 +143,7 @@ final class AccountManagerTests: XCTestCase {
         let session = makeStartupSession()
         defer { session.invalidateAndCancel() }
         let profileManager = makeWorkProfileManager()
+        let startupCompletions = StartupCompletions()
         let backend = EmailBackend(session: session, serverConnector: {
             throw NSError(
                 domain: "AccountManagerTests",
@@ -149,7 +153,8 @@ final class AccountManagerTests: XCTestCase {
         }, profileManager: profileManager)
         let manager = AccountManager(
             emailBackend: backend,
-            profileManager: profileManager
+            profileManager: profileManager,
+            startupCompletion: { startupCompletions.append($0) }
         )
 
         await manager.connectToAllAccounts()
@@ -158,6 +163,7 @@ final class AccountManagerTests: XCTestCase {
         XCTAssertTrue(backend.connectionStatus.contains("server failed"))
         XCTAssertTrue(StartupURLProtocol.requests.isEmpty)
         XCTAssertEqual(manager.selectedFolder, "inbox")
+        XCTAssertEqual(startupCompletions.values, [false])
     }
 
     func testUnexpectedServeDeathClearsConnectionAndReconnectsWithOneNewSearch() async throws {
@@ -167,6 +173,7 @@ final class AccountManagerTests: XCTestCase {
         defer { session.invalidateAndCancel() }
         let profileManager = makeWorkProfileManager()
         let processes = StartupProcesses()
+        let startupCompletions = StartupCompletions()
         defer { processes.terminateAll() }
         let backend = EmailBackend(
             session: session,
@@ -182,7 +189,11 @@ final class AccountManagerTests: XCTestCase {
             },
             profileManager: profileManager
         )
-        let manager = AccountManager(emailBackend: backend, profileManager: profileManager)
+        let manager = AccountManager(
+            emailBackend: backend,
+            profileManager: profileManager,
+            startupCompletion: { startupCompletions.append($0) }
+        )
 
         let firstConnection = await manager.connectToAllAccounts()
         XCTAssertTrue(firstConnection)
@@ -201,6 +212,7 @@ final class AccountManagerTests: XCTestCase {
             StartupURLProtocol.requests.filter { $0.url?.path == "/api/v1/search" }.count,
             2
         )
+        XCTAssertEqual(startupCompletions.values, [true])
         await backend.disconnect()
     }
 
@@ -296,5 +308,16 @@ private final class StartupProcesses: @unchecked Sendable {
         lock.withLock {
             processes.filter(\.isRunning).forEach { $0.terminate() }
         }
+    }
+}
+
+private final class StartupCompletions: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completions: [Bool] = []
+
+    var values: [Bool] { lock.withLock { completions } }
+
+    func append(_ success: Bool) {
+        lock.withLock { completions.append(success) }
     }
 }
