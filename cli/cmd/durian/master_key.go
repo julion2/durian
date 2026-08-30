@@ -126,8 +126,8 @@ func init() {
 func bootstrapKeyring() *dbcrypto.Keyring {
 	kr, err := loadKeyring(true)
 	if err != nil {
-		slog.Error("Master key bootstrap failed", "module", "MASTER-KEY", "err", err)
-		fmt.Fprintln(os.Stderr, "Error: master key bootstrap failed:", err)
+		slog.Error("Master key bootstrap failed", "module", "MASTER-KEY")
+		fmt.Fprintln(os.Stderr, "Error: master key bootstrap failed")
 		os.Exit(1)
 	}
 	return kr
