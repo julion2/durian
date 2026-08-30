@@ -33,6 +33,8 @@ class AccountManager: ObservableObject {
     private var startupConnectionTask: Task<Bool, Never>?
     private var startupConnectionGeneration = 0
     private var hasCompletedInitialSelection = false
+    private var hasReportedStartupCompletion = false
+    private let startupCompletion: @MainActor (Bool) -> Void
 
     /// Folders from current profile config
     var mailFolders: [MailFolder] {
@@ -49,12 +51,20 @@ class AccountManager: ObservableObject {
 
     private init() {
         profileManager = .shared
+        startupCompletion = { SyncManager.shared.startupMailboxDidFinish(success: $0) }
         setupEmailBackend(EmailBackend())
     }
 
     /// Injectable initializer for startup ownership and focused process tests.
-    init(emailBackend: EmailBackend, profileManager: ProfileManager) {
+    init(
+        emailBackend: EmailBackend,
+        profileManager: ProfileManager,
+        startupCompletion: (@MainActor (Bool) -> Void)? = nil
+    ) {
         self.profileManager = profileManager
+        self.startupCompletion = startupCompletion ?? {
+            SyncManager.shared.startupMailboxDidFinish(success: $0)
+        }
         setupEmailBackend(emailBackend)
     }
 
@@ -130,6 +140,10 @@ class AccountManager: ObservableObject {
         let result = await task.value
         if startupConnectionGeneration == generation {
             startupConnectionTask = nil
+            if !hasReportedStartupCompletion {
+                hasReportedStartupCompletion = true
+                startupCompletion(result)
+            }
         }
         return result
     }
@@ -155,7 +169,6 @@ class AccountManager: ObservableObject {
             Log.debug("BACKEND", "AccountManager: Email backend already connected")
             return true
         }
-
         let selected = await selectTag(resolvedFolder())
         hasCompletedInitialSelection = selected
         return selected
