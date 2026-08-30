@@ -31,6 +31,10 @@ type Message struct {
 	// RemoteRef is the backend's provider handle for the message
 	// (IMAP UID as a decimal string, Microsoft Graph message id).
 	RemoteRef string
+	// SyntheticIdentity records that Durian generated MessageID because the
+	// source message had no Message-ID header. The ID's spelling alone cannot
+	// prove that: a sender may legally choose the same string.
+	SyntheticIdentity bool
 	// SyncedFlags is the last-synced flag baseline as a comma-joined
 	// IMAP-style flag string (same format as Flags, e.g. `\Seen,\Flagged`).
 	SyncedFlags string

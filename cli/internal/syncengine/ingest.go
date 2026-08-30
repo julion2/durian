@@ -102,6 +102,10 @@ type IngestOptions struct {
 	// message's Labels are reconciled onto its tags (add/remove against the
 	// stored baseline) instead of applying folder-role tags.
 	LabelsAsTags bool
+	// IdentityRecovered marks a synthetic row adopted during an IMAP
+	// UIDVALIDITY replacement. Once its existing row is durably updated, first-
+	// ingest enrichment must not rerun rules, hooks, or attachment replacement.
+	IdentityRecovered bool
 }
 
 // headerSet returns the deduped, case-insensitive union of the builtin header
@@ -153,6 +157,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 
 	content := parser.Parse(parsed)
 	messageID := strings.Trim(content.MessageID, "<>")
+	syntheticIdentity := messageID == ""
 	if messageID == "" {
 		// The backend already computed the Message-ID (possibly synthetic) —
 		// prefer it so the engine and the backend agree on message identity.
@@ -192,6 +197,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	storeMsg.FetchedBody = true
 	storeMsg.Account = opts.Account
 	storeMsg.RemoteRef = msg.Ref.ID
+	storeMsg.SyntheticIdentity = syntheticIdentity
 	// The message's current server flags are the correct initial baseline: the
 	// first post-ingest flag pass is then a no-op unless the user changed
 	// something locally. joinFlags (not flagStr) so the baseline round-trips
@@ -202,6 +208,9 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	created, err := db.UpsertMessageWithInitialTags(storeMsg, flagAdd)
 	if err != nil {
 		return "", false, fmt.Errorf("insert message: %w", err)
+	}
+	if !created && opts.IdentityRecovered {
+		return messageID, false, nil
 	}
 
 	// Fast path for a message already in the store on a label backend (the

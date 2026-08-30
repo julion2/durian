@@ -1180,6 +1180,26 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 28 {
+		// Record explicit provenance for fallback Message-IDs. Their text format
+		// cannot prove that Durian generated them because a sender may legally
+		// use the same value in a real Message-ID header. Existing rows therefore
+		// remain conservatively unmarked; newly fetched no-ID messages establish
+		// provenance on insert or upsert.
+		has, err := hasColumn(d.db, "messages", "synthetic_identity")
+		if err != nil {
+			return fmt.Errorf("migrate v27→v28 inspect synthetic_identity: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN synthetic_identity INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return fmt.Errorf("migrate v27→v28 add synthetic_identity: %w", err)
+			}
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 28 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v27→v28 bump: %w", err)
+		}
+	}
+
 	return nil
 }
 

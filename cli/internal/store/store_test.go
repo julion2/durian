@@ -46,8 +46,42 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 27 {
-		t.Errorf("version = %d, want 27", version)
+	if version != 28 {
+		t.Errorf("version = %d, want 28", version)
+	}
+}
+
+func TestMigrateV27AddsSyntheticIdentityConservatively(t *testing.T) {
+	db := newTestDB(t)
+	const messageID = "durian-synthetic-1-INBOX@work"
+	if err := db.InsertMessage(&Message{
+		MessageID: messageID, Subject: "old row", Date: 1, CreatedAt: 1,
+		Mailbox: "INBOX", Account: "work", SyntheticIdentity: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("ALTER TABLE messages DROP COLUMN synthetic_identity"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("UPDATE schema_version SET version = 27 WHERE rowid = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Init(); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.GetByMessageID(messageID)
+	if err != nil || stored == nil {
+		t.Fatalf("migrated row = %+v, err=%v", stored, err)
+	}
+	if stored.SyntheticIdentity {
+		t.Fatal("migration inferred provenance from Message-ID text")
+	}
+	var version int
+	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 28 {
+		t.Fatalf("version = %d, want 28", version)
 	}
 }
 
@@ -426,14 +460,14 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	}
 	db := sd.db
 
-	// Schema version must be at the latest migration (v26: repair legacy
-	// comma-separated flags) after Init runs every migration forward.
+	// Schema version must be at the latest migration after Init runs every
+	// migration forward.
 	var version int
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 27 {
-		t.Fatalf("version = %d, want 27", version)
+	if version != 28 {
+		t.Fatalf("version = %d, want 28", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).

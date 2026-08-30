@@ -8,6 +8,8 @@ import (
 	"net/mail"
 	"sort"
 	"strings"
+
+	"github.com/julion2/durian/cli/internal/syncidentity"
 )
 
 // builtinSelectedHeaders is the universal-default set of MIME headers
@@ -180,8 +182,22 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 	mboxState := s.state.GetMailboxState(mailboxName)
 
 	// Check UIDVALIDITY
-	if mboxState.NeedsFullResync(status.UidValidity) {
+	var syntheticMatcher *syncidentity.Matcher
+	replacement := mboxState.NeedsFullResync(status.UidValidity)
+	if replacement {
 		fmt.Fprintf(s.output, "    UIDVALIDITY changed, performing full resync\n")
+		if !s.options.DryRun {
+			syntheticMatcher, err = syncidentity.New(s.store, s.accountName(), mailboxName)
+			if err != nil {
+				result.Error = fmt.Errorf("prepare synthetic identity recovery: %w", err)
+				return result
+			}
+		}
+		// Keep the last complete UID epoch installed until every UID from the
+		// replacement search has been resolved. Sync() saves s.state after this
+		// function returns, including on errors, so mutating the installed state
+		// here would otherwise checkpoint a capped or partially failed recovery.
+		mboxState = NewState().GetMailboxState(mailboxName)
 		mboxState.Reset(status.UidValidity)
 	}
 	mboxState.UIDValidity = status.UidValidity
@@ -218,6 +234,10 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 	}
 
 	if len(unsyncedUIDs) == 0 {
+		if replacement && !s.options.DryRun && !mailboxReplacementComplete(mboxState, allUIDs) {
+			result.Error = fmt.Errorf("UIDVALIDITY recovery incomplete: not every searched UID was resolved")
+			return result
+		}
 		// Still run flag sync even if no new messages
 		// Flag sync runs even in dry-run mode to show what would happen
 		if !s.options.NoFlags {
@@ -227,12 +247,15 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 			result.MovedMsgs = movedMsgs
 			result.Error = syncErr
 		}
+		if replacement && result.Error == nil && !s.options.DryRun {
+			s.state.Mailboxes[mailboxName] = mboxState
+		}
 		return result
 	}
 
 	// Apply max messages limit
 	maxMessages := s.account.GetIMAPMaxMessages()
-	if maxMessages > 0 && len(unsyncedUIDs) > maxMessages {
+	if !replacement && maxMessages > 0 && len(unsyncedUIDs) > maxMessages {
 		// Sort descending (newest first) and take the most recent
 		sort.Slice(unsyncedUIDs, func(i, j int) bool {
 			return unsyncedUIDs[i] > unsyncedUIDs[j]
@@ -243,10 +266,19 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 
 	// Deduplication: Check if messages already exist locally (moved from another folder)
 	// Fetch Message-IDs for unsynced UIDs first
-	toDownload := s.dedupUnsyncedUIDs(mailboxName, mboxState, unsyncedUIDs, &result)
+	toDownload := s.dedupUnsyncedUIDs(mailboxName, mboxState, unsyncedUIDs, replacement, &result)
+	if syntheticMatcher != nil {
+		// Match duplicate-content rows in the same global newest-first order as
+		// the pre-reset candidate set, even when fetching multiple batches.
+		sort.Slice(toDownload, func(i, j int) bool { return toDownload[i] > toDownload[j] })
+	}
 
 	// Nothing left to download after deduplication
 	if len(toDownload) == 0 {
+		if replacement && !s.options.DryRun && !mailboxReplacementComplete(mboxState, allUIDs) {
+			result.Error = fmt.Errorf("UIDVALIDITY recovery incomplete: not every searched UID was resolved")
+			return result
+		}
 		if result.DeduplicatedMsgs > 0 || result.DeletedMsgs > 0 {
 			// Still run flag sync
 			if !s.options.NoFlags {
@@ -256,6 +288,9 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 				result.MovedMsgs = movedMsgs
 				result.Error = syncErr
 			}
+		}
+		if replacement && result.Error == nil && !s.options.DryRun {
+			s.state.Mailboxes[mailboxName] = mboxState
 		}
 		return result
 	}
@@ -287,6 +322,9 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 			result.SkippedMsgs += len(batch)
 			continue
 		}
+		if replacement {
+			sort.Slice(messages, func(i, j int) bool { return messages[i].Uid > messages[j].Uid })
+		}
 
 		// Write to maildir
 		for _, msg := range messages {
@@ -308,7 +346,8 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 			}
 
 			// Insert into SQLite store with eager tags
-			if err := s.storeInsertMessage(mailboxName, msg, msgBody); err != nil {
+			messageID, err := s.storeInsertMessage(mailboxName, status.UidValidity, syntheticMatcher, msg, msgBody)
+			if err != nil {
 				fmt.Fprintf(s.output, "    Warning: failed to store message %d: %v\n", msg.Uid, err)
 				result.SkippedMsgs++
 				continue
@@ -321,10 +360,10 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 			initialFlags := FlagStateFromIMAP(msg.Flags)
 			mboxState.SetMessageFlags(msg.Uid, initialFlags)
 
-			// Extract and store Message-ID for flag sync
-			messageID := extractMessageIDFromBody(msgBody)
-			if messageID != "" {
-				mboxState.SetMessageID(msg.Uid, messageID)
+			// Store the real or synthetic identity for flag sync. Preserve the
+			// legacy notification behavior, which reported only real Message-IDs.
+			mboxState.SetMessageID(msg.Uid, messageID)
+			if extractMessageIDFromBody(msgBody) != "" {
 				result.NewMessageIDs = append(result.NewMessageIDs, messageID)
 			}
 
@@ -334,6 +373,10 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 
 	if result.NewMsgs > 0 {
 		fmt.Fprintf(s.output, "  ✓ %s: %d new\n", mailboxName, result.NewMsgs)
+	}
+	if replacement && !s.options.DryRun && !mailboxReplacementComplete(mboxState, allUIDs) {
+		result.Error = fmt.Errorf("UIDVALIDITY recovery incomplete: not every searched UID was resolved")
+		return result
 	}
 
 	// Flag synchronization (after message download)
@@ -346,8 +389,15 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 		result.MovedMsgs = movedMsgs
 		result.Error = syncErr
 	}
+	if replacement && result.Error == nil && !s.options.DryRun {
+		s.state.Mailboxes[mailboxName] = mboxState
+	}
 
 	return result
+}
+
+func mailboxReplacementComplete(state *MailboxState, searchedUIDs []uint32) bool {
+	return len(state.GetUnsyncedUIDs(searchedUIDs)) == 0
 }
 
 // handleDeletedUID processes a single UID that disappeared from the server.
@@ -387,7 +437,7 @@ func (s *Syncer) handleDeletedUID(uid uint32, mailboxName string, mboxState *Mai
 // (they were moved from another folder). Returns the list of UIDs that still
 // need to be downloaded. In dry-run mode or when envelopes can't be fetched,
 // all unsynced UIDs are returned unchanged.
-func (s *Syncer) dedupUnsyncedUIDs(mailboxName string, mboxState *MailboxState, unsyncedUIDs []uint32, result *MailboxResult) []uint32 {
+func (s *Syncer) dedupUnsyncedUIDs(mailboxName string, mboxState *MailboxState, unsyncedUIDs []uint32, replacement bool, result *MailboxResult) []uint32 {
 	if s.options.DryRun || len(unsyncedUIDs) == 0 {
 		return unsyncedUIDs
 	}
@@ -419,7 +469,7 @@ func (s *Syncer) dedupUnsyncedUIDs(mailboxName string, mboxState *MailboxState, 
 
 	var toDownload []uint32
 	for _, uid := range unsyncedUIDs {
-		if s.dedupOneUID(uid, mailboxName, mboxState, envelopes, tagMapping, result) {
+		if s.dedupOneUID(uid, mailboxName, mboxState, envelopes, tagMapping, replacement, result) {
 			continue
 		}
 		toDownload = append(toDownload, uid)
@@ -434,7 +484,7 @@ func (s *Syncer) dedupUnsyncedUIDs(mailboxName string, mboxState *MailboxState, 
 // dedupOneUID handles deduplication for a single UID. Returns true if the
 // message was deduplicated (already existed locally, tags updated in place),
 // or false if the caller needs to download it.
-func (s *Syncer) dedupOneUID(uid uint32, mailboxName string, mboxState *MailboxState, envelopes map[uint32]string, tagMapping *FolderTagMapping, result *MailboxResult) bool {
+func (s *Syncer) dedupOneUID(uid uint32, mailboxName string, mboxState *MailboxState, envelopes map[uint32]string, tagMapping *FolderTagMapping, strict bool, result *MailboxResult) bool {
 	messageID, hasID := envelopes[uid]
 	if !hasID || messageID == "" {
 		return false
@@ -451,11 +501,15 @@ func (s *Syncer) dedupOneUID(uid uint32, mailboxName string, mboxState *MailboxS
 
 	// Message exists locally — update tags instead of downloading
 	slog.Debug("Message already exists, updating tags", "module", "SYNC", "uid", uid, "message_id", messageID)
-	s.applyDedupTags(messageID, mailboxName, tagMapping)
+	tagErr := s.applyDedupTags(messageID, mailboxName, tagMapping)
 
 	// Update mailbox and UID to reflect the message's current server folder
-	if err := s.store.UpdateMailbox(messageID, s.accountName(), mailboxName, uid); err != nil {
-		slog.Debug("Failed to update mailbox", "module", "SYNC", "message_id", messageID, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+	mailboxErr := s.store.UpdateMailbox(messageID, s.accountName(), mailboxName, uid)
+	if mailboxErr != nil {
+		slog.Debug("Failed to update mailbox", "module", "SYNC", "message_id", messageID, "err", mailboxErr) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+	}
+	if strict && (tagErr != nil || mailboxErr != nil) {
+		return false
 	}
 
 	mboxState.AddSyncedUID(uid)
@@ -468,26 +522,29 @@ func (s *Syncer) dedupOneUID(uid uint32, mailboxName string, mboxState *MailboxS
 // new folder. If the folder has a SPECIAL-USE tag mapping, those tags are
 // added/removed. For custom folders, the inbox tag is stripped since the
 // message was moved out of INBOX.
-func (s *Syncer) applyDedupTags(messageID, mailboxName string, tagMapping *FolderTagMapping) {
+func (s *Syncer) applyDedupTags(messageID, mailboxName string, tagMapping *FolderTagMapping) error {
 	if tagMapping != nil {
 		addTags := s.filterConflictingTags(messageID, tagMapping.AddTags)
 		if len(addTags) == 0 && len(tagMapping.RemoveTags) == 0 {
-			return
+			return nil
 		}
 		if err := s.store.ModifyTagsByMessageIDAndAccount(messageID, s.accountName(), addTags, tagMapping.RemoveTags); err != nil {
 			slog.Debug("Failed to update tags", "module", "SYNC", "message_id", messageID, "err", err)
+			return err
 		}
-		return
+		return nil
 	}
 
 	// Custom folder with no special-use mapping — remove inbox tag since
 	// the message was moved out of INBOX.
 	if strings.EqualFold(mailboxName, "INBOX") {
-		return
+		return nil
 	}
 	if err := s.store.ModifyTagsByMessageIDAndAccount(messageID, s.accountName(), nil, []string{"inbox"}); err != nil {
 		slog.Debug("Failed to remove inbox tag", "module", "SYNC", "message_id", messageID, "err", err)
+		return err
 	}
+	return nil
 }
 
 // isConnectionError checks if an error indicates a lost connection

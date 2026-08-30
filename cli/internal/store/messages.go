@@ -249,8 +249,8 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 			mailbox_id, account_id,
 			is_seen, is_flagged, is_deleted, flags_other,
 			uid, size, fetched_body,
-			remote_ref, synced_flags
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			remote_ref, synthetic_identity, synced_flags
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id, IFNULL(account_id, 0)) DO UPDATE SET
 			subject_ct = CASE WHEN excluded.fetched_body = 1
 			                  THEN excluded.subject_ct ELSE messages.subject_ct END,
@@ -275,7 +275,8 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 			mailbox_id = CASE WHEN excluded.mailbox_id IS NOT NULL
 			                 THEN excluded.mailbox_id ELSE messages.mailbox_id END,
 			remote_ref = CASE WHEN excluded.remote_ref != ''
-			                 THEN excluded.remote_ref ELSE messages.remote_ref END
+			                 THEN excluded.remote_ref ELSE messages.remote_ref END,
+			synthetic_identity = MAX(messages.synthetic_identity, excluded.synthetic_identity)
 			-- synced_flags is deliberately NOT updated on conflict: it is the
 			-- flag-sync baseline, initialized at insert or captured from the old
 			-- row above and thereafter owned by reconciliation (SetSyncedFlags).
@@ -290,7 +291,7 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 		nullableID(mailboxID), nullableID(accountID),
 		isSeen, isFlagged, isDeleted, flagsOtherCT,
 		msg.UID, msg.Size, fetchedBody,
-		msg.RemoteRef, syncedFlags,
+		msg.RemoteRef, msg.SyntheticIdentity, syncedFlags,
 	).Scan(&msg.ID)
 	if err != nil {
 		return fmt.Errorf("upsert message: %w", err)
@@ -590,6 +591,33 @@ func (d *DB) MessageExistsForAccount(messageID, account string) (bool, error) {
 		return false, fmt.Errorf("check message exists for account: %w", err)
 	}
 	return count > 0, nil
+}
+
+// GetSyntheticMessagesForFolder returns rows whose identity Durian is proven
+// to have generated in one account and mailbox. UIDVALIDITY recovery loads this
+// set once, then performs one-to-one content matching in memory instead of
+// rescanning and decrypting the folder for every incoming message. Matching the
+// ID grammar is not sufficient provenance because a sender may choose the same
+// Message-ID string.
+func (d *DB) GetSyntheticMessagesForFolder(account, mailbox string) ([]*Message, error) {
+	rows, err := d.db.Query(`SELECT `+messageSelectColumns+`
+		`+messageSelectFrom+`
+		WHERE ((? = '' AND m.account_id IS NULL)
+		       OR m.account_id = (SELECT id FROM accounts WHERE name = ?))
+		  AND ((? = '' AND m.mailbox_id IS NULL)
+		       OR m.mailbox_id = (SELECT id FROM mailboxes WHERE name = ?))
+		  AND m.synthetic_identity = 1
+		  AND m.message_id LIKE 'durian-synthetic-%'
+		ORDER BY m.id`, account, account, mailbox, mailbox)
+	if err != nil {
+		return nil, fmt.Errorf("query synthetic messages: %w", err)
+	}
+	defer rows.Close()
+	messages, err := d.scanMessages(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan synthetic messages: %w", err)
+	}
+	return messages, nil
 }
 
 // GetAllMessageIDSet returns a set of all Message-IDs in the store.
@@ -942,7 +970,7 @@ const messageSelectColumns = `m.id, m.message_id, m.thread_id, m.in_reply_to, m.
 		m.body_text_ct, m.body_html_ct,
 		mb.name_ct, ac.name_ct,
 		m.is_seen, m.is_flagged, m.is_deleted, m.flags_other,
-		m.uid, m.size, m.fetched_body, m.remote_ref`
+		m.uid, m.size, m.fetched_body, m.remote_ref, m.synthetic_identity`
 
 const messageSelectFrom = `FROM messages m
 		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
@@ -954,7 +982,7 @@ const messageSelectFrom = `FROM messages m
 // row-by-row loop in scanMessages.
 func (d *DB) scanMessageRow(scan func(...any) error) (*Message, error) {
 	msg := &Message{}
-	var fetchedBody int
+	var fetchedBody, syntheticIdentity int
 	var subjectCT, bodyTextCT, bodyHTMLCT, flagsOtherCT, mailboxNameCT, accountNameCT, bccCT []byte
 	var isSeen, isFlagged, isDeleted int
 	if err := scan(
@@ -963,11 +991,12 @@ func (d *DB) scanMessageRow(scan func(...any) error) (*Message, error) {
 		&bodyTextCT, &bodyHTMLCT,
 		&mailboxNameCT, &accountNameCT,
 		&isSeen, &isFlagged, &isDeleted, &flagsOtherCT,
-		&msg.UID, &msg.Size, &fetchedBody, &msg.RemoteRef,
+		&msg.UID, &msg.Size, &fetchedBody, &msg.RemoteRef, &syntheticIdentity,
 	); err != nil {
 		return nil, err
 	}
 	msg.FetchedBody = fetchedBody == 1
+	msg.SyntheticIdentity = syntheticIdentity == 1
 	var err error
 	if msg.Subject, err = d.decryptSubject("", subjectCT); err != nil {
 		return nil, err

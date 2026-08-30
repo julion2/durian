@@ -57,6 +57,36 @@ func TestCompletedReplacementCursorUsesLegacyFormat(t *testing.T) {
 	}
 }
 
+func TestAdoptMessageIdentitiesUpdatesReplacementCursor(t *testing.T) {
+	state := &imap.MailboxState{
+		UIDValidity:    42,
+		SyncedUIDs:     []uint32{7},
+		UIDToMessageID: map[uint32]string{7: "provisional"},
+		MessageIDToUID: map[string]uint32{"provisional": 7},
+	}
+	cursor, err := encodeCursor(state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := (&Backend{}).AdoptMessageIdentities(cursor, map[string]string{"7": "durian-synthetic-old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, replacement, err := decodeCursor(updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messageID, ok := got.GetMessageID(7); !ok || messageID != "durian-synthetic-old" {
+		t.Fatalf("updated identity = %q, %v", messageID, ok)
+	}
+	if _, ok := got.GetUIDByMessageID("provisional"); ok {
+		t.Fatal("provisional reverse identity remains in cursor")
+	}
+	if !replacement {
+		t.Fatal("identity update dropped replacement cursor state")
+	}
+}
+
 func TestReconnectFailureRedactsBothProviderResponses(t *testing.T) {
 	const firstResponse = "first short IMAP provider response"
 	const reconnectResponse = "second short IMAP provider response"

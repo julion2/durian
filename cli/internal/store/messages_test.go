@@ -54,6 +54,47 @@ func TestInsertAndGetMessage(t *testing.T) {
 	}
 }
 
+func TestSyntheticIdentityProvenanceRoundTrip(t *testing.T) {
+	db := newTestDB(t)
+	generated := &Message{
+		MessageID: "durian-synthetic-1-INBOX@work", Subject: "generated",
+		Date: 1, CreatedAt: 1, Mailbox: "INBOX", Account: "work",
+		SyntheticIdentity: true,
+	}
+	if err := db.InsertMessage(generated); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.GetByMessageID(generated.MessageID)
+	if err != nil || stored == nil || !stored.SyntheticIdentity {
+		t.Fatalf("generated row = %+v, err=%v", stored, err)
+	}
+
+	// A metadata update that lacks provenance must not erase established proof.
+	if err := db.InsertMessage(&Message{
+		MessageID: generated.MessageID, Subject: "update", Date: 1, CreatedAt: 2,
+		Mailbox: "INBOX", Account: "work",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = db.GetByMessageID(generated.MessageID)
+	if err != nil || stored == nil || !stored.SyntheticIdentity {
+		t.Fatalf("updated generated row = %+v, err=%v", stored, err)
+	}
+
+	// Exact generated grammar is not provenance for a real sender-supplied ID.
+	real := &Message{
+		MessageID: "durian-synthetic-2-INBOX@work", Subject: "real",
+		Date: 1, CreatedAt: 1, Mailbox: "INBOX", Account: "work",
+	}
+	if err := db.InsertMessage(real); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = db.GetByMessageID(real.MessageID)
+	if err != nil || stored == nil || stored.SyntheticIdentity {
+		t.Fatalf("real row = %+v, err=%v", stored, err)
+	}
+}
+
 func TestInsertMessageParsesCommaAndWhitespaceSeparatedFlags(t *testing.T) {
 	tests := []struct {
 		flags string
