@@ -36,6 +36,7 @@ go_test(
     size = "small",
     srcs = [
         "attachment_test.go",
+        "client_identity_test.go",
         "client_redaction_test.go",
         "exec_test.go",
         "flags_test.go",

@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -21,11 +22,25 @@ type flagTransport interface {
 	RemoveFlags(uid uint32, flags []string) error
 }
 
+type folderMoveTransport interface {
+	ListMailboxes() ([]*goimap.MailboxInfo, error)
+	SupportsCapability(capability string) (bool, error)
+	CreateMailbox(name string) error
+	MoveMessageToMailbox(uid uint32, messageID, destMailbox string) error
+}
+
 // flags returns the transport the flag pass should use. Production always gets
 // the real client; tests substitute a scripted one.
 func (s *Syncer) flags() flagTransport {
 	if s.flagTransportOverride != nil {
 		return s.flagTransportOverride
+	}
+	return s.client
+}
+
+func (s *Syncer) folderMoves() folderMoveTransport {
+	if s.folderMoveTransportOverride != nil {
+		return s.folderMoveTransportOverride
 	}
 	return s.client
 }
@@ -120,19 +135,21 @@ func (s *Syncer) filterConflictingTags(messageID string, addTags []string) []str
 }
 
 // syncFlags synchronizes flags between local store and IMAP server.
-// Returns (flagsUploaded, flagsDownloaded, moved)
+// Returns (flagsUploaded, flagsDownloaded, moved, moveError).
 //
 // This works for ALL messages on the server, not just those downloaded by durian.
 // It builds a UID<->Message-ID mapping on first run (cached in state).
-func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs []uint32) (int, int, int) {
+func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs []uint32) (int, int, int, error) {
 	var uploaded, downloaded, moved, flagErrors int
+	var mappingErr, moveErr error
 
 	if len(allUIDs) == 0 {
-		return 0, 0, 0
+		return 0, 0, 0, nil
 	}
 
 	// 1. Ensure we have Message-ID mapping for all UIDs
 	if err := s.ensureMessageIDMapping(mailboxName, mboxState, allUIDs); err != nil {
+		mappingErr = err
 		slog.Debug("Failed to build Message-ID mapping", "module", "SYNC", "err", err)
 		// Continue anyway - we'll work with what we have
 	}
@@ -141,7 +158,7 @@ func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs 
 	serverFlags, err := s.flags().FetchFlags(allUIDs)
 	if err != nil {
 		fmt.Fprintf(s.output, "    Warning: failed to fetch flags: %v\n", err)
-		return 0, 0, 0
+		return 0, 0, 0, errors.Join(mappingErr, fmt.Errorf("fetch flags: %w", err))
 	}
 
 	// 3. Get all local messages with tags in a single batch query
@@ -150,7 +167,7 @@ func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs 
 	localMessages, err := s.store.GetAllMessagesWithTags(mailboxName, s.accountName())
 	if err != nil {
 		slog.Debug("Failed to get messages from store", "module", "SYNC", "err", err)
-		localMessages = make(map[string][]string)
+		return 0, 0, 0, errors.Join(mappingErr, fmt.Errorf("load local messages for flag sync: %w", err))
 	}
 	slog.Debug("Local messages in folder", "module", "SYNC", "count", len(localMessages)) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 
@@ -163,7 +180,9 @@ func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs 
 		}
 
 		// Backfill UID for messages originally synced with uid=0
-		_ = s.store.BackfillUID(messageID, s.accountName(), uid, mailboxName)
+		if !s.options.DryRun {
+			_ = s.store.BackfillUID(messageID, s.accountName(), uid, mailboxName)
+		}
 
 		// Check if message exists locally and get its tags
 		tags, existsLocally := localMessages[messageID]
@@ -272,7 +291,8 @@ func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs 
 	// Clean up stale inbox tags for messages no longer on server.
 	// This catches messages that existed before durian (e.g., from mbsync) which
 	// have no SyncedUID and thus aren't caught by GetDeletedUIDs.
-	if strings.EqualFold(mailboxName, "INBOX") && !s.options.DryRun {
+	mappingComplete := mappingErr == nil && len(mboxState.GetMissingMappingUIDs(allUIDs)) == 0
+	if strings.EqualFold(mailboxName, "INBOX") && !s.options.DryRun && mappingComplete {
 		serverMessageIDs := make(map[string]bool)
 		for _, uid := range allUIDs {
 			if messageID, ok := mboxState.GetMessageID(uid); ok && messageID != "" {
@@ -299,21 +319,20 @@ func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs 
 		}
 		if cleaned > 0 {
 			slog.Debug("Removed stale inbox tags", "module", "SYNC", "count", cleaned)
-			slog.Debug("Removed stale inbox tags", "module", "SYNC", "count", cleaned)
 		}
 	}
 
 	// Upload folder moves for INBOX messages that lost their "inbox" tag
 	if strings.EqualFold(mailboxName, "INBOX") && s.options.Mode != SyncDownloadOnly {
-		moved = s.uploadFolderMoves(mboxState, localMessages, allUIDs)
+		moved, moveErr = s.uploadFolderMoves(mboxState, localMessages, allUIDs)
 	}
 
 	// Gmail: sync X-GM-LABELS → tags (only for All Mail, not Spam/Trash)
-	if s.isGmailAllMail(mailboxName) {
+	if s.isGmailAllMail(mailboxName) && !s.options.DryRun {
 		s.syncGmailLabels(mboxState, allUIDs)
 	}
 
-	slog.Debug("Flag sync complete", "module", "SYNC", "checked", checkedCount, "uploaded", uploaded, "downloaded", downloaded, "moved", moved, "errors", flagErrors)
+	slog.Debug("Flag sync complete", "module", "SYNC", "checked", checkedCount, "uploaded", uploaded, "downloaded", downloaded, "moved", moved, "errors", flagErrors, "move_error", moveErr != nil)
 
 	if uploaded > 0 || downloaded > 0 || moved > 0 || flagErrors > 0 {
 		if s.options.DryRun {
@@ -325,7 +344,7 @@ func (s *Syncer) syncFlags(mailboxName string, mboxState *MailboxState, allUIDs 
 		}
 	}
 
-	return uploaded, downloaded, moved
+	return uploaded, downloaded, moved, errors.Join(mappingErr, moveErr)
 }
 
 // syncGmailLabels fetches X-GM-LABELS for all UIDs and syncs them to tags.
@@ -418,11 +437,69 @@ type folderMove struct {
 	dest      string // destination mailbox name
 }
 
+// folderMoveDestination classifies the local folder intent. The GUI and tag
+// handler use "trash"; "deleted" is retained for stores written by older
+// clients. A message that still has "inbox" has no pending move.
+func folderMoveDestination(tags []string) (string, bool) {
+	dest := "archive"
+	for _, tag := range tags {
+		switch tag {
+		case "inbox":
+			return "", false
+		case "trash", "deleted":
+			dest = "trash"
+		}
+	}
+	return dest, true
+}
+
+// inferArchiveMailboxName places a new Archive beside the server's existing
+// special-use mailboxes. A successful LIST does not by itself reveal the
+// personal namespace, so fail closed when those siblings provide no unique
+// answer instead of guessing a top-level name.
+func inferArchiveMailboxName(mailboxes []*goimap.MailboxInfo) (string, error) {
+	prefixes := make(map[string]struct{})
+	roles := []SpecialUseRole{RoleTrash, RoleSent, RoleDrafts, RoleJunk}
+	for _, mailbox := range mailboxes {
+		isSpecialUseSibling := false
+		for _, attr := range mailbox.Attributes {
+			if slices.ContainsFunc(roles, func(role SpecialUseRole) bool {
+				return strings.EqualFold(attr, string(role))
+			}) {
+				isSpecialUseSibling = true
+				break
+			}
+		}
+		if !isSpecialUseSibling {
+			continue
+		}
+
+		prefix := ""
+		if mailbox.Delimiter != "" {
+			if i := strings.LastIndex(mailbox.Name, mailbox.Delimiter); i >= 0 {
+				prefix = mailbox.Name[:i+len(mailbox.Delimiter)]
+			}
+		}
+		prefixes[prefix] = struct{}{}
+	}
+
+	if len(prefixes) == 0 {
+		return "", fmt.Errorf("cannot infer Archive namespace from special-use mailboxes")
+	}
+	if len(prefixes) != 1 {
+		return "", fmt.Errorf("cannot infer Archive namespace: special-use mailboxes have different parents")
+	}
+	for prefix := range prefixes {
+		return prefix + "Archive", nil
+	}
+	panic("unreachable")
+}
+
 // uploadFolderMoves detects INBOX messages whose local tags no longer include
 // "inbox" and moves them to the appropriate IMAP folder (Trash or Archive).
-// Uses COPY + \Deleted + Expunge since go-imap v1 has no MOVE command.
-// Returns the number of messages moved.
-func (s *Syncer) uploadFolderMoves(mboxState *MailboxState, localMessages map[string][]string, allUIDs []uint32) int {
+// Returns the number of messages moved and any failure that left a requested
+// move pending.
+func (s *Syncer) uploadFolderMoves(mboxState *MailboxState, localMessages map[string][]string, allUIDs []uint32) (int, error) {
 	// Build O(1) lookup set for server UIDs
 	allUIDSet := make(map[uint32]struct{}, len(allUIDs))
 	for _, uid := range allUIDs {
@@ -432,17 +509,8 @@ func (s *Syncer) uploadFolderMoves(mboxState *MailboxState, localMessages map[st
 	// Scan for messages that lost the "inbox" tag
 	var moves []folderMove
 	for messageID, tags := range localMessages {
-		hasInbox := false
-		hasDeleted := false
-		for _, tag := range tags {
-			switch tag {
-			case "inbox":
-				hasInbox = true
-			case "deleted":
-				hasDeleted = true
-			}
-		}
-		if hasInbox {
+		dest, pending := folderMoveDestination(tags)
+		if !pending {
 			continue // Still in inbox — nothing to do
 		}
 
@@ -455,38 +523,85 @@ func (s *Syncer) uploadFolderMoves(mboxState *MailboxState, localMessages map[st
 			continue // Already gone from INBOX on server
 		}
 
-		// Pick destination
-		dest := "archive"
-		if hasDeleted {
-			dest = "trash"
-		}
 		moves = append(moves, folderMove{uid: uid, messageID: messageID, dest: dest})
 	}
 
 	if len(moves) == 0 {
-		return 0
+		return 0, nil
 	}
 
-	// Lazily resolve destination mailbox names
-	if s.trashMailbox == "" {
-		if trash, err := s.client.FindTrashMailbox(); err == nil {
+	var needTrash, needArchive bool
+	for _, move := range moves {
+		if move.dest == "trash" {
+			needTrash = true
+		} else {
+			needArchive = true
+		}
+	}
+
+	moveClient := s.folderMoves()
+	supportsMove, err := moveClient.SupportsCapability("MOVE")
+	if err != nil {
+		return 0, fmt.Errorf("check MOVE capability: %w", err)
+	}
+	if !supportsMove {
+		return 0, fmt.Errorf("IMAP server does not support safe message moves (MOVE capability missing)")
+	}
+
+	var moveErrors []error
+	var mailboxes []*goimap.MailboxInfo
+	if (needTrash && s.trashMailbox == "") || (needArchive && s.archiveMailbox == "") {
+		var err error
+		mailboxes, err = moveClient.ListMailboxes()
+		if err != nil {
+			return 0, fmt.Errorf("resolve folder-move mailboxes: %w", err)
+		}
+	}
+
+	// Lazily resolve only the destination mailbox names these moves need, using
+	// the same successful LIST for role absence and namespace inference.
+	if needTrash && s.trashMailbox == "" {
+		if trash, err := FindMailboxByRoleIn(mailboxes, RoleTrash); err == nil {
 			s.trashMailbox = trash
 			slog.Debug("Resolved trash mailbox", "module", "SYNC", "account", s.accountName(), "mailbox", trash) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		} else {
 			slog.Warn("No trash mailbox found", "module", "SYNC", "account", s.accountName(), "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+			moveErrors = append(moveErrors, fmt.Errorf("resolve trash mailbox: %w", err))
 		}
 	}
-	if s.archiveMailbox == "" {
-		if archive, err := s.client.FindArchiveMailbox(); err == nil {
+	if needArchive && s.archiveMailbox == "" {
+		if archive, err := FindMailboxByRoleIn(mailboxes, RoleArchive); err == nil {
 			s.archiveMailbox = archive
 			slog.Debug("Resolved archive mailbox", "module", "SYNC", "account", s.accountName(), "mailbox", archive) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-		} else if _, allErr := s.client.FindMailboxByRole(RoleAll); allErr == nil {
-			// Gmail/Google Workspace: no \Archive folder, but \All (All Mail) exists.
-			// Archiving = just remove from INBOX (message stays in All Mail automatically).
-			s.archiveMailbox = "_expunge_only"
-			slog.Debug("Gmail detected: archive via expunge-only (All Mail)", "module", "SYNC", "account", s.accountName()) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+		} else if !errors.Is(err, ErrMailboxRoleNotFound) {
+			moveErrors = append(moveErrors, fmt.Errorf("resolve archive mailbox: %w", err))
 		} else {
-			slog.Warn("No archive mailbox found", "module", "SYNC", "account", s.accountName(), "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+			// Gmail's All Mail is an archive destination, but \All alone does
+			// not imply Gmail semantics on another provider.
+			if s.isGmail() {
+				if allMail, allErr := FindMailboxByRoleIn(mailboxes, RoleAll); allErr == nil {
+					s.archiveMailbox = allMail
+					slog.Debug("Resolved Gmail archive mailbox", "module", "SYNC", "account", s.accountName(), "mailbox", allMail) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+				} else if !errors.Is(allErr, ErrMailboxRoleNotFound) {
+					moveErrors = append(moveErrors, fmt.Errorf("resolve Gmail all-mail mailbox: %w", allErr))
+				}
+			}
+			if s.archiveMailbox == "" {
+				archive, inferErr := inferArchiveMailboxName(mailboxes)
+				if inferErr != nil {
+					moveErrors = append(moveErrors, fmt.Errorf("resolve archive mailbox: %w", inferErr))
+				} else if s.options.DryRun {
+					s.archiveMailbox = archive
+					fmt.Fprintf(s.output, "    + Would create archive mailbox %s (dry-run)\n", archive)
+				} else if createErr := moveClient.CreateMailbox(archive); createErr != nil {
+					slog.Warn("Create archive mailbox failed", "module", "SYNC", "account", s.accountName(), "mailbox", archive, "err", createErr) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+					moveErrors = append(moveErrors, fmt.Errorf("create archive mailbox: %w", createErr))
+				} else {
+					s.archiveMailbox = archive
+					slog.Info("Created archive mailbox", "module", "SYNC", "account", s.accountName(), "mailbox", archive) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+					fmt.Fprintf(s.output, "    + Created archive mailbox %s\n", archive)
+				}
+			}
 		}
 	}
 
@@ -507,23 +622,10 @@ func (s *Syncer) uploadFolderMoves(mboxState *MailboxState, localMessages map[st
 			continue
 		}
 
-		// COPY to destination (skip for Gmail expunge-only archive)
-		if destMailbox != "_expunge_only" {
-			if err := s.client.CopyToMailbox(m.uid, destMailbox); err != nil {
-				slog.Debug("Copy failed for folder move", "module", "SYNC", "uid", m.uid, "dest", destMailbox, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-				continue
-			}
-		}
-
-		// Set \Deleted on source (INBOX)
-		if err := s.client.AddFlags(m.uid, []string{goimap.DeletedFlag}); err != nil {
-			slog.Debug("AddFlags failed for folder move", "module", "SYNC", "uid", m.uid, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+		if err := moveClient.MoveMessageToMailbox(m.uid, m.messageID, destMailbox); err != nil {
+			slog.Debug("Folder move failed", "module", "SYNC", "uid", m.uid, "dest", destMailbox, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+			moveErrors = append(moveErrors, fmt.Errorf("move UID %d to %s: %w", m.uid, destMailbox, err))
 			continue
-		}
-
-		// Expunge from INBOX
-		if err := s.client.Expunge(); err != nil {
-			slog.Debug("Expunge failed for folder move", "module", "SYNC", "uid", m.uid, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		}
 
 		// Clean up INBOX tracking state so next sync doesn't see this as "deleted from server"
@@ -537,7 +639,7 @@ func (s *Syncer) uploadFolderMoves(mboxState *MailboxState, localMessages map[st
 		fmt.Fprintf(s.output, "    ↗ Moved %d messages\n", moved)
 	}
 
-	return moved
+	return moved, errors.Join(moveErrors...)
 }
 
 // uploadFlagChanges moves the server to the resolved state.
@@ -545,10 +647,10 @@ func (s *Syncer) uploadFolderMoves(mboxState *MailboxState, localMessages map[st
 // It used to carry a delete path here — copy to trash, set \Deleted, expunge —
 // gated on local.Deleted && !server.Deleted. That gate can never open:
 // FlagStateFromTags never sets Deleted, deliberately, because Durian's
-// "deleted" tag means moved-to-trash while \Deleted means pending expunge. The
-// branch was unreachable, and an unreachable expunge is not something to leave
-// standing. Deletes travel through uploadFolderMoves, which copies to the trash
-// mailbox explicitly.
+// "trash" tag (and legacy "deleted") means moved-to-trash while \Deleted means
+// pending expunge. The branch was unreachable, and an unreachable expunge is
+// not something to leave standing. Deletes travel through uploadFolderMoves,
+// which uses UID MOVE to the trash mailbox explicitly.
 func (s *Syncer) uploadFlagChanges(uid uint32, target, server FlagState) error {
 	// Use AddFlags/RemoveFlags rather than a full store, to preserve
 	// server-only keywords like $Completed that ToIMAPFlags() doesn't include.

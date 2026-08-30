@@ -57,6 +57,49 @@ func TestOpen_RejectsNilKeyring(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlyRejectsWrites(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "email.db")
+	writable, err := Open(dbPath, testKeyring(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := writable.Init(); err != nil {
+		writable.Close()
+		t.Fatalf("Init: %v", err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatalf("close writable store: %v", err)
+	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+
+	readOnly, err := OpenReadOnly(dbPath, testKeyring(t))
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	var version int
+	if err := readOnly.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		readOnly.Close()
+		t.Fatalf("read schema version: %v", err)
+	}
+	if _, err := readOnly.db.Exec("UPDATE schema_version SET version = version"); err == nil {
+		readOnly.Close()
+		t.Fatal("read-only store accepted a write")
+	}
+	if err := readOnly.Close(); err != nil {
+		t.Fatalf("close read-only store: %v", err)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("read-only open changed database contents")
+	}
+}
+
 // TestOpen_SecureDeleteEnabled asserts ADR-0001 step 8: every fresh
 // connection has PRAGMA secure_delete = ON, so DELETE / UPDATE
 // overwrites freed pages with zeros before reuse. The plaintext

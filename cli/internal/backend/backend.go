@@ -49,6 +49,9 @@ type Folder struct {
 type RemoteRef struct {
 	Folder string
 	ID     string
+	// MessageID is an optional stable identity precondition for operations on
+	// providers whose handles can be reused (notably IMAP after UIDVALIDITY).
+	MessageID string
 }
 
 // ErrRefGone reports that a RemoteRef no longer resolves to a message on the

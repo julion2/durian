@@ -988,8 +988,8 @@ func TestEngineCheckpointsOrdinaryPageBeforeLaterFailure(t *testing.T) {
 	}
 
 	result, err = engine.Sync(t.Context(), fake)
-	if err != nil || len(result.Errors) != 0 {
-		t.Fatalf("retry result=%+v err=%v", result, err)
+	if err != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "no archive folder") {
+		t.Fatalf("retry result=%+v err=%v, want the pending archive reported", result, err)
 	}
 	if got := fake.seenCursors["INBOX"]; len(got) != 3 || string(got[2]) != "page-1" {
 		t.Fatalf("FetchMessages cursors = %q, want retry from page-1", got)
@@ -1590,9 +1590,38 @@ func mustTags(t *testing.T, db *store.DB, messageID string) []string {
 	return tags
 }
 
+func TestMoveDestination(t *testing.T) {
+	folders := []backend.Folder{
+		{Name: "Archive", Role: backend.RoleArchive},
+		{Name: "Trash", Role: backend.RoleTrash},
+	}
+	tests := []struct {
+		name     string
+		tags     []string
+		folders  []backend.Folder
+		wantDest string
+		wantRole backend.Role
+		wantOK   bool
+	}{
+		{name: "archive", tags: []string{"archive"}, folders: folders, wantDest: "Archive", wantRole: backend.RoleArchive, wantOK: true},
+		{name: "GUI trash", tags: []string{"trash"}, folders: folders, wantDest: "Trash", wantRole: backend.RoleTrash, wantOK: true},
+		{name: "legacy deleted", tags: []string{"deleted"}, folders: folders, wantDest: "Trash", wantRole: backend.RoleTrash, wantOK: true},
+		{name: "missing archive", tags: []string{"archive"}, folders: folders[1:], wantRole: backend.RoleArchive},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dest, role, ok := moveDestination(tt.tags, tt.folders)
+			if dest != tt.wantDest || role != tt.wantRole || ok != tt.wantOK {
+				t.Errorf("moveDestination() = (%q, %q, %v), want (%q, %q, %v)",
+					dest, role, ok, tt.wantDest, tt.wantRole, tt.wantOK)
+			}
+		})
+	}
+}
+
 // TestEngineUploadsFolderMoves proves the upload pass: an INBOX message whose
 // "inbox" tag was removed locally (GUI archive) is moved to Archive via
-// Backend.Move on the next sync, a "deleted"-tagged one goes to Trash, and an
+// Backend.Move on the next sync, a "trash"-tagged one goes to Trash, and an
 // untouched one stays put.
 func TestEngineUploadsFolderMoves(t *testing.T) {
 	db := newTestDB(t)
@@ -1632,11 +1661,11 @@ func TestEngineUploadsFolderMoves(t *testing.T) {
 	}
 
 	// Simulate GUI actions: archive one (drop inbox), delete another
-	// (drop inbox, add deleted).
+	// (drop inbox, add trash).
 	if err := db.ModifyTagsByMessageIDAndAccount("arch@example.com", testAccount, nil, []string{"inbox"}); err != nil {
 		t.Fatalf("archive: %v", err)
 	}
-	if err := db.ModifyTagsByMessageIDAndAccount("del@example.com", testAccount, []string{"deleted"}, []string{"inbox"}); err != nil {
+	if err := db.ModifyTagsByMessageIDAndAccount("del@example.com", testAccount, []string{"trash"}, []string{"inbox"}); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
@@ -1656,6 +1685,11 @@ func TestEngineUploadsFolderMoves(t *testing.T) {
 	if len(fake.moveCalls) != 2 {
 		t.Fatalf("moveCalls = %d, want 2: %+v", len(fake.moveCalls), fake.moveCalls)
 	}
+	for _, call := range fake.moveCalls {
+		if call.ref.MessageID == "" {
+			t.Errorf("move call %+v has no stable Message-ID identity", call)
+		}
+	}
 	if dests["2"] != "Archive" {
 		t.Errorf("archived message dest = %q, want Archive", dests["2"])
 	}
@@ -1670,6 +1704,43 @@ func TestEngineUploadsFolderMoves(t *testing.T) {
 	// The archived message's row now points at Archive (not deleted locally).
 	if arch, _ := db.GetByMessageID("arch@example.com"); arch == nil || arch.Mailbox != "Archive" {
 		t.Errorf("archived message should have mailbox Archive")
+	}
+}
+
+func TestEngineReportsMissingFolderMoveDestination(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{
+		{Name: "INBOX", Display: "Inbox", Role: backend.RoleInbox, Selectable: true},
+	}
+	scripts := map[string][]backend.FetchResult{
+		"INBOX": {{
+			Messages: []backend.Message{{
+				MessageID: "archive@example.com",
+				Ref:       backend.RemoteRef{Folder: "INBOX", ID: "1"},
+				Raw:       rawMessage("archive@example.com", "a@example.com", testAccount, "Archive me", "body"),
+			}},
+			Cursor: backend.Cursor("c1"),
+		}},
+	}
+	fake := newFakeBackend(folders, scripts)
+	cursors := newMemCursorStore()
+	engine := newTestEngine(db, cursors)
+	if _, err := engine.Sync(context.Background(), fake); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if err := db.ModifyTagsByMessageIDAndAccount("archive@example.com", testAccount, nil, []string{"inbox"}); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+
+	res, err := engine.Sync(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if len(res.Errors) != 1 || !strings.Contains(res.Errors[0].Error(), "no archive folder") {
+		t.Errorf("Result.Errors = %v, want one missing archive error", res.Errors)
+	}
+	if len(fake.moveCalls) != 0 {
+		t.Errorf("move calls = %+v, want none without a destination", fake.moveCalls)
 	}
 }
 
@@ -2867,6 +2938,43 @@ func TestFileCursorStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReadOnlyFileCursorStoreDoesNotCreateOrWriteFiles(t *testing.T) {
+	cacheRoot := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cacheRoot)
+
+	writable := NewFileCursorStore(testAccount)
+	if err := writable.Set(testAccount, "INBOX", backend.Cursor("cursor")); err != nil {
+		t.Fatalf("seed cursor: %v", err)
+	}
+	lockPath := writable.path(testAccount) + ".lock"
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatalf("remove seed lock: %v", err)
+	}
+	before, err := os.ReadFile(writable.path(testAccount))
+	if err != nil {
+		t.Fatalf("read cursor before: %v", err)
+	}
+
+	readOnly := NewReadOnlyFileCursorStoreWithSuffix(testAccount, "")
+	state, err := readOnly.GetState(testAccount, "INBOX")
+	if err != nil || string(state.Cursor) != "cursor" {
+		t.Fatalf("read-only state = %+v, err=%v", state, err)
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("read-only GetState created a lock: %v", err)
+	}
+	if err := readOnly.Commit(testAccount, "INBOX", backend.Cursor("changed"), PendingFlags{}); err == nil {
+		t.Fatal("read-only cursor store accepted Commit")
+	}
+	after, err := os.ReadFile(writable.path(testAccount))
+	if err != nil {
+		t.Fatalf("read cursor after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("read-only cursor store changed cursor file")
+	}
+}
+
 func TestFileCursorStorePersistsPendingFlagsAndLoadsLegacyFiles(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	fcs := NewFileCursorStore(testAccount)
@@ -3151,6 +3259,45 @@ func TestEngineSeedsEmptyLabelBaseline(t *testing.T) {
 	}
 	if !sameSet(strings.Split(base, ","), []string{"inbox", "important"}) {
 		t.Errorf("seeded baseline = %q, want [inbox important]", base)
+	}
+}
+
+func TestEngineDryRunDoesNotSeedEmptyLabelBaseline(t *testing.T) {
+	db := newTestDB(t)
+	folders := []backend.Folder{{Name: "ALL", Role: backend.RoleAll, Selectable: true}}
+	fake := newFakeBackend(folders, nil)
+	fake.caps.LabelsAreTags = true
+	fake.labelVocab = []string{"inbox", "important"}
+
+	messageID := "dry-labels@example.com"
+	if err := db.InsertMessage(&store.Message{
+		MessageID: messageID,
+		ThreadID:  messageID,
+		Mailbox:   "ALL",
+		Account:   testAccount,
+		RemoteRef: "1",
+	}); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+	if err := db.ModifyTagsByMessageIDAndAccount(messageID, testAccount, []string{"inbox", "important"}, nil); err != nil {
+		t.Fatalf("seed tags: %v", err)
+	}
+
+	engine := New(Options{
+		Store:   db,
+		Cursors: newMemCursorStore(),
+		Account: testAccount,
+		DryRun:  true,
+	})
+	result := &Result{}
+	engine.uploadLabelChanges(context.Background(), fake, result)
+
+	baseline, err := db.GetSyncedLabels(messageID, testAccount)
+	if err != nil {
+		t.Fatalf("get baseline: %v", err)
+	}
+	if baseline != "" {
+		t.Fatalf("dry-run seeded label baseline %q", baseline)
 	}
 }
 
