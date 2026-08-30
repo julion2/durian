@@ -74,7 +74,7 @@ func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matc
 		}
 		return "", fmt.Errorf("insert message: %w", err)
 	}
-	if recoveredIdentity && initialIngestComplete {
+	if recoveredIdentity && initialIngestComplete && !storeMsg.IngestPending {
 		// The existing row now points at the new UID. Preserve its attachments,
 		// indexed headers and rule-derived tags, and never repeat exec hooks.
 		matcher.Commit(messageID)
@@ -194,7 +194,7 @@ func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matc
 		}
 	}
 	if err := s.store.MarkMessageIngestComplete(storeMsg.ID); err != nil {
-		return "", err
+		return "", fmt.Errorf("complete message ingest: %w", err)
 	}
 	if recoveredIdentity {
 		matcher.Commit(messageID)

@@ -424,7 +424,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				continue
 			}
 			provisionalMessageID := msg.MessageID
-			if res.FullSnapshot && syntheticMatcher == nil && canUpdateIdentityCursor && messageIDFromRaw(msg.Raw) == "" {
+			if res.FullSnapshot && syntheticMatcher == nil && canUpdateIdentityCursor && len(msg.Raw) > 0 && messageIDFromRaw(msg.Raw) == "" {
 				if currentUIDValidity, ok := durianmail.SyntheticMessageUIDValidity(provisionalMessageID); ok {
 					syntheticMatcher, err = syncidentity.New(e.opts.Store, e.opts.Account, folder.Name, currentUIDValidity)
 					if err != nil {

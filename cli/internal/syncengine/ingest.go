@@ -235,7 +235,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		return "", false, fmt.Errorf("insert message: %w", err)
 	}
 	coreDurable = true
-	if !created && opts.IdentityRecovered {
+	if !created && opts.IdentityRecovered && !storeMsg.IngestPending {
 		return messageID, false, nil
 	}
 
@@ -249,7 +249,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 			return "", false, fmt.Errorf("reconcile labels: %w", err)
 		}
 		if err := db.MarkMessageIngestComplete(storeMsg.ID); err != nil {
-			return "", false, err
+			return "", false, fmt.Errorf("complete message ingest: %w", err)
 		}
 		return messageID, created, nil
 	}
@@ -312,7 +312,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		return "", false, err
 	}
 	if err := db.MarkMessageIngestComplete(storeMsg.ID); err != nil {
-		return "", false, err
+		return "", false, fmt.Errorf("complete message ingest: %w", err)
 	}
 
 	return messageID, created, nil
