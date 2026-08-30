@@ -59,7 +59,7 @@ func TestOutputSearchJSONUsesEmptyArray(t *testing.T) {
 // iCal UID, and the attachment filename. Asserting only the filename would
 // leave the three that changed unguarded.
 func TestJSONOutputKeepsRemoteValuesVerbatim(t *testing.T) {
-	const hostile = "\x1b]0;pwned\x07‮"
+	const hostile = "\x1b]0;pwned\x07\u202e"
 
 	t.Run("attachment filename", func(t *testing.T) {
 		name := "report" + hostile + ".pdf"

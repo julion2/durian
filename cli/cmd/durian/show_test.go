@@ -79,7 +79,7 @@ func TestOutputThreadFormattedEscapesRemoteControlSequences(t *testing.T) {
 
 	const (
 		osc  = "\x1b]0;pwned\x07"
-		bidi = "‮"
+		bidi = "\u202e"
 	)
 	thread := &mail.ThreadContent{
 		ThreadID: "abc123",
@@ -129,7 +129,7 @@ func TestOutputThreadFormattedEscapesRemoteControlSequences(t *testing.T) {
 func TestEventRefCellEscapesRemoteUIDs(t *testing.T) {
 	const (
 		osc  = "\x1b]0;pwned\x07"
-		bidi = "‮"
+		bidi = "\u202e"
 	)
 	got := eventRefCell("uid" + osc + bidi + "@example.com")
 
