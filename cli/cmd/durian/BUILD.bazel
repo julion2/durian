@@ -74,13 +74,19 @@ go_test(
     name = "durian_test",
     size = "small",
     srcs = [
+        "attachment_test.go",
         "auth_test.go",
         "calendar_test.go",
+        "root_test.go",
+        "sync_test.go",
     ],
     embed = [":durian_lib"],
     deps = [
         "//cli/internal/config",
+        "//cli/internal/dbcrypto",
         "//cli/internal/keychain",
+        "//cli/internal/store",
+        "//cli/internal/tagsync",
     ],
 )
 

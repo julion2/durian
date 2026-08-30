@@ -126,9 +126,12 @@ func TestModifyTagsByThread(t *testing.T) {
 	db.TagThread(root.ThreadID, "unread")
 
 	// Atomic: remove unread, add archived
-	err := db.ModifyTagsByThread(root.ThreadID, []string{"archived"}, []string{"unread"})
+	changed, err := db.ModifyTagsByThread(root.ThreadID, []string{"archived"}, []string{"unread"})
 	if err != nil {
 		t.Fatalf("modify: %v", err)
+	}
+	if !changed {
+		t.Fatal("ModifyTagsByThread() changed = false, want true")
 	}
 
 	tags, _ := db.GetMessageTags(root.ID)

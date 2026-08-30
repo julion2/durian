@@ -9,6 +9,7 @@ import (
 
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/imap"
+	"github.com/julion2/durian/cli/internal/store"
 	"github.com/julion2/durian/cli/internal/tagsync"
 )
 
@@ -151,55 +152,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Tag sync: push journal entries, then pull remote changes
 	if cfg.Sync.TagSync != nil && cfg.Sync.TagSync.URL != "" && cfg.Sync.TagSync.APIKey != "" {
-		client := tagsync.NewClient(cfg.Sync.TagSync.URL, cfg.Sync.TagSync.APIKey)
-		client.SetStore(emailDB)
-
-		// Push pending local changes from journal
-		journal, journalErr := emailDB.ReadTagJournal()
-		if journalErr == nil && len(journal) > 0 {
-			changes := make([]tagsync.TagChange, len(journal))
-			var maxID int64
-			for i, j := range journal {
-				changes[i] = tagsync.TagChange{
-					MessageID: j.MessageID, Account: j.Account,
-					Tag: j.Tag, Action: j.Action, Timestamp: j.Timestamp,
-				}
-				if j.ID > maxID {
-					maxID = j.ID
-				}
-			}
-			if err := client.Push(changes); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: tag sync push failed: %v\n", err)
-			} else {
-				emailDB.ClearTagJournal(maxID)
-				fmt.Fprintf(os.Stderr, "✓ Pushed %d tag changes\n", len(changes))
-			}
-		}
-
-		// Pull remote changes
-		since := client.LoadLastSync()
-		changes, syncAt, pullErr := client.Pull(since)
-		if pullErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: tag sync pull failed: %v\n", pullErr)
-		} else {
-			applied := 0
-			for _, c := range changes {
-				switch c.Action {
-				case "add":
-					if err := emailDB.ModifyTagsByMessageIDAndAccount(c.MessageID, c.Account, []string{c.Tag}, nil); err == nil {
-						applied++
-					}
-				case "remove":
-					if err := emailDB.ModifyTagsByMessageIDAndAccount(c.MessageID, c.Account, nil, []string{c.Tag}); err == nil {
-						applied++
-					}
-				}
-			}
-			client.SaveLastSync(syncAt)
-			if applied > 0 {
-				fmt.Fprintf(os.Stderr, "✓ Applied %d remote tag changes\n", applied)
-			}
-		}
+		syncRemoteTags(emailDB, cfg.Sync.TagSync, syncDryRun)
 	}
 
 	if jsonOutput {
@@ -242,4 +195,71 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func syncRemoteTags(emailDB *store.DB, tagConfig *config.TagSyncConfig, dryRun bool) {
+	client := tagsync.NewClient(tagConfig.URL, tagConfig.APIKey)
+	client.SetStore(emailDB)
+
+	// Push pending local changes from journal.
+	journal, journalErr := emailDB.ReadTagJournal()
+	if journalErr == nil && len(journal) > 0 {
+		changes := make([]tagsync.TagChange, len(journal))
+		var maxID int64
+		for i, j := range journal {
+			changes[i] = tagsync.TagChange{
+				MessageID: j.MessageID, Account: j.Account,
+				Tag: j.Tag, Action: j.Action, Timestamp: j.Timestamp,
+			}
+			if j.ID > maxID {
+				maxID = j.ID
+			}
+		}
+		if dryRun {
+			fmt.Fprintf(os.Stderr, "Would push %d tag changes\n", len(changes))
+		} else if err := client.Push(changes); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: tag sync push failed: %v\n", err)
+		} else if err := emailDB.ClearTagJournal(maxID); err != nil {
+			// The push succeeded but the journal still holds the entries. Keep
+			// them: the next run re-pushes the same changes, which is
+			// idempotent, and reporting success here would claim a cleanup that
+			// did not happen. Tag-sync failures are deliberately non-fatal.
+			fmt.Fprintf(os.Stderr, "Warning: tag sync journal cleanup failed: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "✓ Pushed %d tag changes\n", len(changes))
+		}
+	}
+
+	// Pull remote changes. A dry-run may read the plan from the server but must
+	// not apply it or advance the local cursor.
+	since := client.LoadLastSync()
+	changes, syncAt, pullErr := client.Pull(since)
+	if pullErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: tag sync pull failed: %v\n", pullErr)
+		return
+	}
+	if dryRun {
+		if len(changes) > 0 {
+			fmt.Fprintf(os.Stderr, "Would apply %d remote tag changes\n", len(changes))
+		}
+		return
+	}
+
+	applied := 0
+	for _, c := range changes {
+		switch c.Action {
+		case "add":
+			if err := emailDB.ModifyTagsByMessageIDAndAccount(c.MessageID, c.Account, []string{c.Tag}, nil); err == nil {
+				applied++
+			}
+		case "remove":
+			if err := emailDB.ModifyTagsByMessageIDAndAccount(c.MessageID, c.Account, nil, []string{c.Tag}); err == nil {
+				applied++
+			}
+		}
+	}
+	client.SaveLastSync(syncAt)
+	if applied > 0 {
+		fmt.Fprintf(os.Stderr, "✓ Applied %d remote tag changes\n", applied)
+	}
 }

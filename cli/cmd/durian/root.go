@@ -23,6 +23,7 @@ var (
 	cfgFile    string
 	jsonOutput bool
 	debugMode  bool
+	configErr  error
 )
 
 // Global config (loaded at startup)
@@ -33,6 +34,12 @@ var rootCmd = &cobra.Command{
 	Use:   "durian",
 	Short: "Durian Mail CLI",
 	Long:  `Durian is a macOS email client. CLI backend for provider mail sync, sending, and SQLite storage.`,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if cmd == validateCmd {
+			return nil
+		}
+		return configErr
+	},
 	// Show help when called without subcommands
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()
@@ -73,25 +80,26 @@ func formatVersion() string {
 
 // initConfig loads configuration from file
 func initConfig() {
-	var err error
-
-	// Try to load config from specified path or default
-	if config.Exists(cfgFile) {
-		cfg, err = config.Load(cfgFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to load config: %v\n", err)
-			cfg = config.Default()
-		}
-	} else {
-		// No config file found - use defaults
-		if cfgFile != "" {
-			// User specified a path but file doesn't exist
-			fmt.Fprintf(os.Stderr, "Warning: config file not found: %s\n", cfgFile)
-		}
-		// Silently use defaults if no custom path specified
-		// (most users won't have config initially)
+	cfg, configErr = loadStartupConfig(cfgFile)
+	if cfg == nil {
 		cfg = config.Default()
 	}
+}
+
+func loadStartupConfig(path string) (*config.Config, error) {
+	if !config.Exists(path) {
+		if path != "" {
+			return nil, fmt.Errorf("config file not found: %s", config.ExpandPath(path))
+		}
+		// A missing default config is valid before initial setup.
+		return config.Default(), nil
+	}
+
+	loaded, err := config.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	return loaded, nil
 }
 
 // GetConfig returns the loaded configuration

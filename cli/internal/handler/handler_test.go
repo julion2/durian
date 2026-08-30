@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -299,6 +300,9 @@ func TestStoreTag(t *testing.T) {
 	if !resp.OK {
 		t.Fatalf("Tag failed: %s", resp.Error)
 	}
+	if resp.MatchedThreads == nil || resp.ChangedThreads == nil || *resp.MatchedThreads != 1 || *resp.ChangedThreads != 1 {
+		t.Fatalf("tag effect = matched %v, changed %v; want 1, 1", resp.MatchedThreads, resp.ChangedThreads)
+	}
 
 	// Store should be updated
 	tags, err := db.GetTagsByMessageID("msg1@test")
@@ -329,6 +333,42 @@ func TestStoreTagBySearchQuery(t *testing.T) {
 
 	if !resp.OK {
 		t.Errorf("tag by search query should succeed, got error: %s", resp.Error)
+	}
+}
+
+func TestStoreTagRejectsUnsupportedQueryWithoutChanges(t *testing.T) {
+	db := newTestStore(t)
+	seedStoreData(t, db)
+	h := New(db, nil)
+
+	resp := h.Tag("folder:INBOX", "+todo")
+	if resp.OK {
+		t.Fatal("tag with unsupported query field succeeded")
+	}
+	if !strings.Contains(resp.Error, "not supported") {
+		t.Fatalf("error = %q, want unsupported-field error", resp.Error)
+	}
+
+	resp = h.Search("tag:todo", 10, 0)
+	if !resp.OK {
+		t.Fatalf("search todo: %s", resp.Error)
+	}
+	if len(resp.Results) != 0 {
+		t.Fatalf("todo results = %d, want 0", len(resp.Results))
+	}
+}
+
+func TestStoreTagNoMatchesFails(t *testing.T) {
+	db := newTestStore(t)
+	seedStoreData(t, db)
+	h := New(db, nil)
+
+	resp := h.Tag("from:nobody@example.com", "+todo")
+	if resp.OK {
+		t.Fatal("tag with no matches succeeded")
+	}
+	if resp.ErrorCode != protocol.ErrNotFound {
+		t.Fatalf("error code = %q, want %q", resp.ErrorCode, protocol.ErrNotFound)
 	}
 }
 
