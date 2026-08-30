@@ -63,6 +63,14 @@ swift_test(
 )
 
 swift_test(
+    name = "pkl_startup_snapshot_test",
+    size = "small",
+    srcs = ["tests/PklStartupSnapshotTests.swift"],
+    data = ["tests/Fixtures/pkl-imports-0.31.1.json"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
     name = "startup_coordinator_test",
     size = "small",
     srcs = ["tests/StartupCoordinatorTests.swift"],

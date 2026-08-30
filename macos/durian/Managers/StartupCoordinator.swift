@@ -21,6 +21,8 @@ final class StartupCoordinator: ObservableObject {
     private let apply: @MainActor (PklStartupConfiguration) -> Void
     private let loadFallbacks: @MainActor () async -> Void
     private let setupSync: @MainActor () -> Void
+    private let loadSnapshot: @Sendable () -> PklStartupConfiguration?
+    private let refreshSnapshot: @Sendable () async -> Void
     private var startupTask: Task<Void, Never>?
     private var readinessContinuations: [CheckedContinuation<Void, Never>] = []
 
@@ -41,7 +43,10 @@ final class StartupCoordinator: ObservableObject {
             async let keymaps: Void = KeymapsManager.shared.prepareKeymaps()
             _ = await (settings, profiles, keymaps)
         },
-        setupSync: @escaping @MainActor () -> Void = { SyncManager.shared.setup() }
+        setupSync: @escaping @MainActor () -> Void = { SyncManager.shared.setup() },
+        snapshot: PklStartupSnapshot = PklStartupSnapshot(),
+        loadSnapshot: (@Sendable () -> PklStartupConfiguration?)? = nil,
+        refreshSnapshot: (@Sendable () async -> Void)? = nil
     ) {
         self.moduleURLs = moduleURLs
         self.fileExists = fileExists
@@ -49,6 +54,8 @@ final class StartupCoordinator: ObservableObject {
         self.apply = apply
         self.loadFallbacks = loadFallbacks
         self.setupSync = setupSync
+        self.loadSnapshot = loadSnapshot ?? { snapshot.load() }
+        self.refreshSnapshot = refreshSnapshot ?? { await snapshot.refresh() }
     }
 
     func start() {
@@ -70,12 +77,19 @@ final class StartupCoordinator: ObservableObject {
     }
 
     private func run() async {
+        var shouldRefreshSnapshot = false
         if moduleURLs.allSatisfy({ fileExists($0.path) }) {
-            do {
-                apply(try await evaluate(moduleURLs))
-            } catch {
-                Log.warning("CONFIG", "Batched startup evaluation failed: \(error.localizedDescription)")
-                await loadFallbacks()
+            if let cached = loadSnapshot() {
+                apply(cached)
+                Log.info("CONFIG", "Loaded validated startup snapshot")
+            } else {
+                do {
+                    apply(try await evaluate(moduleURLs))
+                    shouldRefreshSnapshot = true
+                } catch {
+                    Log.warning("CONFIG", "Batched startup evaluation failed: \(error.localizedDescription)")
+                    await loadFallbacks()
+                }
             }
         } else {
             Log.warning("CONFIG", "Startup Pkl files missing; using per-manager fallbacks")
@@ -84,6 +98,13 @@ final class StartupCoordinator: ObservableObject {
 
         setupSync()
         markReady()
+
+        if shouldRefreshSnapshot {
+            let refreshSnapshot = refreshSnapshot
+            Task.detached(priority: .utility) {
+                await refreshSnapshot()
+            }
+        }
     }
 
     private func markReady() {

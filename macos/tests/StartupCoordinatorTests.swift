@@ -15,7 +15,9 @@ final class StartupCoordinatorTests: XCTestCase {
             },
             apply: { _ in events.append("apply") },
             loadFallbacks: { events.append("fallback") },
-            setupSync: { events.append("sync") }
+            setupSync: { events.append("sync") },
+            loadSnapshot: { nil },
+            refreshSnapshot: {}
         )
 
         XCTAssertFalse(coordinator.allowsManualReload)
@@ -39,7 +41,9 @@ final class StartupCoordinatorTests: XCTestCase {
             },
             apply: { _ in events.append("apply") },
             loadFallbacks: { events.append("fallback") },
-            setupSync: { events.append("sync") }
+            setupSync: { events.append("sync") },
+            loadSnapshot: { nil },
+            refreshSnapshot: {}
         )
 
         coordinator.start()
@@ -61,13 +65,71 @@ final class StartupCoordinatorTests: XCTestCase {
             },
             apply: { _ in events.append("apply") },
             loadFallbacks: { events.append("fallback") },
-            setupSync: { events.append("sync") }
+            setupSync: { events.append("sync") },
+            loadSnapshot: { nil },
+            refreshSnapshot: {}
         )
 
         coordinator.start()
         await coordinator.waitUntilReady()
 
         XCTAssertEqual(events.values, ["fallback", "sync"])
+    }
+
+    func testValidSnapshotSkipsEvaluationAndBecomesReady() async throws {
+        let events = LockedEvents()
+        let configuration = try makeConfiguration()
+        let coordinator = StartupCoordinator(
+            moduleURLs: moduleURLs,
+            fileExists: { _ in true },
+            evaluate: { _ in
+                events.append("evaluate")
+                return configuration
+            },
+            apply: { _ in events.append("apply") },
+            loadFallbacks: { events.append("fallback") },
+            setupSync: { events.append("sync") },
+            loadSnapshot: {
+                events.append("snapshot")
+                return configuration
+            },
+            refreshSnapshot: { events.append("refresh") }
+        )
+
+        coordinator.start()
+        await coordinator.waitUntilReady()
+
+        XCTAssertTrue(coordinator.isReady)
+        XCTAssertEqual(events.values, ["snapshot", "apply", "sync"])
+    }
+
+    func testColdEvaluationReachesReadyBeforeBackgroundSnapshotRefresh() async throws {
+        let events = LockedEvents()
+        let configuration = try makeConfiguration()
+        let refreshGate = AsyncGate()
+        let coordinator = StartupCoordinator(
+            moduleURLs: moduleURLs,
+            fileExists: { _ in true },
+            evaluate: { _ in
+                events.append("evaluate")
+                return configuration
+            },
+            apply: { _ in events.append("apply") },
+            loadFallbacks: { events.append("fallback") },
+            setupSync: { events.append("sync") },
+            loadSnapshot: { nil },
+            refreshSnapshot: {
+                events.append("refresh")
+                await refreshGate.wait()
+            }
+        )
+
+        coordinator.start()
+        await coordinator.waitUntilReady()
+
+        XCTAssertTrue(coordinator.isReady)
+        XCTAssertEqual(Array(events.values.prefix(3)), ["evaluate", "apply", "sync"])
+        await refreshGate.open()
     }
 
     private var moduleURLs: [URL] {
@@ -97,5 +159,21 @@ private final class LockedEvents: @unchecked Sendable {
 
     func append(_ event: String) {
         lock.withLock { events.append(event) }
+    }
+}
+
+private actor AsyncGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var isOpen = false
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func open() {
+        isOpen = true
+        continuation?.resume()
+        continuation = nil
     }
 }

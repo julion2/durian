@@ -343,6 +343,35 @@ final class PklEvaluatorTests: XCTestCase {
         )
     }
 
+    func testEvaluatorIdentityUsesResolvedExecutableMetadata() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let executable = root.appendingPathComponent("pkl-0.31.1")
+        try Data("fixture".utf8).write(to: executable)
+        XCTAssertEqual(chmod(executable.path, 0o700), 0)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)],
+            ofItemAtPath: executable.path
+        )
+
+        let symlink = root.appendingPathComponent("pkl")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: executable)
+        let identity = try XCTUnwrap(PklEvaluator.evaluatorIdentity(forExecutableAt: symlink.path))
+        let resolvedPath = executable.resolvingSymlinksInPath().standardizedFileURL.path
+
+        XCTAssertTrue(identity.hasPrefix("\(resolvedPath):"))
+
+        let handle = try FileHandle(forWritingTo: executable)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("-changed".utf8))
+        try handle.close()
+
+        XCTAssertNotEqual(PklEvaluator.evaluatorIdentity(forExecutableAt: symlink.path), identity)
+    }
+
     func testActualPklSyntaxErrorSurfacesStderr() async throws {
         try requireActualPkl()
         let root = FileManager.default.temporaryDirectory
