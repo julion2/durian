@@ -40,13 +40,15 @@ func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matc
 	messageID := strings.Trim(content.MessageID, "<>")
 	syntheticIdentity := messageID == ""
 	recoveredIdentity := false
+	initialIngestComplete := false
 	if messageID == "" {
+		provisionalMessageID := durianmail.SyntheticMessageID(uidValidity, imapMsg.Uid, mailboxName, s.accountName())
 		if matcher != nil {
-			messageID = matcher.Match(content, dateUnix)
+			messageID, initialIngestComplete = matcher.Match(provisionalMessageID, content, dateUnix)
 			recoveredIdentity = messageID != ""
 		}
 		if messageID == "" {
-			messageID = durianmail.SyntheticMessageID(uidValidity, imapMsg.Uid, mailboxName, s.accountName())
+			messageID = provisionalMessageID
 		}
 		slog.Warn("Message has no Message-ID, using synthetic ID", "module", "SYNC",
 			"uid", imapMsg.Uid, "mailbox", mailboxName, "synthetic_id", messageID)
@@ -60,6 +62,11 @@ func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matc
 	storeMsg.FetchedBody = true
 	storeMsg.Account = s.accountName()
 	storeMsg.SyntheticIdentity = syntheticIdentity
+	if syntheticIdentity {
+		fingerprint := durianmail.SyntheticFingerprint(content, dateUnix)
+		storeMsg.SyntheticFingerprint = append([]byte(nil), fingerprint[:]...)
+	}
+	storeMsg.IngestPending = true
 
 	if err := s.store.InsertMessage(storeMsg); err != nil {
 		if recoveredIdentity {
@@ -67,15 +74,17 @@ func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matc
 		}
 		return "", fmt.Errorf("insert message: %w", err)
 	}
-	if recoveredIdentity {
+	if recoveredIdentity && initialIngestComplete {
 		// The existing row now points at the new UID. Preserve its attachments,
 		// indexed headers and rule-derived tags, and never repeat exec hooks.
 		matcher.Commit(messageID)
 		return messageID, nil
 	}
 
-	// Clear old attachments on upsert, then re-insert
-	_ = s.store.DeleteAttachmentsByMessageDBID(storeMsg.ID)
+	// Clear old attachments on upsert, then re-insert.
+	if err := s.store.DeleteAttachmentsByMessageDBID(storeMsg.ID); err != nil {
+		return "", fmt.Errorf("clear attachments: %w", err)
+	}
 	for i, att := range content.Attachments {
 		partID := att.PartID
 		if partID == 0 {
@@ -98,7 +107,9 @@ func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matc
 	// plus user-added entries from config.pkl sync.indexed_headers).
 	for _, hdrName := range s.headerSet() {
 		if v := parsed.Header.Get(hdrName); v != "" {
-			_ = s.store.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v)
+			if err := s.store.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v); err != nil {
+				return "", fmt.Errorf("insert header %q: %w", hdrName, err)
+			}
 		}
 	}
 
@@ -181,6 +192,12 @@ func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matc
 			}
 			slog.Debug("Applied filter rule", "module", "SYNC", "rule", rule.Name, "message_id", messageID)
 		}
+	}
+	if err := s.store.MarkMessageIngestComplete(storeMsg.ID); err != nil {
+		return "", err
+	}
+	if recoveredIdentity {
+		matcher.Commit(messageID)
 	}
 
 	return messageID, nil

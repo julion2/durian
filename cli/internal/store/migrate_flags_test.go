@@ -103,8 +103,8 @@ func TestMigrateV25RepairsLegacyCommaFlags(t *testing.T) {
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 28 {
-		t.Errorf("version = %d, want 28", version)
+	if version != 29 {
+		t.Errorf("version = %d, want 29", version)
 	}
 
 	// A second Init must not re-encrypt or otherwise change the repaired row.
@@ -191,7 +191,7 @@ func TestMigrateV25RollsBackOnDecryptFailure(t *testing.T) {
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read retry version: %v", err)
 	}
-	if version != 28 {
-		t.Errorf("retry version = %d, want 28", version)
+	if version != 29 {
+		t.Errorf("retry version = %d, want 29", version)
 	}
 }

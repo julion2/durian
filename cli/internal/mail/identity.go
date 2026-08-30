@@ -24,32 +24,45 @@ func IsSyntheticMessageID(id string) bool {
 	return ok
 }
 
+// SyntheticMessageUIDValidity returns the UIDVALIDITY embedded in a v2
+// synthetic ID. Legacy generated IDs did not record an epoch.
+func SyntheticMessageUIDValidity(id string) (uint32, bool) {
+	uidValidity, _, hasUIDValidity, ok := syntheticMessageParts(id)
+	return uidValidity, ok && hasUIDValidity
+}
+
 // SyntheticMessageSequence returns the UID embedded in a generated legacy or
 // v2 synthetic ID. The UID is an immutable ordering tie-breaker for otherwise
 // indistinguishable messages; unlike RemoteRef it does not change when a
 // partially completed replacement is retried.
 func SyntheticMessageSequence(id string) (uint64, bool) {
+	_, uid, _, ok := syntheticMessageParts(id)
+	return uid, ok
+}
+
+func syntheticMessageParts(id string) (uint32, uint64, bool, bool) {
 	remainder, ok := strings.CutPrefix(id, syntheticMessageIDPrefix)
 	if !ok {
-		return 0, false
+		return 0, 0, false, false
 	}
 	if strings.HasPrefix(remainder, "v2-") {
 		parts := strings.SplitN(remainder, "-", 4)
 		if len(parts) != 4 || parts[0] != "v2" || !strings.Contains(parts[3], "@") {
-			return 0, false
+			return 0, 0, false, false
 		}
-		if _, err := strconv.ParseUint(parts[1], 10, 32); err != nil {
-			return 0, false
+		uidValidity, err := strconv.ParseUint(parts[1], 10, 32)
+		if err != nil {
+			return 0, 0, false, false
 		}
 		uid, err := strconv.ParseUint(parts[2], 10, 32)
-		return uid, err == nil
+		return uint32(uidValidity), uid, true, err == nil
 	}
 	uidText, suffix, ok := strings.Cut(remainder, "-")
 	if !ok || !strings.Contains(suffix, "@") {
-		return 0, false
+		return 0, 0, false, false
 	}
 	uid, err := strconv.ParseUint(uidText, 10, 32)
-	return uid, err == nil
+	return 0, uid, false, err == nil
 }
 
 // SyntheticFingerprint identifies the parsed, user-visible content of a

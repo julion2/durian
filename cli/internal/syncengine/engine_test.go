@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,7 +19,9 @@ import (
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/dbcrypto"
+	durianmail "github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/syncidentity"
 )
 
 // testAccount is the account identifier used across the engine tests.
@@ -755,6 +758,150 @@ func TestEngineReplacementRecoveredUpsertFailureHoldsCursor(t *testing.T) {
 	}
 }
 
+func TestEnginePostUpsertAttachmentFailureKeepsDuplicateReservationsStable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mail.db")
+	kr, err := dbcrypto.NewKeyring(bytes.Repeat([]byte{0x42}, dbcrypto.MasterKeyLen))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(path, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.Init(); err != nil {
+		t.Fatal(err)
+	}
+	rawDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { rawDB.Close() })
+	if _, err := rawDB.Exec(`CREATE TRIGGER fail_attachment_insert
+		BEFORE INSERT ON attachments BEGIN
+			SELECT RAISE(FAIL, 'forced attachment insert failure');
+		END`); err != nil {
+		t.Fatal(err)
+	}
+
+	date := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
+	raw := []byte("From: notifier@example.com\r\n" +
+		"To: " + testAccount + "\r\n" +
+		"Subject: Identical attachment\r\n" +
+		"Date: Thu, 27 Aug 2026 10:00:00 +0000\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: application/pdf; name=\"report.pdf\"\r\n" +
+		"Content-Disposition: attachment; filename=\"report.pdf\"\r\n" +
+		"Content-Transfer-Encoding: base64\r\n\r\n" +
+		"JVBERi0xLjQK")
+	oldIDs := []string{
+		"durian-synthetic-v2-10-4-INBOX@" + testAccount,
+		"durian-synthetic-v2-10-3-INBOX@" + testAccount,
+	}
+	for i, oldID := range oldIDs {
+		ref := fmt.Sprintf("%d", 4-i)
+		_, _, err := Ingest(db, backend.Message{
+			MessageID: oldID, Ref: backend.RemoteRef{Folder: "INBOX", ID: ref},
+			Raw: raw, InternalDate: date,
+		}, "INBOX", backend.RoleInbox, IngestOptions{Account: testAccount})
+		if err == nil || !messageUpsertCompleted(err) {
+			t.Fatalf("seed %s error = %v, want post-upsert attachment failure", oldID, err)
+		}
+		stored, getErr := db.GetByMessageID(oldID)
+		if getErr != nil || stored == nil || !stored.IngestPending || len(stored.SyntheticFingerprint) == 0 {
+			t.Fatalf("pending seed %s = %+v, err=%v", oldID, stored, getErr)
+		}
+		attachments, getErr := db.GetAttachmentsByMessage(stored.ID)
+		if getErr != nil || len(attachments) != 0 {
+			t.Fatalf("failed seed %s attachments = %+v, err=%v", oldID, attachments, getErr)
+		}
+	}
+
+	message := func(uid uint32) backend.Message {
+		return backend.Message{
+			MessageID: fmt.Sprintf("durian-synthetic-v2-99-%d-INBOX@%s", uid, testAccount),
+			Ref:       backend.RemoteRef{Folder: "INBOX", ID: fmt.Sprintf("%d", uid)},
+			Raw:       raw, InternalDate: date,
+		}
+	}
+	replacementResult := func(cursor string) backend.FetchResult {
+		messages := []backend.Message{message(9), message(8)}
+		return backend.FetchResult{
+			Messages: messages,
+			Present:  []backend.RemoteRef{messages[0].Ref, messages[1].Ref},
+			Cursor:   backend.Cursor(cursor), FullSnapshot: true,
+		}
+	}
+	folder := backend.Folder{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}
+	cursors := newMemCursorStore()
+	if err := cursors.Set(testAccount, "INBOX", backend.Cursor("old")); err != nil {
+		t.Fatal(err)
+	}
+	engine := New(Options{
+		Store: db, Cursors: cursors, Account: testAccount, Mode: DownloadOnly,
+		Ingest: IngestOptions{Account: testAccount},
+	})
+	failedBackend := &identityCursorBackend{
+		Backend: &backendOnly{Backend: newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+			"INBOX": {replacementResult("failed")},
+		})},
+		adopted: make(map[string]string),
+	}
+	result, err := engine.Sync(t.Context(), failedBackend)
+	attachmentErrors := 0
+	for _, resultErr := range result.Errors {
+		if strings.Contains(resultErr.Error(), "forced attachment insert failure") {
+			attachmentErrors++
+		}
+	}
+	if err != nil || attachmentErrors != 2 {
+		t.Fatalf("failed replacement result=%+v err=%v, want two attachment errors", result, err)
+	}
+	if cursor, _ := cursors.Get(testAccount, "INBOX"); string(cursor) != "old" {
+		t.Fatalf("failed replacement cursor = %q, want old", cursor)
+	}
+	for i, oldID := range oldIDs {
+		stored, getErr := db.GetByMessageID(oldID)
+		wantRef := fmt.Sprintf("%d", 9-i)
+		if getErr != nil || stored == nil || stored.RemoteRef != wantRef || !stored.IngestPending {
+			t.Fatalf("reservation %s after failure = %+v, err=%v, want ref %s pending", oldID, stored, getErr, wantRef)
+		}
+	}
+	if _, err := rawDB.Exec("DROP TRIGGER fail_attachment_insert"); err != nil {
+		t.Fatal(err)
+	}
+
+	retryBackend := &identityCursorBackend{
+		Backend: &backendOnly{Backend: newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
+			"INBOX": {replacementResult("done")},
+		})},
+		adopted: make(map[string]string),
+	}
+	result, err = engine.Sync(t.Context(), retryBackend)
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("replacement retry result=%+v err=%v", result, err)
+	}
+	if cursor, _ := cursors.Get(testAccount, "INBOX"); string(cursor) != "done" {
+		t.Fatalf("replacement retry cursor = %q, want done", cursor)
+	}
+	for i, oldID := range oldIDs {
+		stored, getErr := db.GetByMessageID(oldID)
+		wantRef := fmt.Sprintf("%d", 9-i)
+		if getErr != nil || stored == nil || stored.RemoteRef != wantRef || stored.IngestPending {
+			t.Fatalf("completed %s = %+v, err=%v, want ref %s complete", oldID, stored, getErr, wantRef)
+		}
+		attachments, getErr := db.GetAttachmentsByMessage(stored.ID)
+		if getErr != nil || len(attachments) != 1 || attachments[0].Filename != "report.pdf" {
+			t.Fatalf("completed %s attachments = %+v, err=%v", oldID, attachments, getErr)
+		}
+	}
+	for _, uid := range []uint32{9, 8} {
+		if provisional, _ := db.GetByMessageID(message(uid).MessageID); provisional != nil {
+			t.Fatalf("provisional UID %d row remains: %+v", uid, provisional)
+		}
+	}
+}
+
 func TestEngineReplacementDoesNotAdoptRealGeneratedGrammarID(t *testing.T) {
 	db := newTestDB(t)
 	date := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
@@ -810,6 +957,31 @@ func TestEngineReplacementDoesNotAdoptRealGeneratedGrammarID(t *testing.T) {
 	}
 }
 
+func TestEngineDoesNotAdoptParsedMessageIDWithoutRecovery(t *testing.T) {
+	db := newTestDB(t)
+	const messageID = "real@example.com"
+	message := backend.Message{
+		Ref:          backend.RemoteRef{Folder: "ALL", ID: "provider-ref"},
+		Raw:          rawMessage(messageID, "sender@example.com", testAccount, "Subject", "body"),
+		InternalDate: time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC),
+	}
+	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Selectable: true}}, map[string][]backend.FetchResult{
+		"ALL": {{Messages: []backend.Message{message}, Cursor: backend.Cursor("done")}},
+	})
+	engine := New(Options{
+		Store: db, Cursors: newMemCursorStore(), Account: testAccount, Mode: DownloadOnly,
+		Ingest: IngestOptions{Account: testAccount},
+	})
+	result, err := engine.Sync(t.Context(), &backendOnly{Backend: fake})
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("sync result=%+v err=%v", result, err)
+	}
+	stored, err := db.GetByMessageID(messageID)
+	if err != nil || stored == nil || stored.RemoteRef != message.Ref.ID {
+		t.Fatalf("stored message = %+v, err=%v", stored, err)
+	}
+}
+
 func TestEngineReplacementRetryKeepsDuplicateIdentityOrder(t *testing.T) {
 	db := newTestDB(t)
 	cursors := newMemCursorStore()
@@ -822,11 +994,11 @@ func TestEngineReplacementRetryKeepsDuplicateIdentityOrder(t *testing.T) {
 		"Subject: Identical alert\r\n" +
 		"Date: Thu, 27 Aug 2026 10:00:00 +0000\r\n\r\nsame body")
 	oldIDs := []string{
-		"durian-synthetic-200-INBOX@" + testAccount,
-		"durian-synthetic-100-INBOX@" + testAccount,
+		"durian-synthetic-v2-10-4-INBOX@" + testAccount,
+		"durian-synthetic-v2-10-3-INBOX@" + testAccount,
 	}
 	for i, messageID := range oldIDs {
-		ref := fmt.Sprintf("%d", 200-(i*100))
+		ref := fmt.Sprintf("%d", 4-i)
 		msg := backend.Message{
 			MessageID: messageID, Ref: backend.RemoteRef{Folder: "INBOX", ID: ref},
 			Raw: raw, InternalDate: date,
@@ -856,27 +1028,54 @@ func TestEngineReplacementRetryKeepsDuplicateIdentityOrder(t *testing.T) {
 	}
 	folder := backend.Folder{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}
 	first := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
-		"INBOX": {page(2, "page-one", true)},
+		"INBOX": {
+			page(9, "page-one", true),
+			page(8, "page-two", true),
+			page(7, "after-three", true),
+		},
 	})
-	first.fetchErrByCursor = map[string]error{"page-one": errors.New("page two unavailable")}
+	first.fetchErrByCursor = map[string]error{"after-three": errors.New("replacement completion unavailable")}
 	firstWithIdentity := &identityCursorBackend{Backend: &backendOnly{Backend: first}, adopted: make(map[string]string)}
-	engine := newTestEngine(db, cursors)
+	engine := New(Options{
+		Store: db, Cursors: cursors, Account: testAccount,
+		Ingest: IngestOptions{
+			Account: testAccount,
+			FilterRules: []config.RuleConfig{{
+				Name: "first ingest only", Match: "*", AddTags: []string{"first-ingest"},
+			}},
+		},
+	})
 	result, err := engine.Sync(t.Context(), firstWithIdentity)
 	if err != nil || len(result.Errors) == 0 {
-		t.Fatalf("failed replacement result=%+v err=%v, want page-two error", result, err)
+		t.Fatalf("failed replacement result=%+v err=%v, want completion error", result, err)
 	}
 	if cursor, _ := cursors.Get(testAccount, "INBOX"); string(cursor) != "old" {
 		t.Fatalf("failed replacement advanced cursor to %q", cursor)
 	}
-	if high, _ := db.GetByMessageID(oldIDs[0]); high.RemoteRef != "2" {
-		t.Fatalf("first replacement page mapped high copy to ref %q, want 2", high.RemoteRef)
+	if high, _ := db.GetByMessageID(oldIDs[0]); high.RemoteRef != "9" {
+		t.Fatalf("failed replacement mapped high copy to ref %q, want 9", high.RemoteRef)
 	}
-	if low, _ := db.GetByMessageID(oldIDs[1]); low.RemoteRef != "100" {
-		t.Fatalf("failed page mutated low copy ref to %q", low.RemoteRef)
+	if low, _ := db.GetByMessageID(oldIDs[1]); low.RemoteRef != "8" {
+		t.Fatalf("failed replacement mapped low copy to ref %q, want 8", low.RemoteRef)
+	}
+	currentID := message(7).MessageID
+	current, err := db.GetByMessageID(currentID)
+	if err != nil || current == nil || current.RemoteRef != "7" {
+		t.Fatalf("new current-epoch copy = %+v, err=%v", current, err)
+	}
+	if err := db.RemoveTag(current.ID, "first-ingest"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddTag(current.ID, "local-new-copy"); err != nil {
+		t.Fatal(err)
 	}
 
 	retry := newFakeBackend([]backend.Folder{folder}, map[string][]backend.FetchResult{
-		"INBOX": {page(2, "page-one", true), page(1, "done", false)},
+		"INBOX": {
+			page(9, "page-one", true),
+			page(8, "page-two", true),
+			page(7, "done", false),
+		},
 	})
 	retryWithIdentity := &identityCursorBackend{Backend: &backendOnly{Backend: retry}, adopted: make(map[string]string)}
 	result, err = engine.Sync(t.Context(), retryWithIdentity)
@@ -888,14 +1087,97 @@ func TestEngineReplacementRetryKeepsDuplicateIdentityOrder(t *testing.T) {
 		if err != nil || stored == nil {
 			t.Fatalf("stored %s = %+v, err=%v", messageID, stored, err)
 		}
-		wantRef := fmt.Sprintf("%d", 2-i)
+		wantRef := fmt.Sprintf("%d", 9-i)
 		wantTag := fmt.Sprintf("copy-%d", i)
 		if stored.RemoteRef != wantRef || !slices.Contains(mustTags(t, db, messageID), wantTag) {
 			t.Fatalf("%s after retry: ref=%q tags=%v, want ref=%q tag=%q", messageID, stored.RemoteRef, mustTags(t, db, messageID), wantRef, wantTag)
 		}
 	}
+	current, err = db.GetByMessageID(currentID)
+	if err != nil || current == nil || current.RemoteRef != "7" {
+		t.Fatalf("current-epoch copy after retry = %+v, err=%v", current, err)
+	}
+	if tags := mustTags(t, db, currentID); !slices.Contains(tags, "local-new-copy") || slices.Contains(tags, "first-ingest") {
+		t.Fatalf("current-epoch retry reran first-ingest work or lost local state: %v", tags)
+	}
 	if cursor, _ := cursors.Get(testAccount, "INBOX"); string(cursor) != "done" {
 		t.Fatalf("completed replacement cursor = %q, want done", cursor)
+	}
+}
+
+func TestEngineRetryCompletesPendingCurrentEpochIngest(t *testing.T) {
+	db := newTestDB(t)
+	const currentID = "durian-synthetic-v2-99-7-INBOX@" + testAccount
+	raw := []byte("From: notifier@example.com\r\n" +
+		"To: " + testAccount + "\r\n" +
+		"Subject: Pending alert\r\n" +
+		"Date: Thu, 27 Aug 2026 10:00:00 +0000\r\n\r\nsame body")
+	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := durianmail.NewParser().Parse(parsed)
+	date, err := mail.ParseDate(content.Date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := &store.Message{
+		MessageID: currentID, FromAddr: content.From, ToAddrs: content.To,
+		Subject: content.Subject, BodyText: content.Body, Date: date.Unix(), CreatedAt: date.Unix(),
+		Mailbox: "INBOX", Account: testAccount, RemoteRef: "7", FetchedBody: true,
+		SyntheticIdentity: true, IngestPending: true,
+	}
+	if err := db.InsertMessage(seed); err != nil {
+		t.Fatal(err)
+	}
+	msg := backend.Message{
+		MessageID: currentID, Ref: backend.RemoteRef{Folder: "INBOX", ID: "7"},
+		Raw: raw, InternalDate: date, Labels: []string{"remote-label"},
+	}
+	matcher, err := syncidentity.New(db, testAccount, "INBOX", 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, recoveredID, complete := adoptSyntheticIdentity(msg, matcher)
+	if recoveredID != currentID || complete {
+		t.Fatalf("pending adoption = %q complete=%t, want %q incomplete", recoveredID, complete, currentID)
+	}
+	options := IngestOptions{
+		Account:           testAccount,
+		LabelsAsTags:      true,
+		FilterRules:       []config.RuleConfig{{Name: "first ingest", Match: "*", AddTags: []string{"first-ingest"}}},
+		IdentityRecovered: recoveredID != "" && complete,
+	}
+	if got, created, err := Ingest(db, msg, "INBOX", backend.RoleInbox, options); err != nil || created || got != currentID {
+		t.Fatalf("retry ingest = %q created=%t err=%v", got, created, err)
+	}
+	matcher.Commit(recoveredID)
+	stored, err := db.GetByMessageID(currentID)
+	if err != nil || stored == nil || stored.IngestPending ||
+		!slices.Contains(mustTags(t, db, currentID), "first-ingest") ||
+		!slices.Contains(mustTags(t, db, currentID), "remote-label") {
+		t.Fatalf("completed retry = %+v tags=%v err=%v", stored, mustTags(t, db, currentID), err)
+	}
+
+	// Once complete, exact pinning preserves local state and does not repeat
+	// first-ingest rules on another replacement retry.
+	if err := db.RemoveTag(stored.ID, "first-ingest"); err != nil {
+		t.Fatal(err)
+	}
+	matcher, err = syncidentity.New(db, testAccount, "INBOX", 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, recoveredID, complete = adoptSyntheticIdentity(msg, matcher)
+	if recoveredID != currentID || !complete {
+		t.Fatalf("complete adoption = %q complete=%t, want %q complete", recoveredID, complete, currentID)
+	}
+	options.IdentityRecovered = true
+	if _, _, err := Ingest(db, msg, "INBOX", backend.RoleInbox, options); err != nil {
+		t.Fatal(err)
+	}
+	if tags := mustTags(t, db, currentID); slices.Contains(tags, "first-ingest") {
+		t.Fatalf("completed retry reran first-ingest rules: %v", tags)
 	}
 }
 

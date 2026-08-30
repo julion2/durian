@@ -35,6 +35,13 @@ type Message struct {
 	// source message had no Message-ID header. The ID's spelling alone cannot
 	// prove that: a sender may legally choose the same string.
 	SyntheticIdentity bool
+	// SyntheticFingerprint is the parsed-content digest used to recover a
+	// synthetic identity even when attachment enrichment is still incomplete.
+	// It is encrypted at rest.
+	SyntheticFingerprint []byte
+	// IngestPending records that the core message row is durable but first-ingest
+	// enrichment (attachments, indexed headers, tags, and rules) is incomplete.
+	IngestPending bool
 	// SyncedFlags is the last-synced flag baseline as a comma-joined
 	// IMAP-style flag string (same format as Flags, e.g. `\Seen,\Flagged`).
 	SyncedFlags string

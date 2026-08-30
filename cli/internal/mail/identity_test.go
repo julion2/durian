@@ -18,8 +18,14 @@ func TestSyntheticMessageIDSeparatesUIDValidityEpochs(t *testing.T) {
 	if uid, ok := SyntheticMessageSequence(first); !ok || uid != 42 {
 		t.Fatalf("v2 sequence = %d, %v", uid, ok)
 	}
+	if uidValidity, ok := SyntheticMessageUIDValidity(first); !ok || uidValidity != 10 {
+		t.Fatalf("v2 UIDVALIDITY = %d, %v", uidValidity, ok)
+	}
 	if uid, ok := SyntheticMessageSequence("durian-synthetic-7-INBOX@work"); !ok || uid != 7 {
 		t.Fatalf("legacy sequence = %d, %v", uid, ok)
+	}
+	if _, ok := SyntheticMessageUIDValidity("durian-synthetic-7-INBOX@work"); ok {
+		t.Fatal("legacy synthetic ID unexpectedly reported a UIDVALIDITY epoch")
 	}
 	for _, realID := range []string{
 		"durian-synthetic-alerts@example.com",

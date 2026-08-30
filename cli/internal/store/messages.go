@@ -239,6 +239,11 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 	if err != nil {
 		return fmt.Errorf("encrypt bcc: %w", err)
 	}
+	syntheticFingerprintCT, err := d.encryptMeta(string(msg.SyntheticFingerprint))
+	if err != nil {
+		return fmt.Errorf("encrypt synthetic fingerprint: %w", err)
+	}
+	var effectiveIngestPending int
 
 	err = tx.QueryRow(`
 		INSERT INTO messages (
@@ -249,8 +254,8 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 			mailbox_id, account_id,
 			is_seen, is_flagged, is_deleted, flags_other,
 			uid, size, fetched_body,
-			remote_ref, synthetic_identity, synced_flags
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			remote_ref, synthetic_identity, synthetic_fingerprint_ct, ingest_pending, synced_flags
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id, IFNULL(account_id, 0)) DO UPDATE SET
 			subject_ct = CASE WHEN excluded.fetched_body = 1
 			                  THEN excluded.subject_ct ELSE messages.subject_ct END,
@@ -276,14 +281,17 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 			                 THEN excluded.mailbox_id ELSE messages.mailbox_id END,
 			remote_ref = CASE WHEN excluded.remote_ref != ''
 			                 THEN excluded.remote_ref ELSE messages.remote_ref END,
-			synthetic_identity = MAX(messages.synthetic_identity, excluded.synthetic_identity)
+			synthetic_identity = CASE WHEN excluded.synthetic_identity = 1
+			                          THEN 1 ELSE messages.synthetic_identity END,
+			synthetic_fingerprint_ct = CASE WHEN length(excluded.synthetic_fingerprint_ct) > 0
+			                                THEN excluded.synthetic_fingerprint_ct ELSE messages.synthetic_fingerprint_ct END
 			-- synced_flags is deliberately NOT updated on conflict: it is the
 			-- flag-sync baseline, initialized at insert or captured from the old
 			-- row above and thereafter owned by reconciliation (SetSyncedFlags).
 			-- Overwriting it from the incoming row when a delta
 			-- re-delivers a message after a server-side flag change would corrupt
 			-- the three-way merge and revert that change.
-		RETURNING id`,
+		RETURNING id, ingest_pending`,
 		msg.MessageID, threadID, msg.InReplyTo, msg.Refs, subjectCT,
 		msg.FromAddr, msg.ToAddrs, msg.CCAddrs, bccCT,
 		msg.Date, msg.CreatedAt,
@@ -291,11 +299,12 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 		nullableID(mailboxID), nullableID(accountID),
 		isSeen, isFlagged, isDeleted, flagsOtherCT,
 		msg.UID, msg.Size, fetchedBody,
-		msg.RemoteRef, msg.SyntheticIdentity, syncedFlags,
-	).Scan(&msg.ID)
+		msg.RemoteRef, msg.SyntheticIdentity, syntheticFingerprintCT, msg.IngestPending, syncedFlags,
+	).Scan(&msg.ID, &effectiveIngestPending)
 	if err != nil {
 		return fmt.Errorf("upsert message: %w", err)
 	}
+	msg.IngestPending = effectiveIngestPending == 1
 
 	// Metadata-only updates preserve every indexed value. Keep an existing FTS
 	// row untouched so flag/reference refreshes do not decrypt and retokenize
@@ -339,6 +348,15 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 		return fmt.Errorf("blind fts insert: %w", err)
 	}
 
+	return nil
+}
+
+// MarkMessageIngestComplete records that all first-ingest enrichment for the
+// durable message row completed successfully.
+func (d *DB) MarkMessageIngestComplete(messageDBID int64) error {
+	if _, err := d.db.Exec("UPDATE messages SET ingest_pending = 0 WHERE id = ?", messageDBID); err != nil {
+		return fmt.Errorf("mark message ingest complete: %w", err)
+	}
 	return nil
 }
 
@@ -593,12 +611,12 @@ func (d *DB) MessageExistsForAccount(messageID, account string) (bool, error) {
 	return count > 0, nil
 }
 
-// GetSyntheticMessagesForFolder returns rows whose identity Durian is proven
-// to have generated in one account and mailbox. UIDVALIDITY recovery loads this
-// set once, then performs one-to-one content matching in memory instead of
-// rescanning and decrypting the folder for every incoming message. Matching the
-// ID grammar is not sufficient provenance because a sender may choose the same
-// Message-ID string.
+// GetSyntheticMessagesForFolder returns generated rows and the finite set of
+// pre-v28 rows whose legacy ID grammar makes them recovery candidates. Newly
+// stored sender-supplied IDs never enter the latter state. UIDVALIDITY recovery
+// loads this set once, then performs one-to-one content matching in memory; it
+// only consumes a candidate when the replacement message has no Message-ID
+// header and the parsed content matches.
 func (d *DB) GetSyntheticMessagesForFolder(account, mailbox string) ([]*Message, error) {
 	rows, err := d.db.Query(`SELECT `+messageSelectColumns+`
 		`+messageSelectFrom+`
@@ -606,7 +624,7 @@ func (d *DB) GetSyntheticMessagesForFolder(account, mailbox string) ([]*Message,
 		       OR m.account_id = (SELECT id FROM accounts WHERE name = ?))
 		  AND ((? = '' AND m.mailbox_id IS NULL)
 		       OR m.mailbox_id = (SELECT id FROM mailboxes WHERE name = ?))
-		  AND m.synthetic_identity = 1
+		  AND m.synthetic_identity IN (1, 2)
 		  AND m.message_id LIKE 'durian-synthetic-%'
 		ORDER BY m.id`, account, account, mailbox, mailbox)
 	if err != nil {
@@ -970,7 +988,8 @@ const messageSelectColumns = `m.id, m.message_id, m.thread_id, m.in_reply_to, m.
 		m.body_text_ct, m.body_html_ct,
 		mb.name_ct, ac.name_ct,
 		m.is_seen, m.is_flagged, m.is_deleted, m.flags_other,
-		m.uid, m.size, m.fetched_body, m.remote_ref, m.synthetic_identity`
+		m.uid, m.size, m.fetched_body, m.remote_ref, m.synthetic_identity,
+		m.synthetic_fingerprint_ct, m.ingest_pending`
 
 const messageSelectFrom = `FROM messages m
 		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
@@ -982,8 +1001,8 @@ const messageSelectFrom = `FROM messages m
 // row-by-row loop in scanMessages.
 func (d *DB) scanMessageRow(scan func(...any) error) (*Message, error) {
 	msg := &Message{}
-	var fetchedBody, syntheticIdentity int
-	var subjectCT, bodyTextCT, bodyHTMLCT, flagsOtherCT, mailboxNameCT, accountNameCT, bccCT []byte
+	var fetchedBody, syntheticIdentity, ingestPending int
+	var subjectCT, bodyTextCT, bodyHTMLCT, flagsOtherCT, mailboxNameCT, accountNameCT, bccCT, syntheticFingerprintCT []byte
 	var isSeen, isFlagged, isDeleted int
 	if err := scan(
 		&msg.ID, &msg.MessageID, &msg.ThreadID, &msg.InReplyTo, &msg.Refs, &subjectCT,
@@ -991,12 +1010,13 @@ func (d *DB) scanMessageRow(scan func(...any) error) (*Message, error) {
 		&bodyTextCT, &bodyHTMLCT,
 		&mailboxNameCT, &accountNameCT,
 		&isSeen, &isFlagged, &isDeleted, &flagsOtherCT,
-		&msg.UID, &msg.Size, &fetchedBody, &msg.RemoteRef, &syntheticIdentity,
+		&msg.UID, &msg.Size, &fetchedBody, &msg.RemoteRef, &syntheticIdentity, &syntheticFingerprintCT, &ingestPending,
 	); err != nil {
 		return nil, err
 	}
 	msg.FetchedBody = fetchedBody == 1
 	msg.SyntheticIdentity = syntheticIdentity == 1
+	msg.IngestPending = ingestPending == 1
 	var err error
 	if msg.Subject, err = d.decryptSubject("", subjectCT); err != nil {
 		return nil, err
@@ -1010,6 +1030,11 @@ func (d *DB) scanMessageRow(scan func(...any) error) (*Message, error) {
 	if msg.BCCAddrs, err = d.decryptMeta("", bccCT); err != nil {
 		return nil, fmt.Errorf("decrypt bcc: %w", err)
 	}
+	syntheticFingerprint, err := d.decryptMeta("", syntheticFingerprintCT)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt synthetic fingerprint: %w", err)
+	}
+	msg.SyntheticFingerprint = []byte(syntheticFingerprint)
 	if msg.Mailbox, err = d.decryptMeta("", mailboxNameCT); err != nil {
 		return nil, fmt.Errorf("decrypt mailbox name: %w", err)
 	}

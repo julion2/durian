@@ -187,7 +187,7 @@ func (s *Syncer) syncMailbox(mailboxName string) MailboxResult {
 	if replacement {
 		fmt.Fprintf(s.output, "    UIDVALIDITY changed, performing full resync\n")
 		if !s.options.DryRun {
-			syntheticMatcher, err = syncidentity.New(s.store, s.accountName(), mailboxName)
+			syntheticMatcher, err = syncidentity.New(s.store, s.accountName(), mailboxName, status.UidValidity)
 			if err != nil {
 				result.Error = fmt.Errorf("prepare synthetic identity recovery: %w", err)
 				return result
@@ -530,7 +530,7 @@ func (s *Syncer) applyDedupTags(messageID, mailboxName string, tagMapping *Folde
 		}
 		if err := s.store.ModifyTagsByMessageIDAndAccount(messageID, s.accountName(), addTags, tagMapping.RemoveTags); err != nil {
 			slog.Debug("Failed to update tags", "module", "SYNC", "message_id", messageID, "err", err)
-			return err
+			return fmt.Errorf("modify dedup tags: %w", err)
 		}
 		return nil
 	}
@@ -542,7 +542,7 @@ func (s *Syncer) applyDedupTags(messageID, mailboxName string, tagMapping *Folde
 	}
 	if err := s.store.ModifyTagsByMessageIDAndAccount(messageID, s.accountName(), nil, []string{"inbox"}); err != nil {
 		slog.Debug("Failed to remove inbox tag", "module", "SYNC", "message_id", messageID, "err", err)
-		return err
+		return fmt.Errorf("remove inbox tag: %w", err)
 	}
 	return nil
 }

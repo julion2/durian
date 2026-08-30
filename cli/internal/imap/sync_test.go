@@ -1,8 +1,17 @@
 package imap
 
 import (
+	"bytes"
 	"fmt"
+	"net/mail"
+	"slices"
 	"testing"
+	"time"
+
+	goimap "github.com/emersion/go-imap"
+
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/syncidentity"
 )
 
 func TestMatchMailbox(t *testing.T) {
@@ -203,6 +212,156 @@ func TestExtractMessageIDFromBody(t *testing.T) {
 				t.Errorf("extractMessageIDFromBody() = %q, want %q", got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestStoreInsertMessageRetryPinsCurrentEpochCopy(t *testing.T) {
+	db := newFlagTestDB(t)
+	account := &config.AccountConfig{Name: "work"}
+	syncer := NewSyncer(account, &SyncOptions{
+		Store: db,
+		Quiet: true,
+		FilterRules: []config.RuleConfig{{
+			Name: "first ingest only", Match: "*", AddTags: []string{"first-ingest"},
+		}},
+	})
+	date := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
+	raw := []byte("From: notifier@example.com\r\n" +
+		"To: receiver@example.com\r\n" +
+		"Subject: Identical alert\r\n" +
+		"Date: Thu, 27 Aug 2026 10:00:00 +0000\r\n\r\nsame body")
+	messageID := func(epoch, uid uint32) string {
+		return fmt.Sprintf("durian-synthetic-v2-%d-%d-INBOX@work", epoch, uid)
+	}
+	storeOne := func(matcher *syncidentity.Matcher, epoch, uid uint32) string {
+		t.Helper()
+		got, err := syncer.storeInsertMessage("INBOX", epoch, matcher, &goimap.Message{
+			Uid: uid, InternalDate: date,
+		}, raw)
+		if err != nil {
+			t.Fatalf("store epoch %d UID %d: %v", epoch, uid, err)
+		}
+		return got
+	}
+
+	oldIDs := []string{messageID(10, 4), messageID(10, 3)}
+	for i, uid := range []uint32{4, 3} {
+		if got := storeOne(nil, 10, uid); got != oldIDs[i] {
+			t.Fatalf("seed UID %d = %q, want %q", uid, got, oldIDs[i])
+		}
+		stored, _ := db.GetByMessageID(oldIDs[i])
+		if err := db.AddTag(stored.ID, fmt.Sprintf("copy-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	matcher, err := syncidentity.New(db, "work", "INBOX", 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wants := []string{oldIDs[0], oldIDs[1], messageID(99, 7)}
+	for i, uid := range []uint32{9, 8, 7} {
+		if got := storeOne(matcher, 99, uid); got != wants[i] {
+			t.Fatalf("first attempt UID %d = %q, want %q", uid, got, wants[i])
+		}
+	}
+	current, err := db.GetByMessageID(wants[2])
+	if err != nil || current == nil || current.UID != 7 {
+		t.Fatalf("new current-epoch copy = %+v, err=%v", current, err)
+	}
+	if err := db.RemoveTag(current.ID, "first-ingest"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddTag(current.ID, "local-new-copy"); err != nil {
+		t.Fatal(err)
+	}
+
+	matcher, err = syncidentity.New(db, "work", "INBOX", 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, uid := range []uint32{9, 8, 7} {
+		if got := storeOne(matcher, 99, uid); got != wants[i] {
+			t.Fatalf("retry UID %d = %q, want %q", uid, got, wants[i])
+		}
+	}
+	for i, oldID := range oldIDs {
+		stored, err := db.GetByMessageID(oldID)
+		wantUID := uint32(9 - i)
+		wantTag := fmt.Sprintf("copy-%d", i)
+		if err != nil || stored == nil || stored.UID != wantUID || !slices.Contains(messageTags(t, db, oldID), wantTag) {
+			t.Fatalf("old copy %s after retry = %+v tags=%v err=%v", oldID, stored, messageTags(t, db, oldID), err)
+		}
+	}
+	current, err = db.GetByMessageID(wants[2])
+	if err != nil || current == nil || current.UID != 7 {
+		t.Fatalf("current copy after retry = %+v, err=%v", current, err)
+	}
+	if tags := messageTags(t, db, wants[2]); !slices.Contains(tags, "local-new-copy") || slices.Contains(tags, "first-ingest") {
+		t.Fatalf("current retry reran first-ingest work or lost local state: %v", tags)
+	}
+}
+
+func TestStoreInsertMessageRetryCompletesPendingCurrentEpochIngest(t *testing.T) {
+	db := newFlagTestDB(t)
+	account := &config.AccountConfig{Name: "work"}
+	syncer := NewSyncer(account, &SyncOptions{
+		Store: db, Quiet: true,
+		FilterRules: []config.RuleConfig{{Name: "first ingest", Match: "*", AddTags: []string{"first-ingest"}}},
+	})
+	const currentID = "durian-synthetic-v2-99-7-INBOX@work"
+	date := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
+	raw := []byte("From: notifier@example.com\r\n" +
+		"To: receiver@example.com\r\n" +
+		"Subject: Pending alert\r\n" +
+		"Date: Thu, 27 Aug 2026 10:00:00 +0000\r\n\r\nsame body")
+	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := syncer.parser.Parse(parsed)
+	seed := StoreMessageFromContent(currentID, content, date.Unix(), date.Unix())
+	seed.Mailbox = "INBOX"
+	seed.Account = "work"
+	seed.UID = 7
+	seed.FetchedBody = true
+	seed.SyntheticIdentity = true
+	seed.IngestPending = true
+	if err := db.InsertMessage(seed); err != nil {
+		t.Fatal(err)
+	}
+	storeOne := func(matcher *syncidentity.Matcher) string {
+		t.Helper()
+		got, err := syncer.storeInsertMessage("INBOX", 99, matcher, &goimap.Message{Uid: 7, InternalDate: date}, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	matcher, err := syncidentity.New(db, "work", "INBOX", 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := storeOne(matcher); got != currentID {
+		t.Fatalf("pending retry = %q, want %q", got, currentID)
+	}
+	stored, err := db.GetByMessageID(currentID)
+	if err != nil || stored == nil || stored.IngestPending || !slices.Contains(messageTags(t, db, currentID), "first-ingest") {
+		t.Fatalf("completed retry = %+v tags=%v err=%v", stored, messageTags(t, db, currentID), err)
+	}
+
+	if err := db.RemoveTag(stored.ID, "first-ingest"); err != nil {
+		t.Fatal(err)
+	}
+	matcher, err = syncidentity.New(db, "work", "INBOX", 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := storeOne(matcher); got != currentID {
+		t.Fatalf("complete retry = %q, want %q", got, currentID)
+	}
+	if tags := messageTags(t, db, currentID); slices.Contains(tags, "first-ingest") {
+		t.Fatalf("complete retry reran first-ingest rules: %v", tags)
 	}
 }
 

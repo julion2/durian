@@ -394,12 +394,6 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				deadline = time.Now().Add(e.opts.RecoveryTimeout)
 			}
 		}
-		if res.FullSnapshot && syntheticMatcher == nil && canUpdateIdentityCursor && !e.opts.DryRun {
-			syntheticMatcher, err = syncidentity.New(e.opts.Store, e.opts.Account, folder.Name)
-			if err != nil {
-				return nil, fmt.Errorf("prepare synthetic identity recovery: %w", err)
-			}
-		}
 		if res.FullSnapshot {
 			for _, ref := range res.Present {
 				snapshotRefs[ref.ID] = struct{}{}
@@ -430,13 +424,25 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				continue
 			}
 			provisionalMessageID := msg.MessageID
-			msg, recoveredMessageID := adoptSyntheticIdentity(msg, syntheticMatcher)
+			if res.FullSnapshot && syntheticMatcher == nil && canUpdateIdentityCursor && messageIDFromRaw(msg.Raw) == "" {
+				if currentUIDValidity, ok := durianmail.SyntheticMessageUIDValidity(provisionalMessageID); ok {
+					syntheticMatcher, err = syncidentity.New(e.opts.Store, e.opts.Account, folder.Name, currentUIDValidity)
+					if err != nil {
+						return nil, fmt.Errorf("prepare synthetic identity recovery: %w", err)
+					}
+				}
+			}
+			msg, recoveredMessageID, initialIngestComplete := adoptSyntheticIdentity(msg, syntheticMatcher)
 			ingestOptions := e.opts.Ingest
-			ingestOptions.IdentityRecovered = recoveredMessageID != ""
+			ingestOptions.IdentityRecovered = recoveredMessageID != "" && initialIngestComplete
 			messageID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, ingestOptions)
 			if err != nil {
 				if recoveredMessageID != "" {
-					syntheticMatcher.Restore(recoveredMessageID)
+					if messageUpsertCompleted(err) {
+						syntheticMatcher.Commit(recoveredMessageID)
+					} else {
+						syntheticMatcher.Restore(recoveredMessageID)
+					}
 				}
 				slog.Warn("Ingest failed", "module", "SYNCENGINE",
 					"folder", folder.Name, "ref", msg.Ref.ID, "err", err)
@@ -463,7 +469,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				syntheticMatcher.Commit(recoveredMessageID)
 			}
 			sessionRefs[msg.Ref.ID] = messageID
-			if messageID != provisionalMessageID {
+			if recoveredMessageID != "" && messageID != provisionalMessageID {
 				adoptedIdentities[msg.Ref.ID] = messageID
 			}
 			// A re-delivered message (e.g. a flag change surfaced by the delta)
@@ -704,15 +710,15 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 	return nil
 }
 
-func adoptSyntheticIdentity(msg backend.Message, matcher *syncidentity.Matcher) (backend.Message, string) {
+func adoptSyntheticIdentity(msg backend.Message, matcher *syncidentity.Matcher) (backend.Message, string, bool) {
 	if matcher == nil || !durianmail.IsSyntheticMessageID(msg.MessageID) || len(msg.Raw) == 0 {
-		return msg, ""
+		return msg, "", false
 	}
-	if messageID, err := matcher.MatchRaw(msg.Raw, msg.InternalDate); err == nil && messageID != "" {
+	if messageID, initialIngestComplete, err := matcher.MatchRaw(msg.MessageID, msg.Raw, msg.InternalDate); err == nil && messageID != "" {
 		msg.MessageID = messageID
-		return msg, messageID
+		return msg, messageID, initialIngestComplete
 	}
-	return msg, ""
+	return msg, "", false
 }
 
 func validateSnapshotBatch(requested []backend.RemoteRef, batch backend.SnapshotBatch) error {
