@@ -249,16 +249,10 @@ func warnMisconfiguredCollections(cols []calendar.Collection, calendars []calend
 	}
 }
 
-// calendarLabel renders the calendar cell of a row. When the listing spans more
-// than one account, two accounts can each have a calendar called "Calendar" —
-// so the account is prefixed, and only then, to keep the common single-account
-// output unchanged.
-func calendarLabel(cal calendar.LocalCalendar, multiAccount bool) string {
-	name := cal.Name
-	if multiAccount && cal.Account != "" {
-		name = cal.Account + "/" + name
-	}
-	return calSwatch(cal.HexColor, name)
+// calendarLabel renders the calendar cell of a row. Account is a separate
+// column so the calendar name remains stable in single- and multi-account output.
+func calendarLabel(cal calendar.LocalCalendar) string {
+	return calSwatch(cal.HexColor, cal.Name)
 }
 
 // occurrence pairs an expanded event with its calendar for sorting/printing.
@@ -302,7 +296,9 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 	if jsonOutput {
 		out := make([]calendar.CalendarEvent, 0, len(occs))
 		for _, o := range occs {
-			out = append(out, calendar.ToCalendarEvent(o.cal.Name, o.event, false))
+			dto := calendar.ToCalendarEvent(o.cal.Name, o.event, false)
+			dto.Account = o.cal.Account
+			out = append(out, dto)
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -339,7 +335,9 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 			"  " + eventTimeCol(o.event),
 			styAccent(truncate(orDash(o.event.Subject), 50)),
 			styDim(truncate(o.event.Location, 24)),
-			calendarLabel(o.cal, len(accounts) > 1) + eventMarkers(o.event),
+			calendarLabel(o.cal) + eventMarkers(o.event),
+			styDim(o.cal.Account),
+			styDim("event:" + o.event.ICalUID),
 		})
 	}
 	printColumns(os.Stdout, rows)
@@ -407,8 +405,6 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to read local calendars: %w", err)
 	}
 	warnMisconfiguredCollections(cols, calendars)
-	multiAccount := len(contributingAccounts(calendars)) > 1
-
 	var matches []occurrence
 	for _, cal := range calendars {
 		if calSearchCalendar != "" && !strings.EqualFold(cal.Name, calSearchCalendar) {
@@ -425,7 +421,9 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 	if jsonOutput {
 		out := make([]calendar.CalendarEvent, 0, len(matches))
 		for _, o := range matches {
-			out = append(out, calendar.ToCalendarEvent(o.cal.Name, o.event, false))
+			dto := calendar.ToCalendarEvent(o.cal.Name, o.event, false)
+			dto.Account = o.cal.Account
+			out = append(out, dto)
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -439,12 +437,14 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 
 	// Header and cells are styled per cell (not per line), so printColumns can
 	// align them on their visible widths.
-	rows := [][]string{{styHeader("DATE"), styHeader("SUBJECT"), styHeader("CALENDAR")}}
+	rows := [][]string{{styHeader("EVENT"), styHeader("ACCOUNT"), styHeader("DATE"), styHeader("SUBJECT"), styHeader("CALENDAR")}}
 	for _, o := range matches {
 		rows = append(rows, []string{
+			"event:" + o.event.ICalUID,
+			o.cal.Account,
 			o.event.Start.Format("2006-01-02 15:04"),
 			styAccent(truncate(orDash(o.event.Subject), 50)),
-			calendarLabel(o.cal, multiAccount),
+			calendarLabel(o.cal),
 		})
 	}
 	printColumns(os.Stdout, rows)
@@ -456,9 +456,9 @@ func runCalendarShow(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	ref := strings.Join(args, " ")
+	ref := normalizeEventReference(strings.Join(args, " "))
 
-	_, e, calName, err := calendar.ResolveEventIn(cols, ref, calShowCalendar)
+	path, e, calName, err := calendar.ResolveEventIn(cols, ref, calShowCalendar)
 	if err != nil {
 		// A miss may simply mean a configured calendar points one level too
 		// high and contributed nothing to search through.
@@ -468,18 +468,21 @@ func runCalendarShow(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	account := calendar.CollectionAccountForPath(cols, path)
 	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(calendar.ToCalendarEvent(calName, e, true))
+		dto := calendar.ToCalendarEvent(calName, e, true)
+		dto.Account = account
+		return enc.Encode(dto)
 	}
 
-	printEventDetail(e, calName)
+	printEventDetail(e, calName, account)
 	return nil
 }
 
 // printEventDetail renders one event as a labeled block (see show.go's style).
-func printEventDetail(e calendar.Event, calName string) {
+func printEventDetail(e calendar.Event, calName, account string) {
 	fmt.Println(styAccent(orDash(e.Subject)))
 	fmt.Println(strings.Repeat("─", 50))
 	field := func(label, value string) {
@@ -488,6 +491,8 @@ func printEventDetail(e calendar.Event, calName string) {
 		}
 	}
 
+	field("Event", "event:"+e.ICalUID)
+	field("Account", account)
 	field("Calendar", calName)
 	field("When", eventWhen(e))
 	field("Location", e.Location)
@@ -513,6 +518,14 @@ func printEventDetail(e calendar.Event, calName string) {
 	if e.Description != "" {
 		fmt.Printf("\n%s\n%s\n", styDim("Description:"), strings.TrimSpace(e.Description))
 	}
+}
+
+func normalizeEventReference(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if len(ref) >= len("event:") && strings.EqualFold(ref[:len("event:")], "event:") {
+		return strings.TrimSpace(ref[len("event:"):])
+	}
+	return ref
 }
 
 // eventWhen renders the time span of an event for the detail view.

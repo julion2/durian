@@ -210,7 +210,7 @@ func runCalendarModify(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("resolve calendar collections: %w", err)
 	}
-	path, event, calName, err := calendar.ResolveEventIn(cols, args[1], calModifyCalendar)
+	path, event, calName, err := calendar.ResolveEventIn(cols, normalizeEventReference(args[1]), calModifyCalendar)
 	if err != nil {
 		return fmt.Errorf("resolve event: %w", err)
 	}
@@ -363,7 +363,7 @@ func runCalendarRsvp(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	label := args[0]
-	ref := args[1]
+	ref := normalizeEventReference(args[1])
 	response, err := calendar.ParseRSVPVerb(args[2])
 	if err != nil {
 		return err
@@ -420,7 +420,7 @@ func runCalendarDelete(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	label := args[0]
-	ref := args[1]
+	ref := normalizeEventReference(args[1])
 
 	path, event, calName, err := calendar.ResolveEventIn(cols, ref, calDeleteCalendar)
 	if err != nil {

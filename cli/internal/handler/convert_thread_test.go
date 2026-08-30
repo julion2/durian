@@ -112,6 +112,7 @@ func TestConvertThread_AllFieldsMapped(t *testing.T) {
 		BodyText: "plain body",
 		BodyHTML: "<p>html body</p>",
 		Mailbox:  "INBOX",
+		Account:  "work",
 	})
 
 	m, _ := db.GetByMessageID("fields@test")
@@ -124,6 +125,9 @@ func TestConvertThread_AllFieldsMapped(t *testing.T) {
 	}
 	if msg.MessageID != "fields@test" {
 		t.Errorf("MessageID = %q", msg.MessageID)
+	}
+	if msg.Account != "work" {
+		t.Errorf("Account = %q", msg.Account)
 	}
 	if msg.From != "alice@example.com" {
 		t.Errorf("From = %q", msg.From)

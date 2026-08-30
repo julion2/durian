@@ -11,14 +11,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var tagAccountFilter string
+var tagAccountFilter []string
 
 var tagListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all tags",
 	Example: `  durian tag list
   durian tag list --account work
-  durian tag list --account work,personal`,
+  durian tag list --account work --account personal`,
 	RunE: runTagList,
 }
 
@@ -36,7 +36,7 @@ var tagCmd = &cobra.Command{
 
 func init() {
 	tagCmd.Flags().SetInterspersed(false)
-	tagListCmd.Flags().StringVar(&tagAccountFilter, "account", "", "filter by account (comma-separated)")
+	tagListCmd.Flags().StringSliceVarP(&tagAccountFilter, "account", "a", nil, "filter by account (repeatable or comma-separated)")
 	_ = tagListCmd.RegisterFlagCompletionFunc("account", completeAccounts)
 	tagCmd.AddCommand(tagListCmd)
 	rootCmd.AddCommand(tagCmd)
@@ -52,8 +52,12 @@ func runTagList(cmd *cobra.Command, args []string) error {
 	h := handler.New(emailDB, nil)
 
 	var resp protocol.Response
-	if tagAccountFilter != "" {
-		resp = h.ListTagsForAccounts(strings.Split(tagAccountFilter, ","))
+	if len(tagAccountFilter) > 0 {
+		accounts, err := resolveAccountStoreKeys(tagAccountFilter)
+		if err != nil {
+			return err
+		}
+		resp = h.ListTagsForAccounts(accounts)
 	} else {
 		resp = h.ListTags()
 	}

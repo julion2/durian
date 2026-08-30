@@ -161,19 +161,9 @@ func (d *DB) ListTags(accounts ...string) ([]string, error) {
 	var rows *sql.Rows
 	var err error
 	if len(accounts) > 0 {
-		// Resolve account names → ids. Unknown names contribute nothing
-		// to the IN-list; if all names are unknown we short-circuit empty.
-		ids := make([]int64, 0, len(accounts))
-		for _, name := range accounts {
-			var id int64
-			err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", name).Scan(&id)
-			if err == sql.ErrNoRows {
-				continue
-			}
-			if err != nil {
-				return nil, fmt.Errorf("lookup account id: %w", err)
-			}
-			ids = append(ids, id)
+		ids, resolveErr := d.resolveAccountIDs(accounts)
+		if resolveErr != nil {
+			return nil, resolveErr
 		}
 		if len(ids) == 0 {
 			return nil, nil

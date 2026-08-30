@@ -59,6 +59,7 @@ type MessageInfo struct {
 	Date            string           `json:"date"`
 	Timestamp       int64            `json:"timestamp"`
 	MessageID       string           `json:"message_id,omitempty"`
+	Account         string           `json:"account,omitempty"`
 	InReplyTo       string           `json:"in_reply_to,omitempty"`
 	References      string           `json:"references,omitempty"`
 	Body            string           `json:"body"`

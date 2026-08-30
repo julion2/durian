@@ -174,6 +174,9 @@ func TestCalendarEventsWindow(t *testing.T) {
 	if resp.Events[0].UID != "evt-lunch" {
 		t.Errorf("uid = %q", resp.Events[0].UID)
 	}
+	if resp.Events[0].Account != "work" {
+		t.Errorf("account = %q, want work", resp.Events[0].Account)
+	}
 }
 
 func TestCalendarEventsWindowExcludes(t *testing.T) {
@@ -210,6 +213,9 @@ func TestCalendarEventDetail(t *testing.T) {
 	}
 	if !resp.OK || resp.Event.UID != "evt-lunch" || resp.Event.Subject != "Team Lunch" {
 		t.Errorf("event = %+v", resp.Event)
+	}
+	if resp.Event.Account != "work" {
+		t.Errorf("account = %q, want work", resp.Event.Account)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	stdmail "net/mail"
 	"net/textproto"
 	"os"
@@ -49,7 +50,7 @@ func init() {
 }
 
 func runShow(cmd *cobra.Command, args []string) error {
-	threadID := args[0]
+	threadID := normalizeThreadReference(args[0])
 
 	emailDB, err := openEmailDB()
 	if err != nil {
@@ -85,7 +86,7 @@ func runShow(cmd *cobra.Command, args []string) error {
 		return enc.Encode(resp.Thread)
 	}
 
-	return outputThreadFormatted(resp.Thread)
+	return outputThreadFormatted(os.Stdout, resp.Thread)
 }
 
 // runShowHeaders prints stored headers for every message in the thread.
@@ -281,41 +282,74 @@ func filterHeaders(h map[string][]string, filterName string) map[string][]string
 	return out
 }
 
-func outputThreadFormatted(t *mail.ThreadContent) error {
-	fmt.Printf("Thread: %s\n", t.ThreadID)
-	fmt.Printf("Subject: %s\n", t.Subject)
-	fmt.Printf("Messages: %d\n", len(t.Messages))
-	fmt.Println(strings.Repeat("=", 60))
+func outputThreadFormatted(w io.Writer, t *mail.ThreadContent) error {
+	fmt.Fprintf(w, "Thread: thread:%s\n", t.ThreadID)
+	fmt.Fprintf(w, "Subject: %s\n", t.Subject)
+	fmt.Fprintf(w, "Messages: %d\n", len(t.Messages))
+	fmt.Fprintln(w, strings.Repeat("=", 60))
 
 	for i, msg := range t.Messages {
-		fmt.Printf("\n[%d/%d] %s\n", i+1, len(t.Messages), msg.Date)
-		fmt.Printf("From: %s\n", msg.From)
+		fmt.Fprintf(w, "\n[%d/%d] %s\n", i+1, len(t.Messages), msg.Date)
+		fmt.Fprintf(w, "Message: message:%s\n", msg.MessageID)
+		if msg.Account != "" {
+			fmt.Fprintf(w, "Account: %s\n", displayAccountIdentifier(msg.Account))
+		}
+		fmt.Fprintf(w, "From: %s\n", msg.From)
 		if msg.To != "" {
-			fmt.Printf("To:   %s\n", msg.To)
+			fmt.Fprintf(w, "To:   %s\n", msg.To)
+		}
+		if len(msg.Tags) > 0 {
+			fmt.Fprintf(w, "Tags: %s\n", strings.Join(msg.Tags, ", "))
 		}
 		if len(msg.Attachments) > 0 {
-			names := make([]string, len(msg.Attachments))
-			for i, a := range msg.Attachments {
-				names[i] = a.Filename
+			fmt.Fprintln(w, "Attachments:")
+			for _, attachment := range msg.Attachments {
+				fmt.Fprintf(w, "  [%d] %s (%s, %s)\n", attachment.PartID, attachment.Filename, attachment.ContentType, formatSize(attachment.Size))
+				accountArg := ""
+				if msg.Account != "" {
+					accountArg = " --account " + shellQuote(displayAccountIdentifier(msg.Account))
+				}
+				fmt.Fprintf(w, "      Save: durian attachment %s%s --save %d\n",
+					shellQuote("message:"+msg.MessageID), accountArg, attachment.PartID)
 			}
-			fmt.Printf("Attachments: %s\n", strings.Join(names, ", "))
 		}
-		fmt.Println(strings.Repeat("-", 40))
+		fmt.Fprintln(w, strings.Repeat("-", 40))
 
 		if showHTML && msg.HTML != "" {
-			fmt.Println(msg.HTML)
+			fmt.Fprintln(w, msg.HTML)
 		} else if msg.Body != "" {
-			fmt.Println(msg.Body)
+			fmt.Fprintln(w, msg.Body)
 		} else if msg.HTML != "" {
-			fmt.Println("[HTML-only message - use --html to view]")
+			fmt.Fprintln(w, "[HTML-only message - use --html to view]")
 		} else {
-			fmt.Println("[No content]")
+			fmt.Fprintln(w, "[No content]")
 		}
 
 		if i < len(t.Messages)-1 {
-			fmt.Println()
+			fmt.Fprintln(w)
 		}
 	}
 
 	return nil
+}
+
+func normalizeThreadReference(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if len(ref) >= len("thread:") && strings.EqualFold(ref[:len("thread:")], "thread:") {
+		return strings.TrimSpace(ref[len("thread:"):])
+	}
+	return ref
+}
+
+func displayAccountIdentifier(identifier string) string {
+	if cfg != nil {
+		if account, err := cfg.GetAccountByIdentifier(identifier); err == nil {
+			return account.GetAliasOrName()
+		}
+	}
+	return identifier
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
