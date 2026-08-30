@@ -1180,6 +1180,62 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 28 {
+		// Record explicit provenance for fallback Message-IDs. State 1 means a
+		// no-ID message was observed directly; state 2 is limited to pre-v28 rows
+		// matching the old generated grammar. The latter is not treated as proof:
+		// recovery also requires a replacement message with no Message-ID header
+		// and identical parsed content. A successful upsert promotes it to state 1.
+		has, err := hasColumn(d.db, "messages", "synthetic_identity")
+		if err != nil {
+			return fmt.Errorf("migrate v27→v28 inspect synthetic_identity: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN synthetic_identity INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return fmt.Errorf("migrate v27→v28 add synthetic_identity: %w", err)
+			}
+		}
+		if _, err := d.db.Exec(`UPDATE messages SET synthetic_identity = 2
+			WHERE synthetic_identity = 0
+			  AND (message_id GLOB 'durian-synthetic-[0-9]*-*@*'
+			       OR message_id GLOB 'durian-synthetic-v2-[0-9]*-[0-9]*-*@*')`); err != nil {
+			return fmt.Errorf("migrate v27→v28 mark legacy synthetic candidates: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 28 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v27→v28 bump: %w", err)
+		}
+		version = 28
+	}
+
+	if version < 29 {
+		// A durable core row can survive a crash or transient failure before its
+		// attachments, indexed headers, tags, and rules finish. Persist that
+		// distinction and an encrypted complete-content fingerprint so identity
+		// recovery can match and finish the row even when attachment metadata is
+		// absent or partial.
+		has, err := hasColumn(d.db, "messages", "ingest_pending")
+		if err != nil {
+			return fmt.Errorf("migrate v28→v29 inspect ingest_pending: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN ingest_pending INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return fmt.Errorf("migrate v28→v29 add ingest_pending: %w", err)
+			}
+		}
+		has, err = hasColumn(d.db, "messages", "synthetic_fingerprint_ct")
+		if err != nil {
+			return fmt.Errorf("migrate v28→v29 inspect synthetic_fingerprint_ct: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN synthetic_fingerprint_ct BLOB"); err != nil {
+				return fmt.Errorf("migrate v28→v29 add synthetic_fingerprint_ct: %w", err)
+			}
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 29 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v28→v29 bump: %w", err)
+		}
+	}
+
 	return nil
 }
 

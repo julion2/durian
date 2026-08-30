@@ -1,0 +1,24 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "syncidentity",
+    srcs = ["matcher.go"],
+    importpath = "github.com/julion2/durian/cli/internal/syncidentity",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "//cli/internal/mail",
+        "//cli/internal/store",
+    ],
+)
+
+go_test(
+    name = "syncidentity_test",
+    size = "small",
+    srcs = ["matcher_test.go"],
+    embed = [":syncidentity"],
+    deps = [
+        "//cli/internal/dbcrypto",
+        "//cli/internal/mail",
+        "//cli/internal/store",
+    ],
+)

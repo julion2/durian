@@ -25,6 +25,7 @@ go_library(
         "//cli/internal/oauth",
         "//cli/internal/redact",
         "//cli/internal/store",
+        "//cli/internal/syncidentity",
         "@com_github_emersion_go_imap//:go-imap",
         "@com_github_emersion_go_imap//client",
         "@com_github_emersion_go_sasl//:go-sasl",
@@ -52,6 +53,7 @@ go_test(
         "//cli/internal/dbcrypto",
         "//cli/internal/redact",
         "//cli/internal/store",
+        "//cli/internal/syncidentity",
         "@com_github_emersion_go_imap//:go-imap",
     ],
 )

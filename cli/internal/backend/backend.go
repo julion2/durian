@@ -261,3 +261,12 @@ type SnapshotHydrator interface {
 	// FetchSnapshotMessages returns complete messages for locally absent refs.
 	FetchSnapshotMessages(ctx context.Context, refs []RemoteRef) (SnapshotBatch, error)
 }
+
+// IdentityCursorUpdater is implemented by backends whose replacement cursor
+// stores Message-IDs alongside transient remote refs. During recovery the
+// engine may adopt a pre-reset synthetic ID after content matching; the backend
+// must write those canonical IDs into the same page cursor before it is
+// checkpointed or used to fetch the next page.
+type IdentityCursorUpdater interface {
+	AdoptMessageIdentities(cursor Cursor, identities map[string]string) (Cursor, error)
+}

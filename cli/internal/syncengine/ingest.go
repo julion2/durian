@@ -2,6 +2,7 @@ package syncengine
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/mail"
@@ -17,6 +18,18 @@ import (
 
 // parser is the shared (stateless) RFC822 parser, same as the legacy syncer's.
 var parser = durianmail.NewParser()
+
+type postUpsertIngestError struct {
+	err error
+}
+
+func (e *postUpsertIngestError) Error() string { return e.err.Error() }
+func (e *postUpsertIngestError) Unwrap() error { return e.err }
+
+func messageUpsertCompleted(err error) bool {
+	var postUpsert *postUpsertIngestError
+	return errors.As(err, &postUpsert)
+}
 
 // builtinIndexedHeaders is a copy of imap.builtinSelectedHeaders (unexported
 // there; deliberately NOT edited into an export to keep the strangler-fig
@@ -102,6 +115,10 @@ type IngestOptions struct {
 	// message's Labels are reconciled onto its tags (add/remove against the
 	// stored baseline) instead of applying folder-role tags.
 	LabelsAsTags bool
+	// IdentityRecovered marks a synthetic row adopted during an IMAP
+	// UIDVALIDITY replacement. Once its existing row is durably updated, first-
+	// ingest enrichment must not rerun rules, hooks, or attachment replacement.
+	IdentityRecovered bool
 }
 
 // headerSet returns the deduped, case-insensitive union of the builtin header
@@ -145,14 +162,22 @@ func (o IngestOptions) headerSet() []string {
 // engine can track RemoteRef->MessageID for deletions and flag updates) and
 // whether the row was newly created — false when the message already existed and
 // was updated in place, e.g. re-delivered by a delta because a flag changed.
-func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.Role, opts IngestOptions) (string, bool, error) {
+func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.Role, opts IngestOptions) (messageID string, created bool, err error) {
+	coreDurable := false
+	defer func() {
+		if err != nil && coreDurable {
+			err = &postUpsertIngestError{err: err}
+		}
+	}()
+
 	parsed, err := mail.ReadMessage(bytes.NewReader(msg.Raw))
 	if err != nil {
 		return "", false, fmt.Errorf("parse message: %w", err)
 	}
 
 	content := parser.Parse(parsed)
-	messageID := strings.Trim(content.MessageID, "<>")
+	messageID = strings.Trim(content.MessageID, "<>")
+	syntheticIdentity := messageID == ""
 	if messageID == "" {
 		// The backend already computed the Message-ID (possibly synthetic) —
 		// prefer it so the engine and the backend agree on message identity.
@@ -192,6 +217,12 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	storeMsg.FetchedBody = true
 	storeMsg.Account = opts.Account
 	storeMsg.RemoteRef = msg.Ref.ID
+	storeMsg.SyntheticIdentity = syntheticIdentity
+	if syntheticIdentity {
+		fingerprint := durianmail.SyntheticFingerprint(content, dateUnix)
+		storeMsg.SyntheticFingerprint = append([]byte(nil), fingerprint[:]...)
+	}
+	storeMsg.IngestPending = true
 	// The message's current server flags are the correct initial baseline: the
 	// first post-ingest flag pass is then a no-op unless the user changed
 	// something locally. joinFlags (not flagStr) so the baseline round-trips
@@ -199,9 +230,13 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	storeMsg.SyncedFlags = joinFlags(flagState)
 	storeMsg.SyncedFlagsInitialized = true
 
-	created, err := db.UpsertMessageWithInitialTags(storeMsg, flagAdd)
+	created, err = db.UpsertMessageWithInitialTags(storeMsg, flagAdd)
 	if err != nil {
 		return "", false, fmt.Errorf("insert message: %w", err)
+	}
+	coreDurable = true
+	if !created && opts.IdentityRecovered && !storeMsg.IngestPending {
+		return messageID, false, nil
 	}
 
 	// Fast path for a message already in the store on a label backend (the
@@ -209,15 +244,20 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	// its attachments, headers and filter-rule tags were applied on first ingest
 	// and its content is unchanged, so only the labels need re-mirroring. Skip
 	// the heavy re-processing — that is what makes the transition sync fast.
-	if !created && opts.LabelsAsTags {
+	if !created && opts.LabelsAsTags && !storeMsg.IngestPending {
 		if err := reconcileLabels(db, messageID, opts.Account, msg.Labels); err != nil {
 			return "", false, fmt.Errorf("reconcile labels: %w", err)
+		}
+		if err := db.MarkMessageIngestComplete(storeMsg.ID); err != nil {
+			return "", false, fmt.Errorf("complete message ingest: %w", err)
 		}
 		return messageID, created, nil
 	}
 
-	// Clear old attachments on upsert, then re-insert
-	_ = db.DeleteAttachmentsByMessageDBID(storeMsg.ID)
+	// Clear old attachments on upsert, then re-insert.
+	if err := db.DeleteAttachmentsByMessageDBID(storeMsg.ID); err != nil {
+		return "", false, fmt.Errorf("clear attachments: %w", err)
+	}
 	for i, att := range content.Attachments {
 		partID := att.PartID
 		if partID == 0 {
@@ -240,7 +280,9 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	// user-added entries from config.pkl sync.indexed_headers).
 	for _, hdrName := range opts.headerSet() {
 		if v := parsed.Header.Get(hdrName); v != "" {
-			_ = db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v)
+			if err := db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v); err != nil {
+				return "", false, fmt.Errorf("insert header %q: %w", hdrName, err)
+			}
 		}
 	}
 
@@ -268,6 +310,9 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 
 	if err := applyFilterRules(db, storeMsg, content, parsed, opts); err != nil {
 		return "", false, err
+	}
+	if err := db.MarkMessageIngestComplete(storeMsg.ID); err != nil {
+		return "", false, fmt.Errorf("complete message ingest: %w", err)
 	}
 
 	return messageID, created, nil

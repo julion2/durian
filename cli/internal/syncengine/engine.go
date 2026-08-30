@@ -13,7 +13,9 @@ import (
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/imap"
+	durianmail "github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/syncidentity"
 )
 
 // defaultBatchLimit caps message bodies per FetchMessages call when the caller
@@ -353,6 +355,8 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 	snapshotSkipHydration := make(map[string]struct{})
 	fullSnapshot := false
 	snapshotModeSet := false
+	var syntheticMatcher *syncidentity.Matcher
+	identityCursorUpdater, canUpdateIdentityCursor := b.(backend.IdentityCursorUpdater)
 
 	// fetched counts messages pulled this run, to enforce MaxPerFolder.
 	fetched := 0
@@ -402,6 +406,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 			}
 		}
 
+		adoptedIdentities := make(map[string]string)
 		for _, msg := range res.Messages {
 			if err := ctx.Err(); err != nil {
 				return nil, fmt.Errorf("canceled: %w", err)
@@ -418,16 +423,39 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				}
 				continue
 			}
-			messageID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, e.opts.Ingest)
+			provisionalMessageID := msg.MessageID
+			if res.FullSnapshot && syntheticMatcher == nil && canUpdateIdentityCursor && len(msg.Raw) > 0 && messageIDFromRaw(msg.Raw) == "" {
+				if currentUIDValidity, ok := durianmail.SyntheticMessageUIDValidity(provisionalMessageID); ok {
+					syntheticMatcher, err = syncidentity.New(e.opts.Store, e.opts.Account, folder.Name, currentUIDValidity)
+					if err != nil {
+						return nil, fmt.Errorf("prepare synthetic identity recovery: %w", err)
+					}
+				}
+			}
+			msg, recoveredMessageID, initialIngestComplete := adoptSyntheticIdentity(msg, syntheticMatcher)
+			ingestOptions := e.opts.Ingest
+			ingestOptions.IdentityRecovered = recoveredMessageID != "" && initialIngestComplete
+			messageID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, ingestOptions)
 			if err != nil {
+				if recoveredMessageID != "" {
+					if messageUpsertCompleted(err) {
+						syntheticMatcher.Commit(recoveredMessageID)
+					} else {
+						syntheticMatcher.Restore(recoveredMessageID)
+					}
+				}
 				slog.Warn("Ingest failed", "module", "SYNCENGINE",
 					"folder", folder.Name, "ref", msg.Ref.ID, "err", err)
 				result.Errors = append(result.Errors, fmt.Errorf("ingest %s/%s: %w", folder.Name, msg.Ref.ID, err))
-				// Only a retryable failure may hold the cursor back. A message
-				// that cannot be stored for a permanent reason would fail
-				// identically forever, and holding the cursor for it re-downloads
-				// the whole folder on every run without ever making progress.
-				if isRetryableStoreError(err) {
+				// A retryable failure holds the cursor back. A new message that
+				// cannot be stored for a permanent reason would fail identically
+				// forever, so it is skipped; a recovered existing identity is the
+				// exception because skipping it would corrupt the replacement map.
+				if recoveredMessageID != "" || isRetryableStoreError(err) {
+					// Once a replacement message has reserved an existing canonical
+					// identity, every failed durable upsert must hold the cursor. A
+					// permanent-skip path would let hydration discard the new ref and
+					// reconciliation remove the old row/tag before the cursor advances.
 					ingestFailed = true
 				} else if res.FullSnapshot {
 					// A full-body snapshot already made its one ingestion attempt.
@@ -437,7 +465,13 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				}
 				continue
 			}
+			if recoveredMessageID != "" {
+				syntheticMatcher.Commit(recoveredMessageID)
+			}
 			sessionRefs[msg.Ref.ID] = messageID
+			if recoveredMessageID != "" && messageID != provisionalMessageID {
+				adoptedIdentities[msg.Ref.ID] = messageID
+			}
 			// A re-delivered message (e.g. a flag change surfaced by the delta)
 			// is an update, not a new arrival — count the two separately.
 			if created {
@@ -450,6 +484,12 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				}
 			} else {
 				result.Deduplicated++
+			}
+		}
+		if len(adoptedIdentities) > 0 {
+			res.Cursor, err = identityCursorUpdater.AdoptMessageIdentities(res.Cursor, adoptedIdentities)
+			if err != nil {
+				return nil, fmt.Errorf("update cursor with recovered synthetic identities: %w", err)
 			}
 		}
 
@@ -668,6 +708,17 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 		}
 	}
 	return nil
+}
+
+func adoptSyntheticIdentity(msg backend.Message, matcher *syncidentity.Matcher) (backend.Message, string, bool) {
+	if matcher == nil || !durianmail.IsSyntheticMessageID(msg.MessageID) || len(msg.Raw) == 0 {
+		return msg, "", false
+	}
+	if messageID, initialIngestComplete, err := matcher.MatchRaw(msg.MessageID, msg.Raw, msg.InternalDate); err == nil && messageID != "" {
+		msg.MessageID = messageID
+		return msg, messageID, initialIngestComplete
+	}
+	return msg, "", false
 }
 
 func validateSnapshotBatch(requested []backend.RemoteRef, batch backend.SnapshotBatch) error {

@@ -15,6 +15,7 @@ go_library(
         "//cli/internal/imap",
         "//cli/internal/mail",
         "//cli/internal/store",
+        "//cli/internal/syncidentity",
     ],
 )
 

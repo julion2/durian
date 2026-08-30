@@ -29,6 +29,7 @@ import (
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/imap"
+	durianmail "github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/redact"
 )
 
@@ -60,6 +61,7 @@ type Backend struct {
 
 // Compile-time check that Backend satisfies the interface.
 var _ backend.Backend = (*Backend)(nil)
+var _ backend.IdentityCursorUpdater = (*Backend)(nil)
 
 // New creates a connected, authenticated IMAP backend for the given account.
 func New(account *config.AccountConfig) (*Backend, error) {
@@ -210,11 +212,30 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 		for _, uid := range newUIDs {
 			requested[uid] = struct{}{}
 		}
-
+		fetchedByUID := make(map[uint32]*goimap.Message, len(fetched))
 		for _, msg := range fetched {
 			if _, ok := requested[msg.Uid]; !ok {
 				return result, fmt.Errorf("fetch in %s returned unexpected or duplicate UID %d", folder, msg.Uid)
 			}
+			if _, duplicate := fetchedByUID[msg.Uid]; duplicate {
+				return result, fmt.Errorf("fetch in %s returned unexpected or duplicate UID %d", folder, msg.Uid)
+			}
+			fetchedByUID[msg.Uid] = msg
+		}
+
+		// During a replacement, reapply the requested newest-first order so
+		// duplicate identity recovery pairs the same relative copies before and
+		// after a UIDVALIDITY reset. Preserve server order in ordinary syncs.
+		ordered := fetched
+		if fullReplacement {
+			ordered = make([]*goimap.Message, 0, len(fetched))
+			for _, uid := range newUIDs {
+				if msg, ok := fetchedByUID[uid]; ok {
+					ordered = append(ordered, msg)
+				}
+			}
+		}
+		for _, msg := range ordered {
 			delete(requested, msg.Uid)
 			raw := readRawBody(msg.Body)
 			if len(raw) == 0 {
@@ -230,8 +251,7 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 
 			messageID := extractMessageID(raw)
 			if messageID == "" {
-				// Synthetic Message-ID so the message is not lost (mirrors syncer behavior).
-				messageID = fmt.Sprintf("durian-synthetic-%d-%s@%s", msg.Uid, folder, b.account.AccountIdentifier())
+				messageID = durianmail.SyntheticMessageID(status.UidValidity, msg.Uid, folder, b.account.AccountIdentifier())
 				slog.Warn("Message has no Message-ID, using synthetic ID", "module", "IMAPBACKEND",
 					"folder", folder, "uid", msg.Uid, "synthetic_id", messageID)
 			}
@@ -608,6 +628,32 @@ func toFlagState(f backend.Flags) imap.FlagState {
 // formatUID renders a UID as the decimal RemoteRef.ID.
 func formatUID(uid uint32) string {
 	return strconv.FormatUint(uint64(uid), 10)
+}
+
+// AdoptMessageIdentities replaces the provisional synthetic IDs recorded in an
+// IMAP page cursor with the pre-reset IDs selected by the sync engine.
+func (b *Backend) AdoptMessageIdentities(cursor backend.Cursor, identities map[string]string) (backend.Cursor, error) {
+	state, replacement, err := decodeCursor(cursor)
+	if err != nil {
+		return nil, fmt.Errorf("decode cursor for identity recovery: %w", err)
+	}
+	for ref, messageID := range identities {
+		uid, err := strconv.ParseUint(ref, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid IMAP UID %q during identity recovery: %w", ref, err)
+		}
+		previous, ok := state.GetMessageID(uint32(uid))
+		if !ok {
+			return nil, fmt.Errorf("IMAP cursor has no message for recovered UID %d", uid)
+		}
+		delete(state.MessageIDToUID, previous)
+		state.SetMessageID(uint32(uid), messageID)
+	}
+	updated, err := encodeCursor(state, replacement)
+	if err != nil {
+		return nil, fmt.Errorf("encode cursor after identity recovery: %w", err)
+	}
+	return updated, nil
 }
 
 // parseUID parses the decimal UID out of a RemoteRef.

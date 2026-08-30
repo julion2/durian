@@ -164,6 +164,20 @@ func TestMailboxState_GetUnsyncedUIDs(t *testing.T) {
 	}
 }
 
+func TestMailboxReplacementCompleteRequiresEverySearchedUID(t *testing.T) {
+	state := NewState().GetMailboxState("INBOX")
+	state.Reset(2)
+	state.AddSyncedUID(3)
+	if mailboxReplacementComplete(state, []uint32{1, 2, 3}) {
+		t.Fatal("partial replacement reported complete")
+	}
+	state.AddSyncedUID(1)
+	state.AddSyncedUID(2)
+	if !mailboxReplacementComplete(state, []uint32{1, 2, 3}) {
+		t.Fatal("fully resolved replacement reported incomplete")
+	}
+}
+
 func TestMailboxState_NeedsFullResync(t *testing.T) {
 	tests := []struct {
 		name           string
