@@ -118,6 +118,11 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     private var durianProcess: Process?
     private let decoder = JSONDecoder()
     private let baseURL = AppServer.apiBaseURL
+    private let session: URLSession
+    private let serverConnector: (() async throws -> String)?
+    private let serverProcessFactory: ((Pipe) throws -> Process)?
+    private let profileManager: ProfileManager
+    private var serverProcessGeneration = 0
     // Auth token for the current server session — static for cross-component access
     nonisolated(unsafe) static var authToken: String?
 
@@ -135,7 +140,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
 
     // Cancellation support for prefetch and active search
     private var prefetchTask: Task<Void, Never>?
-    private var searchTask: Task<Void, Never>?
+    private var searchTask: Task<Bool, Never>?
     private var cursorPrefetchTask: Task<Void, Never>?
     private var shouldCancelPrefetch = false
 
@@ -153,7 +158,16 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         let timestamp: Date
     }
 
-    init() {
+    init(
+        session: URLSession = .shared,
+        serverConnector: (() async throws -> String)? = nil,
+        serverProcessFactory: ((Pipe) throws -> Process)? = nil,
+        profileManager: ProfileManager? = nil
+    ) {
+        self.session = session
+        self.serverConnector = serverConnector
+        self.serverProcessFactory = serverProcessFactory
+        self.profileManager = profileManager ?? .shared
         folders = MailFolder.defaultTags
     }
 
@@ -163,67 +177,110 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         FileManager.default.resolveDurianPath()
     }
 
-    func connect() async {
+    @discardableResult
+    func connect() async -> Bool {
+        guard !isConnected else {
+            Log.debug("BACKEND", "Server already connected")
+            return true
+        }
+
         guard durianProcess == nil || !durianProcess!.isRunning else {
             Log.debug("BACKEND", "Server already running")
-            return
+            return false
         }
-
-        guard let durianPath = resolveDurianPath() else {
-            connectionStatus = "durian CLI not found"
-            Log.error("BACKEND", connectionStatus)
-            BannerManager.shared.showCritical(title: "Durian CLI Not Found", message: "Cannot start mail server.")
-            return
-        }
-
-        // Free this app's serve port before spawning (a stale orphan may still
-        // hold it). Scoped to AppServer.port so Nightly and Release don't kill
-        // each other's server.
-        freeServePort()
-
-        durianProcess = Process()
-        durianProcess?.executableURL = URL(fileURLWithPath: durianPath)
-        durianProcess?.arguments = ["serve", "--port", "\(AppServer.port)", "--exit-when-orphaned"]
-
-        // Ensure child process can find durian and other tools
-        var env = ProcessInfo.processInfo.environment
-        let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin", "\(NSHomeDirectory())/.local/bin"]
-        let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
-        durianProcess?.environment = env
-
-        // Capture stdout to read the READY line with auth token
-        let stdoutPipe = Pipe()
-        durianProcess?.standardOutput = stdoutPipe
-        durianProcess?.standardError = FileHandle.nullDevice
 
         do {
-            try durianProcess?.run()
-            Log.info("BACKEND", "Started durian server process")
+            let token: String
+            if let serverConnector {
+                token = try await serverConnector()
+            } else {
+                let stdoutPipe = Pipe()
+                let process: Process
+                if let serverProcessFactory {
+                    process = try serverProcessFactory(stdoutPipe)
+                } else {
+                    guard let durianPath = resolveDurianPath() else {
+                        connectionStatus = "durian CLI not found"
+                        Log.error("BACKEND", connectionStatus)
+                        BannerManager.shared.showCritical(title: "Durian CLI Not Found", message: "Cannot start mail server.")
+                        return false
+                    }
 
-            // Read the "READY token=<hex> addr=<addr> api=<n>" handshake, with a timeout
-            // so a serve that never binds can't hang the app, and line buffering
-            // so a chunk-split READY line still parses.
-            let token = try await Self.readReadyToken(from: stdoutPipe, timeout: 10)
+                    // Free this app's serve port before spawning (a stale orphan may still
+                    // hold it). Scoped to AppServer.port so Nightly and Release don't kill
+                    // each other's server.
+                    freeServePort()
+
+                    process = Process()
+                    process.executableURL = URL(fileURLWithPath: durianPath)
+                    process.arguments = ["serve", "--port", "\(AppServer.port)", "--exit-when-orphaned"]
+
+                    // Ensure child process can find durian and other tools
+                    var env = ProcessInfo.processInfo.environment
+                    let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin", "\(NSHomeDirectory())/.local/bin"]
+                    let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+                    env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
+                    process.environment = env
+                }
+
+                process.standardOutput = stdoutPipe
+                process.standardError = FileHandle.nullDevice
+                serverProcessGeneration += 1
+                let generation = serverProcessGeneration
+                process.terminationHandler = { [weak self] _ in
+                    Task { @MainActor in
+                        self?.serverProcessDidTerminate(generation: generation)
+                    }
+                }
+                durianProcess = process
+                try process.run()
+                Log.info("BACKEND", "Started durian server process")
+
+                // Read the "READY token=<hex> addr=<addr> api=<n>" handshake, with a timeout
+                // so a serve that never binds can't hang the app, and line buffering
+                // so a chunk-split READY line still parses.
+                token = try await Self.readReadyToken(from: stdoutPipe, timeout: 10)
+                guard process.isRunning else {
+                    throw NSError(
+                        domain: "EmailBackend",
+                        code: -4,
+                        userInfo: [NSLocalizedDescriptionKey: "durian server exited after READY"]
+                    )
+                }
+            }
 
             Self.authToken = token
             isConnected = true
             connectionStatus = "Connected"
             Log.info("BACKEND", "Server is ready, auth token received")
-            await selectFolder("inbox")
+            return true
         } catch {
             connectionStatus = "Failed to start or connect to server: \(error.localizedDescription)"
             Log.error("BACKEND", connectionStatus)
             BannerManager.shared.showCritical(title: "Mail Server Error", message: error.localizedDescription)
+            serverProcessGeneration += 1
             durianProcess?.terminate()
             durianProcess = nil
             isConnected = false
+            Self.authToken = nil
+            return false
         }
     }
 
+    private func serverProcessDidTerminate(generation: Int) {
+        guard generation == serverProcessGeneration else { return }
+        durianProcess = nil
+        Self.authToken = nil
+        isConnected = false
+        connectionStatus = "Disconnected (server exited)"
+        Log.warning("BACKEND", "durian server process exited unexpectedly")
+    }
+
     func disconnect() async {
+        serverProcessGeneration += 1
         durianProcess?.terminate()
         durianProcess = nil
+        Self.authToken = nil
         isConnected = false
         connectionStatus = "Disconnected"
         Log.info("BACKEND", "Disconnected and server terminated")
@@ -233,8 +290,10 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     /// applicationWillTerminate so the server doesn't outlive the app on a normal
     /// quit; serve's own --exit-when-orphaned poll covers force-quit / crash.
     func terminateServerSync() {
+        serverProcessGeneration += 1
         durianProcess?.terminate()
         durianProcess = nil
+        Self.authToken = nil
         isConnected = false
     }
 
@@ -387,20 +446,21 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
 
     // MARK: - Folder/Tag Selection (unchanged)
 
-    func selectFolder(_ name: String) async {
+    @discardableResult
+    func selectFolder(_ name: String) async -> Bool {
         shouldCancelPrefetch = true
         prefetchTask?.cancel()
         prefetchTask = nil
         searchTask?.cancel()
 
         currentFolder = name
-        currentQuery = ProfileManager.shared.buildQuery(folderName: name)
+        currentQuery = profileManager.buildQuery(folderName: name)
         Log.debug("BACKEND", "selectFolder: \(currentQuery)") // encgrep:allow folder selector built from config, not a user search
 
         // Wrap search in a stored Task so the next selectFolder() can cancel it
         let task = Task { await search(currentQuery) }
         searchTask = task
-        await task.value
+        return await task.value
     }
 
     // MARK: - Generic HTTP Request Function
@@ -462,7 +522,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         defer { signposter.endInterval("Request", state, "\(status)") }
 
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, _) = try await session.data(for: request)
             let response = try decoder.decode(T.self, from: data)
             status = "OK"
             return response
@@ -568,7 +628,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         return emails
     }
 
-    private func search(_ query: String, limit: Int = 2000) async {
+    private func search(_ query: String, limit: Int = 2000) async -> Bool {
         searchGeneration += 1
         let myGeneration = searchGeneration
 
@@ -580,27 +640,27 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         // Cancelled by a newer selectFolder() call — bail out
         guard !Task.isCancelled else {
             Log.debug("BACKEND", "Search cancelled (gen \(myGeneration))")
-            return
+            return false
         }
 
         // A newer search has started — discard this stale result silently
         guard myGeneration == searchGeneration else {
             Log.debug("BACKEND", "Stale search result discarded (gen \(myGeneration) vs \(searchGeneration))")
-            return
+            return false
         }
 
         guard let result else {
             isLoadingEmails = false
             loadingProgress = "Search failed"
             BannerManager.shared.showWarning(title: "Search Failed", message: "Could not complete the search.")
-            return
+            return false
         }
 
         shouldCancelPrefetch = false
         emails = result
 
         restoreCachedThreads()
-        Log.debug("BACKEND", "Search returned \(emails.count) emails")
+        Log.debug("BACKEND", "Search returned \(emails.count) emails for query: \(query)") // encgrep:allow folder selector built from config, never mail content
         isLoadingEmails = false
         loadingProgress = ""
 
@@ -608,6 +668,7 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
             try? await Task.sleep(for: .milliseconds(100))
             startPrefetch(count: 5)
         }
+        return true
     }
 
     func searchAll(query: String, limit: Int = 10) async -> [MailMessage] {
@@ -861,8 +922,8 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     }
 
     func reload() async {
-        currentQuery = ProfileManager.shared.buildQuery(folderName: currentFolder)
-        await search(currentQuery)
+        currentQuery = profileManager.buildQuery(folderName: currentFolder)
+        _ = await search(currentQuery)
     }
 
     // MARK: - Thread Application Helper
