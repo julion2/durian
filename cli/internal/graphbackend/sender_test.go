@@ -174,6 +174,30 @@ func TestPutChunkRejectsInsecureRedirect(t *testing.T) {
 	}
 }
 
+func TestPutChunkRejectsMethodChangingRedirect(t *testing.T) {
+	reachedDestination := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/upload", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "/destination")
+		w.WriteHeader(http.StatusFound)
+	})
+	mux.HandleFunc("/destination", func(w http.ResponseWriter, _ *http.Request) {
+		reachedDestination = true
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+	s := &Sender{b: newTestBackend(t, srv)}
+
+	err := s.putChunk(t.Context(), srv.URL+"/upload", []byte("secret"), 0, 6, 6)
+	if err == nil || !strings.Contains(err.Error(), "method changed to GET") {
+		t.Fatalf("putChunk() error = %v, want rejected method-changing redirect", err)
+	}
+	if reachedDestination {
+		t.Fatal("putChunk() followed method-changing redirect")
+	}
+}
+
 func TestPutChunkFollowsCrossOriginHTTPSRedirect(t *testing.T) {
 	chunk := []byte("secret")
 	var uploaded []byte

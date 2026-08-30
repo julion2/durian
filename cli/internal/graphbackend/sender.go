@@ -286,7 +286,7 @@ func (s *Sender) putChunk(ctx context.Context, uploadURL string, chunk []byte, s
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(chunk))
 	if err != nil {
-		return err
+		return fmt.Errorf("create upload chunk request: %w", err)
 	}
 	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end-1, total))
 	req.ContentLength = int64(len(chunk))
@@ -297,6 +297,9 @@ func (s *Sender) putChunk(ctx context.Context, uploadURL string, chunk []byte, s
 		}
 		if err := validateUploadURL(req.URL.String()); err != nil {
 			return fmt.Errorf("refusing graph upload redirect: %w", err)
+		}
+		if req.Method != http.MethodPut {
+			return fmt.Errorf("refusing graph upload redirect: method changed to %s", req.Method)
 		}
 		return nil
 	}
