@@ -17,15 +17,17 @@ const (
 
 // Response represents a JSON response sent to the client
 type Response struct {
-	OK          bool                           `json:"ok"`
-	ErrorCode   ErrorCode                      `json:"error_code,omitempty"`
-	Error       string                         `json:"error,omitempty"`
-	Results     []mail.Mail                    `json:"results"`
-	Mail        *mail.MailContent              `json:"mail,omitempty"`
-	Thread      *mail.ThreadContent            `json:"thread,omitempty"`
-	Threads     map[string]*mail.ThreadContent `json:"threads,omitempty"`
-	MessageBody *mail.MessageBody              `json:"message_body,omitempty"`
-	Tags        []string                       `json:"tags,omitempty"`
+	OK             bool                           `json:"ok"`
+	ErrorCode      ErrorCode                      `json:"error_code,omitempty"`
+	Error          string                         `json:"error,omitempty"`
+	Results        []mail.Mail                    `json:"results"`
+	Mail           *mail.MailContent              `json:"mail,omitempty"`
+	Thread         *mail.ThreadContent            `json:"thread,omitempty"`
+	Threads        map[string]*mail.ThreadContent `json:"threads,omitempty"`
+	MessageBody    *mail.MessageBody              `json:"message_body,omitempty"`
+	Tags           []string                       `json:"tags,omitempty"`
+	MatchedThreads *int                           `json:"matched_threads,omitempty"`
+	ChangedThreads *int                           `json:"changed_threads,omitempty"`
 }
 
 // Success returns a successful response with no data
@@ -61,6 +63,11 @@ func SuccessWithMessageBody(b *mail.MessageBody) Response {
 // SuccessWithTags returns a successful response with a list of tags
 func SuccessWithTags(tags []string) Response {
 	return Response{OK: true, Tags: tags}
+}
+
+// SuccessWithTagChanges returns the effect of a tag mutation.
+func SuccessWithTagChanges(matched, changed int) Response {
+	return Response{OK: true, MatchedThreads: &matched, ChangedThreads: &changed}
 }
 
 // Fail returns a failed response with an error code and message

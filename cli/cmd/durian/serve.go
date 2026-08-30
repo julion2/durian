@@ -227,6 +227,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	if err != nil {
 		slog.Warn("Could not load config", "module", "SERVE", "err", err)
 	} else {
+		configureStoreAccounts(emailDB, cfg)
 		h.SetConfig(cfg)
 		h.SetCalendarEventSyncer(guiCalendarSyncer{cfg: cfg})
 

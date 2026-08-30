@@ -126,9 +126,12 @@ func TestModifyTagsByThread(t *testing.T) {
 	db.TagThread(root.ThreadID, "unread")
 
 	// Atomic: remove unread, add archived
-	err := db.ModifyTagsByThread(root.ThreadID, []string{"archived"}, []string{"unread"})
+	changed, err := db.ModifyTagsByThread(root.ThreadID, []string{"archived"}, []string{"unread"})
 	if err != nil {
 		t.Fatalf("modify: %v", err)
+	}
+	if !changed {
+		t.Fatal("ModifyTagsByThread() changed = false, want true")
 	}
 
 	tags, _ := db.GetMessageTags(root.ID)
@@ -142,6 +145,29 @@ func TestModifyTagsByThread(t *testing.T) {
 	}
 	if tagSet["unread"] {
 		t.Error("unread should have been removed")
+	}
+}
+
+func TestPreviewTagChangesByThreadDoesNotWrite(t *testing.T) {
+	db := newTestDB(t)
+	msg := &Message{MessageID: "preview-tag@x", Account: "work"}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := db.PreviewTagChangesByThread(msg.ThreadID, []string{"todo"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("preview reported no change")
+	}
+	tags, err := db.GetTagsByMessageID(msg.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tags) != 0 {
+		t.Fatalf("preview persisted tags: %v", tags)
 	}
 }
 
@@ -263,6 +289,58 @@ func TestGetAllMessagesWithTags(t *testing.T) {
 	}
 	if len(result["mwt2@x"]) != 2 {
 		t.Errorf("mwt2 tags = %v, want 2", result["mwt2@x"])
+	}
+}
+
+// TestGetAllMessagesWithTagsIncludesUntaggedMessages covers the message this
+// query used to drop entirely. Presence in the map is how callers decide a
+// message is stored in the folder — the legacy flag pass skips anything absent
+// — so an inner join made a tagless row invisible and its flags stopped
+// reconciling in both directions.
+//
+// The state is not exotic: a read, unflagged, unanswered message gets no flag
+// tag, because ToTagOps emits only removals for it, and a custom folder with no
+// SPECIAL-USE role and no name fallback adds none either.
+func TestGetAllMessagesWithTagsIncludesUntaggedMessages(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+
+	if err := db.InsertMessage(&Message{
+		MessageID: "untagged@x", Subject: "No tags at all",
+		FromAddr: "a@x", Date: now, CreatedAt: now, Mailbox: "Projects",
+		Account: "work", FetchedBody: true,
+	}); err != nil {
+		t.Fatalf("insert untagged: %v", err)
+	}
+	if err := db.InsertMessage(&Message{
+		MessageID: "tagged@x", Subject: "Has a tag",
+		FromAddr: "b@x", Date: now + 1, CreatedAt: now + 1, Mailbox: "Projects",
+		Account: "work", FetchedBody: true,
+	}); err != nil {
+		t.Fatalf("insert tagged: %v", err)
+	}
+	tagged, err := db.GetByMessageID("tagged@x")
+	if err != nil || tagged == nil {
+		t.Fatalf("get tagged: %+v err=%v", tagged, err)
+	}
+	if err := db.AddTag(tagged.ID, "flagged"); err != nil {
+		t.Fatalf("add tag: %v", err)
+	}
+
+	result, err := db.GetAllMessagesWithTags("Projects", "work")
+	if err != nil {
+		t.Fatalf("get all: %v", err)
+	}
+
+	tags, present := result["untagged@x"]
+	if !present {
+		t.Fatal("untagged message missing from the result; callers read that as not stored here")
+	}
+	if len(tags) != 0 {
+		t.Errorf("untagged message tags = %v, want none — the join placeholder is not a tag", tags)
+	}
+	if got := result["tagged@x"]; len(got) != 1 || got[0] != "flagged" {
+		t.Errorf("tagged message tags = %v, want [flagged]", got)
 	}
 }
 

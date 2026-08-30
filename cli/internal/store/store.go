@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,8 +20,15 @@ import (
 // decrypt the ADR-0001 §3 sensitive columns. Nil is not allowed — every
 // caller must derive a keyring from the master key at startup.
 type DB struct {
-	db      *sql.DB
-	keyring *dbcrypto.Keyring
+	db             *sql.DB
+	keyring        *dbcrypto.Keyring
+	accountAliases map[string]string
+}
+
+// SetAccountAliases configures user-facing account identifiers (aliases,
+// names, and email addresses) to resolve to canonical store account names.
+func (d *DB) SetAccountAliases(aliases map[string]string) {
+	d.accountAliases = aliases
 }
 
 // Open opens or creates an email store database at the given path.
@@ -51,7 +59,35 @@ func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	// Every explicit transaction in this package writes before it commits, and
+	// several read first — resolving a row id, capturing a before-image. Those
+	// are the ones at risk: under a deferred BEGIN two Durian processes both
+	// take a shared read lock, and the second to write has to upgrade one the
+	// other still holds. SQLite answers that with SQLITE_BUSY without
+	// consulting the busy handler, since both sides waiting would deadlock
+	// rather than resolve, so the busy_timeout pragma set below cannot cover it.
+	//
+	// Taking the writer lock at BEGIN instead makes the second process wait on
+	// the busy handler like any other writer, and makes a read-then-write
+	// transaction atomic against a competing process rather than merely
+	// against a competing goroutine. Transactions that write first (UpdateBody,
+	// InsertAttachment) are unaffected either way; applying this per connection
+	// rather than per call site is the smaller change and needs no judgement at
+	// each Begin.
+	//
+	// One case gets slower rather than safer. The schema backfills in migrate()
+	// scan and rewrite whole tables, so on the single upgrade where one runs,
+	// it now reserves WAL's one writer slot from BEGIN for the duration instead
+	// of from its first write. Readers are unaffected; a competing writer waits
+	// out busy_timeout and can still fail after it. That is a different loser
+	// rather than a new failure — under deferred, the migration itself is the
+	// one that dies on its lock upgrade. Steady state is unaffected: each
+	// backfill is guarded by its schema_version check and does not run again.
+	separator := "?"
+	if strings.Contains(dbPath, "?") {
+		separator = "&"
+	}
+	db, err := sql.Open("sqlite", dbPath+separator+"_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -94,6 +130,47 @@ func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
 		}
 	}
 
+	return &DB{db: db, keyring: kr}, nil
+}
+
+// OpenReadOnly opens an existing store without creating directories, changing
+// pragmas that write database metadata, vacuuming, or migrating. It is used by
+// sync dry-runs, where an attempted write should fail rather than alter the
+// inspected store.
+func OpenReadOnly(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
+	if kr == nil {
+		return nil, fmt.Errorf("store: OpenReadOnly requires a non-nil keyring (see ADR-0001)")
+	}
+	if dbPath == ":memory:" {
+		return nil, fmt.Errorf("store: OpenReadOnly requires an existing database file")
+	}
+	if strings.HasPrefix(dbPath, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("get home dir: %w", err)
+		}
+		dbPath = filepath.Join(home, dbPath[2:])
+	}
+
+	dsn := &url.URL{Scheme: "file", Path: dbPath}
+	query := dsn.Query()
+	query.Set("mode", "ro")
+	dsn.RawQuery = query.Encode()
+	db, err := sql.Open("sqlite", dsn.String())
+	if err != nil {
+		return nil, fmt.Errorf("open read-only database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	for _, pragma := range []string{
+		"PRAGMA query_only=ON",
+		"PRAGMA busy_timeout=30000",
+		"PRAGMA foreign_keys=ON",
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("set read-only pragma %q: %w", pragma, err)
+		}
+	}
 	return &DB{db: db, keyring: kr}, nil
 }
 
@@ -1072,6 +1149,116 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 26 {
+		if err := d.migrateLegacyCommaFlags(); err != nil {
+			return fmt.Errorf("migrate v25→v26 repair comma-separated flags: %w", err)
+		}
+	}
+
+	if version < 27 {
+		// Add messages.bcc_ct so a draft's blind recipients survive the round
+		// trip through the Drafts mailbox. Until now BuildDraft wrote the Bcc
+		// header into the appended RFC822, but the parser never read it back:
+		// reopening a draft returned an empty Bcc and the next save dropped the
+		// recipients silently.
+		//
+		// Encrypted-only, under the meta sub-key. The addrs columns are
+		// plaintext by the ADR-0001 §3 revision ("already public on the wire"),
+		// a rationale that does not extend to the one class of recipient no
+		// other recipient sees. No plaintext twin means no FTS exposure either.
+		has, err := hasColumn(d.db, "messages", "bcc_ct")
+		if err != nil {
+			return fmt.Errorf("migrate v26→v27 inspect bcc_ct: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN bcc_ct BLOB"); err != nil {
+				return fmt.Errorf("migrate v26→v27 add bcc_ct: %w", err)
+			}
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 27 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v26→v27 bump: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// migrateLegacyCommaFlags repairs rows written before message inserts parsed
+// comma-separated flag lists, plus the bare "Seen" value formerly written for
+// locally sent messages. Those inserts encrypted the complete value in
+// flags_other and left the boolean columns false. Only the known bare value or
+// ciphertext containing a comma-delimited standard flag is changed; unrelated
+// keywords, including comma-bearing keywords, are left byte-for-byte untouched.
+// Once a standard flag identifies the historical representation, commas are
+// necessarily ambiguous (RFC atoms may contain them), so every non-standard
+// component is retained in order and normalized to the store's space-separated
+// form.
+//
+// The row updates and schema-version bump share one transaction. A decrypt,
+// encrypt, or write failure therefore leaves both the data and version at v25
+// so the next Init can retry the complete migration.
+func (d *DB) migrateLegacyCommaFlags() error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	rows, err := tx.Query(`SELECT id, is_seen, is_flagged, is_deleted, flags_other
+		FROM messages WHERE flags_other IS NOT NULL ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("select rows: %w", err)
+	}
+	type pending struct {
+		id                           int64
+		isSeen, isFlagged, isDeleted bool
+		flagsOther                   []byte
+	}
+	var batch []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.isSeen, &p.isFlagged, &p.isDeleted, &p.flagsOther); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan row: %w", err)
+		}
+		batch = append(batch, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate rows: %w", err)
+	}
+
+	stmt, err := tx.Prepare(`UPDATE messages
+		SET is_seen = ?, is_flagged = ?, is_deleted = ?, flags_other = ?
+		WHERE id = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare update: %w", err)
+	}
+	defer stmt.Close()
+	for _, p := range batch {
+		plain, err := d.decryptMeta("", p.flagsOther)
+		if err != nil {
+			return fmt.Errorf("decrypt id=%d: %w", p.id, err)
+		}
+		seen, flagged, deleted, other, affected := parseLegacyCommaFlags(plain)
+		if !affected {
+			continue
+		}
+		otherCT, err := d.encryptMeta(other)
+		if err != nil {
+			return fmt.Errorf("encrypt id=%d: %w", p.id, err)
+		}
+		if _, err := stmt.Exec(p.isSeen || seen, p.isFlagged || flagged,
+			p.isDeleted || deleted, otherCT, p.id); err != nil {
+			return fmt.Errorf("update id=%d: %w", p.id, err)
+		}
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version = 26 WHERE rowid = 1"); err != nil {
+		return fmt.Errorf("bump version: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
 	return nil
 }
 
@@ -1882,8 +2069,64 @@ func (d *DB) decryptMeta(plain string, ct []byte) (string, error) {
 	return string(out), nil
 }
 
-// flagsOtherForEncryption returns the subset of a space-separated IMAP
-// flags string that ADR-0001 §3 marks for meta_key encryption: everything
+// splitMessageFlags accepts both the comma-separated representation written by
+// the legacy IMAP syncer and the whitespace-separated representation returned
+// by store reads.
+func splitMessageFlags(flags string) []string {
+	fields := strings.Fields(flags)
+	parts := make([]string, 0, len(fields))
+	for _, field := range fields {
+		_, _, _, _, commaSeparated := parseLegacyCommaFlags(field)
+		if !commaSeparated {
+			parts = append(parts, field)
+			continue
+		}
+		for _, part := range strings.Split(field, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				parts = append(parts, part)
+			}
+		}
+	}
+	return parts
+}
+
+// parseLegacyCommaFlags recognizes corrupted flags_other forms produced by old
+// insert paths: the outbox's bare "Seen" value and comma-joined lists. Apart
+// from that known bare value, a standard flag must be present as a complete
+// comma-delimited component before the row is treated as affected, avoiding
+// reinterpretation of unrelated comma-bearing keywords.
+func parseLegacyCommaFlags(flags string) (seen, flagged, deleted bool, other string, affected bool) {
+	if flags == "Seen" {
+		return true, false, false, "", true
+	}
+	if !strings.Contains(flags, ",") {
+		return false, false, false, flags, false
+	}
+	parts := strings.Split(flags, ",")
+	remaining := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		switch part {
+		case `\Seen`:
+			seen, affected = true, true
+		case `\Flagged`:
+			flagged, affected = true, true
+		case `\Deleted`:
+			deleted, affected = true, true
+		default:
+			if part != "" {
+				remaining = append(remaining, part)
+			}
+		}
+	}
+	if !affected {
+		return false, false, false, flags, false
+	}
+	return seen, flagged, deleted, strings.Join(remaining, " "), true
+}
+
+// flagsOtherForEncryption returns the subset of a serialized IMAP flags string
+// that ADR-0001 §3 marks for meta_key encryption: everything
 // except the three boolean-tracked standard flags (\Seen, \Flagged,
 // \Deleted) that already live as O(1) integer columns. The remaining
 // flags include \Answered, \Draft, \Recent, $Sensitive and any
@@ -1892,7 +2135,7 @@ func flagsOtherForEncryption(flags string) string {
 	if flags == "" {
 		return ""
 	}
-	parts := strings.Fields(flags)
+	parts := splitMessageFlags(flags)
 	out := parts[:0]
 	for _, p := range parts {
 		switch p {

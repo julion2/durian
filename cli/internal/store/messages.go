@@ -3,8 +3,30 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
+	"unicode"
 )
+
+const syncedFlagsEmpty = "$DurianEmpty"
+
+func encodeSyncedFlags(flags string) string {
+	if flags == "" {
+		return syncedFlagsEmpty
+	}
+	return flags
+}
+
+func decodeSyncedFlags(flags string) (string, bool) {
+	switch flags {
+	case "":
+		return "", false
+	case syncedFlagsEmpty:
+		return "", true
+	default:
+		return flags, true
+	}
+}
 
 // nullableID maps a zero id to sql.NULL so the resulting column stays NULL
 // instead of pointing at the non-existent row 0. Empty mailbox/account
@@ -19,17 +41,58 @@ func nullableID(id int64) any {
 
 // InsertMessage inserts or upserts a single message, resolving its thread ID.
 func (d *DB) InsertMessage(msg *Message) error {
+	_, err := d.upsertMessage(msg, nil)
+	if err != nil {
+		return fmt.Errorf("insert message: %w", err)
+	}
+	return nil
+}
+
+// UpsertMessage inserts or updates a message and reports whether this call
+// created the row. The result is determined inside the write transaction, so
+// it remains authoritative when multiple Durian processes ingest concurrently.
+func (d *DB) UpsertMessage(msg *Message) (bool, error) {
+	created, err := d.upsertMessage(msg, nil)
+	if err != nil {
+		return false, fmt.Errorf("upsert message: %w", err)
+	}
+	return created, nil
+}
+
+// UpsertMessageWithInitialTags atomically seeds tags when this call creates the
+// message. Existing rows are updated without touching their local tags.
+func (d *DB) UpsertMessageWithInitialTags(msg *Message, initialTags []string) (bool, error) {
+	created, err := d.upsertMessage(msg, initialTags)
+	if err != nil {
+		return false, fmt.Errorf("upsert message with initial tags: %w", err)
+	}
+	return created, nil
+}
+
+func (d *DB) upsertMessage(msg *Message, initialTags []string) (bool, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+		return false, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	if err := d.insertMessageTx(tx, msg); err != nil {
-		return err
+	var created bool
+	if err := d.insertMessageTx(tx, msg, &created); err != nil {
+		return false, fmt.Errorf("write message: %w", err)
 	}
-
-	return tx.Commit()
+	if created {
+		for _, tag := range initialTags {
+			if _, err := tx.Exec(
+				"INSERT OR IGNORE INTO tags (message_id, tag) VALUES (?, ?)",
+				msg.ID, tag); err != nil {
+				return false, fmt.Errorf("add initial tag %q: %w", tag, err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit message upsert: %w", err)
+	}
+	return created, nil
 }
 
 // InsertBatch inserts multiple messages in a single transaction.
@@ -42,16 +105,19 @@ func (d *DB) InsertBatch(msgs []*Message) error {
 	defer tx.Rollback()
 
 	for _, msg := range msgs {
-		if err := d.insertMessageTx(tx, msg); err != nil {
+		if err := d.insertMessageTx(tx, msg, nil); err != nil {
 			return fmt.Errorf("insert %q: %w", msg.MessageID, err)
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit message batch: %w", err)
+	}
+	return nil
 }
 
 // insertMessageTx inserts a message within an existing transaction.
-func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
+func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) error {
 	threadID, err := resolveThreadID(tx, msg.MessageID, msg.InReplyTo, msg.Refs)
 	if err != nil {
 		return fmt.Errorf("resolve thread: %w", err)
@@ -81,7 +147,7 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 	// ADR-0001 step 7f: split msg.Flags into the three boolean columns
 	// + flags_other (everything else, encrypted under meta_key). Inverse
 	// of flagsFromParts on the read path.
-	parts := strings.Fields(msg.Flags)
+	parts := splitMessageFlags(msg.Flags)
 	var isSeen, isFlagged, isDeleted int
 	for _, p := range parts {
 		switch p {
@@ -111,26 +177,91 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 		return fmt.Errorf("resolve account: %w", err)
 	}
 
+	// Open configures BEGIN IMMEDIATE, so competing Durian processes serialize
+	// before this existence check even when mailbox and account are empty. This
+	// is the only point that can capture the old provider flags before the upsert
+	// below overwrites them.
+	var existingID int64
+	var storedBaseline string
+	err = tx.QueryRow(`SELECT id, synced_flags FROM messages
+		WHERE message_id = ? AND IFNULL(account_id, 0) = ?`,
+		msg.MessageID, accountID).Scan(&existingID, &storedBaseline)
+	switch err {
+	case nil:
+	case sql.ErrNoRows:
+		if createdResult != nil {
+			*createdResult = true
+		}
+	default:
+		return fmt.Errorf("check existing message: %w", err)
+	}
+	if err == nil && storedBaseline == "" {
+		var isSeen, isFlagged, isDeleted bool
+		var flagsOtherCT []byte
+		if err := tx.QueryRow(`SELECT is_seen, is_flagged, is_deleted, flags_other
+			FROM messages WHERE id = ?`, existingID).
+			Scan(&isSeen, &isFlagged, &isDeleted, &flagsOtherCT); err != nil {
+			return fmt.Errorf("read flag baseline before image: %w", err)
+		}
+		// Keep this decrypt strictly gated on synced_flags == "". Initialized
+		// rows are the permanent hot path; decrypting their flags_other on every
+		// metadata upsert would undo the allocation savings of metadata-only
+		// ingest. A legacy row crosses this transition exactly once.
+		flagsOther, err := d.decryptMeta("", flagsOtherCT)
+		if err != nil {
+			// The plaintext boolean columns still provide a useful baseline. Do
+			// not permanently block this row (or roll back healthy batch siblings)
+			// because encrypted auxiliary flags were already damaged.
+			slog.Warn("Could not decrypt legacy baseline; capturing provider booleans only",
+				"module", "STORE", "err", err)
+			flagsOther = ""
+		}
+		captured := syncedFlagBaseline(isSeen, isFlagged, isDeleted, flagsOther)
+		if _, err := tx.Exec(`UPDATE messages SET synced_flags = ?
+			WHERE id = ? AND synced_flags = ''`, encodeSyncedFlags(captured), existingID); err != nil {
+			return fmt.Errorf("capture flag baseline before image: %w", err)
+		}
+	}
+
+	syncedFlags := msg.SyncedFlags
+	if msg.SyncedFlagsInitialized || syncedFlags != "" {
+		syncedFlags = encodeSyncedFlags(syncedFlags)
+	}
+
 	// ADR-0001 step 7d / §3 revision: from_addr/to_addrs/cc_addrs stay
 	// plaintext (substring-search UX, addresses already public on the
 	// wire). No *_ct columns written for the addrs columns — v17
 	// migration drops them.
+	// bcc_ct is the exception: blind recipients are the addresses that
+	// deliberately do not travel to the other recipients, so the rationale
+	// above does not cover them. Encrypted-only, no plaintext twin.
+	bccCT, err := d.encryptMeta(msg.BCCAddrs)
+	if err != nil {
+		return fmt.Errorf("encrypt bcc: %w", err)
+	}
+
 	err = tx.QueryRow(`
 		INSERT INTO messages (
 			message_id, thread_id, in_reply_to, refs, subject_ct,
-			from_addr, to_addrs, cc_addrs,
+			from_addr, to_addrs, cc_addrs, bcc_ct,
 			date, created_at,
 			body_text_ct, body_html_ct,
 			mailbox_id, account_id,
 			is_seen, is_flagged, is_deleted, flags_other,
 			uid, size, fetched_body,
 			remote_ref, synced_flags
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id, IFNULL(account_id, 0)) DO UPDATE SET
-			subject_ct = excluded.subject_ct,
-			from_addr = excluded.from_addr,
-			to_addrs = excluded.to_addrs,
-			cc_addrs = excluded.cc_addrs,
+			subject_ct = CASE WHEN excluded.fetched_body = 1
+			                  THEN excluded.subject_ct ELSE messages.subject_ct END,
+			from_addr = CASE WHEN excluded.fetched_body = 1
+			                 THEN excluded.from_addr ELSE messages.from_addr END,
+			to_addrs = CASE WHEN excluded.fetched_body = 1
+			                THEN excluded.to_addrs ELSE messages.to_addrs END,
+			cc_addrs = CASE WHEN excluded.fetched_body = 1
+			                THEN excluded.cc_addrs ELSE messages.cc_addrs END,
+			bcc_ct = CASE WHEN excluded.fetched_body = 1
+			              THEN excluded.bcc_ct ELSE messages.bcc_ct END,
 			body_text_ct = CASE WHEN excluded.fetched_body = 1 AND messages.fetched_body = 0
 			                 THEN excluded.body_text_ct ELSE messages.body_text_ct END,
 			body_html_ct = CASE WHEN excluded.fetched_body = 1 AND messages.fetched_body = 0
@@ -146,30 +277,59 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 			remote_ref = CASE WHEN excluded.remote_ref != ''
 			                 THEN excluded.remote_ref ELSE messages.remote_ref END
 			-- synced_flags is deliberately NOT updated on conflict: it is the
-			-- flag-sync baseline, set once at insert and thereafter owned by the
-			-- reconciliation (SetSyncedFlags). Overwriting it when a delta
+			-- flag-sync baseline, initialized at insert or captured from the old
+			-- row above and thereafter owned by reconciliation (SetSyncedFlags).
+			-- Overwriting it from the incoming row when a delta
 			-- re-delivers a message after a server-side flag change would corrupt
 			-- the three-way merge and revert that change.
 		RETURNING id`,
 		msg.MessageID, threadID, msg.InReplyTo, msg.Refs, subjectCT,
-		msg.FromAddr, msg.ToAddrs, msg.CCAddrs,
+		msg.FromAddr, msg.ToAddrs, msg.CCAddrs, bccCT,
 		msg.Date, msg.CreatedAt,
 		bodyTextCT, bodyHTMLCT,
 		nullableID(mailboxID), nullableID(accountID),
 		isSeen, isFlagged, isDeleted, flagsOtherCT,
 		msg.UID, msg.Size, fetchedBody,
-		msg.RemoteRef, msg.SyncedFlags,
+		msg.RemoteRef, syncedFlags,
 	).Scan(&msg.ID)
 	if err != nil {
 		return fmt.Errorf("upsert message: %w", err)
 	}
 
-	// ADR-0001 step 7 (a+b): maintain the parallel blind FTS5 row. The
-	// old messages_fts trigger-pair still fires for the plaintext columns
-	// — step 7c flips reads to messages_blind_fts and step 7e drops the
-	// old triggers. DELETE+INSERT (vs UPDATE) because contentless FTS5
-	// columns can't be updated in place.
-	sTok, fTok, tTok, bTok := d.blindTokens(msg.Subject, msg.FromAddr, msg.ToAddrs, msg.BodyText)
+	// Metadata-only updates preserve every indexed value. Keep an existing FTS
+	// row untouched so flag/reference refreshes do not decrypt and retokenize
+	// the full stored body. A first insert or a missing FTS row still needs one.
+	if !msg.FetchedBody {
+		var ftsExists bool
+		if err := tx.QueryRow(`SELECT EXISTS(
+			SELECT 1 FROM messages_blind_fts WHERE rowid = ?
+		)`, msg.ID).Scan(&ftsExists); err != nil {
+			return fmt.Errorf("check blind FTS row: %w", err)
+		}
+		if ftsExists {
+			return nil
+		}
+	}
+
+	// Read back after the SQL upsert so FTS always reflects the effective stored
+	// values. In particular, a full reingest updates metadata but retains an
+	// already-fetched body, which can differ from the incoming body.
+	var storedSubjectCT, storedBodyCT []byte
+	var ftsFrom, ftsTo string
+	if err := tx.QueryRow(`SELECT subject_ct, COALESCE(from_addr, ''), COALESCE(to_addrs, ''), body_text_ct
+		FROM messages WHERE id = ?`, msg.ID).Scan(&storedSubjectCT, &ftsFrom, &ftsTo, &storedBodyCT); err != nil {
+		return fmt.Errorf("fetch message for blind FTS refresh: %w", err)
+	}
+	ftsSubject, err := d.decryptSubject("", storedSubjectCT)
+	if err != nil {
+		return fmt.Errorf("decrypt subject for blind FTS refresh: %w", err)
+	}
+	ftsBody, err := d.decryptBody("", storedBodyCT)
+	if err != nil {
+		return fmt.Errorf("decrypt body for blind FTS refresh: %w", err)
+	}
+
+	sTok, fTok, tTok, bTok := d.blindTokens(ftsSubject, ftsFrom, ftsTo, ftsBody)
 	if _, err := tx.Exec("DELETE FROM messages_blind_fts WHERE rowid = ?", msg.ID); err != nil {
 		return fmt.Errorf("blind fts delete: %w", err)
 	}
@@ -179,6 +339,37 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message) error {
 	}
 
 	return nil
+}
+
+// syncedFlagBaseline serializes only the five flags the sync engine tracks.
+// Unknown provider keywords remain message metadata, not merge state.
+func syncedFlagBaseline(isSeen, isFlagged, isDeleted bool, flagsOther string) string {
+	present := make(map[string]bool, 5)
+	if isSeen {
+		present[`\Seen`] = true
+	}
+	if isFlagged {
+		present[`\Flagged`] = true
+	}
+	if isDeleted {
+		present[`\Deleted`] = true
+	}
+	for _, flag := range strings.FieldsFunc(flagsOther, func(r rune) bool {
+		return r == ',' || unicode.IsSpace(r)
+	}) {
+		switch flag {
+		case `\Answered`, "$Completed":
+			present[flag] = true
+		}
+	}
+	ordered := []string{`\Seen`, `\Flagged`, `\Answered`, `\Deleted`, "$Completed"}
+	baseline := make([]string, 0, len(present))
+	for _, flag := range ordered {
+		if present[flag] {
+			baseline = append(baseline, flag)
+		}
+	}
+	return strings.Join(baseline, ",")
 }
 
 // UpdateBody updates the body text and HTML for a message (lazy body fetch).
@@ -304,6 +495,24 @@ func (d *DB) GetByMessageID(messageID string) (*Message, error) {
 		return nil, fmt.Errorf("get by message_id: %w", err)
 	}
 	return msg, nil
+}
+
+// GetAllByMessageID retrieves every account-specific row for a Message-ID.
+func (d *DB) GetAllByMessageID(messageID string) ([]*Message, error) {
+	rows, err := d.db.Query(`SELECT `+messageSelectColumns+`
+		`+messageSelectFrom+`
+		WHERE m.message_id = ?
+		ORDER BY m.id`, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("get all by message_id: %w", err)
+	}
+	defer rows.Close()
+
+	messages, err := d.scanMessages(rows)
+	if err != nil {
+		return nil, fmt.Errorf("get all by message_id: %w", err)
+	}
+	return messages, nil
 }
 
 // GetByThread retrieves all messages in a thread, ordered by date ascending.
@@ -444,10 +653,12 @@ func (d *DB) DeleteByMessageIDAndAccount(messageID, account string) error {
 // (SyncedFlags, comma-joined IMAP-style flag string) and its current
 // local tags. The sync engine's flag three-way merge is driven off this.
 type FolderFlagRow struct {
-	MessageID   string
-	RemoteRef   string
-	SyncedFlags string
-	Tags        []string
+	RowID                  int64
+	MessageID              string
+	RemoteRef              string
+	SyncedFlags            string
+	SyncedFlagsInitialized bool
+	Tags                   []string
 	// IsSeen / IsFlagged are the server flag state stored at last ingest, used to
 	// seed an empty synced_flags baseline (a legacy-migrated row) from the server
 	// side rather than guessing from local tags.
@@ -484,7 +695,7 @@ func (d *DB) GetFolderFlagState(account, mailbox string) ([]FolderFlagRow, error
 	// with no tags still needs a row so the three-way sees its empty
 	// local state. ORDER BY m.id groups a message's tag rows together.
 	rows, err := d.db.Query(`
-		SELECT m.message_id, m.remote_ref, m.synced_flags, m.is_seen, m.is_flagged, IFNULL(t.tag, '')
+		SELECT m.id, m.message_id, m.remote_ref, m.synced_flags, m.is_seen, m.is_flagged, IFNULL(t.tag, '')
 		FROM messages m
 		LEFT JOIN tags t ON t.message_id = m.id
 		WHERE m.mailbox_id = ? AND m.account_id = ? AND m.remote_ref != ''
@@ -496,18 +707,22 @@ func (d *DB) GetFolderFlagState(account, mailbox string) ([]FolderFlagRow, error
 
 	result := []FolderFlagRow{}
 	for rows.Next() {
-		var msgID, remoteRef, syncedFlags, tag string
+		var rowID int64
+		var msgID, remoteRef, storedSyncedFlags, tag string
 		var isSeen, isFlagged bool
-		if err := rows.Scan(&msgID, &remoteRef, &syncedFlags, &isSeen, &isFlagged, &tag); err != nil {
+		if err := rows.Scan(&rowID, &msgID, &remoteRef, &storedSyncedFlags, &isSeen, &isFlagged, &tag); err != nil {
 			return nil, fmt.Errorf("scan folder flag row: %w", err)
 		}
 		if n := len(result); n == 0 || result[n-1].MessageID != msgID {
+			syncedFlags, initialized := decodeSyncedFlags(storedSyncedFlags)
 			result = append(result, FolderFlagRow{
-				MessageID:   msgID,
-				RemoteRef:   remoteRef,
-				SyncedFlags: syncedFlags,
-				IsSeen:      isSeen,
-				IsFlagged:   isFlagged,
+				RowID:                  rowID,
+				MessageID:              msgID,
+				RemoteRef:              remoteRef,
+				SyncedFlags:            syncedFlags,
+				SyncedFlagsInitialized: initialized,
+				IsSeen:                 isSeen,
+				IsFlagged:              isFlagged,
 			})
 		}
 		if tag != "" {
@@ -531,7 +746,7 @@ func (d *DB) SetSyncedFlags(messageID, account, syncedFlags string) error {
 	}
 	result, err := d.db.Exec(
 		"UPDATE messages SET synced_flags = ? WHERE message_id = ? AND account_id = ?",
-		syncedFlags, messageID, accountID)
+		encodeSyncedFlags(syncedFlags), messageID, accountID)
 	if err != nil {
 		return fmt.Errorf("set synced flags: %w", err)
 	}
@@ -723,7 +938,7 @@ func (d *DB) GetRecipientAddresses() ([]string, error) {
 // name_ct) and the flags string is reconstructed from is_*  + the
 // decrypted flags_other BLOB.
 const messageSelectColumns = `m.id, m.message_id, m.thread_id, m.in_reply_to, m.refs, m.subject_ct,
-		m.from_addr, m.to_addrs, m.cc_addrs, m.date, m.created_at,
+		m.from_addr, m.to_addrs, m.cc_addrs, m.bcc_ct, m.date, m.created_at,
 		m.body_text_ct, m.body_html_ct,
 		mb.name_ct, ac.name_ct,
 		m.is_seen, m.is_flagged, m.is_deleted, m.flags_other,
@@ -740,11 +955,11 @@ const messageSelectFrom = `FROM messages m
 func (d *DB) scanMessageRow(scan func(...any) error) (*Message, error) {
 	msg := &Message{}
 	var fetchedBody int
-	var subjectCT, bodyTextCT, bodyHTMLCT, flagsOtherCT, mailboxNameCT, accountNameCT []byte
+	var subjectCT, bodyTextCT, bodyHTMLCT, flagsOtherCT, mailboxNameCT, accountNameCT, bccCT []byte
 	var isSeen, isFlagged, isDeleted int
 	if err := scan(
 		&msg.ID, &msg.MessageID, &msg.ThreadID, &msg.InReplyTo, &msg.Refs, &subjectCT,
-		&msg.FromAddr, &msg.ToAddrs, &msg.CCAddrs, &msg.Date, &msg.CreatedAt,
+		&msg.FromAddr, &msg.ToAddrs, &msg.CCAddrs, &bccCT, &msg.Date, &msg.CreatedAt,
 		&bodyTextCT, &bodyHTMLCT,
 		&mailboxNameCT, &accountNameCT,
 		&isSeen, &isFlagged, &isDeleted, &flagsOtherCT,
@@ -762,6 +977,9 @@ func (d *DB) scanMessageRow(scan func(...any) error) (*Message, error) {
 	}
 	if msg.BodyHTML, err = d.decryptBody("", bodyHTMLCT); err != nil {
 		return nil, err
+	}
+	if msg.BCCAddrs, err = d.decryptMeta("", bccCT); err != nil {
+		return nil, fmt.Errorf("decrypt bcc: %w", err)
 	}
 	if msg.Mailbox, err = d.decryptMeta("", mailboxNameCT); err != nil {
 		return nil, fmt.Errorf("decrypt mailbox name: %w", err)

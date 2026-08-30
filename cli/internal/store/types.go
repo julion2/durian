@@ -11,6 +11,13 @@ type Message struct {
 	FromAddr  string
 	ToAddrs   string
 	CCAddrs   string
+	// BCCAddrs holds the blind recipients of a draft. Unlike ToAddrs/CCAddrs,
+	// which ADR-0001 §3 (step 7d revision) keeps in plaintext because those
+	// addresses travel on the wire anyway, blind recipients are precisely the
+	// ones no other recipient ever sees. The column is `bcc_ct` and is only
+	// ever stored encrypted under the meta sub-key — there is no plaintext
+	// twin, and it is deliberately absent from the FTS index.
+	BCCAddrs  string
 	Date      int64
 	CreatedAt int64
 	BodyText  string
@@ -27,6 +34,10 @@ type Message struct {
 	// SyncedFlags is the last-synced flag baseline as a comma-joined
 	// IMAP-style flag string (same format as Flags, e.g. `\Seen,\Flagged`).
 	SyncedFlags string
+	// SyncedFlagsInitialized distinguishes an explicit empty baseline from a
+	// legacy row that has never established one. Non-empty baselines are always
+	// initialized regardless of this field.
+	SyncedFlagsInitialized bool
 	// Account is the account identifier for this message (e.g. "work").
 	// Each account has its own row — UNIQUE(message_id, account).
 	Account string

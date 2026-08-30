@@ -124,6 +124,23 @@ func init() {
 // captured after the read. The legacy name emits an additional Warn
 // asking the operator to rename — one-release deprecation grace period.
 func bootstrapKeyring() *dbcrypto.Keyring {
+	kr, err := loadKeyring(true)
+	if err != nil {
+		slog.Error("Master key bootstrap failed", "module", "MASTER-KEY", "err", err)
+		fmt.Fprintln(os.Stderr, "Error: master key bootstrap failed:", err)
+		os.Exit(1)
+	}
+	return kr
+}
+
+// loadExistingKeyring loads the same key material without creating a missing
+// keychain item. Read-only commands use this path so their setup cannot mutate
+// the OS keychain.
+func loadExistingKeyring() (*dbcrypto.Keyring, error) {
+	return loadKeyring(false)
+}
+
+func loadKeyring(allowCreate bool) (*dbcrypto.Keyring, error) {
 	rawCanonical := strings.TrimSpace(os.Getenv(envMasterKeyHex))
 	rawLegacy := strings.TrimSpace(os.Getenv(envMasterKeyHexLegacy))
 	raw := rawCanonical
@@ -144,34 +161,35 @@ func bootstrapKeyring() *dbcrypto.Keyring {
 	if raw != "" {
 		master, err := hex.DecodeString(raw)
 		if err != nil || len(master) != dbcrypto.MasterKeyLen {
-			slog.Error(source+" is set but not a valid 64-char hex of 32 bytes",
-				"module", "MASTER-KEY", "err", err, "len", len(master))
-			fmt.Fprintln(os.Stderr, "Error: "+source+" must be a 64-character hex string (32 bytes)")
-			os.Exit(1)
+			return nil, fmt.Errorf("%s must be a 64-character hex string (32 bytes)", source)
 		}
 		kr, err := dbcrypto.NewKeyring(master)
 		if err != nil {
-			slog.Error("Keyring derivation failed", "module", "MASTER-KEY", "err", err)
-			fmt.Fprintln(os.Stderr, "Error: keyring derivation failed:", err)
-			os.Exit(1)
+			return nil, fmt.Errorf("derive keyring: %w", err)
 		}
 		slog.Warn("Master key sourced from "+source+" (test/CI mode — NOT for production)",
 			"module", "MASTER-KEY")
-		return kr
+		return kr, nil
 	}
 
-	existed := keychain.Exists(keychain.DBKeychainService, keychain.DBAccountMaster)
-	master, err := keychain.GetOrCreateKey(keychain.DBKeychainService, keychain.DBAccountMaster, dbcrypto.MasterKeyLen)
+	existed := true
+	var master []byte
+	var err error
+	if allowCreate {
+		existed = keychain.Exists(keychain.DBKeychainService, keychain.DBAccountMaster)
+		master, err = keychain.GetOrCreateKey(keychain.DBKeychainService, keychain.DBAccountMaster, dbcrypto.MasterKeyLen)
+	} else {
+		master, err = keychain.GetKey(keychain.DBKeychainService, keychain.DBAccountMaster, dbcrypto.MasterKeyLen)
+	}
 	if err != nil {
-		slog.Error("Master key bootstrap failed", "module", "MASTER-KEY", "err", err)
-		fmt.Fprintln(os.Stderr, "Error: master key bootstrap failed:", err)
-		os.Exit(1)
+		if !allowCreate && errors.Is(err, keychain.ErrNotFound) {
+			return nil, fmt.Errorf("no master key in keychain; run a non-dry Durian command once to initialize it")
+		}
+		return nil, fmt.Errorf("load master key: %w", err)
 	}
 	kr, err := dbcrypto.NewKeyring(master)
 	if err != nil {
-		slog.Error("Keyring derivation failed", "module", "MASTER-KEY", "err", err)
-		fmt.Fprintln(os.Stderr, "Error: keyring derivation failed:", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("derive keyring: %w", err)
 	}
 	if existed {
 		slog.Info("Master key loaded from keychain", "module", "MASTER-KEY",
@@ -180,7 +198,7 @@ func bootstrapKeyring() *dbcrypto.Keyring {
 		slog.Info("Master key generated and stored in keychain (first run)", "module", "MASTER-KEY",
 			"service", keychain.DBKeychainService, "account", keychain.DBAccountMaster)
 	}
-	return kr
+	return kr, nil
 }
 
 func runMasterKeyExport(cmd *cobra.Command, args []string) error {

@@ -29,10 +29,14 @@ go_test(
     name = "store_test",
     srcs = [
         "attachments_test.go",
+        "bcc_test.go",
+        "concurrency_test.go",
+        "flag_tags_cas_test.go",
         "headers_test.go",
         "local_drafts_test.go",
         "messages_test.go",
         "migrate_audit_test.go",
+        "migrate_flags_test.go",
         "outbox_test.go",
         "search_test.go",
         "store_test.go",
@@ -40,5 +44,9 @@ go_test(
         "threads_test.go",
     ],
     embed = [":store"],
-    deps = ["//cli/internal/dbcrypto"],
+    deps = [
+        "//cli/internal/dbcrypto",
+        "//cli/internal/mail",
+        "//cli/internal/smtp",
+    ],
 )

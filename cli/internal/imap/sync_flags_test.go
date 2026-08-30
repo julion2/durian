@@ -1,0 +1,802 @@
+package imap
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"slices"
+	"strings"
+	"testing"
+
+	goimap "github.com/emersion/go-imap"
+
+	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/dbcrypto"
+	"github.com/julion2/durian/cli/internal/store"
+)
+
+const (
+	// A non-INBOX mailbox keeps the tests on the flag reconciliation itself:
+	// INBOX additionally runs stale-tag cleanup and folder-move upload, which
+	// would need a live client and would blur what an assertion here proves.
+	flagSyncMailbox = "Archive"
+	flagSyncAccount = "test"
+)
+
+type flagCall struct {
+	uid   uint32
+	flags []string
+}
+
+// fakeFlagTransport scripts the server side of the flag pass. Add/Remove
+// mutate serverFlags so a later FetchFlags observes what the syncer wrote —
+// the two-run tests depend on the second run seeing the first run's uploads.
+type fakeFlagTransport struct {
+	serverFlags map[uint32][]string
+	addCalls    []flagCall
+	removeCalls []flagCall
+	// onUpload runs before each AddFlags/RemoveFlags. syncFlags snapshots the
+	// local tags before it uploads and writes them after, so this is the hook
+	// a test uses to land a concurrent tag change inside that window and force
+	// the download's compare-and-swap to refuse.
+	onUpload func()
+}
+
+type folderMoveCall struct {
+	uid       uint32
+	messageID string
+	dest      string
+}
+
+type fakeFolderMoveTransport struct {
+	mailboxes       []*goimap.MailboxInfo
+	listErr         error
+	capabilityErr   error
+	moveUnsupported bool
+	createErr       error
+	moveErr         error
+	createCalls     []string
+	moveCalls       []folderMoveCall
+}
+
+func (f *fakeFolderMoveTransport) ListMailboxes() ([]*goimap.MailboxInfo, error) {
+	return f.mailboxes, f.listErr
+}
+
+func (f *fakeFolderMoveTransport) SupportsCapability(capability string) (bool, error) {
+	if capability != "MOVE" {
+		return false, fmt.Errorf("unexpected capability %q", capability)
+	}
+	return !f.moveUnsupported, f.capabilityErr
+}
+
+func (f *fakeFolderMoveTransport) CreateMailbox(name string) error {
+	f.createCalls = append(f.createCalls, name)
+	return f.createErr
+}
+
+func (f *fakeFolderMoveTransport) MoveMessageToMailbox(uid uint32, messageID, destMailbox string) error {
+	f.moveCalls = append(f.moveCalls, folderMoveCall{uid: uid, messageID: messageID, dest: destMailbox})
+	return f.moveErr
+}
+
+func (f *fakeFlagTransport) FetchFlags(uids []uint32) (map[uint32][]string, error) {
+	out := make(map[uint32][]string, len(uids))
+	for _, uid := range uids {
+		if flags, ok := f.serverFlags[uid]; ok {
+			out[uid] = slices.Clone(flags)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeFlagTransport) AddFlags(uid uint32, flags []string) error {
+	// Client.AddFlags returns before issuing UID STORE when the list is empty.
+	// Mirroring that keeps a recorded call meaning what it means in production:
+	// something was actually sent.
+	if len(flags) == 0 {
+		return nil
+	}
+	if f.onUpload != nil {
+		f.onUpload()
+	}
+	f.addCalls = append(f.addCalls, flagCall{uid: uid, flags: slices.Clone(flags)})
+	for _, flag := range flags {
+		if !slices.Contains(f.serverFlags[uid], flag) {
+			f.serverFlags[uid] = append(f.serverFlags[uid], flag)
+		}
+	}
+	return nil
+}
+
+func (f *fakeFlagTransport) RemoveFlags(uid uint32, flags []string) error {
+	if len(flags) == 0 {
+		return nil
+	}
+	if f.onUpload != nil {
+		f.onUpload()
+	}
+	f.removeCalls = append(f.removeCalls, flagCall{uid: uid, flags: slices.Clone(flags)})
+	f.serverFlags[uid] = slices.DeleteFunc(slices.Clone(f.serverFlags[uid]), func(fl string) bool {
+		return slices.Contains(flags, fl)
+	})
+	return nil
+}
+
+// uploadedFlags flattens every flag that travelled to the server, in either
+// direction. Tests that promise "this flag never went up" must check both
+// call lists — an errant \Deleted could arrive as an add or as a remove.
+func (f *fakeFlagTransport) uploadedFlags() []string {
+	var out []string
+	for _, c := range f.addCalls {
+		out = append(out, c.flags...)
+	}
+	for _, c := range f.removeCalls {
+		out = append(out, c.flags...)
+	}
+	return out
+}
+
+func newFlagTestDB(t *testing.T) *store.DB {
+	t.Helper()
+	kr, err := dbcrypto.NewKeyring(bytes.Repeat([]byte{0x42}, dbcrypto.MasterKeyLen))
+	if err != nil {
+		t.Fatalf("test keyring: %v", err)
+	}
+	db, err := store.Open(":memory:", kr)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := db.Init(); err != nil {
+		t.Fatalf("init store: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// seedFlagMessage inserts a message with the given tags, of which there may be
+// none: GetAllMessagesWithTags reports a tagless message too, so the pass sees
+// it. Most cases here still pass a tag because they need a specific local flag
+// state, not because a tag is required.
+func seedFlagMessage(t *testing.T, db *store.DB, messageID string, tags ...string) {
+	t.Helper()
+	msg := &store.Message{
+		MessageID: messageID, Subject: "Test " + messageID,
+		FromAddr: "a@x", Date: 1700000000, CreatedAt: 1700000000,
+		FetchedBody: true, Account: flagSyncAccount, Mailbox: flagSyncMailbox,
+	}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatalf("insert %s: %v", messageID, err)
+	}
+	for _, tag := range tags {
+		if err := db.AddTag(msg.ID, tag); err != nil {
+			t.Fatalf("seed tag %q: %v", tag, err)
+		}
+	}
+}
+
+// newFlagSyncer builds a Syncer whose flag pass runs entirely against the fake
+// transport and the in-memory store; the nil client is never touched because
+// every UID the tests use is pre-mapped, so ensureMessageIDMapping returns
+// before its envelope fetch.
+func newFlagSyncer(db *store.DB, fake *fakeFlagTransport, mode SyncMode) (*Syncer, *MailboxState) {
+	s := &Syncer{
+		account:               &config.AccountConfig{Name: flagSyncAccount},
+		options:               &SyncOptions{Mode: mode, Store: db},
+		output:                io.Discard,
+		store:                 db,
+		flagTransportOverride: fake,
+	}
+	return s, NewState().GetMailboxState(flagSyncMailbox)
+}
+
+func messageTags(t *testing.T, db *store.DB, messageID string) []string {
+	t.Helper()
+	tags, err := db.GetTagsByMessageID(messageID)
+	if err != nil {
+		t.Fatalf("get tags for %s: %v", messageID, err)
+	}
+	return tags
+}
+
+func TestFolderMoveDestination(t *testing.T) {
+	tests := []struct {
+		name    string
+		tags    []string
+		want    string
+		pending bool
+	}{
+		{name: "still in inbox", tags: []string{"inbox", "trash"}, pending: false},
+		{name: "archive", tags: []string{"archive"}, want: "archive", pending: true},
+		{name: "removed inbox", tags: []string{"unread"}, want: "archive", pending: true},
+		{name: "GUI trash tag", tags: []string{"trash"}, want: "trash", pending: true},
+		{name: "legacy deleted tag", tags: []string{"deleted"}, want: "trash", pending: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, pending := folderMoveDestination(tt.tags)
+			if got != tt.want || pending != tt.pending {
+				t.Errorf("folderMoveDestination(%v) = (%q, %v), want (%q, %v)",
+					tt.tags, got, pending, tt.want, tt.pending)
+			}
+		})
+	}
+}
+
+func TestInferArchiveMailboxName(t *testing.T) {
+	tests := []struct {
+		name      string
+		mailboxes []*goimap.MailboxInfo
+		want      string
+		wantErr   bool
+	}{
+		{
+			name: "nested INBOX namespace",
+			mailboxes: []*goimap.MailboxInfo{
+				{Name: "INBOX", Delimiter: "."},
+				{Name: "INBOX.Trash", Delimiter: ".", Attributes: []string{string(RoleTrash)}},
+				{Name: "INBOX.Sent", Delimiter: ".", Attributes: []string{string(RoleSent)}},
+			},
+			want: "INBOX.Archive",
+		},
+		{
+			name: "top-level namespace",
+			mailboxes: []*goimap.MailboxInfo{
+				{Name: "INBOX", Delimiter: "/"},
+				{Name: "INBOX/Receipts", Delimiter: "/"},
+				{Name: "Trash", Delimiter: "/", Attributes: []string{string(RoleTrash)}},
+				{Name: "Sent", Delimiter: "/", Attributes: []string{string(RoleSent)}},
+			},
+			want: "Archive",
+		},
+		{
+			name: "generic nested namespace",
+			mailboxes: []*goimap.MailboxInfo{
+				{Name: "INBOX", Delimiter: "/"},
+				{Name: "Mail/Trash", Delimiter: "/", Attributes: []string{string(RoleTrash)}},
+				{Name: "Mail/Sent", Delimiter: "/", Attributes: []string{string(RoleSent)}},
+			},
+			want: "Mail/Archive",
+		},
+		{
+			name: "unannotated fallback names are not namespace evidence",
+			mailboxes: []*goimap.MailboxInfo{
+				{Name: "INBOX", Delimiter: "/"},
+				{Name: "Mail/Trash", Delimiter: "/"},
+				{Name: "Mail/Sent", Delimiter: "/"},
+			},
+			wantErr: true,
+		},
+		{name: "empty mailbox list", wantErr: true},
+		{
+			name: "ambiguous special-use parents",
+			mailboxes: []*goimap.MailboxInfo{
+				{Name: "Mail/Trash", Delimiter: "/", Attributes: []string{string(RoleTrash)}},
+				{Name: "Other/Sent", Delimiter: "/", Attributes: []string{string(RoleSent)}},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := inferArchiveMailboxName(tt.mailboxes)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("inferArchiveMailboxName() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("inferArchiveMailboxName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func newFolderMoveTestSyncer(fake *fakeFolderMoveTransport, account *config.AccountConfig, dryRun bool, output io.Writer) (*Syncer, *MailboxState) {
+	if account == nil {
+		account = &config.AccountConfig{Name: flagSyncAccount}
+	}
+	if output == nil {
+		output = io.Discard
+	}
+	s := &Syncer{
+		account:                     account,
+		options:                     &SyncOptions{DryRun: dryRun},
+		output:                      output,
+		folderMoveTransportOverride: fake,
+	}
+	return s, NewState().GetMailboxState("INBOX")
+}
+
+func mapFolderMoveUID(mbox *MailboxState, uid uint32, messageID string) {
+	mbox.AddSyncedUID(uid)
+	mbox.SetMessageID(uid, messageID)
+}
+
+func TestUploadFolderMovesUsesResolvedRoles(t *testing.T) {
+	fake := &fakeFolderMoveTransport{mailboxes: []*goimap.MailboxInfo{
+		{Name: "INBOX", Delimiter: "/"},
+		{Name: "Archive", Delimiter: "/", Attributes: []string{string(RoleArchive)}},
+		{Name: "Trash", Delimiter: "/", Attributes: []string{string(RoleTrash)}},
+	}}
+	s, mbox := newFolderMoveTestSyncer(fake, nil, false, nil)
+	mapFolderMoveUID(mbox, 1, "archive@test")
+	mapFolderMoveUID(mbox, 2, "trash@test")
+
+	moved, err := s.uploadFolderMoves(mbox, map[string][]string{
+		"archive@test": {"archive"},
+		"trash@test":   {"trash"},
+	}, []uint32{1, 2})
+	if err != nil {
+		t.Fatalf("uploadFolderMoves: %v", err)
+	}
+	if moved != 2 {
+		t.Fatalf("moved = %d, want 2", moved)
+	}
+	dests := make(map[uint32]string, len(fake.moveCalls))
+	for _, call := range fake.moveCalls {
+		dests[call.uid] = call.dest
+	}
+	if len(fake.moveCalls) != 2 || dests[1] != "Archive" || dests[2] != "Trash" {
+		t.Errorf("move calls = %+v, want UID 1 -> Archive and UID 2 -> Trash", fake.moveCalls)
+	}
+	if fake.moveCalls[0].messageID == "" || fake.moveCalls[1].messageID == "" {
+		t.Errorf("move calls = %+v, want identity-checked moves", fake.moveCalls)
+	}
+	if len(fake.createCalls) != 0 {
+		t.Errorf("create calls = %v, want none", fake.createCalls)
+	}
+}
+
+func TestUploadFolderMovesDryRunPlansNestedArchiveWithoutWrites(t *testing.T) {
+	fake := &fakeFolderMoveTransport{mailboxes: []*goimap.MailboxInfo{
+		{Name: "INBOX", Delimiter: "."},
+		{Name: "INBOX.Trash", Delimiter: ".", Attributes: []string{string(RoleTrash)}},
+	}}
+	var output bytes.Buffer
+	s, mbox := newFolderMoveTestSyncer(fake, nil, true, &output)
+	mapFolderMoveUID(mbox, 7, "archive@test")
+
+	moved, err := s.uploadFolderMoves(mbox, map[string][]string{"archive@test": {"archive"}}, []uint32{7})
+	if err != nil {
+		t.Fatalf("uploadFolderMoves: %v", err)
+	}
+	if moved != 1 {
+		t.Errorf("moved = %d, want one planned move", moved)
+	}
+	if len(fake.createCalls) != 0 || len(fake.moveCalls) != 0 {
+		t.Errorf("dry-run wrote remotely: create=%v move=%v", fake.createCalls, fake.moveCalls)
+	}
+	if !strings.Contains(output.String(), "Would create archive mailbox INBOX.Archive") {
+		t.Errorf("output = %q, want nested archive creation plan", output.String())
+	}
+	if uid, ok := mbox.GetUIDByMessageID("archive@test"); !ok || uid != 7 {
+		t.Errorf("dry-run removed source mapping: uid=%d present=%v", uid, ok)
+	}
+}
+
+func TestUploadFolderMovesListFailureDoesNotCreateOrMove(t *testing.T) {
+	wantErr := errors.New("LIST failed")
+	fake := &fakeFolderMoveTransport{listErr: wantErr}
+	s, mbox := newFolderMoveTestSyncer(fake, nil, false, nil)
+	mapFolderMoveUID(mbox, 1, "archive@test")
+
+	moved, err := s.uploadFolderMoves(mbox, map[string][]string{"archive@test": {"archive"}}, []uint32{1})
+	if moved != 0 || !errors.Is(err, wantErr) {
+		t.Fatalf("uploadFolderMoves = (%d, %v), want (0, LIST error)", moved, err)
+	}
+	if len(fake.createCalls) != 0 || len(fake.moveCalls) != 0 {
+		t.Errorf("LIST failure wrote remotely: create=%v move=%v", fake.createCalls, fake.moveCalls)
+	}
+}
+
+func TestUploadFolderMovesWithoutMoveCapabilityDoesNotCreateOrMove(t *testing.T) {
+	fake := &fakeFolderMoveTransport{
+		moveUnsupported: true,
+		mailboxes: []*goimap.MailboxInfo{
+			{Name: "INBOX", Delimiter: "."},
+			{Name: "INBOX.Trash", Delimiter: ".", Attributes: []string{string(RoleTrash)}},
+		},
+	}
+	s, mbox := newFolderMoveTestSyncer(fake, nil, false, nil)
+	mapFolderMoveUID(mbox, 1, "archive@test")
+
+	moved, err := s.uploadFolderMoves(mbox, map[string][]string{"archive@test": {"archive"}}, []uint32{1})
+	if moved != 0 || err == nil {
+		t.Fatalf("uploadFolderMoves = (%d, %v), want MOVE capability error", moved, err)
+	}
+	if len(fake.createCalls) != 0 || len(fake.moveCalls) != 0 {
+		t.Errorf("missing MOVE capability wrote remotely: create=%v move=%v", fake.createCalls, fake.moveCalls)
+	}
+}
+
+func TestUploadFolderMovesFailurePreservesSourceState(t *testing.T) {
+	wantErr := errors.New("MOVE failed")
+	fake := &fakeFolderMoveTransport{
+		mailboxes: []*goimap.MailboxInfo{
+			{Name: "INBOX", Delimiter: "/"},
+			{Name: "Archive", Delimiter: "/", Attributes: []string{string(RoleArchive)}},
+		},
+		moveErr: wantErr,
+	}
+	s, mbox := newFolderMoveTestSyncer(fake, nil, false, nil)
+	mapFolderMoveUID(mbox, 1, "archive@test")
+
+	moved, err := s.uploadFolderMoves(mbox, map[string][]string{"archive@test": {"archive"}}, []uint32{1})
+	if moved != 0 || !errors.Is(err, wantErr) {
+		t.Fatalf("uploadFolderMoves = (%d, %v), want (0, MOVE error)", moved, err)
+	}
+	if uid, ok := mbox.GetUIDByMessageID("archive@test"); !ok || uid != 1 {
+		t.Errorf("failed move removed source mapping: uid=%d present=%v", uid, ok)
+	}
+}
+
+func TestUploadFolderMovesUsesAllMailOnlyForGmail(t *testing.T) {
+	tests := []struct {
+		name       string
+		account    *config.AccountConfig
+		wantDest   string
+		wantCreate []string
+		wantErr    bool
+	}{
+		{
+			name:    "non-Gmail does not infer semantics or namespace from All Mail",
+			account: &config.AccountConfig{Name: flagSyncAccount},
+			wantErr: true,
+		},
+		{
+			name:     "Gmail uses All Mail",
+			account:  &config.AccountConfig{Name: flagSyncAccount, OAuth: &config.OAuthConfig{Provider: "google"}},
+			wantDest: "[Gmail]/All Mail",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := &fakeFolderMoveTransport{mailboxes: []*goimap.MailboxInfo{
+				{Name: "INBOX", Delimiter: "/"},
+				{Name: "[Gmail]/All Mail", Delimiter: "/", Attributes: []string{string(RoleAll)}},
+			}}
+			s, mbox := newFolderMoveTestSyncer(fake, tt.account, false, nil)
+			mapFolderMoveUID(mbox, 1, "archive@test")
+
+			moved, err := s.uploadFolderMoves(mbox, map[string][]string{"archive@test": {"archive"}}, []uint32{1})
+			if tt.wantErr {
+				if err == nil || moved != 0 {
+					t.Fatalf("uploadFolderMoves = (%d, %v), want namespace error", moved, err)
+				}
+				if len(fake.createCalls) != 0 || len(fake.moveCalls) != 0 {
+					t.Fatalf("failed resolution wrote remotely: create=%v move=%v", fake.createCalls, fake.moveCalls)
+				}
+				return
+			}
+			if err != nil || moved != 1 {
+				t.Fatalf("uploadFolderMoves = (%d, %v), want (1, nil)", moved, err)
+			}
+			if len(fake.moveCalls) != 1 || fake.moveCalls[0].dest != tt.wantDest {
+				t.Errorf("move calls = %+v, want destination %q", fake.moveCalls, tt.wantDest)
+			}
+			if !slices.Equal(fake.createCalls, tt.wantCreate) {
+				t.Errorf("create calls = %v, want %v", fake.createCalls, tt.wantCreate)
+			}
+		})
+	}
+}
+
+// TestSyncFlags_UntaggedMessageStillReconciles covers the message the pass used
+// to never see. A read, unflagged, unanswered message in a folder with no role
+// mapping carries no tags at all — ToTagOps emits only removals for that state
+// — and GetAllMessagesWithTags dropped it, so the pass read "not in this
+// folder" and skipped it. Its flags then stopped moving in either direction,
+// silently and permanently.
+//
+// Starring it on another client must still arrive here.
+func TestSyncFlags_UntaggedMessageStillReconciles(t *testing.T) {
+	db := newFlagTestDB(t)
+	seedFlagMessage(t, db, "no-tags@test")
+
+	if tags := messageTags(t, db, "no-tags@test"); len(tags) != 0 {
+		t.Fatalf("fixture carries tags %v; this case is only meaningful without any", tags)
+	}
+
+	fake := &fakeFlagTransport{serverFlags: map[uint32][]string{
+		1: {goimap.SeenFlag, goimap.FlaggedFlag},
+	}}
+	s, mbox := newFlagSyncer(db, fake, SyncBidirectional)
+	mbox.SetMessageID(1, "no-tags@test")
+	mbox.SetMessageFlags(1, FlagState{Seen: true})
+
+	s.syncFlags(flagSyncMailbox, mbox, []uint32{1})
+
+	if tags := messageTags(t, db, "no-tags@test"); !slices.Contains(tags, "flagged") {
+		t.Errorf("tags = %v, want the server-side star downloaded", tags)
+	}
+
+	// The exact advanced baseline, not merely its presence: this test seeds one
+	// itself, so "a baseline exists" would hold even if the pass had skipped
+	// the message entirely.
+	want := FlagState{Seen: true, Flagged: true}
+	if got, ok := mbox.GetMessageFlags(1); !ok || got != want {
+		t.Errorf("baseline = %+v, present=%v; want %+v", got, ok, want)
+	}
+}
+
+func TestSyncFlags_DryRunDoesNotBackfillUID(t *testing.T) {
+	db := newFlagTestDB(t)
+	seedFlagMessage(t, db, "dry-run@test")
+	fake := &fakeFlagTransport{serverFlags: map[uint32][]string{
+		9: {goimap.SeenFlag},
+	}}
+	s, mbox := newFlagSyncer(db, fake, SyncBidirectional)
+	s.options.DryRun = true
+	mbox.SetMessageID(9, "dry-run@test")
+
+	if _, _, _, err := s.syncFlags(flagSyncMailbox, mbox, []uint32{9}); err != nil {
+		t.Fatalf("syncFlags: %v", err)
+	}
+	msg, err := db.GetByMessageID("dry-run@test")
+	if err != nil {
+		t.Fatalf("get message: %v", err)
+	}
+	if msg == nil || msg.UID != 0 {
+		t.Errorf("message UID after dry-run = %v, want 0", msg)
+	}
+}
+
+func TestSyncFlags_LocalMarkUnreadRemovesSeenOnServer(t *testing.T) {
+	db := newFlagTestDB(t)
+	seedFlagMessage(t, db, "unread@test", "unread")
+
+	fake := &fakeFlagTransport{serverFlags: map[uint32][]string{
+		1: {goimap.SeenFlag},
+	}}
+	s, mbox := newFlagSyncer(db, fake, SyncBidirectional)
+	mbox.SetMessageID(1, "unread@test")
+	mbox.SetMessageFlags(1, FlagState{Seen: true})
+
+	s.syncFlags(flagSyncMailbox, mbox, []uint32{1})
+
+	// The mark-unread must reach the server as exactly one \Seen removal. A
+	// resolver that ORs local and server instead of consulting the baseline
+	// cannot ever let a cleared flag win, and this is the assertion that
+	// catches that regression.
+	var removed []string
+	for _, c := range fake.removeCalls {
+		removed = append(removed, c.flags...)
+	}
+	if !slices.Equal(removed, []string{goimap.SeenFlag}) {
+		t.Errorf("removed flags = %v, want [%s]", removed, goimap.SeenFlag)
+	}
+
+	// Nothing else may travel: an add alongside the removal would mean the
+	// resolver invented a change neither side made.
+	for _, c := range fake.addCalls {
+		if len(c.flags) > 0 {
+			t.Errorf("AddFlags carried %v, want no flags added", c.flags)
+		}
+	}
+	if len(fake.serverFlags[1]) != 0 {
+		t.Errorf("server flags after sync = %v, want none", fake.serverFlags[1])
+	}
+}
+
+func TestSyncFlags_ServerDeletedNeverWrittenBack(t *testing.T) {
+	db := newFlagTestDB(t)
+	seedFlagMessage(t, db, "pending-expunge@test", "archive")
+
+	fake := &fakeFlagTransport{serverFlags: map[uint32][]string{
+		1: {goimap.SeenFlag, goimap.DeletedFlag},
+	}}
+	s, mbox := newFlagSyncer(db, fake, SyncBidirectional)
+	mbox.SetMessageID(1, "pending-expunge@test")
+	mbox.SetMessageFlags(1, FlagState{Seen: true})
+
+	// Two runs on purpose. The first run banks \Deleted into the baseline;
+	// the old defect only surfaced on the run after that, when the local
+	// absence of \Deleted read as a user change and pushed a removal that
+	// un-marked another client's pending expunge.
+	s.syncFlags(flagSyncMailbox, mbox, []uint32{1})
+	s.syncFlags(flagSyncMailbox, mbox, []uint32{1})
+
+	if slices.Contains(fake.uploadedFlags(), goimap.DeletedFlag) {
+		t.Errorf("\\Deleted travelled to the server: adds=%v removes=%v",
+			fake.addCalls, fake.removeCalls)
+	}
+	if !slices.Contains(fake.serverFlags[1], goimap.DeletedFlag) {
+		t.Errorf("server flags = %v, want \\Deleted still set: the pending expunge belongs to the server", fake.serverFlags[1])
+	}
+
+	// \Deleted must not leak into tags either: durian's "deleted" tag means
+	// moved-to-trash, and inventing it here would make the move uploader
+	// treat a mere witness of \Deleted as a user delete.
+	tags := messageTags(t, db, "pending-expunge@test")
+	if slices.Contains(tags, "deleted") || slices.Contains(tags, "trash") {
+		t.Errorf("local tags = %v, want no deleted/trash tag", tags)
+	}
+}
+
+func TestSyncFlags_UploadOnlyDoesNotConsumeServerChange(t *testing.T) {
+	db := newFlagTestDB(t)
+	seedFlagMessage(t, db, "uponly@test", "unread")
+
+	fake := &fakeFlagTransport{serverFlags: map[uint32][]string{
+		1: {goimap.SeenFlag, goimap.FlaggedFlag},
+	}}
+	s, mbox := newFlagSyncer(db, fake, SyncUploadOnly)
+	mbox.SetMessageID(1, "uponly@test")
+	mbox.SetMessageFlags(1, FlagState{Seen: true, Flagged: false})
+
+	s.syncFlags(flagSyncMailbox, mbox, []uint32{1})
+
+	if !slices.Contains(fake.serverFlags[1], goimap.FlaggedFlag) {
+		t.Fatalf("server flags = %v, want \\Flagged still set after upload-only run", fake.serverFlags[1])
+	}
+
+	// The server's star was never applied locally, so the baseline may not
+	// claim it was reconciled. Banking it here is exactly the lie the next
+	// run consumes: the local side lacks a flag the baseline says both sides
+	// agreed on, which reads as the user unstarring.
+	baseline, ok := mbox.GetMessageFlags(1)
+	if !ok {
+		t.Fatal("baseline missing after sync")
+	}
+	if baseline.Flagged {
+		t.Errorf("baseline = %+v, want Flagged=false: the server change was not pulled", baseline)
+	}
+
+	// The live failure mode was the second watcher-triggered UploadOnly run
+	// stripping the star off the server.
+	s.syncFlags(flagSyncMailbox, mbox, []uint32{1})
+	if !slices.Contains(fake.serverFlags[1], goimap.FlaggedFlag) {
+		t.Errorf("server flags = %v after second upload-only run, want \\Flagged still set", fake.serverFlags[1])
+	}
+}
+
+func TestSyncFlags_DownloadOnlyDoesNotConsumeLocalChange(t *testing.T) {
+	db := newFlagTestDB(t)
+	seedFlagMessage(t, db, "downonly@test", "unread")
+
+	fake := &fakeFlagTransport{serverFlags: map[uint32][]string{
+		1: {goimap.SeenFlag, goimap.FlaggedFlag},
+	}}
+	s, mbox := newFlagSyncer(db, fake, SyncDownloadOnly)
+	mbox.SetMessageID(1, "downonly@test")
+	mbox.SetMessageFlags(1, FlagState{Seen: true, Flagged: false})
+
+	s.syncFlags(flagSyncMailbox, mbox, []uint32{1})
+
+	// The server's star lands, and the download must not flatten the local
+	// mark-unread while doing so — the resolved state carries both changes.
+	tags := messageTags(t, db, "downonly@test")
+	if !slices.Contains(tags, "flagged") {
+		t.Errorf("tags = %v, want flagged: the server change was not pulled", tags)
+	}
+	if !slices.Contains(tags, "unread") {
+		t.Errorf("tags = %v, want unread kept: download flattened the local change", tags)
+	}
+
+	// The mark-unread never went up, so the baseline must keep claiming
+	// Seen=true. Banking the un-uploaded change would erase the only evidence
+	// a later bidirectional run has that an upload is still owed.
+	baseline, ok := mbox.GetMessageFlags(1)
+	if !ok {
+		t.Fatal("baseline missing after sync")
+	}
+	if !baseline.Seen {
+		t.Errorf("baseline = %+v, want Seen=true: the local change was not pushed", baseline)
+	}
+
+	if got := fake.uploadedFlags(); len(got) > 0 {
+		t.Errorf("uploaded %v in download-only mode, want nothing", got)
+	}
+}
+
+func TestSyncFlags_RefusedDownloadAdvancesOnlyPushedFields(t *testing.T) {
+	db := newFlagTestDB(t)
+	seedFlagMessage(t, db, "refused@test", "unread")
+
+	fake := &fakeFlagTransport{serverFlags: map[uint32][]string{
+		1: {goimap.SeenFlag, goimap.FlaggedFlag},
+	}}
+	s, mbox := newFlagSyncer(db, fake, SyncBidirectional)
+	mbox.SetMessageID(1, "refused@test")
+	mbox.SetMessageFlags(1, FlagState{Seen: true, Flagged: false})
+
+	// The upload runs between the tag snapshot and the download's write, so
+	// its transport call is where a concurrent user action can land. Adding
+	// "replied" changes the watched flag tags and must make the CAS refuse —
+	// an unguarded absolute write would strip the tag right back off.
+	hooked := false
+	fake.onUpload = func() {
+		if hooked {
+			return
+		}
+		hooked = true
+		if err := db.ModifyTagsByMessageIDAndAccount(
+			"refused@test", flagSyncAccount, []string{"replied"}, nil); err != nil {
+			t.Fatalf("concurrent tag write: %v", err)
+		}
+	}
+
+	s.syncFlags(flagSyncMailbox, mbox, []uint32{1})
+	if !hooked {
+		t.Fatal("upload never ran, the concurrent write was not exercised")
+	}
+
+	// The push half really happened and must count.
+	if slices.Contains(fake.serverFlags[1], goimap.SeenFlag) {
+		t.Errorf("server flags = %v, want \\Seen removed", fake.serverFlags[1])
+	}
+
+	// Seen reached the server, so it advances; Flagged only travelled in the
+	// refused direction, so it must not. Advancing it anyway would tell the
+	// next run the star was already delivered locally, and the pull would
+	// never be retried.
+	baseline, ok := mbox.GetMessageFlags(1)
+	if !ok {
+		t.Fatal("baseline missing after sync")
+	}
+	if baseline.Seen {
+		t.Errorf("baseline = %+v, want Seen=false: the pushed field must advance", baseline)
+	}
+	if baseline.Flagged {
+		t.Errorf("baseline = %+v, want Flagged=false: the refused pull must not advance", baseline)
+	}
+
+	// The refused write means the tags stay exactly as the user left them:
+	// still unread, the mid-sync reply recorded, and no flagged tag yet.
+	tags := messageTags(t, db, "refused@test")
+	if !slices.Contains(tags, "unread") {
+		t.Errorf("tags = %v, want unread kept: refused download must not revert the mark-unread", tags)
+	}
+	if !slices.Contains(tags, "replied") {
+		t.Errorf("tags = %v, want replied kept: the concurrent change is the state to preserve", tags)
+	}
+	if slices.Contains(tags, "flagged") {
+		t.Errorf("tags = %v, want no flagged tag: the download was refused", tags)
+	}
+}
+
+func TestSyncFlags_FirstSyncCASMissLeavesBaselineUninitialized(t *testing.T) {
+	db := newFlagTestDB(t)
+	// The first message exists only to give the run an upload, whose transport
+	// call is the window where the second message's tags change concurrently.
+	seedFlagMessage(t, db, "carrier@test", "unread")
+	seedFlagMessage(t, db, "firstsync@test", "unread")
+
+	fake := &fakeFlagTransport{serverFlags: map[uint32][]string{
+		1: {goimap.SeenFlag},
+		2: {goimap.SeenFlag},
+	}}
+	s, mbox := newFlagSyncer(db, fake, SyncBidirectional)
+	mbox.SetMessageID(1, "carrier@test")
+	mbox.SetMessageFlags(1, FlagState{Seen: true})
+	// UID 2 gets a mapping but no stored baseline: this is its first sync.
+	mbox.SetMessageID(2, "firstsync@test")
+
+	hooked := false
+	fake.onUpload = func() {
+		if hooked {
+			return
+		}
+		hooked = true
+		if err := db.ModifyTagsByMessageIDAndAccount(
+			"firstsync@test", flagSyncAccount, []string{"replied"}, nil); err != nil {
+			t.Fatalf("concurrent tag write: %v", err)
+		}
+	}
+
+	s.syncFlags(flagSyncMailbox, mbox, []uint32{1, 2})
+	if !hooked {
+		t.Fatal("upload never ran, the concurrent write was not exercised")
+	}
+
+	// The refused first-sync write must leave the baseline unset. Recording
+	// the server state anyway would claim a reconciliation that never reached
+	// the tags, and the next run would read the still-divergent local state
+	// as a user change instead of finishing the first sync.
+	if baseline, ok := mbox.GetMessageFlags(2); ok {
+		t.Errorf("baseline = %+v after refused first-sync write, want none stored", baseline)
+	}
+}

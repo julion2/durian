@@ -1,6 +1,10 @@
 package store
 
 import (
+	"fmt"
+	"path/filepath"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -47,6 +51,44 @@ func TestInsertAndGetMessage(t *testing.T) {
 	}
 	if msg.ThreadID == "" {
 		t.Error("thread_id should not be empty")
+	}
+}
+
+func TestInsertMessageParsesCommaAndWhitespaceSeparatedFlags(t *testing.T) {
+	tests := []struct {
+		flags string
+		want  string
+	}{
+		{flags: `\Seen,\Flagged,\Answered`, want: `\Seen \Flagged \Answered`},
+		{flags: `\Seen \Flagged \Answered`, want: `\Seen \Flagged \Answered`},
+		{flags: `$Label,X`, want: `$Label,X`},
+		{flags: `\Answered,\Draft`, want: `\Answered,\Draft`},
+		// Once a standard flag identifies a comma-joined legacy list, commas
+		// inside keywords are irreducibly ambiguous and split as components.
+		{flags: `\Seen,$Label,X`, want: `\Seen $Label X`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.flags, func(t *testing.T) {
+			db := newTestDB(t)
+			msg := &Message{
+				MessageID: "flags@example.com",
+				Subject:   "Flags",
+				Date:      time.Now().Unix(),
+				Mailbox:   "INBOX",
+				Account:   "work",
+				Flags:     tc.flags,
+			}
+			if err := db.InsertMessage(msg); err != nil {
+				t.Fatalf("insert: %v", err)
+			}
+			got, err := db.GetByMessageID("flags@example.com")
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			if got.Flags != tc.want {
+				t.Errorf("flags = %q, want %q", got.Flags, tc.want)
+			}
+		})
 	}
 }
 
@@ -202,6 +244,288 @@ func TestFolderFlagState_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestUpsertMessageCapturesLegacyFlagBeforeImage(t *testing.T) {
+	db := newTestDB(t)
+	legacy := &Message{
+		MessageID: "legacy-flags@example.com", Subject: "legacy", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1", FetchedBody: true,
+		Flags: `\Seen,\Flagged,\Answered,\Deleted,$Completed,$Other`,
+	}
+	if err := db.InsertMessage(legacy); err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+	created, err := db.UpsertMessage(&Message{
+		MessageID: legacy.MessageID, Subject: "delta", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1", FetchedBody: true,
+		SyncedFlagsInitialized: true,
+	})
+	if err != nil || created {
+		t.Fatalf("delta upsert created=%v err=%v, want existing row", created, err)
+	}
+	rows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("flag rows=%+v err=%v", rows, err)
+	}
+	if got, want := rows[0].SyncedFlags, `\Seen,\Flagged,\Answered,\Deleted,$Completed`; got != want {
+		t.Fatalf("captured baseline=%q, want %q", got, want)
+	}
+	if !rows[0].SyncedFlagsInitialized {
+		t.Fatal("captured baseline remains uninitialized")
+	}
+}
+
+func TestUpsertMessageCapturesCommaSeparatedOtherFlags(t *testing.T) {
+	db := newTestDB(t)
+	msg := &Message{
+		MessageID: "legacy-other-flags@example.com", Subject: "legacy", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1", FetchedBody: true,
+	}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatal(err)
+	}
+	legacyCT, err := db.encryptMeta(`\Answered,$Completed,keyword,with,commas`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("UPDATE messages SET flags_other = ? WHERE id = ?", legacyCT, msg.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertMessage(&Message{
+		MessageID: msg.MessageID, Subject: "delta", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1",
+		SyncedFlagsInitialized: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows=%+v err=%v", rows, err)
+	}
+	if got, want := rows[0].SyncedFlags, `\Answered,$Completed`; got != want {
+		t.Fatalf("captured baseline=%q, want %q", got, want)
+	}
+}
+
+func TestExplicitEmptySyncedFlagsUsesStoreSentinel(t *testing.T) {
+	db := newTestDB(t)
+	msg := &Message{
+		MessageID: "empty-baseline@example.com", Subject: "empty", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1",
+		SyncedFlagsInitialized: true,
+	}
+	created, err := db.UpsertMessage(msg)
+	if err != nil || !created {
+		t.Fatalf("upsert created=%v err=%v", created, err)
+	}
+	var stored string
+	if err := db.db.QueryRow("SELECT synced_flags FROM messages WHERE id = ?", msg.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != syncedFlagsEmpty {
+		t.Fatalf("stored baseline=%q, want sentinel %q", stored, syncedFlagsEmpty)
+	}
+	rows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil || len(rows) != 1 || rows[0].SyncedFlags != "" || !rows[0].SyncedFlagsInitialized {
+		t.Fatalf("decoded flag rows=%+v err=%v", rows, err)
+	}
+	if err := db.SetSyncedFlags(msg.MessageID, msg.Account, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRow("SELECT synced_flags FROM messages WHERE id = ?", msg.ID).Scan(&stored); err != nil || stored != syncedFlagsEmpty {
+		t.Fatalf("SetSyncedFlags empty stored=%q err=%v", stored, err)
+	}
+}
+
+func TestInitializedUpsertDoesNotDecryptStoredFlags(t *testing.T) {
+	db := newTestDB(t)
+	msg := &Message{
+		MessageID: "hot-path@example.com", Subject: "full", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1", FetchedBody: true,
+		SyncedFlagsInitialized: true,
+	}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatal(err)
+	}
+	// Invalid ciphertext makes any attempted before-image decrypt fail. An
+	// initialized row must bypass that work and replace the provider metadata.
+	if _, err := db.db.Exec("UPDATE messages SET flags_other = X'010203' WHERE id = ?", msg.ID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := db.UpsertMessage(&Message{
+		MessageID: msg.MessageID, Subject: "metadata", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1",
+		SyncedFlagsInitialized: true,
+	})
+	if err != nil || created {
+		t.Fatalf("initialized metadata upsert created=%v err=%v", created, err)
+	}
+}
+
+func TestCorruptLegacyFlagsDoNotBlockBatchIngest(t *testing.T) {
+	db := newTestDB(t)
+	corrupt := &Message{
+		MessageID: "corrupt@example.com", Subject: "before", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1", Flags: `\Seen`, FetchedBody: true,
+	}
+	if err := db.InsertMessage(corrupt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("UPDATE messages SET flags_other = X'010203' WHERE id = ?", corrupt.ID); err != nil {
+		t.Fatal(err)
+	}
+	healthy := &Message{
+		MessageID: "healthy@example.com", Subject: "healthy", Date: 2, CreatedAt: 2,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r2", FetchedBody: true,
+		SyncedFlagsInitialized: true,
+	}
+	corruptUpdate := &Message{
+		MessageID: corrupt.MessageID, Subject: "after", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1", FetchedBody: true,
+		SyncedFlagsInitialized: true,
+	}
+	if err := db.InsertBatch([]*Message{corruptUpdate, healthy}); err != nil {
+		t.Fatalf("batch ingest: %v", err)
+	}
+	if got, err := db.GetByMessageID(corrupt.MessageID); err != nil || got.Subject != "after" {
+		t.Fatalf("corrupt row after ingest=%+v err=%v", got, err)
+	}
+	if got, err := db.GetByMessageID(healthy.MessageID); err != nil || got == nil {
+		t.Fatalf("healthy sibling=%+v err=%v", got, err)
+	}
+	rows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, row := range rows {
+		if row.MessageID == corrupt.MessageID {
+			found = true
+			if row.SyncedFlags != `\Seen` || !row.SyncedFlagsInitialized {
+				t.Fatalf("degraded baseline=%q initialized=%v, want Seen", row.SyncedFlags, row.SyncedFlagsInitialized)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("corrupt row missing from flag state")
+	}
+}
+
+func TestUpsertMessageWithInitialTagsRollsBackTogether(t *testing.T) {
+	db := newTestDB(t)
+	if _, err := db.db.Exec(`CREATE TRIGGER fail_initial_tag BEFORE INSERT ON tags
+		BEGIN SELECT RAISE(ABORT, 'tag failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	msg := &Message{
+		MessageID: "atomic-tags@example.com", Subject: "atomic", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1",
+		SyncedFlagsInitialized: true,
+	}
+	if _, err := db.UpsertMessageWithInitialTags(msg, []string{"unread"}); err == nil {
+		t.Fatal("upsert succeeded despite tag failure")
+	}
+	if exists, err := db.MessageExistsForAccount(msg.MessageID, msg.Account); err != nil || exists {
+		t.Fatalf("message survived failed initial tags: exists=%v err=%v", exists, err)
+	}
+	if _, err := db.db.Exec("DROP TRIGGER fail_initial_tag"); err != nil {
+		t.Fatal(err)
+	}
+	created, err := db.UpsertMessageWithInitialTags(msg, []string{"unread"})
+	if err != nil || !created {
+		t.Fatalf("retry created=%v err=%v", created, err)
+	}
+	rows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil || len(rows) != 1 || !slices.Contains(rows[0].Tags, "unread") {
+		t.Fatalf("retry rows=%+v err=%v", rows, err)
+	}
+}
+
+func TestConcurrentUpsertReportsSingleCreatorAndCapturesOnce(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "concurrent.db")
+	kr := testKeyring(t)
+	first, err := Open(dbPath, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if err := first.Init(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(dbPath, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	dbs := []*DB{first, second}
+	created := make([]bool, len(dbs))
+	errs := make([]error, len(dbs))
+	var wg sync.WaitGroup
+	for round := 0; round < 40; round++ {
+		messageID := fmt.Sprintf("concurrent-%d@example.com", round)
+		for i, db := range dbs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				created[i], errs[i] = db.UpsertMessage(&Message{
+					MessageID: messageID, Subject: "same", Date: 1, CreatedAt: 1,
+					Mailbox: "ALL", Account: "work", RemoteRef: messageID,
+					SyncedFlagsInitialized: true,
+				})
+			}()
+		}
+		wg.Wait()
+		if errs[0] != nil || errs[1] != nil {
+			t.Fatalf("round %d concurrent errors=%v", round, errs)
+		}
+		if created[0] == created[1] {
+			t.Fatalf("round %d created results=%v, want exactly one creator", round, created)
+		}
+
+		legacyID := fmt.Sprintf("legacy-concurrent-%d@example.com", round)
+		if err := first.InsertMessage(&Message{
+			MessageID: legacyID, Subject: "legacy", Date: 1, CreatedAt: 1,
+			Mailbox: "ALL", Account: "work", RemoteRef: legacyID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for i, db := range dbs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, errs[i] = db.UpsertMessage(&Message{
+					MessageID: legacyID, Subject: "delta", Date: 1, CreatedAt: 1,
+					Mailbox: "ALL", Account: "work", RemoteRef: legacyID,
+					Flags: `\Seen,\Flagged`, SyncedFlagsInitialized: true,
+				})
+			}()
+		}
+		wg.Wait()
+		if errs[0] != nil || errs[1] != nil {
+			t.Fatalf("round %d concurrent capture errors=%v", round, errs)
+		}
+		rows, err := first.GetFolderFlagState("work", "ALL")
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, row := range rows {
+			if row.MessageID == legacyID {
+				found = true
+				if row.SyncedFlags != "" || !row.SyncedFlagsInitialized {
+					t.Fatalf("round %d captured baseline=%q initialized=%v, want explicit empty before-image", round, row.SyncedFlags, row.SyncedFlagsInitialized)
+				}
+				if !row.IsSeen || !row.IsFlagged {
+					t.Fatalf("round %d final provider columns are half-updated: seen=%v flagged=%v", round, row.IsSeen, row.IsFlagged)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("round %d legacy concurrent row missing", round)
+		}
+	}
+}
+
 func TestUpsert_HeadersOnlyThenBody(t *testing.T) {
 	db := newTestDB(t)
 	now := time.Now().Unix()
@@ -280,6 +604,190 @@ func TestUpsert_DoesNotOverwriteBody(t *testing.T) {
 	}
 	if !msg.FetchedBody {
 		t.Error("fetched_body flag was reset")
+	}
+}
+
+func TestUpsert_MetadataOnlyPreservesFullTextSearch(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	full := &Message{
+		MessageID:              "metadata-search@x",
+		Subject:                "Quarterly narwhal report",
+		FromAddr:               "sender@example.com",
+		ToAddrs:                "recipient@example.com",
+		CCAddrs:                "copy@example.com",
+		Date:                   now,
+		CreatedAt:              now,
+		BodyText:               "the aardvark body text",
+		BodyHTML:               "<p>the aardvark body text</p>",
+		Mailbox:                "INBOX",
+		Account:                "work",
+		RemoteRef:              "old-ref",
+		FetchedBody:            true,
+		SyncedFlagsInitialized: true,
+	}
+	if err := db.InsertMessage(full); err != nil {
+		t.Fatalf("insert full message: %v", err)
+	}
+	for _, query := range []string{"subject:narwhal", "aardvark"} {
+		if got, err := db.Search(query, 10); err != nil || len(got) != 1 {
+			t.Fatalf("search %q before metadata update = %d results, %v; want 1", query, len(got), err)
+		}
+	}
+
+	// Gmail/JMAP replacement snapshots can carry only identity, flags and a
+	// provider reference for a message whose full content is already local.
+	var changesBefore int64
+	if err := db.db.QueryRow("SELECT total_changes()").Scan(&changesBefore); err != nil {
+		t.Fatalf("read changes before metadata update: %v", err)
+	}
+	metadata := &Message{
+		MessageID: "metadata-search@x",
+		Mailbox:   "INBOX",
+		Account:   "work",
+		RemoteRef: "new-ref",
+		Flags:     `\Seen`,
+	}
+	if err := db.InsertMessage(metadata); err != nil {
+		t.Fatalf("insert metadata-only update: %v", err)
+	}
+	var changesAfter int64
+	if err := db.db.QueryRow("SELECT total_changes()").Scan(&changesAfter); err != nil {
+		t.Fatalf("read changes after metadata update: %v", err)
+	}
+	if got := changesAfter - changesBefore; got != 1 {
+		t.Errorf("metadata-only update changed %d rows, want 1 messages row and no FTS rewrite", got)
+	}
+
+	for _, query := range []string{"subject:narwhal", "aardvark"} {
+		if got, err := db.Search(query, 10); err != nil || len(got) != 1 {
+			t.Errorf("search %q after metadata update = %d results, %v; want 1", query, len(got), err)
+		}
+	}
+	stored, err := db.GetByMessageID(full.MessageID)
+	if err != nil || stored == nil {
+		t.Fatalf("stored message after metadata update = %+v, %v", stored, err)
+	}
+	if stored.Subject != full.Subject || stored.FromAddr != full.FromAddr ||
+		stored.ToAddrs != full.ToAddrs || stored.CCAddrs != full.CCAddrs ||
+		stored.BodyText != full.BodyText || stored.BodyHTML != full.BodyHTML || !stored.FetchedBody {
+		t.Errorf("stored content after metadata update = %+v, want content from %+v", stored, full)
+	}
+	if stored.RemoteRef != metadata.RemoteRef || stored.Flags != metadata.Flags {
+		t.Errorf("stored metadata = remote_ref %q flags %q, want %q and %q",
+			stored.RemoteRef, stored.Flags, metadata.RemoteRef, metadata.Flags)
+	}
+}
+
+func TestUpsert_FullReingestIndexesEffectiveStoredValues(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	if err := db.InsertMessage(&Message{
+		MessageID: "full-reingest@x", Subject: "Old headline", FromAddr: "old@example.com",
+		ToAddrs: "old-to@example.com", CCAddrs: "old-cc@example.com",
+		Date: now, CreatedAt: now, BodyText: "stored platypus body", BodyHTML: "<p>stored platypus body</p>",
+		Mailbox: "INBOX", Account: "work", FetchedBody: true,
+	}); err != nil {
+		t.Fatalf("insert original message: %v", err)
+	}
+
+	incoming := &Message{
+		MessageID: "full-reingest@x", Subject: "Revised wombat headline", FromAddr: "new@example.com",
+		ToAddrs: "new-to@example.com", CCAddrs: "new-cc@example.com",
+		Date: now, CreatedAt: now, BodyText: "incoming echidna body", BodyHTML: "<p>incoming echidna body</p>",
+		Mailbox: "INBOX", Account: "work", FetchedBody: true,
+	}
+	if err := db.InsertMessage(incoming); err != nil {
+		t.Fatalf("full reingest: %v", err)
+	}
+
+	stored, err := db.GetByMessageID(incoming.MessageID)
+	if err != nil || stored == nil {
+		t.Fatalf("get reingested message = %+v, %v", stored, err)
+	}
+	if stored.Subject != incoming.Subject || stored.FromAddr != incoming.FromAddr ||
+		stored.ToAddrs != incoming.ToAddrs || stored.CCAddrs != incoming.CCAddrs {
+		t.Errorf("effective metadata = %+v, want incoming metadata %+v", stored, incoming)
+	}
+	if stored.BodyText != "stored platypus body" || stored.BodyHTML != "<p>stored platypus body</p>" {
+		t.Errorf("stored body = %q / %q, want original body", stored.BodyText, stored.BodyHTML)
+	}
+	for _, query := range []string{"subject:wombat", "platypus"} {
+		if got, err := db.Search(query, 10); err != nil || len(got) != 1 {
+			t.Errorf("search %q after full reingest = %d results, %v; want 1", query, len(got), err)
+		}
+	}
+}
+
+func TestUpsert_MetadataOnlyFirstInsertBuildsFTS(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	metadata := &Message{
+		MessageID: "metadata-first@x", Subject: "Capybara notice", FromAddr: "sender@example.com",
+		ToAddrs: "recipient@example.com", CCAddrs: "copy@example.com",
+		Date: now, CreatedAt: now, Mailbox: "INBOX", Account: "work",
+	}
+	if err := db.InsertMessage(metadata); err != nil {
+		t.Fatalf("metadata-only first insert: %v", err)
+	}
+	stored, err := db.GetByMessageID(metadata.MessageID)
+	if err != nil || stored == nil || stored.Subject != metadata.Subject || stored.CCAddrs != metadata.CCAddrs {
+		t.Fatalf("stored metadata-only message = %+v, %v", stored, err)
+	}
+	if got, err := db.Search("subject:capybara", 10); err != nil || len(got) != 1 {
+		t.Fatalf("search metadata-only first insert = %d results, %v; want 1", len(got), err)
+	}
+}
+
+func TestUpsert_MetadataOnlyRepairsMissingFTSWithoutBreakingIntegrity(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	full := &Message{
+		MessageID: "repair-fts@x", Subject: "Manatee report", FromAddr: "sender@example.com",
+		ToAddrs: "recipient@example.com", CCAddrs: "copy@example.com",
+		Date: now, CreatedAt: now, BodyText: "durable pangolin body",
+		Mailbox: "INBOX", Account: "work", FetchedBody: true,
+	}
+	if err := db.InsertMessage(full); err != nil {
+		t.Fatalf("insert full message: %v", err)
+	}
+	if _, err := db.db.Exec("DELETE FROM messages_blind_fts WHERE rowid = ?", full.ID); err != nil {
+		t.Fatalf("remove FTS row: %v", err)
+	}
+	if err := db.InsertMessage(&Message{
+		MessageID: full.MessageID, Mailbox: "INBOX", Account: "work", RemoteRef: "new-ref",
+	}); err != nil {
+		t.Fatalf("metadata-only repair: %v", err)
+	}
+	for _, query := range []string{"subject:manatee", "pangolin"} {
+		if got, err := db.Search(query, 10); err != nil || len(got) != 1 {
+			t.Errorf("search %q after FTS repair = %d results, %v; want 1", query, len(got), err)
+		}
+	}
+
+	if _, err := db.db.Exec(`INSERT INTO messages_blind_fts(messages_blind_fts, rank)
+		VALUES ('integrity-check', 1)`); err != nil {
+		t.Errorf("blind FTS integrity-check: %v", err)
+	}
+	var messages, ftsRows, orphans, duplicateRowIDs int
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&messages); err != nil {
+		t.Fatalf("count messages: %v", err)
+	}
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM messages_blind_fts").Scan(&ftsRows); err != nil {
+		t.Fatalf("count FTS rows: %v", err)
+	}
+	if err := db.db.QueryRow(`SELECT COUNT(*) FROM messages_blind_fts f
+		LEFT JOIN messages m ON m.id = f.rowid WHERE m.id IS NULL`).Scan(&orphans); err != nil {
+		t.Fatalf("count FTS orphans: %v", err)
+	}
+	if err := db.db.QueryRow(`SELECT COUNT(*) FROM (
+		SELECT rowid FROM messages_blind_fts GROUP BY rowid HAVING COUNT(*) > 1
+	)`).Scan(&duplicateRowIDs); err != nil {
+		t.Fatalf("count duplicate FTS rowids: %v", err)
+	}
+	if ftsRows != messages || orphans != 0 || duplicateRowIDs != 0 {
+		t.Errorf("FTS shape: messages=%d rows=%d orphans=%d duplicate_rowids=%d",
+			messages, ftsRows, orphans, duplicateRowIDs)
 	}
 }
 
@@ -446,6 +954,13 @@ func TestUpsert_CrossAccount(t *testing.T) {
 	msg, _ := db.GetByMessageID("cross@x")
 	if msg == nil {
 		t.Fatal("GetByMessageID returned nil")
+	}
+	candidates, err := db.GetAllByMessageID("cross@x")
+	if err != nil {
+		t.Fatalf("GetAllByMessageID: %v", err)
+	}
+	if len(candidates) != 2 {
+		t.Fatalf("GetAllByMessageID returned %d rows, want 2", len(candidates))
 	}
 }
 

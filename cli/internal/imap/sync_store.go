@@ -44,25 +44,13 @@ func (s *Syncer) storeInsertMessage(mailboxName string, imapMsg *goimap.Message,
 		dateUnix = imapMsg.InternalDate.Unix()
 	}
 
-	storeMsg := &store.Message{
-		MessageID:   messageID,
-		Subject:     content.Subject,
-		FromAddr:    content.From,
-		ToAddrs:     content.To,
-		CCAddrs:     content.CC,
-		InReplyTo:   content.InReplyTo,
-		Refs:        content.References,
-		BodyText:    content.Body,
-		BodyHTML:    content.HTML,
-		Date:        dateUnix,
-		CreatedAt:   time.Now().Unix(),
-		Mailbox:     mailboxName,
-		Flags:       strings.Join(imapMsg.Flags, ","),
-		UID:         imapMsg.Uid,
-		Size:        len(msgBody),
-		FetchedBody: true,
-		Account:     s.accountName(),
-	}
+	storeMsg := StoreMessageFromContent(messageID, content, dateUnix, time.Now().Unix())
+	storeMsg.Mailbox = mailboxName
+	storeMsg.Flags = strings.Join(imapMsg.Flags, ",")
+	storeMsg.UID = imapMsg.Uid
+	storeMsg.Size = len(msgBody)
+	storeMsg.FetchedBody = true
+	storeMsg.Account = s.accountName()
 
 	if err := s.store.InsertMessage(storeMsg); err != nil {
 		return fmt.Errorf("insert message: %w", err)

@@ -46,14 +46,57 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 25 {
-		t.Errorf("version = %d, want 25", version)
+	if version != 27 {
+		t.Errorf("version = %d, want 27", version)
 	}
 }
 
 func TestOpen_RejectsNilKeyring(t *testing.T) {
 	if _, err := Open(":memory:", nil); err == nil {
 		t.Error("Open(nil keyring) should error")
+	}
+}
+
+func TestOpenReadOnlyRejectsWrites(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "email.db")
+	writable, err := Open(dbPath, testKeyring(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := writable.Init(); err != nil {
+		writable.Close()
+		t.Fatalf("Init: %v", err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatalf("close writable store: %v", err)
+	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+
+	readOnly, err := OpenReadOnly(dbPath, testKeyring(t))
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	var version int
+	if err := readOnly.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		readOnly.Close()
+		t.Fatalf("read schema version: %v", err)
+	}
+	if _, err := readOnly.db.Exec("UPDATE schema_version SET version = version"); err == nil {
+		readOnly.Close()
+		t.Fatal("read-only store accepted a write")
+	}
+	if err := readOnly.Close(); err != nil {
+		t.Fatalf("close read-only store: %v", err)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("read-only open changed database contents")
 	}
 }
 
@@ -383,14 +426,14 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	}
 	db := sd.db
 
-	// Schema version must be at the latest migration (v25: drop stale [imap]/
-	// folder tags) after Init runs every migration forward from a fresh DB.
+	// Schema version must be at the latest migration (v26: repair legacy
+	// comma-separated flags) after Init runs every migration forward.
 	var version int
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 25 {
-		t.Fatalf("version = %d, want 25", version)
+	if version != 27 {
+		t.Fatalf("version = %d, want 27", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).

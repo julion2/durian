@@ -2,10 +2,14 @@ package imapbackend
 
 import (
 	"bytes"
+	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/imap"
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 func TestCursorRoundTrip(t *testing.T) {
@@ -50,5 +54,34 @@ func TestCompletedReplacementCursorUsesLegacyFormat(t *testing.T) {
 	}
 	if replacement || decoded.UIDValidity != 42 || len(decoded.SyncedUIDs) != 1 {
 		t.Fatalf("decoded legacy cursor = %+v, replacement=%v", decoded, replacement)
+	}
+}
+
+func TestReconnectFailureRedactsBothProviderResponses(t *testing.T) {
+	const firstResponse = "first short IMAP provider response"
+	const reconnectResponse = "second short IMAP provider response"
+	firstRaw := errors.New(firstResponse)
+	first := redact.ExternalError(firstRaw, "IMAP operation failed: server response "+redact.Placeholder)
+	reconnect := redact.ExternalError(errors.New(reconnectResponse), "IMAP reconnect failed: server response "+redact.Placeholder)
+	err := reconnectFailure(first, reconnect)
+
+	wantError := firstResponse + " (reconnect failed: " + reconnectResponse + ")"
+	if err.Error() != wantError {
+		t.Fatalf("Error() = %q, want %q", err.Error(), wantError)
+	}
+	if !errors.Is(err, firstRaw) {
+		t.Fatal("reconnect aggregate broke the original operation error chain")
+	}
+
+	var logOutput bytes.Buffer
+	logger := slog.New(redact.Wrap(slog.NewTextHandler(&logOutput, nil)))
+	logger.Error("IMAP operation failed", "err", err)
+	for _, response := range []string{firstResponse, reconnectResponse} {
+		if strings.Contains(logOutput.String(), response) {
+			t.Errorf("provider response %q leaked into log:\n%s", response, logOutput.String())
+		}
+	}
+	if !strings.Contains(logOutput.String(), redact.Placeholder) {
+		t.Fatalf("redaction marker missing from log:\n%s", logOutput.String())
 	}
 }

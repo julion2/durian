@@ -166,15 +166,6 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 			"ref", msg.Ref.ID, "folder", folderName, "synthetic_id", messageID)
 	}
 
-	// A genuinely new message vs. an update of one already stored (a delta
-	// re-delivers a message when its flags change): the caller reports the two
-	// separately so "new" counts arrivals, not re-syncs.
-	existed, err := db.MessageExistsForAccount(messageID, opts.Account)
-	if err != nil {
-		return "", false, fmt.Errorf("check message existence: %w", err)
-	}
-	created := !existed
-
 	var dateUnix int64
 	if t, err := mail.ParseDate(content.Date); err == nil {
 		dateUnix = t.Unix()
@@ -188,37 +179,28 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	// byte-identical with rows written by the legacy syncer.
 	flagState := flagStateFromBackend(msg.Flags)
 	flagStr := strings.Join(flagState.ToIMAPFlags(), ",")
+	flagAdd, _ := flagState.ToTagOps()
 
-	storeMsg := &store.Message{
-		MessageID: messageID,
-		Subject:   content.Subject,
-		FromAddr:  content.From,
-		ToAddrs:   content.To,
-		CCAddrs:   content.CC,
-		InReplyTo: content.InReplyTo,
-		Refs:      content.References,
-		BodyText:  content.Body,
-		BodyHTML:  content.HTML,
-		Date:      dateUnix,
-		CreatedAt: time.Now().Unix(),
-		Mailbox:   folderName,
-		Flags:     flagStr,
-		// UID stays 0 on the engine path: the uint32 UID column is an IMAP
-		// implementation detail; the neutral RemoteRef column carries the
-		// provider handle instead.
-		UID:         0,
-		Size:        len(msg.Raw),
-		FetchedBody: true,
-		Account:     opts.Account,
-		RemoteRef:   msg.Ref.ID,
-		// The message's current server flags are the correct initial
-		// baseline: the first post-ingest flag pass is then a no-op unless
-		// the user changed something locally. joinFlags (not flagStr) so the
-		// baseline round-trips $Completed and avoids per-sync download churn.
-		SyncedFlags: joinFlags(flagState),
-	}
+	storeMsg := imap.StoreMessageFromContent(messageID, content, dateUnix, time.Now().Unix())
+	storeMsg.Mailbox = folderName
+	storeMsg.Flags = flagStr
+	// UID stays 0 on the engine path: the uint32 UID column is an IMAP
+	// implementation detail; the neutral RemoteRef column carries the
+	// provider handle instead.
+	storeMsg.UID = 0
+	storeMsg.Size = len(msg.Raw)
+	storeMsg.FetchedBody = true
+	storeMsg.Account = opts.Account
+	storeMsg.RemoteRef = msg.Ref.ID
+	// The message's current server flags are the correct initial baseline: the
+	// first post-ingest flag pass is then a no-op unless the user changed
+	// something locally. joinFlags (not flagStr) so the baseline round-trips
+	// $Completed and avoids per-sync download churn.
+	storeMsg.SyncedFlags = joinFlags(flagState)
+	storeMsg.SyncedFlagsInitialized = true
 
-	if err := db.InsertMessage(storeMsg); err != nil {
+	created, err := db.UpsertMessageWithInitialTags(storeMsg, flagAdd)
+	if err != nil {
 		return "", false, fmt.Errorf("insert message: %w", err)
 	}
 
@@ -274,17 +256,6 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 			if err := db.AddTag(storeMsg.ID, tag); err != nil {
 				return "", false, fmt.Errorf("add folder tag %q: %w", tag, err)
 			}
-		}
-	}
-
-	// Flag-based tags (unread, flagged, replied). Like the legacy insert path
-	// this only applies the add half; the engine's per-folder flag
-	// reconciliation pass applies removals so re-fetched (updated) messages
-	// shed stale flag tags.
-	flagAdd, _ := flagState.ToTagOps()
-	for _, tag := range flagAdd {
-		if err := db.AddTag(storeMsg.ID, tag); err != nil {
-			return "", false, fmt.Errorf("add flag tag %q: %w", tag, err)
 		}
 	}
 

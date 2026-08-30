@@ -5,6 +5,7 @@ go_library(
     srcs = ["client.go"],
     importpath = "github.com/julion2/durian/cli/internal/tagsync",
     visibility = ["//cli:__subpackages__"],
+    deps = ["//cli/internal/redact"],
 )
 
 go_test(
@@ -12,4 +13,5 @@ go_test(
     size = "small",
     srcs = ["client_test.go"],
     embed = [":tagsync"],
+    deps = ["//cli/internal/redact"],
 )

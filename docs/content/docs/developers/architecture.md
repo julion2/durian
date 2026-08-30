@@ -94,7 +94,7 @@ Integration tests in `integration/integration_test.sh` exercise the contract end
 
 ## Storage model
 
-One SQLite file at `~/.local/share/durian/email.db` (or `$XDG_DATA_HOME/durian/email.db`). Schema version is bumped on every migration step (encryption, then the sync-engine `synced_flags`/`synced_labels` baselines); current version is v25.
+One SQLite file at `~/.local/share/durian/email.db` (or `$XDG_DATA_HOME/durian/email.db`). Schema version is bumped on every migration step (encryption, sync-engine baselines, and data repairs); current version is v26.
 
 - `messages` — one row per email. Plaintext columns: `message_id`, `thread_id`, `in_reply_to`, `refs`, `from_addr`, `to_addrs`, `cc_addrs`, `date`, `created_at`, `size`, `uid`, `account_id` + `mailbox_id` (FKs), `is_seen` / `is_flagged` / `is_deleted` booleans. Encrypted BLOBs: `subject_ct`, `body_text_ct`, `body_html_ct`, `flags_other_ct` (non-canonical IMAP flags).
 - `tags` — tag join table, one row per (message_id, tag).

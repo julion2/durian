@@ -29,6 +29,7 @@ import (
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/imap"
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 // roleMappings pairs IMAP SPECIAL-USE roles with their backend.Role in a fixed
@@ -102,7 +103,7 @@ func (b *Backend) FetchFolders(_ context.Context) ([]backend.Folder, error) {
 
 // fetchFoldersOnce performs one folder-listing pass (no reconnect handling).
 func (b *Backend) fetchFoldersOnce() ([]backend.Folder, error) {
-	names, err := b.client.GetSyncMailboxes()
+	mailboxes, err := b.client.GetSyncMailboxInfos()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list sync mailboxes: %w", err)
 	}
@@ -110,24 +111,24 @@ func (b *Backend) fetchFoldersOnce() ([]backend.Folder, error) {
 	// Resolve special-use roles. A mailbox keeps the first role that claims it.
 	roleByName := make(map[string]backend.Role)
 	for _, m := range roleMappings {
-		name, err := b.client.FindMailboxByRole(m.imapRole)
-		if err != nil {
-			continue // Role not present on this server
+		name, roleErr := imap.FindMailboxByRoleIn(mailboxes, m.imapRole)
+		if roleErr != nil {
+			continue // This successful LIST snapshot has no mailbox for the role.
 		}
 		if _, taken := roleByName[name]; !taken {
 			roleByName[name] = m.role
 		}
 	}
 
-	folders := make([]backend.Folder, 0, len(names))
-	for _, name := range names {
-		role := roleByName[name]
-		if strings.EqualFold(name, "INBOX") {
+	folders := make([]backend.Folder, 0, len(mailboxes))
+	for _, mailbox := range mailboxes {
+		role := roleByName[mailbox.Name]
+		if strings.EqualFold(mailbox.Name, "INBOX") {
 			role = backend.RoleInbox
 		}
 		folders = append(folders, backend.Folder{
-			Name:    name,
-			Display: name,
+			Name:    mailbox.Name,
+			Display: mailbox.Name,
 			Role:    role,
 			// GetSyncMailboxes already filters \Noselect containers.
 			Selectable: true,
@@ -381,28 +382,26 @@ func (b *Backend) FetchFlags(_ context.Context, folder string, refs []backend.Re
 	return result, nil
 }
 
-// Move relocates ref into destFolder via the IMAP copy + \Deleted + expunge
-// dance. IMAP (without UIDPLUS support in go-imap v1) does not report the new
-// UID, so the returned ref has an empty ID; the next sync of destFolder
-// re-establishes the mapping via Message-ID.
+// Move relocates ref into destFolder with UID MOVE. go-imap v1 does not expose
+// the destination UID, so the returned ref has an empty ID; the next sync of
+// destFolder re-establishes the mapping via Message-ID.
 func (b *Backend) Move(_ context.Context, ref backend.RemoteRef, destFolder string) (backend.RemoteRef, error) {
 	uid, err := parseUID(ref)
 	if err != nil {
 		return backend.RemoteRef{}, err
 	}
+	if ref.MessageID == "" {
+		return backend.RemoteRef{}, fmt.Errorf("ref has no Message-ID identity")
+	}
 
 	if _, err := b.client.SelectMailbox(ref.Folder); err != nil {
 		return backend.RemoteRef{}, fmt.Errorf("failed to select %s: %w", ref.Folder, err)
 	}
-	if err := b.client.CopyToMailbox(uid, destFolder); err != nil {
-		return backend.RemoteRef{}, fmt.Errorf("failed to copy UID %d to %s: %w", uid, destFolder, err)
-	}
-	// Delete marks \Deleted and expunges (removes the source copy).
-	if err := b.client.Delete(uid); err != nil {
-		return backend.RemoteRef{}, fmt.Errorf("failed to delete source UID %d in %s: %w", uid, ref.Folder, err)
+	if err := b.client.MoveMessageToMailbox(uid, ref.MessageID, destFolder); err != nil {
+		return backend.RemoteRef{}, fmt.Errorf("failed to move UID %d to %s: %w", uid, destFolder, err)
 	}
 
-	return backend.RemoteRef{Folder: destFolder, ID: ""}, nil
+	return backend.RemoteRef{Folder: destFolder, ID: "", MessageID: ref.MessageID}, nil
 }
 
 // Append stores msg into folder. The go-imap v1 client does not expose
@@ -511,10 +510,15 @@ func (b *Backend) withReconnect(op func() error) error {
 
 	slog.Warn("Connection lost, reconnecting", "module", "IMAPBACKEND", "err", err)
 	if rerr := b.client.Reconnect(); rerr != nil {
-		return fmt.Errorf("%w (reconnect failed: %v)", err, rerr)
+		return reconnectFailure(err, rerr)
 	}
 	slog.Debug("Reconnected, retrying operation", "module", "IMAPBACKEND")
 	return op()
+}
+
+func reconnectFailure(operationErr, reconnectErr error) error {
+	err := fmt.Errorf("%w (reconnect failed: %v)", operationErr, reconnectErr)
+	return redact.ExternalError(err, "IMAP operation and reconnect failed: server responses "+redact.Placeholder)
 }
 
 // isConnectionError reports whether err is a dropped/broken IMAP connection.

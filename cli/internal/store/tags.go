@@ -2,7 +2,9 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -52,35 +54,192 @@ func (d *DB) UntagThread(threadID, tag string) error {
 	return nil
 }
 
-// ModifyTagsByThread atomically adds and removes tags for all messages in a thread.
-func (d *DB) ModifyTagsByThread(threadID string, addTags, removeTags []string) error {
+// TagTargetRow is one stored message a tag operation will act on.
+type TagTargetRow struct {
+	DBID      int64
+	MessageID string
+	Account   string
+}
+
+// ThreadTagTarget resolves the exact rows a tag operation should touch: every
+// message in threadID, narrowed to accounts when that set is non-empty.
+//
+// It exists so the scope is decided once. A tag operation has five effects —
+// preview, mutation, journal, remote push, sync trigger — and each of them
+// deriving "which messages" on its own is how they drift apart: the account
+// filter used to narrow only the thread *search*, after which every effect
+// worked thread-wide and wrote into accounts the user had not selected. One
+// resolved set, five consumers.
+func (d *DB) ThreadTagTarget(threadID string, accounts []string) ([]TagTargetRow, error) {
+	q := `SELECT m.id, m.message_id, IFNULL(ac.name, '')
+		FROM messages m
+		LEFT JOIN accounts ac ON ac.id = m.account_id
+		WHERE m.thread_id = ?`
+	params := []any{threadID}
+	if len(accounts) > 0 {
+		// Names are resolved to ids the same way search does, aliases
+		// included, so "--account office" scopes the mutation exactly as it
+		// scoped the search that found the thread.
+		ids, err := d.resolveAccountIDs(accounts)
+		if err != nil {
+			return nil, fmt.Errorf("resolve accounts: %w", err)
+		}
+		if len(ids) == 0 {
+			// The filter named only accounts this store does not know. No row
+			// is in scope, which is not the same as "no filter".
+			return nil, nil
+		}
+		placeholders := make([]string, len(ids))
+		for i, id := range ids {
+			placeholders[i] = "?"
+			params = append(params, id)
+		}
+		q += " AND m.account_id IN (" + strings.Join(placeholders, ",") + ")"
+	}
+	q += " ORDER BY m.id"
+
+	rows, err := d.db.Query(q, params...)
+	if err != nil {
+		return nil, fmt.Errorf("resolve tag target: %w", err)
+	}
+	defer rows.Close()
+
+	var out []TagTargetRow
+	for rows.Next() {
+		var row TagTargetRow
+		if err := rows.Scan(&row.DBID, &row.MessageID, &row.Account); err != nil {
+			return nil, fmt.Errorf("scan tag target row: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// ModifyTagsByDBIDs atomically adds and removes tags on exactly the given rows,
+// reporting whether any stored tag changed.
+func (d *DB) ModifyTagsByDBIDs(ids []int64, addTags, removeTags []string) (bool, error) {
+	return d.modifyTagsByDBIDs(ids, addTags, removeTags, true)
+}
+
+// PreviewTagChangesByDBIDs reports whether the operation would change anything,
+// rolling the transaction back without modifying the store.
+func (d *DB) PreviewTagChangesByDBIDs(ids []int64, addTags, removeTags []string) (bool, error) {
+	return d.modifyTagsByDBIDs(ids, addTags, removeTags, false)
+}
+
+func (d *DB) modifyTagsByDBIDs(ids []int64, addTags, removeTags []string, commit bool) (bool, error) {
+	if len(ids) == 0 {
+		return false, nil
+	}
+	placeholders := make([]string, len(ids))
+	idParams := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		idParams[i] = id
+	}
+	in := "(" + strings.Join(placeholders, ",") + ")"
+
 	tx, err := d.db.Begin()
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+		return false, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
+	changed := false
 	for _, tag := range addTags {
-		_, err := tx.Exec(`
+		params := append([]any{tag}, idParams...)
+		result, err := tx.Exec(
+			"INSERT OR IGNORE INTO tags (message_id, tag) SELECT id, ? FROM messages WHERE id IN "+in,
+			params...)
+		if err != nil {
+			return false, fmt.Errorf("add tag %q: %w", tag, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("count added tag %q: %w", tag, err)
+		}
+		changed = changed || rows > 0
+	}
+
+	for _, tag := range removeTags {
+		params := append([]any{tag}, idParams...)
+		result, err := tx.Exec(
+			"DELETE FROM tags WHERE tag = ? AND message_id IN "+in, params...)
+		if err != nil {
+			return false, fmt.Errorf("remove tag %q: %w", tag, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("count removed tag %q: %w", tag, err)
+		}
+		changed = changed || rows > 0
+	}
+
+	if !commit {
+		return changed, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit tag changes: %w", err)
+	}
+	return changed, nil
+}
+
+// ModifyTagsByThread atomically adds and removes tags for all messages in a thread.
+// It reports whether any stored tag changed.
+func (d *DB) ModifyTagsByThread(threadID string, addTags, removeTags []string) (bool, error) {
+	return d.modifyTagsByThread(threadID, addTags, removeTags, true)
+}
+
+// PreviewTagChangesByThread reports whether a tag operation would change a
+// thread, rolling the transaction back without modifying the store.
+func (d *DB) PreviewTagChangesByThread(threadID string, addTags, removeTags []string) (bool, error) {
+	return d.modifyTagsByThread(threadID, addTags, removeTags, false)
+}
+
+func (d *DB) modifyTagsByThread(threadID string, addTags, removeTags []string, commit bool) (bool, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	changed := false
+	for _, tag := range addTags {
+		result, err := tx.Exec(`
 			INSERT OR IGNORE INTO tags (message_id, tag)
 			SELECT id, ? FROM messages WHERE thread_id = ?`,
 			tag, threadID)
 		if err != nil {
-			return fmt.Errorf("add tag %q: %w", tag, err)
+			return false, fmt.Errorf("add tag %q: %w", tag, err)
 		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("count added tag %q: %w", tag, err)
+		}
+		changed = changed || rows > 0
 	}
 
 	for _, tag := range removeTags {
-		_, err := tx.Exec(`
+		result, err := tx.Exec(`
 			DELETE FROM tags WHERE tag = ? AND message_id IN (
 				SELECT id FROM messages WHERE thread_id = ?
 			)`, tag, threadID)
 		if err != nil {
-			return fmt.Errorf("remove tag %q: %w", tag, err)
+			return false, fmt.Errorf("remove tag %q: %w", tag, err)
 		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("count removed tag %q: %w", tag, err)
+		}
+		changed = changed || rows > 0
 	}
 
-	return tx.Commit()
+	if commit {
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+	}
+	return changed, nil
 }
 
 // GetMessageTagsBatch returns tags for multiple messages in a single query.
@@ -144,19 +303,9 @@ func (d *DB) ListTags(accounts ...string) ([]string, error) {
 	var rows *sql.Rows
 	var err error
 	if len(accounts) > 0 {
-		// Resolve account names → ids. Unknown names contribute nothing
-		// to the IN-list; if all names are unknown we short-circuit empty.
-		ids := make([]int64, 0, len(accounts))
-		for _, name := range accounts {
-			var id int64
-			err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", name).Scan(&id)
-			if err == sql.ErrNoRows {
-				continue
-			}
-			if err != nil {
-				return nil, fmt.Errorf("lookup account id: %w", err)
-			}
-			ids = append(ids, id)
+		ids, resolveErr := d.resolveAccountIDs(accounts)
+		if resolveErr != nil {
+			return nil, resolveErr
 		}
 		if len(ids) == 0 {
 			return nil, nil
@@ -262,6 +411,98 @@ func (d *DB) ModifyTagsByMessageIDAndAccount(messageID, account string, addTags,
 	}
 
 	return tx.Commit()
+}
+
+// ModifyFlagTagsIfUnchanged is ModifyTagsByMessageIDAndAccount for a caller
+// that decided what to write from a snapshot it read earlier, and must not
+// overwrite a change that landed in between.
+//
+// watch names the tags the caller's decision depended on, and expected is the
+// subset of those the snapshot held. Both the comparison and the write happen
+// in one transaction, so with immediate transactions the pair is atomic against
+// another process as well as another goroutine.
+//
+// Returns false and writes nothing when the current state disagrees. The caller
+// is expected to leave its own before-image alone and retry, rather than force
+// a decision computed against a state that no longer exists.
+func (d *DB) ModifyFlagTagsIfUnchanged(messageID, account string, watch, expected, addTags, removeTags []string) (bool, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// A missing row is a genuine no-op, but any other failure is not: reporting
+	// it as an applied write would let the caller advance a before-image over a
+	// change it never made.
+	var accountID int64
+	switch err := tx.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID); {
+	case errors.Is(err, sql.ErrNoRows):
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("resolve account %q: %w", account, err)
+	}
+	var dbID int64
+	switch err := tx.QueryRow(
+		"SELECT id FROM messages WHERE message_id = ? AND account_id = ?",
+		messageID, accountID).Scan(&dbID); {
+	case errors.Is(err, sql.ErrNoRows):
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("resolve message %q: %w", messageID, err)
+	}
+
+	rows, err := tx.Query("SELECT tag FROM tags WHERE message_id = ?", dbID)
+	if err != nil {
+		return false, fmt.Errorf("read current tags: %w", err)
+	}
+	watched := make(map[string]bool, len(watch))
+	for _, tag := range watch {
+		watched[tag] = true
+	}
+	var current []string
+	for rows.Next() {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
+			rows.Close()
+			return false, fmt.Errorf("scan tag: %w", err)
+		}
+		if watched[tag] {
+			current = append(current, tag)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return false, fmt.Errorf("read current tags: %w", err)
+	}
+	rows.Close()
+
+	want := slices.Clone(expected)
+	slices.Sort(want)
+	slices.Sort(current)
+	if !slices.Equal(current, want) {
+		return false, nil
+	}
+
+	for _, tag := range addTags {
+		if _, err := tx.Exec(
+			"INSERT OR IGNORE INTO tags (message_id, tag) VALUES (?, ?)",
+			dbID, tag); err != nil {
+			return false, fmt.Errorf("add tag %q: %w", tag, err)
+		}
+	}
+	for _, tag := range removeTags {
+		if _, err := tx.Exec(
+			"DELETE FROM tags WHERE message_id = ? AND tag = ?",
+			dbID, tag); err != nil {
+			return false, fmt.Errorf("remove tag %q: %w", tag, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	return true, nil
 }
 
 // GetTagsByMessageID returns all tags for a message identified by its
@@ -414,10 +655,17 @@ func (d *DB) GetAllMessagesWithTags(mailbox string, account ...string) (map[stri
 		}
 		return nil, fmt.Errorf("lookup mailbox id: %w", err)
 	}
+	// LEFT JOIN: a message with no tags still needs a row, or it is absent from
+	// the result and every caller reads that as "not stored here". The flag
+	// pass does exactly that and skips the message, so its flags never
+	// reconcile in either direction. The state is reachable — a read,
+	// unflagged, unanswered message gets no flag tag (ToTagOps emits only
+	// removals for it), and a custom folder with no SPECIAL-USE role and no
+	// name fallback contributes none either.
 	q := `
-		SELECT m.message_id, t.tag
+		SELECT m.message_id, IFNULL(t.tag, '')
 		FROM messages m
-		JOIN tags t ON t.message_id = m.id
+		LEFT JOIN tags t ON t.message_id = m.id
 		WHERE m.mailbox_id = ?`
 	params := []interface{}{mailboxID}
 
@@ -446,7 +694,15 @@ func (d *DB) GetAllMessagesWithTags(mailbox string, account ...string) (map[stri
 		if err := rows.Scan(&msgID, &tag); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
-		result[msgID] = append(result[msgID], tag)
+		// Presence in the map is what tells a caller the message is stored
+		// here, so the entry is created either way; the placeholder from the
+		// LEFT JOIN is not a tag and must not join the list.
+		if _, ok := result[msgID]; !ok {
+			result[msgID] = nil
+		}
+		if tag != "" {
+			result[msgID] = append(result[msgID], tag)
+		}
 	}
 	return result, rows.Err()
 }

@@ -87,6 +87,7 @@ func (p *Parser) Parse(msg *mail.Message) *MailContent {
 		From:       encoding.DecodeHeader(msg.Header.Get("From")),
 		To:         encoding.DecodeHeader(msg.Header.Get("To")),
 		CC:         encoding.DecodeHeader(msg.Header.Get("Cc")),
+		BCC:        encoding.DecodeHeader(msg.Header.Get("Bcc")),
 		Subject:    encoding.DecodeHeader(msg.Header.Get("Subject")),
 		Date:       msg.Header.Get("Date"),
 		MessageID:  msg.Header.Get("Message-ID"),
