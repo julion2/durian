@@ -136,6 +136,33 @@ enum PklEvaluator {
         }
     }
 
+    /// Cheap cache identity for the actual evaluator without launching Pkl or
+    /// reading a potentially large native executable. A resolved path plus
+    /// filesystem identity changes for Nix/Homebrew upgrades and replacements.
+    static var evaluatorIdentity: String? {
+        evaluatorIdentity(forExecutableAt: resolvedPkl)
+    }
+
+    static func evaluatorIdentity(forExecutableAt executablePath: String?) -> String? {
+        guard let executablePath else { return nil }
+        let url = URL(fileURLWithPath: executablePath).resolvingSymlinksInPath().standardizedFileURL
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber,
+              let modified = attributes[.modificationDate] as? Date,
+              let fileNumber = attributes[.systemFileNumber] as? NSNumber,
+              let systemNumber = attributes[.systemNumber] as? NSNumber
+        else {
+            return nil
+        }
+        return [
+            url.path,
+            systemNumber.stringValue,
+            fileNumber.stringValue,
+            size.stringValue,
+            String(modified.timeIntervalSince1970),
+        ].joined(separator: ":")
+    }
+
     static func eval<T: Decodable>(_ type: T.Type, from url: URL) async throws -> T {
         let outputs = try await evaluateJSONModules([url])
         guard let data = outputs[url.deletingPathExtension().lastPathComponent] else {
