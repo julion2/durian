@@ -5,7 +5,32 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
+
+// TestJSONCapableCommandsAllExist keeps the allowlist honest. It is keyed by
+// command path, so a rename or a typo does not fail loudly — the entry simply
+// stops matching, and the command quietly loses JSON support. That surfaces
+// only when a user passes --json to a command that does emit JSON and is told
+// the flag is unsupported.
+func TestJSONCapableCommandsAllExist(t *testing.T) {
+	paths := map[string]bool{}
+	var walk func(*cobra.Command)
+	walk = func(cmd *cobra.Command) {
+		paths[cmd.CommandPath()] = true
+		for _, child := range cmd.Commands() {
+			walk(child)
+		}
+	}
+	walk(rootCmd)
+
+	for listed := range jsonCapableCommands {
+		if !paths[listed] {
+			t.Errorf("jsonCapableCommands names %q, which is not a registered command — that command rejects --json", listed)
+		}
+	}
+}
 
 func TestNoInputDisablesPrompts(t *testing.T) {
 	previous := noInput
@@ -13,6 +38,28 @@ func TestNoInputDisablesPrompts(t *testing.T) {
 	t.Cleanup(func() { noInput = previous })
 	if canPrompt() {
 		t.Fatal("prompting enabled with --no-input")
+	}
+}
+
+func TestConceptualHelpTopicsAreDiscoverable(t *testing.T) {
+	for _, name := range []string{"query", "identifiers", "accounts", "output", "calendar-time"} {
+		cmd, _, err := rootCmd.Find([]string{name})
+		if err != nil || cmd.Name() != name {
+			t.Errorf("help topic %q not found: command=%v err=%v", name, cmd, err)
+			continue
+		}
+		if !cmd.IsAdditionalHelpTopicCommand() {
+			t.Errorf("%q is not classified as an additional help topic", name)
+		}
+	}
+}
+
+func TestJSONSupportIsExplicit(t *testing.T) {
+	if !commandSupportsJSON(searchCmd) || !commandSupportsJSON(calendarNewCmd) {
+		t.Fatal("JSON command reported unsupported")
+	}
+	if commandSupportsJSON(sendCmd) || commandSupportsJSON(validateCmd) {
+		t.Fatal("text-only command reported JSON support")
 	}
 }
 

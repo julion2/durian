@@ -39,15 +39,58 @@ var rootCmd = &cobra.Command{
 	Short: "Durian Mail CLI",
 	Long:  `Durian is a macOS email client. CLI backend for provider mail sync, sending, and SQLite storage.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		if cmd == validateCmd {
-			return nil
+		if cmd != validateCmd && configErr != nil {
+			return configErr
 		}
-		return configErr
+		if jsonOutput && !commandSupportsJSON(cmd) {
+			return fmt.Errorf("--json is not supported by %q", cmd.CommandPath())
+		}
+		return nil
 	},
 	// Show help when called without subcommands
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()
 	},
+}
+
+// jsonCapableCommands names every command that writes a machine-readable
+// document under --json. A command absent from it rejects the flag rather than
+// printing human text a caller would then try to parse.
+//
+// Keyed by command path, so a renamed or mistyped entry matches nothing and
+// silently withdraws JSON support from a command that has it.
+// TestJSONCapableCommandsAllExist walks the command tree and fails on any
+// entry that resolves to no command.
+var jsonCapableCommands = map[string]bool{
+	"durian search":          true,
+	"durian count":           true,
+	"durian show":            true,
+	"durian attachment":      true,
+	"durian tag":             true,
+	"durian tag list":        true,
+	"durian sync":            true,
+	"durian auth status":     true,
+	"durian contacts init":   true,
+	"durian contacts import": true,
+	"durian contacts list":   true,
+	"durian contacts search": true,
+	"durian contacts add":    true,
+	"durian contacts delete": true,
+	"durian group list":      true,
+	"durian group members":   true,
+	"durian draft save":      true,
+	"durian draft delete":    true,
+	"durian calendar list":   true,
+	"durian calendar search": true,
+	"durian calendar show":   true,
+	"durian calendar new":    true,
+	"durian calendar modify": true,
+	"durian calendar rsvp":   true,
+	"durian calendar delete": true,
+}
+
+func commandSupportsJSON(cmd *cobra.Command) bool {
+	return jsonCapableCommands[cmd.CommandPath()]
 }
 
 // Execute runs the root command
