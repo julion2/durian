@@ -51,16 +51,18 @@ func GetKey(service, account string, nbytes int) ([]byte, error) {
 
 	existing, err := GetPassword(service, account)
 	if err != nil {
-		return nil, fmt.Errorf("keychain: lookup %s/%s: %w", service, account, err)
+		if errors.Is(err, ErrNotFound) {
+			return nil, fmt.Errorf("keychain: lookup %s/%s: %w", service, account, ErrNotFound)
+		}
+		return nil, fmt.Errorf("keychain: lookup %s/%s failed", service, account)
 	}
 	key, err := hex.DecodeString(existing)
 	if err != nil {
-		return nil, fmt.Errorf("keychain: stored value at %s/%s is not valid hex: %w",
-			service, account, err)
+		return nil, fmt.Errorf("keychain: stored value at %s/%s is not valid hex", service, account)
 	}
 	if len(key) != nbytes {
-		return nil, fmt.Errorf("keychain: stored key at %s/%s has length %d, want %d",
-			service, account, len(key), nbytes)
+		return nil, fmt.Errorf("keychain: stored key at %s/%s has wrong length; want %d bytes",
+			service, account, nbytes)
 	}
 	return key, nil
 }
