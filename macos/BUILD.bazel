@@ -24,7 +24,6 @@ swift_library(
             "durian/Assets.xcassets/AppIcon.appiconset/**",
         ],
     ),
-    deps = ["@swiftpkg_pkl_swift//:PklSwift"],
 )
 
 # Testable library (excludes @main to avoid duplicate symbol with test runner)
@@ -36,7 +35,6 @@ swift_library(
         exclude = ["durian/DurianApp.swift"],
     ),
     module_name = "durian_lib",
-    deps = ["@swiftpkg_pkl_swift//:PklSwift"],
 )
 
 swift_test(
@@ -55,6 +53,27 @@ swift_test(
     deps = [
         ":durian_testlib",
     ],
+)
+
+swift_test(
+    name = "pkl_evaluator_test",
+    size = "small",
+    srcs = ["tests/PklEvaluatorTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
+    name = "startup_coordinator_test",
+    size = "small",
+    srcs = ["tests/StartupCoordinatorTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
+    name = "startup_manager_test",
+    size = "small",
+    srcs = ["tests/StartupManagerTests.swift"],
+    deps = [":durian_testlib"],
 )
 
 swift_test(

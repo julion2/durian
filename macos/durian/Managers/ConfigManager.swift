@@ -143,7 +143,7 @@ struct AppConfig: Codable {
 class ConfigManager {
     static let shared = ConfigManager()
 
-    typealias ConfigEvaluator = (URL) throws -> AppConfig
+    typealias ConfigEvaluator = (URL) async throws -> AppConfig
     typealias ParseErrorHandler = (String) -> Void
 
     // The config is accessed from many contexts (Views on MainActor, but also
@@ -178,27 +178,23 @@ class ConfigManager {
 
     init(
         configURL: URL = FileManager.default.durianConfigURL().appendingPathComponent("config.pkl"),
-        evaluator: @escaping ConfigEvaluator = { try PklEvaluator.evalSync(AppConfig.self, from: $0) },
+        evaluator: @escaping ConfigEvaluator = { try await PklEvaluator.eval(AppConfig.self, from: $0) },
         parseErrorHandler: @escaping ParseErrorHandler = ConfigManager.showParseError
     ) {
         self.configURL = configURL
         self.evaluator = evaluator
         self.parseErrorHandler = parseErrorHandler
-        loadConfigBlocking()
     }
 
     /// Test-only initializer: inject config directly, skip file loading
     init(config: AppConfig) {
         configURL = FileManager.default.durianConfigURL().appendingPathComponent("config.pkl")
-        evaluator = { try PklEvaluator.evalSync(AppConfig.self, from: $0) }
+        evaluator = { try await PklEvaluator.eval(AppConfig.self, from: $0) }
         parseErrorHandler = ConfigManager.showParseError
         _config = config
     }
 
-    /// Synchronous load via pkl CLI subprocess.
-    /// Uses PklEvaluator.evalSync (Process + waitUntilExit) to avoid
-    /// Swift Concurrency deadlocks from mixing Task.detached with semaphores.
-    private func loadConfigBlocking() {
+    private func loadConfig() async {
         guard FileManager.default.fileExists(atPath: configURL.path) else {
             config = nil
             setLastParseError(nil)
@@ -207,7 +203,7 @@ class ConfigManager {
         }
 
         do {
-            config = try evaluator(configURL)
+            config = try await evaluator(configURL)
             setLastParseError(nil)
             Log.info("CONFIG", "Loaded config from \(configURL.path)")
         } catch {
@@ -250,9 +246,15 @@ class ConfigManager {
     }
 
     /// Reload config from disk (call after editing config.pkl)
-    func reloadConfig() {
+    func reloadConfig() async {
         Log.info("CONFIG", "Reloading config...")
-        loadConfigBlocking()
+        await loadConfig()
+    }
+
+    func applyEvaluatedConfig(_ evaluatedConfig: AppConfig) {
+        config = evaluatedConfig
+        setLastParseError(nil)
+        Log.info("CONFIG", "Loaded evaluated startup config")
     }
 
     func updateSettings(_ newSettings: AppSettings) {
