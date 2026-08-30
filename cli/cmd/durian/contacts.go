@@ -1,11 +1,11 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"text/tabwriter"
+	"time"
 
 	"github.com/julion2/durian/cli/internal/contacts"
 	"github.com/spf13/cobra"
@@ -113,9 +113,7 @@ func runContactsInit(cmd *cobra.Command, args []string) error {
 			"status":  "ok",
 			"db_path": dbPath,
 		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(output)
+		return writeJSON(output)
 	}
 
 	fmt.Printf("Contacts database initialized at: %s\n", dbPath)
@@ -145,7 +143,7 @@ func runContactsImport(cmd *cobra.Command, args []string) error {
 	}
 	defer emailDB.Close()
 
-	fmt.Println("Extracting addresses from email store...") // encgrep:allow user-facing TUI, no PII
+	fmt.Fprintln(os.Stderr, "Extracting addresses from email store...") // encgrep:allow user-facing TUI, no PII
 	contactList, err := contacts.ImportFromStore(emailDB)
 	if err != nil {
 		return fmt.Errorf("import from store: %w", err)
@@ -154,7 +152,7 @@ func runContactsImport(cmd *cobra.Command, args []string) error {
 	slog.Debug("Found unique addresses", "count", len(contactList))
 
 	// Add to database
-	fmt.Printf("Importing %d contacts...\n", len(contactList))
+	fmt.Fprintf(os.Stderr, "Importing %d contacts...\n", len(contactList))
 	added, updated, err := db.AddBatch(contactList)
 	if err != nil {
 		return fmt.Errorf("add contacts: %w", err)
@@ -163,7 +161,7 @@ func runContactsImport(cmd *cobra.Command, args []string) error {
 	// Clean up any invalid entries
 	cleaned, _ := db.CleanInvalid()
 	if cleaned > 0 {
-		fmt.Printf("Cleaned %d invalid entries\n", cleaned)
+		fmt.Fprintf(os.Stderr, "Cleaned %d invalid entries\n", cleaned)
 	}
 
 	// Get final count
@@ -176,9 +174,7 @@ func runContactsImport(cmd *cobra.Command, args []string) error {
 			"updated":  updated,
 			"total":    total,
 		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(output)
+		return writeJSON(output)
 	}
 
 	fmt.Printf("Import complete: %d contacts added, %d total in database\n", added, total)
@@ -200,9 +196,7 @@ func runContactsList(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonOutput {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(contactList)
+		return writeJSON(publicContacts(contactList))
 	}
 
 	if len(contactList) == 0 {
@@ -219,7 +213,7 @@ func runContactsList(cmd *cobra.Command, args []string) error {
 		if name == "" {
 			name = "-"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", c.Email, name, c.UsageCount, c.Source)
+		fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", humanText(c.Email, false), humanText(name, false), c.UsageCount, humanText(c.Source, false))
 	}
 	w.Flush()
 
@@ -247,9 +241,7 @@ func runContactsSearch(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonOutput {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(contactList)
+		return writeJSON(publicContacts(contactList))
 	}
 
 	if len(contactList) == 0 {
@@ -258,7 +250,7 @@ func runContactsSearch(cmd *cobra.Command, args []string) error {
 	}
 
 	for _, c := range contactList {
-		fmt.Println(c.FormatDisplay())
+		fmt.Println(humanText(c.FormatDisplay(), false))
 	}
 
 	return nil
@@ -294,9 +286,7 @@ func runContactsAdd(cmd *cobra.Command, args []string) error {
 			"email":  email,
 			"name":   name,
 		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(output)
+		return writeJSON(output)
 	}
 
 	fmt.Printf("Added contact: %s", email) // encgrep:allow user-facing TUI echoes user's own input
@@ -327,11 +317,35 @@ func runContactsDelete(cmd *cobra.Command, args []string) error {
 			"status": "ok",
 			"email":  email,
 		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(output)
+		return writeJSON(output)
 	}
 
 	fmt.Printf("Deleted contact: %s\n", email) // encgrep:allow user-facing TUI echoes user's own input
 	return nil
+}
+
+type contactJSON struct {
+	Email      string `json:"email"`
+	Name       string `json:"name,omitempty"`
+	LastUsed   string `json:"last_used,omitempty"`
+	UsageCount int    `json:"usage_count"`
+	Source     string `json:"source"`
+	CreatedAt  string `json:"created_at,omitempty"`
+}
+
+func publicContacts(contactList []contacts.Contact) []contactJSON {
+	out := make([]contactJSON, 0, len(contactList))
+	for _, contact := range contactList {
+		item := contactJSON{
+			Email: contact.Email, Name: contact.Name, UsageCount: contact.UsageCount, Source: contact.Source,
+		}
+		if !contact.LastUsed.IsZero() {
+			item.LastUsed = contact.LastUsed.Format(time.RFC3339)
+		}
+		if !contact.CreatedAt.IsZero() {
+			item.CreatedAt = contact.CreatedAt.Format(time.RFC3339)
+		}
+		out = append(out, item)
+	}
+	return out
 }

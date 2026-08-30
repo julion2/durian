@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -89,10 +88,33 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	return outputSearchTable(resp)
 }
 
+type searchResultJSON struct {
+	ThreadID  string   `json:"thread_id"`
+	Subject   string   `json:"subject"`
+	From      string   `json:"from"`
+	To        string   `json:"to,omitempty"`
+	Date      string   `json:"date"`
+	Timestamp int64    `json:"timestamp"`
+	Tags      []string `json:"tags"`
+}
+
+func publicSearchResults(resp protocol.Response) []searchResultJSON {
+	out := make([]searchResultJSON, 0, len(resp.Results))
+	for _, mail := range resp.Results {
+		tags := make([]string, 0)
+		if mail.Tags != "" {
+			tags = strings.Split(mail.Tags, ",")
+		}
+		out = append(out, searchResultJSON{
+			ThreadID: mail.ThreadID, Subject: mail.Subject, From: mail.From,
+			To: mail.To, Date: mail.Date, Timestamp: mail.Timestamp, Tags: tags,
+		})
+	}
+	return out
+}
+
 func outputSearchJSON(resp protocol.Response) error {
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(resp.Results)
+	return writeJSON(publicSearchResults(resp))
 }
 
 func outputSearchTable(resp protocol.Response) error {
@@ -146,18 +168,12 @@ func runCount(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("count: %w", err)
 	}
 
+	if jsonOutput {
+		return writeJSON(struct {
+			Count int `json:"count"`
+		}{Count: count})
+	}
+
 	fmt.Println(count)
 	return nil
-}
-
-func truncate(s string, maxLen int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.ReplaceAll(s, "\t", " ")
-	if len(s) <= maxLen {
-		return s
-	}
-	if maxLen <= 3 {
-		return s[:maxLen]
-	}
-	return s[:maxLen-3] + "..."
 }

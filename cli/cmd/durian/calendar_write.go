@@ -428,6 +428,9 @@ func runCalendarDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	if !calDeleteYes {
+		if !canPrompt() {
+			return fmt.Errorf("cannot confirm deletion because input is not interactive; pass --yes")
+		}
 		if !confirmPrompt(fmt.Sprintf("Delete %q (%s) from %q locally?",
 			orDash(event.Subject), event.Start.Format("2006-01-02 15:04"), calName)) {
 			fmt.Fprintln(os.Stderr, "aborted, nothing deleted")
@@ -447,6 +450,9 @@ func runCalendarDelete(cmd *cobra.Command, args []string) error {
 // a read error or anything but y/yes counts as "no" (same pattern as the
 // calendar sync gate).
 func confirmPrompt(msg string) bool {
+	if !canPrompt() {
+		return false
+	}
 	fmt.Fprint(os.Stderr, msg+" [y/N] ")
 	answer, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil {

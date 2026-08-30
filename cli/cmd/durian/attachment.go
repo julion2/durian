@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -64,19 +63,18 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("get attachments: %w", err)
 	}
-	if len(atts) == 0 {
-		fmt.Fprintln(os.Stderr, "No attachments found")
-		return nil
-	}
-
 	// List mode
 	if attachSavePart == 0 {
 		if jsonOutput {
-			return json.NewEncoder(os.Stdout).Encode(atts)
+			return writeJSON(publicAttachments(atts))
+		}
+		if len(atts) == 0 {
+			fmt.Fprintln(os.Stderr, "No attachments found")
+			return nil
 		}
 		for _, a := range atts {
 			size := formatSize(a.Size)
-			fmt.Fprintf(os.Stdout, "  [%d] %s (%s, %s)\n", a.PartID, a.Filename, a.ContentType, size)
+			fmt.Fprintf(os.Stdout, "  [%d] %s (%s, %s)\n", a.PartID, humanText(a.Filename, false), humanText(a.ContentType, false), size)
 		}
 		return nil
 	}
@@ -131,7 +129,7 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(len(data)))
-		return nil
+		return writeAttachmentSaveJSON(outPath, att.PartID, len(data))
 	}
 
 	// Legacy IMAP path (fetch BODY[section] by UID).
@@ -166,7 +164,38 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(int(fi.Size())))
-	return nil
+	return writeAttachmentSaveJSON(outPath, att.PartID, int(fi.Size()))
+}
+
+type attachmentJSON struct {
+	PartID      int    `json:"part_id"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	Size        int    `json:"size"`
+	Disposition string `json:"disposition,omitempty"`
+	ContentID   string `json:"content_id,omitempty"`
+}
+
+func publicAttachments(atts []store.Attachment) []attachmentJSON {
+	out := make([]attachmentJSON, 0, len(atts))
+	for _, att := range atts {
+		out = append(out, attachmentJSON{
+			PartID: att.PartID, Filename: att.Filename, ContentType: att.ContentType,
+			Size: att.Size, Disposition: att.Disposition, ContentID: att.ContentID,
+		})
+	}
+	return out
+}
+
+func writeAttachmentSaveJSON(path string, partID, size int) error {
+	if !jsonOutput {
+		return nil
+	}
+	return writeJSON(struct {
+		Saved  string `json:"saved"`
+		PartID int    `json:"part_id"`
+		Size   int    `json:"size"`
+	}{Saved: path, PartID: partID, Size: size})
 }
 
 func normalizeMessageReference(ref string) string {

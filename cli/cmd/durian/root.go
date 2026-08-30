@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"github.com/julion2/durian/cli/internal/redact"
 	"github.com/julion2/durian/cli/internal/store"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 // Set via Bazel x_defs (workspace status stamping)
@@ -24,6 +26,7 @@ var (
 	cfgFile    string
 	jsonOutput bool
 	debugMode  bool
+	noInput    bool
 	configErr  error
 )
 
@@ -61,6 +64,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file (default: ~/.config/durian/config.pkl)")
 	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "output as JSON")
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "enable debug logging")
+	rootCmd.PersistentFlags().BoolVar(&noInput, "no-input", false, "never prompt or open an editor")
 
 	installColoredHelp(rootCmd)
 
@@ -107,6 +111,16 @@ func loadStartupConfig(path string) (*config.Config, error) {
 // This is useful for subcommands that need access to config
 func GetConfig() *config.Config {
 	return cfg
+}
+
+func writeJSON(value any) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(value)
+}
+
+func canPrompt() bool {
+	return !noInput && term.IsTerminal(int(os.Stdin.Fd()))
 }
 
 // initLogger configures the default slog logger.
