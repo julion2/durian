@@ -35,12 +35,12 @@ var errorAttrKeys = map[string]struct{}{
 // the log useful (two occurrences of the same literal are still recognizable
 // as the same) without keeping the content.
 //
-// Limitation, documented in ADR-0001 §Logging audit: content shorter than
-// maxSafeRun, or spread across whitespace, is not caught. The heuristic
-// targets raw server-echoed data, not arbitrary Subject text — the latter is
-// stopped at the source by the grep gate + key-based redaction above.
+// This is a fallback for unmarked errors. Provider errors use SafeLogError so
+// short and multiword responses are removed structurally instead of relying on
+// this heuristic; arbitrary Subject text is stopped at the source by the grep
+// gate + key-based redaction above.
 func sanitizeText(s string) string {
-	s = stripURLUserinfo(s)
+	s = sanitizeURLs(s)
 	if len(s) <= maxSafeRun {
 		return s
 	}
@@ -57,6 +57,12 @@ func sanitizeText(s string) string {
 		return s
 	}
 	return strings.Join(fields, " ")
+}
+
+func sanitizeURLs(s string) string {
+	// Keep the passes independent: query/fragment secrets and authority
+	// credentials are sensitive for different structural reasons.
+	return stripURLUserinfo(stripURLQueryValues(s))
 }
 
 // stripURLUserinfo removes the credentials from any URL embedded in error text.
@@ -110,6 +116,114 @@ func stripURLUserinfo(s string) string {
 	}
 	b.WriteString(s[emitted:])
 	return b.String()
+}
+
+// stripURLQueryValues retains URL origins, paths and parameter names for
+// diagnostics but removes every query value and fragment. Provider request
+// errors commonly quote their URL, and authorization codes or access tokens
+// are short enough to evade the length heuristic above.
+func stripURLQueryValues(s string) string {
+	const marker = "://"
+	if !strings.Contains(s, marker) {
+		return s
+	}
+
+	var b strings.Builder
+	emitted := 0
+	for i := 0; ; {
+		rel := strings.Index(s[i:], marker)
+		if rel < 0 {
+			break
+		}
+		urlStart := i + rel
+		authority := urlStart + len(marker)
+		end := authority + urlEnd(s[authority:])
+		urlText := s[authority:end]
+		queryRel := strings.IndexByte(urlText, '?')
+		fragmentRel := strings.IndexByte(urlText, '#')
+		if fragmentRel >= 0 && (queryRel < 0 || fragmentRel < queryRel) {
+			fragmentStart := authority + fragmentRel + 1
+			b.WriteString(s[emitted:fragmentStart])
+			b.WriteString(Placeholder)
+			emitted = end
+			i = end
+			continue
+		}
+		if queryRel < 0 {
+			i = authority
+			continue
+		}
+		queryStart := authority + queryRel + 1
+		b.WriteString(s[emitted:queryStart])
+
+		fragment := strings.IndexByte(s[queryStart:end], '#')
+		queryEnd := end
+		if fragment >= 0 {
+			queryEnd = queryStart + fragment
+		}
+		for pos := queryStart; pos < queryEnd; {
+			amp := strings.IndexByte(s[pos:queryEnd], '&')
+			paramEnd := queryEnd
+			if amp >= 0 {
+				paramEnd = pos + amp
+			}
+			param := s[pos:paramEnd]
+			if eq := strings.IndexByte(param, '='); eq >= 0 {
+				b.WriteString(param[:eq+1])
+			}
+			b.WriteString(Placeholder)
+			if amp < 0 {
+				break
+			}
+			b.WriteByte('&')
+			pos = paramEnd + 1
+		}
+		if fragment >= 0 {
+			b.WriteByte('#')
+			b.WriteString(Placeholder)
+		}
+		emitted = end
+		i = end
+	}
+	if emitted == 0 {
+		return s
+	}
+	b.WriteString(s[emitted:])
+	return b.String()
+}
+
+// urlEnd returns the end of a URL embedded in error text. URL punctuation,
+// including IPv6 brackets, is deliberately accepted; quotes, braces and
+// whitespace are the reliable boundaries emitted by net/http and common error
+// wrappers.
+func urlEnd(s string) int {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case ' ', '\t', '\n', '\r', '"', '<', '>', '{', '}':
+			return i
+		case ',':
+			if startsWithURL(s[i+1:]) {
+				return i
+			}
+		}
+	}
+	return len(s)
+}
+
+func startsWithURL(s string) bool {
+	schemeEnd := strings.Index(s, "://")
+	if schemeEnd < 1 {
+		return false
+	}
+	for i := 0; i < schemeEnd; i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(i > 0 && ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.')) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // authorityEnd returns the offset of the first byte in s that cannot belong to

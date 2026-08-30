@@ -13,6 +13,7 @@ go_library(
         "//cli/internal/config",
         "//cli/internal/mailsend",
         "//cli/internal/oauth",
+        "//cli/internal/redact",
         "//cli/internal/smtp",
     ],
 )

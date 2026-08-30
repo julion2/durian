@@ -29,6 +29,7 @@ import (
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/imap"
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 // roleMappings pairs IMAP SPECIAL-USE roles with their backend.Role in a fixed
@@ -511,10 +512,15 @@ func (b *Backend) withReconnect(op func() error) error {
 
 	slog.Warn("Connection lost, reconnecting", "module", "IMAPBACKEND", "err", err)
 	if rerr := b.client.Reconnect(); rerr != nil {
-		return fmt.Errorf("%w (reconnect failed: %v)", err, rerr)
+		return reconnectFailure(err, rerr)
 	}
 	slog.Debug("Reconnected, retrying operation", "module", "IMAPBACKEND")
 	return op()
+}
+
+func reconnectFailure(operationErr, reconnectErr error) error {
+	err := fmt.Errorf("%w (reconnect failed: %v)", operationErr, reconnectErr)
+	return redact.ExternalError(err, "IMAP operation and reconnect failed: server responses "+redact.Placeholder)
 }
 
 // isConnectionError reports whether err is a dropped/broken IMAP connection.
