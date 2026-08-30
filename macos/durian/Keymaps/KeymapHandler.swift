@@ -130,6 +130,14 @@ class KeymapHandler: ObservableObject {
                 Log.debug("KEYMAPS", "App resigned active")
             }
         }
+
+        // The handler can be initialized after didBecomeActive (for example,
+        // while ContentView waits for startup configuration). Synchronize with
+        // the current state so key monitoring does not wait for reactivation.
+        if NSApp.isActive {
+            isAppInForeground = true
+            startKeyEventMonitoring()
+        }
     }
 
     private func setupKeymapObserver() {
