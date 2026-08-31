@@ -176,6 +176,18 @@ assert_jq "GET /threads/{id} message.date is string" "$RESP" '.thread.messages[0
 assert_jq "GET /threads/{id} message.timestamp is number" "$RESP" '.thread.messages[0].timestamp | type == "number"'
 assert_jq "GET /threads/{id} message.body is string" "$RESP" '.thread.messages[0].body | type == "string"'
 assert_jq "GET /threads/{id} message.tags is array" "$RESP" '.thread.messages[0].tags | type == "array"'
+assert_jq "GET /threads/{id} all message ids are opaque" "$RESP" '
+    all(.thread.messages[]; .id | startswith("local:"))'
+assert_jq "GET /threads/{id} duplicate Message-IDs have distinct opaque ids" "$RESP" '
+    [.thread.messages[] | select(.message_id == "msg1@test")] as $duplicates |
+    ($duplicates | length) == 2 and
+    all($duplicates[]; .id | startswith("local:")) and
+    $duplicates[0].id != $duplicates[1].id'
+
+FIRST_MESSAGE_ID=$(echo "$RESP" | jq -r '.thread.messages[] |
+    select(.message_id == "msg1@test" and .body == "First message body") | .id')
+DUPLICATE_MESSAGE_ID=$(echo "$RESP" | jq -r '.thread.messages[] |
+    select(.message_id == "msg1@test" and .body == "Duplicate provider body") | .id')
 
 # ─────────────────────────────────────────────
 # 6. Tag thread (POST, write + verify)
@@ -209,11 +221,14 @@ assert_http_code "POST /threads/{id}/tags invalid body → 400" \
 # ─────────────────────────────────────────────
 # 7. Message body (DurianResponse + MessageBody)
 # ─────────────────────────────────────────────
-RESP=$(curl -sf "${AUTH[@]}" "$BASE/message/body?id=msg1@test")
+RESP=$(curl -sfG "${AUTH[@]}" --data-urlencode "id=$FIRST_MESSAGE_ID" "$BASE/message/body")
 assert_jq "GET /message/body .ok is true" "$RESP" '.ok == true'
 assert_jq "GET /message/body .message_body.body is string" "$RESP" '.message_body.body | type == "string"'
 assert_jq "GET /message/body .message_body.html is string" "$RESP" '.message_body.html | type == "string"'
-assert_jq "GET /message/body body not empty" "$RESP" '.message_body.body | length > 0'
+assert_jq "GET /message/body opaque id selects first duplicate" "$RESP" '.message_body.body == "First message body"'
+
+RESP=$(curl -sfG "${AUTH[@]}" --data-urlencode "id=$DUPLICATE_MESSAGE_ID" "$BASE/message/body")
+assert_jq "GET /message/body opaque id selects second duplicate" "$RESP" '.message_body.body == "Duplicate provider body"'
 
 # Error: missing id
 assert_http_code "GET /message/body without id → 400" "$BASE/message/body" "GET" "400"

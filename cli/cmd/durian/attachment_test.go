@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,38 @@ func TestResolveAttachmentMessageRequiresAccountWhenAmbiguous(t *testing.T) {
 	}
 	if message.Account != "work" {
 		t.Fatalf("resolved account = %q, want work", message.Account)
+	}
+}
+
+func TestResolveAttachmentMessageUsesOpaqueIdentifier(t *testing.T) {
+	db := newAttachmentTestStore(t)
+	now := time.Now().Unix()
+	first := &store.Message{
+		StableID: "email-1", MessageID: "duplicate@example.com", Account: "work",
+		Subject: "First", Date: now, CreatedAt: now,
+	}
+	second := &store.Message{
+		StableID: "email-2", MessageID: "duplicate@example.com", Account: "work",
+		Subject: "Second", Date: now + 1, CreatedAt: now + 1,
+	}
+	for _, message := range []*store.Message{first, second} {
+		if err := db.InsertMessage(message); err != nil {
+			t.Fatalf("insert %s: %v", message.StableID, err)
+		}
+	}
+
+	message, err := resolveAttachmentMessage(db, nil, fmt.Sprintf("local:%d", second.ID), "")
+	if err != nil {
+		t.Fatalf("resolve opaque identifier: %v", err)
+	}
+	if message.ID != second.ID || message.StableID != "email-2" {
+		t.Fatalf("resolved message = %+v, want second duplicate", message)
+	}
+
+	cfg := &config.Config{Accounts: []config.AccountConfig{{Name: "Work", Alias: "office"}}}
+	if _, err := resolveAttachmentMessage(db, cfg, "duplicate@example.com", "office"); err == nil ||
+		!strings.Contains(err.Error(), "opaque local:") {
+		t.Fatalf("same-account Message-ID resolution error = %v, want opaque identifier guidance", err)
 	}
 }
 

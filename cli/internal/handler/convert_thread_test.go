@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +69,49 @@ func TestConvertThread_OrdersNewestFirst(t *testing.T) {
 	}
 }
 
+func TestConvertThreadKeepsDuplicateMessageIDsAddressable(t *testing.T) {
+	db := newTestStore(t)
+	now := time.Now().Unix()
+	first := &store.Message{
+		StableID: "email-1", MessageID: "duplicate@example.com", Subject: "Duplicate",
+		Date: now, CreatedAt: now, BodyText: "first body", Mailbox: "ALL", Account: "work",
+	}
+	second := &store.Message{
+		MessageID: "duplicate@example.com", Subject: "Duplicate",
+		Date: now + 1, CreatedAt: now + 1, BodyText: "second body", Mailbox: "ALL", Account: "work",
+	}
+	if err := db.InsertMessage(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessage(second); err != nil {
+		t.Fatal(err)
+	}
+	h := New(db, nil)
+	response := h.ShowThread(first.ThreadID)
+	if !response.OK || response.Thread == nil || len(response.Thread.Messages) != 2 {
+		t.Fatalf("thread response = %+v", response)
+	}
+	seenBodies := map[string]bool{}
+	seenIDs := map[string]bool{}
+	for _, message := range response.Thread.Messages {
+		if !strings.HasPrefix(message.ID, "local:") || message.MessageID != "duplicate@example.com" {
+			t.Errorf("message identity = id %q, Message-ID %q", message.ID, message.MessageID)
+		}
+		if seenIDs[message.ID] {
+			t.Errorf("duplicate opaque id %q", message.ID)
+		}
+		seenIDs[message.ID] = true
+		bodyResponse := h.ShowMessageBody(message.ID)
+		if !bodyResponse.OK || bodyResponse.MessageBody == nil {
+			t.Fatalf("body %q response = %+v", message.ID, bodyResponse)
+		}
+		seenBodies[bodyResponse.MessageBody.Body] = true
+	}
+	if !seenBodies["first body"] || !seenBodies["second body"] {
+		t.Fatalf("opaque identifiers resolved bodies %v", seenBodies)
+	}
+}
+
 // --- Subject inheritance ---
 
 func TestConvertThread_SubjectFromFirstMessage(t *testing.T) {
@@ -120,7 +164,7 @@ func TestConvertThread_AllFieldsMapped(t *testing.T) {
 	resp := h.ShowThread(m.ThreadID)
 	msg := resp.Thread.Messages[0]
 
-	if msg.ID != "fields@test" {
+	if msg.ID != "local:"+strconv.FormatInt(m.ID, 10) {
 		t.Errorf("ID = %q", msg.ID)
 	}
 	if msg.MessageID != "fields@test" {
@@ -216,7 +260,7 @@ func TestConvertThread_TagsPerMessage(t *testing.T) {
 
 	tagsByMsg := make(map[string][]string)
 	for _, msg := range resp.Thread.Messages {
-		tagsByMsg[msg.ID] = msg.Tags
+		tagsByMsg[msg.MessageID] = msg.Tags
 	}
 
 	hasTag := func(tags []string, want string) bool {
@@ -274,7 +318,7 @@ func TestConvertThread_AttachmentsPerMessage(t *testing.T) {
 
 	attsByMsg := make(map[string]int)
 	for _, msg := range resp.Thread.Messages {
-		attsByMsg[msg.ID] = len(msg.Attachments)
+		attsByMsg[msg.MessageID] = len(msg.Attachments)
 	}
 
 	if attsByMsg["att1@test"] != 2 {
@@ -286,7 +330,7 @@ func TestConvertThread_AttachmentsPerMessage(t *testing.T) {
 
 	// Verify attachment field mapping
 	for _, msg := range resp.Thread.Messages {
-		if msg.ID == "att1@test" {
+		if msg.MessageID == "att1@test" {
 			var pdf, png bool
 			for _, a := range msg.Attachments {
 				if a.Filename == "doc.pdf" {

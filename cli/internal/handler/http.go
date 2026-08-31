@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -140,7 +141,11 @@ func (h *Handler) ShowMessageBodyHandler(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) DownloadAttachmentHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
-	messageID := vars["message_id"]
+	messageID, err := url.PathUnescape(vars["message_id"])
+	if err != nil {
+		http.Error(w, "Invalid message_id parameter", http.StatusBadRequest)
+		return
+	}
 	partIDStr := vars["part_id"]
 
 	partID, err := strconv.Atoi(partIDStr)
