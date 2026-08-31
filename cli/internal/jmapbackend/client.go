@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 const (
@@ -80,6 +82,12 @@ func (e *methodError) Error() string {
 	return fmt.Sprintf("JMAP method error %s: %s", e.Type, e.Description)
 }
 
+func (e *methodError) SafeLogText() string {
+	return "JMAP method error: provider details " + redact.Placeholder
+}
+
+var _ redact.SafeLogError = (*methodError)(nil)
+
 type statusError struct {
 	Status int
 	Body   string
@@ -88,6 +96,12 @@ type statusError struct {
 func (e *statusError) Error() string {
 	return fmt.Sprintf("JMAP request failed: status %d: %s", e.Status, e.Body)
 }
+
+func (e *statusError) SafeLogText() string {
+	return fmt.Sprintf("JMAP request failed: status %d: response body %s", e.Status, redact.Placeholder)
+}
+
+var _ redact.SafeLogError = (*statusError)(nil)
 
 func (c *client) discover(ctx context.Context) error {
 	resp, err := c.doHTTP(ctx, http.MethodGet, c.sessionURL, nil, "", true)

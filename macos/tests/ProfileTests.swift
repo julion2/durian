@@ -127,6 +127,153 @@ final class ProfileTests: XCTestCase {
         XCTAssertEqual(query, "tag:sent")
     }
 
+    @MainActor
+    func testConcurrentPreparationWaitsForConfiguredDefaultProfile() async throws {
+        let json = """
+        {
+          "profiles": [
+            { "name": "All", "accounts": ["*"] },
+            {
+              "name": "Work", "accounts": ["work"], "default": true,
+              "folders": [
+                { "name": "Inbox", "icon": "tray", "query": "tag:priority" }
+              ]
+            }
+          ]
+        }
+        """
+        let evaluationCount = ProfileCounter()
+        let manager = ProfileManager(
+            configURL: URL(fileURLWithPath: "/unused/profiles.pkl"),
+            evaluator: { _ in
+                evaluationCount.increment()
+                try await Task.sleep(nanoseconds: 25_000_000)
+                return try JSONDecoder().decode(ProfilesConfig.self, from: Data(json.utf8))
+            },
+            fileExists: { _ in true }
+        )
+
+        async let preparation: Void = manager.prepareProfiles()
+        async let readiness: Void = manager.waitUntilReady()
+        _ = await (preparation, readiness)
+
+        XCTAssertTrue(manager.isReady)
+        XCTAssertEqual(evaluationCount.value, 1)
+        XCTAssertEqual(manager.currentProfile?.name, "Work")
+        XCTAssertEqual(
+            manager.buildQuery(folderName: "Inbox"),
+            "(tag:priority) AND (path:work/**)"
+        )
+    }
+
+    @MainActor
+    func testAppliedStartupProfilesAreImmediatelyReadyWithoutEvaluation() async throws {
+        let evaluationCount = ProfileCounter()
+        let manager = ProfileManager(
+            configURL: URL(fileURLWithPath: "/unused/profiles.pkl"),
+            evaluator: { _ in
+                evaluationCount.increment()
+                throw NSError(domain: "ProfileTests", code: 1)
+            },
+            fileExists: { _ in true }
+        )
+        let config = try JSONDecoder().decode(
+            ProfilesConfig.self,
+            from: Data(
+                #"{"profiles":[{"name":"Work","accounts":["work"],"default":true,"folders":[{"name":"Inbox","query":"tag:priority"}]}]}"#.utf8
+            )
+        )
+
+        manager.applyEvaluatedProfiles(config)
+        await manager.waitUntilReady()
+
+        XCTAssertTrue(manager.isReady)
+        XCTAssertEqual(evaluationCount.value, 0)
+        XCTAssertEqual(manager.currentProfile?.name, "Work")
+        XCTAssertEqual(
+            manager.buildQuery(folderName: "Inbox"),
+            "(tag:priority) AND (path:work/**)"
+        )
+    }
+
+    @MainActor
+    func testReadinessWaitDoesNotStartIndependentProfileEvaluation() async throws {
+        let evaluationCount = ProfileCounter()
+        let manager = ProfileManager(
+            configURL: URL(fileURLWithPath: "/unused/profiles.pkl"),
+            evaluator: { _ in
+                evaluationCount.increment()
+                throw NSError(domain: "ProfileTests", code: 1)
+            },
+            fileExists: { _ in true }
+        )
+        let readiness = Task { @MainActor in
+            await manager.waitUntilReady()
+        }
+        await Task.yield()
+
+        XCTAssertEqual(evaluationCount.value, 0)
+        XCTAssertFalse(manager.isReady)
+
+        let config = try JSONDecoder().decode(
+            ProfilesConfig.self,
+            from: Data(#"{"profiles":[{"name":"Work","accounts":["work"],"default":true}]}"#.utf8)
+        )
+        manager.applyEvaluatedProfiles(config)
+        await readiness.value
+
+        XCTAssertEqual(evaluationCount.value, 0)
+        XCTAssertTrue(manager.isReady)
+        XCTAssertEqual(manager.currentProfile?.name, "Work")
+    }
+
+    @MainActor
+    func testManualReloadDuringStartupPerformsSubsequentRead() async throws {
+        let evaluationCount = ProfileCounter()
+        let manager = ProfileManager(
+            configURL: URL(fileURLWithPath: "/unused/profiles.pkl"),
+            evaluator: { _ in
+                let count = evaluationCount.increment()
+                if count == 1 {
+                    try await Task.sleep(for: .milliseconds(40))
+                }
+                let name = count == 1 ? "First" : "Reloaded"
+                return try JSONDecoder().decode(
+                    ProfilesConfig.self,
+                    from: Data("{\"profiles\":[{\"name\":\"\(name)\",\"accounts\":[\"*\"]}]}".utf8)
+                )
+            },
+            fileExists: { _ in true }
+        )
+
+        async let preparation: Void = manager.prepareProfiles()
+        try await Task.sleep(for: .milliseconds(5))
+        async let reload: Void = manager.reloadProfiles()
+        _ = await (preparation, reload)
+
+        XCTAssertEqual(evaluationCount.value, 2)
+        XCTAssertEqual(manager.currentProfile?.name, "Reloaded")
+    }
+
+    @MainActor
+    func testMissingProfilesUsesReadyFallbackWithoutEvaluation() async {
+        let evaluationCount = ProfileCounter()
+        let manager = ProfileManager(
+            configURL: URL(fileURLWithPath: "/missing/profiles.pkl"),
+            evaluator: { _ in
+                evaluationCount.increment()
+                throw NSError(domain: "ProfileTests", code: 1)
+            },
+            fileExists: { _ in false }
+        )
+
+        await manager.prepareProfiles()
+
+        XCTAssertTrue(manager.isReady)
+        XCTAssertEqual(evaluationCount.value, 0)
+        XCTAssertEqual(manager.currentProfile?.name, "All")
+    }
+
     // MARK: - Color(hex:)
 
     func testColorHexRed() {
@@ -184,5 +331,20 @@ final class ProfileTests: XCTestCase {
         let manager = await ProfileManager(profiles: [profile], currentProfile: profile)
         let color = await manager.resolvedAccentColor
         XCTAssertEqual(color, Color.accentColor)
+    }
+}
+
+private final class ProfileCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int { lock.withLock { count } }
+
+    @discardableResult
+    func increment() -> Int {
+        lock.withLock {
+            count += 1
+            return count
+        }
     }
 }

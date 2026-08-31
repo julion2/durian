@@ -60,7 +60,9 @@ func (h *Handler) CalendarSyncEventHandler(w http.ResponseWriter, r *http.Reques
 		case errors.Is(err, ErrCalendarSyncDisabled):
 			http.Error(w, err.Error(), http.StatusConflict)
 		default:
-			slog.Error("Failed to sync calendar event", "module", "API", "err", logSafe(err.Error()))
+			// Keep the error typed so redact.Handler can recognize and replace a
+			// provider-controlled response without changing the HTTP contract.
+			slog.Error("Failed to sync calendar event", "module", "API", "err", err)
 			http.Error(w, "failed to sync calendar event", http.StatusBadGateway)
 		}
 		return

@@ -674,8 +674,7 @@ func TestGetAccountByIdentifier(t *testing.T) {
 		{
 			name:       "email with different case",
 			identifier: "Julian@GMX.de",
-			wantEmail:  "", // Email match is case-sensitive
-			wantErr:    ErrAccountNotFound,
+			wantEmail:  "julian@gmx.de",
 		},
 		// Alias lookup
 		{

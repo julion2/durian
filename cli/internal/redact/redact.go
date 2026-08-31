@@ -18,13 +18,46 @@ package redact
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"strings"
 )
 
 // Placeholder replaces sensitive values in log output. The set of keys
 // triggering replacement is defined in keys.go (SensitiveSlogKeys) so the
 // runtime wrapper and the pre-merge grep gate share one source of truth.
 const Placeholder = "[REDACTED]"
+
+// SafeLogError is an error whose full text is needed by callers but contains
+// externally controlled data that must not be written to a log. Implementors
+// return a safe replacement for their own Error text; Handler preserves any
+// trusted wrapping context around it.
+type SafeLogError interface {
+	error
+	SafeLogText() string
+}
+
+type externalError struct {
+	err      error
+	safeText string
+}
+
+func (e *externalError) Error() string       { return e.err.Error() }
+func (e *externalError) Unwrap() error       { return e.err }
+func (e *externalError) SafeLogText() string { return e.safeText }
+
+// ExternalError marks err as containing provider-controlled text while
+// preserving its Error string and unwrap chain for control flow and user-facing
+// errors. safeText must contain only trusted text suitable for a log.
+func ExternalError(err error, safeText string) error {
+	if err == nil {
+		return nil
+	}
+	if safeText == "" {
+		safeText = Placeholder
+	}
+	return &externalError{err: err, safeText: safeText}
+}
 
 // Handler is a slog.Handler that scrubs sensitive attribute values before
 // delegating to the wrapped handler.
@@ -89,13 +122,13 @@ func redact(a slog.Attr) slog.Attr {
 	if _, sensitive := sensitiveSlogKeySet[a.Key]; sensitive {
 		return slog.String(a.Key, Placeholder)
 	}
-	// Error values (and err.Error() logged as a string) may embed
-	// server-echoed mail content from IMAP/SMTP NO/BAD responses. Pass them
-	// through sanitizeText, which redacts over-long server runs while leaving
-	// short, readable diagnostics intact. See ADR-0001 §Logging audit.
+	// Marked provider errors retain their full text for callers but substitute
+	// SafeLogText here. Unmarked errors (and err.Error() logged as a string)
+	// still pass through the URL and long-run fallback sanitizer. See ADR-0001
+	// §Logging audit.
 	if a.Value.Kind() == slog.KindAny {
 		if err, ok := a.Value.Any().(error); ok {
-			if s := sanitizeText(err.Error()); s != err.Error() {
+			if s := safeErrorText(err); s != err.Error() {
 				return slog.String(a.Key, s)
 			}
 			return a
@@ -107,4 +140,27 @@ func redact(a slog.Attr) slog.Attr {
 		}
 	}
 	return a
+}
+
+// safeErrorText substitutes the safe text of the first marked error in the
+// unwrap chain. Standard %w wrappers include the wrapped Error text verbatim,
+// so replacing that suffix retains Durian's own operation context while
+// removing the provider-controlled portion. A custom wrapper that does not
+// include it falls back to the safe text rather than risking disclosure.
+func safeErrorText(err error) string {
+	var safeErr SafeLogError
+	if !errors.As(err, &safeErr) {
+		return sanitizeText(err.Error())
+	}
+
+	safeText := sanitizeText(safeErr.SafeLogText())
+	externalText := safeErr.Error()
+	fullText := err.Error()
+	if externalText == "" {
+		return safeText
+	}
+	if i := strings.LastIndex(fullText, externalText); i >= 0 {
+		return sanitizeText(fullText[:i] + safeText + fullText[i+len(externalText):])
+	}
+	return safeText
 }

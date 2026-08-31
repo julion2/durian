@@ -49,11 +49,11 @@ const (
 	probeJitter = 0.2
 	// maxProbeBackoff caps the exponential backoff after repeated failures.
 	maxProbeBackoff = 30 * time.Minute
-	// A state-expiry replacement must finish atomically before its cursor can
-	// advance. JMAP enumerates it in bounded pages, so recovery gets more time
-	// than an ordinary pass without holding an account lock for an hour.
+	// Ordinary daemon passes retain the previous watchdog. A state-expiry
+	// replacement may extend it because the authoritative snapshot must finish
+	// atomically before its cursor can advance.
 	syncTimeout         = 5 * time.Minute
-	recoverySyncTimeout = 15 * time.Minute
+	recoverySyncTimeout = 60 * time.Minute
 	// pushReconnectBase is the initial delay before rebuilding a push backend
 	// after its long-lived connection ends unexpectedly.
 	pushReconnectBase = time.Second

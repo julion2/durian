@@ -36,36 +36,49 @@ func Exists(service, account string) bool {
 	return err == nil
 }
 
-// GetOrCreateKey returns the hex-decoded raw key stored at (service, account).
-// If the entry is missing, a fresh crypto/rand key of nbytes bytes is
-// generated, hex-encoded, stored under that name, and returned.
+// GetKey returns the hex-decoded raw key stored at (service, account) without
+// creating it when missing.
 //
 // The on-disk representation is hex (ASCII), so both the macOS `security`
 // CLI and libsecret `secret-tool` round-trip the value cleanly (they treat
 // stored secrets as UTF-8 strings).
 //
 // Callers must never log the returned bytes.
-func GetOrCreateKey(service, account string, nbytes int) ([]byte, error) {
+func GetKey(service, account string, nbytes int) ([]byte, error) {
 	if nbytes <= 0 {
 		return nil, fmt.Errorf("keychain: nbytes must be > 0, got %d", nbytes)
 	}
 
-	if existing, err := GetPassword(service, account); err == nil {
-		key, decodeErr := hex.DecodeString(existing)
-		if decodeErr != nil {
-			return nil, fmt.Errorf("keychain: stored value at %s/%s is not valid hex: %w",
-				service, account, decodeErr)
+	existing, err := GetPassword(service, account)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, fmt.Errorf("keychain: lookup %s/%s: %w", service, account, ErrNotFound)
 		}
-		if len(key) != nbytes {
-			return nil, fmt.Errorf("keychain: stored key at %s/%s has length %d, want %d",
-				service, account, len(key), nbytes)
-		}
+		return nil, fmt.Errorf("keychain: lookup %s/%s failed", service, account)
+	}
+	key, err := hex.DecodeString(existing)
+	if err != nil {
+		return nil, fmt.Errorf("keychain: stored value at %s/%s is not valid hex", service, account)
+	}
+	if len(key) != nbytes {
+		return nil, fmt.Errorf("keychain: stored key at %s/%s has wrong length; want %d bytes",
+			service, account, nbytes)
+	}
+	return key, nil
+}
+
+// GetOrCreateKey returns GetKey's existing value, or generates and stores a
+// fresh crypto/rand key when the entry is missing.
+func GetOrCreateKey(service, account string, nbytes int) ([]byte, error) {
+	key, err := GetKey(service, account, nbytes)
+	if err == nil {
 		return key, nil
-	} else if !errors.Is(err, ErrNotFound) {
-		return nil, fmt.Errorf("keychain: lookup %s/%s: %w", service, account, err)
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, err
 	}
 
-	key := make([]byte, nbytes)
+	key = make([]byte, nbytes)
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("keychain: generate random key: %w", err)
 	}
