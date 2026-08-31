@@ -2,7 +2,10 @@ package store
 
 // Message represents an email message stored in the database.
 type Message struct {
-	ID        int64
+	ID int64
+	// StableID is the immutable provider object id when available. It is the
+	// local identity for JMAP messages; MessageID remains RFC 5322 metadata.
+	StableID  string
 	MessageID string
 	ThreadID  string
 	InReplyTo string
@@ -50,7 +53,8 @@ type Message struct {
 	// initialized regardless of this field.
 	SyncedFlagsInitialized bool
 	// Account is the account identifier for this message (e.g. "work").
-	// Each account has its own row — UNIQUE(message_id, account).
+	// Each account has its own rows, uniquely keyed by StableID when present and
+	// by MessageID as a fallback for backends without a stable object id.
 	Account string
 }
 

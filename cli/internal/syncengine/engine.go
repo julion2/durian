@@ -868,7 +868,7 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 		if !row.SyncedFlagsInitialized {
 			seededBaseline := joinFlags(imap.FlagState{Seen: row.IsSeen, Flagged: row.IsFlagged})
 			if seededBaseline != "" {
-				if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, seededBaseline); err != nil {
+				if err := e.opts.Store.SetSyncedFlagsByDBID(row.RowID, seededBaseline); err != nil {
 					// Don't process this row with an unpersisted baseline: the
 					// candidate check and the merge below must agree, and the
 					// merge re-reads rows[i]. Skip; the next sync retries.
@@ -1116,8 +1116,8 @@ func (e *Engine) reconcileFlagRows(
 				// written below would then agree with the reverted tags, so no
 				// later run could tell anything was lost. Write only while the
 				// snapshot still holds.
-				applied, err := e.opts.Store.ModifyFlagTagsIfUnchanged(
-					row.MessageID, e.opts.Account, imap.FlagTagVocabulary(),
+				applied, err := e.opts.Store.ModifyFlagTagsIfUnchangedByDBID(
+					row.RowID, imap.FlagTagVocabulary(),
 					flagTagsOf(row.Tags), add, remove)
 				switch {
 				case err != nil:
@@ -1147,7 +1147,7 @@ func (e *Engine) reconcileFlagRows(
 		if pushed || pulled {
 			next := imap.AdvanceBaseline(baseline, local, serverState, target, pushed, pulled)
 			if !next.Equal(baseline) {
-				if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, joinFlags(next)); err != nil {
+				if err := e.opts.Store.SetSyncedFlagsByDBID(row.RowID, joinFlags(next)); err != nil {
 					result.Errors = append(result.Errors, fmt.Errorf("flag baseline for %s: %w", row.MessageID, err))
 					failed = append(failed, row.RemoteRef)
 				}

@@ -2977,6 +2977,95 @@ func TestEngineFlagUpload(t *testing.T) {
 	}
 }
 
+func TestEngineFlagBaselinesScopeSameAccountDuplicatesByRow(t *testing.T) {
+	db := newTestDB(t)
+	folder := backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true}
+	first := &store.Message{
+		StableID: "duplicate-first", MessageID: "duplicate-flags@example.com",
+		Date: 1, CreatedAt: 1, Mailbox: folder.Name, Account: testAccount,
+		RemoteRef: "duplicate-first", Flags: `\Seen`, FetchedBody: true,
+	}
+	second := &store.Message{
+		StableID: "duplicate-second", MessageID: first.MessageID,
+		Date: 2, CreatedAt: 2, Mailbox: folder.Name, Account: testAccount,
+		RemoteRef: "duplicate-second", Flags: `\Flagged`, FetchedBody: true,
+		SyncedFlags: `\Flagged`, SyncedFlagsInitialized: true,
+	}
+	if err := db.InsertMessage(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessage(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddTag(second.ID, "unread"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddTag(second.ID, "flagged"); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeBackend([]backend.Folder{folder}, nil)
+	fake.caps.FlagChangesInDelta = true
+	engine := newTestEngine(db, newMemCursorStore())
+	result, err := engine.Sync(t.Context(), fake)
+	if err != nil || len(result.Errors) != 0 {
+		t.Fatalf("seed baselines: result=%+v err=%v", result, err)
+	}
+	rows, err := db.GetFolderFlagState(testAccount, folder.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[int64]store.FolderFlagRow, len(rows))
+	for _, row := range rows {
+		byID[row.RowID] = row
+	}
+	if got := byID[first.ID].SyncedFlags; got != `\Seen` {
+		t.Errorf("first seeded baseline = %q, want \\Seen", got)
+	}
+	if got := byID[second.ID].SyncedFlags; got != `\Flagged` {
+		t.Errorf("second baseline after first-row seed = %q, want \\Flagged", got)
+	}
+
+	if err := db.SetSyncedFlagsByDBID(first.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddTag(first.ID, "unread"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = db.GetFolderFlagState(testAccount, folder.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstRow store.FolderFlagRow
+	for _, row := range rows {
+		if row.RowID == first.ID {
+			firstRow = row
+		}
+	}
+	result = &Result{}
+	_, _, failed := engine.reconcileFlagRows(t.Context(), fake, folder,
+		[]store.FolderFlagRow{firstRow},
+		map[string]backend.Flags{first.RemoteRef: {Seen: true}}, nil,
+		false, true, true, false, result)
+	if len(result.Errors) != 0 || len(failed) != 0 {
+		t.Fatalf("advance baseline: errors=%v failed=%v", result.Errors, failed)
+	}
+	rows, err = db.GetFolderFlagState(testAccount, folder.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID = make(map[int64]store.FolderFlagRow, len(rows))
+	for _, row := range rows {
+		byID[row.RowID] = row
+	}
+	if got := byID[first.ID].SyncedFlags; got != `\Seen` {
+		t.Errorf("first advanced baseline = %q, want \\Seen", got)
+	}
+	if got := byID[second.ID].SyncedFlags; got != `\Flagged` {
+		t.Errorf("second baseline after first-row advance = %q, want \\Flagged", got)
+	}
+}
+
 func TestEngineDeltaReadDoesNotBecomeFalseLocalUnread(t *testing.T) {
 	tests := []struct {
 		name string
