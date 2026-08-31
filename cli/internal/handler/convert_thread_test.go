@@ -93,6 +93,7 @@ func TestConvertThreadKeepsDuplicateMessageIDsAddressable(t *testing.T) {
 	}
 	seenBodies := map[string]bool{}
 	seenIDs := map[string]bool{}
+	seenCacheIDs := map[string]bool{}
 	for _, message := range response.Thread.Messages {
 		if !strings.HasPrefix(message.ID, "local:") || message.MessageID != "duplicate@example.com" {
 			t.Errorf("message identity = id %q, Message-ID %q", message.ID, message.MessageID)
@@ -101,6 +102,13 @@ func TestConvertThreadKeepsDuplicateMessageIDsAddressable(t *testing.T) {
 			t.Errorf("duplicate opaque id %q", message.ID)
 		}
 		seenIDs[message.ID] = true
+		if message.AttachmentCacheID == "" || strings.HasPrefix(message.AttachmentCacheID, "local:") {
+			t.Errorf("attachment cache identity = %q", message.AttachmentCacheID)
+		}
+		if seenCacheIDs[message.AttachmentCacheID] {
+			t.Errorf("duplicate attachment cache identity %q", message.AttachmentCacheID)
+		}
+		seenCacheIDs[message.AttachmentCacheID] = true
 		bodyResponse := h.ShowMessageBody(message.ID)
 		if !bodyResponse.OK || bodyResponse.MessageBody == nil {
 			t.Fatalf("body %q response = %+v", message.ID, bodyResponse)
@@ -109,6 +117,14 @@ func TestConvertThreadKeepsDuplicateMessageIDsAddressable(t *testing.T) {
 	}
 	if !seenBodies["first body"] || !seenBodies["second body"] {
 		t.Fatalf("opaque identifiers resolved bodies %v", seenBodies)
+	}
+}
+
+func TestAttachmentCacheIDDoesNotReuseDatabaseRowIdentity(t *testing.T) {
+	oldMessage := &store.Message{ID: 1, Account: "work", StableID: "provider-object-old", MessageID: "old@example.com"}
+	newMessage := &store.Message{ID: 1, Account: "work", StableID: "provider-object-new", MessageID: "new@example.com"}
+	if oldID, newID := attachmentCacheID(oldMessage), attachmentCacheID(newMessage); oldID == newID {
+		t.Fatalf("reused database row produced the same attachment cache identity %q", oldID)
 	}
 }
 

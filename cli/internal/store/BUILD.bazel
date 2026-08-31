@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "attachments.go",
         "headers.go",
+        "ingest_lock.go",
         "local_drafts.go",
         "messages.go",
         "outbox.go",
@@ -19,6 +20,7 @@ go_library(
     visibility = ["//cli:__subpackages__"],
     deps = [
         "//cli/internal/dbcrypto",
+        "//cli/internal/mail",
         "@org_golang_x_text//cases",
         "@org_golang_x_text//language",
         "@org_modernc_sqlite//:sqlite",

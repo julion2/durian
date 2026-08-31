@@ -1,12 +1,15 @@
 package store
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
 	"unicode"
+
+	durianmail "github.com/julion2/durian/cli/internal/mail"
 )
 
 const syncedFlagsEmpty = "$DurianEmpty"
@@ -179,21 +182,7 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 	}
 	accountKey := accountID
 	if msg.StableID != "" {
-		// Upgrade a legacy Message-ID-keyed row lazily when the stable backend
-		// sees it again. Requiring a matching (or empty) remote_ref avoids
-		// claiming the wrong row when duplicate Message-IDs were previously
-		// collapsed; the matching duplicate will claim it later in the page.
-		if _, err := tx.Exec(`UPDATE messages SET stable_id = ?
-			WHERE id = (
-				SELECT id FROM messages
-				WHERE message_id = ? AND IFNULL(account_id, 0) = ? AND stable_id = ''
-				  AND (remote_ref = '' OR remote_ref = ?)
-				ORDER BY CASE WHEN remote_ref = ? THEN 0 ELSE 1 END, id
-				LIMIT 1
-			)
-			AND NOT EXISTS (
-				SELECT 1 FROM messages WHERE stable_id = ? AND IFNULL(account_id, 0) = ?
-			)`, msg.StableID, msg.MessageID, accountKey, msg.RemoteRef, msg.RemoteRef, msg.StableID, accountKey); err != nil {
+		if err := d.claimStableMessageIdentityTx(tx, msg, accountKey); err != nil {
 			return fmt.Errorf("claim stable message identity: %w", err)
 		}
 	}
@@ -278,6 +267,10 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 		return fmt.Errorf("encrypt synthetic fingerprint: %w", err)
 	}
 	var effectiveIngestPending int
+	initialIngestGeneration := int64(0)
+	if msg.IngestPending {
+		initialIngestGeneration = 1
+	}
 
 	err = tx.QueryRow(`
 		INSERT INTO messages (
@@ -288,8 +281,9 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 			mailbox_id, account_id,
 			is_seen, is_flagged, is_deleted, flags_other,
 			uid, size, fetched_body,
-			remote_ref, synthetic_identity, synthetic_fingerprint_ct, ingest_pending, synced_flags
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			remote_ref, synthetic_identity, synthetic_fingerprint_ct,
+				ingest_pending, ingest_generation, synced_flags
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT DO UPDATE SET
 			subject_ct = CASE WHEN excluded.fetched_body = 1
 			                  THEN excluded.subject_ct ELSE messages.subject_ct END,
@@ -318,14 +312,20 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 			synthetic_identity = CASE WHEN excluded.synthetic_identity = 1
 			                          THEN 1 ELSE messages.synthetic_identity END,
 			synthetic_fingerprint_ct = CASE WHEN length(excluded.synthetic_fingerprint_ct) > 0
-			                                THEN excluded.synthetic_fingerprint_ct ELSE messages.synthetic_fingerprint_ct END
+			                                THEN excluded.synthetic_fingerprint_ct ELSE messages.synthetic_fingerprint_ct END,
+			ingest_pending = CASE WHEN ? THEN 1 ELSE messages.ingest_pending END,
+				ingest_generation = CASE
+					WHEN ? OR (excluded.ingest_pending = 1 AND messages.ingest_pending = 1)
+					THEN messages.ingest_generation + 1
+					ELSE messages.ingest_generation
+				END
 			-- synced_flags is deliberately NOT updated on conflict: it is the
 			-- flag-sync baseline, initialized at insert or captured from the old
 			-- row above and thereafter owned by reconciliation (SetSyncedFlags).
 			-- Overwriting it from the incoming row when a delta
 			-- re-delivers a message after a server-side flag change would corrupt
 			-- the three-way merge and revert that change.
-		RETURNING id, ingest_pending`,
+		RETURNING id, ingest_pending, ingest_generation`,
 		msg.StableID, msg.MessageID, threadID, msg.InReplyTo, msg.Refs, subjectCT,
 		msg.FromAddr, msg.ToAddrs, msg.CCAddrs, bccCT,
 		msg.Date, msg.CreatedAt,
@@ -333,8 +333,10 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 		nullableID(mailboxID), nullableID(accountID),
 		isSeen, isFlagged, isDeleted, flagsOtherCT,
 		msg.UID, msg.Size, fetchedBody,
-		msg.RemoteRef, msg.SyntheticIdentity, syntheticFingerprintCT, msg.IngestPending, syncedFlags,
-	).Scan(&msg.ID, &effectiveIngestPending)
+		msg.RemoteRef, msg.SyntheticIdentity, syntheticFingerprintCT,
+		msg.IngestPending, initialIngestGeneration, syncedFlags,
+		msg.StartIngestOnConflict, msg.StartIngestOnConflict,
+	).Scan(&msg.ID, &effectiveIngestPending, &msg.IngestGeneration)
 	if err != nil {
 		return fmt.Errorf("upsert message: %w", err)
 	}
@@ -385,10 +387,114 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 	return nil
 }
 
-// MarkMessageIngestComplete records that all first-ingest enrichment for the
-// durable message row completed successfully.
-func (d *DB) MarkMessageIngestComplete(messageDBID int64) error {
-	if _, err := d.db.Exec("UPDATE messages SET ingest_pending = 0 WHERE id = ?", messageDBID); err != nil {
+// claimStableMessageIdentityTx upgrades one legacy Message-ID-keyed row to a
+// provider object id. An exact provider ref is authoritative. A row without a
+// ref is claimable only when its completed stored content, including attachment
+// metadata, matches the incoming object. The comparison and claim share the
+// caller's BEGIN IMMEDIATE transaction so two processes cannot reserve the same
+// fallback row for different duplicate objects.
+func (d *DB) claimStableMessageIdentityTx(tx *sql.Tx, msg *Message, accountID int64) error {
+	if msg.RemoteRef != "" {
+		result, err := tx.Exec(`UPDATE messages SET stable_id = ?
+			WHERE id = (
+				SELECT id FROM messages
+				WHERE message_id = ? AND IFNULL(account_id, 0) = ? AND stable_id = '' AND remote_ref = ?
+				ORDER BY id
+				LIMIT 1
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM messages WHERE stable_id = ? AND IFNULL(account_id, 0) = ?
+			)`, msg.StableID, msg.MessageID, accountID, msg.RemoteRef, msg.StableID, accountID)
+		if err != nil {
+			return err
+		}
+		if claimed, err := result.RowsAffected(); err != nil {
+			return err
+		} else if claimed > 0 {
+			return nil
+		}
+	}
+	if len(msg.PromotionFingerprint) == 0 {
+		return nil
+	}
+
+	var stableExists bool
+	if err := tx.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM messages WHERE stable_id = ? AND IFNULL(account_id, 0) = ?
+	)`, msg.StableID, accountID).Scan(&stableExists); err != nil {
+		return err
+	}
+	if stableExists {
+		return nil
+	}
+
+	candidate, err := d.scanMessageRow(tx.QueryRow(`SELECT `+messageSelectColumns+` `+messageSelectFrom+`
+		WHERE m.message_id = ? AND IFNULL(m.account_id, 0) = ?
+		  AND m.stable_id = '' AND m.remote_ref = ''
+		ORDER BY m.id
+		LIMIT 1`, msg.MessageID, accountID).Scan)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !candidate.FetchedBody || candidate.IngestPending {
+		return nil
+	}
+
+	rows, err := tx.Query("SELECT "+attachmentSelectColumns+" FROM attachments WHERE message_db_id = ? ORDER BY part_id, id", candidate.ID)
+	if err != nil {
+		return err
+	}
+	var attachments []Attachment
+	for rows.Next() {
+		attachment, scanErr := d.scanAttachmentRow(rows.Scan)
+		if scanErr != nil {
+			_ = rows.Close()
+			return scanErr
+		}
+		attachments = append(attachments, attachment)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	content := &durianmail.MailContent{
+		From: candidate.FromAddr, To: candidate.ToAddrs, CC: candidate.CCAddrs,
+		BCC: candidate.BCCAddrs, Subject: candidate.Subject,
+		InReplyTo: candidate.InReplyTo, References: candidate.Refs,
+		Body: candidate.BodyText, HTML: candidate.BodyHTML,
+	}
+	for _, attachment := range attachments {
+		content.Attachments = append(content.Attachments, durianmail.AttachmentInfo{
+			PartID: attachment.PartID, Filename: attachment.Filename,
+			ContentType: attachment.ContentType, Size: attachment.Size,
+			Disposition: attachment.Disposition, ContentID: attachment.ContentID,
+		})
+	}
+	fingerprint := durianmail.SyntheticFingerprint(content, candidate.Date)
+	if !bytes.Equal(fingerprint[:], msg.PromotionFingerprint) {
+		return nil
+	}
+	_, err = tx.Exec(`UPDATE messages SET stable_id = ?
+		WHERE id = ? AND stable_id = '' AND remote_ref = ''
+		  AND NOT EXISTS (
+			SELECT 1 FROM messages WHERE stable_id = ? AND IFNULL(account_id, 0) = ?
+		  )`, msg.StableID, candidate.ID, msg.StableID, accountID)
+	return err
+}
+
+// MarkMessageIngestComplete records that all enrichment owned by generation
+// completed successfully. A stale writer deliberately leaves a newer owner's
+// pending state untouched.
+func (d *DB) MarkMessageIngestComplete(messageDBID, generation int64) error {
+	if _, err := d.db.Exec(`UPDATE messages SET ingest_pending = 0
+		WHERE id = ? AND ingest_generation = ?`, messageDBID, generation); err != nil {
 		return fmt.Errorf("mark message ingest complete: %w", err)
 	}
 	return nil
@@ -1190,7 +1296,7 @@ const messageSelectColumns = `m.id, m.message_id, m.thread_id, m.in_reply_to, m.
 		mb.name_ct, ac.name_ct,
 		m.is_seen, m.is_flagged, m.is_deleted, m.flags_other,
 		m.uid, m.size, m.fetched_body, m.remote_ref, m.stable_id, m.synthetic_identity,
-		m.synthetic_fingerprint_ct, m.ingest_pending`
+		m.synthetic_fingerprint_ct, m.ingest_pending, m.ingest_generation`
 
 const messageSelectFrom = `FROM messages m
 		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
@@ -1212,7 +1318,7 @@ func (d *DB) scanMessageRow(scan func(...any) error) (*Message, error) {
 		&mailboxNameCT, &accountNameCT,
 		&isSeen, &isFlagged, &isDeleted, &flagsOtherCT,
 		&msg.UID, &msg.Size, &fetchedBody, &msg.RemoteRef, &msg.StableID,
-		&syntheticIdentity, &syntheticFingerprintCT, &ingestPending,
+		&syntheticIdentity, &syntheticFingerprintCT, &ingestPending, &msg.IngestGeneration,
 	); err != nil {
 		return nil, err
 	}

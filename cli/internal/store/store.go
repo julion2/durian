@@ -23,6 +23,7 @@ type DB struct {
 	db             *sql.DB
 	keyring        *dbcrypto.Keyring
 	accountAliases map[string]string
+	ingestLocks    *ingestLocks
 }
 
 // SetAccountAliases configures user-facing account identifiers (aliases,
@@ -130,7 +131,7 @@ func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
 		}
 	}
 
-	return &DB{db: db, keyring: kr}, nil
+	return &DB{db: db, keyring: kr, ingestLocks: newIngestLocks(dbPath)}, nil
 }
 
 // OpenReadOnly opens an existing store without creating directories, changing
@@ -1272,6 +1273,24 @@ func (d *DB) migrate() error {
 			if _, err := d.db.Exec(stmt); err != nil {
 				return fmt.Errorf("migrate v29→v30: %w", err)
 			}
+		}
+	}
+
+	if version < 31 {
+		// Enrichment spans several transactions. Give each writer a durable
+		// generation so completion by an older overlapping writer cannot clear the
+		// pending marker while a newer writer is still rebuilding attachments.
+		has, err := hasColumn(d.db, "messages", "ingest_generation")
+		if err != nil {
+			return fmt.Errorf("migrate v30→v31 inspect ingest_generation: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN ingest_generation INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return fmt.Errorf("migrate v30→v31 add ingest_generation: %w", err)
+			}
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 31 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v30→v31 bump: %w", err)
 		}
 	}
 

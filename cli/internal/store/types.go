@@ -42,9 +42,23 @@ type Message struct {
 	// synthetic identity even when attachment enrichment is still incomplete.
 	// It is encrypted at rest.
 	SyntheticFingerprint []byte
+	// PromotionFingerprint is the transient parsed-content digest a stable-id
+	// backend supplies when it may adopt a legacy row. It is never persisted;
+	// insertMessageTx compares it with the candidate inside the write
+	// transaction so duplicate Message-IDs cannot claim each other's content.
+	PromotionFingerprint []byte
+	// StartIngestOnConflict transiently asks the upsert to mark an existing row
+	// pending and take a new ingest generation in the same transaction. Callers
+	// that will rebuild attachments and headers set it before exposing a partially
+	// refreshed row to other writers.
+	StartIngestOnConflict bool
 	// IngestPending records that the core message row is durable but first-ingest
 	// enrichment (attachments, indexed headers, tags, and rules) is incomplete.
 	IngestPending bool
+	// IngestGeneration identifies the writer that currently owns an incomplete
+	// enrichment. Only that generation may mark the row complete, so an older
+	// overlapping writer cannot expose a newer writer's partial attachment set.
+	IngestGeneration int64
 	// SyncedFlags is the last-synced flag baseline as a comma-joined
 	// IMAP-style flag string (same format as Flags, e.g. `\Seen,\Flagged`).
 	SyncedFlags string

@@ -819,6 +819,12 @@ components:
           description: >
             Opaque local message identifier. Clients must not interpret this
             field as an RFC Message-ID.
+        attachment_cache_id:
+          type: string
+          description: >
+            Opaque content identity for persistent attachment caches. Unlike
+            id, this value remains tied to the provider object when a local
+            database is recreated.
         message_id:
           type: string
           description: RFC 5322 Message-ID metadata; optional and not guaranteed unique

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	durianmail "github.com/julion2/durian/cli/internal/mail"
 )
 
 func TestInsertAndGetMessage(t *testing.T) {
@@ -249,7 +251,10 @@ func TestIngestPendingRequiresExplicitCompletion(t *testing.T) {
 	if err != nil || stored == nil || !stored.IngestPending || !retry.IngestPending {
 		t.Fatalf("pending row after retry upsert = %+v, effective pending=%t, err=%v", stored, retry.IngestPending, err)
 	}
-	if err := db.MarkMessageIngestComplete(stored.ID); err != nil {
+	if stored.IngestGeneration != 1 {
+		t.Fatalf("initial ingest generation = %d, want 1", stored.IngestGeneration)
+	}
+	if err := db.MarkMessageIngestComplete(stored.ID, stored.IngestGeneration); err != nil {
 		t.Fatal(err)
 	}
 
@@ -264,6 +269,130 @@ func TestIngestPendingRequiresExplicitCompletion(t *testing.T) {
 	stored, err = db.GetByMessageID(messageID)
 	if err != nil || stored == nil || stored.IngestPending || redelivery.IngestPending {
 		t.Fatalf("completed row after redelivery = %+v, effective pending=%t, err=%v", stored, redelivery.IngestPending, err)
+	}
+
+	refresh := &Message{
+		MessageID: messageID, Subject: "refresh", Date: 1, CreatedAt: 4,
+		Mailbox: "INBOX", Account: "work", IngestPending: true, StartIngestOnConflict: true,
+	}
+	if err := db.InsertMessage(refresh); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = db.GetByMessageID(messageID)
+	if err != nil || stored == nil || !stored.IngestPending || !refresh.IngestPending || refresh.IngestGeneration != 2 {
+		t.Fatalf("explicit refresh did not mark row pending: stored=%+v effective=%t err=%v", stored, refresh.IngestPending, err)
+	}
+
+	// A backend that normally fast-paths completed rows still takes ownership
+	// when retrying a row that was already pending.
+	pendingRetry := &Message{
+		MessageID: messageID, Subject: "pending retry", Date: 1, CreatedAt: 5,
+		Mailbox: "INBOX", Account: "work", IngestPending: true,
+	}
+	if err := db.InsertMessage(pendingRetry); err != nil {
+		t.Fatal(err)
+	}
+	if pendingRetry.IngestGeneration != 3 {
+		t.Fatalf("pending retry generation = %d, want 3", pendingRetry.IngestGeneration)
+	}
+	if err := db.MarkMessageIngestComplete(stored.ID, refresh.IngestGeneration); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = db.GetByMessageID(messageID)
+	if err != nil || stored == nil || !stored.IngestPending || stored.IngestGeneration != pendingRetry.IngestGeneration {
+		t.Fatalf("stale refresh completion changed pending retry: stored=%+v err=%v", stored, err)
+	}
+}
+
+func TestStablePromotionSkipsFallbackRefreshInProgress(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "promotion-refresh.db")
+	kr := testKeyring(t)
+	first, err := Open(dbPath, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { first.Close() })
+	if err := first.Init(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(dbPath, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { second.Close() })
+
+	fallback := &Message{
+		MessageID: "refresh-duplicate@example.com", Subject: "Same content",
+		FromAddr: "sender@example.com", ToAddrs: "recipient@example.com",
+		BodyText: "same body", Date: 10, CreatedAt: 10,
+		Mailbox: "INBOX", Account: "work", FetchedBody: true,
+	}
+	if err := first.InsertMessage(fallback); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.InsertAttachment(&Attachment{
+		MessageDBID: fallback.ID, PartID: 1, Filename: "same.bin",
+		ContentType: "application/octet-stream", Size: 1, Disposition: "attachment",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	refreshA := *fallback
+	refreshA.ID = 0
+	refreshA.IngestPending = true
+	refreshA.StartIngestOnConflict = true
+	if err := first.InsertMessage(&refreshA); err != nil {
+		t.Fatal(err)
+	}
+	refreshB := *fallback
+	refreshB.ID = 0
+	refreshB.IngestPending = true
+	refreshB.StartIngestOnConflict = true
+	if err := second.InsertMessage(&refreshB); err != nil {
+		t.Fatal(err)
+	}
+	if refreshB.IngestGeneration <= refreshA.IngestGeneration {
+		t.Fatalf("second refresh generation = %d, want newer than %d", refreshB.IngestGeneration, refreshA.IngestGeneration)
+	}
+
+	// Writer A finishes after writer B has taken ownership. Its stale completion
+	// must not expose B's in-progress enrichment as complete.
+	if err := first.MarkMessageIngestComplete(fallback.ID, refreshA.IngestGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := second.GetByDBID(fallback.ID); err != nil || pending == nil ||
+		!pending.IngestPending || pending.IngestGeneration != refreshB.IngestGeneration {
+		t.Fatalf("fallback refresh state = %+v, err=%v", pending, err)
+	}
+
+	content := &durianmail.MailContent{
+		From: fallback.FromAddr, To: fallback.ToAddrs, Subject: fallback.Subject, Body: fallback.BodyText,
+		Attachments: []durianmail.AttachmentInfo{{
+			PartID: 1, Filename: "same.bin", ContentType: "application/octet-stream", Size: 1, Disposition: "attachment",
+		}},
+	}
+	fingerprint := durianmail.SyntheticFingerprint(content, fallback.Date)
+	stable := *fallback
+	stable.ID = 0
+	stable.StableID = "provider-object"
+	stable.RemoteRef = "provider-object"
+	stable.PromotionFingerprint = fingerprint[:]
+	if err := second.InsertMessage(&stable); err != nil {
+		t.Fatal(err)
+	}
+	if stable.ID == fallback.ID {
+		t.Fatalf("stable object claimed fallback row %d while its enrichment was pending", fallback.ID)
+	}
+	pending, err := first.GetByDBID(fallback.ID)
+	if err != nil || pending == nil || pending.StableID != "" || !pending.IngestPending {
+		t.Fatalf("fallback after competing stable ingest = %+v, err=%v", pending, err)
+	}
+	if err := second.MarkMessageIngestComplete(fallback.ID, refreshB.IngestGeneration); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = first.GetByDBID(fallback.ID)
+	if err != nil || pending == nil || pending.IngestPending || pending.IngestGeneration != refreshB.IngestGeneration {
+		t.Fatalf("fallback after owning writer completed = %+v, err=%v", pending, err)
 	}
 }
 

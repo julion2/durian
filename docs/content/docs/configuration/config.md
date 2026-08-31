@@ -228,7 +228,8 @@ Microsoft account (Microsoft must use Graph). `jmap` requires an absolute HTTP(S
 session URL and a `jmap` block; conversely, configuring a `jmap` block requires
 `sync_engine = "jmap"`. Remote HTTP is rejected. Changing `sync_engine` triggers a
 fresh full resync (the per-backend cursors are incompatible) but is safe — the
-store upserts by Message-ID.
+store adopts matching legacy rows by provider object ID when available and uses
+RFC Message-ID only as metadata and a fallback for protocols without stable IDs.
 
 ### Provider presets
 

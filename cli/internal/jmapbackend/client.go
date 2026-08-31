@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/julion2/durian/cli/internal/redact"
@@ -122,8 +123,68 @@ type client struct {
 	session    session
 	accountID  string
 	limits     coreLimits
-	apiSem     chan struct{}
-	uploadSem  chan struct{}
+	apiSem     *requestLimiter
+	uploadSem  *requestLimiter
+}
+
+type requestLimiter struct {
+	mu       sync.Mutex
+	limit    int
+	inFlight int
+	changed  chan struct{}
+}
+
+type accountLimiters struct {
+	api    requestLimiter
+	upload requestLimiter
+}
+
+var jmapAccountLimiters sync.Map
+
+func sharedAccountLimiters(apiURL, accountID string) *accountLimiters {
+	key := apiURL + "\x00" + accountID
+	limiters, _ := jmapAccountLimiters.LoadOrStore(key, &accountLimiters{})
+	return limiters.(*accountLimiters)
+}
+
+func (l *requestLimiter) configure(limit int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.changed == nil {
+		l.changed = make(chan struct{})
+	}
+	// Multiple clients discover the same account independently. Keep the most
+	// restrictive advertised value so their aggregate can never exceed either
+	// session's account limit if discovery responses change mid-process.
+	if l.limit == 0 || limit < l.limit {
+		l.limit = limit
+		close(l.changed)
+		l.changed = make(chan struct{})
+	}
+}
+
+func (l *requestLimiter) acquire(ctx context.Context) (func(), error) {
+	for {
+		l.mu.Lock()
+		if l.inFlight < l.limit {
+			l.inFlight++
+			l.mu.Unlock()
+			return func() {
+				l.mu.Lock()
+				l.inFlight--
+				close(l.changed)
+				l.changed = make(chan struct{})
+				l.mu.Unlock()
+			}, nil
+		}
+		changed := l.changed
+		l.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 type methodEnvelope struct {
@@ -194,10 +255,6 @@ func (c *client) discover(ctx context.Context) error {
 		c.limits.MaxConcurrentRequests == 0 || c.limits.MaxSizeRequest == 0 {
 		return errors.New("JMAP core capability does not permit API reads")
 	}
-	c.apiSem = make(chan struct{}, min(c.limits.MaxConcurrentRequests, maxClientAPIRequests))
-	if c.limits.MaxConcurrentUpload > 0 {
-		c.uploadSem = make(chan struct{}, min(c.limits.MaxConcurrentUpload, maxClientUploads))
-	}
 	accountID := c.session.PrimaryAccounts[mailCapability]
 	account, primaryOK := c.session.Accounts[accountID]
 	_, primaryHasMail := account.AccountCapabilities[mailCapability]
@@ -234,6 +291,13 @@ func (c *client) discover(ctx context.Context) error {
 				return fmt.Errorf("invalid JMAP %s: %w", name, err)
 			}
 		}
+	}
+	limiters := sharedAccountLimiters(c.session.APIURL, c.accountID)
+	limiters.api.configure(min(c.limits.MaxConcurrentRequests, maxClientAPIRequests))
+	c.apiSem = &limiters.api
+	if c.limits.MaxConcurrentUpload > 0 {
+		limiters.upload.configure(min(c.limits.MaxConcurrentUpload, maxClientUploads))
+		c.uploadSem = &limiters.upload
 	}
 	return nil
 }
@@ -546,16 +610,11 @@ func (c *client) upload(ctx context.Context, data []byte, contentType string) (s
 	return result.BlobID, nil
 }
 
-func acquire(ctx context.Context, sem chan struct{}) (func(), error) {
+func acquire(ctx context.Context, sem *requestLimiter) (func(), error) {
 	if sem == nil {
 		return func() {}, nil
 	}
-	select {
-	case sem <- struct{}{}:
-		return func() { <-sem }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	return sem.acquire(ctx)
 }
 
 func (c *client) maxObjectsInGet(fallback int) int {

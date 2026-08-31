@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
@@ -219,6 +220,29 @@ func roleTag(role string) string {
 		return "important"
 	}
 	return ""
+}
+
+func roleMailboxForTag(tag string) (role, name string, ok bool) {
+	switch tag {
+	case "inbox":
+		return "inbox", "Inbox", true
+	case "archive":
+		return "archive", "Archive", true
+	case "draft":
+		return "drafts", "Drafts", true
+	case "sent":
+		return "sent", "Sent", true
+	case "trash":
+		return "trash", "Trash", true
+	case "spam":
+		return "junk", "Junk", true
+	case "all":
+		return "all", "All Mail", true
+	case "important":
+		return "important", "Important", true
+	default:
+		return "", "", false
+	}
 }
 
 func canonicalMailboxSegment(name string) string {
@@ -723,7 +747,8 @@ func (b *Backend) labelsFor(mailboxIDs, keywords map[string]bool) []string {
 			continue
 		}
 		if tag, ok := decodeDurianKeyword(keyword); ok {
-			if b.tagToID[tag] != "" || isExplicitFlagTag(tag) || strings.HasPrefix(tag, "jmap-keyword/") {
+			_, _, canonicalRole := roleMailboxForTag(tag)
+			if b.tagToID[tag] != "" || canonicalRole || isExplicitFlagTag(tag) || strings.HasPrefix(tag, "jmap-keyword/") {
 				labels = append(labels, "jmap-keyword/"+keyword)
 			} else {
 				labels = append(labels, tag)
@@ -761,7 +786,7 @@ func decodeDurianKeyword(keyword string) (string, bool) {
 		return "", false
 	}
 	decoded, err := keywordEncoding.DecodeString(strings.ToUpper(encoded))
-	if err != nil || string(decoded) == "" {
+	if err != nil || len(decoded) == 0 || !utf8.Valid(decoded) {
 		return "", false
 	}
 	canonical, err := encodeDurianKeyword(string(decoded))
@@ -978,11 +1003,15 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 		return err
 	}
 	for _, tag := range add {
-		if tag == "archive" && b.mailboxIDForTag("archive") == "" {
-			if err := b.createArchiveMailbox(ctx); err != nil {
-				return fmt.Errorf("create JMAP archive mailbox: %w", err)
-			}
-			break
+		role, name, canonicalRole := roleMailboxForTag(tag)
+		if !canonicalRole || b.mailboxIDForTag(tag) != "" {
+			continue
+		}
+		if err := b.createRoleMailbox(ctx, role, name); err != nil {
+			return fmt.Errorf("create JMAP %s mailbox: %w", role, err)
+		}
+		if b.mailboxIDForTag(tag) == "" {
+			return fmt.Errorf("created JMAP %s mailbox could not be resolved", role)
 		}
 	}
 	patch := make(map[string]interface{})
@@ -993,6 +1022,15 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 				if id := b.tagToID[tag]; id != "" {
 					patch["mailboxIds/"+id] = value
 					continue
+				}
+				if _, _, canonicalRole := roleMailboxForTag(tag); canonicalRole {
+					// A missing role on removal means there is no corresponding
+					// membership to remove. Never turn canonical role intent into
+					// a custom keyword.
+					if value == nil {
+						continue
+					}
+					return fmt.Errorf("JMAP role mailbox %q is unavailable", tag)
 				}
 			}
 			keyword, err := keywordForTag(tag)

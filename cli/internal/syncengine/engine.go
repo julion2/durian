@@ -285,13 +285,15 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 }
 
 // isRetryableStoreError reports whether a failed ingest is worth retrying on
-// the next pass. SQLite reports write contention as "database is locked" —
-// which happens because the daemon's watchers and a `durian sync` process write
-// this file from separate processes, where the driver's single-connection
-// setting offers no protection. Those succeed on a retry; a malformed message
-// or a constraint violation never will, so everything else is treated as
-// permanent and skipped rather than blocking the folder's cursor.
+// the next pass. That includes an occupied full-ingest stripe and SQLite write
+// contention between the daemon's watchers and a separate `durian sync`
+// process. Those succeed on a retry; a malformed message or a constraint
+// violation never will, so everything else is treated as permanent and skipped
+// rather than blocking the folder's cursor.
 func isRetryableStoreError(err error) bool {
+	if errors.Is(err, store.ErrMessageIngestLock) {
+		return true
+	}
 	msg := err.Error()
 	return strings.Contains(msg, "database is locked") ||
 		strings.Contains(msg, "database table is locked") ||

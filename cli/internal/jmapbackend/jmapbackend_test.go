@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -659,6 +661,64 @@ func TestCoreLimitsRequireCompleteUsableCapability(t *testing.T) {
 	}
 }
 
+func TestCoreRequestLimitIsSharedAcrossAccountClients(t *testing.T) {
+	s := newTestJMAPServer(t)
+	s.limits = map[string]interface{}{"maxConcurrentRequests": 1, "maxConcurrentUpload": 1}
+	var active atomic.Int32
+	var maximum atomic.Int32
+	s.handler = func(method string, _ map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+		case "Core/echo":
+			current := active.Add(1)
+			defer active.Add(-1)
+			for observed := maximum.Load(); current > observed && !maximum.CompareAndSwap(observed, current); observed = maximum.Load() {
+			}
+			time.Sleep(40 * time.Millisecond)
+			return map[string]interface{}{}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+
+	first := s.backend(t)
+	second := s.backend(t)
+	if _, err := first.FetchFolders(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.FetchFolders(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if first.client.apiSem != second.client.apiSem {
+		t.Fatal("same JMAP account received per-client request limiters")
+	}
+	if first.client.uploadSem != second.client.uploadSem {
+		t.Fatal("same JMAP account received per-client upload limiters")
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, b := range []*Backend{first, second} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var result map[string]interface{}
+			errs <- b.client.call(t.Context(), []string{coreCapability}, "Core/echo", map[string]interface{}{}, &result)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := maximum.Load(); got != 1 {
+		t.Fatalf("maximum concurrent account API requests = %d, want 1", got)
+	}
+}
+
 func TestJMAPKeywordRoundTripAndPropertyPatches(t *testing.T) {
 	keyword, err := encodeDurianKeyword("Project/Alpha")
 	if err != nil {
@@ -666,6 +726,9 @@ func TestJMAPKeywordRoundTripAndPropertyPatches(t *testing.T) {
 	}
 	if tag, ok := decodeDurianKeyword(keyword); !ok || tag != "Project/Alpha" {
 		t.Fatalf("decode %q = %q, %v", keyword, tag, ok)
+	}
+	if tag, ok := decodeDurianKeyword("durian-74"); ok || tag != "" {
+		t.Fatalf("invalid UTF-8 keyword decoded as %q, %v", tag, ok)
 	}
 	conflictingKeyword, err := encodeDurianKeyword("project-alpha")
 	if err != nil {
@@ -676,9 +739,9 @@ func TestJMAPKeywordRoundTripAndPropertyPatches(t *testing.T) {
 		tagToID:      map[string]string{"inbox": "inbox-id", "project-alpha": "project-id"},
 	}
 	labels := b.labelsFor(map[string]bool{"inbox-id": true, "project-id": true}, map[string]bool{
-		keyword: true, conflictingKeyword: true, "custom": true, "$forwarded": true,
+		keyword: true, conflictingKeyword: true, "custom": true, "durian-74": true, "$forwarded": true,
 	})
-	if want := []string{"Project/Alpha", "inbox", "jmap-keyword/custom", "jmap-keyword/" + conflictingKeyword, "project-alpha"}; !slices.Equal(labels, want) {
+	if want := []string{"Project/Alpha", "inbox", "jmap-keyword/custom", "jmap-keyword/durian-74", "jmap-keyword/" + conflictingKeyword, "project-alpha"}; !slices.Equal(labels, want) {
 		t.Fatalf("labels = %v, want %v", labels, want)
 	}
 	if _, err := keywordForTag("jmap-keyword/$seen"); err == nil {
@@ -922,6 +985,113 @@ func TestApplyLabelsCreatesMissingArchiveMailbox(t *testing.T) {
 	}
 	if !createdArchive || emailPatch["mailboxIds/archive-id"] != true || emailPatch["mailboxIds/inbox-id"] != nil {
 		t.Fatalf("created=%v patch=%#v", createdArchive, emailPatch)
+	}
+}
+
+func TestApplyLabelsCreatesMissingTrashMailbox(t *testing.T) {
+	s := newTestJMAPServer(t)
+	createdTrash := false
+	var emailPatch map[string]interface{}
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			mailboxes := testMailboxes()
+			if createdTrash {
+				mailboxes = append(mailboxes, map[string]interface{}{
+					"id": "trash-id", "name": "Trash", "role": "trash", "isSubscribed": true,
+				})
+			}
+			return map[string]interface{}{"state": "mb1", "list": mailboxes}
+		case "Mailbox/set":
+			create := args["create"].(map[string]interface{})
+			trash := create["trash"].(map[string]interface{})
+			if trash["role"] != "trash" || trash["name"] != "Trash" {
+				t.Fatalf("trash create = %#v", trash)
+			}
+			createdTrash = true
+			return map[string]interface{}{"created": map[string]interface{}{"trash": map[string]string{"id": "trash-id"}}, "notCreated": map[string]interface{}{}}
+		case "Email/get":
+			return map[string]interface{}{"state": "s1", "list": []interface{}{emailObject("e1", nil, map[string]bool{"inbox-id": true})}, "notFound": []interface{}{}}
+		case "Email/set":
+			emailPatch = args["update"].(map[string]interface{})["e1"].(map[string]interface{})
+			return map[string]interface{}{"updated": map[string]interface{}{"e1": nil}, "notUpdated": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	b := s.backend(t)
+	if err := b.ApplyLabels(t.Context(), backend.RemoteRef{ID: "e1"}, []string{"trash"}, []string{"inbox"}); err != nil {
+		t.Fatal(err)
+	}
+	if !createdTrash || emailPatch["mailboxIds/trash-id"] != true || emailPatch["mailboxIds/inbox-id"] != nil {
+		t.Fatalf("created=%v patch=%#v", createdTrash, emailPatch)
+	}
+	if _, encodedAsKeyword := emailPatch["keywords/durian-orzgcyti"]; encodedAsKeyword {
+		t.Fatalf("trash intent encoded as a keyword: %#v", emailPatch)
+	}
+}
+
+func TestApplyLabelsMissingRoleCreationFailureDoesNotMutateEmail(t *testing.T) {
+	s := newTestJMAPServer(t)
+	emailSetCalled := false
+	s.handler = func(method string, _ map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+		case "Mailbox/set":
+			return map[string]interface{}{
+				"created":    map[string]interface{}{},
+				"notCreated": map[string]interface{}{"trash": map[string]string{"type": "invalidProperties"}},
+			}
+		case "Email/set":
+			emailSetCalled = true
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	b := s.backend(t)
+	if err := b.ApplyLabels(t.Context(), backend.RemoteRef{ID: "e1"}, []string{"trash"}, []string{"inbox"}); err == nil {
+		t.Fatal("missing Trash creation unexpectedly succeeded")
+	}
+	if emailSetCalled {
+		t.Fatal("email mutated after role mailbox creation failed")
+	}
+}
+
+func TestMissingRoleEncodedKeywordRemainsNativeAndRemovable(t *testing.T) {
+	trashKeyword, err := encodeDurianKeyword("trash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &Backend{mailboxToTag: map[string]string{}, tagToID: map[string]string{}}
+	if labels := b.labelsFor(nil, map[string]bool{trashKeyword: true}); !slices.Equal(labels, []string{"jmap-keyword/" + trashKeyword}) {
+		t.Fatalf("missing-role keyword labels = %v", labels)
+	}
+
+	s := newTestJMAPServer(t)
+	var emailPatch map[string]interface{}
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+		case "Email/get":
+			return map[string]interface{}{"state": "s1", "list": []interface{}{
+				emailObject("e1", map[string]bool{trashKeyword: true}, map[string]bool{"inbox-id": true}),
+			}, "notFound": []interface{}{}}
+		case "Email/set":
+			emailPatch = args["update"].(map[string]interface{})["e1"].(map[string]interface{})
+			return map[string]interface{}{"updated": map[string]interface{}{"e1": nil}, "notUpdated": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	remote := s.backend(t)
+	if err := remote.ApplyLabels(t.Context(), backend.RemoteRef{ID: "e1"}, nil, []string{"jmap-keyword/" + trashKeyword}); err != nil {
+		t.Fatal(err)
+	}
+	value, exists := emailPatch["keywords/"+trashKeyword]
+	if !exists || value != nil {
+		t.Fatalf("native trash keyword removal patch = %#v", emailPatch)
 	}
 }
 

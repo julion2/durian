@@ -59,6 +59,19 @@ func rawMessage(msgID, from, to, subject, body string) []byte {
 		body + "\r\n")
 }
 
+func rawAttachmentMessage(msgID, from, to, subject, filename, base64Body string) []byte {
+	return []byte("From: " + from + "\r\n" +
+		"To: " + to + "\r\n" +
+		"Subject: " + subject + "\r\n" +
+		"Message-ID: <" + msgID + ">\r\n" +
+		"Date: Mon, 20 Jul 2026 10:00:00 +0000\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: application/octet-stream; name=\"" + filename + "\"\r\n" +
+		"Content-Disposition: attachment; filename=\"" + filename + "\"\r\n" +
+		"Content-Transfer-Encoding: base64\r\n\r\n" +
+		base64Body + "\r\n")
+}
+
 // memCursorStore is a map-backed CursorStore so the tests avoid the
 // filesystem/flock machinery of FileCursorStore.
 type memCursorStore struct {
@@ -585,6 +598,65 @@ func TestEngineReportsDistinctStableArrivalsWithDuplicateMessageIDs(t *testing.T
 		}
 		if got, want := msg.StableID, messages[i].StableID; got != want {
 			t.Errorf("identifier %q stable ID = %q, want %q", identifier, got, want)
+		}
+	}
+}
+
+func TestIngestPromotesOnlyMatchingLegacyDuplicate(t *testing.T) {
+	db := newTestDB(t)
+	const messageID = "legacy-duplicate@example.com"
+	legacyB := backend.Message{
+		MessageID: messageID,
+		Ref:       backend.RemoteRef{Folder: "ALL"},
+		Raw:       rawAttachmentMessage(messageID, "b@example.com", testAccount, "Object B", "b.bin", "Yg=="),
+	}
+	_, legacyRowID, created, err := Ingest(db, legacyB, "ALL", backend.RoleAll, IngestOptions{
+		Account: testAccount, LabelsAsTags: true,
+	})
+	if err != nil || !created {
+		t.Fatalf("seed legacy B: row=%d created=%v err=%v", legacyRowID, created, err)
+	}
+
+	stableA := backend.Message{
+		StableID: "object-a", MessageID: messageID,
+		Ref: backend.RemoteRef{Folder: "ALL", ID: "object-a"},
+		Raw: rawAttachmentMessage(messageID, "a@example.com", testAccount, "Object A", "a.bin", "YQ=="),
+	}
+	_, rowA, created, err := Ingest(db, stableA, "ALL", backend.RoleAll, IngestOptions{
+		Account: testAccount, LabelsAsTags: true,
+	})
+	if err != nil || !created || rowA == legacyRowID {
+		t.Fatalf("ingest A first: row=%d legacy=%d created=%v err=%v", rowA, legacyRowID, created, err)
+	}
+
+	stableB := backend.Message{
+		StableID: "object-b", MessageID: messageID,
+		Ref: backend.RemoteRef{Folder: "ALL", ID: "object-b"},
+		Raw: legacyB.Raw,
+	}
+	_, rowB, created, err := Ingest(db, stableB, "ALL", backend.RoleAll, IngestOptions{
+		Account: testAccount, LabelsAsTags: true,
+	})
+	if err != nil || created || rowB != legacyRowID {
+		t.Fatalf("ingest matching B: row=%d legacy=%d created=%v err=%v", rowB, legacyRowID, created, err)
+	}
+
+	rows, err := db.GetAllByMessageID(messageID)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("duplicate rows = %d, err=%v, want 2", len(rows), err)
+	}
+	byStableID := make(map[string]*store.Message, len(rows))
+	for _, row := range rows {
+		byStableID[row.StableID] = row
+	}
+	if byStableID["object-a"] == nil || byStableID["object-a"].Subject != "Object A" ||
+		byStableID["object-b"] == nil || byStableID["object-b"].Subject != "Object B" {
+		t.Fatalf("stable duplicate contents = %#v", byStableID)
+	}
+	for stableID, wantFilename := range map[string]string{"object-a": "a.bin", "object-b": "b.bin"} {
+		attachments, err := db.GetAttachmentsByMessage(byStableID[stableID].ID)
+		if err != nil || len(attachments) != 1 || attachments[0].Filename != wantFilename {
+			t.Fatalf("%s attachments = %#v, err=%v, want %q", stableID, attachments, err, wantFilename)
 		}
 	}
 }
@@ -2277,6 +2349,12 @@ func TestEnginePersistsReplacementCursorWhenFlagUploadFails(t *testing.T) {
 // permanent failure as retryable re-downloads the folder forever without
 // progressing, and treating write contention as permanent drops the message.
 func TestIsRetryableStoreError(t *testing.T) {
+	if err := fmt.Errorf("wrapped: %w", store.ErrMessageIngestLockTimeout); !isRetryableStoreError(err) {
+		t.Error("message ingest lock timeout is not retryable")
+	}
+	if err := fmt.Errorf("wrapped: %w", store.ErrMessageIngestLock); !isRetryableStoreError(err) {
+		t.Error("message ingest lock failure is not retryable")
+	}
 	retryable := []string{
 		"insert message: resolve mailbox: insert mailbox: database is locked (5) (SQLITE_BUSY)",
 		"insert message: database is locked (517)",
@@ -2296,6 +2374,70 @@ func TestIsRetryableStoreError(t *testing.T) {
 		if isRetryableStoreError(errors.New(msg)) {
 			t.Errorf("isRetryableStoreError(%q) = true, want false (would block the folder forever)", msg)
 		}
+	}
+}
+
+func TestEngineIngestLockTimeoutHoldsCursor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ingest-lock-timeout.db")
+	kr, err := dbcrypto.NewKeyring(bytes.Repeat([]byte{0x42}, dbcrypto.MasterKeyLen))
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, err := store.Open(path, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { holder.Close() })
+	if err := holder.Init(); err != nil {
+		t.Fatal(err)
+	}
+	worker, err := store.Open(path, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { worker.Close() })
+
+	const messageID = "lock-timeout@example.com"
+	release, err := holder.AcquireMessageIngest(testAccount, messageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	cursors := newMemCursorStore()
+	if err := cursors.Set(testAccount, "INBOX", backend.Cursor("old")); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeBackend(
+		[]backend.Folder{{Name: "INBOX", Role: backend.RoleInbox, Selectable: true}},
+		map[string][]backend.FetchResult{
+			"INBOX": {{
+				Messages: []backend.Message{{
+					MessageID: messageID,
+					Ref:       backend.RemoteRef{Folder: "INBOX", ID: "1"},
+					Raw:       rawMessage(messageID, "sender@example.com", testAccount, "Locked", "body"),
+				}},
+				Cursor: backend.Cursor("new"),
+			}},
+		},
+	)
+
+	result, err := newTestEngine(worker, cursors).Sync(t.Context(), fake)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	foundTimeout := false
+	for _, resultErr := range result.Errors {
+		foundTimeout = foundTimeout || errors.Is(resultErr, store.ErrMessageIngestLockTimeout)
+	}
+	if !foundTimeout {
+		t.Fatalf("result errors = %v, want message ingest lock timeout", result.Errors)
+	}
+	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "old" {
+		t.Fatalf("cursor advanced to %q after ingest lock timeout", got)
+	}
+	if stored, getErr := worker.GetByMessageID(messageID); getErr != nil || stored != nil {
+		t.Fatalf("message after ingest lock timeout = %+v, err=%v", stored, getErr)
 	}
 }
 

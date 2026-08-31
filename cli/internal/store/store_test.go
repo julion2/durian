@@ -46,8 +46,8 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 30 {
-		t.Errorf("version = %d, want 30", version)
+	if version != 31 {
+		t.Errorf("version = %d, want 31", version)
 	}
 }
 
@@ -77,14 +77,14 @@ func TestMigrateV29AddsProviderNativeState(t *testing.T) {
 	}
 
 	if err := db.Init(); err != nil {
-		t.Fatalf("migrate v29→v30: %v", err)
+		t.Fatalf("migrate v29→latest: %v", err)
 	}
 	var version int
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 30 {
-		t.Fatalf("version = %d, want 30", version)
+	if version != 31 {
+		t.Fatalf("version = %d, want 31", version)
 	}
 	hasStableID, err := hasColumn(db.db, "messages", "stable_id")
 	if err != nil || !hasStableID {
@@ -112,6 +112,50 @@ func TestMigrateV29AddsProviderNativeState(t *testing.T) {
 	}
 	if first.ID == second.ID {
 		t.Fatalf("stable duplicates collapsed to row %d", first.ID)
+	}
+}
+
+func TestMigrateV30AddsIngestGeneration(t *testing.T) {
+	db := newTestDB(t)
+	seed := &Message{
+		MessageID: "v30-pending@example.com", Subject: "pending", Date: 1, CreatedAt: 1,
+		Mailbox: "INBOX", Account: "work", IngestPending: true,
+	}
+	if err := db.InsertMessage(seed); err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		"ALTER TABLE messages DROP COLUMN ingest_generation",
+		"UPDATE schema_version SET version = 30 WHERE rowid = 1",
+	} {
+		if _, err := db.db.Exec(stmt); err != nil {
+			t.Fatalf("prepare v30 schema: %v\nstmt: %s", err, stmt)
+		}
+	}
+
+	if err := db.Init(); err != nil {
+		t.Fatalf("migrate v30→v31: %v", err)
+	}
+	var version int
+	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 31 {
+		t.Fatalf("version = %d, want 31", version)
+	}
+	stored, err := db.GetByMessageID(seed.MessageID)
+	if err != nil || stored == nil || !stored.IngestPending || stored.IngestGeneration != 0 {
+		t.Fatalf("migrated pending row = %+v, err=%v", stored, err)
+	}
+
+	refresh := *stored
+	refresh.ID = 0
+	refresh.StartIngestOnConflict = true
+	if err := db.InsertMessage(&refresh); err != nil {
+		t.Fatal(err)
+	}
+	if refresh.IngestGeneration != 1 {
+		t.Fatalf("claimed migrated ingest generation = %d, want 1", refresh.IngestGeneration)
 	}
 }
 
@@ -176,8 +220,8 @@ func TestMigrateV27MarksLegacySyntheticCandidateWithoutClaimingProvenance(t *tes
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 30 {
-		t.Fatalf("version = %d, want 30", version)
+	if version != 31 {
+		t.Fatalf("version = %d, want 31", version)
 	}
 }
 
@@ -562,8 +606,8 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 30 {
-		t.Fatalf("version = %d, want 30", version)
+	if version != 31 {
+		t.Fatalf("version = %d, want 31", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).
