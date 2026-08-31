@@ -15,17 +15,23 @@ go_library(
         "//cli/internal/imap",
         "//cli/internal/mail",
         "//cli/internal/store",
+        "//cli/internal/syncidentity",
     ],
 )
 
 go_test(
     name = "syncengine_test",
     size = "small",
-    srcs = ["engine_test.go"],
+    srcs = [
+        "capability_contract_test.go",
+        "engine_test.go",
+        "ingest_bcc_test.go",
+    ],
     embed = [":syncengine"],
     deps = [
         "//cli/internal/backend",
         "//cli/internal/dbcrypto",
+        "//cli/internal/smtp",
         "//cli/internal/store",
     ],
 )

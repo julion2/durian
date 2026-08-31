@@ -78,6 +78,45 @@ func TestSearch_Tag(t *testing.T) {
 	}
 }
 
+func TestSearch_Thread(t *testing.T) {
+	db := seedSearchDB(t)
+	message, err := db.GetByMessageID("s2@x")
+	if err != nil {
+		t.Fatalf("get message: %v", err)
+	}
+
+	results, err := db.Search("thread:"+message.ThreadID, 10)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(results) != 1 || results[0].Thread != message.ThreadID {
+		t.Fatalf("search thread results = %#v, want only %q", results, message.ThreadID)
+	}
+
+	count, err := db.SearchCount("thread:" + message.ThreadID)
+	if err != nil {
+		t.Fatalf("search count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("search count = %d, want 1", count)
+	}
+}
+
+func TestSearch_RejectsUnsupportedFields(t *testing.T) {
+	db := seedSearchDB(t)
+	for _, field := range []string{"folder", "id", "mimetype"} {
+		t.Run(field, func(t *testing.T) {
+			query := field + ":value"
+			if _, err := db.Search(query, 10); err == nil {
+				t.Fatalf("Search(%q) succeeded, want unsupported-field error", query)
+			}
+			if _, err := db.SearchCount(query); err == nil {
+				t.Fatalf("SearchCount(%q) succeeded, want unsupported-field error", query)
+			}
+		})
+	}
+}
+
 func TestSearch_NotTag(t *testing.T) {
 	db := seedSearchDB(t)
 	all, _ := db.Search("*", 50)
@@ -624,6 +663,34 @@ func TestSearch_AccountFilter(t *testing.T) {
 	}
 	if len(results) != 2 {
 		t.Errorf("got %d results for path:personal/**, want 2", len(results))
+	}
+}
+
+func TestSearch_AccountFilterResolvesAlias(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	if err := db.InsertMessage(&Message{
+		MessageID: "alias@x", Subject: "From work", FromAddr: "a@x",
+		Date: now, CreatedAt: now, FetchedBody: true, Account: "work mail",
+	}); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+	db.SetAccountAliases(map[string]string{"office": "work mail"})
+
+	results, err := db.Search("path:office", 10)
+	if err != nil {
+		t.Fatalf("search by account alias: %v", err)
+	}
+	if len(results) != 1 {
+		t.Errorf("got %d results for path:office, want 1", len(results))
+	}
+
+	results, err = db.Search(`path:"work mail"`, 10)
+	if err != nil {
+		t.Fatalf("search by quoted account name: %v", err)
+	}
+	if len(results) != 1 {
+		t.Errorf("got %d results for quoted account name, want 1", len(results))
 	}
 }
 

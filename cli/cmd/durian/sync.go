@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/imap"
+	"github.com/julion2/durian/cli/internal/store"
 	"github.com/julion2/durian/cli/internal/tagsync"
 )
 
@@ -24,7 +24,7 @@ var (
 )
 
 var syncCmd = &cobra.Command{
-	Use:   "sync [account] [mailbox]",
+	Use:   "sync [account] [mailbox...]",
 	Short: "Sync email to the local store",
 	Long:  "Sync email from IMAP or a native provider API to local SQLite. Bidirectional by default.",
 	Example: `  durian sync
@@ -57,6 +57,12 @@ func init() {
 }
 
 func runSync(cmd *cobra.Command, args []string) error {
+	if syncDownloadOnly && syncUploadOnly {
+		return fmt.Errorf("--download-only and --upload-only cannot be used together")
+	}
+	if syncBackfillHeadersForce && !syncBackfillHeaders {
+		return fmt.Errorf("--force requires --backfill-headers")
+	}
 	// Load config
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
@@ -77,8 +83,14 @@ func runSync(cmd *cobra.Command, args []string) error {
 		mode = imap.SyncUploadOnly
 	}
 
-	// Open email store (required)
-	emailDB, err := openEmailDB()
+	// A dry-run opens the existing store query-only and does not initialize or
+	// migrate it. Any missed write guard therefore fails closed.
+	var emailDB *store.DB
+	if syncDryRun {
+		emailDB, err = openEmailDBReadOnly()
+	} else {
+		emailDB, err = openEmailDB()
+	}
 	if err != nil {
 		return fmt.Errorf("failed to open email store: %w", err)
 	}
@@ -152,55 +164,12 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Tag sync: push journal entries, then pull remote changes
 	if cfg.Sync.TagSync != nil && cfg.Sync.TagSync.URL != "" && cfg.Sync.TagSync.APIKey != "" {
-		client := tagsync.NewClient(cfg.Sync.TagSync.URL, cfg.Sync.TagSync.APIKey)
-		client.SetStore(emailDB)
+		syncRemoteTags(emailDB, cfg.Sync.TagSync, syncDryRun)
+	}
 
-		// Push pending local changes from journal
-		journal, journalErr := emailDB.ReadTagJournal()
-		if journalErr == nil && len(journal) > 0 {
-			changes := make([]tagsync.TagChange, len(journal))
-			var maxID int64
-			for i, j := range journal {
-				changes[i] = tagsync.TagChange{
-					MessageID: j.MessageID, Account: j.Account,
-					Tag: j.Tag, Action: j.Action, Timestamp: j.Timestamp,
-				}
-				if j.ID > maxID {
-					maxID = j.ID
-				}
-			}
-			if err := client.Push(changes); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: tag sync push failed: %v\n", err)
-			} else {
-				emailDB.ClearTagJournal(maxID)
-				fmt.Fprintf(os.Stderr, "✓ Pushed %d tag changes\n", len(changes))
-			}
-		}
-
-		// Pull remote changes
-		since := client.LoadLastSync()
-		changes, syncAt, pullErr := client.Pull(since)
-		if pullErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: tag sync pull failed: %v\n", pullErr)
-		} else {
-			applied := 0
-			for _, c := range changes {
-				switch c.Action {
-				case "add":
-					if err := emailDB.ModifyTagsByMessageIDAndAccountAndJournal(c.MessageID, c.Account, []string{c.Tag}, nil, time.Now().Unix()); err == nil {
-						applied++
-					}
-				case "remove":
-					if err := emailDB.ModifyTagsByMessageIDAndAccountAndJournal(c.MessageID, c.Account, nil, []string{c.Tag}, time.Now().Unix()); err == nil {
-						applied++
-					}
-				}
-			}
-			client.SaveLastSync(syncAt)
-			if applied > 0 {
-				fmt.Fprintf(os.Stderr, "✓ Applied %d remote tag changes\n", applied)
-			}
-		}
+	// Errors decide the exit before anything is written.
+	if err := firstSyncError(results); err != nil {
+		return err
 	}
 
 	if jsonOutput {
@@ -213,9 +182,8 @@ func runSync(cmd *cobra.Command, args []string) error {
 			FlagsDown    int     `json:"flags_downloaded"`
 			Moved        int     `json:"moved"`
 			DurationSecs float64 `json:"duration_secs"`
-			Error        string  `json:"error,omitempty"`
 		}
-		var out []syncJSON
+		out := make([]syncJSON, 0, len(results))
 		for _, r := range results {
 			s := syncJSON{
 				Account:      r.Account,
@@ -227,20 +195,96 @@ func runSync(cmd *cobra.Command, args []string) error {
 				Moved:        r.TotalMoved,
 				DurationSecs: r.Duration.Seconds(),
 			}
-			if r.Error != nil {
-				s.Error = r.Error.Error()
-			}
 			out = append(out, s)
 		}
-		json.NewEncoder(os.Stdout).Encode(out)
+		if err := writeJSON(out); err != nil {
+			return err
+		}
 	}
 
-	// Check for errors
+	return nil
+}
+
+// firstSyncError reports the failure that decides the command's exit status,
+// or nil when every account succeeded.
+//
+// It runs before any output is produced. `durian output` promises stdout is
+// empty on error, and the JSON document used to be written first: a consumer
+// parsing stdout got a complete-looking result while the command exited
+// nonzero, so the failure was visible only to whoever also checked the status.
+// One failed account is enough, however many succeeded before it.
+func firstSyncError(results []*imap.SyncResult) error {
 	for _, result := range results {
 		if result.Error != nil {
 			return fmt.Errorf("sync failed for %s: %w", result.Account, result.Error)
 		}
 	}
-
 	return nil
+}
+
+func syncRemoteTags(emailDB *store.DB, tagConfig *config.TagSyncConfig, dryRun bool) {
+	client := tagsync.NewClient(tagConfig.URL, tagConfig.APIKey)
+	client.SetStore(emailDB)
+
+	// Push pending local changes from journal.
+	journal, journalErr := emailDB.ReadTagJournal()
+	if journalErr == nil && len(journal) > 0 {
+		changes := make([]tagsync.TagChange, len(journal))
+		var maxID int64
+		for i, j := range journal {
+			changes[i] = tagsync.TagChange{
+				MessageID: j.MessageID, Account: j.Account,
+				Tag: j.Tag, Action: j.Action, Timestamp: j.Timestamp,
+			}
+			if j.ID > maxID {
+				maxID = j.ID
+			}
+		}
+		if dryRun {
+			fmt.Fprintf(os.Stderr, "Would push %d tag changes\n", len(changes))
+		} else if err := client.Push(changes); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: tag sync push failed: %v\n", err)
+		} else if err := emailDB.ClearTagJournal(maxID); err != nil {
+			// The push succeeded but the journal still holds the entries. Keep
+			// them: the next run re-pushes the same changes, which is
+			// idempotent, and reporting success here would claim a cleanup that
+			// did not happen. Tag-sync failures are deliberately non-fatal.
+			fmt.Fprintf(os.Stderr, "Warning: tag sync journal cleanup failed: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "✓ Pushed %d tag changes\n", len(changes))
+		}
+	}
+
+	// Pull remote changes. A dry-run may read the plan from the server but must
+	// not apply it or advance the local cursor.
+	since := client.LoadLastSync()
+	changes, syncAt, pullErr := client.Pull(since)
+	if pullErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: tag sync pull failed: %v\n", pullErr)
+		return
+	}
+	if dryRun {
+		if len(changes) > 0 {
+			fmt.Fprintf(os.Stderr, "Would apply %d remote tag changes\n", len(changes))
+		}
+		return
+	}
+
+	applied := 0
+	for _, c := range changes {
+		switch c.Action {
+		case "add":
+			if err := emailDB.ModifyTagsByMessageIDAndAccountAndJournal(c.MessageID, c.Account, []string{c.Tag}, nil, time.Now().Unix()); err == nil {
+				applied++
+			}
+		case "remove":
+			if err := emailDB.ModifyTagsByMessageIDAndAccountAndJournal(c.MessageID, c.Account, nil, []string{c.Tag}, time.Now().Unix()); err == nil {
+				applied++
+			}
+		}
+	}
+	client.SaveLastSync(syncAt)
+	if applied > 0 {
+		fmt.Fprintf(os.Stderr, "✓ Applied %d remote tag changes\n", applied)
+	}
 }

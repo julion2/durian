@@ -5,10 +5,199 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
 )
+
+// TestSanitizeStripsURLUserinfo covers the credentials the length heuristic
+// cannot see. A URL carrying userinfo is usually well under maxSafeRun, so a
+// connection error quoting the URL it dialled logged the password verbatim.
+// Position, not length, is what makes userinfo sensitive.
+func TestSanitizeStripsURLUserinfo(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    string
+		secrets []string
+	}{
+		{
+			name:    "user and password in a dial error",
+			in:      `dial https://alice:hunter2@imap.example.com/x: refused`,
+			want:    `dial https://[REDACTED]@imap.example.com/x: refused`,
+			secrets: []string{"alice", "hunter2"},
+		},
+		{
+			name:    "user only",
+			in:      `get imaps://alice@mail.example.com failed`,
+			want:    `get imaps://[REDACTED]@mail.example.com failed`,
+			secrets: []string{"alice"},
+		},
+		{
+			name:    "at sign inside the password",
+			in:      `https://u:p@ss@host.example.com/path`,
+			want:    `https://[REDACTED]@host.example.com/path`,
+			secrets: []string{"p@ss"},
+		},
+		{
+			name: "no userinfo is left alone",
+			in:   `dial https://imap.example.com/x: refused`,
+			want: `dial https://imap.example.com/x: refused`,
+		},
+		{
+			// The "@" belongs to a query value, not to authority userinfo.
+			// The complete value is still sensitive and must be removed.
+			name:    "at sign in a query value",
+			in:      `https://api.example.com/send?to=bob@example.com failed`,
+			want:    `https://api.example.com/send?to=[REDACTED] failed`,
+			secrets: []string{"bob@example.com"},
+		},
+		{
+			name:    "multiple query values and fragment",
+			in:      `Get "https://api.example.com/token?code=short-secret&state=also-secret#access-token": 401`,
+			want:    `Get "https://api.example.com/token?code=[REDACTED]&state=[REDACTED]#[REDACTED]": 401`,
+			secrets: []string{"short-secret", "also-secret", "access-token"},
+		},
+		{
+			name:    "query without equals",
+			in:      `https://api.example.com/callback?short-secret`,
+			want:    `https://api.example.com/callback?[REDACTED]`,
+			secrets: []string{"short-secret"},
+		},
+		{
+			name:    "fragment without query",
+			in:      `https://api.example.com/callback#access-token`,
+			want:    `https://api.example.com/callback#[REDACTED]`,
+			secrets: []string{"access-token"},
+		},
+		{
+			name:    "question mark inside fragment",
+			in:      `https://api.example.com/callback#access_token=short-secret?x=y`,
+			want:    `https://api.example.com/callback#[REDACTED]`,
+			secrets: []string{"short-secret", "x=y"},
+		},
+		{
+			name:    "IPv6 URL query",
+			in:      `Get "https://[::1]/callback?code=short-secret": refused`,
+			want:    `Get "https://[::1]/callback?code=[REDACTED]": refused`,
+			secrets: []string{"short-secret"},
+		},
+		{
+			name:    "query URL followed by adjacent safe URL",
+			in:      `https://a.test/c?code=short-secret,https://b.test/health`,
+			want:    `https://a.test/c?code=[REDACTED],https://b.test/health`,
+			secrets: []string{"short-secret"},
+		},
+		{
+			name: "plain text untouched",
+			in:   `connection reset by peer`,
+			want: `connection reset by peer`,
+		},
+		{
+			// Two URLs in one whitespace-delimited field. Scanning fields and
+			// taking the first "://" per field stopped at the safe one and let
+			// the credentials behind it through untouched.
+			name:    "safe URL followed by a credential URL, no whitespace",
+			in:      `tried https://safe.example,https://alice:hunter2@imap.example/x`,
+			want:    `tried https://safe.example,https://[REDACTED]@imap.example/x`,
+			secrets: []string{"alice", "hunter2"},
+		},
+		{
+			// Every URL, not just the first one that matches.
+			name:    "two credential URLs, no whitespace",
+			in:      `https://a:b@h1.example/x,https://c:d@h2.example/y`,
+			want:    `https://[REDACTED]@h1.example/x,https://[REDACTED]@h2.example/y`,
+			secrets: []string{"a:b", "c:d"},
+		},
+		{
+			name:    "three URLs, credentials in the middle",
+			in:      `[https://one.example|https://u:p@two.example|https://three.example]`,
+			want:    `[https://one.example|https://[REDACTED]@two.example|https://three.example]`,
+			secrets: []string{"u:p"},
+		},
+		// RFC 3986 sub-delims are legal unencoded in a userinfo. Treating any
+		// of them as the end of the authority made the scan stop before the
+		// "@" and find nothing, so a password containing one was logged whole.
+		{
+			name:    "comma in the password",
+			in:      `https://alice:pa,ss@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"pa,ss"},
+		},
+		{
+			name:    "semicolon in the password",
+			in:      `https://alice:pa;ss@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"pa;ss"},
+		},
+		{
+			name:    "apostrophe in the password",
+			in:      `https://alice:pa'ss@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"pa'ss"},
+		},
+		{
+			name:    "parentheses in the password",
+			in:      `https://alice:pa(ss)@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{"pa(ss)"},
+		},
+		{
+			// The complete sub-delims production from RFC 3986 §2.2, not just
+			// the five that used to terminate the authority. Written against
+			// the grammar rather than against examples: the earlier version of
+			// this scan looked correct precisely because every fixture used an
+			// alphanumeric password.
+			name:    "every RFC 3986 sub-delim in the password",
+			in:      `https://alice:!$&'()*+,;=@host.example/x`,
+			want:    `https://[REDACTED]@host.example/x`,
+			secrets: []string{`!$&'()*+,;=`},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeText(tt.in)
+			if got != tt.want {
+				t.Errorf("sanitizeText() = %q, want %q", got, tt.want)
+			}
+			for _, secret := range tt.secrets {
+				if strings.Contains(got, secret) {
+					t.Errorf("output still contains %q: %q", secret, got)
+				}
+			}
+		})
+	}
+}
+
+// TestSanitizeStripsUserinfoPreservesWhitespace pins that the scan works on the
+// raw bytes. An earlier version split on whitespace and rejoined with single
+// spaces, which both hid the second URL in a field and rewrote the layout of
+// any multi-line error it touched.
+func TestSanitizeStripsUserinfoPreservesWhitespace(t *testing.T) {
+	in := "dial failed:\n\thttps://u:p@host.example/x\n\tretrying"
+	want := "dial failed:\n\thttps://[REDACTED]@host.example/x\n\tretrying"
+	if len(in) > maxSafeRun {
+		t.Fatalf("fixture is %d bytes; the length pass would collapse whitespace and mask what this asserts", len(in))
+	}
+	if got := sanitizeText(in); got != want {
+		t.Errorf("sanitizeText() = %q, want %q", got, want)
+	}
+}
+
+// TestSanitizeStripsUserinfoBeforeLengthCheck pins the ordering. The userinfo
+// pass has to run before the early return for short strings, or the case it
+// exists for — a short URL — never reaches it.
+func TestSanitizeStripsUserinfoBeforeLengthCheck(t *testing.T) {
+	short := `https://u:p@h.io/x`
+	if len(short) > maxSafeRun {
+		t.Fatalf("fixture is %d bytes, no longer under the %d-byte threshold", len(short), maxSafeRun)
+	}
+	if got := sanitizeText(short); strings.Contains(got, "u:p") {
+		t.Errorf("sanitizeText() = %q, want the userinfo stripped despite the short input", got)
+	}
+}
 
 // newTestLogger returns a logger writing to buf, wrapped with redact.
 func newTestLogger(buf *bytes.Buffer) *slog.Logger {
@@ -223,6 +412,64 @@ func TestHandle_PreservesShortErrors(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "[redacted ") {
 		t.Errorf("short error should not be redacted:\n%s", buf.String())
+	}
+}
+
+type providerError struct {
+	secret string
+	target error
+}
+
+func (e *providerError) Error() string { return "provider response: " + e.secret }
+func (e *providerError) Unwrap() error { return e.target }
+
+func TestExternalErrorPreservesErrorAndRedactsOnlyTheLog(t *testing.T) {
+	sentinel := errors.New("retry classification sentinel")
+	providerErr := &providerError{secret: "short multiword response with token abc123", target: sentinel}
+	err := fmt.Errorf("fetch inbox: %w", ExternalError(providerErr, "provider request failed: status 401: response body "+Placeholder))
+
+	if got, want := err.Error(), "fetch inbox: "+providerErr.Error(); got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatal("ExternalError broke errors.Is through the provider error")
+	}
+	var gotProvider *providerError
+	if !errors.As(err, &gotProvider) || gotProvider != providerErr {
+		t.Fatal("ExternalError broke errors.As through the provider error")
+	}
+
+	var buf bytes.Buffer
+	newTestLogger(&buf).Warn("sync failed", "err", err)
+	out := buf.String()
+	for _, secret := range []string{"short multiword response", "abc123"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("provider-controlled text %q leaked:\n%s", secret, out)
+		}
+	}
+	for _, context := range []string{"fetch inbox", "status 401", Placeholder} {
+		if !strings.Contains(out, context) {
+			t.Errorf("safe context %q missing:\n%s", context, out)
+		}
+	}
+}
+
+func TestHandleSanitizesURLSecretsInUnmarkedErrorAndStringFallback(t *testing.T) {
+	for _, value := range []any{
+		errors.New(`Get "https://alice:hunter2@api.example.test/token?code=short-secret": unauthorized`),
+		`Get "https://alice:hunter2@api.example.test/token?code=short-secret": unauthorized`,
+	} {
+		var buf bytes.Buffer
+		newTestLogger(&buf).Warn("request failed", "err", value)
+		out := buf.String()
+		for _, secret := range []string{"alice", "hunter2", "short-secret"} {
+			if strings.Contains(out, secret) {
+				t.Errorf("URL secret %q leaked from %T:\n%s", secret, value, out)
+			}
+		}
+		if !strings.Contains(out, "api.example.test/token?code="+Placeholder) {
+			t.Errorf("safe URL context missing from %T:\n%s", value, out)
+		}
 	}
 }
 

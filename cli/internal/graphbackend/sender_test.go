@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/julion2/durian/cli/internal/mailsend"
@@ -112,7 +113,7 @@ func TestSenderUploadsLargeAttachment(t *testing.T) {
 		sent = true
 		w.WriteHeader(http.StatusAccepted)
 	})
-	srv = httptest.NewServer(mux)
+	srv = httptest.NewTLSServer(mux)
 	defer srv.Close()
 
 	s := &Sender{b: newTestBackend(t, srv)}
@@ -133,6 +134,100 @@ func TestSenderUploadsLargeAttachment(t *testing.T) {
 	}
 	if !bytes.Equal(uploaded, large) {
 		t.Errorf("uploaded %d bytes, want %d (chunks lost/reordered?)", len(uploaded), len(large))
+	}
+}
+
+func TestPutChunkRejectsUnsafeUploadURL(t *testing.T) {
+	srv := httptest.NewServer(http.NewServeMux())
+	defer srv.Close()
+	s := &Sender{b: newTestBackend(t, srv)}
+	for _, uploadURL := range []string{
+		"http://uploads.example/chunk",
+		"/relative/chunk",
+		"https://user:password@uploads.example/chunk",
+		":not-a-url",
+	} {
+		t.Run(uploadURL, func(t *testing.T) {
+			if err := s.putChunk(t.Context(), uploadURL, []byte("secret"), 0, 6, 6); err == nil {
+				t.Fatal("putChunk() accepted unsafe upload URL")
+			}
+		})
+	}
+	if err := validateUploadURL("https://durian-upload.example/chunk?token=secret"); err != nil {
+		t.Fatalf("validateUploadURL() rejected legitimate off-origin HTTPS endpoint: %v", err)
+	}
+}
+
+func TestPutChunkRejectsInsecureRedirect(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/upload", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "http://uploads.example/chunk")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	})
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+	s := &Sender{b: newTestBackend(t, srv)}
+
+	err := s.putChunk(t.Context(), srv.URL+"/upload", []byte("secret"), 0, 6, 6)
+	if err == nil || !strings.Contains(err.Error(), "refusing graph upload redirect") {
+		t.Fatalf("putChunk() error = %v, want rejected insecure redirect", err)
+	}
+}
+
+func TestPutChunkRejectsMethodChangingRedirect(t *testing.T) {
+	reachedDestination := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/upload", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "/destination")
+		w.WriteHeader(http.StatusFound)
+	})
+	mux.HandleFunc("/destination", func(w http.ResponseWriter, _ *http.Request) {
+		reachedDestination = true
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+	s := &Sender{b: newTestBackend(t, srv)}
+
+	err := s.putChunk(t.Context(), srv.URL+"/upload", []byte("secret"), 0, 6, 6)
+	if err == nil || !strings.Contains(err.Error(), "method changed to GET") {
+		t.Fatalf("putChunk() error = %v, want rejected method-changing redirect", err)
+	}
+	if reachedDestination {
+		t.Fatal("putChunk() followed method-changing redirect")
+	}
+}
+
+func TestPutChunkFollowsCrossOriginHTTPSRedirect(t *testing.T) {
+	chunk := []byte("secret")
+	var uploaded []byte
+	destination := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("redirected upload Authorization = %q, want empty", got)
+		}
+		if r.Method != http.MethodPut {
+			t.Errorf("redirected method = %s, want PUT", r.Method)
+		}
+		uploaded, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer destination.Close()
+
+	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("initial upload Authorization = %q, want empty", got)
+		}
+		w.Header().Set("Location", destination.URL+"/chunk?sig=abc")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	s := &Sender{b: newTestBackend(t, source)}
+	if err := s.putChunk(t.Context(), source.URL+"/upload", chunk, 0, len(chunk), len(chunk)); err != nil {
+		t.Fatalf("putChunk() cross-origin HTTPS redirect: %v", err)
+	}
+	if !bytes.Equal(uploaded, chunk) {
+		t.Fatalf("redirected upload = %q, want %q", uploaded, chunk)
 	}
 }
 

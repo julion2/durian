@@ -4,6 +4,7 @@ go_library(
     name = "mail",
     srcs = [
         "attachment.go",
+        "identity.go",
         "parser.go",
         "types.go",
     ],
@@ -20,6 +21,7 @@ go_test(
     size = "small",
     srcs = [
         "attachment_test.go",
+        "identity_test.go",
         "parser_test.go",
     ],
     data = glob(["testdata/**"]),

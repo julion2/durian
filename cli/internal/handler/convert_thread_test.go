@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -76,7 +77,7 @@ func TestConvertThreadKeepsDuplicateMessageIDsAddressable(t *testing.T) {
 		Date: now, CreatedAt: now, BodyText: "first body", Mailbox: "ALL", Account: "work",
 	}
 	second := &store.Message{
-		StableID: "email-2", MessageID: "duplicate@example.com", Subject: "Duplicate",
+		MessageID: "duplicate@example.com", Subject: "Duplicate",
 		Date: now + 1, CreatedAt: now + 1, BodyText: "second body", Mailbox: "ALL", Account: "work",
 	}
 	if err := db.InsertMessage(first); err != nil {
@@ -155,6 +156,7 @@ func TestConvertThread_AllFieldsMapped(t *testing.T) {
 		BodyText: "plain body",
 		BodyHTML: "<p>html body</p>",
 		Mailbox:  "INBOX",
+		Account:  "work",
 	})
 
 	m, _ := db.GetByMessageID("fields@test")
@@ -162,11 +164,14 @@ func TestConvertThread_AllFieldsMapped(t *testing.T) {
 	resp := h.ShowThread(m.ThreadID)
 	msg := resp.Thread.Messages[0]
 
-	if msg.ID != "fields@test" {
+	if msg.ID != "local:"+strconv.FormatInt(m.ID, 10) {
 		t.Errorf("ID = %q", msg.ID)
 	}
 	if msg.MessageID != "fields@test" {
 		t.Errorf("MessageID = %q", msg.MessageID)
+	}
+	if msg.Account != "work" {
+		t.Errorf("Account = %q", msg.Account)
 	}
 	if msg.From != "alice@example.com" {
 		t.Errorf("From = %q", msg.From)
@@ -255,7 +260,7 @@ func TestConvertThread_TagsPerMessage(t *testing.T) {
 
 	tagsByMsg := make(map[string][]string)
 	for _, msg := range resp.Thread.Messages {
-		tagsByMsg[msg.ID] = msg.Tags
+		tagsByMsg[msg.MessageID] = msg.Tags
 	}
 
 	hasTag := func(tags []string, want string) bool {
@@ -313,7 +318,7 @@ func TestConvertThread_AttachmentsPerMessage(t *testing.T) {
 
 	attsByMsg := make(map[string]int)
 	for _, msg := range resp.Thread.Messages {
-		attsByMsg[msg.ID] = len(msg.Attachments)
+		attsByMsg[msg.MessageID] = len(msg.Attachments)
 	}
 
 	if attsByMsg["att1@test"] != 2 {
@@ -325,7 +330,7 @@ func TestConvertThread_AttachmentsPerMessage(t *testing.T) {
 
 	// Verify attachment field mapping
 	for _, msg := range resp.Thread.Messages {
-		if msg.ID == "att1@test" {
+		if msg.MessageID == "att1@test" {
 			var pdf, png bool
 			for _, a := range msg.Attachments {
 				if a.Filename == "doc.pdf" {

@@ -76,14 +76,14 @@ paths:
       summary: Get the full unstripped body of a single message
       description: >
         Returns the raw plain-text body and optional HTML body of the
-        message identified by the opaque id returned in ThreadMessage.id. Used by the compose
-        window for reply quoting — the sync path stores stripped bodies
-        to save space, but replies need the original.
+        message identified by the id returned in ThreadMessage.id. Used by
+        the compose window for reply quoting — the sync path stores stripped
+        bodies to save space, but replies need the original.
       parameters:
         - name: id
           in: query
           required: true
-          description: Opaque message identifier returned in ThreadMessage.id
+          description: Message identifier returned in ThreadMessage.id; treat as opaque
           schema:
             type: string
       responses:
@@ -231,7 +231,8 @@ paths:
       description: >
         Streams the raw bytes of a MIME part. Content-Type and Content-Disposition
         headers are derived server-side from stored message metadata. The
-        message_id path component is the opaque ThreadMessage.id value.
+        message_id path component is the ThreadMessage.id value and must be
+        treated as opaque and percent-encoded as one URL path segment.
       parameters:
         - name: message_id
           in: path
@@ -752,6 +753,18 @@ components:
           type: boolean
         error:
           type: string
+        matched_threads:
+          type: integer
+          description: >-
+            Threads the query selected. Present on success, absent on failure.
+        changed_threads:
+          type: integer
+          description: >-
+            Threads the mutation actually changed, which is at most
+            `matched_threads`. The two differ when a thread already carried the
+            requested tags, so a client that wants to report what happened has
+            to read this one rather than the match count. Present on success,
+            absent on failure.
     NewMailEvent:
       type: object
       properties:
@@ -803,7 +816,9 @@ components:
       properties:
         id:
           type: string
-          description: Opaque local message identifier; do not interpret it as an RFC Message-ID
+          description: >
+            Opaque local message identifier. Clients must not interpret this
+            field as an RFC Message-ID.
         message_id:
           type: string
           description: RFC 5322 Message-ID metadata; optional and not guaranteed unique
@@ -813,6 +828,14 @@ components:
           type: string
         cc:
           type: string
+        bcc:
+          type: string
+          description: >-
+            Blind recipients. Only ever present on a draft the user has saved
+            themselves: a received message has no Bcc header, because the
+            sending server strips it before delivery. A client reopening a
+            draft for editing must restore this field, or saving again drops
+            the recipients.
         date:
           type: string
         timestamp:

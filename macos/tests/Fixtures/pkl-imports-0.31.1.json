@@ -1,0 +1,18 @@
+{
+  "imports": {
+    "file:///fixtures/pkl/config.pkl": [
+      {
+        "uri": "file:///fixtures/pkl/helper.pkl"
+      }
+    ],
+    "file:///fixtures/pkl/helper.pkl": [],
+    "file:///fixtures/pkl/keymaps.pkl": [],
+    "file:///fixtures/pkl/profiles.pkl": []
+  },
+  "resolvedImports": {
+    "file:///fixtures/pkl/config.pkl": "file:///fixtures/pkl/config.pkl",
+    "file:///fixtures/pkl/helper.pkl": "file:///fixtures/pkl/helper.pkl",
+    "file:///fixtures/pkl/keymaps.pkl": "file:///fixtures/pkl/keymaps.pkl",
+    "file:///fixtures/pkl/profiles.pkl": "file:///fixtures/pkl/profiles.pkl"
+  }
+}

@@ -12,34 +12,88 @@ class KeymapsManager: ObservableObject {
     static let shared = KeymapsManager()
 
     @Published var keymaps: KeymapConfig = KeymapConfig()
+    @Published private(set) var isReady = false
     private var cancellables = Set<AnyCancellable>()
+    private var loadTask: Task<Void, Never>?
+    private let configURL: URL
+    private let evaluator: (URL) async throws -> KeymapConfig
+    private let fileExists: (String) -> Bool
 
-    private init() {
-        loadKeymapsBlocking()
+    init(
+        configURL: URL = FileManager.default.durianConfigURL().appendingPathComponent("keymaps.pkl"),
+        evaluator: @escaping (URL) async throws -> KeymapConfig = {
+            try await PklEvaluator.eval(KeymapConfig.self, from: $0)
+        },
+        fileExists: @escaping (String) -> Bool = FileManager.default.fileExists(atPath:)
+    ) {
+        self.configURL = configURL
+        self.evaluator = evaluator
+        self.fileExists = fileExists
+        keymaps.keymaps = getDefaultKeymaps()
     }
 
-    private func loadKeymapsBlocking() {
-        let pklURL = getKeymapsURL()
+    /// Load keymaps once for startup. Concurrent callers join the same task.
+    @MainActor
+    func prepareKeymaps() async {
+        guard !isReady else { return }
+        await loadKeymaps()
+    }
 
-        guard FileManager.default.fileExists(atPath: pklURL.path) else {
+    @MainActor
+    private func loadKeymaps() async {
+        if let loadTask {
+            await loadTask.value
+            return
+        }
+
+        await startKeymapsLoad()
+    }
+
+    @MainActor
+    private func startKeymapsLoad() async {
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await loadKeymapsFromDisk()
+            loadTask = nil
+        }
+        loadTask = task
+        await task.value
+    }
+
+    @MainActor
+    func applyEvaluatedKeymaps(_ config: KeymapConfig) {
+        apply(config)
+    }
+
+    @MainActor
+    private func loadKeymapsFromDisk() async {
+        guard fileExists(configURL.path) else {
             Log.warning("KEYMAPS", "keymaps.pkl not found, using defaults")
             keymaps = KeymapConfig()
             keymaps.keymaps = getDefaultKeymaps()
             NotificationCenter.default.post(name: .keymapsDidChange, object: nil)
+            isReady = true
             return
         }
 
         do {
-            keymaps = try PklEvaluator.evalSync(KeymapConfig.self, from: pklURL)
-            keymaps.keymaps = mergeWithDefaults(userKeymaps: keymaps.keymaps)
-            Log.info("KEYMAPS", "Loaded \(keymaps.keymaps.count) keymaps (merged with defaults)")
+            apply(try await evaluator(configURL))
         } catch {
             Log.error("KEYMAPS", "Failed to load: \(error)")
             keymaps = KeymapConfig()
             keymaps.keymaps = getDefaultKeymaps()
+            NotificationCenter.default.post(name: .keymapsDidChange, object: nil)
+            isReady = true
         }
+    }
 
+    @MainActor
+    private func apply(_ config: KeymapConfig) {
+        keymaps = config
+        keymaps.keymaps = mergeWithDefaults(userKeymaps: keymaps.keymaps)
+        Log.info("KEYMAPS", "Loaded \(keymaps.keymaps.count) keymaps (merged with defaults)")
         NotificationCenter.default.post(name: .keymapsDidChange, object: nil)
+        isReady = true
     }
 
     /// Returns the default keymaps array
@@ -168,11 +222,6 @@ class KeymapsManager: ObservableObject {
         return merged.filter { $0.enabled }
     }
 
-    private func getKeymapsURL() -> URL {
-        FileManager.default.durianConfigURL().appendingPathComponent("keymaps.pkl")
-    }
-
-
     // MARK: - Public API
 
     func setKeymap(for action: String, key: String, modifiers: [String] = []) {
@@ -212,9 +261,13 @@ class KeymapsManager: ObservableObject {
     }
 
     // Public method to manually reload keymaps
-    func reloadKeymaps() {
+    @MainActor
+    func reloadKeymaps() async {
         Log.info("KEYMAPS", "Manual keymaps reload requested")
-        loadKeymapsBlocking()
+        if let loadTask {
+            await loadTask.value
+        }
+        await startKeymapsLoad()
     }
 }
 

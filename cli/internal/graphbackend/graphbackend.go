@@ -31,6 +31,7 @@ import (
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/oauth"
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 const (
@@ -167,6 +168,12 @@ type statusError struct {
 func (e *statusError) Error() string {
 	return fmt.Sprintf("graph request failed: status %d: %s", e.status, e.body)
 }
+
+func (e *statusError) SafeLogText() string {
+	return fmt.Sprintf("graph request failed: status %d: response body %s", e.status, redact.Placeholder)
+}
+
+var _ redact.SafeLogError = (*statusError)(nil)
 
 // do executes one authenticated Graph request with throttle handling. GET/HEAD
 // requests retry on 429 and once on any 5xx; mutation requests are never
@@ -1036,6 +1043,14 @@ func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
 		PushWatch:          false,
 		FlagChangesInDelta: true,
+		// Graph has no answered flag on the message resource. ApplyFlags
+		// translates only isRead and flagStatus, and flagsFromGraph can never
+		// report Answered, so a local "replied" tag would be uploaded into
+		// nothing, recorded in the baseline, and then removed on the next sync
+		// when the server reports the message as un-answered. Declaring this
+		// keeps Answered out of the three-way merge, which is what the code
+		// here has always actually supported.
+		AnsweredUnsupported: true,
 	}
 }
 
