@@ -13,7 +13,9 @@ import (
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/imap"
+	durianmail "github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/syncidentity"
 )
 
 // defaultBatchLimit caps message bodies per FetchMessages call when the caller
@@ -353,6 +355,8 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 	snapshotSkipHydration := make(map[string]struct{})
 	fullSnapshot := false
 	snapshotModeSet := false
+	var syntheticMatcher *syncidentity.Matcher
+	identityCursorUpdater, canUpdateIdentityCursor := b.(backend.IdentityCursorUpdater)
 
 	// fetched counts messages pulled this run, to enforce MaxPerFolder.
 	fetched := 0
@@ -402,6 +406,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 			}
 		}
 
+		adoptedIdentities := make(map[string]string)
 		for _, msg := range res.Messages {
 			if err := ctx.Err(); err != nil {
 				return nil, fmt.Errorf("canceled: %w", err)
@@ -418,16 +423,39 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				}
 				continue
 			}
-			messageID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, e.opts.Ingest)
+			provisionalMessageID := msg.MessageID
+			if res.FullSnapshot && syntheticMatcher == nil && canUpdateIdentityCursor && len(msg.Raw) > 0 && messageIDFromRaw(msg.Raw) == "" {
+				if currentUIDValidity, ok := durianmail.SyntheticMessageUIDValidity(provisionalMessageID); ok {
+					syntheticMatcher, err = syncidentity.New(e.opts.Store, e.opts.Account, folder.Name, currentUIDValidity)
+					if err != nil {
+						return nil, fmt.Errorf("prepare synthetic identity recovery: %w", err)
+					}
+				}
+			}
+			msg, recoveredMessageID, initialIngestComplete := adoptSyntheticIdentity(msg, syntheticMatcher)
+			ingestOptions := e.opts.Ingest
+			ingestOptions.IdentityRecovered = recoveredMessageID != "" && initialIngestComplete
+			messageID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, ingestOptions)
 			if err != nil {
+				if recoveredMessageID != "" {
+					if messageUpsertCompleted(err) {
+						syntheticMatcher.Commit(recoveredMessageID)
+					} else {
+						syntheticMatcher.Restore(recoveredMessageID)
+					}
+				}
 				slog.Warn("Ingest failed", "module", "SYNCENGINE",
 					"folder", folder.Name, "ref", msg.Ref.ID, "err", err)
 				result.Errors = append(result.Errors, fmt.Errorf("ingest %s/%s: %w", folder.Name, msg.Ref.ID, err))
-				// Only a retryable failure may hold the cursor back. A message
-				// that cannot be stored for a permanent reason would fail
-				// identically forever, and holding the cursor for it re-downloads
-				// the whole folder on every run without ever making progress.
-				if isRetryableStoreError(err) {
+				// A retryable failure holds the cursor back. A new message that
+				// cannot be stored for a permanent reason would fail identically
+				// forever, so it is skipped; a recovered existing identity is the
+				// exception because skipping it would corrupt the replacement map.
+				if recoveredMessageID != "" || isRetryableStoreError(err) {
+					// Once a replacement message has reserved an existing canonical
+					// identity, every failed durable upsert must hold the cursor. A
+					// permanent-skip path would let hydration discard the new ref and
+					// reconciliation remove the old row/tag before the cursor advances.
 					ingestFailed = true
 				} else if res.FullSnapshot {
 					// A full-body snapshot already made its one ingestion attempt.
@@ -437,7 +465,13 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				}
 				continue
 			}
+			if recoveredMessageID != "" {
+				syntheticMatcher.Commit(recoveredMessageID)
+			}
 			sessionRefs[msg.Ref.ID] = messageID
+			if recoveredMessageID != "" && messageID != provisionalMessageID {
+				adoptedIdentities[msg.Ref.ID] = messageID
+			}
 			// A re-delivered message (e.g. a flag change surfaced by the delta)
 			// is an update, not a new arrival — count the two separately.
 			if created {
@@ -450,6 +484,12 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				}
 			} else {
 				result.Deduplicated++
+			}
+		}
+		if len(adoptedIdentities) > 0 {
+			res.Cursor, err = identityCursorUpdater.AdoptMessageIdentities(res.Cursor, adoptedIdentities)
+			if err != nil {
+				return nil, fmt.Errorf("update cursor with recovered synthetic identities: %w", err)
 			}
 		}
 
@@ -670,6 +710,17 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 	return nil
 }
 
+func adoptSyntheticIdentity(msg backend.Message, matcher *syncidentity.Matcher) (backend.Message, string, bool) {
+	if matcher == nil || !durianmail.IsSyntheticMessageID(msg.MessageID) || len(msg.Raw) == 0 {
+		return msg, "", false
+	}
+	if messageID, initialIngestComplete, err := matcher.MatchRaw(msg.MessageID, msg.Raw, msg.InternalDate); err == nil && messageID != "" {
+		msg.MessageID = messageID
+		return msg, messageID, initialIngestComplete
+	}
+	return msg, "", false
+}
+
 func validateSnapshotBatch(requested []backend.RemoteRef, batch backend.SnapshotBatch) error {
 	expected := make(map[string]struct{}, len(requested))
 	for _, ref := range requested {
@@ -817,7 +868,7 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 		if !row.SyncedFlagsInitialized {
 			seededBaseline := joinFlags(imap.FlagState{Seen: row.IsSeen, Flagged: row.IsFlagged})
 			if seededBaseline != "" {
-				if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, seededBaseline); err != nil {
+				if err := e.opts.Store.SetSyncedFlagsByDBID(row.RowID, seededBaseline); err != nil {
 					// Don't process this row with an unpersisted baseline: the
 					// candidate check and the merge below must agree, and the
 					// merge re-reads rows[i]. Skip; the next sync retries.
@@ -1018,11 +1069,11 @@ func (e *Engine) reconcileFlagRows(
 
 		// Local changed vs the baseline: push the difference between the
 		// resolved state and the server so the server converges on it.
-		// DiffFlags only ever emits the user flags ToIMAPFlags covers
-		// (Seen/Flagged/Answered/Deleted), never the server-only $Completed
-		// keyword — same as the legacy upload path.
+		// DiffFlags emits only the locally-owned flags (Seen/Flagged/Answered);
+		// Deleted and the server-only $Completed keyword never travel upward.
+		//
 		// Which halves of target actually reached their side. The baseline may
-		// only record what one of these carried out — see advanceBaseline.
+		// only record what one of these carried out — see imap.AdvanceBaseline.
 		var pushed, pulled bool
 
 		if upload && imap.NeedsUpload(local, baseline) {
@@ -1032,12 +1083,11 @@ func (e *Engine) reconcileFlagRows(
 			remove := backendFlagsFromState(imap.FlagStateFromIMAP(toRemove))
 			switch {
 			case len(toAdd) == 0 && len(toRemove) == 0:
-				// NeedsUpload can fire with nothing to send: it compares local
-				// against the baseline, and a server-owned flag the local side
-				// cannot express (\Deleted) reads as a local change forever.
-				// The server already holds the resolved state, so treat it as
-				// pushed, but do not make the call — the IMAP adapter
-				// reconnects and re-selects the mailbox even for an empty one.
+				// NeedsUpload compares local against the baseline, so it can
+				// fire while the resolved state already matches the server —
+				// the $Completed mask over Flagged is the live case. Nothing to
+				// send, but the server does hold the resolved state, so the
+				// locally-owned fields have converged and may advance.
 				pushed = true
 			default:
 				if err := b.ApplyFlags(ctx, ref, add, remove); err != nil {
@@ -1066,8 +1116,8 @@ func (e *Engine) reconcileFlagRows(
 				// written below would then agree with the reverted tags, so no
 				// later run could tell anything was lost. Write only while the
 				// snapshot still holds.
-				applied, err := e.opts.Store.ModifyFlagTagsIfUnchanged(
-					row.MessageID, e.opts.Account, imap.FlagTagVocabulary(),
+				applied, err := e.opts.Store.ModifyFlagTagsIfUnchangedByDBID(
+					row.RowID, imap.FlagTagVocabulary(),
 					flagTagsOf(row.Tags), add, remove)
 				switch {
 				case err != nil:
@@ -1095,9 +1145,9 @@ func (e *Engine) reconcileFlagRows(
 		// next run would read the local absence as the user removing it and
 		// delete it from the provider.
 		if pushed || pulled {
-			next := advanceBaseline(baseline, local, serverState, target, pushed, pulled)
+			next := imap.AdvanceBaseline(baseline, local, serverState, target, pushed, pulled)
 			if !next.Equal(baseline) {
-				if err := e.opts.Store.SetSyncedFlags(row.MessageID, e.opts.Account, joinFlags(next)); err != nil {
+				if err := e.opts.Store.SetSyncedFlagsByDBID(row.RowID, joinFlags(next)); err != nil {
 					result.Errors = append(result.Errors, fmt.Errorf("flag baseline for %s: %w", row.MessageID, err))
 					failed = append(failed, row.RemoteRef)
 				}
@@ -1105,43 +1155,6 @@ func (e *Engine) reconcileFlagRows(
 		}
 	}
 	return uploaded, downloaded, failed
-}
-
-// advanceBaseline records the resolved state for the flags this run actually
-// settled, and leaves the rest at the old before-image.
-//
-// A baseline field is a claim that both sides agreed on that value at some
-// point. Advancing one whose change only travelled in a direction the run did
-// not take turns that claim into a lie, and the lie is consumed as a user
-// action next time: the local side is missing a flag the baseline says was
-// reconciled, so the next upload removes it from the provider. UploadOnly is
-// the live case — the watcher uses it after a local tag change.
-//
-// So each flag advances only via the direction that owns its change: pushed
-// carries the ones the local side moved, pulled the ones the server moved. A
-// flag both sides moved is carried by either, since ResolveFlags gives them the
-// same value. Deleted and Completed are server-owned and only ever pulled.
-func advanceBaseline(baseline, local, server, target imap.FlagState, pushed, pulled bool) imap.FlagState {
-	next := baseline
-	advance := func(field func(imap.FlagState) bool, set func(*imap.FlagState, bool)) {
-		if pushed && field(local) != field(baseline) {
-			set(&next, field(target))
-		}
-		if pulled && field(server) != field(baseline) {
-			set(&next, field(target))
-		}
-	}
-	advance(func(f imap.FlagState) bool { return f.Seen },
-		func(f *imap.FlagState, v bool) { f.Seen = v })
-	advance(func(f imap.FlagState) bool { return f.Flagged },
-		func(f *imap.FlagState, v bool) { f.Flagged = v })
-	advance(func(f imap.FlagState) bool { return f.Answered },
-		func(f *imap.FlagState, v bool) { f.Answered = v })
-	if pulled {
-		next.Deleted = target.Deleted
-		next.Completed = target.Completed
-	}
-	return next
 }
 
 // flagTagsOf narrows a row's tags to the ones a flag decision depends on, so a
@@ -1436,6 +1449,7 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 	if err != nil {
 		slog.Warn("Folder-move upload: load inbox state failed", "module", "SYNCENGINE",
 			"account", e.opts.Account, "err", err)
+		result.Errors = append(result.Errors, fmt.Errorf("load inbox state for folder moves: %w", err))
 		return
 	}
 
@@ -1443,9 +1457,10 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 		if tagsContain(r.Tags, "inbox") {
 			continue // still in inbox — nothing to upload
 		}
-		dest, ok := moveDestination(r.Tags, folders)
+		dest, role, ok := moveDestination(r.Tags, folders)
 		if !ok {
-			continue // no resolvable destination (e.g. no Archive folder) — leave in place
+			result.Errors = append(result.Errors, fmt.Errorf("move %s: account has no %s folder", r.MessageID, role))
+			continue
 		}
 		if e.opts.DryRun {
 			slog.Debug("[dry-run] Would move message out of inbox", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
@@ -1453,7 +1468,7 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 			result.Moved++
 			continue
 		}
-		ref := backend.RemoteRef{Folder: inbox.Name, ID: r.RemoteRef}
+		ref := backend.RemoteRef{Folder: inbox.Name, ID: r.RemoteRef, MessageID: r.MessageID}
 		if _, err := b.Move(ctx, ref, dest); err != nil {
 			if errors.Is(err, backend.ErrRefGone) {
 				// The message already left INBOX on the server (archived from
@@ -1477,6 +1492,7 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 				if err := e.opts.Store.UpdateMailbox(r.MessageID, e.opts.Account, dest, 0); err != nil {
 					slog.Warn("Folder-move upload: reconcile gone message failed", "module", "SYNCENGINE", // encgrep:allow static message text only; message_id is plaintext and err carries no encrypted column
 						"message_id", r.MessageID, "err", err)
+					result.Errors = append(result.Errors, fmt.Errorf("reconcile moved message %s: %w", r.MessageID, err))
 				}
 				continue
 			}
@@ -1488,6 +1504,8 @@ func (e *Engine) uploadFolderMoves(ctx context.Context, b backend.Backend, folde
 		if err := e.opts.Store.UpdateMailbox(r.MessageID, e.opts.Account, dest, 0); err != nil {
 			slog.Warn("Folder-move upload: update mailbox failed", "module", "SYNCENGINE", // encgrep:allow static message text mentions "mailbox"; only message_id (plaintext) and err are logged
 				"message_id", r.MessageID, "err", err)
+			result.Errors = append(result.Errors, fmt.Errorf("record moved message %s: %w", r.MessageID, err))
+			continue
 		}
 		result.Moved++
 		slog.Info("Moved message out of inbox", "module", "SYNCENGINE", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
@@ -1550,11 +1568,12 @@ func (e *Engine) uploadLabelChanges(ctx context.Context, b backend.Backend, resu
 		// genuine local change is picked up next sync against the seeded baseline.
 		if r.SyncedLabels == "" {
 			_, _, seedBaseline := diffLabels(r.Tags, nil, vocab)
-			if len(seedBaseline) > 0 {
+			if len(seedBaseline) > 0 && !e.opts.DryRun {
 				if err := e.opts.Store.SetSyncedLabels(r.MessageID, e.opts.Account, strings.Join(seedBaseline, ",")); err != nil {
 					result.Errors = append(result.Errors, fmt.Errorf("seed label baseline for %s: %w", r.MessageID, err))
+				} else {
+					seeded++
 				}
-				seeded++
 			}
 			continue
 		}
@@ -1625,19 +1644,20 @@ func diffLabels(tags, baseline []string, vocab map[string]bool) (added, removed,
 
 // moveDestination decides where an INBOX message that lost the "inbox" tag
 // should go, from its remaining tags and the available server folders: a
-// message tagged "deleted" goes to Trash, otherwise to Archive. Returns
-// ("", false) — leave it in place — when the role has no folder on this
-// account, so a missing Archive/Trash never sends mail somewhere wrong.
-func moveDestination(tags []string, folders []backend.Folder) (string, bool) {
+// message tagged "trash" (or the legacy "deleted") goes to Trash, otherwise
+// to Archive. Returns ok=false — leave it in place — when the role has no folder
+// on this account, so a missing Archive/Trash never sends mail somewhere wrong.
+// The returned role identifies the unresolved intent for error reporting.
+func moveDestination(tags []string, folders []backend.Folder) (string, backend.Role, bool) {
 	role := backend.RoleArchive
-	if tagsContain(tags, "deleted") {
+	if tagsContain(tags, "trash") || tagsContain(tags, "deleted") {
 		role = backend.RoleTrash
 	}
 	dest := folderNameByRole(folders, role)
 	if dest == "" {
-		return "", false
+		return "", role, false
 	}
-	return dest, true
+	return dest, role, true
 }
 
 // folderNameByRole returns the name of the first folder with the given role, or

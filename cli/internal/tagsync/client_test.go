@@ -2,10 +2,14 @@ package tagsync
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 // mockStore implements MetaStore for testing.
@@ -88,8 +92,9 @@ func TestPush_Empty(t *testing.T) {
 }
 
 func TestPush_ServerError(t *testing.T) {
+	const response = "short server response echoing API key abc123"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		http.Error(w, response, http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
@@ -98,6 +103,7 @@ func TestPush_ServerError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for 500 response")
 	}
+	assertSafeExternalError(t, err, response)
 }
 
 func TestPush_PreservesExistingTimestamp(t *testing.T) {
@@ -166,8 +172,9 @@ func TestPull_Success(t *testing.T) {
 }
 
 func TestPull_ServerError(t *testing.T) {
+	const response = "short server response echoing API key abc123"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		http.Error(w, response, http.StatusUnauthorized)
 	}))
 	defer srv.Close()
 
@@ -178,6 +185,21 @@ func TestPull_ServerError(t *testing.T) {
 	}
 	if syncAt != 0 {
 		t.Errorf("syncAt = %d, want original since value 0", syncAt)
+	}
+	assertSafeExternalError(t, err, response)
+}
+
+func assertSafeExternalError(t *testing.T, err error, response string) {
+	t.Helper()
+	if !strings.Contains(err.Error(), response) {
+		t.Fatalf("Error() = %q, want original response for the caller", err.Error())
+	}
+	var safeErr redact.SafeLogError
+	if !errors.As(err, &safeErr) {
+		t.Fatalf("error %T is not marked safe for logging", err)
+	}
+	if strings.Contains(safeErr.SafeLogText(), response) || !strings.Contains(safeErr.SafeLogText(), redact.Placeholder) {
+		t.Fatalf("safe log text = %q", safeErr.SafeLogText())
 	}
 }
 

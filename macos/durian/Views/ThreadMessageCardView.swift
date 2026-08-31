@@ -22,7 +22,9 @@ struct ThreadMessageCardView: View {
     let onReply: () -> Void
     let onReplyAll: () -> Void
     let onForward: () -> Void
-    var onEditDraft: (() -> Void)? = nil
+    /// Receives the message this card renders, so editing composes from the
+    /// draft the user clicked rather than from the thread aggregate.
+    var onEditDraft: ((ThreadMessage) -> Void)? = nil
 
     // Each card manages its own expanded state
     @State private var isDetailsExpanded: Bool = false
@@ -602,7 +604,7 @@ struct ThreadMessageCardView: View {
             Spacer()
 
             if message.isDraft, let onEditDraft = onEditDraft {
-                Button(action: onEditDraft) {
+                Button(action: { onEditDraft(message) }) {
                     HStack(spacing: 6) {
                         Image(systemName: "pencil")
                             .font(.system(size: 14))

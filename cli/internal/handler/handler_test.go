@@ -5,6 +5,8 @@ import (
 	"context"
 	"io"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -294,10 +296,13 @@ func TestStoreTag(t *testing.T) {
 	m1, _ := db.GetByMessageID("msg1@test")
 	h := New(db, nil)
 
-	resp := h.Tag("thread:"+m1.ThreadID, "+archived -unread")
+	resp := h.Tag("thread:"+m1.ThreadID, "+archived -unread", nil)
 
 	if !resp.OK {
 		t.Fatalf("Tag failed: %s", resp.Error)
+	}
+	if resp.MatchedThreads == nil || resp.ChangedThreads == nil || *resp.MatchedThreads != 1 || *resp.ChangedThreads != 1 {
+		t.Fatalf("tag effect = matched %v, changed %v; want 1, 1", resp.MatchedThreads, resp.ChangedThreads)
 	}
 
 	// Store should be updated
@@ -325,10 +330,61 @@ func TestStoreTagBySearchQuery(t *testing.T) {
 	seedStoreData(t, db)
 
 	h := New(db, nil)
-	resp := h.Tag("tag:inbox", "+archived")
+	resp := h.Tag("tag:inbox", "+archived", nil)
 
 	if !resp.OK {
 		t.Errorf("tag by search query should succeed, got error: %s", resp.Error)
+	}
+}
+
+func TestStoreTagRejectsUnsupportedQueryWithoutChanges(t *testing.T) {
+	db := newTestStore(t)
+	seedStoreData(t, db)
+	h := New(db, nil)
+
+	resp := h.Tag("folder:INBOX", "+todo", nil)
+	if resp.OK {
+		t.Fatal("tag with unsupported query field succeeded")
+	}
+	if !strings.Contains(resp.Error, "not supported") {
+		t.Fatalf("error = %q, want unsupported-field error", resp.Error)
+	}
+
+	resp = h.Search("tag:todo", 10, 0)
+	if !resp.OK {
+		t.Fatalf("search todo: %s", resp.Error)
+	}
+	if len(resp.Results) != 0 {
+		t.Fatalf("todo results = %d, want 0", len(resp.Results))
+	}
+}
+
+func TestStoreTagNoMatchesFails(t *testing.T) {
+	db := newTestStore(t)
+	seedStoreData(t, db)
+	h := New(db, nil)
+
+	resp := h.Tag("from:nobody@example.com", "+todo", nil)
+	if resp.OK {
+		t.Fatal("tag with no matches succeeded")
+	}
+	if resp.ErrorCode != protocol.ErrNotFound {
+		t.Fatalf("error code = %q, want %q", resp.ErrorCode, protocol.ErrNotFound)
+	}
+}
+
+func TestPreviewTagReportsEffectWithoutChanges(t *testing.T) {
+	db := newTestStore(t)
+	seedStoreData(t, db)
+	h := New(db, nil)
+
+	resp := h.PreviewTag("tag:inbox", "+todo", nil)
+	if !resp.OK || resp.MatchedThreads == nil || resp.ChangedThreads == nil || *resp.ChangedThreads == 0 {
+		t.Fatalf("preview effect = %+v", resp)
+	}
+	search := h.Search("tag:todo", 10, 0)
+	if !search.OK || len(search.Results) != 0 {
+		t.Fatalf("preview modified tags: %+v", search)
 	}
 }
 
@@ -507,5 +563,349 @@ func TestStoreDownloadAttachmentNotFound(t *testing.T) {
 	err := h.DownloadAttachment("nonexistent@test", 1, w)
 	if err == nil {
 		t.Error("expected error for nonexistent attachment")
+	}
+}
+
+// TestTagAccountScopeStaysWithinSelectedAccounts is the contract the account
+// filter used to break. It narrowed the thread search only: the mutation then
+// ran thread-wide, so tagging in one account wrote into every other account
+// sharing that thread — and the journal recorded those writes too, so the
+// change propagated on the next sync.
+//
+// One resolved set of rows feeds the mutation, the journal and the trigger, so
+// there is no second place for the scope to be decided differently.
+func TestTagAccountScopeStaysWithinSelectedAccounts(t *testing.T) {
+	db := newTestStore(t)
+	now := time.Now().Unix()
+
+	// The same conversation in two accounts: one thread, rows in both.
+	for _, account := range []string{"work", "personal"} {
+		if err := db.InsertMessage(&store.Message{
+			MessageID: "shared-" + account + "@test", Subject: "Shared thread",
+			FromAddr: "a@example.com", ToAddrs: "b@example.com",
+			Refs: "<root@test>", InReplyTo: "<root@test>",
+			Date: now, CreatedAt: now, Mailbox: "INBOX",
+			Account: account, FetchedBody: true,
+		}); err != nil {
+			t.Fatalf("insert %s message: %v", account, err)
+		}
+	}
+
+	work, err := db.GetByMessageID("shared-work@test")
+	if err != nil || work == nil {
+		t.Fatalf("get work message: %+v err=%v", work, err)
+	}
+	personal, err := db.GetByMessageID("shared-personal@test")
+	if err != nil || personal == nil {
+		t.Fatalf("get personal message: %+v err=%v", personal, err)
+	}
+	if work.ThreadID != personal.ThreadID {
+		t.Fatalf("fixture threads differ (%q vs %q); this case needs one shared thread",
+			work.ThreadID, personal.ThreadID)
+	}
+
+	h := New(db, nil)
+	resp := h.Tag("thread:"+work.ThreadID, "+archived", []string{"work"})
+	if !resp.OK {
+		t.Fatalf("Tag failed: %s", resp.Error)
+	}
+
+	workTags, err := db.GetMessageTags(work.ID)
+	if err != nil {
+		t.Fatalf("get work tags: %v", err)
+	}
+	if !slices.Contains(workTags, "archived") {
+		t.Errorf("work tags = %v, want the tag applied", workTags)
+	}
+
+	personalTags, err := db.GetMessageTags(personal.ID)
+	if err != nil {
+		t.Fatalf("get personal tags: %v", err)
+	}
+	if slices.Contains(personalTags, "archived") {
+		t.Errorf("personal tags = %v: the mutation escaped the selected account", personalTags)
+	}
+}
+
+// recordingTrigger captures which accounts a mutation asked to be synced.
+type recordingTrigger struct{ accounts []string }
+
+func (r *recordingTrigger) TriggerSync(account string) {
+	r.accounts = append(r.accounts, account)
+}
+
+// seedSharedThread puts one conversation into every named account and returns
+// the messages by account.
+func seedSharedThread(t *testing.T, db *store.DB, accounts ...string) map[string]*store.Message {
+	t.Helper()
+	now := time.Now().Unix()
+	out := make(map[string]*store.Message, len(accounts))
+	for _, account := range accounts {
+		id := "shared-" + account + "@test"
+		if err := db.InsertMessage(&store.Message{
+			MessageID: id, Subject: "Shared thread",
+			FromAddr: "a@example.com", ToAddrs: "b@example.com",
+			Refs: "<root@test>", InReplyTo: "<root@test>",
+			Date: now, CreatedAt: now, Mailbox: "INBOX",
+			Account: account, FetchedBody: true,
+		}); err != nil {
+			t.Fatalf("insert %s message: %v", account, err)
+		}
+		msg, err := db.GetByMessageID(id)
+		if err != nil || msg == nil {
+			t.Fatalf("get %s message: %+v err=%v", account, msg, err)
+		}
+		out[account] = msg
+	}
+	return out
+}
+
+// TestTagAccountScopeGovernsEveryEffect checks the rest of the contract: the
+// scope has to reach the counts, the journal and the sync trigger, not only the
+// stored tags. Each of those used to work out "which messages" for itself, so
+// asserting one of them says nothing about the others.
+func TestTagAccountScopeGovernsEveryEffect(t *testing.T) {
+	db := newTestStore(t)
+	msgs := seedSharedThread(t, db, "work", "personal")
+	thread := msgs["work"].ThreadID
+
+	trigger := &recordingTrigger{}
+	h := New(db, nil)
+	h.SetSyncTrigger(trigger)
+	h.EnableTagJournal()
+
+	resp := h.Tag("thread:"+thread, "+archived", []string{"work"})
+	if !resp.OK {
+		t.Fatalf("Tag failed: %s", resp.Error)
+	}
+
+	// Counts come from the resolved targets. Reporting the search's thread
+	// count would claim work happened in accounts that were skipped.
+	if resp.MatchedThreads == nil || *resp.MatchedThreads != 1 {
+		t.Errorf("matched threads = %v, want 1", resp.MatchedThreads)
+	}
+	if resp.ChangedThreads == nil || *resp.ChangedThreads != 1 {
+		t.Errorf("changed threads = %v, want 1", resp.ChangedThreads)
+	}
+
+	journal, err := db.ReadTagJournal()
+	if err != nil {
+		t.Fatalf("read journal: %v", err)
+	}
+	if len(journal) == 0 {
+		t.Fatal("nothing journalled; the assertions below would hold even if every write was dropped")
+	}
+	for _, entry := range journal {
+		if entry.Account != "work" {
+			t.Errorf("journal entry for account %q (message %q): the unselected account would be tagged remotely on the next sync",
+				entry.Account, entry.MessageID)
+		}
+	}
+
+	if !slices.Equal(trigger.accounts, []string{"work"}) {
+		t.Errorf("sync triggered for %v, want only [work]", trigger.accounts)
+	}
+
+	// The fifth consumer. The push itself runs in a goroutine against a
+	// concrete client, but its payload is a pure function of the same target,
+	// so the scope is assertable without the network.
+	target, err := db.ThreadTagTarget(thread, []string{"work"})
+	if err != nil {
+		t.Fatalf("resolve target: %v", err)
+	}
+	changes := tagChangesFor(target, []string{"archived"}, nil, 0)
+	if len(changes) == 0 {
+		t.Fatal("no changes built; the loop below would assert nothing")
+	}
+	for _, change := range changes {
+		if change.Account != "work" {
+			t.Errorf("remote push carries account %q (message %q): the unselected account would be tagged on the server",
+				change.Account, change.MessageID)
+		}
+	}
+}
+
+// TestTagWithoutAccountScopeSpansTheThread pins the other half of the contract:
+// no filter means the operation stays thread-wide across accounts, which is
+// what makes tagging a set operation rather than a per-account one.
+func TestTagWithoutAccountScopeSpansTheThread(t *testing.T) {
+	db := newTestStore(t)
+	msgs := seedSharedThread(t, db, "work", "personal")
+
+	trigger := &recordingTrigger{}
+	h := New(db, nil)
+	h.SetSyncTrigger(trigger)
+
+	resp := h.Tag("thread:"+msgs["work"].ThreadID, "+archived", nil)
+	if !resp.OK {
+		t.Fatalf("Tag failed: %s", resp.Error)
+	}
+	for account, msg := range msgs {
+		tags, err := db.GetMessageTags(msg.ID)
+		if err != nil {
+			t.Fatalf("get %s tags: %v", account, err)
+		}
+		if !slices.Contains(tags, "archived") {
+			t.Errorf("%s tags = %v, want the tag applied thread-wide", account, tags)
+		}
+	}
+	slices.Sort(trigger.accounts)
+	if !slices.Equal(trigger.accounts, []string{"personal", "work"}) {
+		t.Errorf("sync triggered for %v, want both accounts", trigger.accounts)
+	}
+}
+
+// TestTagAccountTermInQueryIsNotAScope is the case that distinguishes carrying
+// the scope from inferring it. "path:work" here is a search term the user
+// wrote, not the clause --account produces, and the two are textually
+// identical. With no scope passed, the operation stays thread-wide: the query
+// decides which threads match, never which messages are written.
+//
+// The other unscoped test uses a bare "thread:" selector, so it would keep
+// passing if query inference came back.
+func TestTagAccountTermInQueryIsNotAScope(t *testing.T) {
+	db := newTestStore(t)
+	msgs := seedSharedThread(t, db, "work", "personal")
+
+	h := New(db, nil)
+	resp := h.Tag("path:work", "+archived", nil)
+	if !resp.OK {
+		t.Fatalf("Tag failed: %s", resp.Error)
+	}
+
+	for account, msg := range msgs {
+		tags, err := db.GetMessageTags(msg.ID)
+		if err != nil {
+			t.Fatalf("get %s tags: %v", account, err)
+		}
+		if !slices.Contains(tags, "archived") {
+			t.Errorf("%s tags = %v: an account term in the query narrowed the mutation", account, tags)
+		}
+	}
+}
+
+// TestTagMultipleAccountScopeIsTheUnion covers the third row of the contract:
+// several accounts select their union, not their intersection and not the
+// first one.
+func TestTagMultipleAccountScopeIsTheUnion(t *testing.T) {
+	db := newTestStore(t)
+	msgs := seedSharedThread(t, db, "work", "personal", "archive")
+
+	h := New(db, nil)
+	resp := h.Tag("thread:"+msgs["work"].ThreadID, "+archived", []string{"work", "personal"})
+	if !resp.OK {
+		t.Fatalf("Tag failed: %s", resp.Error)
+	}
+
+	for _, account := range []string{"work", "personal"} {
+		tags, err := db.GetMessageTags(msgs[account].ID)
+		if err != nil {
+			t.Fatalf("get %s tags: %v", account, err)
+		}
+		if !slices.Contains(tags, "archived") {
+			t.Errorf("%s tags = %v, want the tag applied", account, tags)
+		}
+	}
+	tags, err := db.GetMessageTags(msgs["archive"].ID)
+	if err != nil {
+		t.Fatalf("get archive tags: %v", err)
+	}
+	if slices.Contains(tags, "archived") {
+		t.Errorf("archive tags = %v: an unselected account was included", tags)
+	}
+}
+
+// TestTagPreviewSharesTheScopeAndWritesNothing pins that the dry run resolves
+// the same rows as the write. A preview that computed its own selection could
+// report an effect the real run would not produce, or miss one it would.
+func TestTagPreviewSharesTheScopeAndWritesNothing(t *testing.T) {
+	db := newTestStore(t)
+	msgs := seedSharedThread(t, db, "work", "personal")
+
+	// The selected account already carries the tag; the other one does not.
+	// A preview that resolved its own, wider selection would see work to do
+	// and report an effect the scoped write will never produce.
+	if err := db.AddTag(msgs["work"].ID, "archived"); err != nil {
+		t.Fatalf("seed existing tag: %v", err)
+	}
+
+	h := New(db, nil)
+	resp := h.PreviewTag("thread:"+msgs["work"].ThreadID, "+archived", []string{"work"})
+	if !resp.OK {
+		t.Fatalf("PreviewTag failed: %s", resp.Error)
+	}
+	if resp.MatchedThreads == nil || *resp.MatchedThreads != 1 {
+		t.Errorf("matched threads = %v, want 1", resp.MatchedThreads)
+	}
+	if resp.ChangedThreads == nil || *resp.ChangedThreads != 0 {
+		t.Errorf("changed threads = %v, want 0: the selected account already has the tag", resp.ChangedThreads)
+	}
+
+	// The seeded tag is still the only one: the preview neither removed it nor
+	// added the other account's.
+	workTags, err := db.GetMessageTags(msgs["work"].ID)
+	if err != nil {
+		t.Fatalf("get work tags: %v", err)
+	}
+	if !slices.Contains(workTags, "archived") {
+		t.Errorf("work tags = %v: the preview removed the seeded tag", workTags)
+	}
+	personalTags, err := db.GetMessageTags(msgs["personal"].ID)
+	if err != nil {
+		t.Fatalf("get personal tags: %v", err)
+	}
+	if slices.Contains(personalTags, "archived") {
+		t.Errorf("personal tags = %v: a preview wrote to the store", personalTags)
+	}
+	journal, err := db.ReadTagJournal()
+	if err != nil {
+		t.Fatalf("read journal: %v", err)
+	}
+	if len(journal) != 0 {
+		t.Errorf("preview journalled %d entries", len(journal))
+	}
+}
+
+// TestTagNamingAnAbsentAccountChangesNothing covers a scope that selects an
+// account the thread has no messages in. The search still matches the thread —
+// it is reached through the accounts that do hold it — so this is the case the
+// empty-target skip exists for: matched by the query, empty after scoping.
+//
+// Nothing may be written, nothing journalled, and the thread must not be
+// counted as matched.
+func TestTagNamingAnAbsentAccountChangesNothing(t *testing.T) {
+	db := newTestStore(t)
+	msgs := seedSharedThread(t, db, "work", "personal")
+
+	h := New(db, nil)
+	h.EnableTagJournal()
+	resp := h.Tag("thread:"+msgs["work"].ThreadID, "+archived", []string{"archive"})
+
+	// Demanded explicitly rather than guarded behind resp.OK: a failure
+	// response or absent counts would otherwise satisfy this by accident.
+	if !resp.OK {
+		t.Fatalf("Tag failed: %s", resp.Error)
+	}
+	if resp.MatchedThreads == nil || *resp.MatchedThreads != 0 {
+		t.Errorf("matched threads = %v, want 0: no message was in scope", resp.MatchedThreads)
+	}
+	if resp.ChangedThreads == nil || *resp.ChangedThreads != 0 {
+		t.Errorf("changed threads = %v, want 0", resp.ChangedThreads)
+	}
+	for account, msg := range msgs {
+		tags, err := db.GetMessageTags(msg.ID)
+		if err != nil {
+			t.Fatalf("get %s tags: %v", account, err)
+		}
+		if slices.Contains(tags, "archived") {
+			t.Errorf("%s tags = %v: an out-of-scope operation wrote anyway", account, tags)
+		}
+	}
+	journal, err := db.ReadTagJournal()
+	if err != nil {
+		t.Fatalf("read journal: %v", err)
+	}
+	if len(journal) != 0 {
+		t.Errorf("journalled %d entries for an out-of-scope operation", len(journal))
 	}
 }

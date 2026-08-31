@@ -29,10 +29,16 @@ class AccountManager: ObservableObject {
     @Published var folderUnreadCounts: [String: Int] = [:]
 
     private var cancellables = Set<AnyCancellable>()
+    private let profileManager: ProfileManager
+    private var startupConnectionTask: Task<Bool, Never>?
+    private var startupConnectionGeneration = 0
+    private var hasCompletedInitialSelection = false
+    private var hasReportedStartupCompletion = false
+    private let startupCompletion: @MainActor (Bool) -> Void
 
     /// Folders from current profile config
     var mailFolders: [MailFolder] {
-        let profile = ProfileManager.shared.currentProfile
+        let profile = profileManager.currentProfile
         let folders = profile?.folders ?? ProfileManager.defaultFolders
 
         return folders.map { folder in
@@ -44,14 +50,29 @@ class AccountManager: ObservableObject {
     }
 
     private init() {
-        setupEmailBackend()
+        profileManager = .shared
+        startupCompletion = { SyncManager.shared.startupMailboxDidFinish(success: $0) }
+        setupEmailBackend(EmailBackend())
+    }
+
+    /// Injectable initializer for startup ownership and focused process tests.
+    init(
+        emailBackend: EmailBackend,
+        profileManager: ProfileManager,
+        startupCompletion: (@MainActor (Bool) -> Void)? = nil
+    ) {
+        self.profileManager = profileManager
+        self.startupCompletion = startupCompletion ?? {
+            SyncManager.shared.startupMailboxDidFinish(success: $0)
+        }
+        setupEmailBackend(emailBackend)
     }
 
     // MARK: - Backend Setup
 
-    private func setupEmailBackend() {
+    private func setupEmailBackend(_ backend: EmailBackend) {
         Log.debug("BACKEND", "AccountManager: Setting up email backend")
-        emailBackend = EmailBackend()
+        emailBackend = backend
 
         // Subscribe to backend changes — debounced to avoid cascade storms
         emailBackend?.objectWillChange
@@ -84,7 +105,7 @@ class AccountManager: ObservableObject {
 
         var counts: [String: Int] = [:]
         for folder in mailFolders where !folder.isSection {
-            let folderQuery = ProfileManager.shared.buildQuery(folderName: folder.displayName)
+            let folderQuery = profileManager.buildQuery(folderName: folder.displayName)
             let unreadQuery = "(\(folderQuery)) AND tag:unread"
             let count = await backend.searchCount(query: unreadQuery)
             Log.debug("COUNTS", "\(folder.name): \(count) unread (query: \(unreadQuery))") // encgrep:allow folder filter built from config, never a user search
@@ -102,15 +123,55 @@ class AccountManager: ObservableObject {
 
     // MARK: - Connection
 
-    func connectToAllAccounts() async {
+    /// Join concurrent startup callers so connection and initial selection are
+    /// one operation. A later call retries after failure or unexpected death.
+    @discardableResult
+    func connectToAllAccounts() async -> Bool {
+        if let startupConnectionTask {
+            return await startupConnectionTask.value
+        }
+
+        startupConnectionGeneration += 1
+        let generation = startupConnectionGeneration
+        let task = Task { @MainActor [weak self] in
+            await self?.performStartupConnection() ?? false
+        }
+        startupConnectionTask = task
+        let result = await task.value
+        if startupConnectionGeneration == generation {
+            startupConnectionTask = nil
+            if !hasReportedStartupCompletion {
+                hasReportedStartupCompletion = true
+                startupCompletion(result)
+            }
+        }
+        return result
+    }
+
+    private func performStartupConnection() async -> Bool {
+        // Folder queries include the active profile's account filter. Resolve
+        // the profile before either connecting or selecting a mailbox.
+        await profileManager.waitUntilReady()
+
         Log.debug("BACKEND", "AccountManager: Connecting to email backend...")
         guard let backend = emailBackend else {
             Log.error("BACKEND", "Backend not initialized")
-            return
+            return false
         }
-        await backend.connect()
+        let wasConnected = backend.isConnected
+        if !wasConnected {
+            await backend.connect()
+        }
         syncFromBackend()
-        await selectTag(resolvedFolder())
+        guard backend.isConnected else { return false }
+
+        if wasConnected, hasCompletedInitialSelection {
+            Log.debug("BACKEND", "AccountManager: Email backend already connected")
+            return true
+        }
+        let selected = await selectTag(resolvedFolder())
+        hasCompletedInitialSelection = selected
+        return selected
     }
 
     // MARK: - Folder/Tag Selection
@@ -118,22 +179,24 @@ class AccountManager: ObservableObject {
     /// Returns `selectedFolder` if it exists in the current profile,
     /// otherwise the first non-section folder, falling back to "inbox".
     private func resolvedFolder() -> String {
-        let profile = ProfileManager.shared.currentProfile
+        let profile = profileManager.currentProfile
         let folders = profile?.folders ?? ProfileManager.defaultFolders
         let exists = folders.contains { !$0.isSection && $0.name.lowercased() == selectedFolder }
         if exists { return selectedFolder }
         return folders.first { !$0.isSection }?.name.lowercased() ?? "inbox"
     }
 
-    func selectTag(_ tag: String) async {
-        guard let backend = emailBackend else { return }
+    @discardableResult
+    func selectTag(_ tag: String) async -> Bool {
+        guard let backend = emailBackend else { return false }
         selectedFolder = tag
         // Don't clear mailMessages eagerly — the old list stays visible
         // until search() replaces it with fresh results. This avoids the
         // blank-screen flash on rapid folder switching (gi → gs → gd).
-        await backend.selectFolder(tag)
+        let selected = await backend.selectFolder(tag)
         syncFromBackend()
         await refreshFolderCounts()
+        return selected
     }
 
     // MARK: - Profile Switching
@@ -141,7 +204,7 @@ class AccountManager: ObservableObject {
     /// Switch to a different profile and reload the current tag/folder
     func switchProfile(_ profile: Profile) async {
         // Update ProfileManager
-        ProfileManager.shared.currentProfile = profile
+        profileManager.currentProfile = profile
         Log.info("BACKEND", "Switched to profile '\(profile.name)'")
 
         await selectTag(resolvedFolder())
@@ -243,7 +306,7 @@ class AccountManager: ObservableObject {
 
     func fetchAllTags() async -> [String] {
         guard let backend = emailBackend else { return [] }
-        let profile = ProfileManager.shared.currentProfile
+        let profile = profileManager.currentProfile
         if let profile, !profile.isAll {
             return await backend.fetchTags(accounts: profile.accounts)
         }

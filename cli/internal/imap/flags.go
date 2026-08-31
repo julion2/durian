@@ -29,9 +29,9 @@ func (f FlagState) IsEmpty() bool {
 
 // ResolveFlags decides the post-sync state of every flag from all three sides.
 //
-// Merge below cannot do this: it ORs local and server without consulting the
-// baseline, so a flag the user cleared can never win — it looks identical to a
-// flag the user never set. The baseline is what tells those apart, and for a
+// It replaces an OR of local and server, which could not consult the baseline
+// and so could never let a flag the user cleared win — that looks identical to
+// a flag the user never set. The baseline is what tells those apart, and for a
 // boolean it settles every field on its own:
 //
 //	local == baseline   only the server moved, take the server
@@ -69,24 +69,52 @@ func ResolveFlags(baseline, local, server FlagState) FlagState {
 	}
 }
 
+// AdvanceBaseline records the resolved state for the flags this run actually
+// settled, and leaves the rest at the old before-image.
+//
+// A baseline field is a claim that both sides agreed on that value at some
+// point. Advancing one whose change only travelled in a direction the run did
+// not take turns that claim into a lie, and the lie is consumed as a user
+// action next time: the local side is missing a flag the baseline says was
+// reconciled, so the next upload removes it from the provider. UploadOnly is
+// the live case — the watcher uses it after a local tag change.
+//
+// So each flag advances only via the direction that owns its change: pushed
+// carries the ones the local side moved, pulled the ones the server moved. A
+// flag both sides moved is carried by either, since ResolveFlags gives them the
+// same value. Deleted and Completed are server-owned and only ever pulled.
+//
+// Both sync implementations share this: the provider-neutral engine and the
+// classic IMAP syncer reach it from different plumbing, but the rule about
+// which side may advance which field is the same rule.
+func AdvanceBaseline(baseline, local, server, target FlagState, pushed, pulled bool) FlagState {
+	next := baseline
+	advance := func(field func(FlagState) bool, set func(*FlagState, bool)) {
+		if pushed && field(local) != field(baseline) {
+			set(&next, field(target))
+		}
+		if pulled && field(server) != field(baseline) {
+			set(&next, field(target))
+		}
+	}
+	advance(func(f FlagState) bool { return f.Seen },
+		func(f *FlagState, v bool) { f.Seen = v })
+	advance(func(f FlagState) bool { return f.Flagged },
+		func(f *FlagState, v bool) { f.Flagged = v })
+	advance(func(f FlagState) bool { return f.Answered },
+		func(f *FlagState, v bool) { f.Answered = v })
+	if pulled {
+		next.Deleted = target.Deleted
+		next.Completed = target.Completed
+	}
+	return next
+}
+
 func resolveFlag(baseline, local, server bool) bool {
 	if local == baseline {
 		return server
 	}
 	return local
-}
-
-// Merge combines two FlagStates using OR logic (except Deleted which uses
-// server value). Superseded by ResolveFlags on the sync engine's path, but
-// still live in the legacy imap.Syncer.
-func (f FlagState) Merge(server FlagState) FlagState {
-	return FlagState{
-		Seen:      f.Seen || server.Seen,
-		Flagged:   f.Flagged || server.Flagged,
-		Answered:  f.Answered || server.Answered,
-		Deleted:   server.Deleted,   // Server wins for deletes
-		Completed: server.Completed, // Server wins for completed (server-only concept)
-	}
 }
 
 // ToIMAPFlags converts FlagState to IMAP flag strings
@@ -182,7 +210,7 @@ func (f FlagState) ToTagOps() (add []string, remove []string) {
 
 	// Note: \Deleted IMAP flag is NOT synced to "deleted" tag.
 	// \Deleted means "permanently expunge" in IMAP, durian handles
-	// deletes via copy-to-trash + expunge in uploadFlagChanges instead.
+	// deletes via copy-to-trash + expunge in uploadFolderMoves instead.
 
 	return add, remove
 }
@@ -211,12 +239,12 @@ func DiffFlags(local, server FlagState) (toAdd, toRemove []string) {
 		toRemove = append(toRemove, imap.AnsweredFlag)
 	}
 
-	// Deleted - sync bidirectionally (server may auto-move to Trash)
-	if local.Deleted && !server.Deleted {
-		toAdd = append(toAdd, imap.DeletedFlag)
-	} else if !local.Deleted && server.Deleted {
-		toRemove = append(toRemove, imap.DeletedFlag)
-	}
+	// Deleted is server-owned and never travels upward. No tag maps to it —
+	// FlagStateFromTags cannot report it — so a local false is the absence of a
+	// representation, not a user clearing the flag. Diffing it bidirectionally
+	// meant every run after the engine witnessed a \Deleted pushed a removal
+	// back, un-marking a pending expunge another client had set. Durian's own
+	// deletes go through copy-to-trash plus expunge, not through this diff.
 
 	return toAdd, toRemove
 }
@@ -228,10 +256,14 @@ func NeedsUpload(local, stored FlagState) bool {
 	// result of a prior download, not a user action.
 	flaggedChanged := local.Flagged != stored.Flagged && !stored.Completed
 
+	// Deleted is excluded on purpose. FlagStateFromTags never reports it, so
+	// comparing it against a stored \Deleted makes every such row a permanent
+	// upload candidate whose diff is then empty — a wasted round trip on every
+	// run, and before DiffFlags stopped carrying it, a removal pushed back at
+	// the provider.
 	return local.Seen != stored.Seen ||
 		flaggedChanged ||
-		local.Answered != stored.Answered ||
-		local.Deleted != stored.Deleted
+		local.Answered != stored.Answered
 }
 
 // NeedsDownload checks if server flags differ from stored state (needs download to local)

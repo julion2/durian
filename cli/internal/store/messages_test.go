@@ -137,9 +137,17 @@ func TestGetByRemoteRefScopesIMAPUIDToMailbox(t *testing.T) {
 	if err != nil || gotInbox == nil || gotInbox.ID != inbox.ID {
 		t.Fatalf("inbox ref = %+v, err=%v", gotInbox, err)
 	}
+	gotLowercaseInbox, err := db.GetByRemoteRef("work", "inbox", "1")
+	if err != nil || gotLowercaseInbox == nil || gotLowercaseInbox.ID != inbox.ID {
+		t.Fatalf("lowercase inbox ref = %+v, err=%v", gotLowercaseInbox, err)
+	}
 	gotArchive, err := db.GetByRemoteRef("work", "Archive", "1")
 	if err != nil || gotArchive == nil || gotArchive.ID != archive.ID {
 		t.Fatalf("archive ref = %+v, err=%v", gotArchive, err)
+	}
+	gotEmpty, err := db.GetByRemoteRef("work", "INBOX", "")
+	if err != nil || gotEmpty != nil {
+		t.Fatalf("empty ref = %+v, err=%v; want nil", gotEmpty, err)
 	}
 }
 
@@ -170,6 +178,92 @@ func TestStableIdentityClaimsMatchingLegacyRow(t *testing.T) {
 	claimed, err := db.GetByDBID(legacy.ID)
 	if err != nil || claimed == nil || claimed.StableID != "email-1" {
 		t.Fatalf("claimed row = %+v, err=%v", claimed, err)
+	}
+}
+
+func TestSyntheticIdentityProvenanceRoundTrip(t *testing.T) {
+	db := newTestDB(t)
+	generated := &Message{
+		MessageID: "durian-synthetic-1-INBOX@work", Subject: "generated",
+		Date: 1, CreatedAt: 1, Mailbox: "INBOX", Account: "work",
+		SyntheticIdentity: true,
+	}
+	if err := db.InsertMessage(generated); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.GetByMessageID(generated.MessageID)
+	if err != nil || stored == nil || !stored.SyntheticIdentity {
+		t.Fatalf("generated row = %+v, err=%v", stored, err)
+	}
+
+	// A metadata update that lacks provenance must not erase established proof.
+	if err := db.InsertMessage(&Message{
+		MessageID: generated.MessageID, Subject: "update", Date: 1, CreatedAt: 2,
+		Mailbox: "INBOX", Account: "work",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = db.GetByMessageID(generated.MessageID)
+	if err != nil || stored == nil || !stored.SyntheticIdentity {
+		t.Fatalf("updated generated row = %+v, err=%v", stored, err)
+	}
+
+	// Exact generated grammar is not provenance for a real sender-supplied ID.
+	real := &Message{
+		MessageID: "durian-synthetic-2-INBOX@work", Subject: "real",
+		Date: 1, CreatedAt: 1, Mailbox: "INBOX", Account: "work",
+	}
+	if err := db.InsertMessage(real); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = db.GetByMessageID(real.MessageID)
+	if err != nil || stored == nil || stored.SyntheticIdentity {
+		t.Fatalf("real row = %+v, err=%v", stored, err)
+	}
+}
+
+func TestIngestPendingRequiresExplicitCompletion(t *testing.T) {
+	db := newTestDB(t)
+	const messageID = "pending@example.com"
+	fingerprint := []byte("complete parsed-content fingerprint")
+	if err := db.InsertMessage(&Message{
+		MessageID: messageID, Subject: "pending", Date: 1, CreatedAt: 1,
+		Mailbox: "INBOX", Account: "work", SyntheticFingerprint: fingerprint, IngestPending: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.GetByMessageID(messageID)
+	if err != nil || stored == nil || !stored.IngestPending || string(stored.SyntheticFingerprint) != string(fingerprint) {
+		t.Fatalf("new pending row = %+v, err=%v", stored, err)
+	}
+
+	// A normal upsert cannot accidentally clear an incomplete ingest.
+	retry := &Message{
+		MessageID: messageID, Subject: "retry", Date: 1, CreatedAt: 2,
+		Mailbox: "INBOX", Account: "work",
+	}
+	if err := db.InsertMessage(retry); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = db.GetByMessageID(messageID)
+	if err != nil || stored == nil || !stored.IngestPending || !retry.IngestPending {
+		t.Fatalf("pending row after retry upsert = %+v, effective pending=%t, err=%v", stored, retry.IngestPending, err)
+	}
+	if err := db.MarkMessageIngestComplete(stored.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Conversely, re-delivery cannot turn a completed row pending again.
+	redelivery := &Message{
+		MessageID: messageID, Subject: "redelivery", Date: 1, CreatedAt: 3,
+		Mailbox: "INBOX", Account: "work", IngestPending: true,
+	}
+	if err := db.InsertMessage(redelivery); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = db.GetByMessageID(messageID)
+	if err != nil || stored == nil || stored.IngestPending || redelivery.IngestPending {
+		t.Fatalf("completed row after redelivery = %+v, effective pending=%t, err=%v", stored, redelivery.IngestPending, err)
 	}
 }
 
@@ -1074,6 +1168,13 @@ func TestUpsert_CrossAccount(t *testing.T) {
 	// hands the caller a row it did not ask for.
 	if _, err := db.GetByMessageID("cross@x"); err == nil {
 		t.Error("GetByMessageID picked one of two accounts instead of reporting ambiguity")
+	}
+	candidates, err := db.GetAllByMessageID("cross@x")
+	if err != nil {
+		t.Fatalf("GetAllByMessageID: %v", err)
+	}
+	if len(candidates) != 2 {
+		t.Fatalf("GetAllByMessageID returned %d rows, want 2", len(candidates))
 	}
 }
 

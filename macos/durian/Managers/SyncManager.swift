@@ -44,6 +44,66 @@ enum SyncState: Equatable {
     }
 }
 
+/// Holds an overdue automatic full sync until the initial mailbox search has
+/// completed. The gate only controls startup catch-up; repeating timers and
+/// user-initiated syncs continue to run through their existing paths.
+struct StartupFullSyncGate {
+    private enum CatchupState {
+        case idle
+        case pending
+        case inFlight
+    }
+
+    private(set) var isStartupFinished = false
+    private var catchupState: CatchupState = .idle
+
+    var hasPendingSync: Bool { catchupState == .pending }
+
+    mutating func requestIfEligible(
+        isOverdue: Bool,
+        isEnabled: Bool,
+        isOnline: Bool
+    ) -> Bool {
+        guard catchupState != .inFlight else { return false }
+        guard isOverdue, isEnabled, isOnline else {
+            catchupState = .idle
+            return false
+        }
+        guard isStartupFinished else {
+            catchupState = .pending
+            return false
+        }
+        catchupState = .inFlight
+        return true
+    }
+
+    mutating func clearPending() {
+        guard catchupState == .pending else { return }
+        catchupState = .idle
+    }
+
+    mutating func catchupDidNotStart() {
+        guard catchupState == .inFlight else { return }
+        catchupState = .pending
+    }
+
+    mutating func catchupDidFinish(success: Bool) {
+        guard catchupState == .inFlight else { return }
+        catchupState = success ? .idle : .pending
+    }
+
+    mutating func startupDidFinish(
+        isOverdue: Bool,
+        isEnabled: Bool,
+        isOnline: Bool
+    ) -> Bool {
+        guard !isStartupFinished else { return false }
+        isStartupFinished = true
+        guard hasPendingSync else { return false }
+        return requestIfEligible(isOverdue: isOverdue, isEnabled: isEnabled, isOnline: isOnline)
+    }
+}
+
 // MARK: - Sync Manager
 
 @MainActor
@@ -68,6 +128,8 @@ class SyncManager: ObservableObject {
 
     /// True if a sync is currently in progress
     var isSyncing: Bool { syncLock }
+    var hasPendingStartupFullSync: Bool { startupFullSyncGate.hasPendingSync }
+    var hasFinishedStartupMailbox: Bool { startupFullSyncGate.isStartupFinished }
 
     // MARK: - Paths
     private let durianPath: String
@@ -76,28 +138,63 @@ class SyncManager: ObservableObject {
     private var quickSyncTimer: Timer?
     private var fullSyncTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
+    private var startupFullSyncGate = StartupFullSyncGate()
 
-    /// When the last full sync completed, persisted so the wall-clock schedule
-    /// survives app restarts as well as timer restarts. Without this the full
-    /// sync is only ever as reliable as an uninterrupted multi-hour timer.
-    private var lastFullSyncAt: Date? {
-        get { UserDefaults.standard.object(forKey: "lastFullSyncAt") as? Date }
-        set { UserDefaults.standard.set(newValue, forKey: "lastFullSyncAt") }
-    }
+    private let isAutoSyncEnabled: @MainActor () -> Bool
+    private let autoFetchInterval: @MainActor () -> TimeInterval
+    private let fullSyncInterval: @MainActor () -> TimeInterval
+    private let isOnline: @MainActor () -> Bool
+    private let readLastFullSyncAt: @MainActor () -> Date?
+    private let writeLastFullSyncAt: @MainActor (Date?) -> Void
+    private let currentDate: @MainActor () -> Date
+    private let startupFullSync: (@MainActor () async -> Bool)?
+    private let profileManager: ProfileManager
+    private let configManager: ConfigManager
+    private let syncRunner: (@MainActor (String?, String?, TimeInterval) async -> Bool)?
+    private let timerSchedulingEnabled: Bool
 
-    private init() {
+    init(
+        isAutoSyncEnabled: (@MainActor () -> Bool)? = nil,
+        autoFetchInterval: (@MainActor () -> TimeInterval)? = nil,
+        fullSyncInterval: (@MainActor () -> TimeInterval)? = nil,
+        isOnline: (@MainActor () -> Bool)? = nil,
+        readLastFullSyncAt: (@MainActor () -> Date?)? = nil,
+        writeLastFullSyncAt: (@MainActor (Date?) -> Void)? = nil,
+        currentDate: (@MainActor () -> Date)? = nil,
+        startupFullSync: (@MainActor () async -> Bool)? = nil,
+        profileManager: ProfileManager? = nil,
+        configManager: ConfigManager = .shared,
+        syncRunner: (@MainActor (String?, String?, TimeInterval) async -> Bool)? = nil,
+        timerSchedulingEnabled: Bool = true
+    ) {
         // Initial path resolution, will be refreshed in runDurianSync if needed
         durianPath = FileManager.default.resolveDurianPath() ?? ""
+        self.isAutoSyncEnabled = isAutoSyncEnabled ?? { SettingsManager.shared.guiAutoSync }
+        self.autoFetchInterval = autoFetchInterval ?? { SettingsManager.shared.autoFetchInterval }
+        self.fullSyncInterval = fullSyncInterval ?? { SettingsManager.shared.fullSyncInterval }
+        self.isOnline = isOnline ?? { NetworkMonitor.shared.isConnected }
+        self.readLastFullSyncAt = readLastFullSyncAt ?? {
+            UserDefaults.standard.object(forKey: "lastFullSyncAt") as? Date
+        }
+        self.writeLastFullSyncAt = writeLastFullSyncAt ?? {
+            UserDefaults.standard.set($0, forKey: "lastFullSyncAt")
+        }
+        self.currentDate = currentDate ?? Date.init
+        self.startupFullSync = startupFullSync
+        self.profileManager = profileManager ?? .shared
+        self.configManager = configManager
+        self.syncRunner = syncRunner
+        self.timerSchedulingEnabled = timerSchedulingEnabled
     }
 
     // MARK: - Setup (call on app start)
 
     func setup() {
         Log.debug("SYNC", "Setting up SyncManager...")
-        Log.debug("SYNC", "Config - guiAutoSync=\(SettingsManager.shared.guiAutoSync), autoFetchInterval=\(SettingsManager.shared.autoFetchInterval)s, fullSyncInterval=\(SettingsManager.shared.fullSyncInterval)s")
+        Log.debug("SYNC", "Config - guiAutoSync=\(isAutoSyncEnabled()), autoFetchInterval=\(autoFetchInterval())s, fullSyncInterval=\(fullSyncInterval())s")
 
         // Start timers based on config (if online)
-        if NetworkMonitor.shared.isConnected {
+        if isOnline() {
             startQuickSyncTimer()
             startFullSyncTimer()
         } else {
@@ -140,15 +237,14 @@ class SyncManager: ObservableObject {
                             BannerManager.shared.showSuccess(title: "Back Online", message: "Connection restored. Syncing now...")
                             self?.userSawFailureBanner = false
                         }
-                        self?.restartTimers()
-                        await self?.quickSync()
+                        await self?.handleReconnect()
                     } else {
                         Log.info("SYNC", "Went offline, stopping timers")
                         self?.stopTimers()
                         // Delay offline banner — brief disconnects (WiFi switch) shouldn't notify
                         let work = DispatchWorkItem { [weak self] in
                             Task { @MainActor in
-                                guard let self = self, !NetworkMonitor.shared.isConnected else { return }
+                                guard let self = self, !self.isOnline() else { return }
                                 self.userSawFailureBanner = true
                                 BannerManager.shared.showWarning(title: "Offline", message: "No network connection. Sync paused.")
                             }
@@ -166,17 +262,19 @@ class SyncManager: ObservableObject {
     // MARK: - Timer Management
 
     func startQuickSyncTimer() {
-        guard SettingsManager.shared.guiAutoSync else {
+        guard isAutoSyncEnabled() else {
             Log.debug("SYNC", "GUI auto-sync disabled, not starting quick sync timer")
             return
         }
-        guard NetworkMonitor.shared.isConnected else {
+        guard isOnline() else {
             Log.debug("SYNC", "Offline, not starting quick sync timer")
             return
         }
 
-        let interval = SettingsManager.shared.autoFetchInterval
+        let interval = autoFetchInterval()
         Log.debug("SYNC", "Starting quick sync timer with interval \(interval)s")
+
+        guard timerSchedulingEnabled else { return }
 
         quickSyncTimer?.invalidate()
         quickSyncTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
@@ -186,7 +284,7 @@ class SyncManager: ObservableObject {
                     Log.debug("SYNC", "Quick sync timer skipped - sync already in progress")
                     return
                 }
-                guard NetworkMonitor.shared.isConnected else {
+                guard self.isOnline() else {
                     Log.debug("SYNC", "Quick sync timer skipped - offline")
                     return
                 }
@@ -196,16 +294,18 @@ class SyncManager: ObservableObject {
     }
 
     func startFullSyncTimer() {
-        guard SettingsManager.shared.guiAutoSync else {
+        let enabled = isAutoSyncEnabled()
+        guard enabled else {
             Log.debug("SYNC", "GUI auto-sync disabled, not starting full sync timer")
             return
         }
-        guard NetworkMonitor.shared.isConnected else {
+        let online = isOnline()
+        guard online else {
             Log.debug("SYNC", "Offline, not starting full sync timer")
             return
         }
 
-        let interval = SettingsManager.shared.fullSyncInterval
+        let interval = fullSyncInterval()
         Log.debug("SYNC", "Starting full sync timer with interval \(interval)s (\(interval/3600)h)")
 
         // A repeating Timer counts from the moment it is scheduled and never
@@ -214,15 +314,23 @@ class SyncManager: ObservableObject {
         // sleeps more often than that would never run a full sync at all. So
         // schedule against wall-clock time: if one is already overdue, run it
         // now rather than waiting out another full interval.
-        if let last = lastFullSyncAt, Date().timeIntervalSince(last) < interval {
-            Log.debug("SYNC", "Full sync not due yet (last \(Int(Date().timeIntervalSince(last)))s ago)")
+        let now = currentDate()
+        let lastFullSyncAt = readLastFullSyncAt()
+        let isOverdue = Self.isFullSyncOverdue(last: lastFullSyncAt, interval: interval, now: now)
+        if !isOverdue, let last = lastFullSyncAt {
+            Log.debug("SYNC", "Full sync not due yet (last \(Int(now.timeIntervalSince(last)))s ago)")
+            startupFullSyncGate.clearPending()
+        } else if startupFullSyncGate.requestIfEligible(
+            isOverdue: isOverdue,
+            isEnabled: enabled,
+            isOnline: online
+        ) {
+            runOverdueFullSync()
         } else {
-            Log.info("SYNC", "Full sync overdue, running now")
-            Task { @MainActor in
-                guard !self.syncLock, NetworkMonitor.shared.isConnected else { return }
-                await self.fullSync()
-            }
+            Log.info("SYNC", "Full sync overdue, waiting for startup mailbox")
         }
+
+        guard timerSchedulingEnabled else { return }
 
         fullSyncTimer?.invalidate()
         fullSyncTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
@@ -232,12 +340,81 @@ class SyncManager: ObservableObject {
                     Log.debug("SYNC", "Full sync timer skipped - sync already in progress")
                     return
                 }
-                guard NetworkMonitor.shared.isConnected else {
+                guard self.isOnline() else {
                     Log.debug("SYNC", "Full sync timer skipped - offline")
                     return
                 }
                 await self.fullSync()
             }
+        }
+    }
+
+    static func isFullSyncOverdue(last: Date?, interval: TimeInterval, now: Date) -> Bool {
+        guard let last else { return true }
+        return now.timeIntervalSince(last) >= interval
+    }
+
+    /// Release a pending automatic full sync after the configured mailbox
+    /// either produced its initial result or reached a bounded final failure.
+    /// Repeated completion notifications are ignored.
+    func startupMailboxDidFinish(success: Bool) {
+        guard !startupFullSyncGate.isStartupFinished else {
+            Log.debug("SYNC", "Startup mailbox completion already recorded")
+            return
+        }
+
+        let shouldRun = startupFullSyncGate.startupDidFinish(
+            isOverdue: Self.isFullSyncOverdue(
+                last: readLastFullSyncAt(),
+                interval: fullSyncInterval(),
+                now: currentDate()
+            ),
+            isEnabled: isAutoSyncEnabled(),
+            isOnline: isOnline()
+        )
+        guard shouldRun else {
+            Log.debug("SYNC", "Startup mailbox finished with no eligible full sync pending")
+            return
+        }
+
+        Log.info("SYNC", "Startup mailbox \(success ? "ready" : "failed"), running pending overdue full sync")
+        runOverdueFullSync()
+    }
+
+    private func runOverdueFullSync() {
+        Log.info("SYNC", "Full sync overdue, running now")
+        Task { @MainActor in
+            guard !self.syncLock, self.isAutoSyncEnabled(), self.isOnline() else {
+                self.startupFullSyncGate.catchupDidNotStart()
+                Log.debug("SYNC", "Deferred overdue full sync after eligibility changed")
+                return
+            }
+            let success: Bool
+            if let startupFullSync = self.startupFullSync {
+                success = await startupFullSync()
+            } else {
+                success = await self.fullSync()
+            }
+            self.startupFullSyncGate.catchupDidFinish(success: success)
+            if !success {
+                Log.debug("SYNC", "Overdue full sync remains pending after failure")
+            }
+        }
+    }
+
+    private func retryPendingOverdueFullSync() {
+        guard startupFullSyncGate.hasPendingSync else { return }
+        let shouldRun = startupFullSyncGate.requestIfEligible(
+            isOverdue: Self.isFullSyncOverdue(
+                last: readLastFullSyncAt(),
+                interval: fullSyncInterval(),
+                now: currentDate()
+            ),
+            isEnabled: isAutoSyncEnabled(),
+            isOnline: isOnline()
+        )
+        if shouldRun {
+            runOverdueFullSync()
         }
     }
 
@@ -252,10 +429,15 @@ class SyncManager: ObservableObject {
     func restartTimers() {
         Log.debug("SYNC", "Restarting timers with new settings")
         stopTimers()
-        if SettingsManager.shared.guiAutoSync {
+        if isAutoSyncEnabled(), isOnline() {
             startQuickSyncTimer()
             startFullSyncTimer()
         }
+    }
+
+    func handleReconnect() async {
+        restartTimers()
+        await quickSync()
     }
 
     // MARK: - Failure Suppression
@@ -287,10 +469,13 @@ class SyncManager: ObservableObject {
         }
 
         syncLock = true
-        defer { syncLock = false }
+        defer {
+            syncLock = false
+            retryPendingOverdueFullSync()
+        }
 
         // Get current profile for targeted sync
-        guard let currentProfile = ProfileManager.shared.currentProfile else {
+        guard let currentProfile = profileManager.currentProfile else {
             Log.debug("SYNC", "Quick sync - no current profile, skipping")
             return false
         }
@@ -298,7 +483,7 @@ class SyncManager: ObservableObject {
         // Use account name for single-account profiles, sync all for multi/wildcard.
         // Profile accounts are maildir path names — only pass to sync if there's
         // a matching CLI account (by name, case-insensitive). Otherwise sync all.
-        let knownAccountNames = Set(ConfigManager.shared.getAccounts().map { $0.name.lowercased() })
+        let knownAccountNames = Set(configManager.getAccounts().map { $0.name.lowercased() })
         let accountName: String?
         if !currentProfile.isAll && currentProfile.accounts.count == 1,
            let profileAccount = currentProfile.accounts.first,
@@ -334,7 +519,7 @@ class SyncManager: ObservableObject {
             Log.error("SYNC", "Quick sync failed")
             consecutiveFailures += 1
             syncState = .failed("sync error")
-            if !NetworkMonitor.shared.isConnected {
+            if !isOnline() {
                 showFailureBannerIfThresholdMet(title: "Offline", message: "Sync skipped — no network connection.")
             } else {
                 showFailureBannerIfThresholdMet(title: "Sync Failed", message: "Could not sync emails. Will retry automatically.")
@@ -355,7 +540,10 @@ class SyncManager: ObservableObject {
         }
 
         syncLock = true
-        defer { syncLock = false }
+        defer {
+            syncLock = false
+            retryPendingOverdueFullSync()
+        }
 
         Log.debug("SYNC", "Full sync starting (all accounts)")
         // No UI feedback for full sync (runs in background)
@@ -365,7 +553,7 @@ class SyncManager: ObservableObject {
         if success {
             Log.info("SYNC", "Full sync completed successfully")
             recordSyncSuccess()
-            lastFullSyncAt = Date()
+            writeLastFullSyncAt(currentDate())
 
             // Reload before updating lastSyncTime (notification recency filter)
             await reloadEmailList()
@@ -373,7 +561,7 @@ class SyncManager: ObservableObject {
         } else {
             Log.error("SYNC", "Full sync failed")
             consecutiveFailures += 1
-            if !NetworkMonitor.shared.isConnected {
+            if !isOnline() {
                 showFailureBannerIfThresholdMet(title: "Offline", message: "Background sync skipped — no network connection.")
             } else {
                 showFailureBannerIfThresholdMet(title: "Full Sync Failed", message: "Background sync encountered an error.")
@@ -391,6 +579,9 @@ class SyncManager: ObservableObject {
     ///   - mailbox: Specific mailbox to sync (nil = all mailboxes)
     ///   - timeout: Command timeout in seconds
     private func runDurianSync(account: String?, mailbox: String?, timeout: TimeInterval) async -> Bool {
+        if let syncRunner {
+            return await syncRunner(account, mailbox, timeout)
+        }
         guard let resolvedPath = FileManager.default.resolveDurianPath() else {
             Log.error("SYNC", "durian CLI not found in ~/.local/bin or /usr/local/bin")
             BannerManager.shared.showCritical(title: "Durian CLI Not Found", message: "Install durian to sync emails.")
