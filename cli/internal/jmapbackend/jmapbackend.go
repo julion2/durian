@@ -74,6 +74,29 @@ type jmapEmail struct {
 	MessageID  []string        `json:"messageId"`
 }
 
+type jmapQueryPage struct {
+	QueryState *string   `json:"queryState"`
+	Position   *int      `json:"position"`
+	IDs        *[]string `json:"ids"`
+	Total      *int      `json:"total"`
+}
+
+func (p jmapQueryPage) validate() error {
+	if p.QueryState == nil || *p.QueryState == "" {
+		return errors.New("JMAP Email/query omitted required queryState")
+	}
+	if p.Position == nil || *p.Position < 0 {
+		return errors.New("JMAP Email/query omitted required valid position")
+	}
+	if p.IDs == nil {
+		return errors.New("JMAP Email/query omitted required ids")
+	}
+	if p.Total == nil || *p.Total < 0 {
+		return errors.New("JMAP Email/query omitted required valid total")
+	}
+	return nil
+}
+
 type jmapCursor struct {
 	Snapshot    string   `json:"snapshot,omitempty"`    // Email state from before an in-progress snapshot.
 	PendingIDs  []string `json:"pendingIds,omitempty"`  // Remaining initial-sync IDs (legacy cursor shape).
@@ -108,7 +131,7 @@ func New(account *config.AccountConfig) (*Backend, error) {
 		account: account,
 		client: &client{
 			httpClient: &http.Client{
-				Timeout:       30 * time.Second,
+				Timeout:       90 * time.Second,
 				CheckRedirect: validateJMAPRedirect,
 			},
 			sessionURL: account.JMAP.SessionURL,
@@ -260,15 +283,33 @@ func buildMailboxMappings(mailboxes map[string]jmapMailbox) (map[string]string, 
 	}
 	mailboxToTag := make(map[string]string, len(ids))
 	tagToID := make(map[string]string, len(ids))
+	// Reserve fixed role vocabulary before allocating ordinary names so roles
+	// always remain reachable regardless of mailbox ID ordering.
 	for _, id := range ids {
+		if !isRole[id] {
+			continue
+		}
+		mailboxToTag[id] = raw[id]
+		tagToID[raw[id]] = id
+	}
+	for _, id := range ids {
+		if isRole[id] {
+			continue
+		}
 		tag := raw[id]
-		if len(groups[tag]) > 1 && !isRole[id] {
-			tag += "~" + mailboxTagSuffix(id)
+		suffix := "~" + mailboxTagSuffix(id)
+		if strings.HasPrefix(tag, "jmap-keyword/") {
+			// jmap-keyword/ is the explicit native-keyword namespace, so a
+			// mailbox path must not claim it.
+			tag = "mailbox" + suffix + "/" + tag
+		} else if len(groups[tag]) > 1 || isExplicitFlagTag(tag) || tagToID[tag] != "" {
+			tag += suffix
+		}
+		for tagToID[tag] != "" {
+			tag += suffix
 		}
 		mailboxToTag[id] = tag
-		if existing := tagToID[tag]; existing == "" || (isRole[id] && !isRole[existing]) {
-			tagToID[tag] = id
-		}
+		tagToID[tag] = id
 	}
 	return mailboxToTag, tagToID
 }
@@ -377,27 +418,36 @@ func (b *Backend) queryAllEmailIDsOnce(ctx context.Context) ([]string, error) {
 	}
 	var ids []string
 	expectedTotal := 0
+	expectedQueryState := ""
 	for {
-		var query struct {
-			Position int      `json:"position"`
-			IDs      []string `json:"ids"`
-			Total    int      `json:"total"`
-		}
+		var query jmapQueryPage
 		if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/query", args, &query); err != nil {
 			return nil, err
 		}
-		expectedTotal = query.Total
-		ids = append(ids, query.IDs...)
-		if len(query.IDs) == 0 {
-			if len(ids) < query.Total {
-				return nil, fmt.Errorf("%w: got %d of %d ids", errIncompleteQuery, len(ids), query.Total)
+		if err := query.validate(); err != nil {
+			return nil, err
+		}
+		queryState, position, pageIDs, total := *query.QueryState, *query.Position, *query.IDs, *query.Total
+		if expectedQueryState == "" {
+			expectedQueryState = queryState
+			expectedTotal = total
+		} else if queryState != expectedQueryState || total != expectedTotal {
+			return nil, fmt.Errorf("%w: query changed while paging", errIncompleteQuery)
+		}
+		if position != len(ids) {
+			return nil, fmt.Errorf("%w: got position %d, expected %d", errIncompleteQuery, position, len(ids))
+		}
+		ids = append(ids, pageIDs...)
+		if len(pageIDs) == 0 {
+			if len(ids) < total {
+				return nil, fmt.Errorf("%w: got %d of %d ids", errIncompleteQuery, len(ids), total)
 			}
 			break
 		}
-		if query.Position+len(query.IDs) >= query.Total {
+		if position+len(pageIDs) >= total {
 			break
 		}
-		nextAnchor := query.IDs[len(query.IDs)-1]
+		nextAnchor := pageIDs[len(pageIDs)-1]
 		if priorAnchor, ok := args["anchor"].(string); ok && priorAnchor == nextAnchor {
 			return nil, errors.New("Email/query anchor pagination made no progress")
 		}
@@ -472,38 +522,34 @@ func (b *Backend) replacementPage(ctx context.Context, state jmapCursor, limit i
 		args["anchor"] = state.QueryAnchor
 		args["anchorOffset"] = 1
 	}
-	var query struct {
-		QueryState string   `json:"queryState"`
-		Position   int      `json:"position"`
-		IDs        []string `json:"ids"`
-		Total      int      `json:"total"`
-	}
+	var query jmapQueryPage
 	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/query", args, &query); err != nil {
 		return backend.FetchResult{}, fmt.Errorf("query JMAP replacement snapshot page: %w", err)
 	}
-	if query.QueryState == "" || query.Position < 0 || query.Total < 0 {
-		return backend.FetchResult{}, errors.New("JMAP replacement query returned invalid state or counts")
+	if err := query.validate(); err != nil {
+		return backend.FetchResult{}, fmt.Errorf("query JMAP replacement snapshot page: %w", err)
 	}
-	if query.Position != state.QuerySeen {
-		return backend.FetchResult{}, fmt.Errorf("JMAP replacement query position changed: got %d, want %d", query.Position, state.QuerySeen)
+	queryState, position, pageIDs, total := *query.QueryState, *query.Position, *query.IDs, *query.Total
+	if position != state.QuerySeen {
+		return backend.FetchResult{}, fmt.Errorf("JMAP replacement query position changed: got %d, want %d", position, state.QuerySeen)
 	}
 	if state.QueryState == "" {
-		state.QueryState = query.QueryState
-		state.QueryTotal = query.Total
-	} else if query.QueryState != state.QueryState || query.Total != state.QueryTotal {
+		state.QueryState = queryState
+		state.QueryTotal = total
+	} else if queryState != state.QueryState || total != state.QueryTotal {
 		return backend.FetchResult{}, errors.New("JMAP replacement query changed while paging; restart recovery")
 	}
-	pageIDs := uniqueStrings(query.IDs)
-	if len(pageIDs) != len(query.IDs) {
+	uniquePageIDs := uniqueStrings(pageIDs)
+	if len(uniquePageIDs) != len(pageIDs) {
 		return backend.FetchResult{}, errors.New("JMAP replacement query returned duplicate IDs in one page")
 	}
-	state.QuerySeen += len(pageIDs)
+	state.QuerySeen += len(uniquePageIDs)
 	if state.QuerySeen > state.QueryTotal || (len(pageIDs) == 0 && state.QuerySeen < state.QueryTotal) {
 		return backend.FetchResult{}, fmt.Errorf("%w: got %d of %d ids", errIncompleteQuery, state.QuerySeen, state.QueryTotal)
 	}
 	hasMore := state.QuerySeen < state.QueryTotal
 	if hasMore {
-		state.QueryAnchor = pageIDs[len(pageIDs)-1]
+		state.QueryAnchor = uniquePageIDs[len(uniquePageIDs)-1]
 	} else {
 		state = jmapCursor{EmailState: state.Snapshot}
 	}
@@ -511,7 +557,7 @@ func (b *Backend) replacementPage(ctx context.Context, state jmapCursor, limit i
 		Cursor:       encodeCursor(state),
 		HasMore:      hasMore,
 		FullSnapshot: true,
-		Present:      presentRefs(allMailStream, pageIDs, nil),
+		Present:      presentRefs(allMailStream, uniquePageIDs, nil),
 	}, nil
 }
 
@@ -677,7 +723,11 @@ func (b *Backend) labelsFor(mailboxIDs, keywords map[string]bool) []string {
 			continue
 		}
 		if tag, ok := decodeDurianKeyword(keyword); ok {
-			labels = append(labels, tag)
+			if b.tagToID[tag] != "" || isExplicitFlagTag(tag) || strings.HasPrefix(tag, "jmap-keyword/") {
+				labels = append(labels, "jmap-keyword/"+keyword)
+			} else {
+				labels = append(labels, tag)
+			}
 		} else {
 			labels = append(labels, "jmap-keyword/"+keyword)
 		}
@@ -720,6 +770,10 @@ func decodeDurianKeyword(keyword string) (string, bool) {
 
 func isFlagKeyword(keyword string) bool {
 	return strings.HasPrefix(keyword, "$")
+}
+
+func isExplicitFlagTag(tag string) bool {
+	return tag == "unread" || tag == "flagged" || tag == "replied"
 }
 
 func validJMAPKeyword(keyword string) bool {
@@ -907,14 +961,15 @@ func (b *Backend) LabelTags(ctx context.Context) ([]string, error) {
 // ManagesLabelTag reports whether a local tag can be represented as a JMAP
 // mailbox membership or custom keyword. Flag tags use ApplyTagMutation instead.
 func (b *Backend) ManagesLabelTag(tag string) bool {
-	if tag == "unread" || tag == "flagged" || tag == "replied" {
+	if isExplicitFlagTag(tag) {
 		return false
 	}
 	keyword, native := strings.CutPrefix(tag, "jmap-keyword/")
 	if native {
 		return validJMAPKeyword(keyword) && !isFlagKeyword(keyword)
 	}
-	return tag != ""
+	_, err := encodeDurianKeyword(tag)
+	return err == nil
 }
 
 // ApplyLabels updates mailbox memberships represented by canonical Durian tags.
@@ -923,7 +978,7 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 		return err
 	}
 	for _, tag := range add {
-		if canonicalMailboxSegment(tag) == "archive" && b.mailboxIDForTag("archive") == "" {
+		if tag == "archive" && b.mailboxIDForTag("archive") == "" {
 			if err := b.createArchiveMailbox(ctx); err != nil {
 				return fmt.Errorf("create JMAP archive mailbox: %w", err)
 			}
@@ -932,29 +987,29 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 	}
 	patch := make(map[string]interface{})
 	b.mu.Lock()
-	for _, tag := range add {
-		if id := b.tagToID[canonicalMailboxSegment(tag)]; id != "" {
-			patch["mailboxIds/"+id] = true
-		} else {
+	apply := func(tags []string, value interface{}) error {
+		for _, tag := range tags {
+			if !strings.HasPrefix(tag, "jmap-keyword/") {
+				if id := b.tagToID[tag]; id != "" {
+					patch["mailboxIds/"+id] = value
+					continue
+				}
+			}
 			keyword, err := keywordForTag(tag)
 			if err != nil {
-				b.mu.Unlock()
 				return err
 			}
-			patch["keywords/"+pointerEscape(keyword)] = true
+			patch["keywords/"+pointerEscape(keyword)] = value
 		}
+		return nil
 	}
-	for _, tag := range remove {
-		if id := b.tagToID[canonicalMailboxSegment(tag)]; id != "" {
-			patch["mailboxIds/"+id] = nil
-		} else {
-			keyword, err := keywordForTag(tag)
-			if err != nil {
-				b.mu.Unlock()
-				return err
-			}
-			patch["keywords/"+pointerEscape(keyword)] = nil
-		}
+	if err := apply(add, true); err != nil {
+		b.mu.Unlock()
+		return err
+	}
+	if err := apply(remove, nil); err != nil {
+		b.mu.Unlock()
+		return err
 	}
 	b.mu.Unlock()
 	if len(patch) == 0 {

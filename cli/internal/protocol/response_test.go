@@ -1,7 +1,9 @@
 package protocol
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/julion2/durian/cli/internal/mail"
@@ -69,6 +71,20 @@ func TestSuccessWithResultsEmpty(t *testing.T) {
 	}
 	if len(resp.Results) != 0 {
 		t.Errorf("SuccessWithResults() with empty slice should have 0 results, got %d", len(resp.Results))
+	}
+}
+
+func TestSuccessWithTagChanges(t *testing.T) {
+	resp := SuccessWithTagChanges(4, 0)
+	if !resp.OK || resp.MatchedThreads == nil || resp.ChangedThreads == nil || *resp.MatchedThreads != 4 || *resp.ChangedThreads != 0 {
+		t.Fatalf("SuccessWithTagChanges() = %#v", resp)
+	}
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"matched_threads":4`) || !strings.Contains(string(raw), `"changed_threads":0`) {
+		t.Fatalf("JSON effect fields missing: %s", raw)
 	}
 }
 

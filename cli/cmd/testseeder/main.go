@@ -80,10 +80,19 @@ func seedEmailDB(path string) error {
 
 	msgs := []*store.Message{
 		{
+			StableID:  "seed-email-1",
 			MessageID: "msg1@test", Subject: "Hello World",
 			FromAddr: "alice@example.com", ToAddrs: "bob@example.com",
 			Date: now - 3600, CreatedAt: now, BodyText: "First message body",
 			BodyHTML: "<p>First message body</p>", Mailbox: "INBOX", FetchedBody: true,
+			Account: "test",
+		},
+		{
+			StableID:  "seed-email-1-duplicate",
+			MessageID: "msg1@test", Subject: "Hello World",
+			FromAddr: "alice@example.com", ToAddrs: "bob@example.com",
+			Date: now - 1800, CreatedAt: now, BodyText: "Duplicate provider body",
+			BodyHTML: "<p>Duplicate provider body</p>", Mailbox: "INBOX", FetchedBody: true,
 			Account: "test",
 		},
 		{
@@ -109,15 +118,22 @@ func seedEmailDB(path string) error {
 		}
 	}
 
-	m1, _ := db.GetByMessageID("msg1@test")
-	m2, _ := db.GetByMessageID("msg2@test")
-	m3, _ := db.GetByMessageID("msg3@test")
-
-	db.AddTag(m1.ID, "inbox")
-	db.AddTag(m1.ID, "unread")
-	db.AddTag(m2.ID, "inbox")
-	db.AddTag(m3.ID, "inbox")
-	db.AddTag(m3.ID, "flagged")
+	seedTags := []struct {
+		message *store.Message
+		tag     string
+	}{
+		{msgs[0], "inbox"},
+		{msgs[0], "unread"},
+		{msgs[1], "inbox"},
+		{msgs[2], "inbox"},
+		{msgs[3], "inbox"},
+		{msgs[3], "flagged"},
+	}
+	for _, seedTag := range seedTags {
+		if err := db.AddTag(seedTag.message.ID, seedTag.tag); err != nil {
+			return fmt.Errorf("tag %s with %s: %w", seedTag.message.MessageID, seedTag.tag, err)
+		}
+	}
 
 	fmt.Printf("  email.db: %d messages at %s\n", len(msgs), path) // encgrep:allow filename, not PII
 	return nil

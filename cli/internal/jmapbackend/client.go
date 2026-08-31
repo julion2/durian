@@ -12,10 +12,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 const (
@@ -133,6 +136,12 @@ type methodResponseEnvelope struct {
 	SessionState    string            `json:"sessionState"`
 }
 
+type methodResponseTarget struct {
+	name string
+	out  interface{}
+	seen bool
+}
+
 type methodError struct {
 	Type        string `json:"type"`
 	Description string `json:"description"`
@@ -145,6 +154,12 @@ func (e *methodError) Error() string {
 	return fmt.Sprintf("JMAP method error %s: %s", e.Type, e.Description)
 }
 
+func (e *methodError) SafeLogText() string {
+	return "JMAP method error: provider details " + redact.Placeholder
+}
+
+var _ redact.SafeLogError = (*methodError)(nil)
+
 type statusError struct {
 	Status int
 	Body   string
@@ -153,6 +168,12 @@ type statusError struct {
 func (e *statusError) Error() string {
 	return fmt.Sprintf("JMAP request failed: status %d: %s", e.Status, e.Body)
 }
+
+func (e *statusError) SafeLogText() string {
+	return fmt.Sprintf("JMAP request failed: status %d: response body %s", e.Status, redact.Placeholder)
+}
+
+var _ redact.SafeLogError = (*statusError)(nil)
 
 func (c *client) discover(ctx context.Context) error {
 	resp, err := c.doHTTP(ctx, http.MethodGet, c.sessionURL, nil, "", true)
@@ -170,12 +191,13 @@ func (c *client) discover(ctx context.Context) error {
 		return fmt.Errorf("decode JMAP core limits: %w", err)
 	}
 	if c.limits.MaxCallsInRequest == 0 || c.limits.MaxObjectsInGet == 0 ||
-		c.limits.MaxObjectsInSet == 0 || c.limits.MaxConcurrentRequests == 0 ||
-		c.limits.MaxConcurrentUpload == 0 || c.limits.MaxSizeRequest == 0 || c.limits.MaxSizeUpload == 0 {
-		return errors.New("JMAP core capability does not permit the required client operations")
+		c.limits.MaxConcurrentRequests == 0 || c.limits.MaxSizeRequest == 0 {
+		return errors.New("JMAP core capability does not permit API reads")
 	}
 	c.apiSem = make(chan struct{}, min(c.limits.MaxConcurrentRequests, maxClientAPIRequests))
-	c.uploadSem = make(chan struct{}, min(c.limits.MaxConcurrentUpload, maxClientUploads))
+	if c.limits.MaxConcurrentUpload > 0 {
+		c.uploadSem = make(chan struct{}, min(c.limits.MaxConcurrentUpload, maxClientUploads))
+	}
 	accountID := c.session.PrimaryAccounts[mailCapability]
 	account, primaryOK := c.session.Accounts[accountID]
 	_, primaryHasMail := account.AccountCapabilities[mailCapability]
@@ -231,7 +253,10 @@ func resolveURL(base, ref string) string {
 	return b.ResolveReference(u).String()
 }
 
-func (c *client) call(ctx context.Context, using []string, method string, args, out interface{}) error {
+func (c *client) call(ctx context.Context, using []string, method string, args, out interface{}, additional ...*methodResponseTarget) error {
+	if c.apiSem != nil && strings.HasSuffix(method, "/set") && c.limits.MaxObjectsInSet == 0 {
+		return fmt.Errorf("JMAP core capability does not permit %s operations", method)
+	}
 	body, err := json.Marshal(methodEnvelope{
 		Using:       using,
 		MethodCalls: [][]interface{}{{method, args, "0"}},
@@ -265,41 +290,111 @@ func (c *client) call(ctx context.Context, using []string, method string, args, 
 		return fmt.Errorf("%s returned no method responses", method)
 	}
 	var responseErr *methodError
+	var protocolErr error
+	recordProtocolError := func(err error) {
+		if protocolErr == nil {
+			protocolErr = err
+		}
+	}
+	found := false
 	for _, raw := range envelope.MethodResponses {
 		var tuple []json.RawMessage
-		if err := json.Unmarshal(raw, &tuple); err != nil || len(tuple) < 2 {
-			return fmt.Errorf("decode %s method response: %w", method, err)
+		if err := json.Unmarshal(raw, &tuple); err != nil {
+			recordProtocolError(fmt.Errorf("decode %s method response: %w", method, err))
+			continue
+		}
+		if len(tuple) != 3 {
+			recordProtocolError(fmt.Errorf("decode %s method response: tuple has %d elements, want 3", method, len(tuple)))
+			continue
+		}
+		var callID string
+		if err := json.Unmarshal(tuple[2], &callID); err != nil {
+			recordProtocolError(fmt.Errorf("decode %s response call ID: %w", method, err))
+			continue
+		}
+		if callID != "0" {
+			recordProtocolError(fmt.Errorf("JMAP %s response has call ID %q, want %q", method, callID, "0"))
+			continue
 		}
 		var responseName string
 		if err := json.Unmarshal(tuple[0], &responseName); err != nil {
-			return fmt.Errorf("decode %s response name: %w", method, err)
+			recordProtocolError(fmt.Errorf("decode %s response name: %w", method, err))
+			continue
 		}
 		if responseName == "error" {
 			var methodErr methodError
-			if err := json.Unmarshal(tuple[1], &methodErr); err != nil {
-				return fmt.Errorf("decode %s method error: %w", method, err)
+			if err := decodeMethodPayload(tuple[1], &methodErr); err != nil {
+				recordProtocolError(fmt.Errorf("decode %s method error: %w", method, err))
+				continue
+			}
+			if methodErr.Type == "" {
+				recordProtocolError(fmt.Errorf("decode %s method error: missing type", method))
+				continue
 			}
 			responseErr = &methodErr
 			continue
 		}
-		if responseName != method {
-			// EmailSubmission/set may produce an additional implicit Email/set
-			// response for onSuccessUpdateEmail. Select the response belonging to
-			// the requested method rather than rejecting the valid side effect.
+		if responseName == method {
+			if found {
+				recordProtocolError(fmt.Errorf("JMAP response included duplicate %s results", method))
+				continue
+			}
+			if err := decodeMethodPayload(tuple[1], out); err != nil {
+				recordProtocolError(fmt.Errorf("decode %s result: %w", method, err))
+				continue
+			}
+			found = true
 			continue
 		}
-		if out == nil {
-			return nil
+		for _, target := range additional {
+			if responseName != target.name {
+				continue
+			}
+			if target.seen {
+				recordProtocolError(fmt.Errorf("JMAP response included duplicate %s results", responseName))
+				break
+			}
+			if err := decodeMethodPayload(tuple[1], target.out); err != nil {
+				recordProtocolError(fmt.Errorf("decode %s result: %w", responseName, err))
+				break
+			}
+			target.seen = true
+			break
 		}
-		if err := json.Unmarshal(tuple[1], out); err != nil {
-			return fmt.Errorf("decode %s result: %w", method, err)
-		}
-		return nil
 	}
 	if responseErr != nil {
 		return responseErr
 	}
-	return fmt.Errorf("JMAP response did not include %s", method)
+	if protocolErr != nil {
+		return protocolErr
+	}
+	if !found {
+		return fmt.Errorf("JMAP response did not include %s", method)
+	}
+	return nil
+}
+
+func decodeMethodPayload(raw json.RawMessage, out interface{}) error {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return err
+	}
+	if object == nil {
+		return errors.New("payload is not a non-null JSON object")
+	}
+	if out == nil {
+		return nil
+	}
+	target := reflect.ValueOf(out)
+	if target.Kind() != reflect.Pointer || target.IsNil() {
+		return errors.New("result target is not a non-nil pointer")
+	}
+	decoded := reflect.New(target.Elem().Type())
+	if err := json.Unmarshal(raw, decoded.Interface()); err != nil {
+		return err
+	}
+	target.Elem().Set(decoded.Elem())
+	return nil
 }
 
 func (c *client) doHTTP(ctx context.Context, method, requestURL string, body []byte, contentType string, safeToRetry bool) (*http.Response, error) {
@@ -421,6 +516,9 @@ func readLimited(r io.Reader, limit int64, description string) ([]byte, error) {
 func (c *client) upload(ctx context.Context, data []byte, contentType string) (string, error) {
 	if c.session.UploadURL == "" {
 		return "", errors.New("JMAP session has no uploadUrl")
+	}
+	if c.apiSem != nil && (c.limits.MaxSizeUpload == 0 || c.limits.MaxConcurrentUpload == 0) {
+		return "", errors.New("JMAP core capability does not permit uploads")
 	}
 	if c.limits.MaxSizeUpload > 0 && int64(len(data)) > c.limits.MaxSizeUpload {
 		return "", fmt.Errorf("JMAP upload is %d bytes, exceeds maxSizeUpload %d", len(data), c.limits.MaxSizeUpload)

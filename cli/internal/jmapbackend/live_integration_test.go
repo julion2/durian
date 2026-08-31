@@ -3,8 +3,10 @@
 package jmapbackend
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net/mail"
 	"os"
 	"strings"
 	"testing"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
+	durianmail "github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/mailsend"
 )
 
@@ -93,17 +96,43 @@ func TestLiveJMAPRoundTrip(t *testing.T) {
 	}) {
 		t.Fatalf("incremental sync did not return changed flags for %s", messageID)
 	}
-	if err := b.ApplyLabels(ctx, ref, []string{"archive"}, []string{"inbox"}); err != nil {
+	if err := b.ApplyTagMutation(ctx, ref, "unread", true); err != nil {
+		t.Fatalf("apply unread tag mutation: %v", err)
+	}
+	unreadDelta, err := b.FetchMessages(ctx, allMailStream, delta.Cursor, 500)
+	if err != nil {
+		t.Fatalf("explicit tag mutation sync: %v", err)
+	}
+	if !containsMessage(unreadDelta.Messages, messageID, func(message backend.Message) bool {
+		return !message.Flags.Seen && message.Flags.Flagged
+	}) {
+		t.Fatalf("incremental sync did not return explicit unread mutation for %s", messageID)
+	}
+	customLabel := "Durian JMAP, native/label"
+	if err := b.ApplyLabels(ctx, ref, []string{"archive", customLabel}, []string{"inbox"}); err != nil {
 		t.Fatalf("archive labels: %v", err)
 	}
-	labelDelta, err := b.FetchMessages(ctx, allMailStream, delta.Cursor, 500)
+	labelDelta, err := b.FetchMessages(ctx, allMailStream, unreadDelta.Cursor, 500)
 	if err != nil {
 		t.Fatalf("mailbox-membership sync: %v", err)
 	}
 	if !containsMessage(labelDelta.Messages, messageID, func(message backend.Message) bool {
-		return containsString(message.Labels, "archive") && !containsString(message.Labels, "inbox")
+		return containsString(message.Labels, "archive") && containsString(message.Labels, customLabel) &&
+			!containsString(message.Labels, "inbox")
 	}) {
-		t.Fatalf("incremental sync did not return changed mailbox membership for %s", messageID)
+		t.Fatalf("incremental sync did not return mailbox and custom keyword labels for %s", messageID)
+	}
+	if err := b.ApplyLabels(ctx, ref, nil, []string{customLabel}); err != nil {
+		t.Fatalf("remove custom keyword label: %v", err)
+	}
+	removedLabelDelta, err := b.FetchMessages(ctx, allMailStream, labelDelta.Cursor, 500)
+	if err != nil {
+		t.Fatalf("custom keyword removal sync: %v", err)
+	}
+	if !containsMessage(removedLabelDelta.Messages, messageID, func(message backend.Message) bool {
+		return containsString(message.Labels, "archive") && !containsString(message.Labels, customLabel)
+	}) {
+		t.Fatalf("incremental sync did not return custom keyword removal for %s", messageID)
 	}
 
 	submissionMessageID := "durian-jmap-submission-" + marker + "@example.test"
@@ -115,7 +144,7 @@ func TestLiveJMAPRoundTrip(t *testing.T) {
 		t.Fatalf("submission: %v", err)
 	}
 
-	submissionDelta, err := b.FetchMessages(ctx, allMailStream, labelDelta.Cursor, 500)
+	submissionDelta, err := b.FetchMessages(ctx, allMailStream, removedLabelDelta.Cursor, 500)
 	if err != nil {
 		t.Fatalf("submission delta: %v", err)
 	}
@@ -209,6 +238,60 @@ func TestLiveJMAPHTMLThreading(t *testing.T) {
 	}
 }
 
+func TestLiveJMAPReplacementRecovery(t *testing.T) {
+	sessionURL := os.Getenv("DURIAN_JMAP_TEST_SESSION_URL")
+	username := os.Getenv("DURIAN_JMAP_TEST_USERNAME")
+	password := os.Getenv("DURIAN_JMAP_TEST_PASSWORD")
+	expiredState := os.Getenv("DURIAN_JMAP_TEST_EXPIRED_STATE")
+	if sessionURL == "" || username == "" || password == "" {
+		t.Skip("live JMAP credentials not configured")
+	}
+	if expiredState == "" {
+		t.Skip("live JMAP expired state not configured")
+	}
+
+	original := getCredential
+	getCredential = func(_, _ string) (string, error) { return password, nil }
+	t.Cleanup(func() { getCredential = original })
+	b := newLiveBackend(t, sessionURL, liveJMAPAuth(), "JMAP Replacement Recovery", username)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if _, err := b.FetchFolders(ctx); err != nil {
+		t.Fatalf("discover folders: %v", err)
+	}
+	cursor := encodeCursor(jmapCursor{EmailState: expiredState})
+	present := make(map[string]struct{})
+	for page := 0; page < 10_000; page++ {
+		result, err := b.FetchMessages(ctx, allMailStream, cursor, 1)
+		if err != nil {
+			t.Fatalf("replacement page %d: %v", page+1, err)
+		}
+		if !result.FullSnapshot {
+			t.Fatalf("replacement page %d was returned as a delta", page+1)
+		}
+		for _, ref := range result.Present {
+			if _, duplicate := present[ref.ID]; duplicate {
+				t.Fatalf("replacement returned duplicate ref %q", ref.ID)
+			}
+			present[ref.ID] = struct{}{}
+		}
+		cursor = result.Cursor
+		if result.HasMore {
+			continue
+		}
+		state := decodeCursor(cursor)
+		if state.EmailState == "" || state.Replacement {
+			t.Fatalf("replacement ended with invalid cursor %+v", state)
+		}
+		if len(present) == 0 {
+			t.Fatal("replacement snapshot unexpectedly contained no messages")
+		}
+		return
+	}
+	t.Fatal("replacement snapshot did not finish within 10000 pages")
+}
+
 func TestLiveJMAPTwoAccountDelivery(t *testing.T) {
 	sessionURL := os.Getenv("DURIAN_JMAP_TEST_SESSION_URL")
 	senderUsername := os.Getenv("DURIAN_JMAP_TEST_USERNAME")
@@ -267,9 +350,11 @@ func TestLiveJMAPTwoAccountDelivery(t *testing.T) {
 
 	marker := time.Now().UTC().Format("20060102T150405.000000000")
 	messageID := "durian-jmap-two-account-" + marker + "@example.test"
+	attachmentData := []byte("Durian JMAP attachment " + marker)
 	if err := (&Sender{b: senderBackend}).Send(ctx, &mailsend.Message{
-		From: senderUsername, To: []string{recipientUsername}, Subject: "Durian JMAP two-account " + marker,
-		Body: "delivered between two JMAP accounts", MessageID: messageID,
+		From: senderUsername, To: []string{senderUsername}, BCC: []string{recipientUsername},
+		Subject: "Durian JMAP two-account " + marker, Body: "delivered between two JMAP accounts", MessageID: messageID,
+		Attachments: []mailsend.Attachment{{Filename: "durian-jmap.txt", MIMEType: "text/plain; charset=utf-8", Data: attachmentData}},
 	}); err != nil {
 		t.Fatalf("two-account submission: %v", err)
 	}
@@ -290,7 +375,26 @@ func TestLiveJMAPTwoAccountDelivery(t *testing.T) {
 	}
 	if !containsMessage(recipientDelta.Messages, messageID, func(message backend.Message) bool {
 		t.Cleanup(func() { destroyLiveEmail(recipientBackend, message.Ref.ID) })
-		return strings.Contains(string(message.Raw), "delivered between two JMAP accounts") && containsString(message.Labels, "inbox")
+		parsed, err := mail.ReadMessage(bytes.NewReader(message.Raw))
+		if err != nil {
+			t.Errorf("parse recipient MIME: %v", err)
+			return false
+		}
+		content := durianmail.NewParser().Parse(parsed)
+		if content.BCC != "" {
+			t.Errorf("delivered recipient copy exposed Bcc header %q", content.BCC)
+			return false
+		}
+		if !strings.Contains(content.To, senderUsername) || len(content.Attachments) != 1 || content.Attachments[0].Filename != "durian-jmap.txt" {
+			t.Errorf("delivered recipient MIME metadata = To %q, attachments %#v", content.To, content.Attachments)
+			return false
+		}
+		attachment, contentType, err := durianmail.ExtractAttachmentPart(message.Raw, 1)
+		if err != nil || !bytes.Equal(attachment, attachmentData) || contentType != "text/plain" {
+			t.Errorf("delivered attachment = %q, type %q, err %v", attachment, contentType, err)
+			return false
+		}
+		return strings.Contains(content.Body, "delivered between two JMAP accounts") && containsString(message.Labels, "inbox")
 	}) {
 		t.Fatalf("recipient sync did not return delivered message %s in inbox", messageID)
 	}
@@ -301,9 +405,15 @@ func TestLiveJMAPTwoAccountDelivery(t *testing.T) {
 	}
 	if !containsMessage(senderDelta.Messages, messageID, func(message backend.Message) bool {
 		t.Cleanup(func() { destroyLiveEmail(senderBackend, message.Ref.ID) })
-		return containsString(message.Labels, "sent")
+		parsed, err := mail.ReadMessage(bytes.NewReader(message.Raw))
+		if err != nil {
+			t.Errorf("parse sender MIME: %v", err)
+			return false
+		}
+		content := durianmail.NewParser().Parse(parsed)
+		return strings.Contains(content.BCC, recipientUsername) && message.Flags.Seen && containsString(message.Labels, "sent")
 	}) {
-		t.Fatalf("sender sync did not return submitted message %s in sent", messageID)
+		t.Fatalf("sender sync did not return submitted message %s in sent with Bcc preserved and seen", messageID)
 	}
 }
 

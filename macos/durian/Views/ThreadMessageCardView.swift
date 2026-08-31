@@ -22,7 +22,9 @@ struct ThreadMessageCardView: View {
     let onReply: () -> Void
     let onReplyAll: () -> Void
     let onForward: () -> Void
-    var onEditDraft: (() -> Void)? = nil
+    /// Receives the message this card renders, so editing composes from the
+    /// draft the user clicked rather than from the thread aggregate.
+    var onEditDraft: ((ThreadMessage) -> Void)? = nil
 
     // Each card manages its own expanded state
     @State private var isDetailsExpanded: Bool = false
@@ -572,8 +574,13 @@ struct ThreadMessageCardView: View {
                 detailRow(label: "Tags", value: tags.joined(separator: ", "))
             }
 
-            // Message-ID (from message)
-            detailRow(label: "Message-ID", value: message.message_id ?? message.id)
+            // Message-ID (from message). Stable provider rows use an opaque
+            // local: identifier for actions; never present that as RFC metadata.
+            if let messageId = message.message_id {
+                detailRow(label: "Message-ID", value: messageId)
+            } else if !message.id.hasPrefix("local:") {
+                detailRow(label: "Message-ID", value: message.id)
+            }
         }
         .padding(.leading, 52)
         .padding(.top, 8)
@@ -602,7 +609,7 @@ struct ThreadMessageCardView: View {
             Spacer()
 
             if message.isDraft, let onEditDraft = onEditDraft {
-                Button(action: onEditDraft) {
+                Button(action: { onEditDraft(message) }) {
                     HStack(spacing: 6) {
                         Image(systemName: "pencil")
                             .font(.system(size: 14))

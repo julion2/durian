@@ -48,6 +48,9 @@ type Folder struct {
 type RemoteRef struct {
 	Folder string
 	ID     string
+	// MessageID is an optional stable identity precondition for operations on
+	// providers whose handles can be reused (notably IMAP after UIDVALIDITY).
+	MessageID string
 }
 
 // ErrRefGone reports that a RemoteRef no longer resolves to a message on the
@@ -163,12 +166,14 @@ type Capabilities struct {
 	// folder-role tag mapping. Durian-local tags (rules, flags) are left intact.
 	LabelsAreTags bool
 	// AnsweredUnsupported reports that the backend cannot persist the \Answered
-	// flag (Gmail has no answered label). The engine then excludes Answered from
-	// the three-way flag merge for this backend: a local "replied" tag would
-	// otherwise be uploaded (silently dropped by the provider), recorded in the
-	// baseline, then removed on the next sync when the server reports the message
-	// as un-answered — a ping-pong that flips the tag every sync. Default false
-	// keeps the full merge for IMAP/Graph, which do round-trip \Answered.
+	// flag — Gmail has no answered label, and Graph's message resource has no
+	// answered property, so its ApplyFlags translates only isRead and
+	// flagStatus. The engine then excludes Answered from the three-way flag
+	// merge for this backend: a local "replied" tag would otherwise be uploaded
+	// (silently dropped by the provider), recorded in the baseline, then removed
+	// on the next sync when the server reports the message as un-answered — a
+	// ping-pong that flips the tag every sync. Default false keeps the full
+	// merge for IMAP and JMAP, which do round-trip \Answered.
 	AnsweredUnsupported bool
 }
 
@@ -276,4 +281,13 @@ type SnapshotHydrator interface {
 	FetchSnapshotMetadata(ctx context.Context, refs []RemoteRef) (SnapshotBatch, error)
 	// FetchSnapshotMessages returns complete messages for locally absent refs.
 	FetchSnapshotMessages(ctx context.Context, refs []RemoteRef) (SnapshotBatch, error)
+}
+
+// IdentityCursorUpdater is implemented by backends whose replacement cursor
+// stores Message-IDs alongside transient remote refs. During recovery the
+// engine may adopt a pre-reset synthetic ID after content matching; the backend
+// must write those canonical IDs into the same page cursor before it is
+// checkpointed or used to fetch the next page.
+type IdentityCursorUpdater interface {
+	AdoptMessageIdentities(cursor Cursor, identities map[string]string) (Cursor, error)
 }

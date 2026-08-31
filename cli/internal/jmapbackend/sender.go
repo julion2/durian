@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/mail"
 	"strings"
@@ -18,6 +19,7 @@ var (
 	errNoDraftsMailbox       = errors.New("JMAP account has no drafts mailbox")
 	errSubmissionUnavailable = errors.New("JMAP mail submission is unavailable")
 	errNoSubmissionIdentity  = errors.New("JMAP account has no submission identity")
+	errInvalidAttachmentType = errors.New("invalid JMAP attachment type")
 )
 
 // Sender creates a structured JMAP Email and submits it for delivery.
@@ -72,7 +74,7 @@ func structuredEmail(message *mailsend.Message) (map[string]interface{}, error) 
 	draft := map[string]interface{}{
 		"from":          from,
 		"subject":       message.Subject,
-		"keywords":      map[string]bool{"$draft": true},
+		"keywords":      map[string]bool{"$draft": true, "$seen": true},
 		"bodyValues":    map[string]interface{}{"body": map[string]interface{}{"value": message.Body}},
 		"bodyStructure": map[string]interface{}{"partId": "body", "type": bodyType},
 	}
@@ -85,13 +87,28 @@ func structuredEmail(message *mailsend.Message) (map[string]interface{}, error) 
 	if len(bcc) > 0 {
 		draft["bcc"] = bcc
 	}
-	if id := bareMessageID(message.MessageID); id != "" {
-		draft["messageId"] = []string{id}
+	messageID, err := messageIDs(message.MessageID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Message-ID: %w", err)
 	}
-	if id := bareMessageID(message.InReplyTo); id != "" {
-		draft["inReplyTo"] = []string{id}
+	if len(messageID) > 1 {
+		return nil, fmt.Errorf("invalid Message-ID: got %d IDs, want one", len(messageID))
 	}
-	if references := messageIDs(message.References); len(references) > 0 {
+	if len(messageID) == 1 {
+		draft["messageId"] = messageID
+	}
+	inReplyTo, err := messageIDs(message.InReplyTo)
+	if err != nil {
+		return nil, fmt.Errorf("invalid In-Reply-To: %w", err)
+	}
+	if len(inReplyTo) > 0 {
+		draft["inReplyTo"] = inReplyTo
+	}
+	references, err := messageIDs(message.References)
+	if err != nil {
+		return nil, fmt.Errorf("invalid References: %w", err)
+	}
+	if len(references) > 0 {
 		draft["references"] = references
 	}
 	return draft, nil
@@ -116,22 +133,277 @@ func jmapAddresses(values []string, field string) ([]map[string]interface{}, err
 	return addresses, nil
 }
 
-func bareMessageID(value string) string {
-	return strings.Trim(strings.TrimSpace(value), "<>")
+func messageIDs(value string) ([]string, error) {
+	var result []string
+	for offset := 0; ; {
+		var err error
+		offset, err = skipMessageIDCFWS(value, offset)
+		if err != nil {
+			return nil, err
+		}
+		if offset == len(value) {
+			if len(result) == 0 && strings.TrimSpace(value) != "" {
+				return nil, errors.New("field contains no Message-ID")
+			}
+			return result, nil
+		}
+
+		var id string
+		if value[offset] == '<' {
+			id, offset, err = angleMessageID(value, offset)
+		} else {
+			// Durian-generated IDs are bracketed, but older API clients and
+			// backend fixtures also use the equivalent bare id-left@id-right.
+			start := offset
+			for offset < len(value) && !messageIDWhitespace(value[offset]) && value[offset] != '(' {
+				offset++
+			}
+			id = value[start:offset]
+			err = validateMessageID(id)
+		}
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, id)
+	}
 }
 
-func messageIDs(value string) []string {
-	fields := strings.Fields(value)
-	result := make([]string, 0, len(fields))
-	for _, field := range fields {
-		if id := bareMessageID(strings.Trim(field, ",")); id != "" {
-			result = append(result, id)
+func skipMessageIDCFWS(value string, offset int) (int, error) {
+	for offset < len(value) {
+		if messageIDWhitespace(value[offset]) {
+			offset++
+			continue
+		}
+		if value[offset] != '(' {
+			break
+		}
+		depth := 1
+		offset++
+		for offset < len(value) && depth > 0 {
+			switch value[offset] {
+			case '\\':
+				offset++
+				if offset == len(value) {
+					return 0, errors.New("unterminated quoted pair in comment")
+				}
+			case '(':
+				depth++
+			case ')':
+				depth--
+			}
+			offset++
+		}
+		if depth != 0 {
+			return 0, errors.New("unterminated comment")
 		}
 	}
-	return result
+	return offset, nil
+}
+
+func angleMessageID(value string, offset int) (string, int, error) {
+	var id strings.Builder
+	quoted := false
+	domainLiteral := false
+	commentDepth := 0
+	for offset++; offset < len(value); offset++ {
+		char := value[offset]
+		if commentDepth > 0 {
+			switch char {
+			case '\\':
+				offset++
+				if offset == len(value) {
+					return "", 0, errors.New("unterminated quoted pair in comment")
+				}
+			case '(':
+				commentDepth++
+			case ')':
+				commentDepth--
+			}
+			continue
+		}
+		if quoted || domainLiteral {
+			id.WriteByte(char)
+			if char == '\\' {
+				offset++
+				if offset == len(value) {
+					return "", 0, errors.New("unterminated quoted pair in Message-ID")
+				}
+				id.WriteByte(value[offset])
+				continue
+			}
+			if quoted && char == '"' {
+				quoted = false
+			}
+			if domainLiteral && char == ']' {
+				domainLiteral = false
+			}
+			continue
+		}
+		switch char {
+		case '"':
+			quoted = true
+			id.WriteByte(char)
+		case '[':
+			domainLiteral = true
+			id.WriteByte(char)
+		case '(':
+			commentDepth = 1
+		case '>':
+			parsed := id.String()
+			if err := validateMessageID(parsed); err != nil {
+				return "", 0, err
+			}
+			return parsed, offset + 1, nil
+		default:
+			if !messageIDWhitespace(char) {
+				id.WriteByte(char)
+			}
+		}
+	}
+	return "", 0, errors.New("unterminated angle-bracketed Message-ID")
+}
+
+func validateMessageID(id string) error {
+	at := -1
+	quoted := false
+	domainLiteral := false
+	for i := 0; i < len(id); i++ {
+		char := id[i]
+		if quoted || domainLiteral {
+			if char == '\\' {
+				i++
+				if i == len(id) {
+					return errors.New("unterminated quoted pair in Message-ID")
+				}
+				continue
+			}
+			if quoted && char == '"' {
+				quoted = false
+			}
+			if domainLiteral && char == ']' {
+				domainLiteral = false
+			}
+			continue
+		}
+		switch char {
+		case '"':
+			quoted = true
+		case '[':
+			domainLiteral = true
+		case '@':
+			if at != -1 {
+				return fmt.Errorf("Message-ID %q has multiple separators", id)
+			}
+			at = i
+		}
+	}
+	if quoted || domainLiteral {
+		return fmt.Errorf("Message-ID %q has an unterminated quoted component", id)
+	}
+	if at <= 0 || at == len(id)-1 {
+		return fmt.Errorf("Message-ID %q must contain non-empty id-left and id-right", id)
+	}
+	left, right := id[:at], id[at+1:]
+	if !validMessageIDDotAtom(left) && !validMessageIDQuotedLeft(left) {
+		return fmt.Errorf("Message-ID %q has invalid id-left", id)
+	}
+	if !validMessageIDDotAtom(right) && !validMessageIDDomainLiteral(right) {
+		return fmt.Errorf("Message-ID %q has invalid id-right", id)
+	}
+	return nil
+}
+
+func validMessageIDDotAtom(value string) bool {
+	if value == "" || value[0] == '.' || value[len(value)-1] == '.' {
+		return false
+	}
+	previousDot := false
+	for i := 0; i < len(value); i++ {
+		if value[i] == '.' {
+			if previousDot {
+				return false
+			}
+			previousDot = true
+			continue
+		}
+		if !messageIDAtext(value[i]) {
+			return false
+		}
+		previousDot = false
+	}
+	return true
+}
+
+func validMessageIDQuotedLeft(value string) bool {
+	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
+		return false
+	}
+	for i := 1; i < len(value)-1; i++ {
+		char := value[i]
+		if char == '\\' {
+			i++
+			if i == len(value)-1 || !messageIDQuotedPair(value[i]) {
+				return false
+			}
+			continue
+		}
+		if !messageIDQuotedText(char) {
+			return false
+		}
+	}
+	return true
+}
+
+func validMessageIDDomainLiteral(value string) bool {
+	if len(value) < 2 || value[0] != '[' || value[len(value)-1] != ']' {
+		return false
+	}
+	for i := 1; i < len(value)-1; i++ {
+		if !messageIDDomainText(value[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func messageIDAtext(char byte) bool {
+	return char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' ||
+		strings.ContainsRune("!#$%&'*+-/=?^_`{|}~", rune(char))
+}
+
+func messageIDQuotedPair(char byte) bool {
+	return char == ' ' || char == '\t' || char >= '!' && char <= '~'
+}
+
+func messageIDQuotedText(char byte) bool {
+	return char == ' ' || char == '\t' || char == '!' || char >= '#' && char <= '[' || char >= ']' && char <= '~'
+}
+
+func messageIDDomainText(char byte) bool {
+	return char >= '!' && char <= 'Z' || char >= '^' && char <= '~'
+}
+
+func messageIDWhitespace(char byte) bool {
+	return char == ' ' || char == '\t' || char == '\r' || char == '\n'
 }
 
 func (b *Backend) sendStructured(ctx context.Context, draft map[string]interface{}, attachments []mailsend.Attachment) error {
+	contentTypes := make([]string, len(attachments))
+	mediaTypes := make([]string, len(attachments))
+	charsets := make([]string, len(attachments))
+	for i, attachment := range attachments {
+		contentType := attachment.MIMEType
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+		mediaType, parameters, err := mime.ParseMediaType(contentType)
+		if err != nil {
+			return fmt.Errorf("%w %q: %v", errInvalidAttachmentType, contentType, err)
+		}
+		contentTypes[i] = contentType
+		mediaTypes[i] = mediaType
+		charsets[i] = parameters["charset"]
+	}
 	draftsID, sentID, identityID, err := b.prepareSubmission(ctx)
 	if err != nil {
 		return err
@@ -140,18 +412,18 @@ func (b *Backend) sendStructured(ctx context.Context, draft map[string]interface
 	if len(attachments) > 0 {
 		body := draft["bodyStructure"]
 		parts := []interface{}{body}
-		for _, attachment := range attachments {
-			contentType := attachment.MIMEType
-			if contentType == "" {
-				contentType = "application/octet-stream"
-			}
-			blobID, err := b.client.upload(ctx, attachment.Data, contentType)
+		for i, attachment := range attachments {
+			blobID, err := b.client.upload(ctx, attachment.Data, contentTypes[i])
 			if err != nil {
 				return fmt.Errorf("upload JMAP attachment %q: %w", attachment.Filename, err)
 			}
-			parts = append(parts, map[string]interface{}{
-				"blobId": blobID, "type": contentType, "name": attachment.Filename, "disposition": "attachment",
-			})
+			part := map[string]interface{}{
+				"blobId": blobID, "type": mediaTypes[i], "name": attachment.Filename, "disposition": "attachment",
+			}
+			if charsets[i] != "" {
+				part["charset"] = charsets[i]
+			}
+			parts = append(parts, part)
 		}
 		draft["bodyStructure"] = map[string]interface{}{"type": "multipart/mixed", "subParts": parts}
 	}
@@ -175,7 +447,7 @@ func (b *Backend) sendStructured(ctx context.Context, draft map[string]interface
 	}
 	draftID := emailResult.Created[emailCreateID].ID
 	if draftID == "" {
-		return errors.New("Email/set returned no created draft")
+		return errors.New("email/set returned no created draft")
 	}
 	return b.submitDraft(ctx, draftID, draftsID, sentID, identityID)
 }
@@ -223,6 +495,11 @@ func (b *Backend) prepareSubmission(ctx context.Context) (string, string, string
 
 func (b *Backend) submitDraft(ctx context.Context, draftID, draftsID, sentID, identityID string) error {
 	createID := "s0"
+	updatePatch := map[string]interface{}{
+		"keywords/$draft":        nil,
+		"mailboxIds/" + draftsID: nil,
+		"mailboxIds/" + sentID:   true,
+	}
 	args := map[string]interface{}{
 		"accountId": b.client.accountID,
 		"create": map[string]interface{}{
@@ -233,11 +510,7 @@ func (b *Backend) submitDraft(ctx context.Context, draftID, draftsID, sentID, id
 		},
 	}
 	args["onSuccessUpdateEmail"] = map[string]interface{}{
-		"#" + createID: map[string]interface{}{
-			"keywords/$draft":        nil,
-			"mailboxIds/" + draftsID: nil,
-			"mailboxIds/" + sentID:   true,
-		},
+		"#" + createID: updatePatch,
 	}
 	var result struct {
 		Created map[string]struct {
@@ -245,6 +518,11 @@ func (b *Backend) submitDraft(ctx context.Context, draftID, draftsID, sentID, id
 		} `json:"created"`
 		NotCreated map[string]methodError `json:"notCreated"`
 	}
+	var updateResult struct {
+		Updated    map[string]interface{} `json:"updated"`
+		NotUpdated map[string]methodError `json:"notUpdated"`
+	}
+	updateResponse := &methodResponseTarget{name: "Email/set", out: &updateResult}
 	// Every failure past this point leaves the created copy behind. The outbox
 	// retries a transient send, so without cleanup each attempt would add
 	// another draft to the user's Drafts mailbox.
@@ -259,16 +537,44 @@ func (b *Backend) submitDraft(ctx context.Context, draftID, draftsID, sentID, id
 		}
 	}()
 
-	if err := b.client.call(ctx, []string{coreCapability, mailCapability, submissionCapability}, "EmailSubmission/set", args, &result); err != nil {
-		return err
-	}
+	callErr := b.client.call(ctx, []string{coreCapability, mailCapability, submissionCapability}, "EmailSubmission/set", args, &result, updateResponse)
 	if createErr, ok := result.NotCreated[createID]; ok {
 		return &createErr
 	}
 	if _, ok := result.Created[createID]; !ok {
+		if callErr != nil {
+			return callErr
+		}
 		return errors.New("EmailSubmission/set returned no created submission")
 	}
+	// Once the submission exists, the message may already be irrevocably in
+	// flight. Never return a retryable send failure or destroy its source Email:
+	// either action could cause duplicate delivery. If the required implicit
+	// Email/set did not file the copy in Sent, retry only that idempotent patch.
 	submitted = true
+	var filingErr error
+	switch {
+	case callErr != nil:
+		filingErr = callErr
+	case !updateResponse.seen:
+		filingErr = errors.New("EmailSubmission/set returned no implicit Email/set response")
+	case updateResult.NotUpdated[draftID].Type != "":
+		setErr := updateResult.NotUpdated[draftID]
+		filingErr = &setErr
+	default:
+		if _, ok := updateResult.Updated[draftID]; !ok {
+			filingErr = errors.New("implicit Email/set did not update the submitted email")
+		}
+	}
+	if filingErr != nil {
+		if err := b.updateEmail(context.WithoutCancel(ctx), draftID, updatePatch); err != nil {
+			slog.Warn("JMAP submission succeeded but Sent filing could not be repaired", "module", "JMAPBACKEND", // encgrep:allow remote id is operational metadata, not message content
+				"id", draftID, "err", err)
+		} else {
+			slog.Warn("Repaired JMAP Sent filing after implicit update failed", "module", "JMAPBACKEND", // encgrep:allow remote id is operational metadata, not message content
+				"id", draftID)
+		}
+	}
 	return nil
 }
 
@@ -308,7 +614,8 @@ func (b *Backend) mailboxIDForTag(tag string) string {
 }
 
 func classifySendError(err error) error {
-	if errors.Is(err, errNoDraftsMailbox) || errors.Is(err, errSubmissionUnavailable) || errors.Is(err, errNoSubmissionIdentity) {
+	if errors.Is(err, errNoDraftsMailbox) || errors.Is(err, errSubmissionUnavailable) || errors.Is(err, errNoSubmissionIdentity) ||
+		errors.Is(err, errInvalidAttachmentType) {
 		return &mailsend.Error{Kind: mailsend.KindPermanent, Err: err}
 	}
 	var statusErr *statusError

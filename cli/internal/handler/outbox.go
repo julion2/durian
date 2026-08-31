@@ -348,6 +348,7 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mail
 		FromAddr:    fromAddr,
 		ToAddrs:     strings.Join(draft.To, ", "),
 		CCAddrs:     strings.Join(draft.CC, ", "),
+		BCCAddrs:    strings.Join(draft.BCC, ", "),
 		InReplyTo:   draft.InReplyTo,
 		Refs:        draft.References,
 		Date:        now,

@@ -1,14 +1,17 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/redact"
 	"github.com/julion2/durian/cli/internal/store"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 // Set via Bazel x_defs (workspace status stamping)
@@ -23,6 +26,8 @@ var (
 	cfgFile    string
 	jsonOutput bool
 	debugMode  bool
+	noInput    bool
+	configErr  error
 )
 
 // Global config (loaded at startup)
@@ -33,10 +38,59 @@ var rootCmd = &cobra.Command{
 	Use:   "durian",
 	Short: "Durian Mail CLI",
 	Long:  `Durian is a macOS email client. CLI backend for provider mail sync, sending, and SQLite storage.`,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if cmd != validateCmd && configErr != nil {
+			return configErr
+		}
+		if jsonOutput && !commandSupportsJSON(cmd) {
+			return fmt.Errorf("--json is not supported by %q", cmd.CommandPath())
+		}
+		return nil
+	},
 	// Show help when called without subcommands
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Help()
 	},
+}
+
+// jsonCapableCommands names every command that writes a machine-readable
+// document under --json. A command absent from it rejects the flag rather than
+// printing human text a caller would then try to parse.
+//
+// Keyed by command path, so a renamed or mistyped entry matches nothing and
+// silently withdraws JSON support from a command that has it.
+// TestJSONCapableCommandsAllExist walks the command tree and fails on any
+// entry that resolves to no command.
+var jsonCapableCommands = map[string]bool{
+	"durian search":          true,
+	"durian count":           true,
+	"durian show":            true,
+	"durian attachment":      true,
+	"durian tag":             true,
+	"durian tag list":        true,
+	"durian sync":            true,
+	"durian auth status":     true,
+	"durian contacts init":   true,
+	"durian contacts import": true,
+	"durian contacts list":   true,
+	"durian contacts search": true,
+	"durian contacts add":    true,
+	"durian contacts delete": true,
+	"durian group list":      true,
+	"durian group members":   true,
+	"durian draft save":      true,
+	"durian draft delete":    true,
+	"durian calendar list":   true,
+	"durian calendar search": true,
+	"durian calendar show":   true,
+	"durian calendar new":    true,
+	"durian calendar modify": true,
+	"durian calendar rsvp":   true,
+	"durian calendar delete": true,
+}
+
+func commandSupportsJSON(cmd *cobra.Command) bool {
+	return jsonCapableCommands[cmd.CommandPath()]
 }
 
 // Execute runs the root command
@@ -53,6 +107,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file (default: ~/.config/durian/config.pkl)")
 	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "output as JSON")
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "enable debug logging")
+	rootCmd.PersistentFlags().BoolVar(&noInput, "no-input", false, "never prompt or open an editor")
 
 	installColoredHelp(rootCmd)
 
@@ -73,31 +128,47 @@ func formatVersion() string {
 
 // initConfig loads configuration from file
 func initConfig() {
-	var err error
-
-	// Try to load config from specified path or default
-	if config.Exists(cfgFile) {
-		cfg, err = config.Load(cfgFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to load config: %v\n", err)
-			cfg = config.Default()
-		}
-	} else {
-		// No config file found - use defaults
-		if cfgFile != "" {
-			// User specified a path but file doesn't exist
-			fmt.Fprintf(os.Stderr, "Warning: config file not found: %s\n", cfgFile)
-		}
-		// Silently use defaults if no custom path specified
-		// (most users won't have config initially)
+	if syncDryRun {
+		// Configuration evaluation is read-only under sync --dry-run too; a
+		// cache miss must not materialize a new cache entry.
+		_ = os.Setenv(config.DisableCacheEnv, "1")
+	}
+	cfg, configErr = loadStartupConfig(cfgFile)
+	if cfg == nil {
 		cfg = config.Default()
 	}
+}
+
+func loadStartupConfig(path string) (*config.Config, error) {
+	if !config.Exists(path) {
+		if path != "" {
+			return nil, fmt.Errorf("config file not found: %s", config.ExpandPath(path))
+		}
+		// A missing default config is valid before initial setup.
+		return config.Default(), nil
+	}
+
+	loaded, err := config.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	return loaded, nil
 }
 
 // GetConfig returns the loaded configuration
 // This is useful for subcommands that need access to config
 func GetConfig() *config.Config {
 	return cfg
+}
+
+func writeJSON(value any) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(value)
+}
+
+func canPrompt() bool {
+	return !noInput && term.IsTerminal(int(os.Stdin.Fd()))
 }
 
 // initLogger configures the default slog logger.
@@ -124,5 +195,37 @@ func openEmailDB() (*store.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("init email store: %w", err)
 	}
+	configureStoreAccounts(db, GetConfig())
 	return db, nil
+}
+
+func openEmailDBReadOnly() (*store.DB, error) {
+	keyring, err := loadExistingKeyring()
+	if err != nil {
+		return nil, fmt.Errorf("load existing master key: %w", err)
+	}
+	db, err := store.OpenReadOnly(store.DefaultDBPath(), keyring)
+	if err != nil {
+		return nil, fmt.Errorf("open email store read-only: %w", err)
+	}
+	configureStoreAccounts(db, GetConfig())
+	return db, nil
+}
+
+func configureStoreAccounts(db *store.DB, cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	aliases := make(map[string]string, len(cfg.Accounts)*3)
+	for i := range cfg.Accounts {
+		account := &cfg.Accounts[i]
+		canonical := account.AccountIdentifier()
+		for _, identifier := range []string{account.Name, account.Alias, account.Email} {
+			identifier = strings.TrimSpace(identifier)
+			if identifier != "" {
+				aliases[strings.ToLower(identifier)] = canonical
+			}
+		}
+	}
+	db.SetAccountAliases(aliases)
 }

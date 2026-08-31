@@ -365,21 +365,42 @@ func (sm *StateManager) Load(email string) (*State, *os.File, error) {
 		return NewState(), lockFile, nil
 	}
 
-	// Rebuild reverse maps for backwards compatibility and consistency
-	// This ensures MessageIDToUID is always in sync with UIDToMessageID
-	for _, mbox := range state.Mailboxes {
-		if mbox.UIDToMessageID != nil {
-			if mbox.MessageIDToUID == nil {
-				mbox.MessageIDToUID = make(map[string]uint32)
-			}
-			// Rebuild from UIDToMessageID
-			for uid, messageID := range mbox.UIDToMessageID {
-				mbox.MessageIDToUID[messageID] = uid
-			}
-		}
-	}
+	rebuildStateReverseMappings(&state)
 
 	return &state, lockFile, nil
+}
+
+// LoadReadOnly loads sync state without creating a directory or lock file.
+// Dry-run callers use this path so inspection cannot mutate local state.
+func (sm *StateManager) LoadReadOnly(email string) (*State, error) {
+	data, err := os.ReadFile(sm.statePath(email))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return NewState(), nil
+		}
+		return nil, fmt.Errorf("failed to read state file: %w", err)
+	}
+
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("failed to decode state file: %w", err)
+	}
+	rebuildStateReverseMappings(&state)
+	return &state, nil
+}
+
+func rebuildStateReverseMappings(state *State) {
+	// Rebuild reverse maps for backwards compatibility and consistency. This
+	// ensures MessageIDToUID is always in sync with UIDToMessageID.
+	for _, mbox := range state.Mailboxes {
+		if mbox.UIDToMessageID == nil {
+			continue
+		}
+		mbox.MessageIDToUID = make(map[string]uint32, len(mbox.UIDToMessageID))
+		for uid, messageID := range mbox.UIDToMessageID {
+			mbox.MessageIDToUID[messageID] = uid
+		}
+	}
 }
 
 // Save saves the sync state for an account

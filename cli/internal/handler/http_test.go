@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,11 +14,13 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/julion2/durian/cli/internal/contacts"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 // newTestRouter sets up a mux.Router with all routes, mirroring serve.go.
 func newTestRouter(h *Handler, hub *EventHub) *mux.Router {
 	r := mux.NewRouter()
+	r.UseEncodedPath()
 	r.HandleFunc("/api/v1/search", h.SearchHandler).Methods("GET")
 	r.HandleFunc("/api/v1/search/count", h.SearchCountHandler).Methods("GET")
 	r.HandleFunc("/api/v1/tags", h.ListTagsHandler).Methods("GET")
@@ -324,6 +327,69 @@ func TestDownloadAttachmentHandler_NotFound(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestDownloadAttachmentHandler_OpaqueIdentifier(t *testing.T) {
+	db := newTestStore(t)
+	msg := &store.Message{
+		StableID: "email-1", MessageID: "duplicate@example.com", Subject: "First",
+		FromAddr: "a@test", ToAddrs: "b@test", Account: "work", Mailbox: "ALL",
+		UID: 41, Date: time.Now().Unix(), CreatedAt: time.Now().Unix(), FetchedBody: true,
+	}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+	if err := db.InsertAttachment(&store.Attachment{
+		MessageDBID: msg.ID, PartID: 1, Filename: "opaque.txt", ContentType: "text/plain", Size: 7,
+	}); err != nil {
+		t.Fatalf("insert attachment: %v", err)
+	}
+
+	h := New(db, nil)
+	h.SetFetcher(&mockFetcher{data: []byte("payload")})
+	r := newTestRouter(h, nil)
+	req := httptest.NewRequest("GET", fmt.Sprintf("/api/v1/messages/local%%3A%d/attachments/1", msg.ID), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); got != "payload" {
+		t.Errorf("body = %q, want payload", got)
+	}
+}
+
+func TestDownloadAttachmentHandler_EncodedLegacyIdentifier(t *testing.T) {
+	db := newTestStore(t)
+	msg := &store.Message{
+		MessageID: "part/percent%plus+@example.com", Subject: "Legacy",
+		FromAddr: "a@test", ToAddrs: "b@test", Account: "work", Mailbox: "INBOX",
+		UID: 42, Date: time.Now().Unix(), CreatedAt: time.Now().Unix(), FetchedBody: true,
+	}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+	if err := db.InsertAttachment(&store.Attachment{
+		MessageDBID: msg.ID, PartID: 1, Filename: "legacy.txt", ContentType: "text/plain", Size: 7,
+	}); err != nil {
+		t.Fatalf("insert attachment: %v", err)
+	}
+
+	h := New(db, nil)
+	h.SetFetcher(&mockFetcher{data: []byte("payload")})
+	r := newTestRouter(h, nil)
+	path := fmt.Sprintf("/api/v1/messages/%s/attachments/1", url.PathEscape(msg.MessageID))
+	req := httptest.NewRequest("GET", path, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); got != "payload" {
+		t.Errorf("body = %q, want payload", got)
 	}
 }
 

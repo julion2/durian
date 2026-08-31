@@ -84,10 +84,7 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 	var subject string
 
 	for _, msg := range msgs {
-		identifier := msg.MessageID
-		if msg.StableID != "" {
-			identifier = "local:" + strconv.FormatInt(msg.ID, 10)
-		}
+		identifier := "local:" + strconv.FormatInt(msg.ID, 10)
 		info := internmail.MessageInfo{
 			ID:        identifier,
 			From:      msg.FromAddr,
@@ -96,12 +93,17 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 			Date:      time.Unix(msg.Date, 0).Format(time.RFC1123Z),
 			Timestamp: msg.Date,
 			MessageID: msg.MessageID,
+			Account:   msg.Account,
 			Body:      sanitize.StripQuotedTextContent(msg.BodyText),
 		}
 		if !light {
 			info.InReplyTo = msg.InReplyTo
 			info.References = msg.Refs
 			info.HTML = sanitize.StripQuotedContent(msg.BodyHTML)
+			// Only the full view reopens a draft for editing, which is the
+			// one caller that needs the blind recipients. Enriched search
+			// results would otherwise decrypt and ship them on every hit.
+			info.BCC = msg.BCCAddrs
 		}
 
 		if subject == "" {
@@ -242,7 +244,7 @@ func (h *Handler) DownloadAttachment(identifier string, partID int, w http.Respo
 			_, werr := w.Write(data)
 			return werr
 		}
-		slog.Warn("Backend attachment fetch failed, falling back to IMAP", "module", "HANDLER", "message_id", msg.MessageID, "err", berr)
+		slog.Warn("Backend attachment fetch failed, falling back to IMAP", "module", "HANDLER", "message_id", msg.MessageID)
 	}
 
 	// Legacy path: break-IDLE IMAP fetch by UID.

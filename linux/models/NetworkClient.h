@@ -120,9 +120,10 @@ public:
         });
     }
 
-    Q_INVOKABLE void downloadAttachment(const QString &messageId, int partId,
+    Q_INVOKABLE void downloadAttachment(const QString &messageIdentifier, int partId,
                                            const QString &filename, const QString &savePath) {
-        QUrl url(baseUrl_ + "/api/v1/messages/" + messageId + "/attachments/" + QString::number(partId));
+        const auto encodedIdentifier = QString::fromLatin1(QUrl::toPercentEncoding(messageIdentifier));
+        QUrl url(baseUrl_ + "/api/v1/messages/" + encodedIdentifier + "/attachments/" + QString::number(partId));
         auto *reply = manager_->get(QNetworkRequest(url));
         connect(reply, &QNetworkReply::finished, this, [this, reply, savePath, filename]() {
             reply->deleteLater();

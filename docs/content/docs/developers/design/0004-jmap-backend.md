@@ -50,22 +50,23 @@ map to lowercase parent paths. Ambiguous normalized paths receive a stable
 mailbox-ID-derived suffix so downloads and later uploads resolve to the same
 mailbox.
 
-JMAP keywords are a second, independent tag source. Durian-owned tags are
-encoded reversibly as lowercase custom keywords, while native keywords from
-other clients are exposed under `jmap-keyword/<keyword>` to avoid collisions
-with mailbox tags. System keywords beginning with `$` remain flag/state
-properties and are not surfaced as arbitrary tags. Local `unread`, `flagged`,
-and `replied` edits are persisted as explicit mutation intent and uploaded as
-property patches (`keywords/$seen`, `$flagged`, `$answered`) before downloading
-the next delta. Other local tags use the normal durable label baseline and
-custom keyword patches. A JMAP account therefore does not require Durian's
-optional tag-sync server merely to round-trip normal tags.
+JMAP keywords are a second, independent tag source. Mailbox tags patch
+`mailboxIds`; arbitrary Durian tags are encoded reversibly as lowercase custom
+keywords. Native keywords that cannot safely decode to a Durian tag are exposed
+under `jmap-keyword/<keyword>` to avoid collisions with mailbox tags. System
+keywords beginning with `$` remain flag/state properties and are not surfaced
+as arbitrary tags. Local `unread`, `flagged`, and `replied` edits are persisted
+as explicit mutation intent and uploaded as property patches
+(`keywords/$seen`, `keywords/$flagged`, `keywords/$answered`) before downloading
+the next delta. Mailbox and arbitrary-tag changes use the normal durable label
+baseline and their respective property patches. A JMAP account therefore does
+not require Durian's optional tag-sync server merely to round-trip normal tags.
 
 Each JMAP message is stored by its immutable, account-scoped `Email.id`.
 RFC 5322 Message-ID remains searchable threading metadata and is the fallback
 identity for protocols that lack a native stable identifier; it is not assumed
-to be present or unique. API message identifiers are consequently opaque and
-stable JMAP messages use a local row identifier, including when Message-IDs are
+to be present or unique. API thread-message identifiers are consequently opaque:
+every message uses its local row identifier, including when Message-IDs are
 missing or duplicated.
 The separate optional cross-device tag-sync protocol remains Message-ID based
 and therefore cannot distinguish such duplicates; native JMAP keywords are the
@@ -81,8 +82,11 @@ missing IDs, and reconciles absent local references. The engine still
 accumulates the complete presence set in memory for final deletion
 reconciliation; durable disk-backed staging is not implemented. A changed query
 state or missing anchor fails the run and safely restarts recovery. Intermediate
-replacement cursors are deliberately not persisted; only the final cursor is
-written after hydration, deletion, label, and flag reconciliation all succeed.
+replacement cursors are deliberately not persisted. Hydration, deletion, and
+label reconciliation must complete before the final cursor is written. A flag
+reconciliation failure holds that cursor for one bounded replacement replay;
+after a repeated failure, the cursor advances with unresolved flag references
+queued for later retries.
 The same neutral `FullSnapshot`/`Present` contract is used for Gmail history-ID
 expiry.
 
@@ -90,7 +94,10 @@ Submission uploads attachment blobs, creates a structured Email in Drafts with
 `Email/set` (`bodyStructure`, `bodyValues`, typed address and threading
 properties), and creates an `EmailSubmission`. `onSuccessUpdateEmail`
 explicitly removes `$draft`, removes Drafts membership, and adds Sent
-membership; a missing Sent role mailbox is created first. `Email/import`
+membership; a missing Sent role mailbox is created first. If that implicit
+filing fails after submission is confirmed, Durian retries one idempotent direct
+patch. A failed repair is logged but the send still returns success to prevent
+duplicate delivery, so the submitted copy may remain misfiled. `Email/import`
 remains the correct path for generic raw `Append`/`Backend.Send` input. Local
 compose autosave, outbox, and undo-send work normally; the separate
 `durian draft save/delete` commands remain IMAP-only for now.
