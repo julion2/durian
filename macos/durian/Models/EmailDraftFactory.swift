@@ -12,15 +12,36 @@ import Foundation
 // MARK: - Reply / Forward Factories
 
 extension EmailDraft {
+    /// Create a draft for editing one specific message of a thread.
+    ///
+    /// `message` carries the thread-level context (subject, thread id) while
+    /// `draftMessage` names the message the user actually clicked "Edit Draft"
+    /// on. They differ whenever the draft is not the newest message in its
+    /// thread — a reply that arrived after the draft was saved is enough. The
+    /// aggregate then describes that reply, so editing without this override
+    /// composed from the wrong body, recipients and blind recipients.
+    static func createFromDraft(message: MailMessage, draftMessage: ThreadMessage?) -> EmailDraft {
+        guard let draftMessage else { return createFromDraft(message: message) }
+        var source = message
+        source.applyFields(from: draftMessage)
+        return createFromDraft(message: source)
+    }
+
     /// Create a draft for editing an existing draft message
     static func createFromDraft(message: MailMessage) -> EmailDraft {
         let toAddresses = message.to.map { parseEmailList($0) } ?? []
         let ccAddresses = message.cc.map { parseEmailList($0) } ?? []
+        // Blind recipients only survive inside our own Drafts mailbox — the
+        // sending server strips the header on delivery. Losing them here means
+        // saving the reopened draft mails it to fewer people than the user
+        // addressed, with nothing on screen to say so.
+        let bccAddresses = message.bcc.map { parseEmailList($0) } ?? []
 
         var draft = EmailDraft(
             from: message.from,
             to: toAddresses,
             cc: ccAddresses,
+            bcc: bccAddresses,
             subject: message.subject,
             body: message.body ?? "",
             isHTML: message.htmlBody != nil && !(message.htmlBody?.isEmpty ?? true),

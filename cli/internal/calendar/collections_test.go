@@ -168,6 +168,73 @@ func TestResolveEventInFindsAcrossCollections(t *testing.T) {
 	}
 }
 
+// TestResolveEventInReportsSharedUIDAcrossAccounts covers the case a fast path
+// used to swallow. The resolver read "<uid>.ics" directly and returned the
+// first collection where it parsed, so the same UID in two accounts silently
+// resolved to whichever came first — and every command built on this then acted
+// on an event the user had not named.
+//
+// An exact UID is a single-resource reference: ambiguity is reported, never
+// resolved by position.
+func TestResolveEventInReportsSharedUIDAcrossAccounts(t *testing.T) {
+	root := t.TempDir()
+	work := filepath.Join(root, "work")
+	personal := filepath.Join(root, "personal")
+	seedCollection(t, work, "shared-uid", "Standup")
+	seedCollection(t, personal, "shared-uid", "Zahnarzt")
+	cols := []Collection{
+		{Dir: work, Name: "Work", Account: "work"},
+		{Dir: personal, Name: "Personal", Account: "personal"},
+	}
+
+	_, _, _, err := ResolveEventIn(cols, "shared-uid", "")
+	if err == nil {
+		t.Fatal("ResolveEventIn resolved a UID held by two accounts instead of reporting it")
+	}
+	for _, want := range []string{"Standup", "Zahnarzt", "work", "personal"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q; the user cannot tell the candidates apart", err, want)
+		}
+	}
+
+	// Naming one of them resolves it, which is what makes the error actionable.
+	_, ev, calName, err := ResolveEventIn(cols, "shared-uid", "Personal")
+	if err != nil {
+		t.Fatalf("scoped resolution: %v", err)
+	}
+	if ev.Subject != "Zahnarzt" || calName != "Personal" {
+		t.Errorf("resolved %q in %q, want the Personal event", ev.Subject, calName)
+	}
+}
+
+// TestResolveEventInFindsUIDUnderAnyFilename pins why the fast path could not
+// simply collect its hits instead of being removed: a file is free to be named
+// anything, so proving that one "<uid>.ics" match is unique means reading the
+// others regardless.
+func TestResolveEventInFindsUIDUnderAnyFilename(t *testing.T) {
+	dir := t.TempDir()
+	seedCollection(t, dir, "renamed-uid", "Offsite")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one seeded file, got %d", len(entries))
+	}
+	old := filepath.Join(dir, entries[0].Name())
+	if err := os.Rename(old, filepath.Join(dir, "not-the-uid.ics")); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+
+	_, ev, _, err := ResolveEventIn([]Collection{{Dir: dir, Name: "Cal"}}, "renamed-uid", "")
+	if err != nil {
+		t.Fatalf("ResolveEventIn: %v", err)
+	}
+	if ev.Subject != "Offsite" {
+		t.Errorf("resolved %q, want Offsite", ev.Subject)
+	}
+}
+
 // Pointing a configured calendar at a vdir BASE directory instead of a
 // collection yields an empty calendar with nothing to explain it — the mistake
 // is easy to make, since durian's own account layout is exactly such a base.

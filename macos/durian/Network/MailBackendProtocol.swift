@@ -37,12 +37,12 @@ protocol MailBackendProtocol: ObservableObject {
     var loadingProgress: String { get }
 
     // MARK: - Connection
-    func connect() async
+    @discardableResult func connect() async -> Bool
     func disconnect() async
 
     // MARK: - Folder/Tag Selection
     /// Select a folder or tag to view
-    func selectFolder(_ name: String) async
+    @discardableResult func selectFolder(_ name: String) async -> Bool
 
     // MARK: - Email Operations
     @discardableResult func fetchEmailBody(id: String) async -> MailMessage?

@@ -164,6 +164,20 @@ func TestMailboxState_GetUnsyncedUIDs(t *testing.T) {
 	}
 }
 
+func TestMailboxReplacementCompleteRequiresEverySearchedUID(t *testing.T) {
+	state := NewState().GetMailboxState("INBOX")
+	state.Reset(2)
+	state.AddSyncedUID(3)
+	if mailboxReplacementComplete(state, []uint32{1, 2, 3}) {
+		t.Fatal("partial replacement reported complete")
+	}
+	state.AddSyncedUID(1)
+	state.AddSyncedUID(2)
+	if !mailboxReplacementComplete(state, []uint32{1, 2, 3}) {
+		t.Fatal("fully resolved replacement reported incomplete")
+	}
+}
+
 func TestMailboxState_NeedsFullResync(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -304,6 +318,23 @@ func TestStateManager_LoadSave(t *testing.T) {
 	sentState := loaded.GetMailboxState("Sent")
 	if sentState.UIDValidity != 67890 {
 		t.Errorf("expected Sent UIDValidity 67890, got %d", sentState.UIDValidity)
+	}
+}
+
+func TestStateManagerLoadReadOnlyDoesNotCreateFiles(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "missing-cache")
+	sm := &StateManager{cacheDir: cacheDir}
+
+	state, err := sm.LoadReadOnly("test@example.com")
+	if err != nil {
+		t.Fatalf("LoadReadOnly: %v", err)
+	}
+	if state == nil || len(state.Mailboxes) != 0 {
+		t.Fatalf("state = %+v, want a new empty state", state)
+	}
+	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
+		t.Fatalf("read-only load created cache directory: %v", err)
 	}
 }
 

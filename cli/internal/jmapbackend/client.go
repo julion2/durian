@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 const (
@@ -145,6 +147,12 @@ func (e *methodError) Error() string {
 	return fmt.Sprintf("JMAP method error %s: %s", e.Type, e.Description)
 }
 
+func (e *methodError) SafeLogText() string {
+	return "JMAP method error: provider details " + redact.Placeholder
+}
+
+var _ redact.SafeLogError = (*methodError)(nil)
+
 type statusError struct {
 	Status int
 	Body   string
@@ -153,6 +161,12 @@ type statusError struct {
 func (e *statusError) Error() string {
 	return fmt.Sprintf("JMAP request failed: status %d: %s", e.Status, e.Body)
 }
+
+func (e *statusError) SafeLogText() string {
+	return fmt.Sprintf("JMAP request failed: status %d: response body %s", e.Status, redact.Placeholder)
+}
+
+var _ redact.SafeLogError = (*statusError)(nil)
 
 func (c *client) discover(ctx context.Context) error {
 	resp, err := c.doHTTP(ctx, http.MethodGet, c.sessionURL, nil, "", true)
@@ -170,12 +184,13 @@ func (c *client) discover(ctx context.Context) error {
 		return fmt.Errorf("decode JMAP core limits: %w", err)
 	}
 	if c.limits.MaxCallsInRequest == 0 || c.limits.MaxObjectsInGet == 0 ||
-		c.limits.MaxObjectsInSet == 0 || c.limits.MaxConcurrentRequests == 0 ||
-		c.limits.MaxConcurrentUpload == 0 || c.limits.MaxSizeRequest == 0 || c.limits.MaxSizeUpload == 0 {
-		return errors.New("JMAP core capability does not permit the required client operations")
+		c.limits.MaxConcurrentRequests == 0 || c.limits.MaxSizeRequest == 0 {
+		return errors.New("JMAP core capability does not permit API reads")
 	}
 	c.apiSem = make(chan struct{}, min(c.limits.MaxConcurrentRequests, maxClientAPIRequests))
-	c.uploadSem = make(chan struct{}, min(c.limits.MaxConcurrentUpload, maxClientUploads))
+	if c.limits.MaxConcurrentUpload > 0 {
+		c.uploadSem = make(chan struct{}, min(c.limits.MaxConcurrentUpload, maxClientUploads))
+	}
 	accountID := c.session.PrimaryAccounts[mailCapability]
 	account, primaryOK := c.session.Accounts[accountID]
 	_, primaryHasMail := account.AccountCapabilities[mailCapability]
@@ -232,6 +247,9 @@ func resolveURL(base, ref string) string {
 }
 
 func (c *client) call(ctx context.Context, using []string, method string, args, out interface{}) error {
+	if c.apiSem != nil && strings.HasSuffix(method, "/set") && c.limits.MaxObjectsInSet == 0 {
+		return fmt.Errorf("JMAP core capability does not permit %s operations", method)
+	}
 	body, err := json.Marshal(methodEnvelope{
 		Using:       using,
 		MethodCalls: [][]interface{}{{method, args, "0"}},
@@ -421,6 +439,9 @@ func readLimited(r io.Reader, limit int64, description string) ([]byte, error) {
 func (c *client) upload(ctx context.Context, data []byte, contentType string) (string, error) {
 	if c.session.UploadURL == "" {
 		return "", errors.New("JMAP session has no uploadUrl")
+	}
+	if c.apiSem != nil && (c.limits.MaxSizeUpload == 0 || c.limits.MaxConcurrentUpload == 0) {
+		return "", errors.New("JMAP core capability does not permit uploads")
 	}
 	if c.limits.MaxSizeUpload > 0 && int64(len(data)) > c.limits.MaxSizeUpload {
 		return "", fmt.Errorf("JMAP upload is %d bytes, exceeds maxSizeUpload %d", len(data), c.limits.MaxSizeUpload)

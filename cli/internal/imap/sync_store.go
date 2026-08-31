@@ -10,7 +10,9 @@ import (
 
 	goimap "github.com/emersion/go-imap"
 
+	durianmail "github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/store"
+	"github.com/julion2/durian/cli/internal/syncidentity"
 )
 
 // accountName returns the account identifier (e.g. "work") used as the
@@ -21,21 +23,13 @@ func (s *Syncer) accountName() string {
 
 // storeInsertMessage parses a raw email and inserts it into the SQLite store.
 // Eagerly applies folder and content tags at insert time.
-func (s *Syncer) storeInsertMessage(mailboxName string, imapMsg *goimap.Message, msgBody []byte) error {
+func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matcher *syncidentity.Matcher, imapMsg *goimap.Message, msgBody []byte) (string, error) {
 	parsed, err := mail.ReadMessage(bytes.NewReader(msgBody))
 	if err != nil {
-		return fmt.Errorf("parse message: %w", err)
+		return "", fmt.Errorf("parse message: %w", err)
 	}
 
 	content := s.parser.Parse(parsed)
-	messageID := strings.Trim(content.MessageID, "<>")
-	if messageID == "" {
-		// Generate synthetic Message-ID from UID + account to avoid losing the message
-		messageID = fmt.Sprintf("durian-synthetic-%d-%s@%s", imapMsg.Uid, mailboxName, s.accountName())
-		slog.Warn("Message has no Message-ID, using synthetic ID", "module", "SYNC",
-			"uid", imapMsg.Uid, "mailbox", mailboxName, "synthetic_id", messageID)
-	}
-
 	var dateUnix int64
 	if t, err := mail.ParseDate(content.Date); err == nil {
 		dateUnix = t.Unix()
@@ -43,33 +37,54 @@ func (s *Syncer) storeInsertMessage(mailboxName string, imapMsg *goimap.Message,
 		// Fallback to IMAP internal date
 		dateUnix = imapMsg.InternalDate.Unix()
 	}
-
-	storeMsg := &store.Message{
-		MessageID:   messageID,
-		Subject:     content.Subject,
-		FromAddr:    content.From,
-		ToAddrs:     content.To,
-		CCAddrs:     content.CC,
-		InReplyTo:   content.InReplyTo,
-		Refs:        content.References,
-		BodyText:    content.Body,
-		BodyHTML:    content.HTML,
-		Date:        dateUnix,
-		CreatedAt:   time.Now().Unix(),
-		Mailbox:     mailboxName,
-		Flags:       strings.Join(imapMsg.Flags, ","),
-		UID:         imapMsg.Uid,
-		Size:        len(msgBody),
-		FetchedBody: true,
-		Account:     s.accountName(),
+	messageID := strings.Trim(content.MessageID, "<>")
+	syntheticIdentity := messageID == ""
+	recoveredIdentity := false
+	initialIngestComplete := false
+	if messageID == "" {
+		provisionalMessageID := durianmail.SyntheticMessageID(uidValidity, imapMsg.Uid, mailboxName, s.accountName())
+		if matcher != nil {
+			messageID, initialIngestComplete = matcher.Match(provisionalMessageID, content, dateUnix)
+			recoveredIdentity = messageID != ""
+		}
+		if messageID == "" {
+			messageID = provisionalMessageID
+		}
+		slog.Warn("Message has no Message-ID, using synthetic ID", "module", "SYNC",
+			"uid", imapMsg.Uid, "mailbox", mailboxName, "synthetic_id", messageID)
 	}
+
+	storeMsg := StoreMessageFromContent(messageID, content, dateUnix, time.Now().Unix())
+	storeMsg.Mailbox = mailboxName
+	storeMsg.Flags = strings.Join(imapMsg.Flags, ",")
+	storeMsg.UID = imapMsg.Uid
+	storeMsg.Size = len(msgBody)
+	storeMsg.FetchedBody = true
+	storeMsg.Account = s.accountName()
+	storeMsg.SyntheticIdentity = syntheticIdentity
+	if syntheticIdentity {
+		fingerprint := durianmail.SyntheticFingerprint(content, dateUnix)
+		storeMsg.SyntheticFingerprint = append([]byte(nil), fingerprint[:]...)
+	}
+	storeMsg.IngestPending = true
 
 	if err := s.store.InsertMessage(storeMsg); err != nil {
-		return fmt.Errorf("insert message: %w", err)
+		if recoveredIdentity {
+			matcher.Restore(messageID)
+		}
+		return "", fmt.Errorf("insert message: %w", err)
+	}
+	if recoveredIdentity && initialIngestComplete && !storeMsg.IngestPending {
+		// The existing row now points at the new UID. Preserve its attachments,
+		// indexed headers and rule-derived tags, and never repeat exec hooks.
+		matcher.Commit(messageID)
+		return messageID, nil
 	}
 
-	// Clear old attachments on upsert, then re-insert
-	_ = s.store.DeleteAttachmentsByMessageDBID(storeMsg.ID)
+	// Clear old attachments on upsert, then re-insert.
+	if err := s.store.DeleteAttachmentsByMessageDBID(storeMsg.ID); err != nil {
+		return "", fmt.Errorf("clear attachments: %w", err)
+	}
 	for i, att := range content.Attachments {
 		partID := att.PartID
 		if partID == 0 {
@@ -84,7 +99,7 @@ func (s *Syncer) storeInsertMessage(mailboxName string, imapMsg *goimap.Message,
 			Disposition: att.Disposition,
 			ContentID:   att.ContentID,
 		}); err != nil {
-			return fmt.Errorf("insert attachment %d: %w", i, err)
+			return "", fmt.Errorf("insert attachment %d: %w", i, err)
 		}
 	}
 
@@ -92,7 +107,9 @@ func (s *Syncer) storeInsertMessage(mailboxName string, imapMsg *goimap.Message,
 	// plus user-added entries from config.pkl sync.indexed_headers).
 	for _, hdrName := range s.headerSet() {
 		if v := parsed.Header.Get(hdrName); v != "" {
-			_ = s.store.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v)
+			if err := s.store.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v); err != nil {
+				return "", fmt.Errorf("insert header %q: %w", hdrName, err)
+			}
 		}
 	}
 
@@ -100,7 +117,7 @@ func (s *Syncer) storeInsertMessage(mailboxName string, imapMsg *goimap.Message,
 	if s.isGmailAllMail(mailboxName) {
 		for _, tag := range gmailLabelsToTags(imapMsg) {
 			if err := s.store.AddTag(storeMsg.ID, tag); err != nil {
-				return fmt.Errorf("add gmail label tag %q: %w", tag, err)
+				return "", fmt.Errorf("add gmail label tag %q: %w", tag, err)
 			}
 		}
 	} else {
@@ -108,7 +125,7 @@ func (s *Syncer) storeInsertMessage(mailboxName string, imapMsg *goimap.Message,
 		if mapping != nil {
 			for _, tag := range mapping.AddTags {
 				if err := s.store.AddTag(storeMsg.ID, tag); err != nil {
-					return fmt.Errorf("add folder tag %q: %w", tag, err)
+					return "", fmt.Errorf("add folder tag %q: %w", tag, err)
 				}
 			}
 		}
@@ -119,14 +136,14 @@ func (s *Syncer) storeInsertMessage(mailboxName string, imapMsg *goimap.Message,
 	flagAdd, _ := flagState.ToTagOps()
 	for _, tag := range flagAdd {
 		if err := s.store.AddTag(storeMsg.ID, tag); err != nil {
-			return fmt.Errorf("add flag tag %q: %w", tag, err)
+			return "", fmt.Errorf("add flag tag %q: %w", tag, err)
 		}
 	}
 
 	// Eagerly detect calendar content
 	if bytes.Contains(msgBody, []byte("text/calendar")) {
 		if err := s.store.AddTag(storeMsg.ID, "cal"); err != nil {
-			return fmt.Errorf("add cal tag: %w", err)
+			return "", fmt.Errorf("add cal tag: %w", err)
 		}
 	}
 
@@ -165,19 +182,25 @@ func (s *Syncer) storeInsertMessage(mailboxName string, imapMsg *goimap.Message,
 
 			for _, tag := range addTags {
 				if err := s.store.AddTag(storeMsg.ID, tag); err != nil {
-					return fmt.Errorf("add rule tag %q: %w", tag, err)
+					return "", fmt.Errorf("add rule tag %q: %w", tag, err)
 				}
 			}
 			for _, tag := range removeTags {
 				if err := s.store.RemoveTag(storeMsg.ID, tag); err != nil {
-					return fmt.Errorf("remove rule tag %q: %w", tag, err)
+					return "", fmt.Errorf("remove rule tag %q: %w", tag, err)
 				}
 			}
 			slog.Debug("Applied filter rule", "module", "SYNC", "rule", rule.Name, "message_id", messageID)
 		}
 	}
+	if err := s.store.MarkMessageIngestComplete(storeMsg.ID); err != nil {
+		return "", fmt.Errorf("complete message ingest: %w", err)
+	}
+	if recoveredIdentity {
+		matcher.Commit(messageID)
+	}
 
-	return nil
+	return messageID, nil
 }
 
 // extractMessageIDFromBody extracts Message-ID from raw email body using net/mail

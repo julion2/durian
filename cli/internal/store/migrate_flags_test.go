@@ -103,8 +103,8 @@ func TestMigrateV25RepairsLegacyCommaFlags(t *testing.T) {
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 27 {
-		t.Errorf("version = %d, want 27", version)
+	if version != 30 {
+		t.Errorf("version = %d, want 30", version)
 	}
 
 	// A second Init must not re-encrypt or otherwise change the repaired row.
@@ -117,6 +117,25 @@ func TestMigrateV25RepairsLegacyCommaFlags(t *testing.T) {
 	}
 	if !bytes.Equal(secondCT, repairedCT) {
 		t.Error("second Init changed migrated ciphertext")
+	}
+
+	// Init completes v26 before any sync ingest can run. The first subsequent
+	// upsert must therefore capture the repaired before-image, independent of
+	// the old comma representation that existed on disk.
+	created, err := db.UpsertMessage(&Message{
+		MessageID: "affected@example.com", Date: 1, CreatedAt: 1,
+		Mailbox: "ALL", Account: "work", RemoteRef: "r1",
+		SyncedFlagsInitialized: true,
+	})
+	if err != nil || created {
+		t.Fatalf("post-migration upsert created=%v err=%v", created, err)
+	}
+	rows, err = db.GetFolderFlagState("work", "ALL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := rows[0].SyncedFlags, `\Seen,\Flagged,\Answered,\Deleted`; got != want || !rows[0].SyncedFlagsInitialized {
+		t.Fatalf("post-v26 captured baseline=%q initialized=%v, want %q", got, rows[0].SyncedFlagsInitialized, want)
 	}
 }
 
@@ -172,7 +191,7 @@ func TestMigrateV25RollsBackOnDecryptFailure(t *testing.T) {
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read retry version: %v", err)
 	}
-	if version != 27 {
-		t.Errorf("retry version = %d, want 27", version)
+	if version != 30 {
+		t.Errorf("retry version = %d, want 30", version)
 	}
 }
