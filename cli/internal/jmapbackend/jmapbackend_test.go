@@ -38,6 +38,7 @@ type testJMAPServer struct {
 	handler  func(string, map[string]interface{}) interface{}
 	uploaded []byte
 	events   string
+	before   []interface{}
 	extra    []interface{}
 	limits   map[string]interface{}
 }
@@ -106,8 +107,10 @@ func (s *testJMAPServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			responseName = response.name
 			result = response.value
 		}
-		responses := []interface{}{[]interface{}{responseName, result, "0"}}
+		responses := append([]interface{}{}, s.before...)
+		responses = append(responses, []interface{}{responseName, result, "0"})
 		responses = append(responses, s.extra...)
+		s.before = nil
 		s.extra = nil
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"methodResponses": responses, "sessionState": "session-1"})
 	case strings.HasPrefix(r.URL.Path, "/download/"):

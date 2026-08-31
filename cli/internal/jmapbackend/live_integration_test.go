@@ -3,8 +3,10 @@
 package jmapbackend
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net/mail"
 	"os"
 	"strings"
 	"testing"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
+	durianmail "github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/mailsend"
 )
 
@@ -347,9 +350,11 @@ func TestLiveJMAPTwoAccountDelivery(t *testing.T) {
 
 	marker := time.Now().UTC().Format("20060102T150405.000000000")
 	messageID := "durian-jmap-two-account-" + marker + "@example.test"
+	attachmentData := []byte("Durian JMAP attachment " + marker)
 	if err := (&Sender{b: senderBackend}).Send(ctx, &mailsend.Message{
-		From: senderUsername, To: []string{recipientUsername}, Subject: "Durian JMAP two-account " + marker,
-		Body: "delivered between two JMAP accounts", MessageID: messageID,
+		From: senderUsername, To: []string{senderUsername}, BCC: []string{recipientUsername},
+		Subject: "Durian JMAP two-account " + marker, Body: "delivered between two JMAP accounts", MessageID: messageID,
+		Attachments: []mailsend.Attachment{{Filename: "durian-jmap.txt", MIMEType: "text/plain; charset=utf-8", Data: attachmentData}},
 	}); err != nil {
 		t.Fatalf("two-account submission: %v", err)
 	}
@@ -370,7 +375,26 @@ func TestLiveJMAPTwoAccountDelivery(t *testing.T) {
 	}
 	if !containsMessage(recipientDelta.Messages, messageID, func(message backend.Message) bool {
 		t.Cleanup(func() { destroyLiveEmail(recipientBackend, message.Ref.ID) })
-		return strings.Contains(string(message.Raw), "delivered between two JMAP accounts") && containsString(message.Labels, "inbox")
+		parsed, err := mail.ReadMessage(bytes.NewReader(message.Raw))
+		if err != nil {
+			t.Errorf("parse recipient MIME: %v", err)
+			return false
+		}
+		content := durianmail.NewParser().Parse(parsed)
+		if content.BCC != "" {
+			t.Errorf("delivered recipient copy exposed Bcc header %q", content.BCC)
+			return false
+		}
+		if !strings.Contains(content.To, senderUsername) || len(content.Attachments) != 1 || content.Attachments[0].Filename != "durian-jmap.txt" {
+			t.Errorf("delivered recipient MIME metadata = To %q, attachments %#v", content.To, content.Attachments)
+			return false
+		}
+		attachment, contentType, err := durianmail.ExtractAttachmentPart(message.Raw, 1)
+		if err != nil || !bytes.Equal(attachment, attachmentData) || contentType != "text/plain" {
+			t.Errorf("delivered attachment = %q, type %q, err %v", attachment, contentType, err)
+			return false
+		}
+		return strings.Contains(content.Body, "delivered between two JMAP accounts") && containsString(message.Labels, "inbox")
 	}) {
 		t.Fatalf("recipient sync did not return delivered message %s in inbox", messageID)
 	}
@@ -381,9 +405,15 @@ func TestLiveJMAPTwoAccountDelivery(t *testing.T) {
 	}
 	if !containsMessage(senderDelta.Messages, messageID, func(message backend.Message) bool {
 		t.Cleanup(func() { destroyLiveEmail(senderBackend, message.Ref.ID) })
-		return containsString(message.Labels, "sent")
+		parsed, err := mail.ReadMessage(bytes.NewReader(message.Raw))
+		if err != nil {
+			t.Errorf("parse sender MIME: %v", err)
+			return false
+		}
+		content := durianmail.NewParser().Parse(parsed)
+		return strings.Contains(content.BCC, recipientUsername) && message.Flags.Seen && containsString(message.Labels, "sent")
 	}) {
-		t.Fatalf("sender sync did not return submitted message %s in sent", messageID)
+		t.Fatalf("sender sync did not return submitted message %s in sent with Bcc preserved and seen", messageID)
 	}
 }
 
