@@ -11,6 +11,7 @@ package jmapbackend
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,9 +50,10 @@ type Backend struct {
 }
 
 var (
-	_ backend.Backend          = (*Backend)(nil)
-	_ backend.LabelWriter      = (*Backend)(nil)
-	_ backend.SnapshotHydrator = (*Backend)(nil)
+	_ backend.Backend              = (*Backend)(nil)
+	_ backend.ArbitraryLabelWriter = (*Backend)(nil)
+	_ backend.SnapshotHydrator     = (*Backend)(nil)
+	_ backend.TagMutationWriter    = (*Backend)(nil)
 )
 
 type jmapMailbox struct {
@@ -72,10 +74,38 @@ type jmapEmail struct {
 	MessageID  []string        `json:"messageId"`
 }
 
+type jmapQueryPage struct {
+	QueryState *string   `json:"queryState"`
+	Position   *int      `json:"position"`
+	IDs        *[]string `json:"ids"`
+	Total      *int      `json:"total"`
+}
+
+func (p jmapQueryPage) validate() error {
+	if p.QueryState == nil || *p.QueryState == "" {
+		return errors.New("JMAP Email/query omitted required queryState")
+	}
+	if p.Position == nil || *p.Position < 0 {
+		return errors.New("JMAP Email/query omitted required valid position")
+	}
+	if p.IDs == nil {
+		return errors.New("JMAP Email/query omitted required ids")
+	}
+	if p.Total == nil || *p.Total < 0 {
+		return errors.New("JMAP Email/query omitted required valid total")
+	}
+	return nil
+}
+
 type jmapCursor struct {
-	Snapshot   string   `json:"snapshot,omitempty"`   // State anchoring an in-progress replacement snapshot.
-	PendingIDs []string `json:"pendingIds,omitempty"` // Remaining IDs captured for that snapshot.
-	EmailState string   `json:"emailState,omitempty"` // Last fully applied Email state token.
+	Snapshot    string   `json:"snapshot,omitempty"`    // Email state from before an in-progress snapshot.
+	PendingIDs  []string `json:"pendingIds,omitempty"`  // Remaining initial-sync IDs (legacy cursor shape).
+	EmailState  string   `json:"emailState,omitempty"`  // Last fully applied Email state token.
+	Replacement bool     `json:"replacement,omitempty"` // Authoritative state-expiry recovery is in progress.
+	QueryState  string   `json:"queryState,omitempty"`  // Email/query state captured on its first page.
+	QueryAnchor string   `json:"queryAnchor,omitempty"` // Last ID from the preceding query page.
+	QuerySeen   int      `json:"querySeen,omitempty"`   // Number of IDs emitted by preceding pages.
+	QueryTotal  int      `json:"queryTotal,omitempty"`  // Total reported by the first query page.
 }
 
 // New creates a JMAP backend for an account configured with sync_engine=jmap.
@@ -253,15 +283,33 @@ func buildMailboxMappings(mailboxes map[string]jmapMailbox) (map[string]string, 
 	}
 	mailboxToTag := make(map[string]string, len(ids))
 	tagToID := make(map[string]string, len(ids))
+	// Reserve fixed role vocabulary before allocating ordinary names so roles
+	// always remain reachable regardless of mailbox ID ordering.
 	for _, id := range ids {
+		if !isRole[id] {
+			continue
+		}
+		mailboxToTag[id] = raw[id]
+		tagToID[raw[id]] = id
+	}
+	for _, id := range ids {
+		if isRole[id] {
+			continue
+		}
 		tag := raw[id]
-		if len(groups[tag]) > 1 && !isRole[id] {
-			tag += "~" + mailboxTagSuffix(id)
+		suffix := "~" + mailboxTagSuffix(id)
+		if strings.HasPrefix(tag, "jmap-keyword/") {
+			// jmap-keyword/ is the explicit native-keyword namespace, so a
+			// mailbox path must not claim it.
+			tag = "mailbox" + suffix + "/" + tag
+		} else if len(groups[tag]) > 1 || isExplicitFlagTag(tag) || tagToID[tag] != "" {
+			tag += suffix
+		}
+		for tagToID[tag] != "" {
+			tag += suffix
 		}
 		mailboxToTag[id] = tag
-		if existing := tagToID[tag]; existing == "" || (isRole[id] && !isRole[existing]) {
-			tagToID[tag] = id
-		}
+		tagToID[tag] = id
 	}
 	return mailboxToTag, tagToID
 }
@@ -301,6 +349,9 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 		return backend.FetchResult{}, err
 	}
 	state := decodeCursor(cursor)
+	if state.Replacement {
+		return b.replacementPage(ctx, state, limit)
+	}
 	if state.EmailState == "" {
 		return b.initialPage(ctx, state, limit)
 	}
@@ -357,7 +408,7 @@ func (b *Backend) queryAllEmailIDs(ctx context.Context) ([]string, error) {
 }
 
 func (b *Backend) queryAllEmailIDsOnce(ctx context.Context) ([]string, error) {
-	const queryPageSize = 1000
+	queryPageSize := b.client.maxObjectsInGet(1000)
 	args := map[string]interface{}{
 		"accountId":      b.client.accountID,
 		"position":       0,
@@ -367,27 +418,36 @@ func (b *Backend) queryAllEmailIDsOnce(ctx context.Context) ([]string, error) {
 	}
 	var ids []string
 	expectedTotal := 0
+	expectedQueryState := ""
 	for {
-		var query struct {
-			Position int      `json:"position"`
-			IDs      []string `json:"ids"`
-			Total    int      `json:"total"`
-		}
+		var query jmapQueryPage
 		if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/query", args, &query); err != nil {
 			return nil, err
 		}
-		expectedTotal = query.Total
-		ids = append(ids, query.IDs...)
-		if len(query.IDs) == 0 {
-			if len(ids) < query.Total {
-				return nil, fmt.Errorf("%w: got %d of %d ids", errIncompleteQuery, len(ids), query.Total)
+		if err := query.validate(); err != nil {
+			return nil, err
+		}
+		queryState, position, pageIDs, total := *query.QueryState, *query.Position, *query.IDs, *query.Total
+		if expectedQueryState == "" {
+			expectedQueryState = queryState
+			expectedTotal = total
+		} else if queryState != expectedQueryState || total != expectedTotal {
+			return nil, fmt.Errorf("%w: query changed while paging", errIncompleteQuery)
+		}
+		if position != len(ids) {
+			return nil, fmt.Errorf("%w: got position %d, expected %d", errIncompleteQuery, position, len(ids))
+		}
+		ids = append(ids, pageIDs...)
+		if len(pageIDs) == 0 {
+			if len(ids) < total {
+				return nil, fmt.Errorf("%w: got %d of %d ids", errIncompleteQuery, len(ids), total)
 			}
 			break
 		}
-		if query.Position+len(query.IDs) >= query.Total {
+		if position+len(pageIDs) >= total {
 			break
 		}
-		nextAnchor := query.IDs[len(query.IDs)-1]
+		nextAnchor := pageIDs[len(pageIDs)-1]
 		if priorAnchor, ok := args["anchor"].(string); ok && priorAnchor == nextAnchor {
 			return nil, errors.New("Email/query anchor pagination made no progress")
 		}
@@ -419,8 +479,8 @@ func (b *Backend) changesPage(ctx context.Context, state jmapCursor, limit int) 
 	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/changes", args, &changes); err != nil {
 		var methodErr *methodError
 		if errors.As(err, &methodErr) && methodErr.Type == "cannotCalculateChanges" {
-			slog.Info("JMAP state expired, reconciling remote IDs", "module", "JMAPBACKEND")
-			return b.replacementSnapshot(ctx)
+			slog.Info("JMAP state expired, starting paged replacement snapshot", "module", "JMAPBACKEND")
+			return b.startReplacement(ctx, limit)
 		}
 		return backend.FetchResult{}, err
 	}
@@ -440,19 +500,64 @@ func (b *Backend) changesPage(ctx context.Context, state jmapCursor, limit int) 
 	}, nil
 }
 
-func (b *Backend) replacementSnapshot(ctx context.Context) (backend.FetchResult, error) {
+func (b *Backend) startReplacement(ctx context.Context, limit int) (backend.FetchResult, error) {
 	state, err := b.currentEmailState(ctx)
 	if err != nil {
 		return backend.FetchResult{}, fmt.Errorf("snapshot JMAP email state: %w", err)
 	}
-	ids, err := b.queryAllEmailIDs(ctx)
-	if err != nil {
-		return backend.FetchResult{}, fmt.Errorf("query JMAP replacement snapshot: %w", err)
+	return b.replacementPage(ctx, jmapCursor{Snapshot: state, Replacement: true}, limit)
+}
+
+func (b *Backend) replacementPage(ctx context.Context, state jmapCursor, limit int) (backend.FetchResult, error) {
+	pageLimit := b.client.maxObjectsInGet(limit)
+	args := map[string]interface{}{
+		"accountId":      b.client.accountID,
+		"limit":          pageLimit,
+		"calculateTotal": true,
+		"sort":           []map[string]interface{}{{"property": "receivedAt", "isAscending": false}},
+	}
+	if state.QueryAnchor == "" {
+		args["position"] = 0
+	} else {
+		args["anchor"] = state.QueryAnchor
+		args["anchorOffset"] = 1
+	}
+	var query jmapQueryPage
+	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/query", args, &query); err != nil {
+		return backend.FetchResult{}, fmt.Errorf("query JMAP replacement snapshot page: %w", err)
+	}
+	if err := query.validate(); err != nil {
+		return backend.FetchResult{}, fmt.Errorf("query JMAP replacement snapshot page: %w", err)
+	}
+	queryState, position, pageIDs, total := *query.QueryState, *query.Position, *query.IDs, *query.Total
+	if position != state.QuerySeen {
+		return backend.FetchResult{}, fmt.Errorf("JMAP replacement query position changed: got %d, want %d", position, state.QuerySeen)
+	}
+	if state.QueryState == "" {
+		state.QueryState = queryState
+		state.QueryTotal = total
+	} else if queryState != state.QueryState || total != state.QueryTotal {
+		return backend.FetchResult{}, errors.New("JMAP replacement query changed while paging; restart recovery")
+	}
+	uniquePageIDs := uniqueStrings(pageIDs)
+	if len(uniquePageIDs) != len(pageIDs) {
+		return backend.FetchResult{}, errors.New("JMAP replacement query returned duplicate IDs in one page")
+	}
+	state.QuerySeen += len(uniquePageIDs)
+	if state.QuerySeen > state.QueryTotal || (len(pageIDs) == 0 && state.QuerySeen < state.QueryTotal) {
+		return backend.FetchResult{}, fmt.Errorf("%w: got %d of %d ids", errIncompleteQuery, state.QuerySeen, state.QueryTotal)
+	}
+	hasMore := state.QuerySeen < state.QueryTotal
+	if hasMore {
+		state.QueryAnchor = uniquePageIDs[len(uniquePageIDs)-1]
+	} else {
+		state = jmapCursor{EmailState: state.Snapshot}
 	}
 	return backend.FetchResult{
-		Cursor:       encodeCursor(jmapCursor{EmailState: state}),
+		Cursor:       encodeCursor(state),
+		HasMore:      hasMore,
 		FullSnapshot: true,
-		Present:      presentRefs(allMailStream, ids, nil),
+		Present:      presentRefs(allMailStream, uniquePageIDs, nil),
 	}, nil
 }
 
@@ -481,8 +586,8 @@ func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.Remo
 	messages := make([]backend.Message, 0, len(objects))
 	for _, email := range objects {
 		messages = append(messages, backend.Message{
-			Ref:   backend.RemoteRef{Folder: allMailStream, ID: email.ID},
-			Flags: flagsFromKeywords(email.Keywords), Labels: b.labelsFor(email.MailboxIDs),
+			StableID: email.ID, Ref: backend.RemoteRef{Folder: allMailStream, ID: email.ID},
+			Flags: flagsFromKeywords(email.Keywords), Labels: b.labelsFor(email.MailboxIDs, email.Keywords),
 		})
 	}
 	return backend.SnapshotBatch{Messages: messages, Missing: presentRefs(allMailStream, missing, nil)}, nil
@@ -509,20 +614,30 @@ func (b *Backend) getEmailObjects(ctx context.Context, ids []string) ([]jmapEmai
 	if len(ids) == 0 {
 		return nil, nil, "", nil
 	}
-	var result struct {
-		State    string      `json:"state"`
-		List     []jmapEmail `json:"list"`
-		NotFound []string    `json:"notFound"`
+	chunkSize := b.client.maxObjectsInGet(len(ids))
+	var objects []jmapEmail
+	var missing []string
+	var state string
+	for start := 0; start < len(ids); start += chunkSize {
+		end := min(start+chunkSize, len(ids))
+		var result struct {
+			State    string      `json:"state"`
+			List     []jmapEmail `json:"list"`
+			NotFound []string    `json:"notFound"`
+		}
+		args := map[string]interface{}{
+			"accountId":  b.client.accountID,
+			"ids":        ids[start:end],
+			"properties": []string{"id", "blobId", "threadId", "mailboxIds", "keywords", "receivedAt", "messageId"},
+		}
+		if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/get", args, &result); err != nil {
+			return nil, nil, "", err
+		}
+		objects = append(objects, result.List...)
+		missing = append(missing, result.NotFound...)
+		state = result.State
 	}
-	args := map[string]interface{}{
-		"accountId":  b.client.accountID,
-		"ids":        ids,
-		"properties": []string{"id", "blobId", "threadId", "mailboxIds", "keywords", "receivedAt", "messageId"},
-	}
-	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/get", args, &result); err != nil {
-		return nil, nil, "", err
-	}
-	return result.List, result.NotFound, result.State, nil
+	return objects, missing, state, nil
 }
 
 func (b *Backend) getMessages(ctx context.Context, ids []string) ([]backend.Message, []string, error) {
@@ -569,8 +684,8 @@ func (b *Backend) getMessages(ctx context.Context, ids []string) ([]backend.Mess
 				messageID = email.MessageID[0]
 			}
 			messages[i] = backend.Message{
-				MessageID: messageID, Ref: backend.RemoteRef{Folder: allMailStream, ID: email.ID}, Raw: body,
-				Flags: flagsFromKeywords(email.Keywords), Labels: b.labelsFor(email.MailboxIDs), InternalDate: received,
+				StableID: email.ID, MessageID: messageID, Ref: backend.RemoteRef{Folder: allMailStream, ID: email.ID}, Raw: body,
+				Flags: flagsFromKeywords(email.Keywords), Labels: b.labelsFor(email.MailboxIDs, email.Keywords), InternalDate: received,
 			}
 		}(i)
 	}
@@ -591,10 +706,10 @@ func (b *Backend) getMessages(ctx context.Context, ids []string) ([]backend.Mess
 	return result, missing, nil
 }
 
-func (b *Backend) labelsFor(mailboxIDs map[string]bool) []string {
+func (b *Backend) labelsFor(mailboxIDs, keywords map[string]bool) []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	labels := make([]string, 0, len(mailboxIDs))
+	labels := make([]string, 0, len(mailboxIDs)+len(keywords))
 	for id, present := range mailboxIDs {
 		if !present {
 			continue
@@ -603,8 +718,96 @@ func (b *Backend) labelsFor(mailboxIDs map[string]bool) []string {
 			labels = append(labels, tag)
 		}
 	}
+	for keyword, present := range keywords {
+		if !present || isFlagKeyword(keyword) {
+			continue
+		}
+		if tag, ok := decodeDurianKeyword(keyword); ok {
+			if b.tagToID[tag] != "" || isExplicitFlagTag(tag) || strings.HasPrefix(tag, "jmap-keyword/") {
+				labels = append(labels, "jmap-keyword/"+keyword)
+			} else {
+				labels = append(labels, tag)
+			}
+		} else {
+			labels = append(labels, "jmap-keyword/"+keyword)
+		}
+	}
+	labels = uniqueStrings(labels)
 	sort.Strings(labels)
 	return labels
+}
+
+const durianKeywordPrefix = "durian-"
+
+var keywordEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
+
+func encodeDurianKeyword(tag string) (string, error) {
+	if tag == "" {
+		return "", errors.New("empty tag cannot be encoded as a JMAP keyword")
+	}
+	keyword := durianKeywordPrefix + strings.ToLower(keywordEncoding.EncodeToString([]byte(tag)))
+	if len(keyword) > 255 {
+		return "", fmt.Errorf("tag %q is too long for a JMAP keyword", tag)
+	}
+	return keyword, nil
+}
+
+func decodeDurianKeyword(keyword string) (string, bool) {
+	if !validJMAPKeyword(keyword) {
+		return "", false
+	}
+	encoded, ok := strings.CutPrefix(keyword, durianKeywordPrefix)
+	if !ok || encoded == "" {
+		return "", false
+	}
+	decoded, err := keywordEncoding.DecodeString(strings.ToUpper(encoded))
+	if err != nil || string(decoded) == "" {
+		return "", false
+	}
+	canonical, err := encodeDurianKeyword(string(decoded))
+	return string(decoded), err == nil && canonical == keyword
+}
+
+func isFlagKeyword(keyword string) bool {
+	return strings.HasPrefix(keyword, "$")
+}
+
+func isExplicitFlagTag(tag string) bool {
+	return tag == "unread" || tag == "flagged" || tag == "replied"
+}
+
+func validJMAPKeyword(keyword string) bool {
+	if len(keyword) == 0 || len(keyword) > 255 || keyword != strings.ToLower(keyword) {
+		return false
+	}
+	for i := 0; i < len(keyword); i++ {
+		char := keyword[i]
+		if char < 0x21 || char > 0x7e {
+			return false
+		}
+		switch char {
+		case '(', ')', '{', ']', '%', '*', '"', '\\':
+			return false
+		}
+	}
+	return true
+}
+
+func keywordForTag(tag string) (string, error) {
+	if keyword, ok := strings.CutPrefix(tag, "jmap-keyword/"); ok {
+		if !validJMAPKeyword(keyword) {
+			return "", fmt.Errorf("invalid native JMAP keyword %q", keyword)
+		}
+		if isFlagKeyword(keyword) {
+			return "", fmt.Errorf("reserved JMAP system keyword %q cannot be used as a label", keyword)
+		}
+		return keyword, nil
+	}
+	return encodeDurianKeyword(tag)
+}
+
+func pointerEscape(value string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(value, "~", "~0"), "/", "~1")
 }
 
 func (b *Backend) downloadRaw(ctx context.Context, email jmapEmail) ([]byte, error) {
@@ -679,6 +882,30 @@ func (b *Backend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, re
 	return b.updateEmail(ctx, ref.ID, patch)
 }
 
+// ApplyTagMutation maps explicit local flag-tag intent directly to one JMAP
+// keyword property patch. unread is the inverse of $seen.
+func (b *Backend) ApplyTagMutation(ctx context.Context, ref backend.RemoteRef, tag string, add bool) error {
+	patch := make(map[string]interface{})
+	set := func(keyword string, present bool) {
+		if present {
+			patch["keywords/"+keyword] = true
+		} else {
+			patch["keywords/"+keyword] = nil
+		}
+	}
+	switch tag {
+	case "unread":
+		set("$seen", !add)
+	case "flagged":
+		set("$flagged", add)
+	case "replied":
+		set("$answered", add)
+	default:
+		return fmt.Errorf("unsupported explicit JMAP tag mutation %q", tag)
+	}
+	return b.updateEmail(ctx, ref.ID, patch)
+}
+
 func setFlagPatch(patch map[string]interface{}, keyword string, add, remove bool) {
 	if add {
 		patch["keywords/"+keyword] = true
@@ -731,13 +958,27 @@ func (b *Backend) LabelTags(ctx context.Context) ([]string, error) {
 	return tags, nil
 }
 
+// ManagesLabelTag reports whether a local tag can be represented as a JMAP
+// mailbox membership or custom keyword. Flag tags use ApplyTagMutation instead.
+func (b *Backend) ManagesLabelTag(tag string) bool {
+	if isExplicitFlagTag(tag) {
+		return false
+	}
+	keyword, native := strings.CutPrefix(tag, "jmap-keyword/")
+	if native {
+		return validJMAPKeyword(keyword) && !isFlagKeyword(keyword)
+	}
+	_, err := encodeDurianKeyword(tag)
+	return err == nil
+}
+
 // ApplyLabels updates mailbox memberships represented by canonical Durian tags.
 func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, remove []string) error {
 	if err := b.loadMailboxes(ctx); err != nil {
 		return err
 	}
 	for _, tag := range add {
-		if canonicalMailboxSegment(tag) == "archive" && b.mailboxIDForTag("archive") == "" {
+		if tag == "archive" && b.mailboxIDForTag("archive") == "" {
 			if err := b.createArchiveMailbox(ctx); err != nil {
 				return fmt.Errorf("create JMAP archive mailbox: %w", err)
 			}
@@ -745,24 +986,32 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 		}
 	}
 	patch := make(map[string]interface{})
-	var unknown []string
 	b.mu.Lock()
-	for _, tag := range add {
-		if id := b.tagToID[canonicalMailboxSegment(tag)]; id != "" {
-			patch["mailboxIds/"+id] = true
-		} else {
-			unknown = append(unknown, tag)
+	apply := func(tags []string, value interface{}) error {
+		for _, tag := range tags {
+			if !strings.HasPrefix(tag, "jmap-keyword/") {
+				if id := b.tagToID[tag]; id != "" {
+					patch["mailboxIds/"+id] = value
+					continue
+				}
+			}
+			keyword, err := keywordForTag(tag)
+			if err != nil {
+				return err
+			}
+			patch["keywords/"+pointerEscape(keyword)] = value
 		}
+		return nil
 	}
-	for _, tag := range remove {
-		if id := b.tagToID[canonicalMailboxSegment(tag)]; id != "" {
-			patch["mailboxIds/"+id] = nil
-		}
+	if err := apply(add, true); err != nil {
+		b.mu.Unlock()
+		return err
+	}
+	if err := apply(remove, nil); err != nil {
+		b.mu.Unlock()
+		return err
 	}
 	b.mu.Unlock()
-	if len(unknown) > 0 {
-		return fmt.Errorf("JMAP account has no mailbox for label %q", strings.Join(unknown, ", "))
-	}
 	if len(patch) == 0 {
 		return nil
 	}
@@ -780,6 +1029,9 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 		}
 	}
 	for path, value := range patch {
+		if !strings.HasPrefix(path, "mailboxIds/") {
+			continue
+		}
 		id := strings.TrimPrefix(path, "mailboxIds/")
 		if value == nil {
 			delete(remaining, id)

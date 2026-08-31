@@ -356,6 +356,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 	// snapshot. It is separate from sessionRefs because a malformed current
 	// message must not make the engine delete an older local copy.
 	snapshotRefs := make(map[string]struct{})
+	snapshotSeenRefs := make(map[string]struct{})
 	snapshotUnavailable := make(map[string]struct{})
 	snapshotSkipHydration := make(map[string]struct{})
 	fullSnapshot := false
@@ -401,6 +402,10 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 		}
 		if res.FullSnapshot {
 			for _, ref := range res.Present {
+				if _, seen := snapshotSeenRefs[ref.ID]; seen {
+					return nil, fmt.Errorf("backend reported duplicate ref %q in replacement snapshot", ref.ID)
+				}
+				snapshotSeenRefs[ref.ID] = struct{}{}
 				snapshotRefs[ref.ID] = struct{}{}
 			}
 			for _, ref := range res.Unavailable {
