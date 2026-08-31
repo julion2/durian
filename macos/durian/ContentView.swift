@@ -880,10 +880,12 @@ struct ContentView: View {
         }
     }
 
-    private func editSelectedDraft() {
+    /// - Parameter draftMessage: the thread message whose "Edit Draft" button
+    ///   was clicked, or nil when the click came from the whole-email footer.
+    private func editSelectedDraft(_ draftMessage: ThreadMessage?) {
         guard let email = selectedEmail,
               case .loaded = email.bodyState else { return }
-        let draft = EmailDraft.createFromDraft(message: email)
+        let draft = EmailDraft.createFromDraft(message: email, draftMessage: draftMessage)
         let draftId = DraftService.shared.createDraft(with: draft)
         openWindow(value: draftId)
     }

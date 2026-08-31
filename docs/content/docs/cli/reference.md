@@ -19,7 +19,7 @@ durian <cmd> --help
 ```bash
 durian sync                          # all accounts, all mailboxes
 durian sync personal                 # one account by alias
-durian sync personal INBOX           # one mailbox
+durian sync personal INBOX Archive   # one or more mailboxes
 durian sync --debug                  # verbose logging to stderr
 durian sync --upload-only            # only push local tag/flag changes
 durian sync --download-only          # only fetch from server
@@ -46,8 +46,9 @@ IDLE, JMAP accounts with EventSource, and polls Gmail and Graph. Explicit
 ```bash
 durian search "tag:inbox" -l 10
 durian search "from:boss@company.com AND has:attachment:pdf"
+durian search "tag:unread" --account work --account personal
 durian search "group:vip AND date:1w.." --json
-durian count "tag:unread"
+durian count "tag:unread" --account work
 ```
 
 Uses [notmuch-style syntax](../gui/search/) — terms are ANDed by default; `OR`/`NOT` are explicit. `--json` emits machine-readable output for piping into other tools.
@@ -56,8 +57,9 @@ Uses [notmuch-style syntax](../gui/search/) — terms are ANDed by default; `OR`
 
 ```bash
 durian tag "tag:inbox AND from:newsletter" +newsletter -inbox
-durian tag <thread-id> +todo
-durian tag list                       # show all tags + counts
+durian tag "thread:<thread-id>" +todo
+durian tag --account work --dry-run "tag:inbox" +todo
+durian tag list                       # show all tag names
 ```
 
 Tags must be prefixed with `+` (add) or `-` (remove). Both can be mixed in one call.
@@ -80,12 +82,15 @@ Renders the thread to stdout — useful for piping into `less` or grepping a spe
 ## attachment — list or download
 
 ```bash
-durian attachment <message-id>                              # list parts
-durian attachment <message-id> --save 2 --output ./out/     # download part 2 into ./out/
-durian attachment <message-id> --save 2                     # download part 2 into the current dir
+durian attachment "message:<message-id>" --account work                      # list parts
+durian attachment "message:<message-id>" --account work --save 2 -o ./out/   # download part 2
+durian attachment "message:<message-id>" --account work --save 2 --force     # overwrite explicitly
 ```
 
-Part IDs come from the `list` output. `--save <part>` selects the part, `-o, --output <dir>` picks the target directory (defaults to `.`). The original filename is preserved.
+Part IDs come from the list output. `--save <part>` selects the part, `-o,
+--output <dir>` picks the target directory (defaults to `.`). Existing files
+are not overwritten unless `--force` is supplied. `--account` is required only
+when the Message-ID exists in more than one account.
 
 ## send — send an email
 
@@ -100,18 +105,20 @@ durian send --to bob@x.com --subject "Re: PR" \
 durian send --to bob@x.com --subject "huge" --attach video.mov --force
 ```
 
-If `--body` is omitted, your `$EDITOR` opens with a temp file. `--body-file`
-reads the body from disk (use with `--html` for HTML mail). `--in-reply-to`
+If `--body` is omitted in an interactive terminal, your `$EDITOR` opens with a
+temp file. In a pipe or with `--no-input`, pass `--body` or `--body-file`.
+The latter reads the body from disk (use with `--html` for HTML mail).
+`--in-reply-to`
 and `--references` set the threading headers when scripting replies.
 `--force` overrides the per-account attachment-size limit (see
-`max_attachment_size_mb` in `config.pkl`).
+`smtp.max_attachment_size` in `config.pkl`).
 
 ## draft — manage IMAP drafts
 
 ```bash
-durian draft save --to alice@x.com --subject WIP --body "..."
-durian draft save --replace "<original-id>" ...
-durian draft delete "<message-id>"
+durian draft save --account work --to alice@x.com --subject WIP --body "..."
+durian draft save --account work --replace "<original-id>" ...
+durian draft delete --account work "<message-id>"
 ```
 
 `--replace` overwrites an existing draft on IMAP by Message-ID — useful for autosave loops in scripts.

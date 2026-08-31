@@ -92,6 +92,9 @@ func runSend(cmd *cobra.Command, args []string) error {
 	// Get To address (prompt if not provided)
 	to := sendTo
 	if to == "" {
+		if !canPrompt() {
+			return errors.New("cannot prompt for recipient because stdin is not interactive; pass --to")
+		}
 		to, err = prompt("To: ")
 		if err != nil {
 			return err
@@ -110,6 +113,9 @@ func runSend(cmd *cobra.Command, args []string) error {
 	// Get Subject (prompt if not provided)
 	subject := sendSubject
 	if subject == "" {
+		if !canPrompt() {
+			return errors.New("cannot prompt for subject because stdin is not interactive; pass --subject")
+		}
 		subject, err = prompt("Subject: ")
 		if err != nil {
 			return err
@@ -133,6 +139,9 @@ func runSend(cmd *cobra.Command, args []string) error {
 	} else if sendBody != "" {
 		body = sendBody
 	} else {
+		if !canPrompt() {
+			return errors.New("cannot open an editor because input is not interactive; pass --body or --body-file")
+		}
 		// Open editor for interactive mode
 		body, err = openEditor(to, subject)
 		if err != nil {
@@ -265,6 +274,9 @@ func runSend(cmd *cobra.Command, args []string) error {
 
 // prompt displays a prompt and reads a line of input
 func prompt(message string) (string, error) {
+	if !canPrompt() {
+		return "", errors.New("input is not interactive; pass the required flag")
+	}
 	fmt.Fprint(os.Stderr, message)
 	reader := bufio.NewReader(os.Stdin)
 	line, err := reader.ReadString('\n')
@@ -283,6 +295,9 @@ func prompt(message string) (string, error) {
 // containing directory restricted to 0700 — matching the imap state-manager
 // convention in the same cache root.
 func openEditor(to, subject string) (string, error) {
+	if !canPrompt() {
+		return "", errors.New("cannot open an editor because input is not interactive")
+	}
 	cacheRoot := os.Getenv("XDG_CACHE_HOME")
 	if cacheRoot == "" {
 		home, err := os.UserHomeDir()

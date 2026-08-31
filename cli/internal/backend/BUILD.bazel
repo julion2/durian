@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "backend",
-    srcs = ["backend.go"],
+    srcs = [
+        "backend.go",
+        "profiles.go",
+    ],
     importpath = "github.com/julion2/durian/cli/internal/backend",
     visibility = ["//cli:__subpackages__"],
 )

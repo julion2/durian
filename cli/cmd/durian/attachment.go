@@ -3,10 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -23,7 +24,7 @@ var attachmentCmd = &cobra.Command{
 	Short: "List or download attachments",
 	Long:  "List attachments for a message, or download a specific part with --save.",
 	Example: `  durian attachment msg-id@example.com
-  durian attachment msg-id@example.com --save 1
+  durian attachment msg-id@example.com --account work --save 1
   durian attachment msg-id@example.com --save 1 --output ~/Downloads/`,
 	Args: cobra.ExactArgs(1),
 	RunE: runAttachment,
@@ -32,16 +33,21 @@ var attachmentCmd = &cobra.Command{
 var (
 	attachSavePart int
 	attachOutput   string
+	attachAccount  string
+	attachForce    bool
 )
 
 func init() {
 	attachmentCmd.Flags().IntVar(&attachSavePart, "save", 0, "download part ID (0 = list only)")
 	attachmentCmd.Flags().StringVarP(&attachOutput, "output", "o", ".", "output directory for download")
+	attachmentCmd.Flags().StringVarP(&attachAccount, "account", "a", "", "account containing the message")
+	attachmentCmd.Flags().BoolVar(&attachForce, "force", false, "overwrite an existing file")
+	_ = attachmentCmd.RegisterFlagCompletionFunc("account", completeAccounts)
 	rootCmd.AddCommand(attachmentCmd)
 }
 
 func runAttachment(cmd *cobra.Command, args []string) error {
-	messageID := args[0]
+	messageID := normalizeMessageReference(args[0])
 
 	emailDB, err := openEmailDB()
 	if err != nil {
@@ -49,23 +55,26 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 	}
 	defer emailDB.Close()
 
-	atts, err := emailDB.GetAttachmentsByMessageID(messageID)
+	msg, err := resolveAttachmentMessage(emailDB, cfg, messageID, attachAccount)
+	if err != nil {
+		return err
+	}
+	atts, err := emailDB.GetAttachmentsByMessage(msg.ID)
 	if err != nil {
 		return fmt.Errorf("get attachments: %w", err)
 	}
-	if len(atts) == 0 {
-		fmt.Fprintln(os.Stderr, "No attachments found")
-		return nil
-	}
-
 	// List mode
 	if attachSavePart == 0 {
 		if jsonOutput {
-			return json.NewEncoder(os.Stdout).Encode(atts)
+			return writeJSON(publicAttachments(atts))
+		}
+		if len(atts) == 0 {
+			fmt.Fprintln(os.Stderr, "No attachments found")
+			return nil
 		}
 		for _, a := range atts {
 			size := formatSize(a.Size)
-			fmt.Fprintf(os.Stdout, "  [%d] %s (%s, %s)\n", a.PartID, a.Filename, a.ContentType, size)
+			fmt.Fprintf(os.Stdout, "  [%d] %s (%s, %s)\n", a.PartID, humanText(a.Filename, false), humanText(a.ContentType, false), size)
 		}
 		return nil
 	}
@@ -82,10 +91,6 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("part %d not found", attachSavePart)
 	}
 
-	msg, err := emailDB.GetByMessageID(messageID)
-	if err != nil || msg == nil {
-		return fmt.Errorf("message not found in store")
-	}
 	account, err := cfg.GetAccountByIdentifier(msg.Account)
 	if err != nil {
 		return fmt.Errorf("account %q not found in config", msg.Account)
@@ -96,6 +101,13 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 		safeFilename = "attachment"
 	}
 	outPath := filepath.Join(attachOutput, safeFilename)
+	if !attachForce {
+		if _, err := os.Lstat(outPath); err == nil {
+			return fmt.Errorf("output file already exists: %s (use --force to overwrite)", outPath)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("check output file: %w", err)
+		}
+	}
 
 	// Backend-neutral path for engine/Graph-synced messages, which carry a
 	// provider handle (remote_ref) rather than an IMAP UID: fetch the raw body
@@ -105,11 +117,19 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("download failed: %w", err)
 		}
-		if err := os.WriteFile(outPath, data, 0o644); err != nil {
+		f, err := createAttachmentFile(outPath)
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(data); err != nil {
+			discardAttachmentFile(f)
 			return fmt.Errorf("write file: %w", err)
 		}
+		if err := commitAttachmentFile(f, outPath, attachForce); err != nil {
+			return err
+		}
 		fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(len(data)))
-		return nil
+		return writeAttachmentSaveJSON(outPath, att.PartID, len(data))
 	}
 
 	// Legacy IMAP path (fetch BODY[section] by UID).
@@ -127,18 +147,173 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 	if _, err := client.SelectMailbox(msg.Mailbox); err != nil {
 		return err
 	}
-	f, err := os.Create(outPath)
+	f, err := createAttachmentFile(outPath)
 	if err != nil {
-		return fmt.Errorf("create file: %w", err)
+		return err
 	}
-	defer f.Close()
 	if err := client.FetchDecodedAttachment(msg.UID, att.Filename, att.PartID, f); err != nil {
-		os.Remove(outPath)
+		discardAttachmentFile(f)
 		return fmt.Errorf("download failed: %w", err)
 	}
-	fi, _ := f.Stat()
+	fi, err := f.Stat()
+	if err != nil {
+		discardAttachmentFile(f)
+		return fmt.Errorf("stat downloaded attachment: %w", err)
+	}
+	if err := commitAttachmentFile(f, outPath, attachForce); err != nil {
+		return err
+	}
 	fmt.Fprintf(os.Stderr, "Saved %s (%s)\n", outPath, formatSize(int(fi.Size())))
-	return nil
+	return writeAttachmentSaveJSON(outPath, att.PartID, int(fi.Size()))
+}
+
+type attachmentJSON struct {
+	PartID      int    `json:"part_id"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	Size        int    `json:"size"`
+	Disposition string `json:"disposition,omitempty"`
+	ContentID   string `json:"content_id,omitempty"`
+}
+
+func publicAttachments(atts []store.Attachment) []attachmentJSON {
+	out := make([]attachmentJSON, 0, len(atts))
+	for _, att := range atts {
+		out = append(out, attachmentJSON{
+			PartID: att.PartID, Filename: att.Filename, ContentType: att.ContentType,
+			Size: att.Size, Disposition: att.Disposition, ContentID: att.ContentID,
+		})
+	}
+	return out
+}
+
+func writeAttachmentSaveJSON(path string, partID, size int) error {
+	if !jsonOutput {
+		return nil
+	}
+	return writeJSON(struct {
+		Saved  string `json:"saved"`
+		PartID int    `json:"part_id"`
+		Size   int    `json:"size"`
+	}{Saved: path, PartID: partID, Size: size})
+}
+
+func normalizeMessageReference(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if len(ref) >= len("message:") && strings.EqualFold(ref[:len("message:")], "message:") {
+		ref = strings.TrimSpace(ref[len("message:"):])
+	}
+	ref = strings.TrimPrefix(ref, "<")
+	return strings.TrimSuffix(ref, ">")
+}
+
+func resolveAttachmentMessage(emailDB *store.DB, cfg *config.Config, messageID, accountIdentifier string) (*store.Message, error) {
+	messages, err := emailDB.GetAllByMessageID(messageID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve message: %w", err)
+	}
+	if len(messages) == 0 {
+		return nil, fmt.Errorf("message %q not found in store", messageID)
+	}
+
+	if accountIdentifier != "" {
+		account, err := cfg.GetAccountByIdentifier(accountIdentifier)
+		if err != nil {
+			return nil, fmt.Errorf("account %q not found in config", accountIdentifier)
+		}
+		for _, message := range messages {
+			if strings.EqualFold(message.Account, account.AccountIdentifier()) {
+				return message, nil
+			}
+		}
+		return nil, fmt.Errorf("message %q was not found in account %q", messageID, account.GetAliasOrName())
+	}
+
+	if len(messages) > 1 {
+		accounts := make([]string, 0, len(messages))
+		for _, message := range messages {
+			name := message.Account
+			if account, err := cfg.GetAccountByIdentifier(message.Account); err == nil {
+				name = account.GetAliasOrName()
+			}
+			accounts = append(accounts, name)
+		}
+		sort.Strings(accounts)
+		return nil, fmt.Errorf("message %q exists in multiple accounts (%s); add --account", messageID, strings.Join(accounts, ", "))
+	}
+	return messages[0], nil
+}
+
+// createAttachmentFile opens a temporary file next to path to download into.
+//
+// Never the destination itself. Opening that with O_TRUNC — which --force did —
+// empties the user's existing file before the download has produced a single
+// byte, and the cleanup on failure then removes what is left: a failed download
+// destroyed the file it was meant to replace, leaving nothing. The temporary
+// lives in the same directory so the commit below is a rename within one
+// filesystem, which is atomic.
+func createAttachmentFile(path string) (*os.File, error) {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".partial-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temporary file: %w", err)
+	}
+	if err := f.Chmod(0o644); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return nil, fmt.Errorf("set permissions: %w", err)
+	}
+	return f, nil
+}
+
+// commitAttachmentFile moves a completed download onto path.
+//
+// With force, a rename: it replaces whatever is there, atomically, and only now
+// that the content exists.
+//
+// Without force, a hardlink. Link fails if the name is taken, which is the
+// no-clobber guarantee, and unlike reserving the name with O_EXCL and renaming
+// over it there is no moment where an empty destination exists — a crash
+// between those two steps would leave the user with a zero-byte file where
+// their data was.
+func commitAttachmentFile(tmp *os.File, path string, force bool) error {
+	name := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return fmt.Errorf("close download: %w", err)
+	}
+	defer os.Remove(name) // no-op once a rename has consumed it
+
+	if force {
+		if err := os.Rename(name, path); err != nil {
+			return fmt.Errorf("move download into place: %w", err)
+		}
+		return nil
+	}
+
+	switch err := os.Link(name, path); {
+	case err == nil:
+		return nil
+	case os.IsExist(err):
+		return fmt.Errorf("output file already exists: %s (use --force to overwrite)", path)
+	default:
+		// No fallback. Reserving the name with O_EXCL and renaming onto it
+		// would work on a filesystem without hardlinks, but it reintroduces
+		// exactly the window this function exists to close — an empty
+		// destination between the two steps — and it would do so for every
+		// link failure, not only the unsupported ones. An attachment can be
+		// downloaded again; a file replaced by a zero-byte one cannot be
+		// recovered. Report it and let the caller pass --force or another
+		// path.
+		return fmt.Errorf("link download into place (use --force, or choose another --output): %w", err)
+	}
+}
+
+// discardAttachmentFile drops a partial download. The destination is untouched
+// by construction — nothing has been written there.
+func discardAttachmentFile(tmp *os.File) {
+	name := tmp.Name()
+	tmp.Close()
+	os.Remove(name)
 }
 
 // fetchAttachmentPartViaBackend fetches msg's raw body through the account's

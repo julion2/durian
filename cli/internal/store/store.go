@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,8 +20,15 @@ import (
 // decrypt the ADR-0001 §3 sensitive columns. Nil is not allowed — every
 // caller must derive a keyring from the master key at startup.
 type DB struct {
-	db      *sql.DB
-	keyring *dbcrypto.Keyring
+	db             *sql.DB
+	keyring        *dbcrypto.Keyring
+	accountAliases map[string]string
+}
+
+// SetAccountAliases configures user-facing account identifiers (aliases,
+// names, and email addresses) to resolve to canonical store account names.
+func (d *DB) SetAccountAliases(aliases map[string]string) {
+	d.accountAliases = aliases
 }
 
 // Open opens or creates an email store database at the given path.
@@ -51,7 +59,35 @@ func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	// Every explicit transaction in this package writes before it commits, and
+	// several read first — resolving a row id, capturing a before-image. Those
+	// are the ones at risk: under a deferred BEGIN two Durian processes both
+	// take a shared read lock, and the second to write has to upgrade one the
+	// other still holds. SQLite answers that with SQLITE_BUSY without
+	// consulting the busy handler, since both sides waiting would deadlock
+	// rather than resolve, so the busy_timeout pragma set below cannot cover it.
+	//
+	// Taking the writer lock at BEGIN instead makes the second process wait on
+	// the busy handler like any other writer, and makes a read-then-write
+	// transaction atomic against a competing process rather than merely
+	// against a competing goroutine. Transactions that write first (UpdateBody,
+	// InsertAttachment) are unaffected either way; applying this per connection
+	// rather than per call site is the smaller change and needs no judgement at
+	// each Begin.
+	//
+	// One case gets slower rather than safer. The schema backfills in migrate()
+	// scan and rewrite whole tables, so on the single upgrade where one runs,
+	// it now reserves WAL's one writer slot from BEGIN for the duration instead
+	// of from its first write. Readers are unaffected; a competing writer waits
+	// out busy_timeout and can still fail after it. That is a different loser
+	// rather than a new failure — under deferred, the migration itself is the
+	// one that dies on its lock upgrade. Steady state is unaffected: each
+	// backfill is guarded by its schema_version check and does not run again.
+	separator := "?"
+	if strings.Contains(dbPath, "?") {
+		separator = "&"
+	}
+	db, err := sql.Open("sqlite", dbPath+separator+"_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -94,6 +130,47 @@ func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
 		}
 	}
 
+	return &DB{db: db, keyring: kr}, nil
+}
+
+// OpenReadOnly opens an existing store without creating directories, changing
+// pragmas that write database metadata, vacuuming, or migrating. It is used by
+// sync dry-runs, where an attempted write should fail rather than alter the
+// inspected store.
+func OpenReadOnly(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
+	if kr == nil {
+		return nil, fmt.Errorf("store: OpenReadOnly requires a non-nil keyring (see ADR-0001)")
+	}
+	if dbPath == ":memory:" {
+		return nil, fmt.Errorf("store: OpenReadOnly requires an existing database file")
+	}
+	if strings.HasPrefix(dbPath, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("get home dir: %w", err)
+		}
+		dbPath = filepath.Join(home, dbPath[2:])
+	}
+
+	dsn := &url.URL{Scheme: "file", Path: dbPath}
+	query := dsn.Query()
+	query.Set("mode", "ro")
+	dsn.RawQuery = query.Encode()
+	db, err := sql.Open("sqlite", dsn.String())
+	if err != nil {
+		return nil, fmt.Errorf("open read-only database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	for _, pragma := range []string{
+		"PRAGMA query_only=ON",
+		"PRAGMA busy_timeout=30000",
+		"PRAGMA foreign_keys=ON",
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("set read-only pragma %q: %w", pragma, err)
+		}
+	}
 	return &DB{db: db, keyring: kr}, nil
 }
 
@@ -1034,9 +1111,9 @@ func (d *DB) migrate() error {
 	}
 
 	if version < 24 {
-		// synced_labels is the last-synced label baseline (comma-joined Durian
-		// tag names) for a label-backed account (Gmail). It lets the label
-		// three-way merge remove tags for labels the server dropped while
+		// synced_labels is the last-synced label baseline (one CSV record of
+		// Durian tag names) for a label-backed account (Gmail/JMAP). The label
+		// three-way merge can remove tags for labels the server dropped while
 		// leaving Durian-local (rule/flag) tags intact — the tag analogue of
 		// synced_flags.
 		// Idempotent column-add via PRAGMA table_info (same as v21→v22): SQLite
@@ -1079,6 +1156,87 @@ func (d *DB) migrate() error {
 	}
 
 	if version < 27 {
+		// Add messages.bcc_ct so a draft's blind recipients survive the round
+		// trip through the Drafts mailbox. Until now BuildDraft wrote the Bcc
+		// header into the appended RFC822, but the parser never read it back:
+		// reopening a draft returned an empty Bcc and the next save dropped the
+		// recipients silently.
+		//
+		// Encrypted-only, under the meta sub-key. The addrs columns are
+		// plaintext by the ADR-0001 §3 revision ("already public on the wire"),
+		// a rationale that does not extend to the one class of recipient no
+		// other recipient sees. No plaintext twin means no FTS exposure either.
+		has, err := hasColumn(d.db, "messages", "bcc_ct")
+		if err != nil {
+			return fmt.Errorf("migrate v26→v27 inspect bcc_ct: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN bcc_ct BLOB"); err != nil {
+				return fmt.Errorf("migrate v26→v27 add bcc_ct: %w", err)
+			}
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 27 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v26→v27 bump: %w", err)
+		}
+	}
+
+	if version < 28 {
+		// Record explicit provenance for fallback Message-IDs. State 1 means a
+		// no-ID message was observed directly; state 2 is limited to pre-v28 rows
+		// matching the old generated grammar. The latter is not treated as proof:
+		// recovery also requires a replacement message with no Message-ID header
+		// and identical parsed content. A successful upsert promotes it to state 1.
+		has, err := hasColumn(d.db, "messages", "synthetic_identity")
+		if err != nil {
+			return fmt.Errorf("migrate v27→v28 inspect synthetic_identity: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN synthetic_identity INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return fmt.Errorf("migrate v27→v28 add synthetic_identity: %w", err)
+			}
+		}
+		if _, err := d.db.Exec(`UPDATE messages SET synthetic_identity = 2
+			WHERE synthetic_identity = 0
+			  AND (message_id GLOB 'durian-synthetic-[0-9]*-*@*'
+			       OR message_id GLOB 'durian-synthetic-v2-[0-9]*-[0-9]*-*@*')`); err != nil {
+			return fmt.Errorf("migrate v27→v28 mark legacy synthetic candidates: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 28 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v27→v28 bump: %w", err)
+		}
+		version = 28
+	}
+
+	if version < 29 {
+		// A durable core row can survive a crash or transient failure before its
+		// attachments, indexed headers, tags, and rules finish. Persist that
+		// distinction and an encrypted complete-content fingerprint so identity
+		// recovery can match and finish the row even when attachment metadata is
+		// absent or partial.
+		has, err := hasColumn(d.db, "messages", "ingest_pending")
+		if err != nil {
+			return fmt.Errorf("migrate v28→v29 inspect ingest_pending: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN ingest_pending INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return fmt.Errorf("migrate v28→v29 add ingest_pending: %w", err)
+			}
+		}
+		has, err = hasColumn(d.db, "messages", "synthetic_fingerprint_ct")
+		if err != nil {
+			return fmt.Errorf("migrate v28→v29 inspect synthetic_fingerprint_ct: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN synthetic_fingerprint_ct BLOB"); err != nil {
+				return fmt.Errorf("migrate v28→v29 add synthetic_fingerprint_ct: %w", err)
+			}
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 29 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v28→v29 bump: %w", err)
+		}
+	}
+
+	if version < 30 {
 		// A JMAP Email.id is immutable and unique within an account, while an RFC
 		// Message-ID is optional, duplicable, and sender-controlled. Keep the
 		// latter as message metadata and fallback identity, but let capable
@@ -1086,11 +1244,11 @@ func (d *DB) migrate() error {
 		// both identity modes coexist without collapsing duplicate Message-IDs.
 		has, err := hasColumn(d.db, "messages", "stable_id")
 		if err != nil {
-			return fmt.Errorf("migrate v26→v27 inspect stable_id: %w", err)
+			return fmt.Errorf("migrate v29→v30 inspect stable_id: %w", err)
 		}
 		if !has {
 			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN stable_id TEXT NOT NULL DEFAULT ''"); err != nil {
-				return fmt.Errorf("migrate v26→v27 add stable_id: %w", err)
+				return fmt.Errorf("migrate v29→v30 add stable_id: %w", err)
 			}
 		}
 		stmts := []string{
@@ -1108,11 +1266,11 @@ func (d *DB) migrate() error {
 			)`,
 			`CREATE INDEX IF NOT EXISTS idx_provider_tag_mutations_message
 				ON provider_tag_mutations(message_db_id, id)`,
-			`UPDATE schema_version SET version = 27 WHERE rowid = 1`,
+			`UPDATE schema_version SET version = 30 WHERE rowid = 1`,
 		}
 		for _, stmt := range stmts {
 			if _, err := d.db.Exec(stmt); err != nil {
-				return fmt.Errorf("migrate v26→v27: %w", err)
+				return fmt.Errorf("migrate v29→v30: %w", err)
 			}
 		}
 	}

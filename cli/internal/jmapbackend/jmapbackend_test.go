@@ -19,6 +19,18 @@ import (
 
 const testRaw = "From: Alice <alice@example.test>\r\nTo: Me <me@example.test>\r\nSubject: hello\r\nMessage-ID: <m1@example.test>\r\nDate: Tue, 25 Aug 2026 12:00:00 +0000\r\n\r\nbody\r\n"
 
+func TestProviderErrorsSafeLogTextOmitsServerDetails(t *testing.T) {
+	const secret = "short multiword response echoing token abc123"
+	for name, err := range map[string]interface{ SafeLogText() string }{
+		"status": &statusError{Status: http.StatusUnauthorized, Body: secret},
+		"method": &methodError{Type: "custom-" + secret, Description: secret},
+	} {
+		if got := err.SafeLogText(); strings.Contains(got, secret) {
+			t.Errorf("%s SafeLogText() leaked server details: %q", name, got)
+		}
+	}
+}
+
 type testJMAPServer struct {
 	t      *testing.T
 	server *httptest.Server
@@ -26,6 +38,7 @@ type testJMAPServer struct {
 	handler  func(string, map[string]interface{}) interface{}
 	uploaded []byte
 	events   string
+	before   []interface{}
 	extra    []interface{}
 	limits   map[string]interface{}
 }
@@ -94,8 +107,10 @@ func (s *testJMAPServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			responseName = response.name
 			result = response.value
 		}
-		responses := []interface{}{[]interface{}{responseName, result, "0"}}
+		responses := append([]interface{}{}, s.before...)
+		responses = append(responses, []interface{}{responseName, result, "0"})
 		responses = append(responses, s.extra...)
+		s.before = nil
 		s.extra = nil
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"methodResponses": responses, "sessionState": "session-1"})
 	case strings.HasPrefix(r.URL.Path, "/download/"):
@@ -138,16 +153,22 @@ func testMailboxes() []map[string]interface{} {
 }
 
 func TestBuildMailboxMappingsCanonicalAndDeterministic(t *testing.T) {
+	flaggedSuffix := "flagged~" + mailboxTagSuffix("flagged")
 	mailboxes := map[string]jmapMailbox{
-		"role":      {ID: "role", Name: "Whatever", Role: "InBoX"},
-		"collision": {ID: "collision", Name: " INBOX "},
-		"parent-a":  {ID: "parent-a", Name: "Projects"},
-		"parent-b":  {ID: "parent-b", Name: "projects"},
-		"leaf-a":    {ID: "leaf-a", Name: "Current", ParentID: "parent-a"},
-		"leaf-b":    {ID: "leaf-b", Name: "CURRENT", ParentID: "parent-b"},
-		"cycle-a":   {ID: "cycle-a", Name: "A", ParentID: "cycle-b"},
-		"cycle-b":   {ID: "cycle-b", Name: "B", ParentID: "cycle-a"},
-		"orphan":    {ID: "orphan", Name: "Orphan", ParentID: "missing"},
+		"role":            {ID: "role", Name: "Whatever", Role: "InBoX"},
+		"collision":       {ID: "collision", Name: " INBOX "},
+		"parent-a":        {ID: "parent-a", Name: "Projects"},
+		"parent-b":        {ID: "parent-b", Name: "projects"},
+		"leaf-a":          {ID: "leaf-a", Name: "Current", ParentID: "parent-a"},
+		"leaf-b":          {ID: "leaf-b", Name: "CURRENT", ParentID: "parent-b"},
+		"cycle-a":         {ID: "cycle-a", Name: "A", ParentID: "cycle-b"},
+		"cycle-b":         {ID: "cycle-b", Name: "B", ParentID: "cycle-a"},
+		"orphan":          {ID: "orphan", Name: "Orphan", ParentID: "missing"},
+		"flagged":         {ID: "flagged", Name: "Flagged"},
+		"flagged-suffix":  {ID: "flagged-suffix", Name: flaggedSuffix},
+		"unread":          {ID: "unread", Name: "Unread"},
+		"replied":         {ID: "replied", Name: "Replied"},
+		"keyword-mailbox": {ID: "keyword-mailbox", Name: "jmap-keyword/foo"},
 	}
 	forward, reverse := buildMailboxMappings(mailboxes)
 	if forward["role"] != "inbox" || reverse["inbox"] != "role" {
@@ -161,6 +182,17 @@ func TestBuildMailboxMappingsCanonicalAndDeterministic(t *testing.T) {
 	}
 	if forward["orphan"] != "orphan" || forward["cycle-a"] == "" || forward["cycle-b"] == "" {
 		t.Errorf("missing-parent/cycle mappings = %v", forward)
+	}
+	for _, id := range []string{"flagged", "unread", "replied"} {
+		if want := id + "~" + mailboxTagSuffix(id); forward[id] != want || reverse[want] != id {
+			t.Errorf("reserved flag-tag mailbox %q mapped as %q, reverse=%q; want %q", id, forward[id], reverse[want], want)
+		}
+	}
+	if forward["flagged-suffix"] == flaggedSuffix || reverse[forward["flagged-suffix"]] != "flagged-suffix" {
+		t.Errorf("post-suffix collision was not disambiguated: forward=%v reverse=%v", forward, reverse)
+	}
+	if got, want := forward["keyword-mailbox"], "mailbox~"+mailboxTagSuffix("keyword-mailbox")+"/jmap-keyword/foo"; got != want || reverse[want] != "keyword-mailbox" {
+		t.Errorf("native-keyword namespace mailbox = %q, reverse=%q; want %q", got, reverse[want], want)
 	}
 	forward2, reverse2 := buildMailboxMappings(mailboxes)
 	if !mapsEqual(forward, forward2) || !mapsEqual(reverse, reverse2) {
@@ -292,9 +324,9 @@ func TestQueryAllEmailIDsRejectsIncompleteResult(t *testing.T) {
 			t.Fatalf("unexpected method %s", method)
 		}
 		if _, paged := args["anchor"]; paged {
-			return map[string]interface{}{"position": 1, "ids": []string{}, "total": 2}
+			return map[string]interface{}{"queryState": "q1", "position": 1, "ids": []string{}, "total": 2}
 		}
-		return map[string]interface{}{"position": 0, "ids": []string{"e1"}, "total": 2}
+		return map[string]interface{}{"queryState": "q1", "position": 0, "ids": []string{"e1"}, "total": 2}
 	}
 	if _, err := b.queryAllEmailIDsOnce(t.Context()); !errors.Is(err, errIncompleteQuery) {
 		t.Fatalf("query error = %v, want errIncompleteQuery", err)
@@ -494,6 +526,51 @@ func TestReplacementSnapshotIsPagedWithoutPersistingRemoteIDSet(t *testing.T) {
 	}
 }
 
+func TestReplacementSnapshotRejectsMissingOrNullRequiredQueryFields(t *testing.T) {
+	tests := []struct {
+		name   string
+		field  string
+		remove bool
+	}{
+		{name: "missing queryState", field: "queryState", remove: true},
+		{name: "null queryState", field: "queryState"},
+		{name: "missing position", field: "position", remove: true},
+		{name: "null position", field: "position"},
+		{name: "missing ids", field: "ids", remove: true},
+		{name: "null ids", field: "ids"},
+		{name: "missing total", field: "total", remove: true},
+		{name: "null total", field: "total"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestJMAPServer(t)
+			s.handler = func(method string, _ map[string]interface{}) interface{} {
+				switch method {
+				case "Mailbox/get":
+					return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+				case "Email/query":
+					response := map[string]interface{}{
+						"queryState": "q1", "position": 0, "ids": []string{}, "total": 0,
+					}
+					if tt.remove {
+						delete(response, tt.field)
+					} else {
+						response[tt.field] = nil
+					}
+					return response
+				}
+				t.Fatalf("unexpected method %s", method)
+				return nil
+			}
+			b := s.backend(t)
+			_, err := b.FetchMessages(t.Context(), allMailStream, encodeCursor(jmapCursor{Snapshot: "s1", Replacement: true}), 10)
+			if err == nil || !strings.Contains(err.Error(), "omitted required") {
+				t.Fatalf("replacement query error = %v", err)
+			}
+		})
+	}
+}
+
 func TestCoreLimitsBoundGetBatchesAndPayloadSizes(t *testing.T) {
 	s := newTestJMAPServer(t)
 	s.limits = map[string]interface{}{
@@ -560,8 +637,25 @@ func TestCoreLimitsRequireCompleteUsableCapability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.FetchFolders(t.Context()); err == nil || !strings.Contains(err.Error(), "does not permit") {
+	if _, err := b.FetchFolders(t.Context()); err == nil || !strings.Contains(err.Error(), "does not permit API reads") {
 		t.Fatalf("zero-limit discovery error = %v", err)
+	}
+
+	s = newTestJMAPServer(t)
+	s.limits = map[string]interface{}{
+		"maxSizeUpload":       0,
+		"maxConcurrentUpload": 0,
+		"maxObjectsInSet":     0,
+	}
+	b = s.backend(t)
+	if _, err := b.FetchFolders(t.Context()); err != nil {
+		t.Fatalf("read-only limits rejected discovery: %v", err)
+	}
+	if _, err := b.client.upload(t.Context(), []byte("x"), "text/plain"); err == nil || !strings.Contains(err.Error(), "does not permit uploads") {
+		t.Fatalf("zero-limit upload error = %v", err)
+	}
+	if err := b.updateEmail(t.Context(), "e1", map[string]interface{}{"keywords/test": true}); err == nil || !strings.Contains(err.Error(), "does not permit Email/set") {
+		t.Fatalf("zero-limit set error = %v", err)
 	}
 }
 
@@ -573,11 +667,18 @@ func TestJMAPKeywordRoundTripAndPropertyPatches(t *testing.T) {
 	if tag, ok := decodeDurianKeyword(keyword); !ok || tag != "Project/Alpha" {
 		t.Fatalf("decode %q = %q, %v", keyword, tag, ok)
 	}
-	b := &Backend{mailboxToTag: map[string]string{"inbox-id": "inbox"}}
-	labels := b.labelsFor(map[string]bool{"inbox-id": true}, map[string]bool{
-		keyword: true, "custom": true, "$forwarded": true,
+	conflictingKeyword, err := encodeDurianKeyword("project-alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &Backend{
+		mailboxToTag: map[string]string{"inbox-id": "inbox", "project-id": "project-alpha"},
+		tagToID:      map[string]string{"inbox": "inbox-id", "project-alpha": "project-id"},
+	}
+	labels := b.labelsFor(map[string]bool{"inbox-id": true, "project-id": true}, map[string]bool{
+		keyword: true, conflictingKeyword: true, "custom": true, "$forwarded": true,
 	})
-	if want := []string{"Project/Alpha", "inbox", "jmap-keyword/custom"}; !slices.Equal(labels, want) {
+	if want := []string{"Project/Alpha", "inbox", "jmap-keyword/custom", "jmap-keyword/" + conflictingKeyword, "project-alpha"}; !slices.Equal(labels, want) {
 		t.Fatalf("labels = %v, want %v", labels, want)
 	}
 	if _, err := keywordForTag("jmap-keyword/$seen"); err == nil {
@@ -592,15 +693,23 @@ func TestJMAPKeywordRoundTripAndPropertyPatches(t *testing.T) {
 	if b.ManagesLabelTag("jmap-keyword/Uppercase") || b.ManagesLabelTag("") {
 		t.Fatal("invalid keyword-backed tag reported as provider-managed")
 	}
+	if !b.ManagesLabelTag(strings.Repeat("a", 155)) || b.ManagesLabelTag(strings.Repeat("a", 156)) {
+		t.Fatal("arbitrary tag encodability boundary reported incorrectly")
+	}
 
 	s := newTestJMAPServer(t)
 	var patches []map[string]interface{}
 	s.handler = func(method string, args map[string]interface{}) interface{} {
 		switch method {
 		case "Mailbox/get":
-			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+			mailboxes := append(testMailboxes(), map[string]interface{}{
+				"id": "flagged-mailbox", "name": "Flagged", "role": nil, "isSubscribed": true,
+			})
+			return map[string]interface{}{"state": "mb1", "list": mailboxes}
 		case "Email/get":
-			return map[string]interface{}{"state": "s1", "list": []interface{}{emailObject("e1", nil, map[string]bool{"inbox-id": true})}, "notFound": []interface{}{}}
+			return map[string]interface{}{"state": "s1", "list": []interface{}{
+				emailObject("e1", nil, map[string]bool{"inbox-id": true, "flagged-mailbox": true}),
+			}, "notFound": []interface{}{}}
 		case "Email/set":
 			patches = append(patches, args["update"].(map[string]interface{})["e1"].(map[string]interface{}))
 			return map[string]interface{}{"updated": map[string]interface{}{"e1": nil}, "notUpdated": map[string]interface{}{}}
@@ -612,11 +721,99 @@ func TestJMAPKeywordRoundTripAndPropertyPatches(t *testing.T) {
 	if err := remote.ApplyLabels(t.Context(), backend.RemoteRef{ID: "e1"}, []string{"Project/Alpha"}, nil); err != nil {
 		t.Fatal(err)
 	}
+	if err := remote.ApplyLabels(t.Context(), backend.RemoteRef{ID: "e1"}, []string{"jmap-keyword/foo/bar~baz"}, nil); err != nil {
+		t.Fatal(err)
+	}
 	if err := remote.ApplyTagMutation(t.Context(), backend.RemoteRef{ID: "e1"}, "unread", true); err != nil {
 		t.Fatal(err)
 	}
-	if len(patches) != 2 || patches[0]["keywords/"+keyword] != true || patches[1]["keywords/$seen"] != nil {
+	if err := remote.ApplyTagMutation(t.Context(), backend.RemoteRef{ID: "e1"}, "flagged", true); err != nil {
+		t.Fatal(err)
+	}
+	flaggedMailboxTag := "flagged~" + mailboxTagSuffix("flagged-mailbox")
+	if labels := remote.labelsFor(map[string]bool{"flagged-mailbox": true}, nil); !slices.Equal(labels, []string{flaggedMailboxTag}) {
+		t.Fatalf("flagged mailbox labels = %v, want [%s]", labels, flaggedMailboxTag)
+	}
+	if err := remote.ApplyLabels(t.Context(), backend.RemoteRef{ID: "e1"}, nil, []string{flaggedMailboxTag}); err != nil {
+		t.Fatal(err)
+	}
+	if len(patches) != 5 {
 		t.Fatalf("keyword patches = %#v", patches)
+	}
+	removedFlaggedMailbox, hasRemovedFlaggedMailbox := patches[4]["mailboxIds/flagged-mailbox"]
+	if patches[0]["keywords/"+keyword] != true ||
+		patches[1]["keywords/foo~1bar~0baz"] != true || patches[2]["keywords/$seen"] != nil ||
+		patches[3]["keywords/$flagged"] != true || !hasRemovedFlaggedMailbox || removedFlaggedMailbox != nil {
+		t.Fatalf("keyword patches = %#v", patches)
+	}
+}
+
+func TestApplyLabelsKeepsMailboxAndKeywordNamespacesDistinct(t *testing.T) {
+	mixedKeyword, err := encodeDurianKeyword("Project Alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exactKeyword, err := encodeDurianKeyword("project-alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveKeyword, err := encodeDurianKeyword("Archive")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := newTestJMAPServer(t)
+	var patches []map[string]interface{}
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			mailboxes := append(testMailboxes(), map[string]interface{}{
+				"id": "project-alpha-id", "name": "Project Alpha", "role": nil, "isSubscribed": true,
+			})
+			return map[string]interface{}{"state": "mb1", "list": mailboxes}
+		case "Email/get":
+			return map[string]interface{}{"state": "s1", "list": []interface{}{
+				emailObject("e1", map[string]bool{mixedKeyword: true, exactKeyword: true}, map[string]bool{"project-alpha-id": true}),
+			}, "notFound": []interface{}{}}
+		case "Email/set":
+			patches = append(patches, args["update"].(map[string]interface{})["e1"].(map[string]interface{}))
+			return map[string]interface{}{"updated": map[string]interface{}{"e1": nil}, "notUpdated": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	remote := s.backend(t)
+	if _, err := remote.FetchFolders(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	wantExactLabel := "jmap-keyword/" + exactKeyword
+	if labels := remote.labelsFor(
+		map[string]bool{"project-alpha-id": true},
+		map[string]bool{mixedKeyword: true, exactKeyword: true},
+	); !slices.Equal(labels, []string{"Project Alpha", wantExactLabel, "project-alpha"}) {
+		t.Fatalf("conflicting mailbox/keyword labels = %v", labels)
+	}
+	if err := remote.ApplyLabels(t.Context(), backend.RemoteRef{ID: "e1"}, nil, []string{"Project Alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.ApplyLabels(t.Context(), backend.RemoteRef{ID: "e1"}, nil, []string{wantExactLabel}); err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.ApplyLabels(t.Context(), backend.RemoteRef{ID: "e1"}, []string{"Archive"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.ApplyLabels(t.Context(), backend.RemoteRef{ID: "e1"}, []string{"jmap-keyword/project-alpha"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(patches) != 4 || patches[0]["keywords/"+mixedKeyword] != nil ||
+		patches[1]["keywords/"+exactKeyword] != nil || patches[2]["keywords/"+archiveKeyword] != true ||
+		patches[3]["keywords/project-alpha"] != true {
+		t.Fatalf("namespace patches = %#v", patches)
+	}
+	for _, patch := range patches {
+		if _, aliasesMailbox := patch["mailboxIds/project-alpha-id"]; aliasesMailbox {
+			t.Fatalf("keyword mutation aliased project-alpha mailbox: %#v", patch)
+		}
 	}
 }
 
