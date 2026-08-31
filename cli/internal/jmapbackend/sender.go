@@ -347,7 +347,7 @@ func validMessageIDQuotedLeft(value string) bool {
 			}
 			continue
 		}
-		if char == '"' || !(char == ' ' || char == '\t' || char == '!' || char >= '#' && char <= '[' || char >= ']' && char <= '~') {
+		if !messageIDQuotedText(char) {
 			return false
 		}
 	}
@@ -359,8 +359,7 @@ func validMessageIDDomainLiteral(value string) bool {
 		return false
 	}
 	for i := 1; i < len(value)-1; i++ {
-		char := value[i]
-		if !(char >= '!' && char <= 'Z' || char >= '^' && char <= '~') {
+		if !messageIDDomainText(value[i]) {
 			return false
 		}
 	}
@@ -374,6 +373,14 @@ func messageIDAtext(char byte) bool {
 
 func messageIDQuotedPair(char byte) bool {
 	return char == ' ' || char == '\t' || char >= '!' && char <= '~'
+}
+
+func messageIDQuotedText(char byte) bool {
+	return char == ' ' || char == '\t' || char == '!' || char >= '#' && char <= '[' || char >= ']' && char <= '~'
+}
+
+func messageIDDomainText(char byte) bool {
+	return char >= '!' && char <= 'Z' || char >= '^' && char <= '~'
 }
 
 func messageIDWhitespace(char byte) bool {
@@ -440,7 +447,7 @@ func (b *Backend) sendStructured(ctx context.Context, draft map[string]interface
 	}
 	draftID := emailResult.Created[emailCreateID].ID
 	if draftID == "" {
-		return errors.New("Email/set returned no created draft")
+		return errors.New("email/set returned no created draft")
 	}
 	return b.submitDraft(ctx, draftID, draftsID, sentID, identityID)
 }

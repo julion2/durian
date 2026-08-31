@@ -386,7 +386,7 @@ func decodeMethodPayload(raw json.RawMessage, out interface{}) error {
 		return nil
 	}
 	target := reflect.ValueOf(out)
-	if target.Kind() != reflect.Ptr || target.IsNil() {
+	if target.Kind() != reflect.Pointer || target.IsNil() {
 		return errors.New("result target is not a non-nil pointer")
 	}
 	decoded := reflect.New(target.Elem().Type())
