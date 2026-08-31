@@ -244,7 +244,7 @@ func (h *Handler) DownloadAttachment(identifier string, partID int, w http.Respo
 			_, werr := w.Write(data)
 			return werr
 		}
-		slog.Warn("Backend attachment fetch failed, falling back to IMAP", "module", "HANDLER", "message_id", msg.MessageID, "err", berr)
+		slog.Warn("Backend attachment fetch failed, falling back to IMAP", "module", "HANDLER", "message_id", msg.MessageID)
 	}
 
 	// Legacy path: break-IDLE IMAP fetch by UID.
