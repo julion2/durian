@@ -3,8 +3,10 @@ package syncengine
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"slices"
 	"sort"
@@ -70,9 +72,10 @@ type Options struct {
 	// DryRun logs what would happen without writing to the store or advancing
 	// cursors.
 	DryRun bool
-	// NoFlags skips the per-folder flag reconciliation pass entirely (parity
-	// with the legacy --no-flags). Delta-carried flag work is retained for the
-	// next sync that enables reconciliation.
+	// NoFlags skips flag synchronization entirely (parity with the legacy
+	// --no-flags), including provider-native explicit tag patches. Messages
+	// still get their flag-derived tags at ingest time, and delta-carried flag
+	// work is retained for the next sync that enables reconciliation.
 	NoFlags bool
 	// OnProgress, if set, is called after each fetched page with the running
 	// count of messages ingested this run — for a live progress line during a
@@ -102,13 +105,11 @@ type Result struct {
 	// Errors collects per-folder and per-message errors; the sync continues
 	// past them (like the legacy syncer continues past a failed mailbox).
 	Errors []error
-	// NewMessageIDs are the Message-IDs of genuinely new arrivals in inbox-role
-	// folders, in ingest order. Only inbox-role folders contribute: a message
-	// appearing in Sent or Archive is not an arrival the user wants to hear
-	// about. Callers use this to raise new-mail notifications, which is why it
-	// is provider-neutral state on the engine rather than something derived
-	// from IMAP UIDNEXT. Empty in dry-run.
-	NewMessageIDs []string
+	// NewMessageIdentifiers are exact local:<row-id> identifiers for arrivals
+	// with provider-stable identity and Message-ID fallbacks for legacy rows.
+	// Only inbox-role folders contribute: a message appearing in Sent or Archive
+	// is not an arrival the user wants to hear about. Empty in dry-run.
+	NewMessageIdentifiers []string
 }
 
 // Engine drives a backend.Backend: folder discovery, cursor-paged incremental
@@ -153,6 +154,9 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 	}
 
 	result := &Result{}
+	mutationCtx, cancel := contextWithDeadline(ctx, deadline)
+	e.uploadProviderTagMutations(mutationCtx, b, result)
+	cancel()
 	for _, folder := range folders {
 		if err := ctx.Err(); err != nil {
 			return result, fmt.Errorf("sync canceled: %w", err)
@@ -270,6 +274,7 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 	// gates, so exactly one does work for a given backend.
 	uploadCtx, cancel := contextWithDeadline(ctx, deadline)
 	e.uploadFolderMoves(uploadCtx, b, folders, result)
+	e.uploadProviderTagMutations(uploadCtx, b, result)
 	e.uploadLabelChanges(uploadCtx, b, result)
 	cancel()
 
@@ -435,7 +440,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 			msg, recoveredMessageID, initialIngestComplete := adoptSyntheticIdentity(msg, syntheticMatcher)
 			ingestOptions := e.opts.Ingest
 			ingestOptions.IdentityRecovered = recoveredMessageID != "" && initialIngestComplete
-			messageID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, ingestOptions)
+			messageID, rowID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, ingestOptions)
 			if err != nil {
 				if recoveredMessageID != "" {
 					if messageUpsertCompleted(err) {
@@ -480,7 +485,7 @@ func (e *Engine) syncFolder(ctx context.Context, b backend.Backend, folder backe
 				// ingested into Sent is the user's own, and Archive/Junk are
 				// not events they asked to be interrupted for.
 				if folder.Role == backend.RoleInbox || (b.Capabilities().LabelsAreTags && tagsContain(msg.Labels, "inbox")) {
-					result.NewMessageIDs = append(result.NewMessageIDs, messageID)
+					result.NewMessageIdentifiers = append(result.NewMessageIdentifiers, messageIdentifier(messageID, msg.StableID, rowID))
 				}
 			} else {
 				result.Deduplicated++
@@ -595,11 +600,11 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 		return fmt.Errorf("load full-snapshot hydration state for %s: %w", folder.Name, err)
 	}
 	existing := make(map[string]struct{}, len(rows))
-	messageIDs := make(map[string]string, len(rows))
+	messageRowIDs := make(map[string]int64, len(rows))
 	refsByMessageID := make(map[string]string, len(rows))
 	for _, row := range rows {
 		existing[row.RemoteRef] = struct{}{}
-		messageIDs[row.RemoteRef] = row.MessageID
+		messageRowIDs[row.RemoteRef] = row.RowID
 		refsByMessageID[row.MessageID] = row.RemoteRef
 	}
 	missing := make([]backend.RemoteRef, 0)
@@ -651,7 +656,7 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 		for _, msg := range hydrated.Messages {
 			deltaFlags[msg.Ref.ID] = msg.Flags
 			if e.opts.Ingest.LabelsAsTags && !e.opts.DryRun {
-				if err := reconcileLabels(e.opts.Store, messageIDs[msg.Ref.ID], e.opts.Account, msg.Labels); err != nil {
+				if err := reconcileLabels(e.opts.Store, messageRowIDs[msg.Ref.ID], msg.Labels); err != nil {
 					return fmt.Errorf("reconcile snapshot labels for %s: %w", msg.Ref.ID, err)
 				}
 			}
@@ -674,7 +679,7 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 				result.New++
 				continue
 			}
-			messageID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, e.opts.Ingest)
+			messageID, rowID, created, err := Ingest(e.opts.Store, msg, folder.Name, folder.Role, e.opts.Ingest)
 			if err != nil {
 				result.Errors = append(result.Errors, fmt.Errorf("ingest hydrated snapshot message %s: %w", msg.Ref.ID, err))
 				if isRetryableStoreError(err) {
@@ -700,7 +705,7 @@ func (e *Engine) hydrateFullSnapshot(ctx context.Context, b backend.Backend, fol
 			if created {
 				result.New++
 				if folder.Role == backend.RoleInbox || (b.Capabilities().LabelsAreTags && tagsContain(msg.Labels, "inbox")) {
-					result.NewMessageIDs = append(result.NewMessageIDs, messageID)
+					result.NewMessageIdentifiers = append(result.NewMessageIdentifiers, messageIdentifier(messageID, msg.StableID, rowID))
 				}
 			} else {
 				result.Deduplicated++
@@ -719,6 +724,13 @@ func adoptSyntheticIdentity(msg backend.Message, matcher *syncidentity.Matcher) 
 		return msg, messageID, initialIngestComplete
 	}
 	return msg, "", false
+}
+
+func messageIdentifier(messageID, stableID string, rowID int64) string {
+	if stableID != "" {
+		return fmt.Sprintf("local:%d", rowID)
+	}
+	return messageID
 }
 
 func validateSnapshotBatch(requested []backend.RemoteRef, batch backend.SnapshotBatch) error {
@@ -826,6 +838,14 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 	var localFailed []string
 
 	upload := e.opts.Mode != DownloadOnly
+	_, nativePatches := b.(backend.TagMutationWriter)
+	if nativePatches {
+		// JMAP user intent is captured at the mutation boundary and sent as an
+		// individual keyword property patch. Never reconstruct intent from
+		// ambient local tags and a stale baseline for such a backend; this pass
+		// remains responsible only for downloading server keyword changes.
+		upload = false
+	}
 	download := e.opts.Mode != UploadOnly
 
 	rows, err := e.opts.Store.GetFolderFlagState(e.opts.Account, folder.Name)
@@ -983,7 +1003,7 @@ func (e *Engine) reconcileFolderFlags(ctx context.Context, b backend.Backend, fo
 
 		batchUploaded, batchDownloaded, batchFailed := e.reconcileFlagRows(
 			ctx, b, folder, chunk, server, deltaFlags, fetchIncomplete,
-			upload, download, answeredUnsupported, result,
+			upload, download, nativePatches, answeredUnsupported, result,
 		)
 		uploaded += batchUploaded
 		downloaded += batchDownloaded
@@ -1018,7 +1038,7 @@ func (e *Engine) reconcileFlagRows(
 	rows []store.FolderFlagRow,
 	server map[string]backend.Flags,
 	deltaFlags map[string]backend.Flags,
-	fetchIncomplete, upload, download, answeredUnsupported bool,
+	fetchIncomplete, upload, download, nativePatches, answeredUnsupported bool,
 	result *Result,
 ) (uploaded, downloaded int, failed []string) {
 	for _, row := range rows {
@@ -1055,10 +1075,10 @@ func (e *Engine) reconcileFlagRows(
 			serverState.Answered = baseline.Answered
 		}
 
-		// The state both sides should end up in, decided per flag against the
-		// baseline. Both branches below drive towards this one value: the upload
-		// moves the server to it and the download moves the local tags to it,
-		// so neither can undo what the other is converging on.
+		// The state both sides should end up in. Generic backends resolve each
+		// field against the shared baseline. Native-patch backends upload durable
+		// user intent separately, so their fetched server state is authoritative
+		// for this download pass and must not resurrect ambient local tags.
 		//
 		// Computing the upload from local-vs-server instead is what made a
 		// server-side change look like a local removal. A star set remotely is
@@ -1066,6 +1086,9 @@ func (e *Engine) reconcileFlagRows(
 		// touched it here — and diffing without the baseline read that as the
 		// user un-starring, so the next upload deleted the new star.
 		target := imap.ResolveFlags(baseline, local, serverState)
+		if nativePatches {
+			target = serverState
+		}
 
 		// Local changed vs the baseline: push the difference between the
 		// resolved state and the server so the server converges on it.
@@ -1104,8 +1127,10 @@ func (e *Engine) reconcileFlagRows(
 		}
 
 		// Server changed vs the baseline: bring the change down to the same
-		// resolved state the upload above pushed.
-		if download && imap.NeedsDownload(serverState, baseline) {
+		// resolved state the upload above pushed. Native-patch backends always
+		// apply the selected server state because their explicit mutation journal,
+		// not ambient local tags, is the source of local user intent.
+		if download && (nativePatches || imap.NeedsDownload(serverState, baseline)) {
 			pulled = true
 			if !target.Equal(local) {
 				add, remove := target.ToTagOps()
@@ -1365,12 +1390,14 @@ func (e *Engine) handleDeleted(folder backend.Folder, del backend.Deletion, sess
 	// (Graph deletions carry only the id). Finally fall back to a message
 	// ingested earlier in THIS run. If nothing resolves, skip safely.
 	messageID := del.MessageID
-	if messageID == "" && del.Ref.ID != "" {
-		if mid, err := e.opts.Store.GetMessageIDByRemoteRef(e.opts.Account, del.Ref.Folder, del.Ref.ID); err != nil {
+	var stored *store.Message
+	if del.Ref.ID != "" {
+		if msg, err := e.opts.Store.GetByRemoteRef(e.opts.Account, folder.Name, del.Ref.ID); err != nil {
 			slog.Debug("remote_ref deletion lookup failed", "module", "SYNCENGINE",
 				"folder", folder.Name, "ref", del.Ref.ID, "err", err)
-		} else {
-			messageID = mid
+		} else if msg != nil {
+			stored = msg
+			messageID = msg.MessageID
 		}
 	}
 	if messageID == "" {
@@ -1392,7 +1419,13 @@ func (e *Engine) handleDeleted(folder backend.Folder, del backend.Deletion, sess
 	if mapping := tagMappingForRole(folder.Role); mapping != nil && len(mapping.addTags) > 0 {
 		slog.Debug("Removing folder tags for moved message", "module", "SYNCENGINE", // encgrep:allow folder name, tag names and Message-ID are operational sync metadata, not encrypted columns
 			"folder", folder.Name, "message_id", messageID, "tags", mapping.addTags)
-		if err := e.opts.Store.ModifyTagsByMessageIDAndAccount(messageID, e.opts.Account, nil, mapping.addTags); err != nil {
+		var err error
+		if stored != nil {
+			err = e.opts.Store.ModifyTagsByMessageDBID(stored.ID, nil, mapping.addTags)
+		} else {
+			err = e.opts.Store.ModifyTagsByMessageIDAndAccount(messageID, e.opts.Account, nil, mapping.addTags)
+		}
+		if err != nil {
 			slog.Warn("Remove folder tags failed", "module", "SYNCENGINE", "message_id", messageID, "err", err) // encgrep:allow Message-ID is a plaintext RFC822 header / stable key, not an encrypted column
 			result.Errors = append(result.Errors, fmt.Errorf("untag deleted %s: %w", messageID, err))
 			return false
@@ -1403,7 +1436,11 @@ func (e *Engine) handleDeleted(folder backend.Folder, del backend.Deletion, sess
 	// User folder without tag mapping: delete the row — but not if the message
 	// has since been ingested from a different folder in this same run (the
 	// Mailbox column reflects the latest ingest).
-	if existing, err := e.opts.Store.GetByMessageID(messageID); err == nil && existing != nil && existing.Mailbox != folder.Name {
+	existing := stored
+	if existing == nil {
+		existing, _ = e.opts.Store.GetByMessageID(messageID)
+	}
+	if existing != nil && existing.Mailbox != folder.Name {
 		slog.Debug("Message moved to another folder, keeping row", "module", "SYNCENGINE", // encgrep:allow Message-ID and folder/mailbox names are operational sync metadata, not encrypted columns
 			"message_id", messageID, "folder", folder.Name, "current_mailbox", existing.Mailbox)
 		return false
@@ -1411,7 +1448,13 @@ func (e *Engine) handleDeleted(folder backend.Folder, del backend.Deletion, sess
 
 	slog.Debug("Deleting message removed from untagged folder", "module", "SYNCENGINE", // encgrep:allow folder name and Message-ID are operational sync metadata, not encrypted columns
 		"folder", folder.Name, "message_id", messageID)
-	if err := e.opts.Store.DeleteByMessageIDAndAccount(messageID, e.opts.Account); err != nil {
+	var err error
+	if stored != nil {
+		err = e.opts.Store.DeleteByDBID(stored.ID)
+	} else {
+		err = e.opts.Store.DeleteByMessageIDAndAccount(messageID, e.opts.Account)
+	}
+	if err != nil {
 		slog.Warn("Store delete failed", "module", "SYNCENGINE", "message_id", messageID, "err", err)
 		result.Errors = append(result.Errors, fmt.Errorf("delete %s: %w", messageID, err))
 		return false
@@ -1551,6 +1594,24 @@ func (e *Engine) uploadLabelChanges(ctx context.Context, b backend.Backend, resu
 			"account", e.opts.Account, "err", err)
 		return
 	}
+	if arbitrary, ok := lw.(backend.ArbitraryLabelWriter); ok {
+		for _, row := range rows {
+			for _, tag := range row.Tags {
+				if arbitrary.ManagesLabelTag(tag) {
+					vocab[tag] = true
+				}
+			}
+			// A custom keyword removed from its final local message no longer
+			// occurs in row.Tags or the provider vocabulary. Keep labels from the
+			// durable baseline in scope so the removal is still uploaded.
+			for _, tag := range decodeLabelBaseline(row.SyncedLabels) {
+				if arbitrary.ManagesLabelTag(tag) {
+					vocab[tag] = true
+				}
+			}
+		}
+	}
+	_, managesArbitraryLabels := lw.(backend.ArbitraryLabelWriter)
 
 	seeded := 0
 	for _, r := range rows {
@@ -1566,10 +1627,13 @@ func (e *Engine) uploadLabelChanges(ctx context.Context, b backend.Backend, resu
 		// already reflect what we last downloaded, so there is nothing local to
 		// push. Mirrors the flag-baseline seeding in reconcileFolderFlags. A
 		// genuine local change is picked up next sync against the seeded baseline.
-		if r.SyncedLabels == "" {
+		if r.SyncedLabels == "" && !managesArbitraryLabels {
 			_, _, seedBaseline := diffLabels(r.Tags, nil, vocab)
 			if len(seedBaseline) > 0 && !e.opts.DryRun {
-				if err := e.opts.Store.SetSyncedLabels(r.MessageID, e.opts.Account, strings.Join(seedBaseline, ",")); err != nil {
+				encoded, err := encodeLabelBaseline(seedBaseline)
+				if err != nil {
+					result.Errors = append(result.Errors, fmt.Errorf("encode label baseline for %s: %w", r.MessageID, err))
+				} else if err := e.opts.Store.SetSyncedLabelsByDBID(r.RowID, encoded); err != nil {
 					result.Errors = append(result.Errors, fmt.Errorf("seed label baseline for %s: %w", r.MessageID, err))
 				} else {
 					seeded++
@@ -1577,7 +1641,7 @@ func (e *Engine) uploadLabelChanges(ctx context.Context, b backend.Backend, resu
 			}
 			continue
 		}
-		added, removed, newBaseline := diffLabels(r.Tags, splitFlags(r.SyncedLabels), vocab)
+		added, removed, newBaseline := diffLabels(r.Tags, decodeLabelBaseline(r.SyncedLabels), vocab)
 		if len(added) == 0 && len(removed) == 0 {
 			continue
 		}
@@ -1596,7 +1660,12 @@ func (e *Engine) uploadLabelChanges(ctx context.Context, b backend.Backend, resu
 		}
 		// Persist the baseline only after the server accepted the change, so a
 		// failed upload is retried next sync instead of being silently dropped.
-		if err := e.opts.Store.SetSyncedLabels(r.MessageID, e.opts.Account, strings.Join(newBaseline, ",")); err != nil {
+		encoded, err := encodeLabelBaseline(newBaseline)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("encode label baseline for %s: %w", r.MessageID, err))
+			continue
+		}
+		if err := e.opts.Store.SetSyncedLabelsByDBID(r.RowID, encoded); err != nil {
 			slog.Warn("Label upload: update baseline failed", "module", "SYNCENGINE",
 				"message_id", r.MessageID, "err", err)
 		}
@@ -1607,6 +1676,63 @@ func (e *Engine) uploadLabelChanges(ctx context.Context, b backend.Backend, resu
 	if seeded > 0 {
 		slog.Info("Seeded label baselines for migrated messages", "module", "SYNCENGINE",
 			"account", e.opts.Account, "count", seeded) // encgrep:allow account identifier (config name) + count, not content
+	}
+}
+
+// uploadProviderTagMutations sends durable user flag intent before downloading
+// deltas. This makes a JMAP property patch the source of truth for local edits;
+// the generic baseline pass that follows still downloads remote changes and
+// supports providers without this optional capability.
+func (e *Engine) uploadProviderTagMutations(ctx context.Context, b backend.Backend, result *Result) {
+	if e.opts.Mode == DownloadOnly || e.opts.NoFlags {
+		return
+	}
+	tw, ok := b.(backend.TagMutationWriter)
+	if !ok {
+		if e.opts.DryRun {
+			return
+		}
+		if err := e.opts.Store.ClearProviderTagMutationsForAccount(e.opts.Account); err != nil {
+			result.Errors = append(result.Errors, err)
+		}
+		return
+	}
+	mutations, err := e.opts.Store.ReadProviderTagMutations(e.opts.Account)
+	if err != nil {
+		result.Errors = append(result.Errors, err)
+		return
+	}
+	for _, mutation := range mutations {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if mutation.RemoteRef == "" {
+			continue
+		}
+		if e.opts.DryRun {
+			slog.Debug("[dry-run] Would upload explicit tag mutation", "module", "SYNCENGINE",
+				"message_id", mutation.MessageID, "tag", mutation.Tag, "action", mutation.Action)
+			continue
+		}
+		if err := tw.ApplyTagMutation(ctx, backend.RemoteRef{ID: mutation.RemoteRef}, mutation.Tag, mutation.Action == "add"); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("apply tag mutation for %s: %w", mutation.MessageID, err))
+			continue
+		}
+		var add, remove []string
+		if mutation.Action == "add" {
+			add = []string{mutation.Tag}
+		} else {
+			remove = []string{mutation.Tag}
+		}
+		if err := e.opts.Store.ModifyTagsByMessageDBID(mutation.RowID, add, remove); err != nil {
+			// The provider already accepted the idempotent property patch. Keep
+			// the queue entry so the next pass also repairs the local read model.
+			result.Errors = append(result.Errors, fmt.Errorf("restore local tag intent for %s: %w", mutation.MessageID, err))
+			continue
+		}
+		if err := e.opts.Store.ClearProviderTagMutation(mutation.ID); err != nil {
+			result.Errors = append(result.Errors, err)
+		}
 	}
 }
 
@@ -1640,6 +1766,41 @@ func diffLabels(tags, baseline []string, vocab map[string]bool) (added, removed,
 		}
 	}
 	return added, removed, newBaseline
+}
+
+// Label baselines use one CSV record so provider keywords containing commas,
+// quotes, or newlines remain distinct. Plain comma-joined baselines written by
+// older versions are valid CSV and continue to decode as before. If a legacy
+// label contains an unescaped quote or newline, fall back to the old split so
+// upgrading does not make that already-stored value unreadable.
+func encodeLabelBaseline(labels []string) (string, error) {
+	if len(labels) == 0 {
+		return "", nil
+	}
+	var encoded strings.Builder
+	writer := csv.NewWriter(&encoded)
+	if err := writer.Write(labels); err != nil {
+		return "", err
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(encoded.String(), "\n"), nil
+}
+
+func decodeLabelBaseline(encoded string) []string {
+	if encoded == "" {
+		return nil
+	}
+	reader := csv.NewReader(strings.NewReader(encoded))
+	labels, err := reader.Read()
+	if err == nil {
+		if _, trailingErr := reader.Read(); trailingErr == io.EOF {
+			return labels
+		}
+	}
+	return strings.Split(encoded, ",")
 }
 
 // moveDestination decides where an INBOX message that lost the "inbox" tag

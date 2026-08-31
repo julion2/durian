@@ -1111,9 +1111,9 @@ func (d *DB) migrate() error {
 	}
 
 	if version < 24 {
-		// synced_labels is the last-synced label baseline (comma-joined Durian
-		// tag names) for a label-backed account (Gmail). It lets the label
-		// three-way merge remove tags for labels the server dropped while
+		// synced_labels is the last-synced label baseline (one CSV record of
+		// Durian tag names) for a label-backed account (Gmail/JMAP). The label
+		// three-way merge can remove tags for labels the server dropped while
 		// leaving Durian-local (rule/flag) tags intact — the tag analogue of
 		// synced_flags.
 		// Idempotent column-add via PRAGMA table_info (same as v21→v22): SQLite

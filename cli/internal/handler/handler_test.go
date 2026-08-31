@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +62,38 @@ func TestOutboxSaveToLocalStoreMarksMessageSeen(t *testing.T) {
 	}
 	if msg == nil || msg.Flags != `\Seen` {
 		t.Fatalf("saved message = %+v, want \\Seen", msg)
+	}
+}
+
+func TestNewMailInfosUsesExactStableMessageIdentifiers(t *testing.T) {
+	db := newTestStore(t)
+	now := time.Now().Unix()
+	first := &store.Message{
+		StableID: "email-1", MessageID: "duplicate@example.com", Subject: "First",
+		FromAddr: "First Sender <first@example.com>", Date: now, CreatedAt: now,
+		BodyText: "first body", Account: "work", Mailbox: "ALL", FetchedBody: true,
+	}
+	second := &store.Message{
+		StableID: "email-2", MessageID: "duplicate@example.com", Subject: "Second",
+		FromAddr: "Second Sender <second@example.com>", Date: now + 1, CreatedAt: now,
+		BodyText: "second body", Account: "work", Mailbox: "ALL", FetchedBody: true,
+	}
+	for _, msg := range []*store.Message{first, second} {
+		if err := db.InsertMessage(msg); err != nil {
+			t.Fatalf("insert %s: %v", msg.StableID, err)
+		}
+	}
+
+	identifiers := []string{
+		"local:" + strconv.FormatInt(second.ID, 10),
+		"local:" + strconv.FormatInt(first.ID, 10),
+	}
+	infos := newMailInfos(db, "work", identifiers)
+	if len(infos) != 2 {
+		t.Fatalf("newMailInfos returned %d messages, want 2", len(infos))
+	}
+	if infos[0].Subject != "Second" || infos[0].From != "Second Sender" || infos[1].Subject != "First" {
+		t.Fatalf("newMailInfos returned wrong duplicate rows: %+v", infos)
 	}
 }
 

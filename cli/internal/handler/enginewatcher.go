@@ -416,7 +416,7 @@ func (w *EngineWatcher) syncAccountMode(ctx context.Context, account *config.Acc
 			"account", account.AccountIdentifier(), "new", res.New,
 			"deleted", res.Deleted, "moved", res.Moved, "inbox_only", inboxOnly)
 	}
-	w.broadcastNewMail(account, res.NewMessageIDs)
+	w.broadcastNewMail(account, res.NewMessageIdentifiers)
 	return nil
 }
 
@@ -434,11 +434,11 @@ func watchedFolders(inboxOnly bool, capabilities backend.Capabilities) []string 
 // broadcastNewMail turns the engine's new inbox arrivals into a NewMailEvent.
 // Unlike the IMAP watcher's UIDNEXT diffing, this works for any backend: the
 // engine already knows which messages it created this run.
-func (w *EngineWatcher) broadcastNewMail(account *config.AccountConfig, messageIDs []string) {
-	if len(messageIDs) == 0 {
+func (w *EngineWatcher) broadcastNewMail(account *config.AccountConfig, identifiers []string) {
+	if len(identifiers) == 0 {
 		return
 	}
-	messages := newMailInfos(w.store, account.Email, messageIDs)
+	messages := newMailInfos(w.store, account.Email, identifiers)
 	if len(messages) == 0 {
 		return
 	}
@@ -451,22 +451,23 @@ func (w *EngineWatcher) broadcastNewMail(account *config.AccountConfig, messageI
 	})
 }
 
-// newMailInfos resolves Message-IDs to the payload a NewMailEvent carries,
+// newMailInfos resolves exact local identifiers or legacy Message-IDs to the
+// payload a NewMailEvent carries,
 // skipping anything the store cannot resolve. Shared by both watchers: the
 // IMAP one arrives here from a UID search, the engine one from the ingest
 // result, and from this point on a new message is a new message.
-func newMailInfos(st *store.DB, account string, messageIDs []string) []NewMailInfo {
-	messages := make([]NewMailInfo, 0, len(messageIDs))
-	for _, messageID := range messageIDs {
-		msg, err := st.GetByMessageID(messageID)
+func newMailInfos(st *store.DB, account string, identifiers []string) []NewMailInfo {
+	messages := make([]NewMailInfo, 0, len(identifiers))
+	for _, identifier := range identifiers {
+		msg, err := st.GetByIdentifier(identifier)
 		if err != nil {
 			slog.Error("Store lookup failed", "module", "WATCH", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-				"account", account, "message_id", messageID, "err", err)
+				"account", account, "message_id", identifier, "err", err)
 			continue
 		}
 		if msg == nil {
 			slog.Debug("Message not yet in store", "module", "WATCH", // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-				"account", account, "message_id", messageID)
+				"account", account, "message_id", identifier)
 			continue
 		}
 		from := msg.FromAddr
