@@ -224,7 +224,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 	if err := json.Unmarshal([]byte(item.DraftJSON), &draft); err != nil {
 		slog.Error("Failed to unmarshal draft", "module", "OUTBOX", "id", item.ID, "err", err) // encgrep:allow word "draft" in message text, no draft value logged
 		if transitionErr := w.store.MarkAttempted(item.ID, sanitizeOutboxError(err)); transitionErr != nil {
-			slog.Error("Failed to record invalid outbox draft", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
+			slog.Error("Failed to record invalid outbox draft", "module", "OUTBOX", "id", item.ID, "err", transitionErr) // encgrep:allow word "draft" is static; outbox id and store error are operational metadata
 			return false
 		}
 		return true

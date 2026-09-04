@@ -96,10 +96,10 @@ func (d *DB) AcquireAccountSync(ctx context.Context, account string) (func(), er
 	return func() {
 		once.Do(func() {
 			if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN); err != nil {
-				slog.Warn("Could not unlock account sync", "module", "STORE", "err", err)
+				slog.Warn("Could not unlock account sync", "module", "STORE", "err", err) // encgrep:allow static message only; syscall error contains no account value
 			}
 			if err := lockFile.Close(); err != nil {
-				slog.Warn("Could not close account sync lock", "module", "STORE", "err", err)
+				slog.Warn("Could not close account sync lock", "module", "STORE", "err", err) // encgrep:allow static message only; close error contains no account value
 			}
 		})
 	}, nil

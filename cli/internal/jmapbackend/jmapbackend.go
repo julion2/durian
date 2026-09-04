@@ -337,7 +337,7 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 	}
 	state := decodeCursor(cursor)
 	if len(cursor) > 0 && state.AccountScope != b.client.accountScope {
-		slog.Info("JMAP provider account changed, starting replacement snapshot", "module", "JMAPBACKEND")
+		slog.Info("JMAP provider account changed, starting replacement snapshot", "module", "JMAPBACKEND") // encgrep:allow static message only; no account value is logged
 		return b.startReplacement(ctx, limit)
 	}
 	state.AccountScope = b.client.accountScope
