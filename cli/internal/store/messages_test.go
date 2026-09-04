@@ -7,8 +7,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	durianmail "github.com/julion2/durian/cli/internal/mail"
 )
 
 func TestInsertAndGetMessage(t *testing.T) {
@@ -304,7 +302,7 @@ func TestIngestPendingRequiresExplicitCompletion(t *testing.T) {
 	}
 }
 
-func TestStablePromotionSkipsFallbackRefreshInProgress(t *testing.T) {
+func TestStableIdentityDoesNotClaimFallbackRefreshInProgress(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "promotion-refresh.db")
 	kr := testKeyring(t)
 	first, err := Open(dbPath, kr)
@@ -365,18 +363,10 @@ func TestStablePromotionSkipsFallbackRefreshInProgress(t *testing.T) {
 		t.Fatalf("fallback refresh state = %+v, err=%v", pending, err)
 	}
 
-	content := &durianmail.MailContent{
-		From: fallback.FromAddr, To: fallback.ToAddrs, Subject: fallback.Subject, Body: fallback.BodyText,
-		Attachments: []durianmail.AttachmentInfo{{
-			PartID: 1, Filename: "same.bin", ContentType: "application/octet-stream", Size: 1, Disposition: "attachment",
-		}},
-	}
-	fingerprint := durianmail.SyntheticFingerprint(content, fallback.Date)
 	stable := *fallback
 	stable.ID = 0
 	stable.StableID = "provider-object"
 	stable.RemoteRef = "provider-object"
-	stable.PromotionFingerprint = fingerprint[:]
 	if err := second.InsertMessage(&stable); err != nil {
 		t.Fatal(err)
 	}

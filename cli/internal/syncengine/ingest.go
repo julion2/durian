@@ -223,9 +223,6 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	storeMsg.RemoteRef = msg.Ref.ID
 	storeMsg.SyntheticIdentity = syntheticIdentity
 	fingerprint := durianmail.SyntheticFingerprint(content, dateUnix)
-	if msg.StableID != "" {
-		storeMsg.PromotionFingerprint = append([]byte(nil), fingerprint[:]...)
-	}
 	if syntheticIdentity {
 		storeMsg.SyntheticFingerprint = append([]byte(nil), fingerprint[:]...)
 	}

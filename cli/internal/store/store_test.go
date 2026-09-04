@@ -46,8 +46,8 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 31 {
-		t.Errorf("version = %d, want 31", version)
+	if version != 34 {
+		t.Errorf("version = %d, want 34", version)
 	}
 }
 
@@ -83,8 +83,8 @@ func TestMigrateV29AddsProviderNativeState(t *testing.T) {
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 31 {
-		t.Fatalf("version = %d, want 31", version)
+	if version != 34 {
+		t.Fatalf("version = %d, want 34", version)
 	}
 	hasStableID, err := hasColumn(db.db, "messages", "stable_id")
 	if err != nil || !hasStableID {
@@ -140,8 +140,8 @@ func TestMigrateV30AddsIngestGeneration(t *testing.T) {
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 31 {
-		t.Fatalf("version = %d, want 31", version)
+	if version != 34 {
+		t.Fatalf("version = %d, want 34", version)
 	}
 	stored, err := db.GetByMessageID(seed.MessageID)
 	if err != nil || stored == nil || !stored.IngestPending || stored.IngestGeneration != 0 {
@@ -156,6 +156,66 @@ func TestMigrateV30AddsIngestGeneration(t *testing.T) {
 	}
 	if refresh.IngestGeneration != 1 {
 		t.Fatalf("claimed migrated ingest generation = %d, want 1", refresh.IngestGeneration)
+	}
+}
+
+func TestMigrateV31AddsDurableOutboxClaims(t *testing.T) {
+	db := newTestDB(t)
+	id, err := db.Enqueue(`{"subject":"preserved"}`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		"ALTER TABLE outbox DROP COLUMN delivery_confirmed",
+		"ALTER TABLE outbox DROP COLUMN in_flight",
+		"UPDATE schema_version SET version = 31 WHERE rowid = 1",
+	} {
+		if _, err := db.db.Exec(stmt); err != nil {
+			t.Fatalf("prepare v31 schema: %v\nstmt: %s", err, stmt)
+		}
+	}
+
+	if err := db.Init(); err != nil {
+		t.Fatalf("migrate v31→v32: %v", err)
+	}
+	var version int
+	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 34 {
+		t.Fatalf("version = %d, want 34", version)
+	}
+	item, err := db.ClaimNextOutboxItem()
+	if err != nil || item == nil || item.ID != id || !item.InFlight || item.DeliveryConfirmed {
+		t.Fatalf("migrated outbox claim = %#v, %v", item, err)
+	}
+}
+
+func TestMigrateV33AddsDurableOutboxIdempotency(t *testing.T) {
+	db := newTestDB(t)
+	if _, err := db.db.Exec("DROP TABLE outbox_idempotency"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("UPDATE schema_version SET version = 33 WHERE rowid = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Init(); err != nil {
+		t.Fatalf("migrate v33→v34: %v", err)
+	}
+	firstID, _, err := db.EnqueueIdempotent(`{"subject":"first"}`, 0, "migrated-send-action")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, _, err := db.EnqueueIdempotent(`{"subject":"duplicate"}`, 0, "migrated-send-action")
+	if err != nil || secondID != firstID {
+		t.Fatalf("migrated idempotency first=%d second=%d err=%v", firstID, secondID, err)
+	}
+	var version int
+	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 34 {
+		t.Fatalf("version = %d, want 34", version)
 	}
 }
 
@@ -220,8 +280,8 @@ func TestMigrateV27MarksLegacySyntheticCandidateWithoutClaimingProvenance(t *tes
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 31 {
-		t.Fatalf("version = %d, want 31", version)
+	if version != 34 {
+		t.Fatalf("version = %d, want 34", version)
 	}
 }
 
@@ -606,8 +666,8 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 31 {
-		t.Fatalf("version = %d, want 31", version)
+	if version != 34 {
+		t.Fatalf("version = %d, want 34", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).

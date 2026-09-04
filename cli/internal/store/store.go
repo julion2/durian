@@ -24,6 +24,7 @@ type DB struct {
 	keyring        *dbcrypto.Keyring
 	accountAliases map[string]string
 	ingestLocks    *ingestLocks
+	syncLocks      *accountSyncLocks
 }
 
 // SetAccountAliases configures user-facing account identifiers (aliases,
@@ -131,7 +132,10 @@ func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
 		}
 	}
 
-	return &DB{db: db, keyring: kr, ingestLocks: newIngestLocks(dbPath)}, nil
+	return &DB{
+		db: db, keyring: kr,
+		ingestLocks: newIngestLocks(dbPath), syncLocks: newAccountSyncLocks(dbPath),
+	}, nil
 }
 
 // OpenReadOnly opens an existing store without creating directories, changing
@@ -338,7 +342,15 @@ func (d *DB) Init() error {
 			last_error TEXT,
 			created_at INTEGER NOT NULL,
 			last_attempted_at INTEGER DEFAULT 0,
-			send_after INTEGER DEFAULT 0
+			send_after INTEGER DEFAULT 0,
+			in_flight INTEGER NOT NULL DEFAULT 0 CHECK(in_flight IN (0, 1)),
+			delivery_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(delivery_confirmed IN (0, 1))
+		)`,
+		`CREATE TABLE IF NOT EXISTS outbox_idempotency (
+			idempotency_key TEXT PRIMARY KEY,
+			outbox_id INTEGER NOT NULL,
+			send_after INTEGER NOT NULL,
+			created_at INTEGER NOT NULL
 		)`,
 
 		// local_drafts was first added in the v6→v7 migration. Listing it
@@ -1291,6 +1303,76 @@ func (d *DB) migrate() error {
 		}
 		if _, err := d.db.Exec("UPDATE schema_version SET version = 31 WHERE rowid = 1"); err != nil {
 			return fmt.Errorf("migrate v30→v31 bump: %w", err)
+		}
+		version = 31
+	}
+
+	if version < 32 {
+		// Claim an outbox item durably before any delivery attempt. A process
+		// crash after the provider accepts a message cannot safely distinguish
+		// success from failure, so a claimed item must remain blocked for manual
+		// reconciliation rather than being submitted automatically again. Keep
+		// confirmed delivery as a separate durable bit so an accepted message can
+		// never be requeued through the not-delivered transition.
+		has, err := hasColumn(d.db, "outbox", "in_flight")
+		if err != nil {
+			return fmt.Errorf("migrate v31→v32 inspect in_flight: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE outbox ADD COLUMN in_flight INTEGER NOT NULL DEFAULT 0 CHECK(in_flight IN (0, 1))"); err != nil {
+				return fmt.Errorf("migrate v31→v32 add in_flight: %w", err)
+			}
+		}
+		has, err = hasColumn(d.db, "outbox", "delivery_confirmed")
+		if err != nil {
+			return fmt.Errorf("migrate v31→v32 inspect delivery_confirmed: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE outbox ADD COLUMN delivery_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(delivery_confirmed IN (0, 1))"); err != nil {
+				return fmt.Errorf("migrate v31→v32 add delivery_confirmed: %w", err)
+			}
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 32 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v31→v32 bump: %w", err)
+		}
+		version = 32
+	}
+
+	if version < 33 {
+		stmts := []string{
+			`CREATE TABLE IF NOT EXISTS snapshot_episodes (
+				account TEXT NOT NULL, folder TEXT NOT NULL,
+				base_cursor BLOB NOT NULL,
+				checkpoint_cursor BLOB NOT NULL,
+				complete INTEGER NOT NULL DEFAULT 0 CHECK(complete IN (0, 1)),
+				PRIMARY KEY(account, folder))`,
+			`CREATE TABLE IF NOT EXISTS snapshot_present_refs (
+				account TEXT NOT NULL, folder TEXT NOT NULL, remote_ref TEXT NOT NULL,
+				seen INTEGER NOT NULL DEFAULT 0 CHECK(seen IN (0, 1)),
+				present INTEGER NOT NULL DEFAULT 0 CHECK(present IN (0, 1)),
+				PRIMARY KEY(account, folder, remote_ref),
+				FOREIGN KEY(account, folder) REFERENCES snapshot_episodes(account, folder) ON DELETE CASCADE)`,
+			`CREATE INDEX IF NOT EXISTS idx_snapshot_present_episode ON snapshot_present_refs(account, folder, remote_ref)`,
+			`UPDATE schema_version SET version = 33 WHERE rowid = 1`,
+		}
+		for _, stmt := range stmts {
+			if _, err := d.db.Exec(stmt); err != nil {
+				return fmt.Errorf("migrate v32→v33: %w", err)
+			}
+		}
+		version = 33
+	}
+
+	if version < 34 {
+		if _, err := d.db.Exec(`CREATE TABLE IF NOT EXISTS outbox_idempotency (
+			idempotency_key TEXT PRIMARY KEY,
+			outbox_id INTEGER NOT NULL,
+			send_after INTEGER NOT NULL,
+			created_at INTEGER NOT NULL)`); err != nil {
+			return fmt.Errorf("migrate v33→v34 create outbox idempotency: %w", err)
+		}
+		if _, err := d.db.Exec("UPDATE schema_version SET version = 34 WHERE rowid = 1"); err != nil {
+			return fmt.Errorf("migrate v33→v34 bump: %w", err)
 		}
 	}
 

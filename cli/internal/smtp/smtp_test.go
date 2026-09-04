@@ -3,6 +3,7 @@ package smtp
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/smtp"
 	"net/textproto"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/julion2/durian/cli/internal/mailsend"
 	"github.com/julion2/durian/cli/internal/redact"
 )
 
@@ -38,6 +40,62 @@ func TestSMTPServerErrorPreservesCallerTextAndProvidesSafeLogText(t *testing.T) 
 	}
 	if strings.Contains(safeErr.SafeLogText(), response) || strings.Contains(safeErr.SafeLogText(), "private@example.test") {
 		t.Fatalf("safe log text leaked SMTP data: %q", safeErr.SafeLogText())
+	}
+}
+
+func TestSMTPDataCompletionDistinguishesTransportLossFromServerResponse(t *testing.T) {
+	transportLoss := classifyDataCompletionError(io.ErrUnexpectedEOF)
+	if got := classifySMTPError(transportLoss); got != mailsend.KindAmbiguous {
+		t.Fatalf("DATA completion transport loss kind = %v, want ambiguous", got)
+	}
+	if !errors.Is(transportLoss, io.ErrUnexpectedEOF) {
+		t.Fatal("DATA completion transport loss discarded its cause")
+	}
+
+	temporary := classifyDataCompletionError(&textproto.Error{Code: 451, Msg: "try later"})
+	if got := classifySMTPError(temporary); got != mailsend.KindTransient {
+		t.Fatalf("DATA completion 451 kind = %v, want transient", got)
+	}
+	permanent := classifyDataCompletionError(&textproto.Error{Code: 550, Msg: "rejected"})
+	if got := classifySMTPError(permanent); got != mailsend.KindPermanent {
+		t.Fatalf("DATA completion 550 kind = %v, want permanent", got)
+	}
+}
+
+type failingSMTPDataWriter struct {
+	writeErr error
+	written  int
+	closed   bool
+}
+
+func (w *failingSMTPDataWriter) Write(data []byte) (int, error) {
+	if w.written != 0 {
+		return w.written, w.writeErr
+	}
+	return len(data), w.writeErr
+}
+func (w *failingSMTPDataWriter) Close() error {
+	w.closed = true
+	return nil
+}
+
+func TestSMTPWriteFailureAbortsWithoutFinalizingData(t *testing.T) {
+	w := &failingSMTPDataWriter{written: 1, writeErr: &net.OpError{Op: "write", Net: "tcp", Err: io.ErrUnexpectedEOF}}
+	err := writeSMTPData(w, []byte("complete message"))
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("write error = %v", err)
+	}
+	if w.closed {
+		t.Fatal("failed DATA write was finalized")
+	}
+	if got := classifySMTPError(err); got != mailsend.KindNetwork {
+		t.Fatalf("aborted DATA write kind = %v, want retryable network", got)
+	}
+
+	short := &failingSMTPDataWriter{written: 1}
+	err = writeSMTPData(short, []byte("complete message"))
+	if !errors.Is(err, io.ErrShortWrite) || short.closed || classifySMTPError(err) != mailsend.KindNetwork {
+		t.Fatalf("short DATA write error=%v finalized=%v kind=%v", err, short.closed, classifySMTPError(err))
 	}
 }
 

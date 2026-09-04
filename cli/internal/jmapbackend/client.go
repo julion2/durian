@@ -4,19 +4,22 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/julion2/durian/cli/internal/redact"
@@ -29,6 +32,11 @@ const (
 	maxSessionBytes      = 4 << 20
 	maxMethodBytes       = 64 << 20
 	maxMessageBytes      = 100 << 20
+	maxEventBytes        = 1 << 20
+	minEventRetry        = time.Second
+	maxEventRetry        = 5 * time.Minute
+	eventHeaderTimeout   = 30 * time.Second
+	eventIdleTimeout     = 90 * time.Second
 	maxJSONSafeInteger   = int64(1<<53 - 1)
 	maxClientAPIRequests = 16
 	maxClientUploads     = 4
@@ -38,10 +46,12 @@ type session struct {
 	Capabilities    map[string]json.RawMessage `json:"capabilities"`
 	Accounts        map[string]sessionAccount  `json:"accounts"`
 	PrimaryAccounts map[string]string          `json:"primaryAccounts"`
+	Username        *string                    `json:"username"`
 	APIURL          string                     `json:"apiUrl"`
 	DownloadURL     string                     `json:"downloadUrl"`
 	UploadURL       string                     `json:"uploadUrl"`
 	EventSourceURL  string                     `json:"eventSourceUrl"`
+	State           string                     `json:"state"`
 }
 
 type sessionAccount struct {
@@ -49,6 +59,116 @@ type sessionAccount struct {
 	IsPersonal          bool                       `json:"isPersonal"`
 	IsReadOnly          bool                       `json:"isReadOnly"`
 	AccountCapabilities map[string]json.RawMessage `json:"accountCapabilities"`
+}
+
+func (s *session) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Capabilities    *map[string]json.RawMessage `json:"capabilities"`
+		Accounts        *map[string]sessionAccount  `json:"accounts"`
+		PrimaryAccounts *map[string]string          `json:"primaryAccounts"`
+		Username        *string                     `json:"username"`
+		APIURL          *string                     `json:"apiUrl"`
+		DownloadURL     *string                     `json:"downloadUrl"`
+		UploadURL       *string                     `json:"uploadUrl"`
+		EventSourceURL  *string                     `json:"eventSourceUrl"`
+		State           *string                     `json:"state"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	requiredObjects := []struct {
+		name  string
+		value any
+	}{
+		{"capabilities", wire.Capabilities},
+		{"accounts", wire.Accounts},
+		{"primaryAccounts", wire.PrimaryAccounts},
+	}
+	for _, field := range requiredObjects {
+		if reflect.ValueOf(field.value).IsNil() {
+			return fmt.Errorf("missing required %s", field.name)
+		}
+	}
+	requiredStrings := []struct {
+		name  string
+		value *string
+	}{
+		{"username", wire.Username},
+		{"apiUrl", wire.APIURL},
+		{"downloadUrl", wire.DownloadURL},
+		{"uploadUrl", wire.UploadURL},
+		{"eventSourceUrl", wire.EventSourceURL},
+		{"state", wire.State},
+	}
+	for _, field := range requiredStrings {
+		if field.value == nil {
+			return fmt.Errorf("missing required %s", field.name)
+		}
+	}
+	if err := validateCapabilityObjects("capabilities", *wire.Capabilities); err != nil {
+		return err
+	}
+	for id, account := range *wire.Accounts {
+		if !validJMAPID(id) {
+			return fmt.Errorf("accounts contains invalid account id %q", id)
+		}
+		if err := validateCapabilityObjects("accountCapabilities", account.AccountCapabilities); err != nil {
+			return fmt.Errorf("account %q: %w", id, err)
+		}
+	}
+	for capability, id := range *wire.PrimaryAccounts {
+		account, ok := (*wire.Accounts)[id]
+		if capability == "" || !validJMAPID(id) || !ok {
+			return fmt.Errorf("primaryAccounts contains invalid account %q for capability %q", id, capability)
+		}
+		if _, ok := account.AccountCapabilities[capability]; !ok {
+			return fmt.Errorf("primary account %q does not advertise capability %q", id, capability)
+		}
+	}
+	*s = session{
+		Capabilities:    *wire.Capabilities,
+		Accounts:        *wire.Accounts,
+		PrimaryAccounts: *wire.PrimaryAccounts,
+		Username:        wire.Username,
+		APIURL:          *wire.APIURL,
+		DownloadURL:     *wire.DownloadURL,
+		UploadURL:       *wire.UploadURL,
+		EventSourceURL:  *wire.EventSourceURL,
+		State:           *wire.State,
+	}
+	return nil
+}
+
+func (a *sessionAccount) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Name                *string                     `json:"name"`
+		IsPersonal          *bool                       `json:"isPersonal"`
+		IsReadOnly          *bool                       `json:"isReadOnly"`
+		AccountCapabilities *map[string]json.RawMessage `json:"accountCapabilities"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.Name == nil || wire.IsPersonal == nil || wire.IsReadOnly == nil || wire.AccountCapabilities == nil {
+		return errors.New("missing required name, isPersonal, isReadOnly, or accountCapabilities")
+	}
+	*a = sessionAccount{
+		Name:                *wire.Name,
+		IsPersonal:          *wire.IsPersonal,
+		IsReadOnly:          *wire.IsReadOnly,
+		AccountCapabilities: *wire.AccountCapabilities,
+	}
+	return nil
+}
+
+func validateCapabilityObjects(name string, capabilities map[string]json.RawMessage) error {
+	for capability, raw := range capabilities {
+		var object map[string]json.RawMessage
+		if capability == "" || json.Unmarshal(raw, &object) != nil || object == nil {
+			return fmt.Errorf("%s contains an invalid object for capability %q", name, capability)
+		}
+	}
+	return nil
 }
 
 type coreLimits struct {
@@ -117,14 +237,16 @@ type credential struct {
 }
 
 type client struct {
-	httpClient *http.Client
-	sessionURL string
-	credential credential
-	session    session
-	accountID  string
-	limits     coreLimits
-	apiSem     *requestLimiter
-	uploadSem  *requestLimiter
+	httpClient   *http.Client
+	sessionURL   string
+	credential   credential
+	session      session
+	accountID    string
+	accountScope string
+	limits       coreLimits
+	apiSem       *requestLimiter
+	uploadSem    *requestLimiter
+	sessionStale atomic.Bool
 }
 
 type requestLimiter struct {
@@ -194,7 +316,7 @@ type methodEnvelope struct {
 
 type methodResponseEnvelope struct {
 	MethodResponses []json.RawMessage `json:"methodResponses"`
-	SessionState    string            `json:"sessionState"`
+	SessionState    *string           `json:"sessionState"`
 }
 
 type methodResponseTarget struct {
@@ -202,6 +324,16 @@ type methodResponseTarget struct {
 	out  interface{}
 	seen bool
 }
+
+var errJMAPLocalPermanent = errors.New("permanent local JMAP failure")
+
+type protocolError struct {
+	err              error
+	primaryAmbiguous bool
+}
+
+func (e *protocolError) Error() string { return e.err.Error() }
+func (e *protocolError) Unwrap() error { return e.err }
 
 type methodError struct {
 	Type        string `json:"type"`
@@ -265,19 +397,45 @@ func (c *client) discover(ctx context.Context) error {
 				candidates = append(candidates, id)
 			}
 		}
-		sort.Strings(candidates)
 		accountID = ""
-		if len(candidates) > 0 {
+		if len(candidates) == 1 {
 			accountID = candidates[0]
+		} else if len(candidates) > 1 {
+			return errors.New("JMAP session has multiple writable mail accounts and no valid primary account")
 		}
 	}
 	if accountID == "" {
 		return errors.New("JMAP session has no writable mail account")
 	}
-	if strings.TrimSpace(c.session.APIURL) == "" {
-		return errors.New("JMAP session has no apiUrl")
+	for name, endpoint := range map[string]string{
+		"apiUrl": c.session.APIURL, "downloadUrl": c.session.DownloadURL,
+		"uploadUrl": c.session.UploadURL, "eventSourceUrl": c.session.EventSourceURL,
+	} {
+		if strings.TrimSpace(endpoint) == "" {
+			return fmt.Errorf("JMAP session has no %s", name)
+		}
+	}
+	for name, template := range map[string]struct {
+		value     string
+		variables []string
+	}{
+		"downloadUrl":    {c.session.DownloadURL, []string{"accountId", "blobId", "type", "name"}},
+		"uploadUrl":      {c.session.UploadURL, []string{"accountId"}},
+		"eventSourceUrl": {c.session.EventSourceURL, []string{"types", "closeafter", "ping"}},
+	} {
+		if err := requireTemplateVariables(template.value, template.variables...); err != nil {
+			return fmt.Errorf("invalid JMAP %s: %w", name, err)
+		}
+	}
+	principal := *c.session.Username
+	if principal == "" {
+		principal = c.credential.username
+		if principal == "" {
+			return errors.New("JMAP session username is empty and no configured principal is available")
+		}
 	}
 	c.accountID = accountID
+	c.accountScope = providerAccountScope(c.sessionURL, principal, accountID)
 	c.session.APIURL = resolveURL(c.sessionURL, c.session.APIURL)
 	c.session.DownloadURL = resolveURL(c.sessionURL, c.session.DownloadURL)
 	c.session.UploadURL = resolveURL(c.sessionURL, c.session.UploadURL)
@@ -286,10 +444,8 @@ func (c *client) discover(ctx context.Context) error {
 		"apiUrl": c.session.APIURL, "downloadUrl": c.session.DownloadURL,
 		"uploadUrl": c.session.UploadURL, "eventSourceUrl": c.session.EventSourceURL,
 	} {
-		if endpoint != "" {
-			if err := validateJMAPURL(endpoint); err != nil {
-				return fmt.Errorf("invalid JMAP %s: %w", name, err)
-			}
+		if err := validateJMAPURL(endpoint); err != nil {
+			return fmt.Errorf("invalid JMAP %s: %w", name, err)
 		}
 	}
 	limiters := sharedAccountLimiters(c.session.APIURL, c.accountID)
@@ -299,7 +455,32 @@ func (c *client) discover(ctx context.Context) error {
 		limiters.upload.configure(min(c.limits.MaxConcurrentUpload, maxClientUploads))
 		c.uploadSem = &limiters.upload
 	}
+	c.sessionStale.Store(false)
 	return nil
+}
+
+func requireTemplateVariables(template string, variables ...string) error {
+	for _, variable := range variables {
+		if !strings.Contains(template, "{"+variable+"}") {
+			return fmt.Errorf("URI template must contain {%s}", variable)
+		}
+	}
+	return nil
+}
+
+// providerAccountScope binds provider object IDs and sync cursors to the
+// authenticated JMAP account that issued them. Email.id and state values are
+// only unique within one account, while a Durian account alias is mutable.
+func providerAccountScope(sessionURL, username, accountID string) string {
+	service := strings.TrimSpace(sessionURL)
+	if parsed, err := url.Parse(sessionURL); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		parsed.Scheme = strings.ToLower(parsed.Scheme)
+		parsed.Host = strings.ToLower(parsed.Host)
+		parsed.Fragment = ""
+		service = parsed.String()
+	}
+	sum := sha256.Sum256([]byte("jmap\x00" + service + "\x00" + username + "\x00" + accountID))
+	return hex.EncodeToString(sum[:])
 }
 
 func resolveURL(base, ref string) string {
@@ -319,21 +500,21 @@ func resolveURL(base, ref string) string {
 
 func (c *client) call(ctx context.Context, using []string, method string, args, out interface{}, additional ...*methodResponseTarget) error {
 	if c.apiSem != nil && strings.HasSuffix(method, "/set") && c.limits.MaxObjectsInSet == 0 {
-		return fmt.Errorf("JMAP core capability does not permit %s operations", method)
+		return fmt.Errorf("%w: JMAP core capability does not permit %s operations", errJMAPLocalPermanent, method)
 	}
 	body, err := json.Marshal(methodEnvelope{
 		Using:       using,
 		MethodCalls: [][]interface{}{{method, args, "0"}},
 	})
 	if err != nil {
-		return fmt.Errorf("encode %s request: %w", method, err)
+		return fmt.Errorf("%w: encode %s request: %v", errJMAPLocalPermanent, method, err)
 	}
 	requestLimit := int64(maxMethodBytes)
 	if c.limits.MaxSizeRequest > 0 && c.limits.MaxSizeRequest < requestLimit {
 		requestLimit = c.limits.MaxSizeRequest
 	}
 	if int64(len(body)) > requestLimit {
-		return fmt.Errorf("%s request is %d bytes, exceeds JMAP maxSizeRequest %d", method, len(body), requestLimit)
+		return fmt.Errorf("%w: %s request is %d bytes, exceeds JMAP maxSizeRequest %d", errJMAPLocalPermanent, method, len(body), requestLimit)
 	}
 	release, err := acquire(ctx, c.apiSem)
 	if err != nil {
@@ -350,87 +531,114 @@ func (c *client) call(ctx context.Context, using []string, method string, args, 
 	if err := decodeJSONLimited(resp.Body, maxMethodBytes, &envelope); err != nil {
 		return fmt.Errorf("decode %s response: %w", method, err)
 	}
+	if envelope.SessionState == nil {
+		return &protocolError{err: fmt.Errorf("%s response omitted required sessionState", method), primaryAmbiguous: true}
+	}
+	if *envelope.SessionState != c.session.State {
+		c.sessionStale.Store(true)
+		return &protocolError{
+			err:              fmt.Errorf("JMAP Session changed during %s; rediscovery is required", method),
+			primaryAmbiguous: true,
+		}
+	}
 	if len(envelope.MethodResponses) == 0 {
 		return fmt.Errorf("%s returned no method responses", method)
 	}
 	var responseErr *methodError
 	var protocolErr error
-	recordProtocolError := func(err error) {
+	primaryAmbiguous := false
+	recordProtocolError := func(err error, primary bool) {
 		if protocolErr == nil {
 			protocolErr = err
 		}
+		primaryAmbiguous = primaryAmbiguous || primary
 	}
 	found := false
 	for _, raw := range envelope.MethodResponses {
 		var tuple []json.RawMessage
 		if err := json.Unmarshal(raw, &tuple); err != nil {
-			recordProtocolError(fmt.Errorf("decode %s method response: %w", method, err))
+			recordProtocolError(fmt.Errorf("decode %s method response: %w", method, err), false)
 			continue
 		}
 		if len(tuple) != 3 {
-			recordProtocolError(fmt.Errorf("decode %s method response: tuple has %d elements, want 3", method, len(tuple)))
+			recordProtocolError(fmt.Errorf("decode %s method response: tuple has %d elements, want 3", method, len(tuple)), false)
 			continue
 		}
 		var callID string
 		if err := json.Unmarshal(tuple[2], &callID); err != nil {
-			recordProtocolError(fmt.Errorf("decode %s response call ID: %w", method, err))
+			recordProtocolError(fmt.Errorf("decode %s response call ID: %w", method, err), false)
 			continue
 		}
 		if callID != "0" {
-			recordProtocolError(fmt.Errorf("JMAP %s response has call ID %q, want %q", method, callID, "0"))
+			recordProtocolError(fmt.Errorf("JMAP %s response has call ID %q, want %q", method, callID, "0"), false)
 			continue
 		}
 		var responseName string
 		if err := json.Unmarshal(tuple[0], &responseName); err != nil {
-			recordProtocolError(fmt.Errorf("decode %s response name: %w", method, err))
+			recordProtocolError(fmt.Errorf("decode %s response name: %w", method, err), false)
 			continue
 		}
 		if responseName == "error" {
 			var methodErr methodError
 			if err := decodeMethodPayload(tuple[1], &methodErr); err != nil {
-				recordProtocolError(fmt.Errorf("decode %s method error: %w", method, err))
+				recordProtocolError(fmt.Errorf("decode %s method error: %w", method, err), true)
 				continue
 			}
 			if methodErr.Type == "" {
-				recordProtocolError(fmt.Errorf("decode %s method error: missing type", method))
+				recordProtocolError(fmt.Errorf("decode %s method error: missing type", method), true)
 				continue
+			}
+			additionalSeen := false
+			for _, target := range additional {
+				additionalSeen = additionalSeen || target.seen
+			}
+			if responseErr != nil || found || additionalSeen {
+				recordProtocolError(fmt.Errorf("JMAP response included contradictory primary results for %s", method), true)
 			}
 			responseErr = &methodErr
 			continue
 		}
 		if responseName == method {
-			if found {
-				recordProtocolError(fmt.Errorf("JMAP response included duplicate %s results", method))
+			if found || responseErr != nil {
+				recordProtocolError(fmt.Errorf("JMAP response included contradictory primary results for %s", method), true)
 				continue
 			}
 			if err := decodeMethodPayload(tuple[1], out); err != nil {
-				recordProtocolError(fmt.Errorf("decode %s result: %w", method, err))
+				recordProtocolError(fmt.Errorf("decode %s result: %w", method, err), true)
 				continue
 			}
 			found = true
 			continue
 		}
+		matchedAdditional := false
 		for _, target := range additional {
 			if responseName != target.name {
 				continue
 			}
+			matchedAdditional = true
+			if responseErr != nil {
+				recordProtocolError(fmt.Errorf("JMAP response included an implicit %s result with a primary error", responseName), true)
+			}
 			if target.seen {
-				recordProtocolError(fmt.Errorf("JMAP response included duplicate %s results", responseName))
+				recordProtocolError(fmt.Errorf("JMAP response included duplicate %s results", responseName), false)
 				break
 			}
 			if err := decodeMethodPayload(tuple[1], target.out); err != nil {
-				recordProtocolError(fmt.Errorf("decode %s result: %w", responseName, err))
+				recordProtocolError(fmt.Errorf("decode %s result: %w", responseName, err), false)
 				break
 			}
 			target.seen = true
 			break
 		}
+		if !matchedAdditional {
+			recordProtocolError(fmt.Errorf("JMAP response included unexpected %s result", responseName), false)
+		}
+	}
+	if protocolErr != nil {
+		return &protocolError{err: protocolErr, primaryAmbiguous: primaryAmbiguous}
 	}
 	if responseErr != nil {
 		return responseErr
-	}
-	if protocolErr != nil {
-		return protocolErr
 	}
 	if !found {
 		return fmt.Errorf("JMAP response did not include %s", method)
@@ -490,8 +698,8 @@ func (c *client) doHTTP(ctx context.Context, method, requestURL string, body []b
 		_ = resp.Body.Close()
 		if safeToRetry && attempt < maxRetries && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) {
 			delay := time.Duration(1<<attempt) * time.Second
-			if seconds, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && seconds > 0 {
-				delay = time.Duration(seconds) * time.Second
+			if retryAfter, ok := parseRetryAfter(resp.Header.Get("Retry-After")); ok {
+				delay = retryAfter
 			}
 			slog.Warn("JMAP request throttled or unavailable, backing off", "module", "JMAPBACKEND",
 				"status", resp.StatusCode, "retry", attempt+1, "delay", delay)
@@ -502,6 +710,25 @@ func (c *client) doHTTP(ctx context.Context, method, requestURL string, body []b
 		}
 		return nil, &statusError{Status: resp.StatusCode, Body: strings.TrimSpace(string(responseBody))}
 	}
+}
+
+func parseRetryAfter(value string) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if strings.IndexFunc(value, func(r rune) bool { return r < '0' || r > '9' }) == -1 {
+		seconds, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || seconds >= uint64(maxEventRetry/time.Second) {
+			return maxEventRetry, true
+		}
+		return max(time.Duration(seconds)*time.Second, minEventRetry), true
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	return min(max(time.Until(when), minEventRetry), maxEventRetry), true
 }
 
 func (c *client) authorize(req *http.Request) {
@@ -579,13 +806,13 @@ func readLimited(r io.Reader, limit int64, description string) ([]byte, error) {
 
 func (c *client) upload(ctx context.Context, data []byte, contentType string) (string, error) {
 	if c.session.UploadURL == "" {
-		return "", errors.New("JMAP session has no uploadUrl")
+		return "", fmt.Errorf("%w: JMAP session has no uploadUrl", errJMAPLocalPermanent)
 	}
 	if c.apiSem != nil && (c.limits.MaxSizeUpload == 0 || c.limits.MaxConcurrentUpload == 0) {
-		return "", errors.New("JMAP core capability does not permit uploads")
+		return "", fmt.Errorf("%w: JMAP core capability does not permit uploads", errJMAPLocalPermanent)
 	}
 	if c.limits.MaxSizeUpload > 0 && int64(len(data)) > c.limits.MaxSizeUpload {
-		return "", fmt.Errorf("JMAP upload is %d bytes, exceeds maxSizeUpload %d", len(data), c.limits.MaxSizeUpload)
+		return "", fmt.Errorf("%w: JMAP upload is %d bytes, exceeds maxSizeUpload %d", errJMAPLocalPermanent, len(data), c.limits.MaxSizeUpload)
 	}
 	release, err := acquire(ctx, c.uploadSem)
 	if err != nil {
@@ -599,15 +826,41 @@ func (c *client) upload(ctx context.Context, data []byte, contentType string) (s
 	}
 	defer resp.Body.Close()
 	var result struct {
-		BlobID string `json:"blobId"`
+		AccountID *string `json:"accountId"`
+		BlobID    *string `json:"blobId"`
+		Type      *string `json:"type"`
+		Size      *int64  `json:"size"`
 	}
 	if err := decodeJSONLimited(resp.Body, maxSessionBytes, &result); err != nil {
 		return "", fmt.Errorf("decode JMAP upload response: %w", err)
 	}
-	if result.BlobID == "" {
-		return "", errors.New("JMAP upload returned no blobId")
+	if result.AccountID == nil || *result.AccountID != c.accountID {
+		return "", errors.New("JMAP upload omitted required matching accountId")
 	}
-	return result.BlobID, nil
+	if result.BlobID == nil || !validJMAPID(*result.BlobID) {
+		return "", errors.New("JMAP upload omitted required valid blobId")
+	}
+	wantType, wantParams, wantErr := mime.ParseMediaType(contentType)
+	gotType, gotParams, gotErr := "", map[string]string(nil), error(nil)
+	if result.Type != nil {
+		gotType, gotParams, gotErr = mime.ParseMediaType(*result.Type)
+	}
+	paramsMatch := len(gotParams) == len(wantParams)
+	for name, want := range wantParams {
+		got, ok := gotParams[name]
+		if !ok || (name == "charset" && !strings.EqualFold(got, want)) || (name != "charset" && got != want) {
+			paramsMatch = false
+			break
+		}
+	}
+	if result.Type == nil || wantErr != nil || gotErr != nil ||
+		!strings.EqualFold(gotType, wantType) || !paramsMatch {
+		return "", errors.New("JMAP upload omitted required matching type")
+	}
+	if result.Size == nil || *result.Size != int64(len(data)) {
+		return "", errors.New("JMAP upload omitted required matching size")
+	}
+	return *result.BlobID, nil
 }
 
 func acquire(ctx context.Context, sem *requestLimiter) (func(), error) {
@@ -655,26 +908,41 @@ func (c *client) watch(ctx context.Context, onChange func()) error {
 	if c.session.EventSourceURL == "" {
 		return errors.New("JMAP session has no eventSourceUrl")
 	}
-	u, err := url.Parse(c.session.EventSourceURL)
+	template := c.session.EventSourceURL
+	u, err := url.Parse(expandTemplate(template, map[string]string{
+		"types": "Email", "closeafter": "no", "ping": "30",
+	}))
 	if err != nil {
 		return fmt.Errorf("parse JMAP eventSourceUrl: %w", err)
 	}
 	q := u.Query()
-	q.Set("types", "Email")
-	q.Set("closeafter", "no")
-	q.Set("ping", "30")
+	if !strings.Contains(template, "{types}") {
+		q.Set("types", "Email")
+	}
+	if !strings.Contains(template, "{closeafter}") {
+		q.Set("closeafter", "no")
+	}
+	if !strings.Contains(template, "{ping}") {
+		q.Set("ping", "30")
+	}
 	u.RawQuery = q.Encode()
 
-	eventClient := *c.httpClient
-	eventClient.Timeout = 0
+	eventClient, err := newEventHTTPClient(c.httpClient, eventHeaderTimeout)
+	if err != nil {
+		return err
+	}
 	var lastEventID string
+	var serverRetry time.Duration
+	var serverRetrySet bool
 	retryAttempt := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		requestCtx, cancelRequest := context.WithCancel(ctx)
+		req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, u.String(), nil)
 		if err != nil {
+			cancelRequest()
 			return err
 		}
 		c.authorize(req)
@@ -683,18 +951,38 @@ func (c *client) watch(ctx context.Context, onChange func()) error {
 			req.Header.Set("Last-Event-ID", lastEventID)
 		}
 		resp, err := eventClient.Do(req)
-		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			lastEventID, err = c.consumeEvents(ctx, resp.Body, lastEventID, onChange)
+		if err == nil && resp.StatusCode == http.StatusNoContent {
+			_ = resp.Body.Close()
+			cancelRequest()
+			return nil
+		}
+		if err == nil && resp.StatusCode == http.StatusOK {
+			if mediaErr := validateEventStreamContentType(resp.Header.Get("Content-Type")); mediaErr != nil {
+				err = mediaErr
+			} else {
+				var retry time.Duration
+				var retrySet bool
+				lastEventID, retry, retrySet, err = c.consumeEventsWithIdleTimeout(ctx, cancelRequest, resp.Body, lastEventID, onChange, eventIdleTimeout)
+				if retrySet {
+					serverRetry = retry
+					serverRetrySet = true
+				}
+			}
 			_ = resp.Body.Close()
 		} else if resp != nil {
 			responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			_ = resp.Body.Close()
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+				cancelRequest()
 				return &statusError{Status: resp.StatusCode, Body: strings.TrimSpace(string(responseBody))}
 			}
 		}
+		cancelRequest()
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if resp != nil && resp.StatusCode != http.StatusOK && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return fmt.Errorf("JMAP EventSource returned unsupported status %d", resp.StatusCode)
 		}
 		if err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			retryAttempt = 0
@@ -705,9 +993,12 @@ func (c *client) watch(ctx context.Context, onChange func()) error {
 		if delay > time.Minute {
 			delay = time.Minute
 		}
+		if serverRetrySet {
+			delay = serverRetry
+		}
 		if resp != nil {
-			if seconds, parseErr := strconv.Atoi(resp.Header.Get("Retry-After")); parseErr == nil && seconds > 0 {
-				delay = time.Duration(seconds) * time.Second
+			if retryAfter, ok := parseRetryAfter(resp.Header.Get("Retry-After")); ok {
+				delay = retryAfter
 			}
 		}
 		slog.Warn("JMAP EventSource disconnected, reconnecting", "module", "JMAPBACKEND",
@@ -718,31 +1009,203 @@ func (c *client) watch(ctx context.Context, onChange func()) error {
 	}
 }
 
-func (c *client) consumeEvents(ctx context.Context, r io.Reader, lastID string, onChange func()) (string, error) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64<<10), 1<<20)
-	var data strings.Builder
-	for scanner.Scan() {
-		if err := ctx.Err(); err != nil {
-			return lastID, err
-		}
-		line := scanner.Text()
-		switch {
-		case strings.HasPrefix(line, "id:"):
-			lastID = strings.TrimSpace(strings.TrimPrefix(line, "id:"))
-		case strings.HasPrefix(line, "data:"):
-			if data.Len() > 0 {
-				data.WriteByte('\n')
-			}
-			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-		case line == "":
-			if stateChangeIncludesEmail(data.String(), c.accountID) {
-				onChange()
-			}
-			data.Reset()
+func newEventHTTPClient(base *http.Client, headerTimeout time.Duration) (*http.Client, error) {
+	if base == nil {
+		return nil, errors.New("JMAP EventSource requires an HTTP client")
+	}
+	transport := base.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	baseTransport, ok := transport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("JMAP EventSource HTTP transport does not support a bounded response-header timeout")
+	}
+	boundedTransport := baseTransport.Clone()
+	if boundedTransport.ResponseHeaderTimeout == 0 || boundedTransport.ResponseHeaderTimeout > headerTimeout {
+		boundedTransport.ResponseHeaderTimeout = headerTimeout
+	}
+	eventClient := *base
+	eventClient.Transport = boundedTransport
+	eventClient.Timeout = 0
+	return &eventClient, nil
+}
+
+func validateEventStreamContentType(contentType string) error {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil || !strings.EqualFold(mediaType, "text/event-stream") {
+		return fmt.Errorf("JMAP EventSource returned invalid Content-Type %q", contentType)
+	}
+	return nil
+}
+
+var errEventStreamIdle = errors.New("JMAP EventSource exceeded its read-idle timeout")
+
+type eventConsumeResult struct {
+	lastID   string
+	retry    time.Duration
+	retrySet bool
+	err      error
+}
+
+type activityReader struct {
+	reader   io.Reader
+	activity chan<- struct{}
+}
+
+func (r activityReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		select {
+		case r.activity <- struct{}{}:
+		default:
 		}
 	}
-	return lastID, scanner.Err()
+	return n, err
+}
+
+func (c *client) consumeEventsWithIdleTimeout(
+	ctx context.Context,
+	cancelRequest context.CancelFunc,
+	body io.ReadCloser,
+	lastID string,
+	onChange func(),
+	idleTimeout time.Duration,
+) (string, time.Duration, bool, error) {
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	activity := make(chan struct{}, 1)
+	result := make(chan eventConsumeResult, 1)
+	go func() {
+		id, retry, retrySet, err := c.consumeEvents(streamCtx, activityReader{reader: body, activity: activity}, lastID, onChange)
+		result <- eventConsumeResult{lastID: id, retry: retry, retrySet: retrySet, err: err}
+	}()
+
+	timer := time.NewTimer(idleTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case consumed := <-result:
+			return consumed.lastID, consumed.retry, consumed.retrySet, consumed.err
+		case <-activity:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(idleTimeout)
+		case <-timer.C:
+			cancel()
+			cancelRequest()
+			_ = body.Close()
+			select {
+			case consumed := <-result:
+				return consumed.lastID, consumed.retry, consumed.retrySet, errEventStreamIdle
+			default:
+				return lastID, 0, false, errEventStreamIdle
+			}
+		case <-ctx.Done():
+			cancel()
+			cancelRequest()
+			_ = body.Close()
+			select {
+			case consumed := <-result:
+				return consumed.lastID, consumed.retry, consumed.retrySet, ctx.Err()
+			default:
+				return lastID, 0, false, ctx.Err()
+			}
+		}
+	}
+}
+
+func (c *client) consumeEvents(ctx context.Context, r io.Reader, lastID string, onChange func()) (string, time.Duration, bool, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Split(splitEventStreamLines)
+	scanner.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	var data strings.Builder
+	pendingID := lastID
+	idSeen := false
+	var retry time.Duration
+	retrySet := false
+	firstLine := true
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return lastID, retry, retrySet, err
+		}
+		line := scanner.Text()
+		if firstLine {
+			line = strings.TrimPrefix(line, "\ufeff")
+			firstLine = false
+		}
+		if line == "" {
+			payload := strings.TrimSuffix(data.String(), "\n")
+			if stateChangeIncludesEmail(payload, c.accountID) {
+				onChange()
+			}
+			if idSeen {
+				lastID = pendingID
+				idSeen = false
+			}
+			data.Reset()
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		field, value, hasColon := strings.Cut(line, ":")
+		if !hasColon {
+			value = ""
+		} else if strings.HasPrefix(value, " ") {
+			value = value[1:]
+		}
+		switch field {
+		case "id":
+			if !strings.ContainsRune(value, '\x00') {
+				pendingID = value
+				idSeen = true
+			}
+		case "data":
+			if data.Len()+len(value)+1 > maxEventBytes {
+				return lastID, retry, retrySet, fmt.Errorf("JMAP EventSource event exceeds %d bytes", maxEventBytes)
+			}
+			data.WriteString(value)
+			data.WriteByte('\n')
+		case "retry":
+			if value != "" && strings.IndexFunc(value, func(r rune) bool { return r < '0' || r > '9' }) == -1 {
+				milliseconds, err := strconv.ParseUint(value, 10, 64)
+				if err == nil && milliseconds <= uint64((1<<63-1)/int64(time.Millisecond)) {
+					retry = min(max(time.Duration(milliseconds)*time.Millisecond, minEventRetry), maxEventRetry)
+					retrySet = true
+				}
+			}
+		}
+	}
+	return lastID, retry, retrySet, scanner.Err()
+}
+
+func splitEventStreamLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	for i, char := range data {
+		switch char {
+		case '\n':
+			return i + 1, data[:i], nil
+		case '\r':
+			if i+1 < len(data) {
+				if data[i+1] == '\n' {
+					return i + 2, data[:i], nil
+				}
+				return i + 1, data[:i], nil
+			}
+			if atEOF {
+				return i + 1, data[:i], nil
+			}
+			return 0, nil, nil
+		}
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
 
 func stateChangeIncludesEmail(data, accountID string) bool {

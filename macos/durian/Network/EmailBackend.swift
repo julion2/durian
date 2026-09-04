@@ -40,6 +40,7 @@ private struct EmptyResponse: Decodable {}
 
 /// Payload for POST /api/v1/outbox/send
 struct OutboxPayload: Encodable {
+    let idempotency_key: String
     let from: String
     let to: [String]
     let cc: [String]
@@ -62,11 +63,14 @@ struct OutboxAttachmentPayload: Encodable {
 /// Entry returned by GET /api/v1/outbox
 struct OutboxEntry: Decodable, Identifiable {
     let id: Int64
+    let message_id: String?
     let subject: String
     let to: String
     let attempts: Int
     let last_error: String?
     let created_at: Int64
+    let in_flight: Bool?
+    let delivery_confirmed: Bool?
 }
 
 struct MessageBodyResponse: Decodable {

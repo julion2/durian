@@ -42,11 +42,6 @@ type Message struct {
 	// synthetic identity even when attachment enrichment is still incomplete.
 	// It is encrypted at rest.
 	SyntheticFingerprint []byte
-	// PromotionFingerprint is the transient parsed-content digest a stable-id
-	// backend supplies when it may adopt a legacy row. It is never persisted;
-	// insertMessageTx compares it with the candidate inside the write
-	// transaction so duplicate Message-IDs cannot claim each other's content.
-	PromotionFingerprint []byte
 	// StartIngestOnConflict transiently asks the upsert to mark an existing row
 	// pending and take a new ingest generation in the same transaction. Callers
 	// that will rebuild attachments and headers set it before exposing a partially
@@ -98,9 +93,11 @@ type SearchResult struct {
 
 // OutboxItem represents a queued message waiting to be sent.
 type OutboxItem struct {
-	ID        int64
-	DraftJSON string
-	Attempts  int
-	LastError string
-	CreatedAt int64
+	ID                int64
+	DraftJSON         string
+	Attempts          int
+	LastError         string
+	CreatedAt         int64
+	InFlight          bool
+	DeliveryConfirmed bool
 }

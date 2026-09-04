@@ -1,15 +1,13 @@
 package store
 
 import (
-	"bytes"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
 	"unicode"
-
-	durianmail "github.com/julion2/durian/cli/internal/mail"
 )
 
 const syncedFlagsEmpty = "$DurianEmpty"
@@ -387,106 +385,53 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 	return nil
 }
 
-// claimStableMessageIdentityTx upgrades one legacy Message-ID-keyed row to a
-// provider object id. An exact provider ref is authoritative. A row without a
-// ref is claimable only when its completed stored content, including attachment
-// metadata, matches the incoming object. The comparison and claim share the
-// caller's BEGIN IMMEDIATE transaction so two processes cannot reserve the same
-// fallback row for different duplicate objects.
+// claimStableMessageIdentityTx upgrades a row that already carries the exact
+// current provider ref but lacks its stable id. Provider refs are opaque: an
+// unscoped historical ref or matching message content cannot prove provider
+// provenance, so those rows must not transfer tags, baselines, or queued
+// mutations into a newly retargeted account.
 func (d *DB) claimStableMessageIdentityTx(tx *sql.Tx, msg *Message, accountID int64) error {
-	if msg.RemoteRef != "" {
-		result, err := tx.Exec(`UPDATE messages SET stable_id = ?
-			WHERE id = (
-				SELECT id FROM messages
-				WHERE message_id = ? AND IFNULL(account_id, 0) = ? AND stable_id = '' AND remote_ref = ?
-				ORDER BY id
-				LIMIT 1
-			)
-			AND NOT EXISTS (
-				SELECT 1 FROM messages WHERE stable_id = ? AND IFNULL(account_id, 0) = ?
-			)`, msg.StableID, msg.MessageID, accountID, msg.RemoteRef, msg.StableID, accountID)
-		if err != nil {
-			return err
-		}
-		if claimed, err := result.RowsAffected(); err != nil {
-			return err
-		} else if claimed > 0 {
-			return nil
-		}
-	}
-	if len(msg.PromotionFingerprint) == 0 {
+	if msg.RemoteRef == "" {
 		return nil
 	}
-
-	var stableExists bool
-	if err := tx.QueryRow(`SELECT EXISTS(
-		SELECT 1 FROM messages WHERE stable_id = ? AND IFNULL(account_id, 0) = ?
-	)`, msg.StableID, accountID).Scan(&stableExists); err != nil {
-		return err
-	}
-	if stableExists {
-		return nil
-	}
-
-	candidate, err := d.scanMessageRow(tx.QueryRow(`SELECT `+messageSelectColumns+` `+messageSelectFrom+`
-		WHERE m.message_id = ? AND IFNULL(m.account_id, 0) = ?
-		  AND m.stable_id = '' AND m.remote_ref = ''
-		ORDER BY m.id
-		LIMIT 1`, msg.MessageID, accountID).Scan)
-	if err == sql.ErrNoRows {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !candidate.FetchedBody || candidate.IngestPending {
-		return nil
-	}
-
-	rows, err := tx.Query("SELECT "+attachmentSelectColumns+" FROM attachments WHERE message_db_id = ? ORDER BY part_id, id", candidate.ID)
-	if err != nil {
-		return err
-	}
-	var attachments []Attachment
-	for rows.Next() {
-		attachment, scanErr := d.scanAttachmentRow(rows.Scan)
-		if scanErr != nil {
-			_ = rows.Close()
-			return scanErr
-		}
-		attachments = append(attachments, attachment)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-
-	content := &durianmail.MailContent{
-		From: candidate.FromAddr, To: candidate.ToAddrs, CC: candidate.CCAddrs,
-		BCC: candidate.BCCAddrs, Subject: candidate.Subject,
-		InReplyTo: candidate.InReplyTo, References: candidate.Refs,
-		Body: candidate.BodyText, HTML: candidate.BodyHTML,
-	}
-	for _, attachment := range attachments {
-		content.Attachments = append(content.Attachments, durianmail.AttachmentInfo{
-			PartID: attachment.PartID, Filename: attachment.Filename,
-			ContentType: attachment.ContentType, Size: attachment.Size,
-			Disposition: attachment.Disposition, ContentID: attachment.ContentID,
-		})
-	}
-	fingerprint := durianmail.SyntheticFingerprint(content, candidate.Date)
-	if !bytes.Equal(fingerprint[:], msg.PromotionFingerprint) {
-		return nil
-	}
-	_, err = tx.Exec(`UPDATE messages SET stable_id = ?
-		WHERE id = ? AND stable_id = '' AND remote_ref = ''
-		  AND NOT EXISTS (
+	_, err := tx.Exec(`UPDATE messages SET stable_id = ?
+		WHERE id = (
+			SELECT id FROM messages
+			WHERE IFNULL(account_id, 0) = ? AND stable_id = '' AND remote_ref = ?
+			ORDER BY id
+			LIMIT 1
+		)
+		AND NOT EXISTS (
 			SELECT 1 FROM messages WHERE stable_id = ? AND IFNULL(account_id, 0) = ?
-		  )`, msg.StableID, candidate.ID, msg.StableID, accountID)
+		)`, msg.StableID, accountID, msg.RemoteRef, msg.StableID, accountID)
 	return err
+}
+
+// MigrateLegacyProviderIdentityScope prefixes immutable provider identities
+// that predate account scoping. The transaction preserves row IDs, tags,
+// baselines, enrichment state and provider mutation foreign keys. Repeating it
+// after a cursor-file commit failure is safe because current-prefix rows are
+// excluded.
+func (d *DB) MigrateLegacyProviderIdentityScope(account, mailbox, prefix string) error {
+	if prefix == "" {
+		return errors.New("legacy provider identity prefix is empty")
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`UPDATE messages
+		SET stable_id = ? || stable_id, remote_ref = ? || remote_ref
+		WHERE account_id = (SELECT id FROM accounts WHERE name = ?)
+		AND mailbox_id = (SELECT id FROM mailboxes WHERE name = ?)
+		AND stable_id != '' AND stable_id = remote_ref
+		AND substr(remote_ref, 1, length(?)) != ?`,
+		prefix, prefix, account, mailbox, prefix, prefix)
+	if err != nil {
+		return fmt.Errorf("scope legacy provider identities: %w", err)
+	}
+	return tx.Commit()
 }
 
 // MarkMessageIngestComplete records that all enrichment owned by generation
@@ -826,8 +771,8 @@ func (d *DB) MessageExistsForAccount(messageID, account string) (bool, error) {
 
 // MessageIdentityExistsForAccount checks the identity mode used by an incoming
 // message: a native stable id when present, otherwise its RFC Message-ID. A
-// stable message also matches the legacy fallback row that InsertMessage would
-// claim, so upgrading an existing JMAP row is not reported as a new arrival.
+// stable message also matches a row carrying its exact current provider ref,
+// which InsertMessage can safely claim without guessing provider provenance.
 func (d *DB) MessageIdentityExistsForAccount(stableID, messageID, remoteRef, account string) (bool, error) {
 	var accountID int64
 	err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID)
@@ -841,11 +786,8 @@ func (d *DB) MessageIdentityExistsForAccount(stableID, messageID, remoteRef, acc
 	if stableID != "" {
 		err = d.db.QueryRow(`SELECT COUNT(*) FROM messages
 			WHERE account_id = ? AND (
-				stable_id = ? OR (
-					stable_id = '' AND message_id = ?
-					AND (remote_ref = '' OR remote_ref = ?)
-				)
-			)`, accountID, stableID, messageID, remoteRef).Scan(&count)
+				stable_id = ? OR (stable_id = '' AND remote_ref = ?)
+			)`, accountID, stableID, remoteRef).Scan(&count)
 	} else {
 		err = d.db.QueryRow(
 			"SELECT COUNT(*) FROM messages WHERE stable_id = '' AND message_id = ? AND account_id = ?",
@@ -978,22 +920,9 @@ type FolderFlagRow struct {
 // GetAllMessagesWithTags does; unknown names return an empty slice
 // without an error (no rows can match).
 func (d *DB) GetFolderFlagState(account, mailbox string) ([]FolderFlagRow, error) {
-	if strings.EqualFold(mailbox, "INBOX") {
-		mailbox = "INBOX"
-	}
-	var mailboxID int64
-	if err := d.db.QueryRow("SELECT id FROM mailboxes WHERE name = ?", mailbox).Scan(&mailboxID); err != nil {
-		if err == sql.ErrNoRows {
-			return []FolderFlagRow{}, nil
-		}
-		return nil, fmt.Errorf("lookup mailbox id: %w", err)
-	}
-	var accountID int64
-	if err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID); err != nil {
-		if err == sql.ErrNoRows {
-			return []FolderFlagRow{}, nil
-		}
-		return nil, fmt.Errorf("lookup account id: %w", err)
+	mailboxID, accountID, found, err := d.folderFlagStateIDs(account, mailbox)
+	if err != nil || !found {
+		return []FolderFlagRow{}, err
 	}
 
 	// LEFT JOIN (vs the inner JOIN in GetAllMessagesWithTags): a message
@@ -1008,8 +937,88 @@ func (d *DB) GetFolderFlagState(account, mailbox string) ([]FolderFlagRow, error
 	if err != nil {
 		return nil, fmt.Errorf("get folder flag state: %w", err)
 	}
-	defer rows.Close()
+	return scanFolderFlagRows(rows)
+}
 
+// GetFolderFlagStatePage returns at most limit complete message rows after a
+// stable database ID. Selecting message IDs in the CTE before joining tags
+// prevents a heavily tagged message from consuming the page limit.
+func (d *DB) GetFolderFlagStatePage(account, mailbox string, afterID int64, limit int) ([]FolderFlagRow, error) {
+	if limit <= 0 {
+		return []FolderFlagRow{}, nil
+	}
+	mailboxID, accountID, found, err := d.folderFlagStateIDs(account, mailbox)
+	if err != nil || !found {
+		return []FolderFlagRow{}, err
+	}
+	rows, err := d.db.Query(`
+		WITH selected AS (
+			SELECT id FROM messages
+			WHERE mailbox_id = ? AND account_id = ? AND remote_ref != '' AND id > ?
+			ORDER BY id LIMIT ?
+		)
+		SELECT m.id, m.message_id, m.remote_ref, m.synced_flags, m.is_seen, m.is_flagged, IFNULL(t.tag, '')
+		FROM selected s
+		JOIN messages m ON m.id = s.id
+		LEFT JOIN tags t ON t.message_id = m.id
+		ORDER BY m.id`, mailboxID, accountID, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get folder flag state page: %w", err)
+	}
+	return scanFolderFlagRows(rows)
+}
+
+// GetFolderFlagStateForRefs loads only the complete flag rows identified by a
+// bounded pending/delta ref set.
+func (d *DB) GetFolderFlagStateForRefs(account, mailbox string, refs []string) ([]FolderFlagRow, error) {
+	if len(refs) == 0 {
+		return []FolderFlagRow{}, nil
+	}
+	mailboxID, accountID, found, err := d.folderFlagStateIDs(account, mailbox)
+	if err != nil || !found {
+		return []FolderFlagRow{}, err
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(refs)), ",")
+	query := `
+		SELECT m.id, m.message_id, m.remote_ref, m.synced_flags, m.is_seen, m.is_flagged, IFNULL(t.tag, '')
+		FROM messages m
+		LEFT JOIN tags t ON t.message_id = m.id
+		WHERE m.mailbox_id = ? AND m.account_id = ? AND m.remote_ref != ''
+		AND m.remote_ref IN (` + placeholders + `)
+		ORDER BY m.id`
+	args := make([]any, 0, len(refs)+2)
+	args = append(args, mailboxID, accountID)
+	for _, ref := range refs {
+		args = append(args, ref)
+	}
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get folder flag state for refs: %w", err)
+	}
+	return scanFolderFlagRows(rows)
+}
+
+func (d *DB) folderFlagStateIDs(account, mailbox string) (mailboxID, accountID int64, found bool, err error) {
+	if strings.EqualFold(mailbox, "INBOX") {
+		mailbox = "INBOX"
+	}
+	if err := d.db.QueryRow("SELECT id FROM mailboxes WHERE name = ?", mailbox).Scan(&mailboxID); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, 0, false, nil
+		}
+		return 0, 0, false, fmt.Errorf("lookup mailbox id: %w", err)
+	}
+	if err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, 0, false, nil
+		}
+		return 0, 0, false, fmt.Errorf("lookup account id: %w", err)
+	}
+	return mailboxID, accountID, true, nil
+}
+
+func scanFolderFlagRows(rows *sql.Rows) ([]FolderFlagRow, error) {
+	defer rows.Close()
 	result := []FolderFlagRow{}
 	for rows.Next() {
 		var rowID int64
@@ -1165,6 +1174,19 @@ type LabelStateRow struct {
 // Gmail keeps every message in one synthetic "All Mail" stream, so this is not
 // scoped to a folder). Unknown account returns an empty slice without error.
 func (d *DB) GetLabelState(account string) ([]LabelStateRow, error) {
+	return d.getLabelStatePage(account, 0, -1)
+}
+
+// GetLabelStatePage returns at most limit messages after the given stable row
+// ID. The limit applies to messages, not joined tag rows.
+func (d *DB) GetLabelStatePage(account string, afterID int64, limit int) ([]LabelStateRow, error) {
+	if limit <= 0 {
+		return nil, errors.New("label state page limit must be positive")
+	}
+	return d.getLabelStatePage(account, afterID, limit)
+}
+
+func (d *DB) getLabelStatePage(account string, afterID int64, limit int) ([]LabelStateRow, error) {
 	var accountID int64
 	if err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID); err != nil {
 		if err == sql.ErrNoRows {
@@ -1173,14 +1195,20 @@ func (d *DB) GetLabelState(account string) ([]LabelStateRow, error) {
 		return nil, fmt.Errorf("lookup account id: %w", err)
 	}
 
-	// LEFT JOIN so a message with no tags still yields a row (its empty local
-	// state matters to the three-way). ORDER BY m.id groups a message's tags.
+	// Select message IDs before joining tags so a heavily tagged row cannot
+	// split across pages. LEFT JOIN keeps an untagged message in the result.
 	rows, err := d.db.Query(`
+		WITH selected AS (
+			SELECT id FROM messages
+			WHERE account_id = ? AND remote_ref != '' AND id > ?
+			ORDER BY id
+			LIMIT ?
+		)
 		SELECT m.id, m.message_id, m.remote_ref, m.synced_labels, IFNULL(t.tag, '')
-		FROM messages m
+		FROM selected s
+		JOIN messages m ON m.id = s.id
 		LEFT JOIN tags t ON t.message_id = m.id
-		WHERE m.account_id = ? AND m.remote_ref != ''
-		ORDER BY m.id`, accountID)
+		ORDER BY m.id`, accountID, afterID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("get label state: %w", err)
 	}

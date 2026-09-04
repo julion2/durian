@@ -24,7 +24,7 @@ struct NewMailMessage: Decodable {
 
 struct OutboxUpdateEvent: Decodable {
     let item_id: Int64
-    let status: String   // "sent", "failed", "queued"
+    let status: String   // "sent", "failed", "queued", or a reconciliation status
     let error: String?
     let subject: String?
     let to: String?

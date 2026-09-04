@@ -3,16 +3,25 @@ package smtp
 import (
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/smtp"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/julion2/durian/cli/internal/redact"
 )
+
+// dataCompletionUnknown marks transport loss after the complete DATA body was
+// submitted, while waiting for the server's final acceptance response.
+type dataCompletionUnknown struct{ error }
+
+func (e dataCompletionUnknown) Unwrap() error { return e.error }
 
 const (
 	// DefaultTimeout for SMTP operations
@@ -214,32 +223,58 @@ func (c *Client) Send(msg *Message) error {
 		}
 	}
 
-	// Send message data
+	// Render completely before DATA. Once DATA begins, closing its writer sends
+	// the terminating dot and can submit whatever was written, so build failures
+	// must happen before the irreversible protocol phase.
+	data, err := msg.Build()
+	if err != nil {
+		return fmt.Errorf("failed to build message: %w", err)
+	}
+
+	// Send message data.
 	wc, err := client.Data()
 	if err != nil {
 		return smtpServerError(fmt.Errorf("DATA failed: %w", err), "SMTP DATA failed")
 	}
-
-	// Build and write message
-	data, err := msg.Build()
-	if err != nil {
-		wc.Close()
-		return fmt.Errorf("failed to build message: %w", err)
-	}
-
-	if _, err := wc.Write(data); err != nil {
-		wc.Close()
-		return fmt.Errorf("failed to write message: %w", err)
-	}
-
-	if err := wc.Close(); err != nil {
-		return smtpServerError(fmt.Errorf("failed to complete message: %w", err), "complete SMTP message failed")
+	if err := writeSMTPData(wc, data); err != nil {
+		return err
 	}
 
 	// Quit gracefully
 	client.Quit()
 
 	return nil
+}
+
+type smtpDataWriter interface {
+	Write([]byte) (int, error)
+	Close() error
+}
+
+func writeSMTPData(w smtpDataWriter, data []byte) error {
+	n, err := w.Write(data)
+	if err != nil {
+		// Do not close after a failed write: net/smtp's Close sends the DATA
+		// terminator and could turn a locally retryable write error into an
+		// accepted partial message. Closing the connection aborts the transaction.
+		return fmt.Errorf("failed to write message: %w", err)
+	}
+	if n != len(data) {
+		return fmt.Errorf("failed to write message: %w", io.ErrShortWrite)
+	}
+	if err := w.Close(); err != nil {
+		return classifyDataCompletionError(err)
+	}
+	return nil
+}
+
+func classifyDataCompletionError(err error) error {
+	wrapped := smtpServerError(fmt.Errorf("failed to complete message: %w", err), "complete SMTP message failed")
+	var responseErr *textproto.Error
+	if errors.As(err, &responseErr) {
+		return wrapped
+	}
+	return dataCompletionUnknown{wrapped}
 }
 
 // Send is a convenience function to send an email

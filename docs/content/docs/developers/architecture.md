@@ -94,14 +94,15 @@ Integration tests in `integration/integration_test.sh` exercise the contract end
 
 ## Storage model
 
-One SQLite file at `~/.local/share/durian/email.db` (or `$XDG_DATA_HOME/durian/email.db`). Schema version is bumped on every migration step (encryption, sync-engine baselines, and data repairs); current version is v31.
+One SQLite file at `~/.local/share/durian/email.db` (or `$XDG_DATA_HOME/durian/email.db`). Schema version is bumped on every migration step (encryption, sync-engine baselines, and data repairs); current version is v34.
 
-- `messages` — one row per local message identity. `stable_id` is the immutable native object identity when a provider has one (JMAP `Email.id`), so JMAP objects remain distinct even with missing or duplicate Message-IDs. `message_id` is RFC 5322 metadata and the compatibility identity for older protocols; that fallback cannot distinguish same-account duplicates. Other plaintext columns: `thread_id`, `in_reply_to`, `refs`, `from_addr`, `to_addrs`, `cc_addrs`, `date`, `created_at`, `size`, `uid`, `account_id` + `mailbox_id` (FKs), `is_seen` / `is_flagged` / `is_deleted` booleans. Encrypted BLOBs: `subject_ct`, `body_text_ct`, `body_html_ct`, `flags_other` (remaining IMAP flags and keywords).
+- `messages` — one row per local message identity. `stable_id` is the immutable native object identity when a provider has one (for JMAP, a hashed provider-account scope plus `Email.id`), so provider objects remain distinct even with missing or duplicate Message-IDs or a retargeted local account alias. `message_id` is RFC 5322 metadata and the compatibility identity for older protocols; that fallback cannot distinguish same-account duplicates. Other plaintext columns: `thread_id`, `in_reply_to`, `refs`, `from_addr`, `to_addrs`, `cc_addrs`, `date`, `created_at`, `size`, `uid`, `account_id` + `mailbox_id` (FKs), `is_seen` / `is_flagged` / `is_deleted` booleans. Encrypted BLOBs: `subject_ct`, `body_text_ct`, `body_html_ct`, `flags_other` (remaining IMAP flags and keywords).
 - `tags` — tag join table, one row per (message_id, tag).
 - `message_headers` — raw headers used by filter rules (List-Id, Authentication-Results, …). The `value` column is encrypted (`value_ct` BLOB); `name` stays plaintext for SQL filtering.
 - `attachments` — per-part metadata. `filename_ct`, `content_type_ct`, `size_ct` are encrypted; `part_id`, `disposition`, `content_id` stay plaintext (needed for fetch correlation with the IMAP server).
 - `local_drafts` — crash-recovery drafts kept locally until saved to IMAP. The `draft_json` payload is encrypted (`draft_json_ct` BLOB).
-- `outbox` — queued outgoing messages with `send_after` timestamp for undo-send. `draft_json_ct` BLOB; `attempts`, `last_error`, `created_at`, `last_attempted_at`, `send_after` plaintext.
+- `outbox` — queued outgoing messages with `send_after` timestamp for undo-send. `draft_json_ct` BLOB (including the durable outgoing Message-ID); `attempts`, `last_error`, `created_at`, `last_attempted_at`, `send_after`, `in_flight`, and `delivery_confirmed` plaintext. The worker atomically sets `in_flight` before delivery; Undo atomically deletes only unclaimed rows and returns a conflict after a claim. Ambiguous or delivered-with-warning outcomes retain that claim and its full payload and use distinct SSE states rather than reporting "Not Sent". Provider acceptance sets `delivery_confirmed` before local and IMAP Sent filing; the claim is deleted only after filing succeeds, so a crash or filing error retains a recoverable payload and cannot requeue an accepted message. A claim surviving restart is never retried automatically: after provider verification, `durian outbox reconcile` removes or safely requeues an unconfirmed claim only while the GUI/server is stopped and the CLI holds the exclusive outbox lifecycle lock.
+- `outbox_idempotency` — durable tombstones mapping a client-generated logical send key to its original outbox row and schedule. They intentionally survive outbox deletion, so replaying a request after a lost HTTP response cannot create a second delivery.
 - `provider_tag_mutations` — durable explicit `unread` / `flagged` / `replied` intent for provider-native property patches. Newer intent supersedes an older entry for the same message and tag. A native-patch backend retains the entry until the provider accepts it and the local read model reflects it. On a non-dry-run pass with flag upload enabled, generic backends discard these entries because their baseline merge owns flag synchronization.
 - `mailboxes`, `accounts` — operational lookup tables. `name_ct` encrypted (mailbox / account display names are sensitive); integer IDs are the FK targets for `messages.mailbox_id` / `messages.account_id`.
 - `messages_blind_fts` — FTS5 virtual table indexing HMAC-blind tokens of subject + body + addresses. No plaintext lives here; see [§Encryption layer](#encryption-layer) below.
@@ -212,10 +213,14 @@ engine accounts.
 
 Daemon-triggered engine passes have a 5-minute watchdog so a stalled provider
 does not hold the per-account mutex indefinitely. An authoritative replacement
-snapshot may extend that deadline to 60 minutes: the snapshot must complete
-before its cursor can advance. JMAP recovery emits bounded anchored query pages
-instead of retaining a complete remote-ID set in its cursor, although the engine
-still holds the presence set in memory until final deletion reconciliation. The
+snapshot may extend that deadline to 60 minutes. JMAP recovery emits bounded
+anchored query pages and syncengine checkpoints each completed page after
+staging its authoritative presence in SQLite. Final deletion reconciliation is
+also keyset-paged, so neither cursors nor process memory contain mailbox-sized
+ID sets. Every mutating engine pass holds a cross-process account lock for its
+complete lifetime, preventing daemon and manual sync processes from mixing
+snapshot pages, SQLite staging, or cursor commits; the same account scope also
+serializes backend retargets. The
 extension applies only to that recovery and its flag reconciliation; the
 ordinary deadline still bounds later folders and the upload pass rather than
 granting the entire account pass another hour.
