@@ -8,6 +8,7 @@ go_library(
         "ingest_lock.go",
         "local_drafts.go",
         "messages.go",
+        "migrate_provider_native.go",
         "outbox.go",
         "outbox_lock.go",
         "search.go",
