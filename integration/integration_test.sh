@@ -178,11 +178,14 @@ assert_jq "GET /threads/{id} message.body is string" "$RESP" '.thread.messages[0
 assert_jq "GET /threads/{id} message.tags is array" "$RESP" '.thread.messages[0].tags | type == "array"'
 assert_jq "GET /threads/{id} all message ids are opaque" "$RESP" '
     all(.thread.messages[]; .id | startswith("local:"))'
+assert_jq "GET /threads/{id} all attachment cache ids are content identities" "$RESP" '
+    all(.thread.messages[]; .attachment_cache_id | startswith("v1-"))'
 assert_jq "GET /threads/{id} duplicate Message-IDs have distinct opaque ids" "$RESP" '
     [.thread.messages[] | select(.message_id == "msg1@test")] as $duplicates |
     ($duplicates | length) == 2 and
     all($duplicates[]; .id | startswith("local:")) and
-    $duplicates[0].id != $duplicates[1].id'
+    $duplicates[0].id != $duplicates[1].id and
+    $duplicates[0].attachment_cache_id != $duplicates[1].attachment_cache_id'
 
 FIRST_MESSAGE_ID=$(echo "$RESP" | jq -r '.thread.messages[] |
     select(.message_id == "msg1@test" and .body == "First message body") | .id')

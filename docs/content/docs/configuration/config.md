@@ -153,7 +153,7 @@ A `Listing<AccountConfig>`. Each entry can be a literal `new { ... }` (password 
 | `notifications` | Per-account override of `settings.notifications_enabled` |
 | `smtp` | Optional `{ host, port, auth }`; not needed by native Graph, Gmail, or JMAP sending |
 | `imap` | Optional `{ host, port, auth, max_messages }`; required by IMAP engines and JMAP's server-side draft-command fallback |
-| `jmap` | `{ session_url, auth }`; `auth` is `password` or `bearer` |
+| `jmap` | `{ session_url, auth, trust_legacy_identity }`; the trust flag is a one-time pre-account-scope upgrade opt-in |
 | `auth` | `{ username }` for password, or `oauth { client_id, client_secret }` for Google |
 | `sync_engine` | Which sync path this account uses — see [Sync engine](#sync-engine) |
 | `calendar` | Per-account calendar overrides — see [calendar](#calendar) |
@@ -208,6 +208,7 @@ new {
   jmap {
     session_url = "https://api.fastmail.com/jmap/session"
     auth = "bearer"
+    // trust_legacy_identity = true  // Only for a verified same-account upgrade.
   }
 }
 ```
@@ -228,7 +229,19 @@ Microsoft account (Microsoft must use Graph). `jmap` requires an absolute HTTP(S
 session URL and a `jmap` block; conversely, configuring a `jmap` block requires
 `sync_engine = "jmap"`. Remote HTTP is rejected. Changing `sync_engine` triggers a
 fresh full resync (the per-backend cursors are incompatible) but is safe — the
-store upserts by Message-ID.
+store adopts rows carrying the exact current account-scoped provider object ID
+when available and uses RFC Message-ID only as metadata and a fallback for
+protocols without stable IDs. A valid legacy JMAP cursor with no account scope
+is conservatively replaced by default because it cannot prove whether the
+provider account was retargeted. For a verified same-account upgrade from a
+Durian version that wrote unscoped JMAP cursors, temporarily set
+`jmap.trust_legacy_identity = true`: its immutable IDs are prefixed and a durable
+replacement marker blocks queued mutations until the authoritative replacement
+succeeds, preserving local tags and baselines. Do not enable that option while
+changing endpoint, credential, or provider account.
+A cursor with a different non-empty scope is a provider-account retarget; its
+old identities are replaced rather than migrated, so local mutations cannot
+cross that boundary.
 
 ### Provider presets
 

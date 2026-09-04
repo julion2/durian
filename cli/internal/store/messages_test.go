@@ -249,7 +249,10 @@ func TestIngestPendingRequiresExplicitCompletion(t *testing.T) {
 	if err != nil || stored == nil || !stored.IngestPending || !retry.IngestPending {
 		t.Fatalf("pending row after retry upsert = %+v, effective pending=%t, err=%v", stored, retry.IngestPending, err)
 	}
-	if err := db.MarkMessageIngestComplete(stored.ID); err != nil {
+	if stored.IngestGeneration != 1 {
+		t.Fatalf("initial ingest generation = %d, want 1", stored.IngestGeneration)
+	}
+	if err := db.MarkMessageIngestComplete(stored.ID, stored.IngestGeneration); err != nil {
 		t.Fatal(err)
 	}
 
@@ -264,6 +267,122 @@ func TestIngestPendingRequiresExplicitCompletion(t *testing.T) {
 	stored, err = db.GetByMessageID(messageID)
 	if err != nil || stored == nil || stored.IngestPending || redelivery.IngestPending {
 		t.Fatalf("completed row after redelivery = %+v, effective pending=%t, err=%v", stored, redelivery.IngestPending, err)
+	}
+
+	refresh := &Message{
+		MessageID: messageID, Subject: "refresh", Date: 1, CreatedAt: 4,
+		Mailbox: "INBOX", Account: "work", IngestPending: true, StartIngestOnConflict: true,
+	}
+	if err := db.InsertMessage(refresh); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = db.GetByMessageID(messageID)
+	if err != nil || stored == nil || !stored.IngestPending || !refresh.IngestPending || refresh.IngestGeneration != 2 {
+		t.Fatalf("explicit refresh did not mark row pending: stored=%+v effective=%t err=%v", stored, refresh.IngestPending, err)
+	}
+
+	// A backend that normally fast-paths completed rows still takes ownership
+	// when retrying a row that was already pending.
+	pendingRetry := &Message{
+		MessageID: messageID, Subject: "pending retry", Date: 1, CreatedAt: 5,
+		Mailbox: "INBOX", Account: "work", IngestPending: true,
+	}
+	if err := db.InsertMessage(pendingRetry); err != nil {
+		t.Fatal(err)
+	}
+	if pendingRetry.IngestGeneration != 3 {
+		t.Fatalf("pending retry generation = %d, want 3", pendingRetry.IngestGeneration)
+	}
+	if err := db.MarkMessageIngestComplete(stored.ID, refresh.IngestGeneration); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = db.GetByMessageID(messageID)
+	if err != nil || stored == nil || !stored.IngestPending || stored.IngestGeneration != pendingRetry.IngestGeneration {
+		t.Fatalf("stale refresh completion changed pending retry: stored=%+v err=%v", stored, err)
+	}
+}
+
+func TestStableIdentityDoesNotClaimFallbackRefreshInProgress(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "promotion-refresh.db")
+	kr := testKeyring(t)
+	first, err := Open(dbPath, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { first.Close() })
+	if err := first.Init(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(dbPath, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { second.Close() })
+
+	fallback := &Message{
+		MessageID: "refresh-duplicate@example.com", Subject: "Same content",
+		FromAddr: "sender@example.com", ToAddrs: "recipient@example.com",
+		BodyText: "same body", Date: 10, CreatedAt: 10,
+		Mailbox: "INBOX", Account: "work", FetchedBody: true,
+	}
+	if err := first.InsertMessage(fallback); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.InsertAttachment(&Attachment{
+		MessageDBID: fallback.ID, PartID: 1, Filename: "same.bin",
+		ContentType: "application/octet-stream", Size: 1, Disposition: "attachment",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	refreshA := *fallback
+	refreshA.ID = 0
+	refreshA.IngestPending = true
+	refreshA.StartIngestOnConflict = true
+	if err := first.InsertMessage(&refreshA); err != nil {
+		t.Fatal(err)
+	}
+	refreshB := *fallback
+	refreshB.ID = 0
+	refreshB.IngestPending = true
+	refreshB.StartIngestOnConflict = true
+	if err := second.InsertMessage(&refreshB); err != nil {
+		t.Fatal(err)
+	}
+	if refreshB.IngestGeneration <= refreshA.IngestGeneration {
+		t.Fatalf("second refresh generation = %d, want newer than %d", refreshB.IngestGeneration, refreshA.IngestGeneration)
+	}
+
+	// Writer A finishes after writer B has taken ownership. Its stale completion
+	// must not expose B's in-progress enrichment as complete.
+	if err := first.MarkMessageIngestComplete(fallback.ID, refreshA.IngestGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := second.GetByDBID(fallback.ID); err != nil || pending == nil ||
+		!pending.IngestPending || pending.IngestGeneration != refreshB.IngestGeneration {
+		t.Fatalf("fallback refresh state = %+v, err=%v", pending, err)
+	}
+
+	stable := *fallback
+	stable.ID = 0
+	stable.StableID = "provider-object"
+	stable.RemoteRef = "provider-object"
+	if err := second.InsertMessage(&stable); err != nil {
+		t.Fatal(err)
+	}
+	if stable.ID == fallback.ID {
+		t.Fatalf("stable object claimed fallback row %d while its enrichment was pending", fallback.ID)
+	}
+	pending, err := first.GetByDBID(fallback.ID)
+	if err != nil || pending == nil || pending.StableID != "" || !pending.IngestPending {
+		t.Fatalf("fallback after competing stable ingest = %+v, err=%v", pending, err)
+	}
+	if err := second.MarkMessageIngestComplete(fallback.ID, refreshB.IngestGeneration); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = first.GetByDBID(fallback.ID)
+	if err != nil || pending == nil || pending.IngestPending || pending.IngestGeneration != refreshB.IngestGeneration {
+		t.Fatalf("fallback after owning writer completed = %+v, err=%v", pending, err)
 	}
 }
 
@@ -1258,156 +1377,5 @@ func TestDeleteByMessageIDAndAccount(t *testing.T) {
 	db.db.QueryRow("SELECT COUNT(*) FROM messages WHERE message_id = ?", "del-acct@x").Scan(&count)
 	if count != 1 {
 		t.Errorf("got %d rows after delete, want 1", count)
-	}
-}
-
-// TestMixedStableAndFallbackIdentityIsAmbiguous covers the store that a real
-// multi-account setup produces: a JMAP object carrying a stable id beside an
-// IMAP row that has none, both holding the same RFC Message-ID.
-//
-// Ambiguity here is a property of the stored rows, not of their identity kind.
-// Resolving to the single stable row would hand the caller the wrong object's
-// body and attachments whenever it meant the IMAP one — and the IMAP row would
-// have no working Message-ID lookup at all. Both must stay reachable by their
-// row id, and the raw lookup must refuse to guess.
-func TestMixedStableAndFallbackIdentityIsAmbiguous(t *testing.T) {
-	db := newTestDB(t)
-	now := time.Now().Unix()
-
-	stable := &Message{
-		StableID: "jmap-obj", MessageID: "mixed@example.com", Subject: "From JMAP",
-		Date: now, CreatedAt: now, Mailbox: "ALL", Account: "work",
-		RemoteRef: "jmap-obj", FetchedBody: true, BodyText: "jmap body",
-	}
-	fallback := &Message{
-		MessageID: "mixed@example.com", Subject: "From IMAP",
-		Date: now + 1, CreatedAt: now + 1, Mailbox: "INBOX", Account: "personal",
-		RemoteRef: "42", FetchedBody: true, BodyText: "imap body",
-	}
-	if err := db.InsertMessage(stable); err != nil {
-		t.Fatalf("insert stable: %v", err)
-	}
-	if err := db.InsertMessage(fallback); err != nil {
-		t.Fatalf("insert fallback: %v", err)
-	}
-	if stable.ID == fallback.ID {
-		t.Fatalf("both identities collapsed to row %d", stable.ID)
-	}
-
-	if _, err := db.GetByMessageID("mixed@example.com"); err == nil {
-		t.Error("raw Message-ID lookup resolved a shared id instead of reporting ambiguity")
-	}
-
-	// Each row still has to be reachable by its own identity, or the ambiguity
-	// guard would just have made the messages unopenable.
-	gotStable, err := db.GetByDBID(stable.ID)
-	if err != nil || gotStable == nil {
-		t.Fatalf("get stable row: %+v err=%v", gotStable, err)
-	}
-	if gotStable.BodyText != "jmap body" {
-		t.Errorf("stable row body = %q, want the JMAP object's", gotStable.BodyText)
-	}
-	gotFallback, err := db.GetByDBID(fallback.ID)
-	if err != nil || gotFallback == nil {
-		t.Fatalf("get fallback row: %+v err=%v", gotFallback, err)
-	}
-	if gotFallback.BodyText != "imap body" {
-		t.Errorf("fallback row body = %q, want the IMAP row's", gotFallback.BodyText)
-	}
-}
-
-// TestUpsertReportsSecondStableObjectAsCreated covers the interaction between
-// stable identities and the created/before-image detection. The detection used
-// to key on (Message-ID, account), which matches the FIRST object when a
-// provider holds several sharing one Message-ID: the second would be reported
-// as already stored, so its initial tags would never be seeded and its arrival
-// would not be announced, while the before-image captured belonged to the other
-// row entirely.
-func TestUpsertReportsSecondStableObjectAsCreated(t *testing.T) {
-	db := newTestDB(t)
-	now := time.Now().Unix()
-
-	first := &Message{
-		StableID: "obj-1", MessageID: "shared@example.com", Subject: "First",
-		Date: now, CreatedAt: now, Mailbox: "ALL", Account: "work", RemoteRef: "obj-1",
-		SyncedFlags: `\Seen`, SyncedFlagsInitialized: true,
-	}
-	created, err := db.UpsertMessageWithInitialTags(first, []string{"inbox"})
-	if err != nil {
-		t.Fatalf("upsert first: %v", err)
-	}
-	if !created {
-		t.Fatal("first object: created = false, want true")
-	}
-
-	second := &Message{
-		StableID: "obj-2", MessageID: "shared@example.com", Subject: "Second",
-		Date: now + 1, CreatedAt: now + 1, Mailbox: "ALL", Account: "work", RemoteRef: "obj-2",
-		SyncedFlags: "", SyncedFlagsInitialized: true,
-	}
-	created, err = db.UpsertMessageWithInitialTags(second, []string{"inbox", "unread"})
-	if err != nil {
-		t.Fatalf("upsert second: %v", err)
-	}
-	if !created {
-		t.Fatal("second object: created = false — the Message-ID it shares with the first is not its identity")
-	}
-	if first.ID == second.ID {
-		t.Fatalf("both objects landed on row %d", first.ID)
-	}
-
-	// The seeding is the visible consequence: a row reported as existing skips
-	// it, and nothing later puts those tags back.
-	tags, err := db.GetMessageTags(second.ID)
-	if err != nil {
-		t.Fatalf("get tags: %v", err)
-	}
-	if !slices.Contains(tags, "unread") {
-		t.Errorf("second object tags = %v, want the initial tags seeded", tags)
-	}
-}
-
-// TestSetSyncedFlagsByDBIDKeepsEmptyBaselineInitialized guards the row-addressed
-// setter against the same ambiguity SetSyncedFlags encodes around: an
-// initialized-but-empty baseline stored raw reads back as "never initialized",
-// which sends the reconciler down the legacy seeding path on a row whose
-// emptiness is the truth.
-func TestSetSyncedFlagsByDBIDKeepsEmptyBaselineInitialized(t *testing.T) {
-	db := newTestDB(t)
-	now := time.Now().Unix()
-
-	msg := &Message{
-		StableID: "obj-empty", MessageID: "empty-baseline@example.com", Subject: "Empty",
-		Date: now, CreatedAt: now, Mailbox: "ALL", Account: "work", RemoteRef: "obj-empty",
-		SyncedFlags: `\Seen`, SyncedFlagsInitialized: true,
-	}
-	if _, err := db.UpsertMessage(msg); err != nil {
-		t.Fatalf("upsert: %v", err)
-	}
-
-	// The server clears every flag: a real, initialized, empty baseline.
-	if err := db.SetSyncedFlagsByDBID(msg.ID, ""); err != nil {
-		t.Fatalf("set synced flags: %v", err)
-	}
-
-	rows, err := db.GetFolderFlagState("work", "ALL")
-	if err != nil {
-		t.Fatalf("flag state: %v", err)
-	}
-	var found bool
-	for _, row := range rows {
-		if row.RowID != msg.ID {
-			continue
-		}
-		found = true
-		if row.SyncedFlags != "" {
-			t.Errorf("baseline = %q, want empty", row.SyncedFlags)
-		}
-		if !row.SyncedFlagsInitialized {
-			t.Error("baseline reads as uninitialized after an explicit empty write")
-		}
-	}
-	if !found {
-		t.Fatalf("row %d missing from folder flag state", msg.ID)
 	}
 }

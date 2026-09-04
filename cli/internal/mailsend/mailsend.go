@@ -62,6 +62,15 @@ type Sender interface {
 	SavesSentCopy() bool
 }
 
+// DurableSender prepares a provider draft, reports the provider-exact RFC
+// Message-ID for durable persistence, and only then performs the irreversible
+// delivery operation. Implementations must not deliver when persist returns an
+// error. Ordinary callers may continue to use Sender.Send.
+type DurableSender interface {
+	Sender
+	SendAfterPersist(ctx context.Context, msg *Message, persist func(messageID string) error) error
+}
+
 // Kind classifies a send failure so the outbox's retry/poison policy stays
 // provider-neutral.
 type Kind int
@@ -73,6 +82,12 @@ const (
 	KindNetwork
 	// KindPermanent — will never send (5xx, bad recipient); poison the item.
 	KindPermanent
+	// KindAmbiguous — the provider may have accepted the delivery. Keep the
+	// durable claim until an operator verifies whether it was delivered.
+	KindAmbiguous
+	// KindDeliveredWithWarning — delivery definitely succeeded, but a
+	// post-delivery provider action needs manual remediation.
+	KindDeliveredWithWarning
 )
 
 // Error wraps a provider error with its Kind. Senders return this so callers

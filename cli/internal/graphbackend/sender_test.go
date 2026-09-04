@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -93,7 +94,7 @@ func TestSenderUploadsLargeAttachment(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&draft); err != nil {
 			t.Errorf("decode draft: %v", err)
 		}
-		writeJSON(t, w, map[string]string{"id": "d1"})
+		writeJSON(t, w, map[string]string{"id": "d1", "internetMessageId": "<graph@example.com>"})
 	})
 	mux.HandleFunc("/v1.0/me/messages/d1/attachments/createUploadSession", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(t, w, map[string]string{"uploadUrl": srv.URL + "/upload"})
@@ -304,5 +305,69 @@ func TestClassifyGraphSendError(t *testing.T) {
 		if got := mailsend.Classify(err); got != c.want {
 			t.Errorf("status %d classified %v, want %v", c.status, got, c.want)
 		}
+	}
+}
+
+func TestSenderPersistsGraphMessageIDBeforeAmbiguousFinalSend(t *testing.T) {
+	persisted := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/messages", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]string{"id": "draft1", "internetMessageId": "<graph-exact@example.test>"})
+	})
+	mux.HandleFunc("/v1.0/me/messages/draft1/send", func(http.ResponseWriter, *http.Request) {
+		if !persisted {
+			t.Error("final Graph send started before Message-ID persistence")
+		}
+		panic(http.ErrAbortHandler)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	s := &Sender{b: newTestBackend(t, server)}
+	err := s.SendAfterPersist(t.Context(), &mailsend.Message{To: []string{"recipient@example.test"}}, func(messageID string) error {
+		if messageID != "<graph-exact@example.test>" {
+			t.Fatalf("persisted Message-ID = %q", messageID)
+		}
+		persisted = true
+		return nil
+	})
+	if !persisted || mailsend.Classify(err) != mailsend.KindAmbiguous {
+		t.Fatalf("final Graph transport loss = persisted %v, error %v, kind %v", persisted, err, mailsend.Classify(err))
+	}
+}
+
+func TestSenderTreatsGraphFinalServerErrorAsAmbiguous(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/messages", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]string{"id": "draft1", "internetMessageId": "<graph-exact@example.test>"})
+	})
+	mux.HandleFunc("/v1.0/me/messages/draft1/send", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream response lost", http.StatusServiceUnavailable)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	s := &Sender{b: newTestBackend(t, server)}
+	err := s.SendAfterPersist(t.Context(), &mailsend.Message{To: []string{"recipient@example.test"}}, func(string) error { return nil })
+	if got := mailsend.Classify(err); got != mailsend.KindAmbiguous {
+		t.Fatalf("final Graph 503 classified %v, want ambiguous: %v", got, err)
+	}
+}
+
+func TestSenderDoesNotSendWhenGraphMessageIDPersistenceFails(t *testing.T) {
+	persistErr := errors.New("disk unavailable")
+	sent := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/messages", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]string{"id": "draft1", "internetMessageId": "<graph-exact@example.test>"})
+	})
+	mux.HandleFunc("/v1.0/me/messages/draft1/send", func(http.ResponseWriter, *http.Request) { sent = true })
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	s := &Sender{b: newTestBackend(t, server)}
+	err := s.SendAfterPersist(t.Context(), &mailsend.Message{To: []string{"recipient@example.test"}}, func(string) error { return persistErr })
+	if !errors.Is(err, persistErr) || sent {
+		t.Fatalf("persistence failure = error %v, sent %v", err, sent)
 	}
 }

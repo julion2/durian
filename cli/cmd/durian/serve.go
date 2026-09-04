@@ -105,6 +105,13 @@ func runServe(cmd *cobra.Command, args []string) {
 	if dbPath == "" {
 		dbPath = store.DefaultDBPath()
 	}
+	releaseOutbox, err := store.AcquireOutboxLifecycle(dbPath)
+	if err != nil {
+		slog.Error("Outbox lifecycle lock unavailable", "module", "SERVE", "err", err)
+		fmt.Fprintln(os.Stderr, "Error: another Durian process owns the outbox:", err)
+		os.Exit(1)
+	}
+	defer releaseOutbox()
 	emailDB, err := store.Open(dbPath, keyring)
 	if err != nil {
 		slog.Error("Email store required but unavailable", "module", "SERVE", "err", err)

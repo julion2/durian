@@ -51,6 +51,37 @@ final class BccRoundTripTests: XCTestCase {
         XCTAssertNil(message.bcc)
     }
 
+    func testThreadMessageUsesServerAttachmentCacheIdentity() throws {
+        let json = """
+        {
+            "id": "local:1",
+            "attachment_cache_id": "v1-provider-object",
+            "from": "sender@example.com",
+            "date": "Mon, 01 Jan 2024 00:00:00 +0000",
+            "timestamp": 1704067200,
+            "body": "body"
+        }
+        """.data(using: .utf8)!
+
+        let message = try JSONDecoder().decode(ThreadMessage.self, from: json)
+        XCTAssertEqual(message.attachmentCacheId, "v1-provider-object")
+    }
+
+    func testThreadMessageFallsBackForOlderServerWithoutAttachmentCacheIdentity() throws {
+        let json = """
+        {
+            "id": "legacy-id",
+            "from": "sender@example.com",
+            "date": "Mon, 01 Jan 2024 00:00:00 +0000",
+            "timestamp": 1704067200,
+            "body": "body"
+        }
+        """.data(using: .utf8)!
+
+        let message = try JSONDecoder().decode(ThreadMessage.self, from: json)
+        XCTAssertEqual(message.attachmentCacheId, "legacy-id")
+    }
+
     // MARK: - Thread application
 
     /// applyThread is the only place a decoded ThreadMessage becomes the

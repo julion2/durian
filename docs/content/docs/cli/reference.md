@@ -82,15 +82,18 @@ Renders the thread to stdout — useful for piping into `less` or grepping a spe
 ## attachment — list or download
 
 ```bash
-durian attachment "message:<message-id>" --account work                      # list parts
-durian attachment "message:<message-id>" --account work --save 2 -o ./out/   # download part 2
-durian attachment "message:<message-id>" --account work --save 2 --force     # overwrite explicitly
+durian attachment local:42                         # list parts by exact local identifier
+durian attachment local:42 --save 2 -o ./out/      # download part 2
+durian attachment local:42 --save 2 --force        # overwrite explicitly
+durian attachment msg-id@example.com --account work # Message-ID fallback
 ```
 
 Part IDs come from the list output. `--save <part>` selects the part, `-o,
 --output <dir>` picks the target directory (defaults to `.`). Existing files
-are not overwritten unless `--force` is supplied. `--account` is required only
-when the Message-ID exists in more than one account.
+are not overwritten unless `--force` is supplied. Prefer the opaque `local:`
+identifier returned by the API because RFC Message-ID is optional and may be
+duplicated even within one account. For the Message-ID fallback, `--account`
+selects an account; if duplicates remain, the command asks for `local:` instead.
 
 ## send — send an email
 

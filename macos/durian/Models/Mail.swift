@@ -25,6 +25,7 @@ struct AttachmentInfo: Decodable, Equatable {
 
 struct ThreadMessage: Decodable, Identifiable, Equatable {
     let id: String
+    let attachment_cache_id: String?
     let from: String
     let to: String?
     let cc: String?
@@ -43,6 +44,10 @@ struct ThreadMessage: Decodable, Identifiable, Equatable {
     let hidden_signature: String?
     let attachments: [AttachmentInfo]?
     let tags: [String]?
+
+    var attachmentCacheId: String {
+        attachment_cache_id ?? id
+    }
 
     var isDraft: Bool {
         tags?.contains("draft") ?? false

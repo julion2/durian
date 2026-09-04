@@ -140,6 +140,9 @@ class JMAPConfig {
   /// Password uses HTTP Basic auth; bearer uses an API token. The secret is
   /// always read from the OS keychain by `durian auth login`.
   auth: "password"|"bearer" = "password"
+  /// One-time opt-in for upgrading a pre-account-scope JMAP cursor. Enable only
+  /// when the configured endpoint and credential still identify the same provider account.
+  trust_legacy_identity: Boolean = false
 }
 
 class AuthConfig {

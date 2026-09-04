@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http/httptest"
 	"slices"
@@ -57,9 +58,11 @@ func TestOutboxSaveToLocalStoreMarksMessageSeen(t *testing.T) {
 	db := newTestStore(t)
 	worker := NewOutboxWorker(db, nil, nil)
 	account := &config.AccountConfig{Name: "work", Email: "sender@example.com"}
-	worker.saveToLocalStore(account,
+	if err := worker.saveToLocalStore(account,
 		&mailsend.Message{MessageID: "<sent@example.com>"},
-		&OutboxDraft{To: []string{"recipient@example.com"}, Subject: "Sent"})
+		&OutboxDraft{To: []string{"recipient@example.com"}, Subject: "Sent"}); err != nil {
+		t.Fatal(err)
+	}
 
 	msg, err := db.GetByMessageID("sent@example.com")
 	if err != nil {
@@ -67,6 +70,119 @@ func TestOutboxSaveToLocalStoreMarksMessageSeen(t *testing.T) {
 	}
 	if msg == nil || msg.Flags != `\Seen` {
 		t.Fatalf("saved message = %+v, want \\Seen", msg)
+	}
+}
+
+func TestOutboxDoesNotInsertMessageIDPlaceholderForJMAP(t *testing.T) {
+	db := newTestStore(t)
+	worker := NewOutboxWorker(db, nil, nil)
+	account := &config.AccountConfig{Name: "work", Email: "sender@example.com", SyncEngine: "jmap"}
+	if err := worker.saveToLocalStore(account,
+		&mailsend.Message{MessageID: "<sent@example.com>"},
+		&OutboxDraft{To: []string{"recipient@example.com"}, Subject: "Sent"}); err != nil {
+		t.Fatal(err)
+	}
+
+	msg, err := db.GetByMessageID("sent@example.com")
+	if err != nil {
+		t.Fatalf("GetByMessageID: %v", err)
+	}
+	if msg != nil {
+		t.Fatalf("saved JMAP placeholder = %+v, want nil", msg)
+	}
+}
+
+func TestOutboxWorkerStopsWhenClaimTransitionFails(t *testing.T) {
+	db := newTestStore(t)
+	if _, err := db.Enqueue("not-json", 0); err != nil {
+		t.Fatal(err)
+	}
+	item, err := db.ClaimNextOutboxItem()
+	if err != nil || item == nil {
+		t.Fatalf("claim = %#v, %v", item, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	worker := NewOutboxWorker(db, nil, nil)
+	if worker.sendItem(item) {
+		t.Fatal("worker continued after the claimed-item state transition failed")
+	}
+}
+
+func TestOutboxWorkerPreservesClaimsForReconciliationOutcomes(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		kind              mailsend.Kind
+		status            string
+		deliveryConfirmed bool
+	}{
+		{"ambiguous", mailsend.KindAmbiguous, "reconciliation_required", false},
+		{"delivered with warning", mailsend.KindDeliveredWithWarning, "delivered_with_warning", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := newTestStore(t)
+			id, err := db.Enqueue(`{"message_id":"<correlation@example.com>","from":"sender@example.com","to":["recipient@example.com"]}`, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			item, err := db.ClaimNextOutboxItem()
+			if err != nil || item == nil {
+				t.Fatalf("claim = %#v, %v", item, err)
+			}
+			hub := NewEventHub()
+			ch := hub.Subscribe()
+			defer hub.Unsubscribe(ch)
+			worker := NewOutboxWorker(db, nil, hub)
+			draft := &OutboxDraft{Subject: "Status", To: []string{"recipient@example.com"}}
+			sendErr := &mailsend.Error{Kind: test.kind, Err: context.DeadlineExceeded}
+			if !worker.handleSendError(item, draft, sendErr) {
+				t.Fatal("worker stopped after preserving reconciliation state")
+			}
+
+			items, err := db.ListOutbox()
+			if err != nil || len(items) != 1 || !items[0].InFlight || items[0].DeliveryConfirmed != test.deliveryConfirmed || items[0].Attempts != 0 || items[0].LastError == "" {
+				t.Fatalf("preserved outbox = %#v, %v", items, err)
+			}
+			select {
+			case event := <-ch:
+				if !strings.Contains(string(event), `"status":"`+test.status+`"`) || strings.Contains(string(event), `"status":"failed"`) {
+					t.Fatalf("outbox event = %s", event)
+				}
+			default:
+				t.Fatal("missing outbox reconciliation event")
+			}
+			if err := db.DeleteClaimedOutboxItem(id); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestOutboxWorkerPersistsLegacyMessageIDBeforeAccountLookup(t *testing.T) {
+	db := newTestStore(t)
+	id, err := db.Enqueue(`{"from":"sender@example.com","to":["recipient@example.com"]}`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := db.ClaimNextOutboxItem()
+	if err != nil || item == nil {
+		t.Fatalf("claim = %#v, %v", item, err)
+	}
+	worker := NewOutboxWorker(db, &config.Config{}, nil)
+	if !worker.sendItem(item) {
+		t.Fatal("worker stopped while poisoning an item with no configured account")
+	}
+	items, err := db.ListOutbox()
+	if err != nil || len(items) != 1 || items[0].ID != id {
+		t.Fatalf("outbox after account lookup = %#v, %v", items, err)
+	}
+	var draft OutboxDraft
+	if err := json.Unmarshal([]byte(items[0].DraftJSON), &draft); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(draft.MessageID, "<") || !strings.HasSuffix(draft.MessageID, "@example.com>") {
+		t.Fatalf("persisted Message-ID = %q", draft.MessageID)
 	}
 }
 

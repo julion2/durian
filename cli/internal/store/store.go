@@ -23,6 +23,8 @@ type DB struct {
 	db             *sql.DB
 	keyring        *dbcrypto.Keyring
 	accountAliases map[string]string
+	ingestLocks    *ingestLocks
+	syncLocks      *accountSyncLocks
 }
 
 // SetAccountAliases configures user-facing account identifiers (aliases,
@@ -130,7 +132,10 @@ func Open(dbPath string, kr *dbcrypto.Keyring) (*DB, error) {
 		}
 	}
 
-	return &DB{db: db, keyring: kr}, nil
+	return &DB{
+		db: db, keyring: kr,
+		ingestLocks: newIngestLocks(dbPath), syncLocks: newAccountSyncLocks(dbPath),
+	}, nil
 }
 
 // OpenReadOnly opens an existing store without creating directories, changing
@@ -337,7 +342,15 @@ func (d *DB) Init() error {
 			last_error TEXT,
 			created_at INTEGER NOT NULL,
 			last_attempted_at INTEGER DEFAULT 0,
-			send_after INTEGER DEFAULT 0
+			send_after INTEGER DEFAULT 0,
+			in_flight INTEGER NOT NULL DEFAULT 0 CHECK(in_flight IN (0, 1)),
+			delivery_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(delivery_confirmed IN (0, 1))
+		)`,
+		`CREATE TABLE IF NOT EXISTS outbox_idempotency (
+			idempotency_key TEXT PRIMARY KEY,
+			outbox_id INTEGER NOT NULL,
+			send_after INTEGER NOT NULL,
+			created_at INTEGER NOT NULL
 		)`,
 
 		// local_drafts was first added in the v6→v7 migration. Listing it
@@ -1236,43 +1249,8 @@ func (d *DB) migrate() error {
 		}
 	}
 
-	if version < 30 {
-		// A JMAP Email.id is immutable and unique within an account, while an RFC
-		// Message-ID is optional, duplicable, and sender-controlled. Keep the
-		// latter as message metadata and fallback identity, but let capable
-		// backends key rows by their native stable id. Partial unique indexes let
-		// both identity modes coexist without collapsing duplicate Message-IDs.
-		has, err := hasColumn(d.db, "messages", "stable_id")
-		if err != nil {
-			return fmt.Errorf("migrate v29→v30 inspect stable_id: %w", err)
-		}
-		if !has {
-			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN stable_id TEXT NOT NULL DEFAULT ''"); err != nil {
-				return fmt.Errorf("migrate v29→v30 add stable_id: %w", err)
-			}
-		}
-		stmts := []string{
-			`DROP INDEX IF EXISTS idx_messages_msgid_acctid_uniq`,
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_stableid_acctid_uniq
-				ON messages(stable_id, IFNULL(account_id, 0)) WHERE stable_id != ''`,
-			`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_msgid_fallback_acctid_uniq
-				ON messages(message_id, IFNULL(account_id, 0)) WHERE stable_id = ''`,
-			`CREATE TABLE IF NOT EXISTS provider_tag_mutations (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				message_db_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-				tag TEXT NOT NULL,
-				action TEXT NOT NULL CHECK(action IN ('add', 'remove')),
-				created_at INTEGER NOT NULL
-			)`,
-			`CREATE INDEX IF NOT EXISTS idx_provider_tag_mutations_message
-				ON provider_tag_mutations(message_db_id, id)`,
-			`UPDATE schema_version SET version = 30 WHERE rowid = 1`,
-		}
-		for _, stmt := range stmts {
-			if _, err := d.db.Exec(stmt); err != nil {
-				return fmt.Errorf("migrate v29→v30: %w", err)
-			}
-		}
+	if err := d.migrateProviderNative(version); err != nil {
+		return err
 	}
 
 	return nil

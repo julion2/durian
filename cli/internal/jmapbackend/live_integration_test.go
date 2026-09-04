@@ -52,7 +52,7 @@ func TestLiveJMAPRoundTrip(t *testing.T) {
 	}
 	t.Cleanup(func() { destroyLiveEmail(b, ref.ID) })
 
-	initial, err := b.FetchMessages(ctx, allMailStream, nil, 500)
+	initial, err := completeLiveInitialSync(ctx, b, true)
 	if err != nil {
 		t.Fatalf("initial sync: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestLiveJMAPHTMLThreading(t *testing.T) {
 	if _, err := b.FetchFolders(ctx); err != nil {
 		t.Fatalf("discover folders: %v", err)
 	}
-	initial, err := b.FetchMessages(ctx, allMailStream, nil, 500)
+	initial, err := completeLiveInitialSync(ctx, b, false)
 	if err != nil {
 		t.Fatalf("initial sync: %v", err)
 	}
@@ -229,7 +229,15 @@ func TestLiveJMAPHTMLThreading(t *testing.T) {
 	if refs[parentID] == "" || refs[replyID] == "" {
 		t.Fatalf("submission delta did not contain both thread messages: parent=%t reply=%t", refs[parentID] != "", refs[replyID] != "")
 	}
-	objects, missing, _, err := b.getEmailObjects(ctx, []string{refs[parentID], refs[replyID]})
+	parentRef, err := b.rawEmailID(refs[parentID])
+	if err != nil {
+		t.Fatal(err)
+	}
+	replyRef, err := b.rawEmailID(refs[replyID])
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects, missing, _, err := b.getEmailObjects(ctx, []string{parentRef, replyRef})
 	if err != nil {
 		t.Fatalf("fetch JMAP thread metadata: %v", err)
 	}
@@ -260,7 +268,7 @@ func TestLiveJMAPReplacementRecovery(t *testing.T) {
 	if _, err := b.FetchFolders(ctx); err != nil {
 		t.Fatalf("discover folders: %v", err)
 	}
-	cursor := encodeCursor(jmapCursor{EmailState: expiredState})
+	cursor := encodeCursor(jmapCursor{AccountScope: b.client.accountScope, EmailState: expiredState})
 	present := make(map[string]struct{})
 	for page := 0; page < 10_000; page++ {
 		result, err := b.FetchMessages(ctx, allMailStream, cursor, 1)
@@ -290,6 +298,62 @@ func TestLiveJMAPReplacementRecovery(t *testing.T) {
 		return
 	}
 	t.Fatal("replacement snapshot did not finish within 10000 pages")
+}
+
+func TestLiveJMAPProviderRetargetUsesNewScope(t *testing.T) {
+	primaryURL := os.Getenv("DURIAN_JMAP_TEST_SESSION_URL")
+	secondaryURL := os.Getenv("DURIAN_JMAP_TEST_SECONDARY_SESSION_URL")
+	username := os.Getenv("DURIAN_JMAP_TEST_USERNAME")
+	password := os.Getenv("DURIAN_JMAP_TEST_PASSWORD")
+	if primaryURL == "" || secondaryURL == "" || username == "" || password == "" {
+		t.Skip("two live JMAP providers are not configured")
+	}
+
+	original := getCredential
+	getCredential = func(_, _ string) (string, error) { return password, nil }
+	t.Cleanup(func() { getCredential = original })
+	primary := newLiveBackend(t, primaryURL, liveJMAPAuth(), "JMAP Retarget A", username)
+	secondary := newLiveBackend(t, secondaryURL, liveJMAPAuth(), "JMAP Retarget B", username)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if _, err := primary.FetchFolders(ctx); err != nil {
+		t.Fatalf("discover primary: %v", err)
+	}
+	if _, err := secondary.FetchFolders(ctx); err != nil {
+		t.Fatalf("discover secondary: %v", err)
+	}
+	if primary.client.accountScope == secondary.client.accountScope {
+		t.Fatal("independent JMAP providers produced the same account scope")
+	}
+
+	inboxID := primary.mailboxIDForTag("inbox")
+	marker := time.Now().UTC().Format("20060102T150405.000000000")
+	raw := []byte("From: " + username + "\r\nTo: " + username + "\r\nSubject: Durian JMAP retarget " + marker + "\r\nMessage-ID: <durian-jmap-retarget-" + marker + "@example.test>\r\n\r\nretarget\r\n")
+	primaryRef, err := primary.Append(ctx, inboxID, backend.Flags{}, raw)
+	if err != nil {
+		t.Fatalf("append primary marker: %v", err)
+	}
+	t.Cleanup(func() { destroyLiveEmail(primary, primaryRef.ID) })
+
+	primaryInitial, err := completeLiveInitialSync(ctx, primary, false)
+	if err != nil {
+		t.Fatalf("primary initial sync: %v", err)
+	}
+	replacement, err := secondary.FetchMessages(ctx, allMailStream, primaryInitial.Cursor, 500)
+	if err != nil {
+		t.Fatalf("retargeted sync: %v", err)
+	}
+	if !replacement.FullSnapshot {
+		t.Fatalf("retargeted sync reused the primary cursor: %#v", replacement)
+	}
+	for _, ref := range replacement.Present {
+		if !strings.HasPrefix(ref.ID, secondary.client.accountScope+":") {
+			t.Fatalf("secondary snapshot returned unscoped ref %q", ref.ID)
+		}
+	}
+	if err := secondary.ApplyFlags(ctx, primaryRef, backend.Flags{Seen: true}, backend.Flags{}); !errors.Is(err, backend.ErrRefGone) {
+		t.Fatalf("secondary accepted primary provider ref: %v", err)
+	}
 }
 
 func TestLiveJMAPTwoAccountDelivery(t *testing.T) {
@@ -326,11 +390,11 @@ func TestLiveJMAPTwoAccountDelivery(t *testing.T) {
 		}
 	}
 
-	senderInitial, err := senderBackend.FetchMessages(ctx, allMailStream, nil, 500)
+	senderInitial, err := completeLiveInitialSync(ctx, senderBackend, false)
 	if err != nil {
 		t.Fatalf("initial sender sync: %v", err)
 	}
-	recipientInitial, err := recipientBackend.FetchMessages(ctx, allMailStream, nil, 500)
+	recipientInitial, err := completeLiveInitialSync(ctx, recipientBackend, false)
 	if err != nil {
 		t.Fatalf("initial recipient sync: %v", err)
 	}
@@ -427,7 +491,7 @@ func liveJMAPAuth() string {
 func newLiveBackend(t *testing.T, sessionURL, auth, name, username string) *Backend {
 	t.Helper()
 	account := &config.AccountConfig{
-		Name: name, Email: username, SyncEngine: "jmap",
+		Name: name, Email: username, Alias: "jmap-integration", SyncEngine: "jmap",
 		Auth: &config.AuthConfig{Username: username},
 		JMAP: &config.JMAPConfig{SessionURL: sessionURL, Auth: auth},
 	}
@@ -437,6 +501,31 @@ func newLiveBackend(t *testing.T, sessionURL, auth, name, username string) *Back
 	}
 	t.Cleanup(func() { _ = b.Close() })
 	return b
+}
+
+func completeLiveInitialSync(ctx context.Context, b *Backend, hydrate bool) (backend.FetchResult, error) {
+	var combined backend.FetchResult
+	var cursor backend.Cursor
+	for page := 0; page < 10_000; page++ {
+		result, err := b.FetchMessages(ctx, allMailStream, cursor, 500)
+		if err != nil {
+			return backend.FetchResult{}, err
+		}
+		combined.Cursor = result.Cursor
+		combined.Messages = append(combined.Messages, result.Messages...)
+		if hydrate && result.FullSnapshot && len(result.Present) > 0 {
+			batch, err := b.FetchSnapshotMessages(ctx, result.Present)
+			if err != nil {
+				return backend.FetchResult{}, err
+			}
+			combined.Messages = append(combined.Messages, batch.Messages...)
+		}
+		if !result.HasMore {
+			return combined, nil
+		}
+		cursor = result.Cursor
+	}
+	return backend.FetchResult{}, errors.New("initial JMAP snapshot did not finish within 10000 pages")
 }
 
 func containsMessage(messages []backend.Message, messageID string, check func(backend.Message) bool) bool {
@@ -460,11 +549,15 @@ func containsString(values []string, want string) bool {
 func destroyLiveEmail(b *Backend, id string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	rawID, err := b.rawEmailID(id)
+	if err != nil {
+		return
+	}
 	var result struct {
 		NotDestroyed map[string]methodError `json:"notDestroyed"`
 	}
 	_ = b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/set", map[string]interface{}{
 		"accountId": b.client.accountID,
-		"destroy":   []string{id},
+		"destroy":   []string{rawID},
 	}, &result)
 }

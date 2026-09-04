@@ -4,7 +4,9 @@ go_library(
     name = "jmapbackend",
     srcs = [
         "client.go",
+        "cursor.go",
         "jmapbackend.go",
+        "responses.go",
         "sender.go",
     ],
     importpath = "github.com/julion2/durian/cli/internal/jmapbackend",
@@ -24,6 +26,7 @@ go_test(
     size = "small",
     srcs = [
         "jmapbackend_test.go",
+        "operations_test.go",
         "sender_test.go",
     ],
     embed = [":jmapbackend"],

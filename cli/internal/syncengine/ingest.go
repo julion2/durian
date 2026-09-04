@@ -189,6 +189,11 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		slog.Warn("Message has no Message-ID, using synthetic ID", "module", "SYNCENGINE",
 			"ref", msg.Ref.ID, "folder", folderName, "synthetic_id", messageID)
 	}
+	releaseIngest, err := db.AcquireMessageIngest(opts.Account, messageID)
+	if err != nil {
+		return "", 0, false, err
+	}
+	defer releaseIngest()
 	var dateUnix int64
 	if t, err := mail.ParseDate(content.Date); err == nil {
 		dateUnix = t.Unix()
@@ -217,11 +222,12 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	storeMsg.Account = opts.Account
 	storeMsg.RemoteRef = msg.Ref.ID
 	storeMsg.SyntheticIdentity = syntheticIdentity
+	fingerprint := durianmail.SyntheticFingerprint(content, dateUnix)
 	if syntheticIdentity {
-		fingerprint := durianmail.SyntheticFingerprint(content, dateUnix)
 		storeMsg.SyntheticFingerprint = append([]byte(nil), fingerprint[:]...)
 	}
 	storeMsg.IngestPending = true
+	storeMsg.StartIngestOnConflict = !opts.LabelsAsTags && !opts.IdentityRecovered
 	// The message's current server flags are the correct initial baseline: the
 	// first post-ingest flag pass is then a no-op unless the user changed
 	// something locally. joinFlags (not flagStr) so the baseline round-trips
@@ -247,7 +253,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		if err := reconcileLabels(db, storeMsg.ID, msg.Labels); err != nil {
 			return "", 0, false, fmt.Errorf("reconcile labels: %w", err)
 		}
-		if err := db.MarkMessageIngestComplete(storeMsg.ID); err != nil {
+		if err := db.MarkMessageIngestComplete(storeMsg.ID, storeMsg.IngestGeneration); err != nil {
 			return "", 0, false, fmt.Errorf("complete message ingest: %w", err)
 		}
 		return messageID, storeMsg.ID, created, nil
@@ -310,7 +316,7 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	if err := applyFilterRules(db, storeMsg, content, parsed, opts); err != nil {
 		return "", 0, false, err
 	}
-	if err := db.MarkMessageIngestComplete(storeMsg.ID); err != nil {
+	if err := db.MarkMessageIngestComplete(storeMsg.ID, storeMsg.IngestGeneration); err != nil {
 		return "", 0, false, fmt.Errorf("complete message ingest: %w", err)
 	}
 

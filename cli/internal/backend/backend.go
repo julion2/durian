@@ -68,6 +68,12 @@ var ErrRefGone = errors.New("remote ref no longer exists on server")
 // refs pending without pinning message-download progress.
 var ErrPartialFlags = errors.New("some remote flags remain unresolved")
 
+// ErrSnapshotInvalidated reports that a paged authoritative snapshot no
+// longer describes one coherent provider view. The engine must discard its
+// durable staging and restart from the pre-snapshot cursor; resuming the page
+// token would otherwise fail forever or reconcile an inconsistent presence set.
+var ErrSnapshotInvalidated = errors.New("provider snapshot was invalidated while paging")
+
 // Cursor is an opaque, per-folder incremental-sync token, owned and interpreted
 // solely by the Backend that issued it. The sync engine persists it verbatim
 // and hands it back to the next FetchMessages call. IMAP encodes UIDVALIDITY
@@ -155,6 +161,17 @@ type FetchResult struct {
 type Capabilities struct {
 	// PushWatch reports real push/delta notifications rather than poll-only.
 	PushWatch bool
+	// BodyBatchLimit caps full message bodies retained by one provider fetch.
+	// Zero uses the engine's configured batch size. Backends whose messages can
+	// be unusually large should set this to bound peak memory independently of
+	// metadata-only snapshot batches.
+	BodyBatchLimit int
+	// InitialSnapshotIsAuthoritative reports that FetchMessages with an empty
+	// cursor emits Present refs for every page of a complete provider snapshot.
+	// When local rows already exist despite the missing cursor (for example after
+	// cursor-file loss), the engine finishes every page and reconciles stale rows
+	// instead of applying the normal first-sync message cap.
+	InitialSnapshotIsAuthoritative bool
 	// FlagChangesInDelta reports that FetchMessages already surfaces server-side
 	// flag/read-state changes (a message reappears in the delta with its new
 	// flags). The engine then reconciles flags from the delta stream instead of
@@ -259,6 +276,17 @@ type ArbitraryLabelWriter interface {
 // unread ↔ $seen) should not be reconstructed from ambient local state.
 type TagMutationWriter interface {
 	ApplyTagMutation(ctx context.Context, ref RemoteRef, tag string, add bool) error
+}
+
+// LegacyIdentityMigrator upgrades cursors and stable provider identities that
+// predate account scoping. The engine applies Prefix to the matching local
+// rows in one transaction before persisting Cursor and before uploading queued
+// mutations. Cursor must force an authoritative provider snapshot so absent
+// legacy rows and their queued intent are removed before any upload. A backend
+// returns ok only for a recognized legacy cursor; a non-empty, different
+// account scope is a retarget and must never migrate.
+type LegacyIdentityMigrator interface {
+	LegacyIdentityMigration(cursor Cursor) (scoped Cursor, prefix string, ok bool)
 }
 
 // SnapshotHydrator is implemented by metadata-first backends. A replacement

@@ -701,7 +701,7 @@ class SyncManager: ObservableObject {
 
     // MARK: - Outbox Update Handler
 
-    /// Handle an outbox_update SSE event — show banners for sent/failed status.
+    /// Handle an outbox_update SSE event, including manual reconciliation states.
     private func handleOutboxUpdate(_ event: OutboxUpdateEvent) {
         Log.info("OUTBOX", "SSE outbox_update: id=\(event.item_id) status=\(event.status)")
 
@@ -724,6 +724,18 @@ class SyncManager: ObservableObject {
             let detail = event.error ?? "Unknown error"
             let subject = event.subject ?? "Email"
             BannerManager.shared.showWarning(title: "\(subject) Not Sent", message: detail)
+        case "reconciliation_required":
+            EmailSendingManager.shared.handleSentEvent(itemId: event.item_id)
+            BannerManager.shared.showWarning(
+                title: "Delivery Status Unknown",
+                message: "Verify the provider using the outbox Message-ID before retrying."
+            )
+        case "delivered_with_warning":
+            EmailSendingManager.shared.handleSentEvent(itemId: event.item_id)
+            BannerManager.shared.showWarning(
+                title: "Delivered — Sent Filing Failed",
+                message: event.error ?? "The message was delivered, but its Sent copy needs manual remediation."
+            )
         default:
             break
         }
