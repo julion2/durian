@@ -388,11 +388,12 @@ func (e *Engine) reconcileFlagRows(
 				pushed = true
 			default:
 				if err := b.ApplyFlags(ctx, ref, add, remove); err != nil {
-					// Continue with the remaining messages (legacy behavior); the
-					// baseline stays put so the upload is retried next sync.
+					// A provider error can carry credential-derived text, so do not
+					// propagate its text to logs or caller-facing results. Continue;
+					// the unchanged baseline retries this message on the next sync.
 					slog.Warn("Flag upload failed", "module", "SYNCENGINE",
-						"folder", folder.Name, "message_id", row.MessageID, "err", err)
-					result.Errors = append(result.Errors, fmt.Errorf("flag upload for %s: %w", row.MessageID, err))
+						"folder", folder.Name, "message_id", row.MessageID)
+					result.Errors = append(result.Errors, fmt.Errorf("flag upload for %s failed", row.MessageID))
 					continue
 				}
 				pushed = true

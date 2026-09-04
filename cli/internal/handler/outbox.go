@@ -356,7 +356,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 			slog.Error("Delivered outbox item could not retain filing state", "module", "OUTBOX", "id", item.ID, "err", err)
 			return false
 		}
-		slog.Error("Delivery succeeded but Sent filing failed", "module", "OUTBOX", "id", item.ID, "err", filingErr)
+		slog.Error("Delivery succeeded but Sent filing failed", "module", "OUTBOX", "id", item.ID)
 		w.broadcastStatus(item.ID, "delivered_with_warning", reason, draft.Subject, strings.Join(draft.To, ", "))
 		return true
 	}

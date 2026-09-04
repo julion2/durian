@@ -866,10 +866,14 @@ func TestEnginePersistsReplacementCursorWhenFlagUploadFails(t *testing.T) {
 	if err := db.ModifyTagsByMessageIDAndAccount("upload-denied@example.com", testAccount, nil, []string{"unread"}); err != nil {
 		t.Fatal(err)
 	}
-	fake.applyFlagsErr = errors.New("permanent access denied")
+	const providerSecret = "permanent access denied with credential material"
+	fake.applyFlagsErr = errors.New(providerSecret)
 	result, err := engine.Sync(t.Context(), &backendOnly{Backend: fake})
 	if err != nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "flag upload") {
 		t.Fatalf("replacement result=%+v err=%v", result, err)
+	}
+	if strings.Contains(result.Errors[0].Error(), providerSecret) {
+		t.Fatalf("flag upload result exposed provider error: %v", result.Errors[0])
 	}
 	if got, _ := cursors.Get(testAccount, "INBOX"); string(got) != "replacement" {
 		t.Fatalf("cursor = %q, want replacement despite durable local upload failure", got)

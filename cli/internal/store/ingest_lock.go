@@ -80,12 +80,18 @@ func (d *DB) AcquireMessageIngest(account, messageID string) (func(), error) {
 			break
 		}
 		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN && err != syscall.EINTR {
-			lockFile.Close()
-			return nil, fmt.Errorf("%w: flock stripe: %w", ErrMessageIngestLock, err)
+			resultErr := fmt.Errorf("%w: flock stripe: %w", ErrMessageIngestLock, err)
+			if closeErr := lockFile.Close(); closeErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("close stripe: %w", closeErr))
+			}
+			return nil, resultErr
 		}
 		if !time.Now().Before(deadline) {
-			lockFile.Close()
-			return nil, fmt.Errorf("%w after %s", ErrMessageIngestLockTimeout, ingestLockTimeout)
+			resultErr := fmt.Errorf("%w after %s", ErrMessageIngestLockTimeout, ingestLockTimeout)
+			if closeErr := lockFile.Close(); closeErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("close stripe: %w", closeErr))
+			}
+			return nil, resultErr
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
