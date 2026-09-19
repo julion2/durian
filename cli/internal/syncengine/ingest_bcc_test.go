@@ -38,7 +38,7 @@ func TestIngestKeepsBlindRecipients(t *testing.T) {
 		Ref:       backend.RemoteRef{Folder: "Drafts", ID: "d1"},
 		Raw:       raw,
 	}
-	if _, _, err := Ingest(db, msg, "Drafts", backend.RoleDrafts, IngestOptions{Account: testAccount}); err != nil {
+	if _, _, _, err := Ingest(db, msg, "Drafts", backend.RoleDrafts, IngestOptions{Account: testAccount}); err != nil {
 		t.Fatalf("ingest draft: %v", err)
 	}
 

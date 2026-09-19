@@ -95,7 +95,7 @@ func (h *Handler) tag(query string, tags string, accounts []string, dryRun bool)
 		if dryRun {
 			changed, err = h.store.PreviewTagChangesByDBIDs(ids, add, remove)
 		} else {
-			changed, err = h.store.ModifyTagsByDBIDs(ids, add, remove)
+			changed, err = h.store.ModifyTagsByDBIDsAndJournal(ids, add, remove, time.Now().Unix())
 		}
 		if err != nil {
 			return protocol.Fail(protocol.ErrBackendError, err)
