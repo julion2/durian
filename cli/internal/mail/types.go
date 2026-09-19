@@ -67,8 +67,11 @@ type MessageInfo struct {
 	Timestamp         int64  `json:"timestamp"`
 	MessageID         string `json:"message_id,omitempty"`
 	Account           string `json:"account,omitempty"`
-	// CanReact reports whether this exact row's Reply-To status is indexed, so
-	// a reaction can derive its recipient without guessing. IsReaction marks a
+	// CanReact reports whether this exact row is a reaction target at all: a
+	// non-draft message with a sending account and a sender. The reply
+	// recipient is resolved by the reaction endpoint at click time, fetching
+	// the message's Reply-To from the provider when it was never indexed, so
+	// eligibility no longer depends on a header backfill. IsReaction marks a
 	// received RFC 9078 emoji reply, which never offers a palette of its own.
 	CanReact        bool             `json:"can_react"`
 	IsReaction      bool             `json:"is_reaction,omitempty"`

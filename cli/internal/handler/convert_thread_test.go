@@ -220,11 +220,13 @@ func TestConvertThread_AllFieldsMapped(t *testing.T) {
 	}
 }
 
-func TestShowThreadScopesReactionEligibilityToEachAccountRow(t *testing.T) {
+func TestShowThreadOffersReactionsWithoutIndexedReplyTo(t *testing.T) {
 	// Provider-native rows are never collapsed across accounts, so one thread
-	// can show the same message twice. Each row carries its own opaque
-	// identifier, and indexing Reply-To for one must not make the other
-	// reactable: the reply recipient is only known per row.
+	// can show the same message twice, each with its own opaque identifier.
+	// Eligibility no longer depends on an indexed Reply-To: the engine never
+	// backfills that marker for messages it synced before the reaction feature
+	// existed, and the reaction endpoint resolves it on demand instead. A
+	// draft has no one to react to and stays out.
 	db := newTestStore(t)
 	for _, account := range []string{"work", "personal"} {
 		if err := db.InsertMessage(&store.Message{
@@ -242,6 +244,7 @@ func TestShowThreadScopesReactionEligibilityToEachAccountRow(t *testing.T) {
 	for _, row := range rows {
 		byAccount[row.Account] = row
 	}
+	// Only one row has the marker, exactly as a partially migrated store does.
 	if err := db.InsertHeader(byAccount["work"].ID, "reply-to", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -250,24 +253,52 @@ func TestShowThreadScopesReactionEligibilityToEachAccountRow(t *testing.T) {
 	if !response.OK || len(response.Thread.Messages) != 2 {
 		t.Fatalf("response = %+v", response)
 	}
-	eligible := map[string]bool{}
 	for _, message := range response.Thread.Messages {
 		if message.ID != "local:"+strconv.FormatInt(byAccount[message.Account].ID, 10) {
 			t.Fatalf("identifier %q does not address the %s row", message.ID, message.Account)
 		}
-		eligible[message.Account] = message.CanReact
-	}
-	if !eligible["work"] || eligible["personal"] {
-		t.Fatalf("reaction eligibility = %v, want only work", eligible)
+		if !message.CanReact {
+			t.Fatalf("%s row is not reactable", message.Account)
+		}
 	}
 
-	if err := db.InsertHeader(byAccount["personal"].ID, "reply-to", ""); err != nil {
+	// A draft is written by the user, so it offers no palette.
+	draft := seedThreadMessage(t, db, &store.Message{
+		MessageID: "draft@test", Subject: "Draft", FromAddr: "me@test",
+		Account: "work", Date: 2, CreatedAt: 2, BodyText: "unsent",
+	})
+	if err := db.AddTag(draft.ID, "draft"); err != nil {
 		t.Fatal(err)
 	}
-	response = New(db, nil).ShowThread(rows[0].ThreadID)
-	for _, message := range response.Thread.Messages {
-		if !message.CanReact {
-			t.Fatalf("%s row is not reactable after indexing Reply-To", message.Account)
+	draftResponse := New(db, nil).ShowThread(draft.ThreadID)
+	if !draftResponse.OK || len(draftResponse.Thread.Messages) != 1 {
+		t.Fatalf("draft response = %+v", draftResponse)
+	}
+	if draftResponse.Thread.Messages[0].CanReact {
+		t.Fatal("a draft must not be reactable")
+	}
+}
+
+func TestShowThreadWithoutSendingAccountIsNotReactable(t *testing.T) {
+	// A row with no account has no credentials to send from, and one with no
+	// sender has no reply recipient to derive. Either way the server would
+	// refuse, so the palette must not promise otherwise.
+	db := newTestStore(t)
+	accountless := seedThreadMessage(t, db, &store.Message{
+		MessageID: "accountless@test", Subject: "Orphan", FromAddr: "sender@test",
+		Date: 1, CreatedAt: 1, BodyText: "no account",
+	})
+	senderless := seedThreadMessage(t, db, &store.Message{
+		MessageID: "senderless@test", Subject: "Anonymous", Account: "work",
+		Date: 1, CreatedAt: 1, BodyText: "no sender",
+	})
+	for _, row := range []*store.Message{accountless, senderless} {
+		response := New(db, nil).ShowThread(row.ThreadID)
+		if !response.OK || len(response.Thread.Messages) != 1 {
+			t.Fatalf("response for %s = %+v", row.MessageID, response)
+		}
+		if response.Thread.Messages[0].CanReact {
+			t.Fatalf("%s is reactable without an account or sender", row.MessageID)
 		}
 	}
 }

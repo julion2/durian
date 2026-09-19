@@ -118,9 +118,10 @@ func seedEmailDB(path string) error {
 		}
 	}
 
-	// An indexed Reply-To — empty means "replies go to From" — is what makes a
-	// message eligible for a reaction. Seed it on the first message only, so
-	// the contract test can also exercise an ineligible one.
+	// An indexed Reply-To — empty means "replies go to From" — lets a reaction
+	// derive its recipient without a provider roundtrip. Seed it on the first
+	// message only: the others carry no marker and no RemoteRef, which is the
+	// legacy IMAP shape the contract test asserts still refuses.
 	if err := db.InsertHeader(msgs[0].ID, "reply-to", ""); err != nil {
 		return fmt.Errorf("insert reply-to marker: %w", err)
 	}

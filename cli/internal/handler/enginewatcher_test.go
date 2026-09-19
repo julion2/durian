@@ -11,35 +11,44 @@ import (
 	"github.com/julion2/durian/cli/internal/config"
 )
 
-type watchBackend struct {
-	watch func(context.Context, func()) error
+// fakeBackend is the package's provider double. Only the operations a test
+// exercises are set; the rest are inert.
+type fakeBackend struct {
+	watch     func(context.Context, func()) error
+	fetchBody func(backend.RemoteRef, io.Writer) error
+	closed    bool
 }
 
-func (b *watchBackend) FetchFolders(context.Context) ([]backend.Folder, error) { return nil, nil }
-func (b *watchBackend) FetchMessages(context.Context, string, backend.Cursor, int) (backend.FetchResult, error) {
+func (b *fakeBackend) FetchFolders(context.Context) ([]backend.Folder, error) { return nil, nil }
+func (b *fakeBackend) FetchMessages(context.Context, string, backend.Cursor, int) (backend.FetchResult, error) {
 	return backend.FetchResult{}, nil
 }
-func (b *watchBackend) FetchBody(context.Context, backend.RemoteRef, io.Writer) error { return nil }
-func (b *watchBackend) ApplyFlags(context.Context, backend.RemoteRef, backend.Flags, backend.Flags) error {
+func (b *fakeBackend) FetchBody(_ context.Context, ref backend.RemoteRef, w io.Writer) error {
+	if b.fetchBody == nil {
+		return nil
+	}
+	return b.fetchBody(ref, w)
+}
+func (b *fakeBackend) ApplyFlags(context.Context, backend.RemoteRef, backend.Flags, backend.Flags) error {
 	return nil
 }
-func (b *watchBackend) FetchFlags(context.Context, string, []backend.RemoteRef) (map[string]backend.Flags, error) {
+func (b *fakeBackend) FetchFlags(context.Context, string, []backend.RemoteRef) (map[string]backend.Flags, error) {
 	return nil, nil
 }
-func (b *watchBackend) Move(context.Context, backend.RemoteRef, string) (backend.RemoteRef, error) {
+func (b *fakeBackend) Move(context.Context, backend.RemoteRef, string) (backend.RemoteRef, error) {
 	return backend.RemoteRef{}, nil
 }
-func (b *watchBackend) Append(context.Context, string, backend.Flags, []byte) (backend.RemoteRef, error) {
+func (b *fakeBackend) Append(context.Context, string, backend.Flags, []byte) (backend.RemoteRef, error) {
 	return backend.RemoteRef{}, nil
 }
-func (b *watchBackend) Send(context.Context, []byte) error { return nil }
-func (b *watchBackend) Watch(ctx context.Context, _ string, onChange func()) error {
+func (b *fakeBackend) Send(context.Context, []byte) error { return nil }
+func (b *fakeBackend) Watch(ctx context.Context, _ string, onChange func()) error {
 	return b.watch(ctx, onChange)
 }
-func (b *watchBackend) Capabilities() backend.Capabilities {
+func (b *fakeBackend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{PushWatch: true}
 }
-func (b *watchBackend) Close() error { return nil }
+func (b *fakeBackend) Close() error { b.closed = true; return nil }
 
 type recordingSyncTrigger struct{ accounts []string }
 
@@ -131,11 +140,11 @@ func TestEngineWatcherReconnectsStoppedPushBackend(t *testing.T) {
 		count++
 		created <- count
 		if count == 1 {
-			return &watchBackend{watch: func(context.Context, func()) error {
+			return &fakeBackend{watch: func(context.Context, func()) error {
 				return errors.New("IDLE connection dropped")
 			}}, nil
 		}
-		return &watchBackend{watch: func(ctx context.Context, _ func()) error {
+		return &fakeBackend{watch: func(ctx context.Context, _ func()) error {
 			<-ctx.Done()
 			return ctx.Err()
 		}}, nil

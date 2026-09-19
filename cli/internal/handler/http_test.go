@@ -2,7 +2,9 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/gorilla/mux"
 
+	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/contacts"
 	"github.com/julion2/durian/cli/internal/store"
@@ -633,7 +636,125 @@ func TestReactionEnqueueDerivesReplyFromTargetRow(t *testing.T) {
 	}
 }
 
-func TestReactionRejectsUnsupportedWrongAccountAndUnindexedReplyTo(t *testing.T) {
+// TestReactionResolvesMissingReplyToViaBackend covers the rows the engine
+// synced before Reply-To was a marker: no backfill ever writes one for them,
+// so the first reaction fetches the message and indexes both markers itself.
+func TestReactionResolvesMissingReplyToViaBackend(t *testing.T) {
+	db := newTestStore(t)
+	if err := db.InsertMessage(&store.Message{
+		MessageID: "legacy@test", Account: "work", FromAddr: "Author <author@test>",
+		Subject: "Old mail", Mailbox: "ALL", RemoteRef: "graph-42", Date: 1, CreatedAt: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	target := accountRow(t, db, "legacy@test", "work")
+	raw := "From: Author <author@test>\r\n" +
+		"Reply-To: Replies <reply@test>\r\n" +
+		"Subject: Old mail\r\n\r\nbody\r\n"
+	var fetched []backend.RemoteRef
+	fake := &fakeBackend{fetchBody: func(ref backend.RemoteRef, w io.Writer) error {
+		fetched = append(fetched, ref)
+		_, err := io.WriteString(w, raw)
+		return err
+	}}
+	h := New(db, nil)
+	h.SetConfig(&config.Config{Accounts: []config.AccountConfig{{Name: "Work", Email: "me@work.test"}}})
+	h.newBackend = func(*config.AccountConfig) (backend.Backend, error) { return fake, nil }
+	r := newTestRouter(h, nil)
+
+	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/messages/local:%d/reactions", target.ID),
+		strings.NewReader(`{"emoji":"\ud83d\udc4d","idempotency_key":"resolve-1"}`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	if len(fetched) != 1 || fetched[0].Folder != "ALL" || fetched[0].ID != "graph-42" {
+		t.Fatalf("backend fetches = %+v", fetched)
+	}
+	if !fake.closed {
+		t.Error("backend was not closed after the header fetch")
+	}
+
+	// Both markers are now durable, exactly as Ingest writes them — the empty
+	// Content-Disposition records that it was inspected and absent.
+	for _, marker := range []string{"reply-to", "content-disposition"} {
+		indexed, err := db.HasHeader(target.ID, marker)
+		if err != nil || !indexed {
+			t.Fatalf("%s indexed = %v, err = %v", marker, indexed, err)
+		}
+	}
+	if got, err := db.GetHeader(target.ID, "content-disposition"); err != nil || got != "" {
+		t.Errorf("content-disposition = %q, err = %v", got, err)
+	}
+
+	// The fetched Reply-To, not the From address, is the reply recipient.
+	items, err := db.ListOutbox()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("outbox = %v err=%v", items, err)
+	}
+	var draft OutboxDraft
+	if err := json.Unmarshal([]byte(items[0].DraftJSON), &draft); err != nil {
+		t.Fatal(err)
+	}
+	if len(draft.To) != 1 || draft.To[0] != `"Replies" <reply@test>` {
+		t.Fatalf("resolved recipient = %v", draft.To)
+	}
+
+	// A second reaction reuses the stored markers rather than the provider.
+	second := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/messages/local:%d/reactions", target.ID),
+		strings.NewReader(`{"emoji":"\u2764\ufe0f","idempotency_key":"resolve-2"}`))
+	secondRecorder := httptest.NewRecorder()
+	r.ServeHTTP(secondRecorder, second)
+	if secondRecorder.Code != http.StatusOK {
+		t.Fatalf("second status = %d body=%s", secondRecorder.Code, secondRecorder.Body.String())
+	}
+	if len(fetched) != 1 {
+		t.Fatalf("second reaction refetched headers: %+v", fetched)
+	}
+}
+
+// TestReactionReportsFailedHeaderResolution proves a provider failure is
+// reported as a retryable upstream error and enqueues nothing, so the user
+// never sees a silently dropped reaction.
+func TestReactionReportsFailedHeaderResolution(t *testing.T) {
+	db := newTestStore(t)
+	if err := db.InsertMessage(&store.Message{
+		MessageID: "unreachable@test", Account: "work", FromAddr: "author@test",
+		Subject: "Old mail", Mailbox: "ALL", RemoteRef: "graph-99", Date: 1, CreatedAt: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	target := accountRow(t, db, "unreachable@test", "work")
+	h := New(db, nil)
+	h.SetConfig(&config.Config{Accounts: []config.AccountConfig{{Name: "Work", Email: "me@work.test"}}})
+	h.newBackend = func(*config.AccountConfig) (backend.Backend, error) {
+		return &fakeBackend{fetchBody: func(backend.RemoteRef, io.Writer) error {
+			return errors.New("provider unavailable")
+		}}, nil
+	}
+	r := newTestRouter(h, nil)
+
+	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/messages/local:%d/reactions", target.ID),
+		strings.NewReader(`{"emoji":"\ud83d\udc4d","idempotency_key":"unreachable-1"}`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "backfill") {
+		t.Errorf("error still tells the user to run a backfill: %s", w.Body.String())
+	}
+	if items, err := db.ListOutbox(); err != nil || len(items) != 0 {
+		t.Fatalf("failed resolution enqueued %v (err %v)", items, err)
+	}
+	// A failed fetch must not leave a marker claiming the header was seen.
+	if indexed, err := db.HasHeader(target.ID, "reply-to"); err != nil || indexed {
+		t.Fatalf("reply-to indexed after a failed fetch = %v, err = %v", indexed, err)
+	}
+}
+
+func TestReactionRejectsUnsupportedWrongAccountAndUnfetchableReplyTo(t *testing.T) {
 	db := newTestStore(t)
 	if err := db.InsertMessage(&store.Message{MessageID: "target@test", Account: "work", FromAddr: "author@test", Subject: "Hi", Date: 1, CreatedAt: 1}); err != nil {
 		t.Fatal(err)
@@ -654,8 +775,11 @@ func TestReactionRejectsUnsupportedWrongAccountAndUnindexedReplyTo(t *testing.T)
 	if got := post(`{"account":"personal","emoji":"\ud83d\udc4d"}`); got.Code != http.StatusNotFound {
 		t.Errorf("wrong account status = %d", got.Code)
 	}
-	if got := post(`{"emoji":"\ud83d\udc4d"}`); got.Code != http.StatusConflict || !strings.Contains(got.Body.String(), "header backfill") {
-		t.Fatalf("unindexed Reply-To response = %d %s", got.Code, got.Body.String())
+	// A legacy IMAP row carries no RemoteRef, so there is no provider handle
+	// to fetch its headers with. The IMAP syncer backfills those markers on
+	// its own, so this stays a 409 rather than a failed fetch.
+	if got := post(`{"emoji":"\ud83d\udc4d"}`); got.Code != http.StatusConflict {
+		t.Fatalf("unfetchable Reply-To response = %d %s", got.Code, got.Body.String())
 	}
 	if err := db.InsertHeader(target.ID, "reply-to", ""); err != nil {
 		t.Fatal(err)

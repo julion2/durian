@@ -12,7 +12,7 @@ The release body on GitHub Releases mirrors the corresponding section of this fi
 
 ### Migration
 
-- The first IMAP sync after upgrading performs a one-time header-only backfill for messages missing reaction-routing markers. Large mailboxes may make this first sync noticeably longer; subsequent syncs skip completed account/mailbox pairs.
+- The first IMAP sync after upgrading performs a one-time header-only backfill for messages missing reaction-routing markers. Large mailboxes may make this first sync noticeably longer; subsequent syncs skip completed account/mailbox pairs. Graph, Gmail and JMAP accounts need no backfill: the first reaction on a message synced before this release fetches its routing headers on demand.
 
 ## [v0.4.0] - 2026-06-02
 

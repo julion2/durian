@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -17,6 +18,7 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/gorilla/mux"
 
+	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/encoding"
 	imapClient "github.com/julion2/durian/cli/internal/imap"
@@ -173,8 +175,17 @@ func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if !replyToIndexed {
-		writeReactionError(w, http.StatusConflict, "Reply-To status is unavailable; run a header backfill before reacting")
-		return
+		if err := h.resolveReactionHeaders(r.Context(), target, account); err != nil {
+			// The provider error is deliberately absent: it can echo the
+			// fetched message, and no header value may reach a log.
+			slog.Warn("Failed to resolve reaction headers on demand", "module", "OUTBOX", "account", account.AccountIdentifier()) // encgrep:allow account identifier (config name); no header value or provider text is logged
+			if errors.Is(err, errReactionHeadersUnfetchable) {
+				writeReactionError(w, http.StatusConflict, "Reply-To status is unavailable for this message")
+				return
+			}
+			writeReactionError(w, http.StatusBadGateway, "Failed to fetch the message's Reply-To from the mail server")
+			return
+		}
 	}
 
 	recipient := target.FromAddr
@@ -228,6 +239,53 @@ func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, map[string]any{"ok": true, "id": id, "send_after": sendAfter, "recipient": recipient})
 }
 
+// errReactionHeadersUnfetchable reports that this row carries no provider
+// handle the header fetch could use. Only legacy IMAP rows land here, and the
+// IMAP syncer backfills their markers on its own schedule.
+var errReactionHeadersUnfetchable = errors.New("message has no provider handle for a header fetch")
+
+// reactionHeaderFetchTimeout bounds the one provider roundtrip an old message
+// pays on its first reaction. A user is waiting on the click, so this is far
+// shorter than the attachment path's 60s download budget.
+const reactionHeaderFetchTimeout = 10 * time.Second
+
+// resolveReactionHeaders fetches the target message through its account's
+// backend and writes the Reply-To and Content-Disposition markers for that
+// row, exactly as syncengine.Ingest does for freshly synced messages —
+// including empty values, which record that the header was inspected and
+// absent. Rows synced before the reaction feature existed have no markers and
+// no backfill will ever produce them on the provider-neutral engine, so the
+// first reaction resolves them here instead of refusing.
+func (h *Handler) resolveReactionHeaders(ctx context.Context, target *store.Message, account *config.AccountConfig) error {
+	if target.RemoteRef == "" {
+		return errReactionHeadersUnfetchable
+	}
+	ctx, cancel := context.WithTimeout(ctx, reactionHeaderFetchTimeout)
+	defer cancel()
+
+	b, err := h.mailBackend(account)
+	if err != nil {
+		return fmt.Errorf("create backend: %w", err)
+	}
+	defer b.Close()
+
+	var buf bytes.Buffer
+	ref := backend.RemoteRef{Folder: target.Mailbox, ID: target.RemoteRef, MessageID: target.MessageID}
+	if err := b.FetchBody(ctx, ref, &buf); err != nil {
+		return fmt.Errorf("fetch body: %w", err)
+	}
+	parsed, err := mail.ReadMessage(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		return fmt.Errorf("parse message: %w", err)
+	}
+	for _, name := range []string{"Reply-To", "Content-Disposition"} {
+		if err := h.store.InsertHeader(target.ID, strings.ToLower(name), parsed.Header.Get(name)); err != nil {
+			return fmt.Errorf("insert header %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
 // reactionIdempotencyKey identifies one logical reaction. A client-supplied key
 // scopes it to a single user action, so reacting again after an Undo enqueues a
 // new send. Without one, the key falls back to the target row and emoji, which
@@ -244,8 +302,8 @@ func reactionIdempotencyKey(request reactionRequest, account string, targetRowID
 }
 
 // writeReactionError returns a machine-readable body so the GUI can show the
-// server's reason — an unindexed Reply-To in particular is actionable — rather
-// than a bare status code.
+// server's reason — a failed Reply-To fetch in particular is worth retrying —
+// rather than a bare status code.
 func writeReactionError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

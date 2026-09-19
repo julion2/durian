@@ -361,7 +361,9 @@ paths:
         Enqueues a reaction to the exact stored message row named by the path
         identifier. The account, reply recipient, subject and threading
         metadata are derived server-side from that row; the client supplies
-        only the emoji.
+        only the emoji. A row synced before Reply-To was indexed has its
+        Reply-To and Content-Disposition markers fetched from the provider on
+        the first reaction, so no header backfill is required.
       parameters:
         - name: message_id
           in: path
@@ -391,9 +393,14 @@ paths:
         '404':
           description: Message not found, or not owned by the asserted account
         '409':
-          description: Reply-To was never indexed; run a header backfill first
+          description: >
+            The row carries no provider handle to fetch its Reply-To with.
+            Only legacy IMAP rows, whose markers the IMAP syncer backfills
+            automatically.
         '500':
           description: Enqueue failed
+        '502':
+          description: Fetching the message's Reply-To from the provider failed
         '503':
           description: Mail configuration is unavailable
   /outbox:
@@ -882,9 +889,11 @@ components:
         can_react:
           type: boolean
           description: >
-            Whether this row's Reply-To status is indexed, so a reaction can
-            derive its reply recipient. False when the message's headers were
-            never fetched; run a header backfill first.
+            Whether this row is a reaction target: a non-draft message with a
+            sending account and a sender. The reply recipient is resolved when
+            the reaction is posted — the server fetches the message's Reply-To
+            from the provider if it was never indexed — so this does not
+            depend on a header backfill.
         is_reaction:
           type: boolean
           description: True for a received RFC 9078 Content-Disposition reaction

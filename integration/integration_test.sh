@@ -321,8 +321,9 @@ assert_http_code "POST reactions rejects an emoji outside the palette" \
     "$BASE/messages/$FIRST_MESSAGE_ID/reactions" "POST" "400" '{"emoji":"🔥"}'
 assert_http_code "POST reactions rejects an unknown message" \
     "$BASE/messages/local:999999/reactions" "POST" "404" '{"emoji":"👍"}'
-# A message whose Reply-To was never indexed has no known reply recipient.
-assert_http_code "POST reactions rejects an unindexed Reply-To" \
+# A legacy IMAP row has neither an indexed Reply-To nor a provider handle to
+# fetch one with, so the server cannot resolve a reply recipient on demand.
+assert_http_code "POST reactions rejects an unfetchable Reply-To" \
     "$BASE/messages/$DUPLICATE_MESSAGE_ID/reactions" "POST" "409" '{"emoji":"👍"}'
 
 curl -sf "${AUTH[@]}" -X DELETE "$BASE/outbox/$REACTION_ID" > /dev/null
@@ -330,10 +331,14 @@ RESP=$(curl -sf "${AUTH[@]}" "$BASE/outbox")
 assert_jq "DELETE /outbox/{id} undoes the queued reaction" "$RESP" \
     "[.[] | select(.id == $REACTION_ID)] | length == 0"
 
+# Eligibility is a property of the row, not of its indexed headers: both
+# duplicate rows offer a palette even though only one carries a Reply-To
+# marker, and the server resolves the recipient when the reaction is posted.
 RESP=$(curl -sf "${AUTH[@]}" "$BASE/threads/$THREAD_ID")
 assert_jq "GET /threads/{id} reports per-row reaction eligibility" "$RESP" '
     [.thread.messages[] | select(.message_id == "msg1@test")] as $duplicates |
-    ([$duplicates[] | select(.can_react)] | length) == 1 and
+    ($duplicates | length) == 2 and
+    all($duplicates[]; .can_react) and
     all($duplicates[]; .is_reaction != true)'
 
 # ─────────────────────────────────────────────
