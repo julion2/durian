@@ -15,7 +15,8 @@ import (
 // exercises are set; the rest are inert.
 type fakeBackend struct {
 	watch     func(context.Context, func()) error
-	fetchBody func(backend.RemoteRef, io.Writer) error
+	fetchBody func(context.Context, backend.RemoteRef, io.Writer) error
+	onClose   func()
 	closed    bool
 }
 
@@ -23,11 +24,11 @@ func (b *fakeBackend) FetchFolders(context.Context) ([]backend.Folder, error) { 
 func (b *fakeBackend) FetchMessages(context.Context, string, backend.Cursor, int) (backend.FetchResult, error) {
 	return backend.FetchResult{}, nil
 }
-func (b *fakeBackend) FetchBody(_ context.Context, ref backend.RemoteRef, w io.Writer) error {
+func (b *fakeBackend) FetchBody(ctx context.Context, ref backend.RemoteRef, w io.Writer) error {
 	if b.fetchBody == nil {
 		return nil
 	}
-	return b.fetchBody(ref, w)
+	return b.fetchBody(ctx, ref, w)
 }
 func (b *fakeBackend) ApplyFlags(context.Context, backend.RemoteRef, backend.Flags, backend.Flags) error {
 	return nil
@@ -48,7 +49,13 @@ func (b *fakeBackend) Watch(ctx context.Context, _ string, onChange func()) erro
 func (b *fakeBackend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{PushWatch: true}
 }
-func (b *fakeBackend) Close() error { b.closed = true; return nil }
+func (b *fakeBackend) Close() error {
+	b.closed = true
+	if b.onClose != nil {
+		b.onClose()
+	}
+	return nil
+}
 
 type recordingSyncTrigger struct{ accounts []string }
 

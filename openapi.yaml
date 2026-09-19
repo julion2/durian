@@ -394,13 +394,18 @@ paths:
           description: Message not found, or not owned by the asserted account
         '409':
           description: >
-            The row carries no provider handle to fetch its Reply-To with.
-            Only legacy IMAP rows, whose markers the IMAP syncer backfills
-            automatically.
+            The Reply-To cannot be resolved for this row and retrying will not
+            help: either the row carries no provider handle to fetch it with
+            (legacy IMAP rows, whose markers the IMAP syncer backfills
+            automatically) or the message no longer exists on the server.
         '500':
           description: Enqueue failed
         '502':
-          description: Fetching the message's Reply-To from the provider failed
+          description: >
+            Fetching the message's Reply-To from the provider failed or
+            exceeded the server's 10-second budget, or the client disconnected
+            before the reaction could be queued. Nothing was queued; retrying
+            is safe.
         '503':
           description: Mail configuration is unavailable
   /outbox:

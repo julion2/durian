@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -652,7 +653,10 @@ func TestReactionResolvesMissingReplyToViaBackend(t *testing.T) {
 		"Reply-To: Replies <reply@test>\r\n" +
 		"Subject: Old mail\r\n\r\nbody\r\n"
 	var fetched []backend.RemoteRef
-	fake := &fakeBackend{fetchBody: func(ref backend.RemoteRef, w io.Writer) error {
+	fake := &fakeBackend{fetchBody: func(ctx context.Context, ref backend.RemoteRef, w io.Writer) error {
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+			t.Error("header fetch ran without a deadline")
+		}
 		fetched = append(fetched, ref)
 		_, err := io.WriteString(w, raw)
 		return err
@@ -669,7 +673,7 @@ func TestReactionResolvesMissingReplyToViaBackend(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
 	}
-	if len(fetched) != 1 || fetched[0].Folder != "ALL" || fetched[0].ID != "graph-42" {
+	if len(fetched) != 1 || fetched[0].Folder != "ALL" || fetched[0].ID != "graph-42" || fetched[0].MessageID != "legacy@test" {
 		t.Fatalf("backend fetches = %+v", fetched)
 	}
 	if !fake.closed {
@@ -714,43 +718,147 @@ func TestReactionResolvesMissingReplyToViaBackend(t *testing.T) {
 	}
 }
 
-// TestReactionReportsFailedHeaderResolution proves a provider failure is
-// reported as a retryable upstream error and enqueues nothing, so the user
-// never sees a silently dropped reaction.
+// TestReactionReportsFailedHeaderResolution proves every way the on-demand
+// header fetch can fail is reported to the client and enqueues nothing, so
+// the user never sees a silently dropped reaction — or, worse, one sent after
+// the GUI told them it failed. The deadline case is the one that matters
+// most: imapbackend.FetchBody ignores its context, so the handler has to
+// enforce the budget itself instead of trusting the provider call to return.
 func TestReactionReportsFailedHeaderResolution(t *testing.T) {
+	cases := []struct {
+		name       string
+		fetchBody  func(context.Context, backend.RemoteRef, io.Writer) error
+		wantStatus int
+	}{
+		{
+			name: "provider error",
+			fetchBody: func(context.Context, backend.RemoteRef, io.Writer) error {
+				return errors.New("provider unavailable")
+			},
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			// A body that is not a message must not be recorded as "headers
+			// inspected, none present": that would route the reaction to From
+			// on the strength of garbage.
+			name: "unparseable body",
+			fetchBody: func(_ context.Context, _ backend.RemoteRef, w io.Writer) error {
+				_, err := io.WriteString(w, "not a message")
+				return err
+			},
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			// The provider call never returns on its own and never looks at
+			// ctx, which is exactly how imapbackend.FetchBody behaves. The
+			// handler must still answer within its own budget.
+			name: "fetch ignores the deadline",
+			fetchBody: func(_ context.Context, _ backend.RemoteRef, _ io.Writer) error {
+				time.Sleep(1500 * time.Millisecond)
+				return nil
+			},
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			name: "message gone from the server",
+			fetchBody: func(context.Context, backend.RemoteRef, io.Writer) error {
+				return fmt.Errorf("%w: graph-99", backend.ErrRefGone)
+			},
+			wantStatus: http.StatusConflict,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Keep the deadline case fast; the value is irrelevant to the rest.
+			previous := reactionHeaderFetchTimeout
+			reactionHeaderFetchTimeout = 50 * time.Millisecond
+			t.Cleanup(func() { reactionHeaderFetchTimeout = previous })
+
+			db := newTestStore(t)
+			if err := db.InsertMessage(&store.Message{
+				MessageID: "unreachable@test", Account: "work", FromAddr: "author@test",
+				Subject: "Old mail", Mailbox: "ALL", RemoteRef: "graph-99", Date: 1, CreatedAt: 1,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			target := accountRow(t, db, "unreachable@test", "work")
+			h := New(db, nil)
+			h.SetConfig(&config.Config{Accounts: []config.AccountConfig{{Name: "Work", Email: "me@work.test"}}})
+			closed := make(chan struct{}, 1)
+			h.newBackend = func(*config.AccountConfig) (backend.Backend, error) {
+				return &fakeBackend{fetchBody: tc.fetchBody, onClose: func() { closed <- struct{}{} }}, nil
+			}
+			r := newTestRouter(h, nil)
+
+			req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/messages/local:%d/reactions", target.ID),
+				strings.NewReader(`{"emoji":"\ud83d\udc4d","idempotency_key":"unreachable-1"}`))
+			w := httptest.NewRecorder()
+			started := time.Now()
+			r.ServeHTTP(w, req)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+			}
+			if elapsed := time.Since(started); elapsed > time.Second {
+				t.Fatalf("handler took %v; the fetch budget was not enforced", elapsed)
+			}
+			if strings.Contains(w.Body.String(), "backfill") {
+				t.Errorf("error still tells the user to run a backfill: %s", w.Body.String())
+			}
+			if items, err := db.ListOutbox(); err != nil || len(items) != 0 {
+				t.Fatalf("failed resolution enqueued %v (err %v)", items, err)
+			}
+			// A failed fetch must not leave a marker claiming the header was seen.
+			for _, marker := range []string{"reply-to", "content-disposition"} {
+				if indexed, err := db.HasHeader(target.ID, marker); err != nil || indexed {
+					t.Fatalf("%s indexed after a failed fetch = %v, err = %v", marker, indexed, err)
+				}
+			}
+			// The connection is released even when the provider call outlived
+			// the handler's answer.
+			select {
+			case <-closed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("backend was never closed")
+			}
+		})
+	}
+}
+
+// TestReactionNotQueuedAfterClientGaveUp proves a reaction whose client
+// disconnected during the header fetch is dropped rather than queued: the GUI
+// has already shown "Reaction Not Queued" and cleared its pending state, so a
+// late enqueue would send an emoji the user believes was never sent.
+func TestReactionNotQueuedAfterClientGaveUp(t *testing.T) {
 	db := newTestStore(t)
 	if err := db.InsertMessage(&store.Message{
-		MessageID: "unreachable@test", Account: "work", FromAddr: "author@test",
-		Subject: "Old mail", Mailbox: "ALL", RemoteRef: "graph-99", Date: 1, CreatedAt: 1,
+		MessageID: "slow@test", Account: "work", FromAddr: "author@test",
+		Subject: "Old mail", Mailbox: "ALL", RemoteRef: "graph-7", Date: 1, CreatedAt: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	target := accountRow(t, db, "unreachable@test", "work")
+	target := accountRow(t, db, "slow@test", "work")
 	h := New(db, nil)
 	h.SetConfig(&config.Config{Accounts: []config.AccountConfig{{Name: "Work", Email: "me@work.test"}}})
+	ctx, clientGaveUp := context.WithCancel(context.Background())
 	h.newBackend = func(*config.AccountConfig) (backend.Backend, error) {
-		return &fakeBackend{fetchBody: func(backend.RemoteRef, io.Writer) error {
-			return errors.New("provider unavailable")
+		return &fakeBackend{fetchBody: func(_ context.Context, _ backend.RemoteRef, w io.Writer) error {
+			// The fetch itself succeeds, but only after the client is gone.
+			clientGaveUp()
+			_, err := io.WriteString(w, "From: author@test\r\nSubject: Old mail\r\n\r\nbody\r\n")
+			return err
 		}}, nil
 	}
 	r := newTestRouter(h, nil)
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/messages/local:%d/reactions", target.ID),
-		strings.NewReader(`{"emoji":"\ud83d\udc4d","idempotency_key":"unreachable-1"}`))
+		strings.NewReader(`{"emoji":"\ud83d\udc4d","idempotency_key":"slow-1"}`)).WithContext(ctx)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
-	if w.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
-	}
-	if strings.Contains(w.Body.String(), "backfill") {
-		t.Errorf("error still tells the user to run a backfill: %s", w.Body.String())
+	if w.Code == http.StatusOK {
+		t.Fatalf("reaction was queued for a client that had gone away: %s", w.Body.String())
 	}
 	if items, err := db.ListOutbox(); err != nil || len(items) != 0 {
-		t.Fatalf("failed resolution enqueued %v (err %v)", items, err)
-	}
-	// A failed fetch must not leave a marker claiming the header was seen.
-	if indexed, err := db.HasHeader(target.ID, "reply-to"); err != nil || indexed {
-		t.Fatalf("reply-to indexed after a failed fetch = %v, err = %v", indexed, err)
+		t.Fatalf("outbox after client disconnect = %v (err %v)", items, err)
 	}
 }
 

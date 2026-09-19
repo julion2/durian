@@ -176,14 +176,17 @@ func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request)
 	}
 	if !replyToIndexed {
 		if err := h.resolveReactionHeaders(r.Context(), target, account); err != nil {
-			// The provider error is deliberately absent: it can echo the
-			// fetched message, and no header value may reach a log.
-			slog.Warn("Failed to resolve reaction headers on demand", "module", "OUTBOX", "account", account.AccountIdentifier()) // encgrep:allow account identifier (config name); no header value or provider text is logged
-			if errors.Is(err, errReactionHeadersUnfetchable) {
+			switch {
+			case errors.Is(err, errReactionHeadersUnfetchable):
 				writeReactionError(w, http.StatusConflict, "Reply-To status is unavailable for this message")
-				return
+			case errors.Is(err, backend.ErrRefGone):
+				writeReactionError(w, http.StatusConflict, "Message no longer exists on the mail server")
+			default:
+				// The provider error is deliberately absent: it can echo the
+				// fetched message, and no header value may reach a log.
+				slog.Warn("Failed to resolve reaction headers on demand", "module", "OUTBOX", "account", account.AccountIdentifier(), "timeout", errors.Is(err, context.DeadlineExceeded)) // encgrep:allow account identifier (config name); no header value or provider text is logged
+				writeReactionError(w, http.StatusBadGateway, "Failed to fetch the message's Reply-To from the mail server")
 			}
-			writeReactionError(w, http.StatusBadGateway, "Failed to fetch the message's Reply-To from the mail server")
 			return
 		}
 	}
@@ -229,6 +232,13 @@ func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request)
 		writeReactionError(w, http.StatusInternalServerError, "Failed to encode reaction")
 		return
 	}
+	// A client that gave up during the header fetch has already told the user
+	// the reaction failed and will never show the Undo countdown; queueing it
+	// now would send an emoji the user believes was not sent.
+	if err := r.Context().Err(); err != nil {
+		writeReactionError(w, http.StatusBadGateway, "Client went away before the reaction could be queued")
+		return
+	}
 	id, sendAfter, err := h.store.EnqueueIdempotent(string(draftJSON), time.Now().Unix()+reactionSendDelay, draft.IdempotencyKey)
 	if err != nil {
 		slog.Error("Failed to enqueue reaction", "module", "OUTBOX", "err", err)
@@ -246,8 +256,9 @@ var errReactionHeadersUnfetchable = errors.New("message has no provider handle f
 
 // reactionHeaderFetchTimeout bounds the one provider roundtrip an old message
 // pays on its first reaction. A user is waiting on the click, so this is far
-// shorter than the attachment path's 60s download budget.
-const reactionHeaderFetchTimeout = 10 * time.Second
+// shorter than the attachment path's 60s download budget. A variable so a
+// test can shrink it.
+var reactionHeaderFetchTimeout = 10 * time.Second
 
 // resolveReactionHeaders fetches the target message through its account's
 // backend and writes the Reply-To and Content-Disposition markers for that
@@ -263,27 +274,63 @@ func (h *Handler) resolveReactionHeaders(ctx context.Context, target *store.Mess
 	ctx, cancel := context.WithTimeout(ctx, reactionHeaderFetchTimeout)
 	defer cancel()
 
-	b, err := h.mailBackend(account)
+	raw, err := h.fetchRawMessage(ctx, target, account)
 	if err != nil {
-		return fmt.Errorf("create backend: %w", err)
+		return err
 	}
-	defer b.Close()
-
-	var buf bytes.Buffer
-	ref := backend.RemoteRef{Folder: target.Mailbox, ID: target.RemoteRef, MessageID: target.MessageID}
-	if err := b.FetchBody(ctx, ref, &buf); err != nil {
-		return fmt.Errorf("fetch body: %w", err)
-	}
-	parsed, err := mail.ReadMessage(bytes.NewReader(buf.Bytes()))
+	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("parse message: %w", err)
 	}
-	for _, name := range []string{"Reply-To", "Content-Disposition"} {
+	// Reply-To is the eligibility gate (HasHeader), so it is written last:
+	// should the earlier insert fail, the next reaction fetches again rather
+	// than finding the gate open with the other marker missing.
+	for _, name := range []string{"Content-Disposition", "Reply-To"} {
 		if err := h.store.InsertHeader(target.ID, strings.ToLower(name), parsed.Header.Get(name)); err != nil {
 			return fmt.Errorf("insert header %q: %w", name, err)
 		}
 	}
 	return nil
+}
+
+// fetchRawMessage streams the whole RFC822 message for target through a
+// freshly built backend and enforces ctx itself rather than trusting the
+// backend to. The HTTP backends honor ctx, but imapbackend.FetchBody ignores
+// it and imap.Client has no per-command deadline, so on an engine-IMAP
+// account a slow FETCH would otherwise outlive both this budget and the GUI's
+// request timeout — and the reaction would be queued after the user was told
+// it failed. The goroutine owns the backend and closes it when the provider
+// call returns; when the deadline wins, the caller gets ctx.Err() at once and
+// the goroutine finishes and releases the connection on its own.
+func (h *Handler) fetchRawMessage(ctx context.Context, target *store.Message, account *config.AccountConfig) ([]byte, error) {
+	type fetched struct {
+		raw []byte
+		err error
+	}
+	done := make(chan fetched, 1)
+	go func() {
+		b, err := h.mailBackend(account)
+		if err != nil {
+			done <- fetched{err: fmt.Errorf("create backend: %w", err)}
+			return
+		}
+		var buf bytes.Buffer
+		ref := backend.RemoteRef{Folder: target.Mailbox, ID: target.RemoteRef, MessageID: target.MessageID}
+		err = b.FetchBody(ctx, ref, &buf)
+		b.Close()
+		if err != nil {
+			done <- fetched{err: fmt.Errorf("fetch body: %w", err)}
+			return
+		}
+		done <- fetched{raw: buf.Bytes()}
+	}()
+
+	select {
+	case result := <-done:
+		return result.raw, result.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("fetch body: %w", ctx.Err())
+	}
 }
 
 // reactionIdempotencyKey identifies one logical reaction. A client-supplied key
