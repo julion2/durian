@@ -34,10 +34,11 @@ type CursorStore interface {
 // ReplayCount records whether a replacement snapshot has already been replayed
 // after its first failed flag pass.
 type PendingFlags struct {
-	Refs        []string `json:"refs,omitempty"`
-	FullScan    bool     `json:"fullScan,omitempty"`
-	ScanAfterID int64    `json:"scanAfterId,omitempty"`
-	ReplayCount int      `json:"replayCount,omitempty"`
+	Refs               []string `json:"refs,omitempty"`
+	FullScan           bool     `json:"fullScan,omitempty"`
+	ScanAfterID        int64    `json:"scanAfterId,omitempty"`
+	ReplayCount        int      `json:"replayCount,omitempty"`
+	SnapshotInProgress bool     `json:"snapshotInProgress,omitempty"`
 }
 
 // FolderState is the atomic persisted state for one backend folder.
@@ -327,7 +328,7 @@ func (f *FileCursorStore) save(account string, cursors map[string]FolderState) e
 	pendingByFolder := make(map[string]PendingFlags)
 	for folder, state := range cursors {
 		legacy[folder] = []byte(state.Cursor)
-		if len(state.PendingFlags.Refs) > 0 || state.PendingFlags.FullScan || state.PendingFlags.ReplayCount != 0 {
+		if len(state.PendingFlags.Refs) > 0 || state.PendingFlags.FullScan || state.PendingFlags.ReplayCount != 0 || state.PendingFlags.SnapshotInProgress {
 			pendingByFolder[folder] = state.PendingFlags
 		}
 	}

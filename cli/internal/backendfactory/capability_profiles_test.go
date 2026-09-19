@@ -68,16 +68,20 @@ func TestEveryCapabilityBitIsExercisedBySomeProfile(t *testing.T) {
 	var union backend.Capabilities
 	for _, caps := range backend.ProductionProfiles {
 		union.PushWatch = union.PushWatch || caps.PushWatch
+		union.BodyBatchLimit = max(union.BodyBatchLimit, caps.BodyBatchLimit)
+		union.InitialSnapshotIsAuthoritative = union.InitialSnapshotIsAuthoritative || caps.InitialSnapshotIsAuthoritative
 		union.FlagChangesInDelta = union.FlagChangesInDelta || caps.FlagChangesInDelta
 		union.LabelsAreTags = union.LabelsAreTags || caps.LabelsAreTags
 		union.AnsweredUnsupported = union.AnsweredUnsupported || caps.AnsweredUnsupported
 	}
 
 	bits := map[string]bool{
-		"PushWatch":           union.PushWatch,
-		"FlagChangesInDelta":  union.FlagChangesInDelta,
-		"LabelsAreTags":       union.LabelsAreTags,
-		"AnsweredUnsupported": union.AnsweredUnsupported,
+		"PushWatch":                      union.PushWatch,
+		"BodyBatchLimit":                 union.BodyBatchLimit > 0,
+		"InitialSnapshotIsAuthoritative": union.InitialSnapshotIsAuthoritative,
+		"FlagChangesInDelta":             union.FlagChangesInDelta,
+		"LabelsAreTags":                  union.LabelsAreTags,
+		"AnsweredUnsupported":            union.AnsweredUnsupported,
 	}
 	for name, set := range bits {
 		if _, known := notReadByEngine[name]; known {

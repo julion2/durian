@@ -57,20 +57,21 @@ type MessageBody struct {
 
 // MessageInfo represents a single message within a thread
 type MessageInfo struct {
-	ID              string           `json:"id"`
-	From            string           `json:"from"`
-	To              string           `json:"to,omitempty"`
-	CC              string           `json:"cc,omitempty"`
-	BCC             string           `json:"bcc,omitempty"`
-	Date            string           `json:"date"`
-	Timestamp       int64            `json:"timestamp"`
-	MessageID       string           `json:"message_id,omitempty"`
-	Account         string           `json:"account,omitempty"`
-	InReplyTo       string           `json:"in_reply_to,omitempty"`
-	References      string           `json:"references,omitempty"`
-	Body            string           `json:"body"`
-	HTML            string           `json:"html,omitempty"`
-	HiddenSignature string           `json:"hidden_signature,omitempty"`
-	Attachments     []AttachmentInfo `json:"attachments,omitempty"`
-	Tags            []string         `json:"tags,omitempty"`
+	ID                string           `json:"id"`
+	AttachmentCacheID string           `json:"attachment_cache_id,omitempty"`
+	From              string           `json:"from"`
+	To                string           `json:"to,omitempty"`
+	CC                string           `json:"cc,omitempty"`
+	BCC               string           `json:"bcc,omitempty"`
+	Date              string           `json:"date"`
+	Timestamp         int64            `json:"timestamp"`
+	MessageID         string           `json:"message_id,omitempty"`
+	Account           string           `json:"account,omitempty"`
+	InReplyTo         string           `json:"in_reply_to,omitempty"`
+	References        string           `json:"references,omitempty"`
+	Body              string           `json:"body"`
+	HTML              string           `json:"html,omitempty"`
+	HiddenSignature   string           `json:"hidden_signature,omitempty"`
+	Attachments       []AttachmentInfo `json:"attachments,omitempty"`
+	Tags              []string         `json:"tags,omitempty"`
 }

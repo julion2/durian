@@ -77,6 +77,12 @@ type graphDraft struct {
 // Send creates a draft from m and sends it. BCC recipients are delivered via the
 // typed bccRecipients field and never appear in the To/Cc headers.
 func (s *Sender) Send(ctx context.Context, m *mailsend.Message) error {
+	return s.SendAfterPersist(ctx, m, func(string) error { return nil })
+}
+
+// SendAfterPersist prepares a Graph draft and persists its exact Message-ID
+// before asking Graph to deliver it.
+func (s *Sender) SendAfterPersist(ctx context.Context, m *mailsend.Message, persist func(string) error) error {
 	small, large := splitAttachments(m.Attachments)
 
 	// A reply gets its threading headers from Graph via createReply; a new
@@ -95,11 +101,19 @@ func (s *Sender) Send(ctx context.Context, m *mailsend.Message) error {
 			return classifyGraphSendError(err)
 		}
 	}
+	if msgID == "" {
+		var fetched draftResult
+		if err := s.b.doJSON(ctx, http.MethodGet, s.b.baseURL+s.b.mailbox+"/messages/"+url.PathEscape(draftID)+"?$select=id,internetMessageId", nil, &fetched); err != nil {
+			return classifyGraphSendError(err)
+		}
+		msgID = fetched.InternetMessageID
+	}
+	if msgID == "" {
+		return &mailsend.Error{Kind: mailsend.KindTransient, Err: errors.New("graph draft has no internetMessageId")}
+	}
 	// Adopt Graph's Message-ID so the caller's local Sent row carries the same
 	// id as the server's sent copy and the two dedupe on the next sync.
-	if msgID != "" {
-		m.MessageID = msgID
-	}
+	m.MessageID = msgID
 
 	// Large attachments go up in resumable chunks against the draft.
 	for _, a := range large {
@@ -107,12 +121,28 @@ func (s *Sender) Send(ctx context.Context, m *mailsend.Message) error {
 			return classifyGraphSendError(err)
 		}
 	}
+	if err := persist(msgID); err != nil {
+		return &mailsend.Error{Kind: mailsend.KindTransient, Err: fmt.Errorf("persist graph Message-ID: %w", err)}
+	}
 
 	if err := s.b.doJSON(ctx, http.MethodPost,
 		s.b.baseURL+s.b.mailbox+"/messages/"+url.PathEscape(draftID)+"/send", nil, nil); err != nil {
-		return classifyGraphSendError(err)
+		return classifyGraphFinalSendError(err)
 	}
 	return nil
+}
+
+func classifyGraphFinalSendError(err error) error {
+	var se *statusError
+	if errors.As(err, &se) {
+		// The draft send endpoint is irreversible. A 5xx may be generated
+		// after Graph accepted the draft, so retrying could deliver twice.
+		if se.status >= 500 {
+			return &mailsend.Error{Kind: mailsend.KindAmbiguous, Err: err}
+		}
+		return classifyGraphSendError(err)
+	}
+	return &mailsend.Error{Kind: mailsend.KindAmbiguous, Err: err}
 }
 
 // SavesSentCopy reports that Microsoft Graph stores sent mail server-side.

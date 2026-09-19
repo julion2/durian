@@ -94,14 +94,16 @@ Integration tests in `integration/integration_test.sh` exercise the contract end
 
 ## Storage model
 
-One SQLite file at `~/.local/share/durian/email.db` (or `$XDG_DATA_HOME/durian/email.db`). Schema version is bumped on every migration step (encryption, sync-engine baselines, and data repairs); current version is v26.
+One SQLite file at `~/.local/share/durian/email.db` (or `$XDG_DATA_HOME/durian/email.db`). Schema version is bumped on every migration step (encryption, sync-engine baselines, and data repairs); current version is v34.
 
-- `messages` — one row per email. Plaintext columns: `message_id`, `thread_id`, `in_reply_to`, `refs`, `from_addr`, `to_addrs`, `cc_addrs`, `date`, `created_at`, `size`, `uid`, `account_id` + `mailbox_id` (FKs), `is_seen` / `is_flagged` / `is_deleted` booleans. Encrypted BLOBs: `subject_ct`, `body_text_ct`, `body_html_ct`, `flags_other_ct` (non-canonical IMAP flags).
+- `messages` — one row per local message identity. `stable_id` is the immutable native object identity when a provider has one (for JMAP, a hashed provider-account scope plus `Email.id`), so provider objects remain distinct even with missing or duplicate Message-IDs or a retargeted local account alias. `message_id` is RFC 5322 metadata and the compatibility identity for older protocols; that fallback cannot distinguish same-account duplicates. Other plaintext columns: `thread_id`, `in_reply_to`, `refs`, `from_addr`, `to_addrs`, `cc_addrs`, `date`, `created_at`, `size`, `uid`, `account_id` + `mailbox_id` (FKs), `is_seen` / `is_flagged` / `is_deleted` booleans. Encrypted BLOBs: `subject_ct`, `body_text_ct`, `body_html_ct`, `flags_other` (remaining IMAP flags and keywords).
 - `tags` — tag join table, one row per (message_id, tag).
 - `message_headers` — raw headers used by filter rules (List-Id, Authentication-Results, …). The `value` column is encrypted (`value_ct` BLOB); `name` stays plaintext for SQL filtering.
 - `attachments` — per-part metadata. `filename_ct`, `content_type_ct`, `size_ct` are encrypted; `part_id`, `disposition`, `content_id` stay plaintext (needed for fetch correlation with the IMAP server).
 - `local_drafts` — crash-recovery drafts kept locally until saved to IMAP. The `draft_json` payload is encrypted (`draft_json_ct` BLOB).
-- `outbox` — queued outgoing messages with `send_after` timestamp for undo-send. `draft_json_ct` BLOB; `attempts`, `last_error`, `created_at`, `last_attempted_at`, `send_after` plaintext.
+- `outbox` — queued outgoing messages with `send_after` timestamp for undo-send. `draft_json_ct` BLOB (including the durable outgoing Message-ID); `attempts`, `last_error`, `created_at`, `last_attempted_at`, `send_after`, `in_flight`, and `delivery_confirmed` plaintext. The worker atomically sets `in_flight` before delivery; Undo atomically deletes only unclaimed rows and returns a conflict after a claim. Ambiguous or delivered-with-warning outcomes retain that claim and its full payload and use distinct SSE states rather than reporting "Not Sent". Provider acceptance sets `delivery_confirmed` before local and IMAP Sent filing; the claim is deleted only after filing succeeds, so a crash or filing error retains a recoverable payload and cannot requeue an accepted message. A claim surviving restart is never retried automatically: after provider verification, `durian outbox reconcile` removes or safely requeues an unconfirmed claim only while the GUI/server is stopped and the CLI holds the exclusive outbox lifecycle lock.
+- `outbox_idempotency` — durable tombstones mapping a client-generated logical send key to its original outbox row and schedule. They intentionally survive outbox deletion, so replaying a request after a lost HTTP response cannot create a second delivery.
+- `provider_tag_mutations` — durable explicit `unread` / `flagged` / `replied` intent for provider-native property patches. Newer intent supersedes an older entry for the same message and tag. A native-patch backend retains the entry until the provider accepts it and the local read model reflects it. On a non-dry-run pass with flag upload enabled, generic backends discard these entries because their baseline merge owns flag synchronization.
 - `mailboxes`, `accounts` — operational lookup tables. `name_ct` encrypted (mailbox / account display names are sensitive); integer IDs are the FK targets for `messages.mailbox_id` / `messages.account_id`.
 - `messages_blind_fts` — FTS5 virtual table indexing HMAC-blind tokens of subject + body + addresses. No plaintext lives here; see [§Encryption layer](#encryption-layer) below.
 
@@ -136,9 +138,12 @@ the path:
 `cli/internal/backend/backend.go` defines the `Backend` interface every provider
 implements — `FetchFolders`, `FetchMessages` (cursor-paged incremental),
 `FetchBody`, `ApplyFlags`/`FetchFlags`, `Move`, `Append`, `Send`, `Watch`,
-`Capabilities`, `Close`. The engine addresses messages by their durable
-`(Message-ID, account)` key; a `RemoteRef` (folder + provider id) is a transient
-handle, never a store key.
+`Capabilities`, `Close`. The engine addresses a message by `(StableID, account)`
+when the provider supplies an immutable object identity, and falls back to
+`(Message-ID, account)` otherwise. RFC Message-ID remains threading/search
+metadata and may be absent or duplicated. A `RemoteRef` (folder + provider id)
+is the follow-up operation handle; for JMAP it happens to carry the same
+immutable Email ID.
 
 A `Capabilities` struct lets the engine adapt to provider quirks without
 branching on provider names: `PushWatch`, `FlagChangesInDelta` (the delta already
@@ -146,7 +151,9 @@ carries flag changes, so the flag pass is O(changes)), `LabelsAreTags` (Gmail/JM
 is the authoritative tag set), and `AnsweredUnsupported` (Gmail can't persist
 `\Answered`, so it's excluded from the merge to stop per-sync ping-pong). A
 label-native backend also implements the optional `LabelWriter` interface
-(`LabelTags`, `ApplyLabels`).
+(`LabelTags`, `ApplyLabels`). JMAP implements `ArbitraryLabelWriter` to extend it
+with arbitrary custom-keyword tags, and `TagMutationWriter` for explicit
+`$seen`/`$flagged`/`$answered` property patches.
 
 Outbound transport behavior belongs to `mailsend.Sender`: `SavesSentCopy`
 decides whether Durian appends an IMAP Sent copy without branching on provider
@@ -157,8 +164,11 @@ client; **`graphbackend`** speaks Microsoft Graph (`/me` or `/users/{email}` for
 shared mailboxes, cursor = Graph delta URL, native `/move`); **`gmailbackend`**
 speaks the Gmail REST API (no folders — one "All Mail" stream, labels-as-tags,
 cursor = `history.list` historyId); **`jmapbackend`** discovers RFC 8620/8621
-endpoints, exposes one account-wide stream, maps mailbox memberships to tags,
-and advances an `Email/changes` state cursor. `backendfactory` is the shared
+endpoints, enforces the advertised Core request/object/concurrency limits,
+exposes one account-wide stream, maps mailbox memberships and custom keywords
+to tags, stores immutable Email IDs, and advances an `Email/changes` state
+cursor. Its sender creates structured Email objects and references separately
+uploaded attachment blobs; raw append still uses `Email/import`. `backendfactory` is the shared
 composition root used by sync, body/attachment fetching, and daemon watchers.
 Graph, Gmail, and JMAP send via a dedicated `sender.go` in each package.
 
@@ -168,13 +178,16 @@ Graph, Gmail, and JMAP send via a dedicated `sender.go` in each package.
 cursor-page `FetchMessages` until drained (persisting the cursor only after a
 fully-ingested batch), `Ingest` each message (row + attachments + indexed
 headers + tags — folder-role mapping, or `reconcileLabels` for label backends),
-handle deletions, run a **three-way flag merge** (local tags vs server flags vs
+handle deletions, run a **three-way flag merge** for generic backends (local tags vs server flags vs
 the `synced_flags` baseline — local wins Seen/Flagged/Answered, server wins
 Deleted/Completed), then upload local intents: `uploadFolderMoves` (an INBOX
 message that lost its `inbox` tag is `Move`d to Archive/Trash) and
-`uploadLabelChanges` (per-message tag diffs via `ApplyLabels` for Gmail). It
-emits `Result.NewMessageIDs` for provider-neutral new-mail notification, instead
-of the legacy path's IMAP-UIDNEXT diffing.
+`uploadLabelChanges` (per-message tag diffs via `ApplyLabels` for Gmail/JMAP).
+For JMAP, explicit local unread/flagged/replied intents are durably journaled
+and sent as property patches before the next download, so stale ambient local
+state is not reconstructed as intent. The engine emits
+`Result.NewMessageIdentifiers` for provider-neutral new-mail notification
+instead of the legacy path's IMAP-UIDNEXT diffing.
 
 ### Watchers in `durian serve`
 
@@ -200,10 +213,17 @@ engine accounts.
 
 Daemon-triggered engine passes have a 5-minute watchdog so a stalled provider
 does not hold the per-account mutex indefinitely. An authoritative replacement
-snapshot may extend that deadline to 60 minutes: the snapshot must complete
-before its cursor can advance. The extension applies only to that recovery and
-its flag reconciliation; the ordinary deadline still bounds later folders and
-the upload pass rather than granting the entire account pass another hour.
+snapshot may extend that deadline to 60 minutes. JMAP recovery emits bounded
+anchored query pages and syncengine checkpoints each completed page after
+staging its authoritative presence in SQLite. Final deletion reconciliation is
+also keyset-paged, so neither cursors nor process memory contain mailbox-sized
+ID sets. Every mutating engine pass holds a cross-process account lock for its
+complete lifetime, preventing daemon and manual sync processes from mixing
+snapshot pages, SQLite staging, or cursor commits; the same account scope also
+serializes backend retargets. The
+extension applies only to that recovery and its flag reconciliation; the
+ordinary deadline still bounds later folders and the upload pass rather than
+granting the entire account pass another hour.
 Explicit `durian sync` commands remain caller-controlled.
 
 ### Live JMAP tests
@@ -241,7 +261,8 @@ session configuration, and `legacy`/`engine` on
 a Microsoft account (Microsoft must use Graph). Each backend namespaces its
 cursor file (`-graph`, `-gmail`, `-jmap`, unsuffixed for IMAP) so switching engines can't
 feed one backend another's incompatible cursor — it just forces a fresh full
-resync, which is safe because the store upserts by Message-ID.
+resync, which is safe because the store upserts by native stable identity when
+available and by Message-ID only as a compatibility fallback.
 
 ## Calendar
 
@@ -271,7 +292,7 @@ for the design and the recurrence handling.
 
 ## Optional tag sync
 
-For multi-machine setups, `sync/` contains a small self-hosted server that stores `(message_id, account, tag, action, timestamp)` tuples. Clients push local changes and pull remote ones via HTTP. Auth is a shared API key; **run it only on a trusted network** (Tailnet, LAN) — it has no TLS and no rate limiting. See the [tag sync README](https://github.com/julion2/durian/tree/main/sync) for setup.
+For multi-machine setups, `sync/` contains a small self-hosted server that stores `(message_id, account, tag, action, timestamp)` tuples. Clients push local changes and pull remote ones via HTTP. JMAP accounts already synchronize normal Durian tags through custom Email keywords, so they do not need this server for that purpose; tag sync remains useful for local-only/cross-provider state. Its Message-ID protocol cannot distinguish two same-account provider objects with a duplicate Message-ID, another reason to prefer native JMAP keywords for JMAP mail. Auth is a shared API key; **run it only on a trusted network** (Tailnet, LAN) — it has no TLS and no rate limiting. See the [tag sync README](https://github.com/julion2/durian/tree/main/sync) for setup.
 
 ## Design decisions
 

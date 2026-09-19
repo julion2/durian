@@ -11,7 +11,7 @@ func TestClassify(t *testing.T) {
 	if got := Classify(base); got != KindTransient {
 		t.Errorf("untagged error = %v, want KindTransient", got)
 	}
-	for _, kind := range []Kind{KindTransient, KindNetwork, KindPermanent} {
+	for _, kind := range []Kind{KindTransient, KindNetwork, KindPermanent, KindAmbiguous, KindDeliveredWithWarning} {
 		wrapped := &Error{Kind: kind, Err: base}
 		if got := Classify(wrapped); got != kind {
 			t.Errorf("Classify(%v) = %v, want %v", kind, got, kind)

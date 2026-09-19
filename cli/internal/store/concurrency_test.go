@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Durian writes to one database file from more than one process: the daemon's
@@ -98,5 +99,59 @@ func TestConcurrentTagWritesDoNotFailOnLockUpgrade(t *testing.T) {
 				t.Fatalf("round %d tags=%v, missing %q", round, tags, want)
 			}
 		}
+	}
+}
+
+func TestMessageIngestLockSerializesIndependentHandles(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "ingest-lock.db")
+	kr := testKeyring(t)
+	first, err := Open(dbPath, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { first.Close() })
+	second, err := Open(dbPath, kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { second.Close() })
+
+	releaseFirst, err := first.AcquireMessageIngest("work", "same@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseFirst()
+
+	type result struct {
+		release func()
+		err     error
+	}
+	started := make(chan struct{})
+	acquired := make(chan result, 1)
+	go func() {
+		close(started)
+		release, err := second.AcquireMessageIngest("work", "same@example.com")
+		acquired <- result{release: release, err: err}
+	}()
+	<-started
+
+	select {
+	case got := <-acquired:
+		if got.release != nil {
+			got.release()
+		}
+		t.Fatalf("second handle acquired the ingest lock before release: %v", got.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseFirst()
+	select {
+	case got := <-acquired:
+		if got.err != nil {
+			t.Fatalf("second handle acquire after release: %v", got.err)
+		}
+		got.release()
+	case <-time.After(5 * time.Second):
+		t.Fatal("second handle did not acquire the ingest lock after release")
 	}
 }

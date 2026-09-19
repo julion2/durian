@@ -3,6 +3,49 @@ import XCTest
 
 final class EmailSendingManagerTests: XCTestCase {
 
+    // MARK: - Idempotency
+
+    func testSendRetriesReuseDraftIdempotencyKey() {
+        let draftID = UUID(uuidString: "62D1EE16-A017-462C-8C04-8E6F6C4769DB")!
+        let draft = EmailDraft(id: draftID, from: "sender@example.com")
+
+        let firstAttempt = EmailSendingManager.idempotencyKey(for: draft)
+        let retryAfterLostResponse = EmailSendingManager.idempotencyKey(for: draft)
+
+        XCTAssertEqual(firstAttempt, retryAfterLostResponse)
+        XCTAssertEqual(firstAttempt, draftID.uuidString)
+        XCTAssertNotEqual(
+            EmailSendingManager.idempotencyKey(for: EmailDraft(from: draft.from)),
+            firstAttempt
+        )
+    }
+
+    func testSendRetryUsesOriginalUndoDeadline() {
+        let sendAfter: Int64 = 1_010
+
+        XCTAssertEqual(
+            EmailSendingManager.undoSecondsRemaining(
+                sendAfter: sendAfter,
+                now: Date(timeIntervalSince1970: 1_000.1)
+            ),
+            10
+        )
+        XCTAssertEqual(
+            EmailSendingManager.undoSecondsRemaining(
+                sendAfter: sendAfter,
+                now: Date(timeIntervalSince1970: 1_008.1)
+            ),
+            2
+        )
+        XCTAssertEqual(
+            EmailSendingManager.undoSecondsRemaining(
+                sendAfter: sendAfter,
+                now: Date(timeIntervalSince1970: 1_010)
+            ),
+            0
+        )
+    }
+
     // MARK: - stripStyleTags
 
     func testStripsSingleStyleBlock() {

@@ -348,6 +348,10 @@ paths:
                     type: integer
                     format: int64
                     description: Unix timestamp after which the worker may send the email (0 = immediate)
+                required:
+                  - ok
+                  - id
+                  - send_after
         '400':
           description: Invalid request (missing fields)
   /outbox:
@@ -384,6 +388,8 @@ paths:
                     type: boolean
         '404':
           description: Item not found
+        '409':
+          description: Item was already claimed for delivery and can no longer be undone
   /threads/{thread_id}/tags:
     post:
       summary: Add or remove tags from an email thread
@@ -819,6 +825,12 @@ components:
           description: >
             Opaque local message identifier. Clients must not interpret this
             field as an RFC Message-ID.
+        attachment_cache_id:
+          type: string
+          description: >
+            Opaque content identity for persistent attachment caches. Unlike
+            id, this value remains tied to the provider object when a local
+            database is recreated.
         message_id:
           type: string
           description: RFC 5322 Message-ID metadata; optional and not guaranteed unique
@@ -889,6 +901,10 @@ components:
     OutboxDraft:
       type: object
       properties:
+        idempotency_key:
+          type: string
+          maxLength: 200
+          description: Stable unique ID for this logical send action; retries with the same value return the original outbox row.
         from:
           type: string
         to:
@@ -922,6 +938,7 @@ components:
           description: Seconds to delay before the worker may send (undo window). 0 = immediate.
           default: 0
       required:
+        - idempotency_key
         - from
         - to
         - subject
@@ -945,6 +962,9 @@ components:
         id:
           type: integer
           format: int64
+        message_id:
+          type: string
+          description: Durable RFC 5322 Message-ID used to verify ambiguous provider outcomes
         subject:
           type: string
         to:
@@ -956,6 +976,12 @@ components:
         created_at:
           type: integer
           format: int64
+        in_flight:
+          type: boolean
+          description: Delivery was claimed and must not be retried automatically; if it survives a process restart, verify provider delivery before deleting it.
+        delivery_confirmed:
+          type: boolean
+          description: The provider has definitely accepted delivery; a confirmed item may be removed but never requeued as not delivered.
     OutboxUpdateEvent:
       type: object
       description: SSE event broadcast when an outbox item changes status
@@ -965,7 +991,7 @@ components:
           format: int64
         status:
           type: string
-          enum: [sent, failed, queued]
+          enum: [sent, failed, queued, reconciliation_required, delivered_with_warning]
         error:
           type: string
         subject:

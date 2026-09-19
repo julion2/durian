@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -86,15 +87,16 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 	for _, msg := range msgs {
 		identifier := "local:" + strconv.FormatInt(msg.ID, 10)
 		info := internmail.MessageInfo{
-			ID:        identifier,
-			From:      msg.FromAddr,
-			To:        msg.ToAddrs,
-			CC:        msg.CCAddrs,
-			Date:      time.Unix(msg.Date, 0).Format(time.RFC1123Z),
-			Timestamp: msg.Date,
-			MessageID: msg.MessageID,
-			Account:   msg.Account,
-			Body:      sanitize.StripQuotedTextContent(msg.BodyText),
+			ID:                identifier,
+			AttachmentCacheID: attachmentCacheID(msg),
+			From:              msg.FromAddr,
+			To:                msg.ToAddrs,
+			CC:                msg.CCAddrs,
+			Date:              time.Unix(msg.Date, 0).Format(time.RFC1123Z),
+			Timestamp:         msg.Date,
+			MessageID:         msg.MessageID,
+			Account:           msg.Account,
+			Body:              sanitize.StripQuotedTextContent(msg.BodyText),
 		}
 		if !light {
 			info.InReplyTo = msg.InReplyTo
@@ -195,6 +197,15 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 		Subject:  subject,
 		Messages: messages,
 	}
+}
+
+func attachmentCacheID(msg *store.Message) string {
+	kind, identity := "message-id", msg.MessageID
+	if msg.StableID != "" {
+		kind, identity = "stable-id", msg.StableID
+	}
+	digest := sha256.Sum256([]byte(msg.Account + "\x00" + kind + "\x00" + identity))
+	return fmt.Sprintf("v1-%x", digest)
 }
 
 // DownloadAttachment streams a raw attachment part, setting Content-Type and

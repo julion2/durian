@@ -3,7 +3,9 @@ package smtp
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
+	"net/textproto"
 	"strings"
 
 	"github.com/julion2/durian/cli/internal/mailsend"
@@ -65,8 +67,19 @@ func toSMTPAttachments(atts []mailsend.Attachment) []Attachment {
 // classifySMTPError maps an SMTP send failure to a mailsend.Kind: network
 // errors retry silently, 5xx poisons, everything else retries with an attempt.
 func classifySMTPError(err error) mailsend.Kind {
+	var unknown dataCompletionUnknown
+	if errors.As(err, &unknown) {
+		return mailsend.KindAmbiguous
+	}
 	if isNetworkErr(err) {
 		return mailsend.KindNetwork
+	}
+	var responseErr *textproto.Error
+	if errors.As(err, &responseErr) {
+		if responseErr.Code >= 500 && responseErr.Code < 600 {
+			return mailsend.KindPermanent
+		}
+		return mailsend.KindTransient
 	}
 	if se := ParseSMTPError(err); se != nil && se.IsPermanent() {
 		return mailsend.KindPermanent
@@ -77,6 +90,9 @@ func classifySMTPError(err error) mailsend.Kind {
 // isNetworkErr reports a transient transport failure (offline, timeout, refused,
 // DNS) as opposed to a server rejection.
 func isNetworkErr(err error) bool {
+	if errors.Is(err, io.ErrShortWrite) {
+		return true
+	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return true

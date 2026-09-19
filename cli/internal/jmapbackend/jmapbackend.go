@@ -1,14 +1,16 @@
 // Package jmapbackend implements Durian's provider-neutral mail backend on
 // RFC 8620 (JMAP Core) and RFC 8621 (JMAP Mail and Submission).
 //
-// Cursor encoding is opaque JSON. During initial sync it contains a start-state
-// snapshot and the remaining stable Email/query ID set; after that it contains
-// only EmailState. If Email/changes returns cannotCalculateChanges, the backend
-// emits a metadata-first replacement snapshot and advances EmailState only
-// after the engine has hydrated and reconciled the complete remote ID set.
+// Cursor encoding is opaque JSON. It binds all state to the authenticated
+// provider account. During initial sync it also contains a start-state snapshot
+// and the remaining stable Email/query ID set; after that it contains EmailState.
+// If Email/changes returns cannotCalculateChanges, the backend emits a
+// metadata-first replacement snapshot and advances EmailState only after the
+// engine has hydrated and reconciled the complete remote ID set.
 package jmapbackend
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base32"
@@ -22,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
@@ -55,58 +58,6 @@ var (
 	_ backend.SnapshotHydrator     = (*Backend)(nil)
 	_ backend.TagMutationWriter    = (*Backend)(nil)
 )
-
-type jmapMailbox struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	ParentID     string `json:"parentId"`
-	Role         string `json:"role"`
-	IsSubscribed bool   `json:"isSubscribed"`
-}
-
-type jmapEmail struct {
-	ID         string          `json:"id"`
-	BlobID     string          `json:"blobId"`
-	ThreadID   string          `json:"threadId"`
-	MailboxIDs map[string]bool `json:"mailboxIds"`
-	Keywords   map[string]bool `json:"keywords"`
-	ReceivedAt string          `json:"receivedAt"`
-	MessageID  []string        `json:"messageId"`
-}
-
-type jmapQueryPage struct {
-	QueryState *string   `json:"queryState"`
-	Position   *int      `json:"position"`
-	IDs        *[]string `json:"ids"`
-	Total      *int      `json:"total"`
-}
-
-func (p jmapQueryPage) validate() error {
-	if p.QueryState == nil || *p.QueryState == "" {
-		return errors.New("JMAP Email/query omitted required queryState")
-	}
-	if p.Position == nil || *p.Position < 0 {
-		return errors.New("JMAP Email/query omitted required valid position")
-	}
-	if p.IDs == nil {
-		return errors.New("JMAP Email/query omitted required ids")
-	}
-	if p.Total == nil || *p.Total < 0 {
-		return errors.New("JMAP Email/query omitted required valid total")
-	}
-	return nil
-}
-
-type jmapCursor struct {
-	Snapshot    string   `json:"snapshot,omitempty"`    // Email state from before an in-progress snapshot.
-	PendingIDs  []string `json:"pendingIds,omitempty"`  // Remaining initial-sync IDs (legacy cursor shape).
-	EmailState  string   `json:"emailState,omitempty"`  // Last fully applied Email state token.
-	Replacement bool     `json:"replacement,omitempty"` // Authoritative state-expiry recovery is in progress.
-	QueryState  string   `json:"queryState,omitempty"`  // Email/query state captured on its first page.
-	QueryAnchor string   `json:"queryAnchor,omitempty"` // Last ID from the preceding query page.
-	QuerySeen   int      `json:"querySeen,omitempty"`   // Number of IDs emitted by preceding pages.
-	QueryTotal  int      `json:"queryTotal,omitempty"`  // Total reported by the first query page.
-}
 
 // New creates a JMAP backend for an account configured with sync_engine=jmap.
 func New(account *config.AccountConfig) (*Backend, error) {
@@ -143,9 +94,10 @@ func New(account *config.AccountConfig) (*Backend, error) {
 func (b *Backend) ensure(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.initialized {
+	if b.initialized && !b.client.sessionStale.Load() {
 		return nil
 	}
+	b.initialized = false
 	secret, err := getCredential(keychain.JMAPKeychainService, b.account.Email)
 	legacyCredential := false
 	if errors.Is(err, keychain.ErrNotFound) && b.client.credential.mode == "password" {
@@ -176,9 +128,7 @@ func (b *Backend) loadMailboxes(ctx context.Context) error {
 	if err := b.ensure(ctx); err != nil {
 		return err
 	}
-	var result struct {
-		List []jmapMailbox `json:"list"`
-	}
+	var result jmapMailboxGetPage
 	args := map[string]interface{}{
 		"accountId":  b.client.accountID,
 		"properties": []string{"id", "name", "parentId", "role", "isSubscribed"},
@@ -186,8 +136,11 @@ func (b *Backend) loadMailboxes(ctx context.Context) error {
 	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Mailbox/get", args, &result); err != nil {
 		return err
 	}
-	mailboxes := make(map[string]jmapMailbox, len(result.List))
-	for _, mailbox := range result.List {
+	if err := result.validate(b.client.accountID); err != nil {
+		return err
+	}
+	mailboxes := make(map[string]jmapMailbox, len(*result.List))
+	for _, mailbox := range *result.List {
 		mailboxes[mailbox.ID] = mailbox
 	}
 	mailboxToTag, tagToID := buildMailboxMappings(mailboxes)
@@ -219,6 +172,29 @@ func roleTag(role string) string {
 		return "important"
 	}
 	return ""
+}
+
+func roleMailboxForTag(tag string) (role, name string, ok bool) {
+	switch tag {
+	case "inbox":
+		return "inbox", "Inbox", true
+	case "archive":
+		return "archive", "Archive", true
+	case "draft":
+		return "drafts", "Drafts", true
+	case "sent":
+		return "sent", "Sent", true
+	case "trash":
+		return "trash", "Trash", true
+	case "spam":
+		return "junk", "Junk", true
+	case "all":
+		return "all", "All Mail", true
+	case "important":
+		return "important", "Important", true
+	default:
+		return "", "", false
+	}
 }
 
 func canonicalMailboxSegment(name string) string {
@@ -323,17 +299,28 @@ func (b *Backend) FetchFolders(ctx context.Context) ([]backend.Folder, error) {
 	return []backend.Folder{{Name: allMailStream, Display: "All Mail", Role: backend.RoleAll, Selectable: true}}, nil
 }
 
-func decodeCursor(cursor backend.Cursor) jmapCursor {
-	var state jmapCursor
-	if len(cursor) != 0 {
-		_ = json.Unmarshal(cursor, &state)
-	}
-	return state
+func (b *Backend) scopedEmailID(id string) string {
+	return b.client.accountScope + ":" + id
 }
 
-func encodeCursor(cursor jmapCursor) backend.Cursor {
-	encoded, _ := json.Marshal(cursor)
-	return encoded
+func (b *Backend) rawEmailID(refID string) (string, error) {
+	id, ok := strings.CutPrefix(refID, b.client.accountScope+":")
+	if !ok || id == "" {
+		return "", fmt.Errorf("%w: JMAP ref does not belong to the authenticated account", backend.ErrRefGone)
+	}
+	return id, nil
+}
+
+func (b *Backend) rawEmailIDs(refs []backend.RemoteRef) ([]string, error) {
+	ids := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		id, err := b.rawEmailID(ref.ID)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 // FetchMessages pages an initial account snapshot or follows Email/changes from
@@ -349,22 +336,34 @@ func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backe
 		return backend.FetchResult{}, err
 	}
 	state := decodeCursor(cursor)
+	if len(cursor) > 0 && state.AccountScope != b.client.accountScope {
+		slog.Info("JMAP provider account changed, starting replacement snapshot", "module", "JMAPBACKEND") // encgrep:allow static message only; no account value is logged
+		return b.startReplacement(ctx, limit)
+	}
+	state.AccountScope = b.client.accountScope
 	if state.Replacement {
 		return b.replacementPage(ctx, state, limit)
 	}
-	if state.EmailState == "" {
+	if !state.EmailStateSet {
+		// New initial syncs use the same bounded, anchor-based authoritative
+		// enumeration as state-expiry recovery. initialPage remains solely for
+		// resuming cursors written by older versions with PendingIDs/Snapshot.
+		if !state.SnapshotSet && len(state.PendingIDs) == 0 {
+			return b.startReplacement(ctx, limit)
+		}
 		return b.initialPage(ctx, state, limit)
 	}
 	return b.changesPage(ctx, state, limit)
 }
 
 func (b *Backend) initialPage(ctx context.Context, state jmapCursor, limit int) (backend.FetchResult, error) {
-	if state.Snapshot == "" {
+	if !state.SnapshotSet {
 		var err error
 		state.Snapshot, err = b.currentEmailState(ctx)
 		if err != nil {
 			return backend.FetchResult{}, fmt.Errorf("snapshot JMAP email state: %w", err)
 		}
+		state.SnapshotSet = true
 		// Capture the complete ID set before paging bodies. Anchoring each query
 		// page to the last ID avoids the position shifts caused by concurrent
 		// inserts/deletes. A deleted anchor restarts the short ID-only scan.
@@ -379,16 +378,17 @@ func (b *Backend) initialPage(ctx context.Context, state jmapCursor, limit int) 
 	if err != nil {
 		return backend.FetchResult{}, err
 	}
-	deleted := deletions(allMailStream, missing)
+	deleted := b.deletions(allMailStream, missing)
 	state.PendingIDs = state.PendingIDs[count:]
 	hasMore := len(state.PendingIDs) > 0
 	if hasMore {
 		state.PendingIDs = append([]string(nil), state.PendingIDs...)
 	} else {
-		state = jmapCursor{EmailState: state.Snapshot}
+		state = jmapCursor{AccountScope: b.client.accountScope, EmailState: state.Snapshot, EmailStateSet: true}
 	}
 	return backend.FetchResult{
 		Messages: messages, Deleted: deleted, Cursor: encodeCursor(state), HasMore: hasMore,
+		Present: b.presentRefs(allMailStream, ids, missing),
 	}, nil
 }
 
@@ -419,17 +419,19 @@ func (b *Backend) queryAllEmailIDsOnce(ctx context.Context) ([]string, error) {
 	var ids []string
 	expectedTotal := 0
 	expectedQueryState := ""
+	expectedQueryStateSet := false
 	for {
 		var query jmapQueryPage
 		if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/query", args, &query); err != nil {
 			return nil, err
 		}
-		if err := query.validate(); err != nil {
+		if err := query.validate(b.client.accountID); err != nil {
 			return nil, err
 		}
 		queryState, position, pageIDs, total := *query.QueryState, *query.Position, *query.IDs, *query.Total
-		if expectedQueryState == "" {
+		if !expectedQueryStateSet {
 			expectedQueryState = queryState
+			expectedQueryStateSet = true
 			expectedTotal = total
 		} else if queryState != expectedQueryState || total != expectedTotal {
 			return nil, fmt.Errorf("%w: query changed while paging", errIncompleteQuery)
@@ -463,14 +465,7 @@ func (b *Backend) queryAllEmailIDsOnce(ctx context.Context) ([]string, error) {
 }
 
 func (b *Backend) changesPage(ctx context.Context, state jmapCursor, limit int) (backend.FetchResult, error) {
-	var changes struct {
-		OldState       string   `json:"oldState"`
-		NewState       string   `json:"newState"`
-		HasMoreChanges bool     `json:"hasMoreChanges"`
-		Created        []string `json:"created"`
-		Updated        []string `json:"updated"`
-		Destroyed      []string `json:"destroyed"`
-	}
+	var changes jmapChangesPage
 	args := map[string]interface{}{
 		"accountId":  b.client.accountID,
 		"sinceState": state.EmailState,
@@ -484,19 +479,32 @@ func (b *Backend) changesPage(ctx context.Context, state jmapCursor, limit int) 
 		}
 		return backend.FetchResult{}, err
 	}
-	ids := append(append([]string(nil), changes.Created...), changes.Updated...)
+	if err := changes.validate(b.client.accountID, state.EmailState); err != nil {
+		return backend.FetchResult{}, err
+	}
+	destroyedSet := make(map[string]struct{}, len(*changes.Destroyed))
+	for _, id := range *changes.Destroyed {
+		destroyedSet[id] = struct{}{}
+	}
+	ids := make([]string, 0, len(*changes.Created)+len(*changes.Updated))
+	for _, id := range append(append([]string(nil), (*changes.Created)...), (*changes.Updated)...) {
+		if _, destroyed := destroyedSet[id]; !destroyed {
+			ids = append(ids, id)
+		}
+	}
 	ids = uniqueStrings(ids)
 	messages, missing, err := b.getMessages(ctx, ids)
 	if err != nil {
 		return backend.FetchResult{}, err
 	}
-	destroyed := append(append([]string(nil), changes.Destroyed...), missing...)
-	state.EmailState = changes.NewState
+	destroyed := append(append([]string(nil), (*changes.Destroyed)...), missing...)
+	state.EmailState = *changes.NewState
+	state.EmailStateSet = true
 	return backend.FetchResult{
 		Messages: messages,
-		Deleted:  deletions(allMailStream, uniqueStrings(destroyed)),
+		Deleted:  b.deletions(allMailStream, uniqueStrings(destroyed)),
 		Cursor:   encodeCursor(state),
-		HasMore:  changes.HasMoreChanges,
+		HasMore:  *changes.HasMoreChanges,
 	}, nil
 }
 
@@ -505,7 +513,7 @@ func (b *Backend) startReplacement(ctx context.Context, limit int) (backend.Fetc
 	if err != nil {
 		return backend.FetchResult{}, fmt.Errorf("snapshot JMAP email state: %w", err)
 	}
-	return b.replacementPage(ctx, jmapCursor{Snapshot: state, Replacement: true}, limit)
+	return b.replacementPage(ctx, jmapCursor{AccountScope: b.client.accountScope, Snapshot: state, SnapshotSet: true, Replacement: true}, limit)
 }
 
 func (b *Backend) replacementPage(ctx context.Context, state jmapCursor, limit int) (backend.FetchResult, error) {
@@ -524,20 +532,25 @@ func (b *Backend) replacementPage(ctx context.Context, state jmapCursor, limit i
 	}
 	var query jmapQueryPage
 	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/query", args, &query); err != nil {
+		var methodErr *methodError
+		if state.QueryStateSet && errors.As(err, &methodErr) && methodErr.Type == "anchorNotFound" {
+			return backend.FetchResult{}, fmt.Errorf("%w: replacement anchor disappeared", backend.ErrSnapshotInvalidated)
+		}
 		return backend.FetchResult{}, fmt.Errorf("query JMAP replacement snapshot page: %w", err)
 	}
-	if err := query.validate(); err != nil {
+	if err := query.validate(b.client.accountID); err != nil {
 		return backend.FetchResult{}, fmt.Errorf("query JMAP replacement snapshot page: %w", err)
 	}
 	queryState, position, pageIDs, total := *query.QueryState, *query.Position, *query.IDs, *query.Total
 	if position != state.QuerySeen {
-		return backend.FetchResult{}, fmt.Errorf("JMAP replacement query position changed: got %d, want %d", position, state.QuerySeen)
+		return backend.FetchResult{}, fmt.Errorf("%w: JMAP replacement query position changed: got %d, want %d", backend.ErrSnapshotInvalidated, position, state.QuerySeen)
 	}
-	if state.QueryState == "" {
+	if !state.QueryStateSet {
 		state.QueryState = queryState
+		state.QueryStateSet = true
 		state.QueryTotal = total
 	} else if queryState != state.QueryState || total != state.QueryTotal {
-		return backend.FetchResult{}, errors.New("JMAP replacement query changed while paging; restart recovery")
+		return backend.FetchResult{}, fmt.Errorf("%w: JMAP replacement query changed while paging", backend.ErrSnapshotInvalidated)
 	}
 	uniquePageIDs := uniqueStrings(pageIDs)
 	if len(uniquePageIDs) != len(pageIDs) {
@@ -545,39 +558,45 @@ func (b *Backend) replacementPage(ctx context.Context, state jmapCursor, limit i
 	}
 	state.QuerySeen += len(uniquePageIDs)
 	if state.QuerySeen > state.QueryTotal || (len(pageIDs) == 0 && state.QuerySeen < state.QueryTotal) {
-		return backend.FetchResult{}, fmt.Errorf("%w: got %d of %d ids", errIncompleteQuery, state.QuerySeen, state.QueryTotal)
+		return backend.FetchResult{}, fmt.Errorf("%w: %w: got %d of %d ids", backend.ErrSnapshotInvalidated, errIncompleteQuery, state.QuerySeen, state.QueryTotal)
 	}
 	hasMore := state.QuerySeen < state.QueryTotal
 	if hasMore {
 		state.QueryAnchor = uniquePageIDs[len(uniquePageIDs)-1]
 	} else {
-		state = jmapCursor{EmailState: state.Snapshot}
+		state = jmapCursor{AccountScope: b.client.accountScope, EmailState: state.Snapshot, EmailStateSet: true}
 	}
 	return backend.FetchResult{
 		Cursor:       encodeCursor(state),
 		HasMore:      hasMore,
 		FullSnapshot: true,
-		Present:      presentRefs(allMailStream, uniquePageIDs, nil),
+		Present:      b.presentRefs(allMailStream, uniquePageIDs, nil),
 	}, nil
 }
 
 // FetchSnapshotMessages hydrates only replacement-snapshot refs absent from
 // Durian's local read model; the engine determines that set before calling.
 func (b *Backend) FetchSnapshotMessages(ctx context.Context, refs []backend.RemoteRef) (backend.SnapshotBatch, error) {
-	ids := make([]string, 0, len(refs))
-	for _, ref := range refs {
-		ids = append(ids, ref.ID)
+	if err := b.ensure(ctx); err != nil {
+		return backend.SnapshotBatch{}, err
+	}
+	ids, err := b.rawEmailIDs(refs)
+	if err != nil {
+		return backend.SnapshotBatch{}, err
 	}
 	messages, missing, err := b.getMessages(ctx, ids)
-	return backend.SnapshotBatch{Messages: messages, Missing: presentRefs(allMailStream, missing, nil)}, err
+	return backend.SnapshotBatch{Messages: messages, Missing: b.presentRefs(allMailStream, missing, nil)}, err
 }
 
 // FetchSnapshotMetadata returns current mailbox memberships and keywords in a
 // batched Email/get without downloading RFC 5322 blobs.
 func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.RemoteRef) (backend.SnapshotBatch, error) {
-	ids := make([]string, 0, len(refs))
-	for _, ref := range refs {
-		ids = append(ids, ref.ID)
+	if err := b.ensure(ctx); err != nil {
+		return backend.SnapshotBatch{}, err
+	}
+	ids, err := b.rawEmailIDs(refs)
+	if err != nil {
+		return backend.SnapshotBatch{}, err
 	}
 	objects, missing, _, err := b.getEmailObjects(ctx, ids)
 	if err != nil {
@@ -585,26 +604,25 @@ func (b *Backend) FetchSnapshotMetadata(ctx context.Context, refs []backend.Remo
 	}
 	messages := make([]backend.Message, 0, len(objects))
 	for _, email := range objects {
+		stableID := b.scopedEmailID(email.ID)
 		messages = append(messages, backend.Message{
-			StableID: email.ID, Ref: backend.RemoteRef{Folder: allMailStream, ID: email.ID},
+			StableID: stableID, Ref: backend.RemoteRef{Folder: allMailStream, ID: stableID},
 			Flags: flagsFromKeywords(email.Keywords), Labels: b.labelsFor(email.MailboxIDs, email.Keywords),
 		})
 	}
-	return backend.SnapshotBatch{Messages: messages, Missing: presentRefs(allMailStream, missing, nil)}, nil
+	return backend.SnapshotBatch{Messages: messages, Missing: b.presentRefs(allMailStream, missing, nil)}, nil
 }
 
 func (b *Backend) currentEmailState(ctx context.Context) (string, error) {
-	var result struct {
-		State string `json:"state"`
-	}
+	var result jmapGetPage
 	args := map[string]interface{}{"accountId": b.client.accountID, "ids": []string{}, "properties": []string{"id"}}
 	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/get", args, &result); err != nil {
 		return "", err
 	}
-	if result.State == "" {
-		return "", errors.New("Email/get returned an empty state")
+	if err := result.validate(b.client.accountID, nil); err != nil {
+		return "", err
 	}
-	return result.State, nil
+	return *result.State, nil
 }
 
 func (b *Backend) getEmailObjects(ctx context.Context, ids []string) ([]jmapEmail, []string, string, error) {
@@ -620,22 +638,25 @@ func (b *Backend) getEmailObjects(ctx context.Context, ids []string) ([]jmapEmai
 	var state string
 	for start := 0; start < len(ids); start += chunkSize {
 		end := min(start+chunkSize, len(ids))
-		var result struct {
-			State    string      `json:"state"`
-			List     []jmapEmail `json:"list"`
-			NotFound []string    `json:"notFound"`
-		}
+		chunkIDs := ids[start:end]
+		var result jmapGetPage
 		args := map[string]interface{}{
 			"accountId":  b.client.accountID,
-			"ids":        ids[start:end],
+			"ids":        chunkIDs,
 			"properties": []string{"id", "blobId", "threadId", "mailboxIds", "keywords", "receivedAt", "messageId"},
 		}
 		if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/get", args, &result); err != nil {
 			return nil, nil, "", err
 		}
-		objects = append(objects, result.List...)
-		missing = append(missing, result.NotFound...)
-		state = result.State
+		if err := result.validate(b.client.accountID, chunkIDs); err != nil {
+			return nil, nil, "", err
+		}
+		if err := b.validateEmailMailboxes(*result.List); err != nil {
+			return nil, nil, "", err
+		}
+		objects = append(objects, (*result.List)...)
+		missing = append(missing, (*result.NotFound)...)
+		state = *result.State
 	}
 	return objects, missing, state, nil
 }
@@ -650,7 +671,6 @@ func (b *Backend) getMessages(ctx context.Context, ids []string) ([]backend.Mess
 	const downloadConcurrency = 4
 	messages := make([]backend.Message, len(objects))
 	errs := make([]error, len(objects))
-	notFound := make([]bool, len(objects))
 	sem := make(chan struct{}, downloadConcurrency)
 	var wg sync.WaitGroup
 	for i := range objects {
@@ -667,24 +687,17 @@ func (b *Backend) getMessages(ctx context.Context, ids []string) ([]backend.Mess
 			email := objects[i]
 			body, err := b.downloadRaw(ctx, email)
 			if err != nil {
-				var statusErr *statusError
-				if errors.As(err, &statusErr) && statusErr.Status == http.StatusNotFound {
-					notFound[i] = true
-					return
-				}
 				errs[i] = fmt.Errorf("download email %s: %w", email.ID, err)
 				return
 			}
-			received, parseErr := time.Parse(time.RFC3339, email.ReceivedAt)
-			if parseErr != nil {
-				slog.Warn("Could not parse JMAP receivedAt", "module", "JMAPBACKEND", "err", parseErr)
-			}
+			received, _ := time.Parse(time.RFC3339, email.ReceivedAt)
 			messageID := ""
 			if len(email.MessageID) > 0 {
 				messageID = email.MessageID[0]
 			}
+			stableID := b.scopedEmailID(email.ID)
 			messages[i] = backend.Message{
-				StableID: email.ID, MessageID: messageID, Ref: backend.RemoteRef{Folder: allMailStream, ID: email.ID}, Raw: body,
+				StableID: stableID, MessageID: messageID, Ref: backend.RemoteRef{Folder: allMailStream, ID: stableID}, Raw: body,
 				Flags: flagsFromKeywords(email.Keywords), Labels: b.labelsFor(email.MailboxIDs, email.Keywords), InternalDate: received,
 			}
 		}(i)
@@ -695,35 +708,51 @@ func (b *Backend) getMessages(ctx context.Context, ids []string) ([]backend.Mess
 			return nil, nil, err
 		}
 	}
-	result := messages[:0]
-	for i, message := range messages {
-		if notFound[i] {
-			missing = append(missing, objects[i].ID)
-			continue
-		}
-		result = append(result, message)
+	return messages, missing, nil
+}
+
+func (b *Backend) validateEmailMailboxes(emails []jmapEmail) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.mailboxes == nil {
+		return nil
 	}
-	return result, missing, nil
+	for _, email := range emails {
+		for id := range email.MailboxIDs {
+			if _, ok := b.mailboxes[id]; !ok {
+				return fmt.Errorf("JMAP Email/get returned unknown mailbox %q for email %q", id, email.ID)
+			}
+		}
+	}
+	return nil
 }
 
 func (b *Backend) labelsFor(mailboxIDs, keywords map[string]bool) []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	labels := make([]string, 0, len(mailboxIDs)+len(keywords))
+	isDraft := keywords["$draft"]
 	for id, present := range mailboxIDs {
 		if !present {
 			continue
 		}
 		if tag := b.mailboxToTag[id]; tag != "" {
+			if isDraft && tag == "sent" {
+				continue
+			}
 			labels = append(labels, tag)
 		}
+	}
+	if isDraft {
+		labels = append(labels, "draft")
 	}
 	for keyword, present := range keywords {
 		if !present || isFlagKeyword(keyword) {
 			continue
 		}
 		if tag, ok := decodeDurianKeyword(keyword); ok {
-			if b.tagToID[tag] != "" || isExplicitFlagTag(tag) || strings.HasPrefix(tag, "jmap-keyword/") {
+			_, _, canonicalRole := roleMailboxForTag(tag)
+			if b.tagToID[tag] != "" || canonicalRole || isExplicitFlagTag(tag) || strings.HasPrefix(tag, "jmap-keyword/") {
 				labels = append(labels, "jmap-keyword/"+keyword)
 			} else {
 				labels = append(labels, tag)
@@ -761,7 +790,7 @@ func decodeDurianKeyword(keyword string) (string, bool) {
 		return "", false
 	}
 	decoded, err := keywordEncoding.DecodeString(strings.ToUpper(encoded))
-	if err != nil || string(decoded) == "" {
+	if err != nil || len(decoded) == 0 || !utf8.Valid(decoded) {
 		return "", false
 	}
 	canonical, err := encodeDurianKeyword(string(decoded))
@@ -787,6 +816,19 @@ func validJMAPKeyword(keyword string) bool {
 		}
 		switch char {
 		case '(', ')', '{', ']', '%', '*', '"', '\\':
+			return false
+		}
+	}
+	return true
+}
+
+func validJMAPID(id string) bool {
+	if len(id) == 0 || len(id) > 255 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		char := id[i]
+		if (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' && char != '_' {
 			return false
 		}
 	}
@@ -827,20 +869,30 @@ func (b *Backend) FetchBody(ctx context.Context, ref backend.RemoteRef, w io.Wri
 	if err := b.ensure(ctx); err != nil {
 		return err
 	}
-	objects, _, _, err := b.getEmailObjects(ctx, []string{ref.ID})
+	id, err := b.rawEmailID(ref.ID)
+	if err != nil {
+		return err
+	}
+	objects, _, _, err := b.getEmailObjects(ctx, []string{id})
 	if err != nil {
 		return err
 	}
 	if len(objects) == 0 {
 		return fmt.Errorf("%w: JMAP email %s", backend.ErrRefGone, ref.ID)
 	}
-	r, err := b.client.download(ctx, objects[0].BlobID, ref.ID+".eml", "message/rfc822")
+	r, err := b.client.download(ctx, objects[0].BlobID, id+".eml", "message/rfc822")
 	if err != nil {
 		return err
 	}
 	defer r.Close()
-	_, err = io.Copy(w, r)
-	return err
+	written, err := io.CopyN(w, r, maxMessageBytes+1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	if written > maxMessageBytes {
+		return fmt.Errorf("JMAP message exceeds %d bytes", maxMessageBytes)
+	}
+	return nil
 }
 
 func flagsFromKeywords(keywords map[string]bool) backend.Flags {
@@ -879,7 +931,7 @@ func (b *Backend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, re
 	if len(patch) == 0 {
 		return nil
 	}
-	return b.updateEmail(ctx, ref.ID, patch)
+	return b.updateRefEmail(ctx, ref.ID, patch)
 }
 
 // ApplyTagMutation maps explicit local flag-tag intent directly to one JMAP
@@ -903,7 +955,7 @@ func (b *Backend) ApplyTagMutation(ctx context.Context, ref backend.RemoteRef, t
 	default:
 		return fmt.Errorf("unsupported explicit JMAP tag mutation %q", tag)
 	}
-	return b.updateEmail(ctx, ref.ID, patch)
+	return b.updateRefEmail(ctx, ref.ID, patch)
 }
 
 func setFlagPatch(patch map[string]interface{}, keyword string, add, remove bool) {
@@ -916,9 +968,12 @@ func setFlagPatch(patch map[string]interface{}, keyword string, add, remove bool
 
 // FetchFlags returns current JMAP keyword state for refs that still exist.
 func (b *Backend) FetchFlags(ctx context.Context, _ string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
-	ids := make([]string, 0, len(refs))
-	for _, ref := range refs {
-		ids = append(ids, ref.ID)
+	if err := b.ensure(ctx); err != nil {
+		return nil, err
+	}
+	ids, err := b.rawEmailIDs(refs)
+	if err != nil {
+		return nil, err
 	}
 	objects, _, _, err := b.getEmailObjects(ctx, ids)
 	if err != nil {
@@ -926,7 +981,7 @@ func (b *Backend) FetchFlags(ctx context.Context, _ string, refs []backend.Remot
 	}
 	result := make(map[string]backend.Flags, len(objects))
 	for _, email := range objects {
-		result[email.ID] = flagsFromKeywords(email.Keywords)
+		result[b.scopedEmailID(email.ID)] = flagsFromKeywords(email.Keywords)
 	}
 	return result, nil
 }
@@ -937,7 +992,7 @@ func (b *Backend) Move(ctx context.Context, ref backend.RemoteRef, destFolder st
 	if ref.Folder != "" && ref.Folder != allMailStream && ref.Folder != destFolder {
 		patch["mailboxIds/"+ref.Folder] = nil
 	}
-	if err := b.updateEmail(ctx, ref.ID, patch); err != nil {
+	if err := b.updateRefEmail(ctx, ref.ID, patch); err != nil {
 		return backend.RemoteRef{}, err
 	}
 	return backend.RemoteRef{Folder: destFolder, ID: ref.ID}, nil
@@ -977,22 +1032,42 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 	if err := b.loadMailboxes(ctx); err != nil {
 		return err
 	}
+	id, err := b.rawEmailID(ref.ID)
+	if err != nil {
+		return err
+	}
 	for _, tag := range add {
-		if tag == "archive" && b.mailboxIDForTag("archive") == "" {
-			if err := b.createArchiveMailbox(ctx); err != nil {
-				return fmt.Errorf("create JMAP archive mailbox: %w", err)
-			}
-			break
+		role, name, canonicalRole := roleMailboxForTag(tag)
+		if !canonicalRole || b.mailboxIDForTag(tag) != "" {
+			continue
+		}
+		if err := b.createRoleMailbox(ctx, role, name); err != nil {
+			return fmt.Errorf("create JMAP %s mailbox: %w", role, err)
+		}
+		if b.mailboxIDForTag(tag) == "" {
+			return fmt.Errorf("created JMAP %s mailbox could not be resolved", role)
 		}
 	}
 	patch := make(map[string]interface{})
 	b.mu.Lock()
 	apply := func(tags []string, value interface{}) error {
 		for _, tag := range tags {
+			if tag == "draft" {
+				patch["keywords/$draft"] = value
+			}
 			if !strings.HasPrefix(tag, "jmap-keyword/") {
 				if id := b.tagToID[tag]; id != "" {
 					patch["mailboxIds/"+id] = value
 					continue
+				}
+				if _, _, canonicalRole := roleMailboxForTag(tag); canonicalRole {
+					// A missing role on removal means there is no corresponding
+					// membership to remove. Never turn canonical role intent into
+					// a custom keyword.
+					if value == nil {
+						continue
+					}
+					return fmt.Errorf("JMAP role mailbox %q is unavailable", tag)
 				}
 			}
 			keyword, err := keywordForTag(tag)
@@ -1015,7 +1090,7 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 	if len(patch) == 0 {
 		return nil
 	}
-	objects, missing, _, err := b.getEmailObjects(ctx, []string{ref.ID})
+	objects, missing, _, err := b.getEmailObjects(ctx, []string{id})
 	if err != nil {
 		return fmt.Errorf("load JMAP mailbox membership: %w", err)
 	}
@@ -1052,18 +1127,81 @@ func (b *Backend) ApplyLabels(ctx context.Context, ref backend.RemoteRef, add, r
 		}
 		patch["mailboxIds/"+archiveID] = true
 	}
-	return b.updateEmail(ctx, ref.ID, patch)
+	return b.updateEmail(ctx, id, patch)
 }
 
 func (b *Backend) createArchiveMailbox(ctx context.Context) error {
 	return b.createRoleMailbox(ctx, "archive", "Archive")
 }
 
+func validateResponseAccount(method, accountID string, responseAccountID *string) error {
+	if responseAccountID == nil || *responseAccountID != accountID {
+		return fmt.Errorf("JMAP %s omitted required matching accountId", method)
+	}
+	return nil
+}
+
+type setResponseState struct {
+	OldState json.RawMessage `json:"oldState"`
+	NewState *string         `json:"newState"`
+}
+
+func validateSetResponseState(method string, state setResponseState) error {
+	oldState := bytes.TrimSpace(state.OldState)
+	if len(oldState) == 0 {
+		return fmt.Errorf("JMAP %s omitted required oldState", method)
+	}
+	if !bytes.Equal(oldState, []byte("null")) {
+		var value string
+		if err := json.Unmarshal(oldState, &value); err != nil {
+			return fmt.Errorf("JMAP %s returned invalid oldState", method)
+		}
+	}
+	if state.NewState == nil {
+		return fmt.Errorf("JMAP %s omitted required newState", method)
+	}
+	return nil
+}
+
+func mapKeys[T any](values map[string]T) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func validateSingleOutcome(method, expected string, successKeys []string, failures map[string]methodError) (*methodError, error) {
+	for _, key := range successKeys {
+		if key != expected {
+			return nil, fmt.Errorf("JMAP %s returned unexpected successful id %q", method, key)
+		}
+	}
+	for key := range failures {
+		if key != expected {
+			return nil, fmt.Errorf("JMAP %s returned unexpected failed id %q", method, key)
+		}
+	}
+	failure, failed := failures[expected]
+	if failed && failure.Type == "" {
+		return nil, fmt.Errorf("JMAP %s returned a failed outcome without a type for %q", method, expected)
+	}
+	if len(successKeys) == 1 && !failed {
+		return nil, nil
+	}
+	if len(successKeys) == 0 && failed {
+		return &failure, nil
+	}
+	return nil, fmt.Errorf("JMAP %s did not return exactly one outcome for %q", method, expected)
+}
+
 // createRoleMailbox creates a role mailbox the account is missing and reloads
 // the mailbox table so the new id is resolvable by tag.
 func (b *Backend) createRoleMailbox(ctx context.Context, role, name string) error {
 	var result struct {
-		Created map[string]struct {
+		setResponseState
+		AccountID *string `json:"accountId"`
+		Created   map[string]struct {
 			ID string `json:"id"`
 		} `json:"created"`
 		NotCreated map[string]methodError `json:"notCreated"`
@@ -1081,10 +1219,20 @@ func (b *Backend) createRoleMailbox(ctx context.Context, role, name string) erro
 	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Mailbox/set", args, &result); err != nil {
 		return err
 	}
-	if createErr, ok := result.NotCreated[role]; ok {
-		return &createErr
+	if err := validateResponseAccount("Mailbox/set", b.client.accountID, result.AccountID); err != nil {
+		return err
 	}
-	if result.Created[role].ID == "" {
+	if err := validateSetResponseState("Mailbox/set", result.setResponseState); err != nil {
+		return err
+	}
+	createErr, err := validateSingleOutcome("Mailbox/set", role, mapKeys(result.Created), result.NotCreated)
+	if err != nil {
+		return err
+	}
+	if createErr != nil {
+		return createErr
+	}
+	if !validJMAPID(result.Created[role].ID) {
 		return fmt.Errorf("Mailbox/set returned no created %s mailbox", role)
 	}
 	return b.loadMailboxes(ctx)
@@ -1098,14 +1246,26 @@ func (b *Backend) destroyEmail(ctx context.Context, id string) error {
 		"destroy":   []string{id},
 	}
 	var result struct {
+		setResponseState
+		AccountID    *string                `json:"accountId"`
 		Destroyed    []string               `json:"destroyed"`
 		NotDestroyed map[string]methodError `json:"notDestroyed"`
 	}
 	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/set", args, &result); err != nil {
 		return err
 	}
-	if destroyErr, ok := result.NotDestroyed[id]; ok {
-		return &destroyErr
+	if err := validateResponseAccount("Email/set", b.client.accountID, result.AccountID); err != nil {
+		return err
+	}
+	if err := validateSetResponseState("Email/set", result.setResponseState); err != nil {
+		return err
+	}
+	destroyErr, err := validateSingleOutcome("Email/set", id, result.Destroyed, result.NotDestroyed)
+	if err != nil {
+		return err
+	}
+	if destroyErr != nil {
+		return destroyErr
 	}
 	return nil
 }
@@ -1115,7 +1275,10 @@ func (b *Backend) updateEmail(ctx context.Context, id string, patch map[string]i
 		return err
 	}
 	var result struct {
-		NotUpdated map[string]methodError `json:"notUpdated"`
+		setResponseState
+		AccountID  *string                    `json:"accountId"`
+		Updated    map[string]json.RawMessage `json:"updated"`
+		NotUpdated map[string]methodError     `json:"notUpdated"`
 	}
 	args := map[string]interface{}{
 		"accountId": b.client.accountID,
@@ -1124,17 +1287,53 @@ func (b *Backend) updateEmail(ctx context.Context, id string, patch map[string]i
 	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/set", args, &result); err != nil {
 		return err
 	}
-	if setErr, ok := result.NotUpdated[id]; ok {
+	if err := validateResponseAccount("Email/set", b.client.accountID, result.AccountID); err != nil {
+		return err
+	}
+	if err := validateSetResponseState("Email/set", result.setResponseState); err != nil {
+		return err
+	}
+	setErr, err := validateSingleOutcome("Email/set", id, mapKeys(result.Updated), result.NotUpdated)
+	if err != nil {
+		return err
+	}
+	if setErr != nil {
 		if setErr.Type == "notFound" {
 			return fmt.Errorf("%w: JMAP email %s", backend.ErrRefGone, id)
 		}
-		return &setErr
+		return setErr
+	}
+	return validateUpdatedValue("JMAP Email/set", id, result.Updated[id])
+}
+
+func validateUpdatedValue(method, id string, value json.RawMessage) error {
+	if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		return nil
+	}
+	var computed map[string]json.RawMessage
+	if err := json.Unmarshal(value, &computed); err != nil || computed == nil {
+		return fmt.Errorf("%s returned an invalid updated value for %q", method, id)
 	}
 	return nil
 }
 
+func (b *Backend) updateRefEmail(ctx context.Context, refID string, patch map[string]interface{}) error {
+	if err := b.ensure(ctx); err != nil {
+		return err
+	}
+	id, err := b.rawEmailID(refID)
+	if err != nil {
+		return err
+	}
+	return b.updateEmail(ctx, id, patch)
+}
+
 // Append uploads and imports an RFC 5322 message into folder.
 func (b *Backend) Append(ctx context.Context, folder string, flags backend.Flags, msg []byte) (backend.RemoteRef, error) {
+	return b.append(ctx, folder, flags, msg, false)
+}
+
+func (b *Backend) append(ctx context.Context, folder string, flags backend.Flags, msg []byte, draft bool) (backend.RemoteRef, error) {
 	if err := b.loadMailboxes(ctx); err != nil {
 		return backend.RemoteRef{}, err
 	}
@@ -1144,15 +1343,18 @@ func (b *Backend) Append(ctx context.Context, folder string, flags backend.Flags
 		keywords["$draft"] = true
 	}
 	b.mu.Unlock()
+	if draft {
+		keywords["$draft"] = true
+	}
 	blobID, err := b.client.upload(ctx, msg, "message/rfc822")
 	if err != nil {
 		return backend.RemoteRef{}, fmt.Errorf("upload message: %w", err)
 	}
 	var result struct {
-		Created map[string]struct {
-			ID string `json:"id"`
-		} `json:"created"`
-		NotCreated map[string]methodError `json:"notCreated"`
+		setResponseState
+		AccountID  *string                 `json:"accountId"`
+		Created    map[string]createdEmail `json:"created"`
+		NotCreated map[string]methodError  `json:"notCreated"`
 	}
 	args := map[string]interface{}{
 		"accountId": b.client.accountID,
@@ -1165,17 +1367,44 @@ func (b *Backend) Append(ctx context.Context, folder string, flags backend.Flags
 			},
 		},
 	}
-	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/import", args, &result); err != nil {
-		return backend.RemoteRef{}, err
+	callErr := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/import", args, &result)
+	if errors.Is(callErr, errJMAPLocalPermanent) {
+		return backend.RemoteRef{}, callErr
 	}
-	if importErr, ok := result.NotCreated["0"]; ok {
-		return backend.RemoteRef{}, &importErr
+	var protocolErr *protocolError
+	if errors.As(callErr, &protocolErr) {
+		return backend.RemoteRef{}, fmt.Errorf("%w: %w", errEmailCreationOutcomeUnknown, callErr)
+	}
+	if err := validateResponseAccount("Email/import", b.client.accountID, result.AccountID); err != nil {
+		if definiteMutationRejection(callErr) {
+			return backend.RemoteRef{}, callErr
+		}
+		if callErr != nil {
+			err = errors.Join(err, callErr)
+		}
+		return backend.RemoteRef{}, fmt.Errorf("%w: %w", errEmailCreationOutcomeUnknown, err)
+	}
+	if err := validateSetResponseState("Email/import", result.setResponseState); err != nil {
+		return backend.RemoteRef{}, fmt.Errorf("%w: %w", errEmailCreationOutcomeUnknown, err)
+	}
+	importErr, err := validateSingleOutcome("Email/import", "0", mapKeys(result.Created), result.NotCreated)
+	if err != nil {
+		if callErr != nil {
+			err = errors.Join(err, callErr)
+		}
+		return backend.RemoteRef{}, fmt.Errorf("%w: %w", errEmailCreationOutcomeUnknown, err)
+	}
+	if importErr != nil {
+		return backend.RemoteRef{}, importErr
 	}
 	created, ok := result.Created["0"]
-	if !ok || created.ID == "" {
-		return backend.RemoteRef{}, errors.New("Email/import returned no created email")
+	if !ok {
+		return backend.RemoteRef{}, fmt.Errorf("%w: Email/import omitted the created Email", errEmailCreationOutcomeUnknown)
 	}
-	return backend.RemoteRef{Folder: folder, ID: created.ID}, nil
+	if err := validateCreatedEmail("Email/import", created); err != nil {
+		return backend.RemoteRef{}, fmt.Errorf("%w: %w", errEmailCreationOutcomeUnknown, err)
+	}
+	return backend.RemoteRef{Folder: folder, ID: b.scopedEmailID(created.ID)}, nil
 }
 
 // Send submits a raw RFC 5322 message through JMAP Submission.
@@ -1194,9 +1423,11 @@ func (b *Backend) Watch(ctx context.Context, _ string, onChange func()) error {
 // Capabilities reports JMAP's account-wide push and label-native delta support.
 func (b *Backend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
-		PushWatch:          true,
-		FlagChangesInDelta: true,
-		LabelsAreTags:      true,
+		PushWatch:                      true,
+		BodyBatchLimit:                 4,
+		InitialSnapshotIsAuthoritative: true,
+		FlagChangesInDelta:             true,
+		LabelsAreTags:                  true,
 	}
 }
 
@@ -1208,15 +1439,15 @@ func (b *Backend) Close() error {
 	return nil
 }
 
-func deletions(folder string, ids []string) []backend.Deletion {
+func (b *Backend) deletions(folder string, ids []string) []backend.Deletion {
 	result := make([]backend.Deletion, 0, len(ids))
 	for _, id := range ids {
-		result = append(result, backend.Deletion{Ref: backend.RemoteRef{Folder: folder, ID: id}})
+		result = append(result, backend.Deletion{Ref: backend.RemoteRef{Folder: folder, ID: b.scopedEmailID(id)}})
 	}
 	return result
 }
 
-func presentRefs(folder string, ids, missing []string) []backend.RemoteRef {
+func (b *Backend) presentRefs(folder string, ids, missing []string) []backend.RemoteRef {
 	missingSet := make(map[string]struct{}, len(missing))
 	for _, id := range missing {
 		missingSet[id] = struct{}{}
@@ -1228,7 +1459,7 @@ func presentRefs(folder string, ids, missing []string) []backend.RemoteRef {
 	result := make([]backend.RemoteRef, 0, capacity)
 	for _, id := range ids {
 		if _, absent := missingSet[id]; !absent {
-			result = append(result, backend.RemoteRef{Folder: folder, ID: id})
+			result = append(result, backend.RemoteRef{Folder: folder, ID: b.scopedEmailID(id)})
 		}
 	}
 	return result

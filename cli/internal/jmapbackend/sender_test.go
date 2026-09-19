@@ -1,14 +1,20 @@
 package jmapbackend
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/julion2/durian/cli/internal/mailsend"
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 func TestSenderCreatesStructuredEmailAndSubmits(t *testing.T) {
@@ -18,7 +24,7 @@ func TestSenderCreatesStructuredEmailAndSubmits(t *testing.T) {
 	s.handler = func(method string, args map[string]interface{}) interface{} {
 		switch method {
 		case "Mailbox/get":
-			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
 		case "Identity/get":
 			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
 		case "Email/set":
@@ -28,7 +34,11 @@ func TestSenderCreatesStructuredEmailAndSubmits(t *testing.T) {
 			submitted = true
 			// onSuccessUpdateEmail produces this second, implicit response on
 			// real servers such as Stalwart.
-			s.extra = []interface{}{[]interface{}{"Email/set", map[string]interface{}{"updated": map[string]interface{}{"draft-1": nil}}, "0"}}
+			s.extra = []interface{}{[]interface{}{"Email/set", map[string]interface{}{
+				"accountId": "a1", "updated": map[string]interface{}{
+					"draft-1": map[string]interface{}{"keywords": map[string]bool{"$seen": true}},
+				},
+			}, "0"}}
 			create := args["create"].(map[string]interface{})["s0"].(map[string]interface{})
 			if create["emailId"] != "draft-1" || create["identityId"] != "identity-1" {
 				t.Errorf("submission create = %#v", create)
@@ -81,13 +91,23 @@ func TestSenderCreatesStructuredEmailAndSubmits(t *testing.T) {
 	}
 }
 
-func TestClassifySendErrorTreatsLocalJMAPPreconditionsAsPermanent(t *testing.T) {
-	for _, err := range []error{errNoDraftsMailbox, errSubmissionUnavailable, errNoSubmissionIdentity} {
-		t.Run(err.Error(), func(t *testing.T) {
-			classified := classifySendError(errors.Join(errors.New("context"), err))
+func TestClassifySendErrorTreatsJMAPOutcomeStatesDistinctly(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		kind mailsend.Kind
+	}{
+		{errEmailCreationOutcomeUnknown, mailsend.KindAmbiguous},
+		{errSubmissionOutcomeUnknown, mailsend.KindAmbiguous},
+		{errSentFilingFailed, mailsend.KindDeliveredWithWarning},
+		{errSubmissionUnavailable, mailsend.KindPermanent},
+		{errNoSubmissionIdentity, mailsend.KindPermanent},
+		{errAmbiguousSubmissionIdentity, mailsend.KindPermanent},
+	} {
+		t.Run(test.err.Error(), func(t *testing.T) {
+			classified := classifySendError(errors.Join(errors.New("context"), test.err))
 			var sendErr *mailsend.Error
-			if !errors.As(classified, &sendErr) || sendErr.Kind != mailsend.KindPermanent || !errors.Is(classified, err) {
-				t.Fatalf("classifySendError(%v) = %#v", err, classified)
+			if !errors.As(classified, &sendErr) || sendErr.Kind != test.kind || !errors.Is(classified, test.err) {
+				t.Fatalf("classifySendError(%v) = %#v", test.err, classified)
 			}
 		})
 	}
@@ -105,8 +125,11 @@ func TestClassifySendError(t *testing.T) {
 		{name: "permanent method error", err: &methodError{Type: "invalidArguments"}, kind: mailsend.KindPermanent},
 		{name: "server method error", err: &methodError{Type: "serverFail"}, kind: mailsend.KindTransient},
 		{name: "partial server method error", err: &methodError{Type: "serverPartialFail"}, kind: mailsend.KindTransient},
+		{name: "server unavailable", err: &methodError{Type: "serverUnavailable"}, kind: mailsend.KindTransient},
 		{name: "method rate limit", err: &methodError{Type: "rateLimit"}, kind: mailsend.KindTransient},
-		{name: "network error", err: errors.New("connection reset"), kind: mailsend.KindNetwork},
+		{name: "network error", err: &url.Error{Op: "POST", URL: "https://example.test", Err: io.EOF}, kind: mailsend.KindNetwork},
+		{name: "local provider limit", err: fmt.Errorf("attachment: %w", errJMAPLocalPermanent), kind: mailsend.KindPermanent},
+		{name: "untyped deterministic error", err: errors.New("invalid local input"), kind: mailsend.KindPermanent},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -186,6 +209,137 @@ func TestSenderRejectsInvalidAttachmentTypeAsPermanent(t *testing.T) {
 	}
 }
 
+func TestSenderTreatsProviderUploadLimitAsPermanent(t *testing.T) {
+	s := newTestJMAPServer(t)
+	s.limits = map[string]interface{}{"maxSizeUpload": 1}
+	s.handler = func(method string, _ map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
+		From: "me@example.test", To: []string{"you@example.test"}, Subject: "test", Body: "body",
+		Attachments: []mailsend.Attachment{{Filename: "large.txt", MIMEType: "text/plain", Data: []byte("xx")}},
+	})
+	if err == nil || mailsend.Classify(err) != mailsend.KindPermanent || !errors.Is(err, errJMAPLocalPermanent) {
+		t.Fatalf("Send() error = %#v, want permanent provider limit", err)
+	}
+	if len(s.uploaded) != 0 {
+		t.Fatal("oversized attachment was uploaded")
+	}
+}
+
+func TestSenderStopsAfterAmbiguousEmailCreation(t *testing.T) {
+	s := newTestJMAPServer(t)
+	var created bool
+	s.handler = func(method string, _ map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		case "Email/set":
+			created = true
+			s.dropAPIResponse = true
+			return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
+		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
+	})
+	if !created || err == nil || !errors.Is(err, errEmailCreationOutcomeUnknown) || mailsend.Classify(err) != mailsend.KindAmbiguous {
+		t.Fatalf("created=%v Send() error=%#v, want ambiguous unknown creation", created, err)
+	}
+}
+
+func TestSenderRejectsIncompleteCreatedEmail(t *testing.T) {
+	s := newTestJMAPServer(t)
+	var submitted bool
+	s.handler = func(method string, _ map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		case "Email/set":
+			s.rawResponses = true
+			return map[string]interface{}{
+				"accountId": "a1", "oldState": "s1", "newState": "s2",
+				"created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{},
+			}
+		case "EmailSubmission/set":
+			submitted = true
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
+		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
+	})
+	if err == nil || !errors.Is(err, errEmailCreationOutcomeUnknown) || mailsend.Classify(err) != mailsend.KindAmbiguous {
+		t.Fatalf("Send() error=%#v, want ambiguous unknown creation", err)
+	}
+	if submitted {
+		t.Fatal("submitted an Email whose created response omitted required properties")
+	}
+}
+
+func TestValidateCreatedEmailRequiresAllServerProperties(t *testing.T) {
+	size := uint64(1)
+	valid := createdEmail{ID: "email-1", BlobID: "blob-1", ThreadID: "thread-1", Size: &size}
+	for _, test := range []struct {
+		name   string
+		mutate func(*createdEmail)
+	}{
+		{name: "id", mutate: func(email *createdEmail) { email.ID = "" }},
+		{name: "blobId", mutate: func(email *createdEmail) { email.BlobID = "" }},
+		{name: "threadId", mutate: func(email *createdEmail) { email.ThreadID = "" }},
+		{name: "size", mutate: func(email *createdEmail) { email.Size = nil }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			email := valid
+			test.mutate(&email)
+			if err := validateCreatedEmail("Email/import", email); err == nil {
+				t.Fatalf("validateCreatedEmail(%+v) succeeded", email)
+			}
+		})
+	}
+}
+
+func TestRawSenderStopsAfterAmbiguousEmailImport(t *testing.T) {
+	s := newTestJMAPServer(t)
+	var imported bool
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		case "Email/import":
+			imported = true
+			email := args["emails"].(map[string]interface{})["0"].(map[string]interface{})
+			if email["keywords"].(map[string]interface{})["$draft"] != true {
+				t.Fatal("temporary raw Email was not marked $draft")
+			}
+			s.dropAPIResponse = true
+			return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	err := s.backend(t).Send(t.Context(), []byte(testRaw))
+	if !imported || err == nil || !errors.Is(err, errEmailCreationOutcomeUnknown) {
+		t.Fatalf("imported=%v Send() error=%#v, want unknown creation", imported, err)
+	}
+}
+
 // A failed submission must not leave the created copy in Drafts: the outbox
 // retries, so every attempt would otherwise add another draft.
 func TestSenderDestroysCreatedDraftWhenSubmissionFails(t *testing.T) {
@@ -194,7 +348,7 @@ func TestSenderDestroysCreatedDraftWhenSubmissionFails(t *testing.T) {
 	s.handler = func(method string, args map[string]interface{}) interface{} {
 		switch method {
 		case "Mailbox/get":
-			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
 		case "Identity/get":
 			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
 		case "Email/set":
@@ -206,7 +360,8 @@ func TestSenderDestroysCreatedDraftWhenSubmissionFails(t *testing.T) {
 			}
 			return map[string]interface{}{"accountId": "a1", "oldState": "s2", "newState": "s3", "destroyed": []string{"draft-1"}, "notDestroyed": map[string]interface{}{}}
 		case "EmailSubmission/set":
-			return map[string]interface{}{"accountId": "a1", "oldState": "sub1", "newState": "sub1", "created": map[string]interface{}{}, "notCreated": map[string]interface{}{
+			s.rawResponses = true
+			return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{}, "notCreated": map[string]interface{}{
 				"s0": map[string]interface{}{"type": "forbiddenFrom", "description": "identity not allowed"},
 			}}
 		}
@@ -225,6 +380,177 @@ func TestSenderDestroysCreatedDraftWhenSubmissionFails(t *testing.T) {
 	}
 }
 
+func TestSenderAcceptsSubmissionAndImplicitUpdateWithoutOldState(t *testing.T) {
+	s := newTestJMAPServer(t)
+	var repaired bool
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		case "Email/set":
+			if _, creating := args["create"]; !creating {
+				repaired = true
+				t.Fatal("complete implicit Email/set outcome triggered a redundant repair")
+			}
+			return map[string]interface{}{
+				"accountId": "a1", "oldState": "s1", "newState": "s2",
+				"created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{},
+			}
+		case "EmailSubmission/set":
+			s.rawResponses = true
+			s.extra = []interface{}{[]interface{}{"Email/set", map[string]interface{}{
+				"accountId": "a1", "newState": "s3", "updated": map[string]interface{}{"draft-1": nil}, "notUpdated": map[string]interface{}{},
+			}, "0"}}
+			return map[string]interface{}{
+				"accountId": "a1", "newState": "sub2", "created": map[string]interface{}{"s0": map[string]string{"id": "submission-1"}}, "notCreated": map[string]interface{}{},
+			}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+
+	err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
+		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
+	})
+	if err != nil {
+		t.Fatalf("Send() rejected complete submission outcomes without oldState: %v", err)
+	}
+	if repaired {
+		t.Fatal("implicit update without oldState was repaired despite its complete outcome")
+	}
+}
+
+func TestSubmissionSetStatesAllowProviderOldStateOmission(t *testing.T) {
+	state := "s2"
+	for _, test := range []struct {
+		name  string
+		state setResponseState
+		ok    bool
+	}{
+		{name: "both omitted"},
+		{name: "only new", state: setResponseState{NewState: &state}, ok: true},
+		{name: "both present", state: setResponseState{OldState: json.RawMessage(`"s1"`), NewState: &state}, ok: true},
+		{name: "only old", state: setResponseState{OldState: json.RawMessage(`"s1"`)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateSubmissionSetResponseState("EmailSubmission/set", test.state)
+			if (err == nil) != test.ok {
+				t.Fatalf("validateSubmissionSetResponseState() error = %v, want success %v", err, test.ok)
+			}
+		})
+	}
+}
+
+func TestSenderPreservesDraftWhenSubmissionResponseIsLost(t *testing.T) {
+	s := newTestJMAPServer(t)
+	mailboxes := []map[string]interface{}{
+		{"id": "inbox-id", "name": "Inbox", "role": "inbox", "isSubscribed": true},
+		{"id": "sent-id", "name": "Sent", "role": "sent", "isSubscribed": true},
+	}
+	var accepted, destroyed bool
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": mailboxes, "notFound": nil}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		case "Email/set":
+			if _, creating := args["create"]; creating {
+				draft := args["create"].(map[string]interface{})["e0"].(map[string]interface{})
+				if draft["mailboxIds"].(map[string]interface{})["sent-id"] != true || draft["keywords"].(map[string]interface{})["$draft"] != true {
+					t.Fatalf("no-Drafts temporary Email = %#v", draft)
+				}
+				return map[string]interface{}{"accountId": "a1", "oldState": "s1", "newState": "s2", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
+			}
+			destroyed = true
+			return map[string]interface{}{"accountId": "a1", "destroyed": []string{"draft-1"}, "notDestroyed": map[string]interface{}{}}
+		case "EmailSubmission/set":
+			accepted = true
+			s.dropAPIResponse = true
+			return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"s0": map[string]string{"id": "submission-1"}}, "notCreated": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
+		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
+	})
+	if !accepted || err == nil || !errors.Is(err, errSubmissionOutcomeUnknown) || mailsend.Classify(err) != mailsend.KindAmbiguous {
+		t.Fatalf("accepted=%v Send() error=%#v, want ambiguous unknown outcome", accepted, err)
+	}
+	if destroyed {
+		t.Fatal("source Email was destroyed after an ambiguous accepted submission")
+	}
+}
+
+func TestSenderTreatsServerPartialFailAsUnknownOutcome(t *testing.T) {
+	s := newTestJMAPServer(t)
+	var destroyed bool
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		case "Email/set":
+			if _, creating := args["create"]; creating {
+				return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
+			}
+			destroyed = true
+			return map[string]interface{}{"accountId": "a1", "destroyed": []string{"draft-1"}, "notDestroyed": map[string]interface{}{}}
+		case "EmailSubmission/set":
+			return testMethodResponse{name: "error", value: map[string]interface{}{"type": "serverPartialFail"}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
+		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
+	})
+	if err == nil || !errors.Is(err, errSubmissionOutcomeUnknown) || mailsend.Classify(err) != mailsend.KindAmbiguous {
+		t.Fatalf("Send() error=%#v, want ambiguous unknown outcome", err)
+	}
+	if destroyed {
+		t.Fatal("source Email was destroyed after serverPartialFail")
+	}
+}
+
+func TestSenderTreatsContradictorySubmissionResponsesAsUnknown(t *testing.T) {
+	s := newTestJMAPServer(t)
+	var accepted, destroyed bool
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		case "Email/set":
+			if _, creating := args["create"]; creating {
+				return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
+			}
+			destroyed = true
+			return map[string]interface{}{"accountId": "a1", "destroyed": []string{"draft-1"}, "notDestroyed": map[string]interface{}{}}
+		case "EmailSubmission/set":
+			accepted = true
+			s.before = []interface{}{[]interface{}{"error", map[string]interface{}{"type": "serverFail"}, "0"}}
+			return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"s0": map[string]string{"id": "submission-1"}}, "notCreated": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
+		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
+	})
+	if !accepted || err == nil || !errors.Is(err, errSubmissionOutcomeUnknown) || mailsend.Classify(err) != mailsend.KindAmbiguous {
+		t.Fatalf("accepted=%v Send() error=%#v, want ambiguous unknown outcome", accepted, err)
+	}
+	if destroyed {
+		t.Fatal("source Email was destroyed after contradictory submission responses")
+	}
+}
+
 func TestSenderRepairsSentFilingAfterImplicitUpdateFails(t *testing.T) {
 	s := newTestJMAPServer(t)
 	var repaired map[string]interface{}
@@ -232,7 +558,7 @@ func TestSenderRepairsSentFilingAfterImplicitUpdateFails(t *testing.T) {
 	s.handler = func(method string, args map[string]interface{}) interface{} {
 		switch method {
 		case "Mailbox/get":
-			return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
 		case "Identity/get":
 			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
 		case "Email/set":
@@ -247,7 +573,7 @@ func TestSenderRepairsSentFilingAfterImplicitUpdateFails(t *testing.T) {
 			return map[string]interface{}{"accountId": "a1", "destroyed": []string{"draft-1"}, "notDestroyed": map[string]interface{}{}}
 		case "EmailSubmission/set":
 			s.extra = []interface{}{[]interface{}{"Email/set", map[string]interface{}{
-				"updated": map[string]interface{}{},
+				"accountId": "a1", "updated": map[string]interface{}{},
 				"notUpdated": map[string]interface{}{"draft-1": map[string]interface{}{
 					"type": "serverFail", "description": "temporary filing failure",
 				}},
@@ -272,6 +598,51 @@ func TestSenderRepairsSentFilingAfterImplicitUpdateFails(t *testing.T) {
 	}
 }
 
+func TestSenderReportsAcceptedDeliveryWhenSentRepairFails(t *testing.T) {
+	const (
+		implicitSecret = "private implicit detail"
+		repairSecret   = "private repair detail"
+	)
+	var logOutput bytes.Buffer
+	priorLogger := slog.Default()
+	slog.SetDefault(slog.New(redact.Wrap(slog.NewTextHandler(&logOutput, nil))))
+	t.Cleanup(func() { slog.SetDefault(priorLogger) })
+
+	s := newTestJMAPServer(t)
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		case "Email/set":
+			if _, creating := args["create"]; creating {
+				return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
+			}
+			return map[string]interface{}{"accountId": "a1", "updated": map[string]interface{}{}, "notUpdated": map[string]interface{}{
+				"draft-1": map[string]interface{}{"type": "serverFail", "description": repairSecret},
+			}}
+		case "EmailSubmission/set":
+			s.extra = []interface{}{[]interface{}{"Email/set", map[string]interface{}{"accountId": "a1", "updated": map[string]interface{}{}, "notUpdated": map[string]interface{}{
+				"draft-1": map[string]interface{}{"type": "serverFail", "description": implicitSecret},
+			}}, "0"}}
+			return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"s0": map[string]string{"id": "submission-1"}}, "notCreated": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
+		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
+	})
+	if err == nil || !errors.Is(err, errSentFilingFailed) || mailsend.Classify(err) != mailsend.KindDeliveredWithWarning {
+		t.Fatalf("Send() error=%#v, want delivered-with-warning outcome", err)
+	}
+	slog.Error("outbox send failed", "err", err)
+	if got := logOutput.String(); strings.Contains(got, implicitSecret) || strings.Contains(got, repairSecret) || !strings.Contains(got, redact.Placeholder) {
+		t.Fatalf("redacted filing logs = %q", got)
+	}
+}
+
 func TestSenderRepairsSentFilingAfterUncorrelatedImplicitResponse(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -293,7 +664,6 @@ func TestSenderRepairsSentFilingAfterUncorrelatedImplicitResponse(t *testing.T) 
 		{name: "non-tuple before acceptance", before: []interface{}{map[string]interface{}{"malformed": true}}},
 		{name: "invalid response name before acceptance", before: []interface{}{[]interface{}{12, map[string]interface{}{}, "0"}}},
 		{name: "malformed implicit result before acceptance", before: []interface{}{[]interface{}{"Email/set", "not an object", "0"}}},
-		{name: "null primary result before acceptance", before: []interface{}{[]interface{}{"EmailSubmission/set", nil, "0"}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			s := newTestJMAPServer(t)
@@ -302,7 +672,7 @@ func TestSenderRepairsSentFilingAfterUncorrelatedImplicitResponse(t *testing.T) 
 			s.handler = func(method string, args map[string]interface{}) interface{} {
 				switch method {
 				case "Mailbox/get":
-					return map[string]interface{}{"state": "mb1", "list": testMailboxes()}
+					return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
 				case "Identity/get":
 					return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
 				case "Email/set":
@@ -352,7 +722,7 @@ func TestSenderCreatesSentMailboxWhenMissing(t *testing.T) {
 	s.handler = func(method string, args map[string]interface{}) interface{} {
 		switch method {
 		case "Mailbox/get":
-			return map[string]interface{}{"state": "mb1", "list": mailboxes}
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": mailboxes, "notFound": nil}
 		case "Mailbox/set":
 			create := args["create"].(map[string]interface{})["sent"].(map[string]interface{})
 			if create["role"] != "sent" {
@@ -366,7 +736,7 @@ func TestSenderCreatesSentMailboxWhenMissing(t *testing.T) {
 		case "Email/set":
 			return map[string]interface{}{"accountId": "a1", "oldState": "s1", "newState": "s2", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
 		case "EmailSubmission/set":
-			s.extra = []interface{}{[]interface{}{"Email/set", map[string]interface{}{"updated": map[string]interface{}{"draft-1": nil}}, "0"}}
+			s.extra = []interface{}{[]interface{}{"Email/set", map[string]interface{}{"accountId": "a1", "updated": map[string]interface{}{"draft-1": nil}}, "0"}}
 			updates, ok := args["onSuccessUpdateEmail"].(map[string]interface{})["#s0"].(map[string]interface{})
 			if !ok {
 				t.Fatal("onSuccessUpdateEmail missing: message would stay in Drafts")
@@ -390,5 +760,204 @@ func TestSenderCreatesSentMailboxWhenMissing(t *testing.T) {
 	}
 	if !created {
 		t.Fatal("Sent mailbox was not created")
+	}
+}
+
+func TestSenderUsesSentMailboxWhenDraftsRoleIsMissing(t *testing.T) {
+	s := newTestJMAPServer(t)
+	mailboxes := []map[string]interface{}{
+		{"id": "inbox-id", "name": "Inbox", "role": "inbox", "isSubscribed": true},
+		{"id": "sent-id", "name": "Sent", "role": "sent", "isSubscribed": true},
+	}
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": mailboxes, "notFound": nil}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
+		case "Email/set":
+			create := args["create"].(map[string]interface{})["e0"].(map[string]interface{})
+			if mailboxes := create["mailboxIds"].(map[string]interface{}); mailboxes["sent-id"] != true {
+				t.Fatalf("draft mailboxIds = %#v, want sent-id", mailboxes)
+			}
+			return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
+		case "EmailSubmission/set":
+			update := args["onSuccessUpdateEmail"].(map[string]interface{})["#s0"].(map[string]interface{})
+			if len(update) != 2 || update["mailboxIds/sent-id"] != true || update["keywords/$draft"] != nil {
+				t.Fatalf("submission update = %#v", update)
+			}
+			s.extra = []interface{}{[]interface{}{"Email/set", map[string]interface{}{"accountId": "a1", "updated": map[string]interface{}{"draft-1": nil}}, "0"}}
+			return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"s0": map[string]string{"id": "submission-1"}}, "notCreated": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	if err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
+		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIdentityGetRejectsMalformedResponses(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]interface{})
+	}{
+		{name: "missing account", mutate: func(r map[string]interface{}) { delete(r, "accountId") }},
+		{name: "wrong account", mutate: func(r map[string]interface{}) { r["accountId"] = "other" }},
+		{name: "missing state", mutate: func(r map[string]interface{}) { delete(r, "state") }},
+		{name: "missing list", mutate: func(r map[string]interface{}) { delete(r, "list") }},
+		{name: "missing not found", mutate: func(r map[string]interface{}) { delete(r, "notFound") }},
+		{name: "non-empty not found", mutate: func(r map[string]interface{}) { r["notFound"] = []string{"missing"} }},
+		{name: "invalid id", mutate: func(r map[string]interface{}) {
+			r["list"] = []interface{}{map[string]interface{}{"id": "bad=", "email": "me@example.test"}}
+		}},
+		{name: "duplicate id", mutate: func(r map[string]interface{}) {
+			r["list"] = []interface{}{
+				map[string]interface{}{"id": "identity-1", "email": "me@example.test"},
+				map[string]interface{}{"id": "identity-1", "email": "other@example.test"},
+			}
+		}},
+		{name: "missing email", mutate: func(r map[string]interface{}) {
+			r["list"] = []interface{}{map[string]interface{}{"id": "identity-1"}}
+		}},
+		{name: "invalid email", mutate: func(r map[string]interface{}) {
+			r["list"] = []interface{}{map[string]interface{}{"id": "identity-1", "email": "Me <me@example.test>"}}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestJMAPServer(t)
+			s.rawResponses = true
+			s.handler = func(method string, _ map[string]interface{}) interface{} {
+				if method != "Identity/get" {
+					t.Fatalf("unexpected method %s", method)
+				}
+				response := map[string]interface{}{
+					"accountId": "a1", "state": "i1", "list": []interface{}{
+						map[string]interface{}{"id": "identity-1", "email": "me@example.test"},
+					}, "notFound": []interface{}{},
+				}
+				tt.mutate(response)
+				return response
+			}
+			b := s.backend(t)
+			if err := b.ensure(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := b.identityID(t.Context()); err == nil {
+				t.Fatal("malformed Identity/get response accepted")
+			}
+		})
+	}
+}
+
+func TestIdentityGetAcceptsEmptyState(t *testing.T) {
+	s := newTestJMAPServer(t)
+	s.handler = func(method string, _ map[string]interface{}) interface{} {
+		if method != "Identity/get" {
+			t.Fatalf("unexpected method %s", method)
+		}
+		return map[string]interface{}{
+			"accountId": "a1", "state": "", "list": []interface{}{
+				map[string]interface{}{"id": "identity-1", "email": "me@example.test"},
+			}, "notFound": []interface{}{},
+		}
+	}
+	b := s.backend(t)
+	if err := b.ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := b.identityID(t.Context()); err != nil || id != "identity-1" {
+		t.Fatalf("identityID() = %q, %v", id, err)
+	}
+}
+
+func TestIdentityGetSelectsMatchingWildcard(t *testing.T) {
+	s := newTestJMAPServer(t)
+	s.handler = func(method string, _ map[string]interface{}) interface{} {
+		if method != "Identity/get" {
+			t.Fatalf("unexpected method %s", method)
+		}
+		return map[string]interface{}{
+			"accountId": "a1", "state": "i1", "list": []interface{}{
+				map[string]interface{}{"id": "other", "email": "other@elsewhere.test"},
+				map[string]interface{}{"id": "wildcard", "email": "*@example.test"},
+			},
+		}
+	}
+	b := s.backend(t)
+	if err := b.ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := b.identityID(t.Context()); err != nil || got != "wildcard" {
+		t.Fatalf("identityID() = %q, %v, want wildcard", got, err)
+	}
+}
+
+func TestIdentityGetPrefersExactCaseCorrectLocalPart(t *testing.T) {
+	s := newTestJMAPServer(t)
+	s.handler = func(method string, _ map[string]interface{}) interface{} {
+		if method != "Identity/get" {
+			t.Fatalf("unexpected method %s", method)
+		}
+		return map[string]interface{}{
+			"accountId": "a1", "state": "i1", "list": []interface{}{
+				map[string]interface{}{"id": "wildcard", "email": "*@example.test"},
+				map[string]interface{}{"id": "wrong-case", "email": "Me@example.test"},
+				map[string]interface{}{"id": "exact", "email": "me@EXAMPLE.TEST"},
+			},
+		}
+	}
+	b := s.backend(t)
+	if err := b.ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := b.identityID(t.Context()); err != nil || got != "exact" {
+		t.Fatalf("identityID() = %q, %v, want exact", got, err)
+	}
+}
+
+func TestIdentityGetRejectsAmbiguousExactIdentities(t *testing.T) {
+	s := newTestJMAPServer(t)
+	s.handler = func(method string, _ map[string]interface{}) interface{} {
+		if method != "Identity/get" {
+			t.Fatalf("unexpected method %s", method)
+		}
+		return map[string]interface{}{
+			"accountId": "a1", "state": "i1", "list": []interface{}{
+				map[string]interface{}{"id": "first", "email": "me@example.test"},
+				map[string]interface{}{"id": "second", "email": "me@EXAMPLE.TEST"},
+			},
+		}
+	}
+	b := s.backend(t)
+	if err := b.ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.identityID(t.Context()); !errors.Is(err, errAmbiguousSubmissionIdentity) {
+		t.Fatalf("identityID() error = %v, want ambiguous identity", err)
+	}
+}
+
+func TestIdentityGetRejectsUnmatchedIdentities(t *testing.T) {
+	s := newTestJMAPServer(t)
+	s.handler = func(method string, _ map[string]interface{}) interface{} {
+		if method != "Identity/get" {
+			t.Fatalf("unexpected method %s", method)
+		}
+		return map[string]interface{}{
+			"accountId": "a1", "state": "i1", "list": []interface{}{
+				map[string]interface{}{"id": "other", "email": "other@elsewhere.test"},
+			},
+		}
+	}
+	b := s.backend(t)
+	if err := b.ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.identityID(t.Context()); !errors.Is(err, errNoSubmissionIdentity) {
+		t.Fatalf("identityID() error = %v, want errNoSubmissionIdentity", err)
 	}
 }

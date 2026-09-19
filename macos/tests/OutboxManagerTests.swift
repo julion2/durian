@@ -14,8 +14,9 @@ private class MockOutboxBackend: OutboxBackend {
 final class OutboxManagerTests: XCTestCase {
 
     private func makeEntry(id: Int64, subject: String) -> OutboxEntry {
-        OutboxEntry(id: id, subject: subject, to: "test@example.com",
-                    attempts: 0, last_error: nil, created_at: 1743868800)
+        OutboxEntry(id: id, message_id: nil, subject: subject, to: "test@example.com",
+                    attempts: 0, last_error: nil, created_at: 1743868800, in_flight: false,
+                    delivery_confirmed: false)
     }
 
     func testRefreshUpdatesPendingCount() async {

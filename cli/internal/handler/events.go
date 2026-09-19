@@ -27,7 +27,7 @@ type NewMailInfo struct {
 // OutboxUpdateEvent is broadcast over SSE when an outbox item changes status.
 type OutboxUpdateEvent struct {
 	ItemID  int64  `json:"item_id"`
-	Status  string `json:"status"` // "sent", "failed", "queued"
+	Status  string `json:"status"` // "sent", "failed", "queued", "reconciliation_required", "delivered_with_warning"
 	Error   string `json:"error,omitempty"`
 	Subject string `json:"subject,omitempty"`
 	To      string `json:"to,omitempty"`

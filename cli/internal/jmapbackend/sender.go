@@ -2,10 +2,12 @@ package jmapbackend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"net/mail"
 	"strings"
@@ -13,18 +15,29 @@ import (
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/mailsend"
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 var (
-	errNoDraftsMailbox       = errors.New("JMAP account has no drafts mailbox")
-	errSubmissionUnavailable = errors.New("JMAP mail submission is unavailable")
-	errNoSubmissionIdentity  = errors.New("JMAP account has no submission identity")
-	errInvalidAttachmentType = errors.New("invalid JMAP attachment type")
+	errSubmissionUnavailable       = errors.New("JMAP mail submission is unavailable")
+	errNoSubmissionIdentity        = errors.New("JMAP account has no submission identity")
+	errAmbiguousSubmissionIdentity = errors.New("JMAP account has multiple matching submission identities")
+	errEmailCreationOutcomeUnknown = errors.New("JMAP email creation outcome is unknown; automatic retry disabled")
+	errSubmissionOutcomeUnknown    = errors.New("JMAP submission outcome is unknown; automatic retry disabled")
+	errSentFilingFailed            = errors.New("JMAP delivery succeeded but Sent filing failed; automatic retry disabled")
+	errInvalidAttachmentType       = errors.New("invalid JMAP attachment type")
 )
 
 // Sender creates a structured JMAP Email and submits it for delivery.
 type Sender struct {
 	b *Backend
+}
+
+type createdEmail struct {
+	ID       string  `json:"id"`
+	BlobID   string  `json:"blobId"`
+	ThreadID string  `json:"threadId"`
+	Size     *uint64 `json:"size"`
 }
 
 // NewSender creates a JMAP submission sender for account.
@@ -430,26 +443,50 @@ func (b *Backend) sendStructured(ctx context.Context, draft map[string]interface
 
 	const emailCreateID = "e0"
 	var emailResult struct {
-		Created map[string]struct {
-			ID string `json:"id"`
-		} `json:"created"`
-		NotCreated map[string]methodError `json:"notCreated"`
+		setResponseState
+		AccountID  *string                 `json:"accountId"`
+		Created    map[string]createdEmail `json:"created"`
+		NotCreated map[string]methodError  `json:"notCreated"`
 	}
 	emailArgs := map[string]interface{}{
 		"accountId": b.client.accountID,
 		"create":    map[string]interface{}{emailCreateID: draft},
 	}
-	if err := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/set", emailArgs, &emailResult); err != nil {
-		return err
+	callErr := b.client.call(ctx, []string{coreCapability, mailCapability}, "Email/set", emailArgs, &emailResult)
+	if errors.Is(callErr, errJMAPLocalPermanent) {
+		return callErr
 	}
-	if createErr, ok := emailResult.NotCreated[emailCreateID]; ok {
-		return &createErr
+	var protocolErr *protocolError
+	if errors.As(callErr, &protocolErr) {
+		return fmt.Errorf("%w: %w", errEmailCreationOutcomeUnknown, callErr)
 	}
-	draftID := emailResult.Created[emailCreateID].ID
-	if draftID == "" {
-		return errors.New("email/set returned no created draft")
+	if err := validateResponseAccount("Email/set", b.client.accountID, emailResult.AccountID); err != nil {
+		if definiteMutationRejection(callErr) {
+			return callErr
+		}
+		if callErr != nil {
+			err = errors.Join(err, callErr)
+		}
+		return fmt.Errorf("%w: %w", errEmailCreationOutcomeUnknown, err)
 	}
-	return b.submitDraft(ctx, draftID, draftsID, sentID, identityID)
+	if err := validateSetResponseState("Email/set", emailResult.setResponseState); err != nil {
+		return fmt.Errorf("%w: %w", errEmailCreationOutcomeUnknown, err)
+	}
+	createErr, err := validateSingleOutcome("Email/set", emailCreateID, mapKeys(emailResult.Created), emailResult.NotCreated)
+	if err != nil {
+		if callErr != nil {
+			err = errors.Join(err, callErr)
+		}
+		return fmt.Errorf("%w: %w", errEmailCreationOutcomeUnknown, err)
+	}
+	if createErr != nil {
+		return createErr
+	}
+	created := emailResult.Created[emailCreateID]
+	if err := validateCreatedEmail("Email/set", created); err != nil {
+		return fmt.Errorf("%w: %w", errEmailCreationOutcomeUnknown, err)
+	}
+	return b.submitDraft(ctx, created.ID, draftsID, sentID, identityID)
 }
 
 func (b *Backend) sendRaw(ctx context.Context, raw []byte) error {
@@ -457,20 +494,20 @@ func (b *Backend) sendRaw(ctx context.Context, raw []byte) error {
 	if err != nil {
 		return err
 	}
-	ref, err := b.Append(ctx, draftsID, backend.Flags{}, raw)
+	ref, err := b.append(ctx, draftsID, backend.Flags{}, raw, true)
 	if err != nil {
 		return fmt.Errorf("import JMAP draft: %w", err)
 	}
-	return b.submitDraft(ctx, ref.ID, draftsID, sentID, identityID)
+	draftID, err := b.rawEmailID(ref.ID)
+	if err != nil {
+		return err
+	}
+	return b.submitDraft(ctx, draftID, draftsID, sentID, identityID)
 }
 
 func (b *Backend) prepareSubmission(ctx context.Context) (string, string, string, error) {
 	if err := b.loadMailboxes(ctx); err != nil {
 		return "", "", "", err
-	}
-	draftsID := b.mailboxIDForTag("draft")
-	if draftsID == "" {
-		return "", "", "", errNoDraftsMailbox
 	}
 	// Without a Sent mailbox there is nowhere to move the message to on success,
 	// and RFC 8621 forbids clearing its last mailbox — it would stay in Drafts,
@@ -486,6 +523,13 @@ func (b *Backend) prepareSubmission(ctx context.Context) (string, string, string
 			return "", "", "", errors.New("created JMAP sent mailbox could not be resolved")
 		}
 	}
+	// RFC 8621 does not require an account to have a Drafts-role mailbox. In
+	// that case create the temporary Email directly in Sent and clear only its
+	// $draft keyword after submission.
+	draftsID := b.mailboxIDForTag("draft")
+	if draftsID == "" {
+		draftsID = sentID
+	}
 	identityID, err := b.identityID(ctx)
 	if err != nil {
 		return "", "", "", err
@@ -496,9 +540,11 @@ func (b *Backend) prepareSubmission(ctx context.Context) (string, string, string
 func (b *Backend) submitDraft(ctx context.Context, draftID, draftsID, sentID, identityID string) error {
 	createID := "s0"
 	updatePatch := map[string]interface{}{
-		"keywords/$draft":        nil,
-		"mailboxIds/" + draftsID: nil,
-		"mailboxIds/" + sentID:   true,
+		"keywords/$draft":      nil,
+		"mailboxIds/" + sentID: true,
+	}
+	if draftsID != sentID {
+		updatePatch["mailboxIds/"+draftsID] = nil
 	}
 	args := map[string]interface{}{
 		"accountId": b.client.accountID,
@@ -513,22 +559,29 @@ func (b *Backend) submitDraft(ctx context.Context, draftID, draftsID, sentID, id
 		"#" + createID: updatePatch,
 	}
 	var result struct {
-		Created map[string]struct {
+		setResponseState
+		AccountID *string `json:"accountId"`
+		Created   map[string]struct {
 			ID string `json:"id"`
 		} `json:"created"`
 		NotCreated map[string]methodError `json:"notCreated"`
 	}
 	var updateResult struct {
-		Updated    map[string]interface{} `json:"updated"`
-		NotUpdated map[string]methodError `json:"notUpdated"`
+		setResponseState
+		AccountID  *string                    `json:"accountId"`
+		Updated    map[string]json.RawMessage `json:"updated"`
+		NotUpdated map[string]methodError     `json:"notUpdated"`
 	}
 	updateResponse := &methodResponseTarget{name: "Email/set", out: &updateResult}
-	// Every failure past this point leaves the created copy behind. The outbox
-	// retries a transient send, so without cleanup each attempt would add
-	// another draft to the user's Drafts mailbox.
+	// Clean up only after an explicit server rejection. Once the request has
+	// been sent, a transport or malformed-response failure is ambiguous: the
+	// submission may already be in flight, and deleting the Email does not
+	// cancel it. Such outcomes are preserved and classified as permanent below
+	// so the outbox cannot deliver a duplicate automatically.
 	submitted := false
+	cleanup := false
 	defer func() {
-		if submitted {
+		if submitted || !cleanup {
 			return
 		}
 		if err := b.destroyEmail(context.WithoutCancel(ctx), draftID); err != nil {
@@ -538,14 +591,41 @@ func (b *Backend) submitDraft(ctx context.Context, draftID, draftsID, sentID, id
 	}()
 
 	callErr := b.client.call(ctx, []string{coreCapability, mailCapability, submissionCapability}, "EmailSubmission/set", args, &result, updateResponse)
-	if createErr, ok := result.NotCreated[createID]; ok {
-		return &createErr
+	if errors.Is(callErr, errJMAPLocalPermanent) {
+		cleanup = true
+		return callErr
 	}
-	if _, ok := result.Created[createID]; !ok {
-		if callErr != nil {
+	var protocolErr *protocolError
+	if errors.As(callErr, &protocolErr) && protocolErr.primaryAmbiguous {
+		return fmt.Errorf("%w: %w", errSubmissionOutcomeUnknown, callErr)
+	}
+	if err := validateResponseAccount("EmailSubmission/set", b.client.accountID, result.AccountID); err != nil {
+		var methodErr *methodError
+		if callErr != nil && errors.As(callErr, &methodErr) && methodErr.Type != "serverPartialFail" {
+			cleanup = true
 			return callErr
 		}
-		return errors.New("EmailSubmission/set returned no created submission")
+		if callErr != nil {
+			err = errors.Join(err, callErr)
+		}
+		return fmt.Errorf("%w: %w", errSubmissionOutcomeUnknown, err)
+	}
+	createErr, outcomeErr := validateSingleOutcome("EmailSubmission/set", createID, mapKeys(result.Created), result.NotCreated)
+	if outcomeErr != nil {
+		if callErr != nil {
+			outcomeErr = errors.Join(outcomeErr, callErr)
+		}
+		return fmt.Errorf("%w: %w", errSubmissionOutcomeUnknown, outcomeErr)
+	}
+	if createErr != nil {
+		cleanup = true
+		return createErr
+	}
+	if err := validateSubmissionSetResponseState("EmailSubmission/set", result.setResponseState); err != nil {
+		return fmt.Errorf("%w: %w", errSubmissionOutcomeUnknown, err)
+	}
+	if !validJMAPID(result.Created[createID].ID) {
+		return fmt.Errorf("%w: EmailSubmission/set returned an invalid created submission", errSubmissionOutcomeUnknown)
 	}
 	// Once the submission exists, the message may already be irrevocably in
 	// flight. Never return a retryable send failure or destroy its source Email:
@@ -558,24 +638,51 @@ func (b *Backend) submitDraft(ctx context.Context, draftID, draftsID, sentID, id
 		filingErr = callErr
 	case !updateResponse.seen:
 		filingErr = errors.New("EmailSubmission/set returned no implicit Email/set response")
-	case updateResult.NotUpdated[draftID].Type != "":
-		setErr := updateResult.NotUpdated[draftID]
-		filingErr = &setErr
 	default:
-		if _, ok := updateResult.Updated[draftID]; !ok {
-			filingErr = errors.New("implicit Email/set did not update the submitted email")
+		if err := validateResponseAccount("Email/set", b.client.accountID, updateResult.AccountID); err != nil {
+			filingErr = err
+			break
+		}
+		setErr, err := validateSingleOutcome("Email/set", draftID, mapKeys(updateResult.Updated), updateResult.NotUpdated)
+		if err != nil {
+			filingErr = err
+		} else if setErr != nil {
+			filingErr = setErr
+		} else if stateErr := validateSubmissionSetResponseState("Email/set", updateResult.setResponseState); stateErr != nil {
+			filingErr = stateErr
+		} else if valueErr := validateUpdatedValue("implicit JMAP Email/set", draftID, updateResult.Updated[draftID]); valueErr != nil {
+			filingErr = valueErr
 		}
 	}
 	if filingErr != nil {
 		if err := b.updateEmail(context.WithoutCancel(ctx), draftID, updatePatch); err != nil {
 			slog.Warn("JMAP submission succeeded but Sent filing could not be repaired", "module", "JMAPBACKEND", // encgrep:allow remote id is operational metadata, not message content
 				"id", draftID, "err", err)
+			causes := errors.Join(
+				fmt.Errorf("implicit filing: %w", filingErr),
+				fmt.Errorf("repair: %w", err),
+			)
+			safeCauses := redact.ExternalError(causes, "JMAP Sent filing and repair failed: provider details "+redact.Placeholder)
+			return fmt.Errorf("%w: %w", errSentFilingFailed, safeCauses)
 		} else {
 			slog.Warn("Repaired JMAP Sent filing after implicit update failed", "module", "JMAPBACKEND", // encgrep:allow remote id is operational metadata, not message content
 				"id", draftID)
 		}
 	}
 	return nil
+}
+
+// Some JMAP servers omit oldState from EmailSubmission/set while still
+// returning newState and a complete, account-scoped per-object outcome. Durian
+// does not consume oldState when sending, so validate it only when present.
+func validateSubmissionSetResponseState(method string, state setResponseState) error {
+	if state.NewState == nil {
+		return fmt.Errorf("JMAP %s omitted required newState", method)
+	}
+	if state.OldState == nil {
+		return nil
+	}
+	return validateSetResponseState(method, state)
 }
 
 func (b *Backend) identityID(ctx context.Context) (string, error) {
@@ -587,24 +694,107 @@ func (b *Backend) identityID(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("%w: account capability missing", errSubmissionUnavailable)
 	}
 	var result struct {
-		List []struct {
-			ID    string `json:"id"`
-			Email string `json:"email"`
+		AccountID *string `json:"accountId"`
+		State     *string `json:"state"`
+		List      *[]struct {
+			ID    string  `json:"id"`
+			Email *string `json:"email"`
 		} `json:"list"`
+		NotFound *[]string `json:"notFound"`
 	}
 	args := map[string]interface{}{"accountId": b.client.accountID, "properties": []string{"id", "email"}}
 	if err := b.client.call(ctx, []string{coreCapability, submissionCapability}, "Identity/get", args, &result); err != nil {
 		return "", err
 	}
-	for _, identity := range result.List {
-		if strings.EqualFold(identity.Email, b.account.Email) {
-			return identity.ID, nil
+	if result.AccountID == nil || *result.AccountID != b.client.accountID || result.State == nil ||
+		result.List == nil || result.NotFound == nil || len(*result.NotFound) != 0 {
+		return "", errors.New("JMAP Identity/get returned an incomplete response")
+	}
+	seen := make(map[string]struct{}, len(*result.List))
+	exactID := ""
+	wildcardID := ""
+	wildcardMatches := 0
+	for _, identity := range *result.List {
+		if !validJMAPID(identity.ID) || identity.Email == nil {
+			return "", errors.New("JMAP Identity/get returned an incomplete identity")
+		}
+		if _, duplicate := seen[identity.ID]; duplicate {
+			return "", fmt.Errorf("JMAP Identity/get returned duplicate id %q", identity.ID)
+		}
+		seen[identity.ID] = struct{}{}
+		valid, match := identityEmailMatch(*identity.Email, b.account.Email)
+		if !valid {
+			return "", fmt.Errorf("JMAP Identity/get returned invalid email for %q", identity.ID)
+		}
+		switch match {
+		case identityExactMatch:
+			if exactID != "" {
+				return "", errAmbiguousSubmissionIdentity
+			}
+			exactID = identity.ID
+		case identityWildcardMatch:
+			wildcardMatches++
+			wildcardID = identity.ID
 		}
 	}
-	if len(result.List) == 0 {
-		return "", errNoSubmissionIdentity
+	if exactID != "" {
+		return exactID, nil
 	}
-	return result.List[0].ID, nil
+	if wildcardMatches == 1 {
+		return wildcardID, nil
+	}
+	if wildcardMatches > 1 {
+		return "", errAmbiguousSubmissionIdentity
+	}
+	return "", errNoSubmissionIdentity
+}
+
+type identityMatch int
+
+const (
+	identityNoMatch identityMatch = iota
+	identityWildcardMatch
+	identityExactMatch
+)
+
+func identityEmailMatch(identity, configured string) (valid bool, match identityMatch) {
+	wildcard := strings.HasPrefix(identity, "*@")
+	parsedValue := identity
+	if wildcard {
+		parsedValue = "wildcard" + identity[1:]
+	}
+	address, err := mail.ParseAddress(parsedValue)
+	if err != nil || address.Address != parsedValue {
+		return false, identityNoMatch
+	}
+	configuredAddress, err := mail.ParseAddress(configured)
+	if err != nil || configuredAddress.Address != configured {
+		return true, identityNoMatch
+	}
+	configuredAt := strings.LastIndexByte(configuredAddress.Address, '@')
+	identityAt := strings.LastIndexByte(parsedValue, '@')
+	if configuredAt <= 0 || identityAt <= 0 || !strings.EqualFold(parsedValue[identityAt+1:], configuredAddress.Address[configuredAt+1:]) {
+		return true, identityNoMatch
+	}
+	if wildcard {
+		return true, identityWildcardMatch
+	}
+	if parsedValue[:identityAt] == configuredAddress.Address[:configuredAt] {
+		return true, identityExactMatch
+	}
+	return true, identityNoMatch
+}
+
+func definiteMutationRejection(err error) bool {
+	var methodErr *methodError
+	return errors.As(err, &methodErr) && methodErr.Type != "serverPartialFail"
+}
+
+func validateCreatedEmail(method string, email createdEmail) error {
+	if !validJMAPID(email.ID) || !validJMAPID(email.BlobID) || !validJMAPID(email.ThreadID) || email.Size == nil {
+		return fmt.Errorf("%s returned an incomplete or invalid created Email", method)
+	}
+	return nil
 }
 
 func (b *Backend) mailboxIDForTag(tag string) string {
@@ -614,8 +804,18 @@ func (b *Backend) mailboxIDForTag(tag string) string {
 }
 
 func classifySendError(err error) error {
-	if errors.Is(err, errNoDraftsMailbox) || errors.Is(err, errSubmissionUnavailable) || errors.Is(err, errNoSubmissionIdentity) ||
-		errors.Is(err, errInvalidAttachmentType) {
+	if errors.Is(err, errEmailCreationOutcomeUnknown) || errors.Is(err, errSubmissionOutcomeUnknown) {
+		return &mailsend.Error{Kind: mailsend.KindAmbiguous, Err: err}
+	}
+	if errors.Is(err, errSentFilingFailed) {
+		return &mailsend.Error{Kind: mailsend.KindDeliveredWithWarning, Err: err}
+	}
+	if errors.Is(err, errSubmissionUnavailable) || errors.Is(err, errNoSubmissionIdentity) || errors.Is(err, errAmbiguousSubmissionIdentity) ||
+		errors.Is(err, errInvalidAttachmentType) || errors.Is(err, errJMAPLocalPermanent) {
+		return &mailsend.Error{Kind: mailsend.KindPermanent, Err: err}
+	}
+	var protocolErr *protocolError
+	if errors.As(err, &protocolErr) {
 		return &mailsend.Error{Kind: mailsend.KindPermanent, Err: err}
 	}
 	var statusErr *statusError
@@ -629,10 +829,14 @@ func classifySendError(err error) error {
 	var methodErr *methodError
 	if errors.As(err, &methodErr) {
 		kind := mailsend.KindPermanent
-		if methodErr.Type == "serverFail" || methodErr.Type == "serverPartialFail" || methodErr.Type == "rateLimit" {
+		if methodErr.Type == "serverFail" || methodErr.Type == "serverPartialFail" || methodErr.Type == "serverUnavailable" || methodErr.Type == "rateLimit" {
 			kind = mailsend.KindTransient
 		}
 		return &mailsend.Error{Kind: kind, Err: err}
 	}
-	return &mailsend.Error{Kind: mailsend.KindNetwork, Err: err}
+	var networkErr net.Error
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkErr) {
+		return &mailsend.Error{Kind: mailsend.KindNetwork, Err: err}
+	}
+	return &mailsend.Error{Kind: mailsend.KindPermanent, Err: err}
 }

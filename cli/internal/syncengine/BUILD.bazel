@@ -5,7 +5,9 @@ go_library(
     srcs = [
         "cursorstore.go",
         "engine.go",
+        "flags.go",
         "ingest.go",
+        "snapshot.go",
     ],
     importpath = "github.com/julion2/durian/cli/internal/syncengine",
     visibility = ["//cli:__subpackages__"],
@@ -25,7 +27,13 @@ go_test(
     srcs = [
         "capability_contract_test.go",
         "engine_test.go",
+        "flags_paging_test.go",
         "ingest_bcc_test.go",
+        "legacy_identity_test.go",
+        "snapshot_identity_test.go",
+        "snapshot_recovery_test.go",
+        "snapshot_test.go",
+        "sync_lock_test.go",
     ],
     embed = [":syncengine"],
     deps = [

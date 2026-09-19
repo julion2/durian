@@ -45,6 +45,12 @@ type gmailSendResponse struct {
 // threads the reply from the In-Reply-To / References headers the MIME already
 // carries, delivers Bcc recipients (see below), and auto-saves a Sent copy.
 func (s *Sender) Send(ctx context.Context, m *mailsend.Message) error {
+	return s.SendAfterPersist(ctx, m, func(string) error { return nil })
+}
+
+// SendAfterPersist creates a Gmail draft and durably records Gmail's normalized
+// Message-Id before drafts.send can deliver it.
+func (s *Sender) SendAfterPersist(ctx context.Context, m *mailsend.Message, persist func(string) error) error {
 	mime, err := smtp.FromMessage(m).Build()
 	if err != nil {
 		return &mailsend.Error{Kind: mailsend.KindPermanent, Err: fmt.Errorf("build message: %w", err)}
@@ -63,17 +69,39 @@ func (s *Sender) Send(ctx context.Context, m *mailsend.Message) error {
 		mime = append([]byte("Bcc: "+strings.Join(m.BCC, ", ")+"\r\n"), mime...)
 	}
 
-	body := map[string]string{"raw": base64.URLEncoding.EncodeToString(mime)}
-	var sent gmailSendResponse
-	if err := s.b.doJSON(ctx, http.MethodPost, s.b.baseURL+"/users/me/messages/send", body, &sent); err != nil {
+	body := map[string]any{"message": map[string]string{"raw": base64.URLEncoding.EncodeToString(mime)}}
+	var draft struct {
+		ID      string            `json:"id"`
+		Message gmailSendResponse `json:"message"`
+	}
+	if err := s.b.doJSON(ctx, http.MethodPost, s.b.baseURL+"/users/me/drafts", body, &draft); err != nil {
 		return classifyGmailSendError(err)
 	}
-
-	// Adopt the Message-ID Gmail actually stored so the local Sent row dedupes
-	// with the server's auto-saved Sent copy on the next sync (Gmail may rewrite
-	// the id). Best-effort: a lookup failure leaves our generated id in place.
-	if id := s.sentMessageID(ctx, sent.ID); id != "" {
-		m.MessageID = id
+	if draft.Message.ID == "" {
+		if err := s.b.doJSON(ctx, http.MethodGet, s.b.baseURL+"/users/me/drafts/"+url.PathEscape(draft.ID), nil, &draft); err != nil {
+			return classifyGmailSendError(err)
+		}
+	}
+	id := s.sentMessageID(ctx, draft.Message.ID)
+	if id == "" {
+		return &mailsend.Error{Kind: mailsend.KindTransient, Err: errors.New("gmail draft has no Message-Id")}
+	}
+	m.MessageID = id
+	if err := persist(id); err != nil {
+		return &mailsend.Error{Kind: mailsend.KindTransient, Err: fmt.Errorf("persist gmail Message-Id: %w", err)}
+	}
+	var sent gmailSendResponse
+	if err := s.b.doJSON(ctx, http.MethodPost, s.b.baseURL+"/users/me/drafts/send", map[string]string{"id": draft.ID}, &sent); err != nil {
+		var se *statusError
+		if !errors.As(err, &se) {
+			return &mailsend.Error{Kind: mailsend.KindAmbiguous, Err: err}
+		}
+		// drafts.send is irreversible. A 5xx may be emitted after Gmail
+		// accepted the draft, so an automatic retry could deliver twice.
+		if se.status >= 500 {
+			return &mailsend.Error{Kind: mailsend.KindAmbiguous, Err: err}
+		}
+		return classifyGmailSendError(err)
 	}
 	return nil
 }

@@ -37,9 +37,11 @@ var ProfileGraph = Capabilities{
 // mirroring. Unlike Gmail, JMAP persists $answered, so the flag three-way runs
 // unmodified.
 var ProfileJMAP = Capabilities{
-	PushWatch:          true,
-	FlagChangesInDelta: true,
-	LabelsAreTags:      true,
+	PushWatch:                      true,
+	BodyBatchLimit:                 4,
+	InitialSnapshotIsAuthoritative: true,
+	FlagChangesInDelta:             true,
+	LabelsAreTags:                  true,
 }
 
 // ProfileGmail is the Gmail API: delta-carried flag changes, labels as tags,

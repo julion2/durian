@@ -53,6 +53,11 @@ func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matc
 		slog.Warn("Message has no Message-ID, using synthetic ID", "module", "SYNC",
 			"uid", imapMsg.Uid, "mailbox", mailboxName, "synthetic_id", messageID)
 	}
+	releaseIngest, err := s.store.AcquireMessageIngest(s.accountName(), messageID)
+	if err != nil {
+		return "", err
+	}
+	defer releaseIngest()
 
 	storeMsg := StoreMessageFromContent(messageID, content, dateUnix, time.Now().Unix())
 	storeMsg.Mailbox = mailboxName
@@ -67,6 +72,7 @@ func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matc
 		storeMsg.SyntheticFingerprint = append([]byte(nil), fingerprint[:]...)
 	}
 	storeMsg.IngestPending = true
+	storeMsg.StartIngestOnConflict = !recoveredIdentity || !initialIngestComplete
 
 	if err := s.store.InsertMessage(storeMsg); err != nil {
 		if recoveredIdentity {
@@ -193,7 +199,7 @@ func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matc
 			slog.Debug("Applied filter rule", "module", "SYNC", "rule", rule.Name, "message_id", messageID)
 		}
 	}
-	if err := s.store.MarkMessageIngestComplete(storeMsg.ID); err != nil {
+	if err := s.store.MarkMessageIngestComplete(storeMsg.ID, storeMsg.IngestGeneration); err != nil {
 		return "", fmt.Errorf("complete message ingest: %w", err)
 	}
 	if recoveredIdentity {
