@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -176,6 +177,26 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 	if err != nil {
 		return fmt.Errorf("resolve account: %w", err)
 	}
+	accountKey := accountID
+	if msg.StableID != "" {
+		// Upgrade a legacy Message-ID-keyed row lazily when the stable backend
+		// sees it again. Requiring a matching (or empty) remote_ref avoids
+		// claiming the wrong row when duplicate Message-IDs were previously
+		// collapsed; the matching duplicate will claim it later in the page.
+		if _, err := tx.Exec(`UPDATE messages SET stable_id = ?
+			WHERE id = (
+				SELECT id FROM messages
+				WHERE message_id = ? AND IFNULL(account_id, 0) = ? AND stable_id = ''
+				  AND (remote_ref = '' OR remote_ref = ?)
+				ORDER BY CASE WHEN remote_ref = ? THEN 0 ELSE 1 END, id
+				LIMIT 1
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM messages WHERE stable_id = ? AND IFNULL(account_id, 0) = ?
+			)`, msg.StableID, msg.MessageID, accountKey, msg.RemoteRef, msg.RemoteRef, msg.StableID, accountKey); err != nil {
+			return fmt.Errorf("claim stable message identity: %w", err)
+		}
+	}
 
 	// Open configures BEGIN IMMEDIATE, so competing Durian processes serialize
 	// before this existence check even when mailbox and account are empty. This
@@ -183,9 +204,22 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 	// below overwrites them.
 	var existingID int64
 	var storedBaseline string
-	err = tx.QueryRow(`SELECT id, synced_flags FROM messages
-		WHERE message_id = ? AND IFNULL(account_id, 0) = ?`,
-		msg.MessageID, accountID).Scan(&existingID, &storedBaseline)
+	if msg.StableID != "" {
+		// A provider with stable identities may hold several objects sharing one
+		// Message-ID. Keying this on the Message-ID would match the first of
+		// them, report the second as already existing, and capture a before-image
+		// belonging to the wrong row — so the new object would silently skip its
+		// initial tags and its arrival notification. The claim above has already
+		// upgraded a legacy row to this stable id if one was eligible, so a miss
+		// here genuinely means "not stored yet".
+		err = tx.QueryRow(`SELECT id, synced_flags FROM messages
+			WHERE stable_id = ? AND IFNULL(account_id, 0) = ?`,
+			msg.StableID, accountKey).Scan(&existingID, &storedBaseline)
+	} else {
+		err = tx.QueryRow(`SELECT id, synced_flags FROM messages
+			WHERE message_id = ? AND IFNULL(account_id, 0) = ?`,
+			msg.MessageID, accountID).Scan(&existingID, &storedBaseline)
+	}
 	switch err {
 	case nil:
 	case sql.ErrNoRows:
@@ -247,7 +281,7 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 
 	err = tx.QueryRow(`
 		INSERT INTO messages (
-			message_id, thread_id, in_reply_to, refs, subject_ct,
+			stable_id, message_id, thread_id, in_reply_to, refs, subject_ct,
 			from_addr, to_addrs, cc_addrs, bcc_ct,
 			date, created_at,
 			body_text_ct, body_html_ct,
@@ -255,8 +289,8 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 			is_seen, is_flagged, is_deleted, flags_other,
 			uid, size, fetched_body,
 			remote_ref, synthetic_identity, synthetic_fingerprint_ct, ingest_pending, synced_flags
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(message_id, IFNULL(account_id, 0)) DO UPDATE SET
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT DO UPDATE SET
 			subject_ct = CASE WHEN excluded.fetched_body = 1
 			                  THEN excluded.subject_ct ELSE messages.subject_ct END,
 			from_addr = CASE WHEN excluded.fetched_body = 1
@@ -292,7 +326,7 @@ func (d *DB) insertMessageTx(tx *sql.Tx, msg *Message, createdResult *bool) erro
 			-- re-delivers a message after a server-side flag change would corrupt
 			-- the three-way merge and revert that change.
 		RETURNING id, ingest_pending`,
-		msg.MessageID, threadID, msg.InReplyTo, msg.Refs, subjectCT,
+		msg.StableID, msg.MessageID, threadID, msg.InReplyTo, msg.Refs, subjectCT,
 		msg.FromAddr, msg.ToAddrs, msg.CCAddrs, bccCT,
 		msg.Date, msg.CreatedAt,
 		bodyTextCT, bodyHTMLCT,
@@ -501,17 +535,86 @@ func (d *DB) BackfillUID(messageID, account string, uid uint32, mailbox string) 
 	return tx.Commit()
 }
 
-// GetByMessageID retrieves a message by its Message-ID header value.
+// GetByMessageID retrieves a message by its Message-ID header value. Stable
+// rows require an opaque identifier when the header is ambiguous; silently
+// selecting one would defeat their provider-native identity.
 func (d *DB) GetByMessageID(messageID string) (*Message, error) {
+	// Ambiguity is a property of the stored rows, not of their identity kind.
+	// Counting only stable rows would return the single stable match while an
+	// IMAP fallback row carrying the same RFC Message-ID sits beside it — the
+	// caller asked for that row and would silently receive the other object's
+	// body and attachments. A Message-ID lookup may only succeed when it
+	// identifies exactly one stored row.
+	rows, err := d.db.Query(`SELECT `+messageSelectColumns+`
+		`+messageSelectFrom+`
+		WHERE m.message_id = ? ORDER BY m.id LIMIT 2`, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("query rows by message_id: %w", err)
+	}
+	matches, err := d.scanMessages(rows)
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	switch len(matches) {
+	case 0:
+		return nil, nil
+	case 1:
+		return matches[0], nil
+	default:
+		return nil, fmt.Errorf("message-ID %q is ambiguous; use the opaque message identifier", messageID)
+	}
+}
+
+// GetByDBID retrieves one message by Durian's local row identity.
+func (d *DB) GetByDBID(id int64) (*Message, error) {
 	row := d.db.QueryRow(`SELECT `+messageSelectColumns+`
 		`+messageSelectFrom+`
-		WHERE m.message_id = ? LIMIT 1`, messageID)
+		WHERE m.id = ?`, id)
 	msg, err := d.scanMessageRow(row.Scan)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("get by message_id: %w", err)
+		return nil, fmt.Errorf("get by database id: %w", err)
+	}
+	return msg, nil
+}
+
+// GetByIdentifier accepts the opaque local:<rowid> identifier returned by the
+// HTTP API and, for backward compatibility, an RFC Message-ID.
+func (d *DB) GetByIdentifier(identifier string) (*Message, error) {
+	if rawID, ok := strings.CutPrefix(identifier, "local:"); ok {
+		id, err := strconv.ParseInt(rawID, 10, 64)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("invalid local message identifier %q", identifier)
+		}
+		return d.GetByDBID(id)
+	}
+	return d.GetByMessageID(identifier)
+}
+
+// GetByRemoteRef retrieves the message addressed by a provider ref within an
+// account and mailbox. The mailbox scope matters for IMAP, where UIDs are only
+// unique within one mailbox. Unknown names or refs return nil.
+func (d *DB) GetByRemoteRef(account, mailbox, remoteRef string) (*Message, error) {
+	if remoteRef == "" {
+		return nil, nil
+	}
+	if strings.EqualFold(mailbox, "INBOX") {
+		mailbox = "INBOX"
+	}
+	row := d.db.QueryRow(`SELECT `+messageSelectColumns+`
+		`+messageSelectFrom+`
+		WHERE m.account_id = (SELECT id FROM accounts WHERE name = ?)
+		  AND m.mailbox_id = (SELECT id FROM mailboxes WHERE name = ?)
+		  AND m.remote_ref = ? LIMIT 1`, account, mailbox, remoteRef)
+	msg, err := d.scanMessageRow(row.Scan)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get by remote ref: %w", err)
 	}
 	return msg, nil
 }
@@ -535,7 +638,9 @@ func (d *DB) GetAllByMessageID(messageID string) ([]*Message, error) {
 }
 
 // GetByThread retrieves all messages in a thread, ordered by date ascending.
-// When a message exists in multiple accounts, only the first row is kept.
+// Cross-account fallback rows for one RFC Message-ID are deduplicated. Rows
+// with provider-stable identity are always retained: Message-ID cannot prove
+// that two native objects, even across accounts, are the same message.
 func (d *DB) GetByThread(threadID string) ([]*Message, error) {
 	rows, err := d.db.Query(`SELECT `+messageSelectColumns+`
 		`+messageSelectFrom+`
@@ -551,15 +656,17 @@ func (d *DB) GetByThread(threadID string) ([]*Message, error) {
 		return nil, err
 	}
 
-	// Dedup: same message_id across accounts appears once in thread view.
-	// Arbitrary account is fine — tags are fetched separately and content is identical.
-	seen := make(map[string]bool, len(all))
+	seenAccount := make(map[string]string, len(all))
 	deduped := make([]*Message, 0, len(all))
 	for _, msg := range all {
-		if seen[msg.MessageID] {
+		if msg.StableID != "" {
+			deduped = append(deduped, msg)
 			continue
 		}
-		seen[msg.MessageID] = true
+		if account, seen := seenAccount[msg.MessageID]; seen && account != msg.Account {
+			continue
+		}
+		seenAccount[msg.MessageID] = msg.Account
 		deduped = append(deduped, msg)
 	}
 	return deduped, nil
@@ -607,6 +714,39 @@ func (d *DB) MessageExistsForAccount(messageID, account string) (bool, error) {
 		messageID, accountID).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("check message exists for account: %w", err)
+	}
+	return count > 0, nil
+}
+
+// MessageIdentityExistsForAccount checks the identity mode used by an incoming
+// message: a native stable id when present, otherwise its RFC Message-ID. A
+// stable message also matches the legacy fallback row that InsertMessage would
+// claim, so upgrading an existing JMAP row is not reported as a new arrival.
+func (d *DB) MessageIdentityExistsForAccount(stableID, messageID, remoteRef, account string) (bool, error) {
+	var accountID int64
+	err := d.db.QueryRow("SELECT id FROM accounts WHERE name = ?", account).Scan(&accountID)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lookup account id: %w", err)
+	}
+	var count int
+	if stableID != "" {
+		err = d.db.QueryRow(`SELECT COUNT(*) FROM messages
+			WHERE account_id = ? AND (
+				stable_id = ? OR (
+					stable_id = '' AND message_id = ?
+					AND (remote_ref = '' OR remote_ref = ?)
+				)
+			)`, accountID, stableID, messageID, remoteRef).Scan(&count)
+	} else {
+		err = d.db.QueryRow(
+			"SELECT COUNT(*) FROM messages WHERE stable_id = '' AND message_id = ? AND account_id = ?",
+			messageID, accountID).Scan(&count)
+	}
+	if err != nil {
+		return false, fmt.Errorf("check message identity for account: %w", err)
 	}
 	return count > 0, nil
 }
@@ -694,6 +834,19 @@ func (d *DB) DeleteByMessageIDAndAccount(messageID, account string) error {
 	return nil
 }
 
+// DeleteByDBID deletes exactly one local message row.
+func (d *DB) DeleteByDBID(id int64) error {
+	result, err := d.db.Exec("DELETE FROM messages WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("delete message row: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("message row not found: %d", id)
+	}
+	return nil
+}
+
 // FolderFlagRow is one message's flag-sync state within a folder: its
 // provider handle (RemoteRef), the last-synced flag baseline
 // (SyncedFlags, comma-joined IMAP-style flag string) and its current
@@ -759,7 +912,7 @@ func (d *DB) GetFolderFlagState(account, mailbox string) ([]FolderFlagRow, error
 		if err := rows.Scan(&rowID, &msgID, &remoteRef, &storedSyncedFlags, &isSeen, &isFlagged, &tag); err != nil {
 			return nil, fmt.Errorf("scan folder flag row: %w", err)
 		}
-		if n := len(result); n == 0 || result[n-1].MessageID != msgID {
+		if n := len(result); n == 0 || result[n-1].RowID != rowID {
 			syncedFlags, initialized := decodeSyncedFlags(storedSyncedFlags)
 			result = append(result, FolderFlagRow{
 				RowID:                  rowID,
@@ -799,6 +952,25 @@ func (d *DB) SetSyncedFlags(messageID, account, syncedFlags string) error {
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
 		return fmt.Errorf("message not found: %s (account %s)", messageID, account)
+	}
+	return nil
+}
+
+// SetSyncedFlagsByDBID updates one row without relying on a duplicable
+// Message-ID. Provider-engine reconciliation should prefer this method.
+func (d *DB) SetSyncedFlagsByDBID(id int64, syncedFlags string) error {
+	// Same sentinel encoding as SetSyncedFlags. Writing the raw value would
+	// store an initialized-but-empty baseline as "", which decodeSyncedFlags
+	// reads back as "never initialized" — the distinction the flag reconciler
+	// depends on to tell a legitimately empty before-image from a missing one.
+	result, err := d.db.Exec("UPDATE messages SET synced_flags = ? WHERE id = ?",
+		encodeSyncedFlags(syncedFlags), id)
+	if err != nil {
+		return fmt.Errorf("set synced flags by row: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("message row not found: %d", id)
 	}
 	return nil
 }
@@ -845,10 +1017,37 @@ func (d *DB) SetSyncedLabels(messageID, account, syncedLabels string) error {
 	return nil
 }
 
+// GetSyncedLabelsByDBID returns one row's label baseline.
+func (d *DB) GetSyncedLabelsByDBID(id int64) (string, error) {
+	var labels string
+	err := d.db.QueryRow("SELECT synced_labels FROM messages WHERE id = ?", id).Scan(&labels)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get synced labels by row: %w", err)
+	}
+	return labels, nil
+}
+
+// SetSyncedLabelsByDBID updates one row's label baseline.
+func (d *DB) SetSyncedLabelsByDBID(id int64, syncedLabels string) error {
+	result, err := d.db.Exec("UPDATE messages SET synced_labels = ? WHERE id = ?", syncedLabels, id)
+	if err != nil {
+		return fmt.Errorf("set synced labels by row: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("message row not found: %d", id)
+	}
+	return nil
+}
+
 // LabelStateRow is one message's label-upload state: its durable Message-ID,
 // the provider ref to modify, the last-synced label baseline, and the current
 // local tags. Used by the label three-way upload (Gmail/JMAP).
 type LabelStateRow struct {
+	RowID        int64
 	MessageID    string
 	RemoteRef    string
 	SyncedLabels string
@@ -871,7 +1070,7 @@ func (d *DB) GetLabelState(account string) ([]LabelStateRow, error) {
 	// LEFT JOIN so a message with no tags still yields a row (its empty local
 	// state matters to the three-way). ORDER BY m.id groups a message's tags.
 	rows, err := d.db.Query(`
-		SELECT m.message_id, m.remote_ref, m.synced_labels, IFNULL(t.tag, '')
+		SELECT m.id, m.message_id, m.remote_ref, m.synced_labels, IFNULL(t.tag, '')
 		FROM messages m
 		LEFT JOIN tags t ON t.message_id = m.id
 		WHERE m.account_id = ? AND m.remote_ref != ''
@@ -883,12 +1082,14 @@ func (d *DB) GetLabelState(account string) ([]LabelStateRow, error) {
 
 	result := []LabelStateRow{}
 	for rows.Next() {
+		var rowID int64
 		var msgID, remoteRef, syncedLabels, tag string
-		if err := rows.Scan(&msgID, &remoteRef, &syncedLabels, &tag); err != nil {
+		if err := rows.Scan(&rowID, &msgID, &remoteRef, &syncedLabels, &tag); err != nil {
 			return nil, fmt.Errorf("scan label state row: %w", err)
 		}
-		if n := len(result); n == 0 || result[n-1].MessageID != msgID {
+		if n := len(result); n == 0 || result[n-1].RowID != rowID {
 			result = append(result, LabelStateRow{
+				RowID:        rowID,
 				MessageID:    msgID,
 				RemoteRef:    remoteRef,
 				SyncedLabels: syncedLabels,
@@ -988,7 +1189,7 @@ const messageSelectColumns = `m.id, m.message_id, m.thread_id, m.in_reply_to, m.
 		m.body_text_ct, m.body_html_ct,
 		mb.name_ct, ac.name_ct,
 		m.is_seen, m.is_flagged, m.is_deleted, m.flags_other,
-		m.uid, m.size, m.fetched_body, m.remote_ref, m.synthetic_identity,
+		m.uid, m.size, m.fetched_body, m.remote_ref, m.stable_id, m.synthetic_identity,
 		m.synthetic_fingerprint_ct, m.ingest_pending`
 
 const messageSelectFrom = `FROM messages m
@@ -1010,7 +1211,8 @@ func (d *DB) scanMessageRow(scan func(...any) error) (*Message, error) {
 		&bodyTextCT, &bodyHTMLCT,
 		&mailboxNameCT, &accountNameCT,
 		&isSeen, &isFlagged, &isDeleted, &flagsOtherCT,
-		&msg.UID, &msg.Size, &fetchedBody, &msg.RemoteRef, &syntheticIdentity, &syntheticFingerprintCT, &ingestPending,
+		&msg.UID, &msg.Size, &fetchedBody, &msg.RemoteRef, &msg.StableID,
+		&syntheticIdentity, &syntheticFingerprintCT, &ingestPending,
 	); err != nil {
 		return nil, err
 	}

@@ -242,3 +242,45 @@ func TestModifyFlagTagsIfUnchanged_MissingRowIsNoOp(t *testing.T) {
 		t.Errorf("unknown account wrote tags to existing row: %v", tags)
 	}
 }
+
+func TestModifyFlagTagsIfUnchangedByDBIDScopesSameAccountDuplicates(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	first := &Message{
+		StableID: "cas-first", MessageID: "cas-duplicate@x", Date: now, CreatedAt: now,
+		Mailbox: "ALL", Account: "work", RemoteRef: "cas-first",
+	}
+	second := &Message{
+		StableID: "cas-second", MessageID: first.MessageID, Date: now, CreatedAt: now,
+		Mailbox: "ALL", Account: "work", RemoteRef: "cas-second",
+	}
+	mustInsertMessage(t, db, first)
+	mustInsertMessage(t, db, second)
+	mustAddTag(t, db, first.ID, "unread")
+	mustAddTag(t, db, second.ID, "unread", "flagged")
+
+	applied, err := db.ModifyFlagTagsIfUnchangedByDBID(second.ID,
+		flagWatch, []string{"unread", "flagged"},
+		[]string{"replied"}, []string{"flagged"})
+	if err != nil {
+		t.Fatalf("modify second duplicate: %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want exact second-row snapshot to match")
+	}
+
+	firstTags, err := db.GetMessageTags(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(firstTags, []string{"unread"}) {
+		t.Errorf("first duplicate tags = %v, want [unread]", firstTags)
+	}
+	secondTags, err := db.GetMessageTags(second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(secondTags, []string{"replied", "unread"}) {
+		t.Errorf("second duplicate tags = %v, want [replied unread]", secondTags)
+	}
+}

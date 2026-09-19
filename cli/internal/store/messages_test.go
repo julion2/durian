@@ -54,6 +54,133 @@ func TestInsertAndGetMessage(t *testing.T) {
 	}
 }
 
+func TestStableIdentityKeepsDuplicateMessageIDsDistinct(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	first := &Message{
+		StableID: "email-1", MessageID: "duplicate@example.com", Subject: "First",
+		Date: now, CreatedAt: now, Mailbox: "ALL", Account: "work", RemoteRef: "email-1",
+	}
+	second := &Message{
+		StableID: "email-2", MessageID: "duplicate@example.com", Subject: "Second",
+		Date: now + 1, CreatedAt: now + 1, Mailbox: "ALL", Account: "work", RemoteRef: "email-2",
+	}
+	if err := db.InsertMessage(first); err != nil {
+		t.Fatalf("insert first: %v", err)
+	}
+	if err := db.InsertMessage(second); err != nil {
+		t.Fatalf("insert second: %v", err)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("duplicate Message-IDs collapsed to row %d", first.ID)
+	}
+	if _, err := db.GetByMessageID(first.MessageID); err == nil {
+		t.Fatal("ambiguous stable Message-ID selected an arbitrary row")
+	}
+	thread, err := db.GetByThread(first.ThreadID)
+	if err != nil || len(thread) != 2 {
+		t.Fatalf("thread rows = %d, err=%v; want 2", len(thread), err)
+	}
+	if err := db.SetSyncedFlagsByDBID(first.ID, `\Seen`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetSyncedLabelsByDBID(second.ID, "project"); err != nil {
+		t.Fatal(err)
+	}
+	flagRows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil || len(flagRows) != 2 {
+		t.Fatalf("flag rows = %+v, err=%v", flagRows, err)
+	}
+	byRef := make(map[string]FolderFlagRow, len(flagRows))
+	for _, row := range flagRows {
+		byRef[row.RemoteRef] = row
+	}
+	if byRef["email-1"].SyncedFlags != `\Seen` || byRef["email-2"].SyncedFlags != "" {
+		t.Fatalf("row-specific flags = %+v", byRef)
+	}
+	labelRows, err := db.GetLabelState("work")
+	if err != nil || len(labelRows) != 2 {
+		t.Fatalf("label rows = %+v, err=%v", labelRows, err)
+	}
+	for _, row := range labelRows {
+		if row.RemoteRef == "email-2" && row.SyncedLabels != "project" {
+			t.Errorf("second label baseline = %q", row.SyncedLabels)
+		}
+	}
+	if err := db.DeleteByDBID(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := db.GetByRemoteRef("work", "ALL", "email-2")
+	if err != nil || remaining == nil || remaining.ID != second.ID {
+		t.Fatalf("second row after deleting first = %+v, err=%v", remaining, err)
+	}
+}
+
+func TestGetByRemoteRefScopesIMAPUIDToMailbox(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	inbox := &Message{
+		MessageID: "inbox@example.com", Date: now, CreatedAt: now,
+		Mailbox: "INBOX", Account: "work", RemoteRef: "1",
+	}
+	archive := &Message{
+		MessageID: "archive@example.com", Date: now, CreatedAt: now,
+		Mailbox: "Archive", Account: "work", RemoteRef: "1",
+	}
+	if err := db.InsertMessage(inbox); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessage(archive); err != nil {
+		t.Fatal(err)
+	}
+	gotInbox, err := db.GetByRemoteRef("work", "INBOX", "1")
+	if err != nil || gotInbox == nil || gotInbox.ID != inbox.ID {
+		t.Fatalf("inbox ref = %+v, err=%v", gotInbox, err)
+	}
+	gotLowercaseInbox, err := db.GetByRemoteRef("work", "inbox", "1")
+	if err != nil || gotLowercaseInbox == nil || gotLowercaseInbox.ID != inbox.ID {
+		t.Fatalf("lowercase inbox ref = %+v, err=%v", gotLowercaseInbox, err)
+	}
+	gotArchive, err := db.GetByRemoteRef("work", "Archive", "1")
+	if err != nil || gotArchive == nil || gotArchive.ID != archive.ID {
+		t.Fatalf("archive ref = %+v, err=%v", gotArchive, err)
+	}
+	gotEmpty, err := db.GetByRemoteRef("work", "INBOX", "")
+	if err != nil || gotEmpty != nil {
+		t.Fatalf("empty ref = %+v, err=%v; want nil", gotEmpty, err)
+	}
+}
+
+func TestStableIdentityClaimsMatchingLegacyRow(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	legacy := &Message{
+		MessageID: "legacy@example.com", Subject: "Legacy", Date: now, CreatedAt: now,
+		Mailbox: "ALL", Account: "work", RemoteRef: "email-1",
+	}
+	if err := db.InsertMessage(legacy); err != nil {
+		t.Fatal(err)
+	}
+	exists, err := db.MessageIdentityExistsForAccount("email-1", legacy.MessageID, legacy.RemoteRef, legacy.Account)
+	if err != nil || !exists {
+		t.Fatalf("stable identity did not recognize claimable legacy row: exists=%v err=%v", exists, err)
+	}
+	stable := &Message{
+		StableID: "email-1", MessageID: legacy.MessageID, Subject: "Hydrated", Date: now,
+		CreatedAt: now, Mailbox: "ALL", Account: "work", RemoteRef: "email-1",
+	}
+	if err := db.InsertMessage(stable); err != nil {
+		t.Fatal(err)
+	}
+	if stable.ID != legacy.ID {
+		t.Fatalf("stable identity created row %d instead of claiming legacy row %d", stable.ID, legacy.ID)
+	}
+	claimed, err := db.GetByDBID(legacy.ID)
+	if err != nil || claimed == nil || claimed.StableID != "email-1" {
+		t.Fatalf("claimed row = %+v, err=%v", claimed, err)
+	}
+}
+
 func TestSyntheticIdentityProvenanceRoundTrip(t *testing.T) {
 	db := newTestDB(t)
 	generated := &Message{
@@ -1036,10 +1163,11 @@ func TestUpsert_CrossAccount(t *testing.T) {
 		t.Errorf("got %d rows, want 2 (one per account)", count)
 	}
 
-	// GetByMessageID returns one (LIMIT 1)
-	msg, _ := db.GetByMessageID("cross@x")
-	if msg == nil {
-		t.Fatal("GetByMessageID returned nil")
+	// Two accounts hold this Message-ID and the lookup takes no account, so it
+	// cannot name one of them. Returning either — as it used to, with LIMIT 1 —
+	// hands the caller a row it did not ask for.
+	if _, err := db.GetByMessageID("cross@x"); err == nil {
+		t.Error("GetByMessageID picked one of two accounts instead of reporting ambiguity")
 	}
 	candidates, err := db.GetAllByMessageID("cross@x")
 	if err != nil {
@@ -1055,24 +1183,53 @@ func TestGetByThread_Dedup(t *testing.T) {
 	now := time.Now().Unix()
 
 	// Same message in two accounts → same thread
-	db.InsertMessage(&Message{
+	work := &Message{
 		MessageID: "td-root@x", Subject: "Thread dedup",
 		FromAddr: "a@x", Date: now, CreatedAt: now, FetchedBody: true,
 		Account: "work",
-	})
-	db.InsertMessage(&Message{
+	}
+	if err := db.InsertMessage(work); err != nil {
+		t.Fatalf("insert work: %v", err)
+	}
+	if err := db.InsertMessage(&Message{
 		MessageID: "td-root@x", Subject: "Thread dedup",
 		FromAddr: "a@x", Date: now, CreatedAt: now, FetchedBody: true,
 		Account: "personal",
-	})
+	}); err != nil {
+		t.Fatalf("insert personal: %v", err)
+	}
 
-	root, _ := db.GetByMessageID("td-root@x")
-	msgs, err := db.GetByThread(root.ThreadID)
+	// Read the thread id off the insert: a Message-ID shared by two accounts is
+	// ambiguous by design, and this test is about the thread, not the lookup.
+	msgs, err := db.GetByThread(work.ThreadID)
 	if err != nil {
 		t.Fatalf("get by thread: %v", err)
 	}
 	if len(msgs) != 1 {
 		t.Errorf("got %d messages, want 1 (dedup across accounts)", len(msgs))
+	}
+}
+
+func TestGetByThreadDoesNotDedupStableObjectsAcrossAccounts(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	work := &Message{
+		StableID: "work-email", MessageID: "stable-cross-account@x", Subject: "Stable objects",
+		FromAddr: "a@x", Date: now, CreatedAt: now, FetchedBody: true, Account: "work",
+	}
+	personal := &Message{
+		StableID: "personal-email", MessageID: work.MessageID, Subject: work.Subject,
+		FromAddr: "a@x", Date: now, CreatedAt: now, FetchedBody: true, Account: "personal",
+	}
+	if err := db.InsertMessage(work); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessage(personal); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := db.GetByThread(work.ThreadID)
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("stable thread rows = %d, err=%v; want both provider objects", len(msgs), err)
 	}
 }
 
@@ -1101,5 +1258,156 @@ func TestDeleteByMessageIDAndAccount(t *testing.T) {
 	db.db.QueryRow("SELECT COUNT(*) FROM messages WHERE message_id = ?", "del-acct@x").Scan(&count)
 	if count != 1 {
 		t.Errorf("got %d rows after delete, want 1", count)
+	}
+}
+
+// TestMixedStableAndFallbackIdentityIsAmbiguous covers the store that a real
+// multi-account setup produces: a JMAP object carrying a stable id beside an
+// IMAP row that has none, both holding the same RFC Message-ID.
+//
+// Ambiguity here is a property of the stored rows, not of their identity kind.
+// Resolving to the single stable row would hand the caller the wrong object's
+// body and attachments whenever it meant the IMAP one — and the IMAP row would
+// have no working Message-ID lookup at all. Both must stay reachable by their
+// row id, and the raw lookup must refuse to guess.
+func TestMixedStableAndFallbackIdentityIsAmbiguous(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+
+	stable := &Message{
+		StableID: "jmap-obj", MessageID: "mixed@example.com", Subject: "From JMAP",
+		Date: now, CreatedAt: now, Mailbox: "ALL", Account: "work",
+		RemoteRef: "jmap-obj", FetchedBody: true, BodyText: "jmap body",
+	}
+	fallback := &Message{
+		MessageID: "mixed@example.com", Subject: "From IMAP",
+		Date: now + 1, CreatedAt: now + 1, Mailbox: "INBOX", Account: "personal",
+		RemoteRef: "42", FetchedBody: true, BodyText: "imap body",
+	}
+	if err := db.InsertMessage(stable); err != nil {
+		t.Fatalf("insert stable: %v", err)
+	}
+	if err := db.InsertMessage(fallback); err != nil {
+		t.Fatalf("insert fallback: %v", err)
+	}
+	if stable.ID == fallback.ID {
+		t.Fatalf("both identities collapsed to row %d", stable.ID)
+	}
+
+	if _, err := db.GetByMessageID("mixed@example.com"); err == nil {
+		t.Error("raw Message-ID lookup resolved a shared id instead of reporting ambiguity")
+	}
+
+	// Each row still has to be reachable by its own identity, or the ambiguity
+	// guard would just have made the messages unopenable.
+	gotStable, err := db.GetByDBID(stable.ID)
+	if err != nil || gotStable == nil {
+		t.Fatalf("get stable row: %+v err=%v", gotStable, err)
+	}
+	if gotStable.BodyText != "jmap body" {
+		t.Errorf("stable row body = %q, want the JMAP object's", gotStable.BodyText)
+	}
+	gotFallback, err := db.GetByDBID(fallback.ID)
+	if err != nil || gotFallback == nil {
+		t.Fatalf("get fallback row: %+v err=%v", gotFallback, err)
+	}
+	if gotFallback.BodyText != "imap body" {
+		t.Errorf("fallback row body = %q, want the IMAP row's", gotFallback.BodyText)
+	}
+}
+
+// TestUpsertReportsSecondStableObjectAsCreated covers the interaction between
+// stable identities and the created/before-image detection. The detection used
+// to key on (Message-ID, account), which matches the FIRST object when a
+// provider holds several sharing one Message-ID: the second would be reported
+// as already stored, so its initial tags would never be seeded and its arrival
+// would not be announced, while the before-image captured belonged to the other
+// row entirely.
+func TestUpsertReportsSecondStableObjectAsCreated(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+
+	first := &Message{
+		StableID: "obj-1", MessageID: "shared@example.com", Subject: "First",
+		Date: now, CreatedAt: now, Mailbox: "ALL", Account: "work", RemoteRef: "obj-1",
+		SyncedFlags: `\Seen`, SyncedFlagsInitialized: true,
+	}
+	created, err := db.UpsertMessageWithInitialTags(first, []string{"inbox"})
+	if err != nil {
+		t.Fatalf("upsert first: %v", err)
+	}
+	if !created {
+		t.Fatal("first object: created = false, want true")
+	}
+
+	second := &Message{
+		StableID: "obj-2", MessageID: "shared@example.com", Subject: "Second",
+		Date: now + 1, CreatedAt: now + 1, Mailbox: "ALL", Account: "work", RemoteRef: "obj-2",
+		SyncedFlags: "", SyncedFlagsInitialized: true,
+	}
+	created, err = db.UpsertMessageWithInitialTags(second, []string{"inbox", "unread"})
+	if err != nil {
+		t.Fatalf("upsert second: %v", err)
+	}
+	if !created {
+		t.Fatal("second object: created = false — the Message-ID it shares with the first is not its identity")
+	}
+	if first.ID == second.ID {
+		t.Fatalf("both objects landed on row %d", first.ID)
+	}
+
+	// The seeding is the visible consequence: a row reported as existing skips
+	// it, and nothing later puts those tags back.
+	tags, err := db.GetMessageTags(second.ID)
+	if err != nil {
+		t.Fatalf("get tags: %v", err)
+	}
+	if !slices.Contains(tags, "unread") {
+		t.Errorf("second object tags = %v, want the initial tags seeded", tags)
+	}
+}
+
+// TestSetSyncedFlagsByDBIDKeepsEmptyBaselineInitialized guards the row-addressed
+// setter against the same ambiguity SetSyncedFlags encodes around: an
+// initialized-but-empty baseline stored raw reads back as "never initialized",
+// which sends the reconciler down the legacy seeding path on a row whose
+// emptiness is the truth.
+func TestSetSyncedFlagsByDBIDKeepsEmptyBaselineInitialized(t *testing.T) {
+	db := newTestDB(t)
+	now := time.Now().Unix()
+
+	msg := &Message{
+		StableID: "obj-empty", MessageID: "empty-baseline@example.com", Subject: "Empty",
+		Date: now, CreatedAt: now, Mailbox: "ALL", Account: "work", RemoteRef: "obj-empty",
+		SyncedFlags: `\Seen`, SyncedFlagsInitialized: true,
+	}
+	if _, err := db.UpsertMessage(msg); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	// The server clears every flag: a real, initialized, empty baseline.
+	if err := db.SetSyncedFlagsByDBID(msg.ID, ""); err != nil {
+		t.Fatalf("set synced flags: %v", err)
+	}
+
+	rows, err := db.GetFolderFlagState("work", "ALL")
+	if err != nil {
+		t.Fatalf("flag state: %v", err)
+	}
+	var found bool
+	for _, row := range rows {
+		if row.RowID != msg.ID {
+			continue
+		}
+		found = true
+		if row.SyncedFlags != "" {
+			t.Errorf("baseline = %q, want empty", row.SyncedFlags)
+		}
+		if !row.SyncedFlagsInitialized {
+			t.Error("baseline reads as uninitialized after an explicit empty write")
+		}
+	}
+	if !found {
+		t.Fatalf("row %d missing from folder flag state", msg.ID)
 	}
 }

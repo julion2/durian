@@ -46,8 +46,72 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 29 {
-		t.Errorf("version = %d, want 29", version)
+	if version != 30 {
+		t.Errorf("version = %d, want 30", version)
+	}
+}
+
+func TestMigrateV29AddsProviderNativeState(t *testing.T) {
+	db := newTestDB(t)
+	seed := &Message{
+		MessageID: "v29@example.com", Subject: "preserved", Date: 1, CreatedAt: 1,
+		Mailbox: "INBOX", Account: "work", BCCAddrs: "blind@example.com",
+		SyntheticIdentity: true, SyntheticFingerprint: []byte("fingerprint"), IngestPending: true,
+	}
+	if err := db.InsertMessage(seed); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, stmt := range []string{
+		"DROP TABLE provider_tag_mutations",
+		"DROP INDEX idx_messages_stableid_acctid_uniq",
+		"DROP INDEX idx_messages_msgid_fallback_acctid_uniq",
+		"ALTER TABLE messages DROP COLUMN stable_id",
+		`CREATE UNIQUE INDEX idx_messages_msgid_acctid_uniq
+			ON messages(message_id, IFNULL(account_id, 0))`,
+		"UPDATE schema_version SET version = 29 WHERE rowid = 1",
+	} {
+		if _, err := db.db.Exec(stmt); err != nil {
+			t.Fatalf("prepare v29 schema: %v\nstmt: %s", err, stmt)
+		}
+	}
+
+	if err := db.Init(); err != nil {
+		t.Fatalf("migrate v29→v30: %v", err)
+	}
+	var version int
+	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 30 {
+		t.Fatalf("version = %d, want 30", version)
+	}
+	hasStableID, err := hasColumn(db.db, "messages", "stable_id")
+	if err != nil || !hasStableID {
+		t.Fatalf("stable_id present = %t, err=%v", hasStableID, err)
+	}
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM provider_tag_mutations").Scan(new(int)); err != nil {
+		t.Fatalf("provider mutation table missing: %v", err)
+	}
+	preserved, err := db.GetByMessageID(seed.MessageID)
+	if err != nil || preserved == nil {
+		t.Fatalf("preserved row = %+v, err=%v", preserved, err)
+	}
+	if preserved.BCCAddrs != seed.BCCAddrs || !preserved.SyntheticIdentity ||
+		string(preserved.SyntheticFingerprint) != string(seed.SyntheticFingerprint) || !preserved.IngestPending {
+		t.Fatalf("v29 fields changed during migration: %+v", preserved)
+	}
+
+	first := &Message{StableID: "email-1", MessageID: "duplicate@example.com", Account: "work"}
+	second := &Message{StableID: "email-2", MessageID: first.MessageID, Account: first.Account}
+	if err := db.InsertMessage(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessage(second); err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("stable duplicates collapsed to row %d", first.ID)
 	}
 }
 
@@ -112,8 +176,8 @@ func TestMigrateV27MarksLegacySyntheticCandidateWithoutClaimingProvenance(t *tes
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 29 {
-		t.Fatalf("version = %d, want 29", version)
+	if version != 30 {
+		t.Fatalf("version = %d, want 30", version)
 	}
 }
 
@@ -498,8 +562,8 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 29 {
-		t.Fatalf("version = %d, want 29", version)
+	if version != 30 {
+		t.Fatalf("version = %d, want 30", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).

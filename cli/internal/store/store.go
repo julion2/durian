@@ -1236,6 +1236,45 @@ func (d *DB) migrate() error {
 		}
 	}
 
+	if version < 30 {
+		// A JMAP Email.id is immutable and unique within an account, while an RFC
+		// Message-ID is optional, duplicable, and sender-controlled. Keep the
+		// latter as message metadata and fallback identity, but let capable
+		// backends key rows by their native stable id. Partial unique indexes let
+		// both identity modes coexist without collapsing duplicate Message-IDs.
+		has, err := hasColumn(d.db, "messages", "stable_id")
+		if err != nil {
+			return fmt.Errorf("migrate v29→v30 inspect stable_id: %w", err)
+		}
+		if !has {
+			if _, err := d.db.Exec("ALTER TABLE messages ADD COLUMN stable_id TEXT NOT NULL DEFAULT ''"); err != nil {
+				return fmt.Errorf("migrate v29→v30 add stable_id: %w", err)
+			}
+		}
+		stmts := []string{
+			`DROP INDEX IF EXISTS idx_messages_msgid_acctid_uniq`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_stableid_acctid_uniq
+				ON messages(stable_id, IFNULL(account_id, 0)) WHERE stable_id != ''`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_msgid_fallback_acctid_uniq
+				ON messages(message_id, IFNULL(account_id, 0)) WHERE stable_id = ''`,
+			`CREATE TABLE IF NOT EXISTS provider_tag_mutations (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				message_db_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+				tag TEXT NOT NULL,
+				action TEXT NOT NULL CHECK(action IN ('add', 'remove')),
+				created_at INTEGER NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_provider_tag_mutations_message
+				ON provider_tag_mutations(message_db_id, id)`,
+			`UPDATE schema_version SET version = 30 WHERE rowid = 1`,
+		}
+		for _, stmt := range stmts {
+			if _, err := d.db.Exec(stmt); err != nil {
+				return fmt.Errorf("migrate v29→v30: %w", err)
+			}
+		}
+	}
+
 	return nil
 }
 
