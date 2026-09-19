@@ -634,6 +634,30 @@ func TestEngineReconcilesReplacementFullSnapshot(t *testing.T) {
 	}
 }
 
+func TestEngineRejectsDuplicateRefsAcrossReplacementPages(t *testing.T) {
+	db := newTestDB(t)
+	cursors := newMemCursorStore()
+	_ = cursors.Set(testAccount, "ALL", backend.Cursor("old"))
+	ref := backend.RemoteRef{Folder: "ALL", ID: "duplicate"}
+	fake := newFakeBackend([]backend.Folder{{Name: "ALL", Selectable: true}}, map[string][]backend.FetchResult{
+		"ALL": {
+			{Cursor: backend.Cursor("page-1"), HasMore: true, FullSnapshot: true, Present: []backend.RemoteRef{ref}},
+			{Cursor: backend.Cursor("final"), FullSnapshot: true, Present: []backend.RemoteRef{ref}},
+		},
+	})
+
+	result, err := newTestEngine(db, cursors).Sync(t.Context(), fake)
+	if err != nil {
+		t.Fatalf("Sync returned top-level error: %v", err)
+	}
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "duplicate ref") {
+		t.Fatalf("Sync errors = %v, want duplicate replacement ref error", result.Errors)
+	}
+	if got, _ := cursors.Get(testAccount, "ALL"); string(got) != "old" {
+		t.Fatalf("cursor advanced to %q", got)
+	}
+}
+
 func TestEngineReplacementPreservesDistinctSyntheticRowsAndTags(t *testing.T) {
 	db := newTestDB(t)
 	ingestOptions := IngestOptions{
