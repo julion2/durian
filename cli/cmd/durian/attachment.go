@@ -20,10 +20,11 @@ import (
 )
 
 var attachmentCmd = &cobra.Command{
-	Use:   "attachment <message-id>",
+	Use:   "attachment <message-identifier>",
 	Short: "List or download attachments",
 	Long:  "List attachments for a message, or download a specific part with --save.",
-	Example: `  durian attachment msg-id@example.com
+	Example: `  durian attachment local:42
+  durian attachment msg-id@example.com
   durian attachment msg-id@example.com --account work --save 1
   durian attachment msg-id@example.com --save 1 --output ~/Downloads/`,
 	Args: cobra.ExactArgs(1),
@@ -47,7 +48,7 @@ func init() {
 }
 
 func runAttachment(cmd *cobra.Command, args []string) error {
-	messageID := normalizeMessageReference(args[0])
+	identifier := strings.TrimSpace(args[0])
 
 	emailDB, err := openEmailDB()
 	if err != nil {
@@ -55,7 +56,7 @@ func runAttachment(cmd *cobra.Command, args []string) error {
 	}
 	defer emailDB.Close()
 
-	msg, err := resolveAttachmentMessage(emailDB, cfg, messageID, attachAccount)
+	msg, err := resolveAttachmentMessage(emailDB, cfg, identifier, attachAccount)
 	if err != nil {
 		return err
 	}
@@ -207,7 +208,19 @@ func normalizeMessageReference(ref string) string {
 	return strings.TrimSuffix(ref, ">")
 }
 
-func resolveAttachmentMessage(emailDB *store.DB, cfg *config.Config, messageID, accountIdentifier string) (*store.Message, error) {
+func resolveAttachmentMessage(emailDB *store.DB, cfg *config.Config, identifier, accountIdentifier string) (*store.Message, error) {
+	identifier = strings.TrimSpace(identifier)
+	if strings.HasPrefix(identifier, "local:") {
+		message, err := emailDB.GetByIdentifier(identifier)
+		if err != nil {
+			return nil, fmt.Errorf("resolve message: %w", err)
+		}
+		if message == nil {
+			return nil, fmt.Errorf("message %q not found in store", identifier)
+		}
+		return message, nil
+	}
+	messageID := normalizeMessageReference(identifier)
 	messages, err := emailDB.GetAllByMessageID(messageID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve message: %w", err)
@@ -221,24 +234,39 @@ func resolveAttachmentMessage(emailDB *store.DB, cfg *config.Config, messageID, 
 		if err != nil {
 			return nil, fmt.Errorf("account %q not found in config", accountIdentifier)
 		}
+		var matches []*store.Message
 		for _, message := range messages {
 			if strings.EqualFold(message.Account, account.AccountIdentifier()) {
-				return message, nil
+				matches = append(matches, message)
 			}
 		}
-		return nil, fmt.Errorf("message %q was not found in account %q", messageID, account.GetAliasOrName())
+		switch len(matches) {
+		case 0:
+			return nil, fmt.Errorf("message %q was not found in account %q", messageID, account.GetAliasOrName())
+		case 1:
+			return matches[0], nil
+		default:
+			return nil, fmt.Errorf("message %q is ambiguous in account %q; use an opaque local: identifier", messageID, account.GetAliasOrName())
+		}
 	}
 
 	if len(messages) > 1 {
-		accounts := make([]string, 0, len(messages))
+		accountSet := make(map[string]struct{}, len(messages))
 		for _, message := range messages {
 			name := message.Account
 			if account, err := cfg.GetAccountByIdentifier(message.Account); err == nil {
 				name = account.GetAliasOrName()
 			}
-			accounts = append(accounts, name)
+			accountSet[name] = struct{}{}
+		}
+		accounts := make([]string, 0, len(accountSet))
+		for account := range accountSet {
+			accounts = append(accounts, account)
 		}
 		sort.Strings(accounts)
+		if len(accounts) == 1 {
+			return nil, fmt.Errorf("message %q is ambiguous in account %q; use an opaque local: identifier", messageID, accounts[0])
+		}
 		return nil, fmt.Errorf("message %q exists in multiple accounts (%s); add --account", messageID, strings.Join(accounts, ", "))
 	}
 	return messages[0], nil

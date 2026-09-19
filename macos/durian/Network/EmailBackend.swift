@@ -727,8 +727,11 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
     // MARK: - Attachment Download
 
     func downloadAttachment(messageId: String, partId: Int) async throws -> (Data, String) {
-        // Message IDs contain <, >, @, + which must be percent-encoded
-        guard let encodedId = messageId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+        // Encode one path segment. In particular, RFC Message-IDs may contain
+        // slashes, percent signs, and plus signs that must not affect routing.
+        var pathSegmentAllowed = CharacterSet.alphanumerics
+        pathSegmentAllowed.insert(charactersIn: "-._~")
+        guard let encodedId = messageId.addingPercentEncoding(withAllowedCharacters: pathSegmentAllowed) else {
             throw AttachmentError.parseError
         }
         guard let url = URL(string: "\(baseURL)/messages/\(encodedId)/attachments/\(partId)") else {

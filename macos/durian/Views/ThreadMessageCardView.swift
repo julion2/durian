@@ -574,8 +574,13 @@ struct ThreadMessageCardView: View {
                 detailRow(label: "Tags", value: tags.joined(separator: ", "))
             }
 
-            // Message-ID (from message)
-            detailRow(label: "Message-ID", value: message.id)
+            // Message-ID (from message). Stable provider rows use an opaque
+            // local: identifier for actions; never present that as RFC metadata.
+            if let messageId = message.message_id {
+                detailRow(label: "Message-ID", value: messageId)
+            } else if !message.id.hasPrefix("local:") {
+                detailRow(label: "Message-ID", value: message.id)
+            }
         }
         .padding(.leading, 52)
         .padding(.top, 8)

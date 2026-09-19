@@ -20,12 +20,17 @@ import (
 
 // mockFetcher implements AttachmentFetcher for testing.
 type mockFetcher struct {
-	data []byte
+	data      []byte
+	dataByUID map[uint32][]byte
 }
 
 func (m *mockFetcher) FetchAttachment(_ context.Context, _, _ string,
-	_ uint32, _, _, _ string, _ int, w io.Writer) error {
-	_, err := w.Write(m.data)
+	uid uint32, _, _, _ string, _ int, w io.Writer) error {
+	data := m.data
+	if uidData, ok := m.dataByUID[uid]; ok {
+		data = uidData
+	}
+	_, err := w.Write(data)
 	return err
 }
 
@@ -556,6 +561,65 @@ func TestStoreDownloadAttachment(t *testing.T) {
 	// Verify body streamed from fetcher
 	if w.Body.String() != "fake-pdf-bytes" {
 		t.Errorf("Body = %q, want fake-pdf-bytes", w.Body.String())
+	}
+}
+
+func TestStoreDownloadAttachmentUsesOpaqueIdentifier(t *testing.T) {
+	db := newTestStore(t)
+	now := time.Now().Unix()
+	first := &store.Message{
+		StableID: "email-1", MessageID: "duplicate@example.com", Subject: "First",
+		FromAddr: "a@test", ToAddrs: "b@test", Account: "work", Mailbox: "ALL",
+		UID: 41, Date: now, CreatedAt: now, FetchedBody: true,
+	}
+	second := &store.Message{
+		StableID: "email-2", MessageID: "duplicate@example.com", Subject: "Second",
+		FromAddr: "a@test", ToAddrs: "b@test", Account: "work", Mailbox: "ALL",
+		UID: 42, Date: now + 1, CreatedAt: now + 1, FetchedBody: true,
+	}
+	for _, message := range []*store.Message{first, second} {
+		if err := db.InsertMessage(message); err != nil {
+			t.Fatalf("insert %s: %v", message.StableID, err)
+		}
+	}
+	for _, attachment := range []*store.Attachment{
+		{MessageDBID: first.ID, PartID: 1, Filename: "first.pdf", ContentType: "application/pdf", Size: 10},
+		{MessageDBID: second.ID, PartID: 1, Filename: "second.txt", ContentType: "text/plain", Size: 20},
+	} {
+		if err := db.InsertAttachment(attachment); err != nil {
+			t.Fatalf("insert attachment %q: %v", attachment.Filename, err)
+		}
+	}
+
+	h := New(db, nil)
+	h.SetFetcher(&mockFetcher{dataByUID: map[uint32][]byte{
+		41: []byte("first payload"),
+		42: []byte("second payload"),
+	}})
+	for _, test := range []struct {
+		message  *store.Message
+		filename string
+		mimeType string
+		payload  string
+	}{
+		{message: first, filename: "first.pdf", mimeType: "application/pdf", payload: "first payload"},
+		{message: second, filename: "second.txt", mimeType: "text/plain", payload: "second payload"},
+	} {
+		w := httptest.NewRecorder()
+		identifier := "local:" + strconv.FormatInt(test.message.ID, 10)
+		if err := h.DownloadAttachment(identifier, 1, w); err != nil {
+			t.Fatalf("DownloadAttachment(%q): %v", identifier, err)
+		}
+		if got := w.Header().Get("Content-Type"); got != test.mimeType {
+			t.Errorf("DownloadAttachment(%q) Content-Type = %q, want %q", identifier, got, test.mimeType)
+		}
+		wantDisposition := `attachment; filename="` + test.filename + `"`
+		if got := w.Header().Get("Content-Disposition"); got != wantDisposition {
+			t.Errorf("DownloadAttachment(%q) Content-Disposition = %q, want %q", identifier, got, wantDisposition)
+		}
+		if got := w.Body.String(); got != test.payload {
+			t.Errorf("DownloadAttachment(%q) payload = %q, want %q", identifier, got, test.payload)
+		}
 	}
 }
 

@@ -140,6 +140,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	}
 
 	r := mux.NewRouter()
+	r.UseEncodedPath()
 	addr := fmt.Sprintf("127.0.0.1:%d", servePort)
 	allowedHost := fmt.Sprintf("localhost:%d", servePort)
 	allowedHostIP := fmt.Sprintf("127.0.0.1:%d", servePort)

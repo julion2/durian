@@ -167,7 +167,7 @@ Item {
                 implicitHeight: card.implicitHeight
 
                 property bool isOwn: profileModel ? profileModel.isOwnEmail(modelData.from || "") : false
-                property string msgId: modelData.message_id || modelData.id || ""
+                property string msgId: modelData.id || modelData.message_id || ""
 
                 Rectangle {
                     id: card
