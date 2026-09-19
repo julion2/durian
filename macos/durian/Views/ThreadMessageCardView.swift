@@ -613,7 +613,7 @@ struct ThreadMessageCardView: View {
     private var reactionMenu: some View {
         Menu {
             ForEach(EmailSendingManager.reactionOptions) { option in
-                Button("\(option.label) \(option.emoji)") {
+                Button(option.emoji) {
                     Task {
                         await sendingManager.sendReaction(
                             messageId: message.id,
