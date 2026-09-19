@@ -53,7 +53,14 @@ jobs:
         run: |
           # Format-checks the BUILD/MODULE/.bzl files actually tracked in
           # git. -r would also walk .bazelbsp/ (tool-generated, gitignored).
-          go install github.com/bazelbuild/buildtools/buildifier@latest
+          #
+          # Pinned to the buildifier v8.5.1 commit. @latest resolves to a
+          # revision whose go.mod does not require golang.org/x/sys, so Go
+          # picks the newest one, which needs go >= 1.26 and fails against
+          # the go 1.25 toolchain from cli/go.mod. The v8.5.1 tag itself is
+          # not installable — buildtools has no /v8 module path — so the
+          # commit's pseudo-version is the pin.
+          go install github.com/bazelbuild/buildtools/buildifier@v0.0.0-20260128144711-f6a198225003
           tracked=$(git ls-files '*.bzl' '*.bazel' 'BUILD' 'WORKSPACE' 'MODULE.bazel')
           if [ -z "$tracked" ]; then
             echo "no Bazel files to check"; exit 0
