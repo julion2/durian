@@ -202,8 +202,7 @@ func (d *DB) DeferOutboxItem(id int64, sendAfter int64, lastErr string) error {
 	return requireOutboxTransition(result, id, "defer outbox item")
 }
 
-// PoisonOutboxItem marks an item as permanently failed and releases any
-// deduplication key so the user can retry it as a new outbox item.
+// PoisonOutboxItem marks an item as permanently failed by setting attempts to 5.
 func (d *DB) PoisonOutboxItem(id int64, reason string) error {
 	result, err := d.db.Exec(
 		"UPDATE outbox SET attempts = 5, last_error = ?, in_flight = 0 WHERE id = ? AND in_flight = 1 AND delivery_confirmed = 0",
