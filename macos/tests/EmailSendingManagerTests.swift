@@ -3,6 +3,48 @@ import XCTest
 
 final class EmailSendingManagerTests: XCTestCase {
 
+    func testReactionPaletteMatchesServerAllowlistAndHasAccessibleLabels() {
+        XCTAssertEqual(EmailSendingManager.reactionOptions.map(\.emoji), ["\u{1F44D}", "\u{2764}\u{FE0F}", "\u{1F602}", "\u{1F62E}", "\u{1F622}"])
+        XCTAssertTrue(EmailSendingManager.reactionOptions.allSatisfy { !$0.label.isEmpty })
+        XCTAssertEqual(Set(EmailSendingManager.reactionOptions.map(\.id)).count, EmailSendingManager.reactionOptions.count)
+    }
+
+    func testReactionReconciliationRecognizesTerminalOutboxStates() {
+        let pending = OutboxEntry(
+            id: 1, message_id: nil, subject: "Re: Hi", to: "to@test",
+            attempts: 1, last_error: nil, created_at: 1, in_flight: false, delivery_confirmed: false
+        )
+        let claimed = OutboxEntry(
+            id: 4, message_id: nil, subject: "Re: Hi", to: "to@test",
+            attempts: 1, last_error: nil, created_at: 1, in_flight: true, delivery_confirmed: false
+        )
+        let poisoned = OutboxEntry(
+            id: 2, message_id: nil, subject: "Re: Hi", to: "to@test",
+            attempts: 5, last_error: "failed", created_at: 1, in_flight: false, delivery_confirmed: false
+        )
+        let delivered = OutboxEntry(
+            id: 5, message_id: nil, subject: "Re: Hi", to: "to@test",
+            attempts: 1, last_error: nil, created_at: 1, in_flight: true, delivery_confirmed: true
+        )
+        XCTAssertFalse(EmailSendingManager.isReactionTerminal(itemId: 1, outbox: [pending]))
+        // A claimed item is still being delivered; its palette entry stays disabled.
+        XCTAssertFalse(EmailSendingManager.isReactionTerminal(itemId: 4, outbox: [claimed]))
+        XCTAssertTrue(EmailSendingManager.isReactionTerminal(itemId: 2, outbox: [poisoned]))
+        XCTAssertTrue(EmailSendingManager.isReactionTerminal(itemId: 5, outbox: [delivered]))
+        XCTAssertTrue(EmailSendingManager.isReactionTerminal(itemId: 3, outbox: [pending]))
+    }
+
+    func testReactionCountdownOmitsUnknownRecipientPlaceholder() {
+        XCTAssertEqual(
+            EmailSendingManager.countdownMessage(kind: "reaction", secondsLeft: 10, recipient: ""),
+            "Sending reaction in 10s..."
+        )
+        XCTAssertEqual(
+            EmailSendingManager.countdownMessage(kind: "reaction", secondsLeft: 10, recipient: "reply@test"),
+            "Sending reaction in 10s to reply@test..."
+        )
+    }
+
     // MARK: - Idempotency
 
     func testSendRetriesReuseDraftIdempotencyKey() {

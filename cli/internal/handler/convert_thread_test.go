@@ -220,6 +220,104 @@ func TestConvertThread_AllFieldsMapped(t *testing.T) {
 	}
 }
 
+func TestShowThreadOffersReactionsWithoutIndexedReplyTo(t *testing.T) {
+	// Provider-native rows are never collapsed across accounts, so one thread
+	// can show the same message twice, each with its own opaque identifier.
+	// Eligibility no longer depends on an indexed Reply-To: the engine never
+	// backfills that marker for messages it synced before the reaction feature
+	// existed, and the reaction endpoint resolves it on demand instead. A
+	// draft has no one to react to and stays out.
+	db := newTestStore(t)
+	for _, account := range []string{"work", "personal"} {
+		if err := db.InsertMessage(&store.Message{
+			StableID: "email-" + account, MessageID: "shared@test", Subject: "Shared",
+			FromAddr: "sender@test", Account: account, Date: 1, CreatedAt: 1, BodyText: "same",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := db.GetAllByMessageID("shared@test")
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("rows = %d, err = %v", len(rows), err)
+	}
+	byAccount := map[string]*store.Message{}
+	for _, row := range rows {
+		byAccount[row.Account] = row
+	}
+	// Only one row has the marker, exactly as a partially migrated store does.
+	if err := db.InsertHeader(byAccount["work"].ID, "reply-to", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	response := New(db, nil).ShowThread(rows[0].ThreadID)
+	if !response.OK || len(response.Thread.Messages) != 2 {
+		t.Fatalf("response = %+v", response)
+	}
+	for _, message := range response.Thread.Messages {
+		if message.ID != "local:"+strconv.FormatInt(byAccount[message.Account].ID, 10) {
+			t.Fatalf("identifier %q does not address the %s row", message.ID, message.Account)
+		}
+		if !message.CanReact {
+			t.Fatalf("%s row is not reactable", message.Account)
+		}
+	}
+
+	// A draft is written by the user, so it offers no palette.
+	draft := seedThreadMessage(t, db, &store.Message{
+		MessageID: "draft@test", Subject: "Draft", FromAddr: "me@test",
+		Account: "work", Date: 2, CreatedAt: 2, BodyText: "unsent",
+	})
+	if err := db.AddTag(draft.ID, "draft"); err != nil {
+		t.Fatal(err)
+	}
+	draftResponse := New(db, nil).ShowThread(draft.ThreadID)
+	if !draftResponse.OK || len(draftResponse.Thread.Messages) != 1 {
+		t.Fatalf("draft response = %+v", draftResponse)
+	}
+	if draftResponse.Thread.Messages[0].CanReact {
+		t.Fatal("a draft must not be reactable")
+	}
+}
+
+func TestShowThreadWithoutSendingAccountIsNotReactable(t *testing.T) {
+	// A row with no account has no credentials to send from, and one with no
+	// sender has no reply recipient to derive. Either way the server would
+	// refuse, so the palette must not promise otherwise.
+	db := newTestStore(t)
+	accountless := seedThreadMessage(t, db, &store.Message{
+		MessageID: "accountless@test", Subject: "Orphan", FromAddr: "sender@test",
+		Date: 1, CreatedAt: 1, BodyText: "no account",
+	})
+	senderless := seedThreadMessage(t, db, &store.Message{
+		MessageID: "senderless@test", Subject: "Anonymous", Account: "work",
+		Date: 1, CreatedAt: 1, BodyText: "no sender",
+	})
+	for _, row := range []*store.Message{accountless, senderless} {
+		response := New(db, nil).ShowThread(row.ThreadID)
+		if !response.OK || len(response.Thread.Messages) != 1 {
+			t.Fatalf("response for %s = %+v", row.MessageID, response)
+		}
+		if response.Thread.Messages[0].CanReact {
+			t.Fatalf("%s is reactable without an account or sender", row.MessageID)
+		}
+	}
+}
+
+func TestShowThreadMarksLocallyStoredReaction(t *testing.T) {
+	db := newTestStore(t)
+	message := seedThreadMessage(t, db, &store.Message{
+		MessageID: "reaction@test", Subject: "Re: Hello", FromAddr: "me@test",
+		Account: "work", Date: 1, CreatedAt: 1, BodyText: "\U0001F44D",
+	})
+	if err := db.InsertHeader(message.ID, "content-disposition", "reaction"); err != nil {
+		t.Fatal(err)
+	}
+	response := New(db, nil).ShowThread(message.ThreadID)
+	if !response.OK || len(response.Thread.Messages) != 1 || !response.Thread.Messages[0].IsReaction {
+		t.Fatalf("reaction response = %+v", response)
+	}
+}
+
 // --- Quote stripping is applied ---
 
 func TestConvertThread_StripsQuotedHTML(t *testing.T) {
@@ -464,9 +562,16 @@ func TestConvertThread_LightOmitsHTMLAndReplyHeaders(t *testing.T) {
 		BodyText: "plain body",
 		BodyHTML: "<p>html body</p>",
 		Mailbox:  "INBOX",
+		Account:  "work",
 	})
 
 	m, _ := db.GetByMessageID("light@test")
+	if err := db.InsertHeader(m.ID, "reply-to", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertHeader(m.ID, "content-disposition", "reaction"); err != nil {
+		t.Fatal(err)
+	}
 	msgs, _ := db.GetByThread(m.ThreadID)
 	h := New(db, nil)
 
@@ -490,6 +595,9 @@ func TestConvertThread_LightOmitsHTMLAndReplyHeaders(t *testing.T) {
 	}
 	if msg.References != "" {
 		t.Errorf("References should be empty in light mode, got %q", msg.References)
+	}
+	if !msg.IsReaction || !msg.CanReact {
+		t.Errorf("light mode reaction metadata = isReaction %v, canReact %v", msg.IsReaction, msg.CanReact)
 	}
 }
 

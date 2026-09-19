@@ -292,6 +292,56 @@ RESP=$(curl -sf "${AUTH[@]}" "$BASE/outbox")
 assert_jq "GET /outbox is array" "$RESP" 'type == "array"'
 
 # ─────────────────────────────────────────────
+# 10b. Reactions (RFC 9078 emoji replies)
+# ─────────────────────────────────────────────
+# A reaction addresses one exact stored row by its opaque identifier. The
+# server derives the account, reply recipient and threading metadata from that
+# row, so the client sends only an emoji.
+RESP=$(curl -sf "${AUTH[@]}" -X POST -H "Content-Type: application/json" \
+    -d '{"emoji":"👍","idempotency_key":"integration-reaction-1"}' \
+    "$BASE/messages/$FIRST_MESSAGE_ID/reactions")
+assert_jq "POST /messages/{id}/reactions .ok is true" "$RESP" '.ok == true'
+assert_jq "POST /messages/{id}/reactions .id is number" "$RESP" '.id | type == "number"'
+assert_jq "POST /messages/{id}/reactions .send_after is number" "$RESP" '.send_after | type == "number"'
+assert_jq "POST /messages/{id}/reactions derives the reply recipient" "$RESP" '.recipient == "<alice@example.com>"'
+
+REACTION_ID=$(echo "$RESP" | jq -r '.id')
+
+# Replaying one action must return the same queued row, never a second emoji.
+RESP=$(curl -sf "${AUTH[@]}" -X POST -H "Content-Type: application/json" \
+    -d '{"emoji":"👍","idempotency_key":"integration-reaction-1"}' \
+    "$BASE/messages/$FIRST_MESSAGE_ID/reactions")
+assert_jq "POST /messages/{id}/reactions replay is idempotent" "$RESP" ".id == $REACTION_ID"
+
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/outbox")
+assert_jq "GET /outbox holds one queued reaction" "$RESP" \
+    "[.[] | select(.id == $REACTION_ID)] | length == 1"
+
+assert_http_code "POST reactions rejects an emoji outside the palette" \
+    "$BASE/messages/$FIRST_MESSAGE_ID/reactions" "POST" "400" '{"emoji":"🔥"}'
+assert_http_code "POST reactions rejects an unknown message" \
+    "$BASE/messages/local:999999/reactions" "POST" "404" '{"emoji":"👍"}'
+# A legacy IMAP row has neither an indexed Reply-To nor a provider handle to
+# fetch one with, so the server cannot resolve a reply recipient on demand.
+assert_http_code "POST reactions rejects an unfetchable Reply-To" \
+    "$BASE/messages/$DUPLICATE_MESSAGE_ID/reactions" "POST" "409" '{"emoji":"👍"}'
+
+curl -sf "${AUTH[@]}" -X DELETE "$BASE/outbox/$REACTION_ID" > /dev/null
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/outbox")
+assert_jq "DELETE /outbox/{id} undoes the queued reaction" "$RESP" \
+    "[.[] | select(.id == $REACTION_ID)] | length == 0"
+
+# Eligibility is a property of the row, not of its indexed headers: both
+# duplicate rows offer a palette even though only one carries a Reply-To
+# marker, and the server resolves the recipient when the reaction is posted.
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/threads/$THREAD_ID")
+assert_jq "GET /threads/{id} reports per-row reaction eligibility" "$RESP" '
+    [.thread.messages[] | select(.message_id == "msg1@test")] as $duplicates |
+    ($duplicates | length) == 2 and
+    all($duplicates[]; .can_react) and
+    all($duplicates[]; .is_reaction != true)'
+
+# ─────────────────────────────────────────────
 # 11. Calendar (read-only, from the seeded vdir)
 # ─────────────────────────────────────────────
 RESP=$(curl -sf "${AUTH[@]}" "$BASE/calendars?account=test")

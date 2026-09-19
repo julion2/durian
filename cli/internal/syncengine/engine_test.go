@@ -692,6 +692,46 @@ func TestIngestDoesNotPromoteUnprovenLegacyDuplicate(t *testing.T) {
 	}
 }
 
+func TestIngestRecordsAbsentReplyToAsIndexed(t *testing.T) {
+	db := newTestDB(t)
+	message := backend.Message{
+		MessageID: "reply-marker@example.com",
+		Ref:       backend.RemoteRef{Folder: "INBOX", ID: "reply-marker"},
+		Raw:       rawMessage("reply-marker@example.com", "a@example.com", testAccount, "Marker", "body"),
+	}
+	_, rowID, _, err := Ingest(db, message, "INBOX", backend.RoleInbox, IngestOptions{Account: testAccount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An absent Reply-To must still be recorded, so a reaction can tell "this
+	// message replies to From" from "this message's headers were never read".
+	if has, err := db.HasHeader(rowID, "reply-to"); err != nil || !has {
+		t.Fatalf("Reply-To marker = %v, %v", has, err)
+	}
+	if has, err := db.HasHeader(rowID, "content-disposition"); err != nil || !has {
+		t.Fatalf("Content-Disposition marker = %v, %v", has, err)
+	}
+}
+
+func TestIngestIndexesIncomingRFC9078Reaction(t *testing.T) {
+	db := newTestDB(t)
+	raw := rawMessage("reaction@example.com", "a@example.com", testAccount, "Re: Hello", "\U0001F44D")
+	raw = bytes.Replace(raw, []byte("MIME-Version: 1.0\r\n"), []byte("MIME-Version: 1.0\r\nContent-Disposition: reaction\r\n"), 1)
+	message := backend.Message{
+		MessageID: "reaction@example.com",
+		Ref:       backend.RemoteRef{Folder: "INBOX", ID: "reaction"},
+		Raw:       raw,
+	}
+	_, rowID, _, err := Ingest(db, message, "INBOX", backend.RoleInbox, IngestOptions{Account: testAccount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	disposition, err := db.GetHeader(rowID, "content-disposition")
+	if err != nil || disposition != "reaction" {
+		t.Fatalf("stored Content-Disposition = %q, %v", disposition, err)
+	}
+}
+
 func TestEngineAuthoritativeInitialDoesNotAdoptSameRawRefFromDifferentProviderScope(t *testing.T) {
 	db := newTestDB(t)
 	folder := backend.Folder{Name: "ALL", Role: backend.RoleAll, Selectable: true}

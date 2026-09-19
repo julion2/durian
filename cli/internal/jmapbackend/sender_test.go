@@ -91,6 +91,50 @@ func TestSenderCreatesStructuredEmailAndSubmits(t *testing.T) {
 	}
 }
 
+func TestSenderPreservesCanonicalRawMIME(t *testing.T) {
+	s := newTestJMAPServer(t)
+	var submittedEmailID string
+	s.handler = func(method string, args map[string]interface{}) interface{} {
+		switch method {
+		case "Mailbox/get":
+			return map[string]interface{}{"accountId": "a1", "state": "mb1", "list": testMailboxes(), "notFound": nil}
+		case "Identity/get":
+			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}, "notFound": []interface{}{}}
+		case "Email/set":
+			t.Error("a reaction must not be rebuilt as a structured Email")
+			return map[string]interface{}{}
+		case "Email/import":
+			return map[string]interface{}{
+				"accountId": "a1", "oldState": "s1", "newState": "s2",
+				"created":    map[string]interface{}{"0": map[string]string{"id": "draft-1"}},
+				"notCreated": map[string]interface{}{},
+			}
+		case "EmailSubmission/set":
+			s.extra = []interface{}{[]interface{}{"Email/set", map[string]interface{}{
+				"accountId": "a1", "updated": map[string]interface{}{
+					"draft-1": map[string]interface{}{"keywords": map[string]bool{"$seen": true}},
+				},
+			}, "0"}}
+			submittedEmailID = args["create"].(map[string]interface{})["s0"].(map[string]interface{})["emailId"].(string)
+			return map[string]interface{}{"accountId": "a1", "oldState": "sub1", "newState": "sub2", "created": map[string]interface{}{"s0": map[string]string{"id": "submission-1"}}, "notCreated": map[string]interface{}{}}
+		}
+		t.Fatalf("unexpected method %s", method)
+		return nil
+	}
+	want := []byte("From: me@example.test\r\nContent-Disposition: reaction\r\n\r\nemoji\r\n")
+	if err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
+		From: "me@example.test", To: []string{"you@example.test"}, Body: "\U0001F44D", RawMIME: want,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if string(s.uploaded) != string(want) {
+		t.Fatalf("uploaded MIME changed:\n got %q\nwant %q", s.uploaded, want)
+	}
+	if submittedEmailID != "draft-1" {
+		t.Fatalf("submitted email id = %q, want the imported Email", submittedEmailID)
+	}
+}
+
 func TestClassifySendErrorTreatsJMAPOutcomeStatesDistinctly(t *testing.T) {
 	for _, test := range []struct {
 		err  error

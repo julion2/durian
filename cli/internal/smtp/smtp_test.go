@@ -145,6 +145,29 @@ func TestMessageBuild(t *testing.T) {
 	}
 }
 
+func TestMessageBuildPreservesRawMIME(t *testing.T) {
+	want := []byte("From: me@example.com\r\nContent-Disposition: reaction\r\n\r\nemoji\r\n")
+	msg := &Message{RawMIME: want}
+	for name, build := range map[string]func() ([]byte, error){
+		"Build":      msg.Build,
+		"BuildDraft": msg.BuildDraft,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := build()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != string(want) {
+				t.Fatalf("raw MIME changed: got %q want %q", got, want)
+			}
+			got[0] = 'X'
+			if string(msg.RawMIME) != string(want) {
+				t.Fatal("build returned an alias instead of a copy")
+			}
+		})
+	}
+}
+
 func TestMessageBuildDraftRetainsBcc(t *testing.T) {
 	msg := &Message{
 		From: "sender@example.com", To: []string{"recipient@example.com"},

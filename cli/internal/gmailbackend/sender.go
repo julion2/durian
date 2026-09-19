@@ -49,7 +49,9 @@ func (s *Sender) Send(ctx context.Context, m *mailsend.Message) error {
 }
 
 // SendAfterPersist creates a Gmail draft and durably records Gmail's normalized
-// Message-Id before drafts.send can deliver it.
+// Message-Id before drafts.send can deliver it. An RFC 9078 reaction carries
+// its canonical MIME in Message.RawMIME, which Build returns unchanged, so the
+// single-part body and its Content-Disposition reach Gmail verbatim.
 func (s *Sender) SendAfterPersist(ctx context.Context, m *mailsend.Message, persist func(string) error) error {
 	mime, err := smtp.FromMessage(m).Build()
 	if err != nil {

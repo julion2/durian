@@ -72,6 +72,42 @@ func TestSenderSendsRawWithBccAndAdoptsID(t *testing.T) {
 	}
 }
 
+func TestSenderPreservesCanonicalRawMIME(t *testing.T) {
+	// An RFC 9078 reaction must reach Gmail byte for byte: rebuilding it would
+	// drop Content-Disposition and re-encode the single-part body.
+	want := []byte("From: me@example.com\r\nTo: you@example.com\r\nContent-Disposition: reaction\r\n\r\nemoji\r\n")
+	var got []byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("/users/me/drafts", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Message struct {
+				Raw string `json:"raw"`
+			} `json:"message"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode draft body: %v", err)
+		}
+		got, _ = base64.URLEncoding.DecodeString(body.Message.Raw)
+		writeJSON(t, w, map[string]any{"id": "draft1", "message": map[string]string{"id": "prepared1"}})
+	})
+	mux.HandleFunc("/users/me/messages/prepared1", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]any{"payload": map[string]any{
+			"headers": []map[string]string{{"name": "Message-Id", "value": "<reaction@example.com>"}},
+		}})
+	})
+	mux.HandleFunc("/users/me/drafts/send", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]string{"id": "sent1"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	if err := (&Sender{b: newTestBackend(t, srv)}).Send(t.Context(), &mailsend.Message{RawMIME: want}); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("raw MIME changed:\n got %q\nwant %q", got, want)
+	}
+}
+
 func TestClassifyGmailSendError(t *testing.T) {
 	cases := []struct {
 		status int

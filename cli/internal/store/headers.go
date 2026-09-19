@@ -39,6 +39,19 @@ func (d *DB) GetHeader(messageDBID int64, name string) (string, error) {
 	return out, nil
 }
 
+// HasHeader reports whether a specific header was indexed. An indexed empty
+// Reply-To is distinct from a legacy message whose Reply-To was never fetched.
+func (d *DB) HasHeader(messageDBID int64, name string) (bool, error) {
+	var count int
+	err := d.db.QueryRow(
+		"SELECT COUNT(*) FROM message_headers WHERE message_id = ? AND name = ?",
+		messageDBID, name).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // HasHeaders returns true if the message has any stored headers.
 func (d *DB) HasHeaders(messageDBID int64) (bool, error) {
 	var count int

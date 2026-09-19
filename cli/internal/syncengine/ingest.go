@@ -36,9 +36,23 @@ func messageUpsertCompleted(err error) bool {
 // constraint of touching no existing files). Keep the two lists in sync until
 // the legacy syncer is retired.
 var builtinIndexedHeaders = []string{
-	"List-Id", "List-Unsubscribe", "Precedence",
+	"Reply-To", "Content-Disposition", "List-Id", "List-Unsubscribe", "Precedence",
 	"X-Mailer", "Return-Path", "X-GitHub-Reason",
 	"Authentication-Results",
+}
+
+var markerIndexedHeaders = []string{"Reply-To", "Content-Disposition"}
+
+// isMarkerIndexedHeader reports whether a header is written unconditionally,
+// including an empty value, because reaction eligibility depends on knowing
+// that it was inspected rather than merely absent.
+func isMarkerIndexedHeader(name string) bool {
+	for _, marker := range markerIndexedHeaders {
+		if strings.EqualFold(name, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // folderTagMapping defines which tags to add/remove when a message is found in
@@ -244,9 +258,19 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		return messageID, storeMsg.ID, false, nil
 	}
 
+	// Reply-To and Content-Disposition affect reaction eligibility and display,
+	// so persist empty markers as well as values. Existing label-backed rows
+	// acquire them on re-delivery without rewriting every indexed header, so
+	// this runs before the label fast path returns.
+	for _, hdrName := range markerIndexedHeaders {
+		if err := db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), parsed.Header.Get(hdrName)); err != nil {
+			return "", 0, false, fmt.Errorf("insert header %q: %w", hdrName, err)
+		}
+	}
+
 	// Fast path for a message already in the store on a label backend (the
 	// common case of a legacy->engine migration re-ingesting the whole mailbox):
-	// its attachments, headers and filter-rule tags were applied on first ingest
+	// its attachments and filter-rule tags were applied on first ingest
 	// and its content is unchanged, so only the labels need re-mirroring. Skip
 	// the heavy re-processing — that is what makes the transition sync fast.
 	if !created && opts.LabelsAsTags && !storeMsg.IngestPending {
@@ -281,9 +305,14 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		}
 	}
 
-	// Store selected headers for rule matching and analysis (builtin set plus
-	// user-added entries from config.pkl sync.indexed_headers).
+	// Store the remaining selected headers for rule matching and analysis
+	// (builtin set plus user-added entries from config.pkl
+	// sync.indexed_headers). The reaction markers were written above, with
+	// their empty values preserved.
 	for _, hdrName := range opts.headerSet() {
+		if isMarkerIndexedHeader(hdrName) {
+			continue
+		}
 		if v := parsed.Header.Get(hdrName); v != "" {
 			if err := db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v); err != nil {
 				return "", 0, false, fmt.Errorf("insert header %q: %w", hdrName, err)

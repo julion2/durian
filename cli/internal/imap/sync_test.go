@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"net/mail"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	goimap "github.com/emersion/go-imap"
 
 	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/dbcrypto"
+	"github.com/julion2/durian/cli/internal/store"
 	"github.com/julion2/durian/cli/internal/syncidentity"
 )
 
@@ -524,14 +527,14 @@ func TestHeaderSet_MergesBuiltinAndUser(t *testing.T) {
 		{
 			name: "no user additions returns builtins",
 			user: nil,
-			want: []string{"List-Id", "List-Unsubscribe", "Precedence",
+			want: []string{"Reply-To", "Content-Disposition", "List-Id", "List-Unsubscribe", "Precedence",
 				"X-Mailer", "Return-Path", "X-GitHub-Reason",
 				"Authentication-Results"},
 		},
 		{
 			name: "user additions are appended",
 			user: []string{"X-GitLab-NotificationReason", "X-Spam-Status"},
-			want: []string{"List-Id", "List-Unsubscribe", "Precedence",
+			want: []string{"Reply-To", "Content-Disposition", "List-Id", "List-Unsubscribe", "Precedence",
 				"X-Mailer", "Return-Path", "X-GitHub-Reason",
 				"Authentication-Results",
 				"X-GitLab-NotificationReason", "X-Spam-Status"},
@@ -539,21 +542,21 @@ func TestHeaderSet_MergesBuiltinAndUser(t *testing.T) {
 		{
 			name: "case-insensitive dedup against builtins",
 			user: []string{"list-id", "LIST-UNSUBSCRIBE", "X-Spam-Status"},
-			want: []string{"List-Id", "List-Unsubscribe", "Precedence",
+			want: []string{"Reply-To", "Content-Disposition", "List-Id", "List-Unsubscribe", "Precedence",
 				"X-Mailer", "Return-Path", "X-GitHub-Reason",
 				"Authentication-Results", "X-Spam-Status"},
 		},
 		{
 			name: "case-insensitive dedup within user list",
 			user: []string{"X-Spam-Status", "x-spam-status", "X-SPAM-STATUS"},
-			want: []string{"List-Id", "List-Unsubscribe", "Precedence",
+			want: []string{"Reply-To", "Content-Disposition", "List-Id", "List-Unsubscribe", "Precedence",
 				"X-Mailer", "Return-Path", "X-GitHub-Reason",
 				"Authentication-Results", "X-Spam-Status"},
 		},
 		{
 			name: "empty + whitespace-only entries dropped",
 			user: []string{"", "   ", "X-Spam-Status"},
-			want: []string{"List-Id", "List-Unsubscribe", "Precedence",
+			want: []string{"Reply-To", "Content-Disposition", "List-Id", "List-Unsubscribe", "Precedence",
 				"X-Mailer", "Return-Path", "X-GitHub-Reason",
 				"Authentication-Results", "X-Spam-Status"},
 		},
@@ -572,4 +575,57 @@ func TestHeaderSet_MergesBuiltinAndUser(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHeaderBackfillDoesNotTreatUnrelatedHeaderAsComplete(t *testing.T) {
+	kr, err := dbcrypto.NewKeyring(bytes.Repeat([]byte{0x42}, dbcrypto.MasterKeyLen))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(":memory:", kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.Init(); err != nil {
+		t.Fatal(err)
+	}
+	message := &store.Message{
+		MessageID: "list-message@test", Subject: "List", FromAddr: "author@test",
+		Account: "work", Date: time.Now().Unix(), CreatedAt: time.Now().Unix(),
+	}
+	if err := db.InsertMessage(message); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertHeader(message.ID, "list-id", "<list.test>"); err != nil {
+		t.Fatal(err)
+	}
+	state := &MailboxState{SyncedUIDs: []uint32{42}}
+	state.SetMessageID(42, message.MessageID)
+	syncer := &Syncer{
+		store: db, account: &config.AccountConfig{Name: "Work"}, options: &SyncOptions{},
+	}
+	if got := syncer.uidsNeedingHeaderBackfill(state); len(got) != 1 || got[0] != 42 {
+		t.Fatalf("backfill UIDs with only List-Id = %v, want [42]", got)
+	}
+	rawHeader := []byte("Message-ID: <list-message@test>\r\nContent-Disposition: reaction\r\n")
+	if !syncer.storeHeadersForUID(42, rawHeader, state) {
+		t.Fatal("storeHeadersForUID returned false")
+	}
+	if has, err := db.HasHeader(message.ID, "reply-to"); err != nil || !has {
+		t.Fatalf("empty Reply-To marker = %v, %v", has, err)
+	}
+	if disposition, err := db.GetHeader(message.ID, "content-disposition"); err != nil || disposition != "reaction" {
+		t.Fatalf("Content-Disposition = %q, %v", disposition, err)
+	}
+	if got := syncer.uidsNeedingHeaderBackfill(state); len(got) != 0 {
+		t.Fatalf("backfill UIDs after required markers = %v, want none", got)
+	}
+	key := syncer.requiredHeaderBackfillKey("INBOX")
+	if strings.Contains(key, "work") || strings.Contains(key, "INBOX") {
+		t.Fatalf("backfill metadata key exposes account or mailbox: %q", key)
+	}
+	db.SetMeta(key, requiredHeaderBackfillVersion)
+	// A completed mailbox must return before touching the nil test client.
+	syncer.backfillHeaders([]string{"INBOX"})
 }

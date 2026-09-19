@@ -67,10 +67,15 @@ func (h *Handler) Search(query string, limit int, enrichLimit int) protocol.Resp
 
 	tagMap, _ := h.store.GetMessageTagsBatch(allMsgIDs)
 	attMap, _ := h.store.GetAttachmentsByMessages(allMsgIDs)
+	var allMessageRowIDs []int64
+	for _, e := range enriched {
+		allMessageRowIDs = append(allMessageRowIDs, threadMessageRowIDs(e.msgs)...)
+	}
+	headerMap, _ := h.store.HeadersByMessageDBIDs(allMessageRowIDs)
 
 	threads := make(map[string]*mail.ThreadContent, len(enriched))
 	for _, e := range enriched {
-		threads[e.threadID] = h.convertThread(e.threadID, e.msgs, true, tagMap, attMap)
+		threads[e.threadID] = h.convertThreadWithHeaders(e.threadID, e.msgs, true, tagMap, attMap, headerMap)
 	}
 
 	return protocol.SuccessWithResultsAndThreads(mails, threads)

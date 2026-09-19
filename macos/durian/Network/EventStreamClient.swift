@@ -28,6 +28,7 @@ struct OutboxUpdateEvent: Decodable {
     let error: String?
     let subject: String?
     let to: String?
+    let kind: String?
 }
 
 /// Emitted by the serve calendar autosync loop after a download-only run that

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/mail"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -73,21 +74,36 @@ func (h *Handler) ShowMessageBody(identifier string) protocol.Response {
 	})
 }
 
-// convertThread converts store messages into ThreadContent format, sorted
+// convertThread converts store messages into ThreadContent and batch-loads
+// the indexed headers needed for reaction metadata.
+func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bool, tagMap map[int64][]string, attMap map[int64][]store.Attachment) *internmail.ThreadContent {
+	headerMap, _ := h.store.HeadersByMessageDBIDs(threadMessageRowIDs(msgs))
+	return h.convertThreadWithHeaders(threadID, msgs, light, tagMap, attMap, headerMap)
+}
+
+// convertThreadWithHeaders converts store messages into ThreadContent, sorted
 // newest-first. When light=true, HTML and reply headers (InReplyTo,
 // References) are omitted — used by search enrichment to keep response
 // size small; the full thread is loaded on demand via /threads/{id}.
 //
-// When tagMap/attMap are provided, tags and attachments are looked up from
-// the pre-fetched maps instead of querying per message (batch optimization).
-func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bool, tagMap map[int64][]string, attMap map[int64][]store.Attachment) *internmail.ThreadContent {
+// The maps are pre-fetched across enriched search results to avoid per-message
+// queries. A full thread request uses convertThread to fetch its headers once.
+func (h *Handler) convertThreadWithHeaders(threadID string, msgs []*store.Message, light bool, tagMap map[int64][]string, attMap map[int64][]store.Attachment, headerMap map[int64]map[string][]string) *internmail.ThreadContent {
 	messages := make([]internmail.MessageInfo, 0, len(msgs))
 	var subject string
 
 	for _, msg := range msgs {
-		identifier := "local:" + strconv.FormatInt(msg.ID, 10)
+		// Tags decide draft status, which decides reaction eligibility, so
+		// they are resolved before the message info is built.
+		var tags []string
+		if tagMap != nil {
+			tags = tagMap[msg.ID]
+		} else if stored, err := h.store.GetMessageTags(msg.ID); err == nil {
+			tags = stored
+		}
+		canReact, isReaction := reactionHeaderMetadata(msg, tags, headerMap)
 		info := internmail.MessageInfo{
-			ID:                identifier,
+			ID:                "local:" + strconv.FormatInt(msg.ID, 10),
 			AttachmentCacheID: attachmentCacheID(msg),
 			From:              msg.FromAddr,
 			To:                msg.ToAddrs,
@@ -96,6 +112,8 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 			Timestamp:         msg.Date,
 			MessageID:         msg.MessageID,
 			Account:           msg.Account,
+			CanReact:          canReact,
+			IsReaction:        isReaction,
 			Body:              sanitize.StripQuotedTextContent(msg.BodyText),
 		}
 		if !light {
@@ -112,13 +130,9 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 			subject = msg.Subject
 		}
 
-		// Use pre-fetched maps when available, otherwise query per message
-		if tagMap != nil {
-			info.Tags = tagMap[msg.ID]
-		} else if tags, err := h.store.GetMessageTags(msg.ID); err == nil {
-			info.Tags = tags
-		}
+		info.Tags = tags
 
+		// Use the pre-fetched map when available, otherwise query per message
 		var atts []store.Attachment
 		if attMap != nil {
 			atts = attMap[msg.ID]
@@ -199,6 +213,39 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 	}
 }
 
+func threadMessageRowIDs(msgs []*store.Message) []int64 {
+	ids := make([]int64, 0, len(msgs))
+	for _, msg := range msgs {
+		ids = append(ids, msg.ID)
+	}
+	return ids
+}
+
+// reactionHeaderMetadata reports whether this exact row can be reacted to and
+// whether it is itself an RFC 9078 reaction.
+//
+// Eligibility is a property of the row, not of its indexed headers: a row that
+// names a sending account and a sender can be reacted to, and the reaction
+// endpoint resolves the Reply-To marker on demand for rows synced before that
+// marker existed. Deriving it from the marker instead greyed out the palette
+// for every message the provider-neutral engine had already synced, because no
+// engine backfill ever writes one.
+func reactionHeaderMetadata(msg *store.Message, tags []string, headerMap map[int64]map[string][]string) (canReact, isReaction bool) {
+	canReact = msg.Account != "" && strings.TrimSpace(msg.FromAddr) != "" && !slices.Contains(tags, "draft")
+	headers := headerMap[msg.ID]
+	for _, disposition := range headers["Content-Disposition"] {
+		disposition = strings.TrimSpace(disposition)
+		if separator := strings.IndexByte(disposition, ';'); separator >= 0 {
+			disposition = disposition[:separator]
+		}
+		if strings.EqualFold(strings.TrimSpace(disposition), "reaction") {
+			isReaction = true
+			break
+		}
+	}
+	return canReact, isReaction
+}
+
 func attachmentCacheID(msg *store.Message) string {
 	kind, identity := "message-id", msg.MessageID
 	if msg.StableID != "" {
@@ -276,7 +323,7 @@ func (h *Handler) fetchAttachmentViaBackend(ctx context.Context, msg *store.Mess
 	if err != nil {
 		return nil, "", fmt.Errorf("account %q: %w", msg.Account, err)
 	}
-	b, err := newMailBackend(account)
+	b, err := h.mailBackend(account)
 	if err != nil {
 		return nil, "", fmt.Errorf("create backend: %w", err)
 	}
@@ -289,8 +336,12 @@ func (h *Handler) fetchAttachmentViaBackend(ctx context.Context, msg *store.Mess
 	return internmail.ExtractAttachmentPart(buf.Bytes(), partID)
 }
 
-// newMailBackend builds the provider selected by account.sync_engine.
-func newMailBackend(account *config.AccountConfig) (backend.Backend, error) {
+// mailBackend builds the provider selected by account.sync_engine, or the
+// constructor a test installed on the handler.
+func (h *Handler) mailBackend(account *config.AccountConfig) (backend.Backend, error) {
+	if h.newBackend != nil {
+		return h.newBackend(account)
+	}
 	return backendfactory.New(account)
 }
 

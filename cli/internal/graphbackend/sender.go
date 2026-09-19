@@ -83,6 +83,16 @@ func (s *Sender) Send(ctx context.Context, m *mailsend.Message) error {
 // SendAfterPersist prepares a Graph draft and persists its exact Message-ID
 // before asking Graph to deliver it.
 func (s *Sender) SendAfterPersist(ctx context.Context, m *mailsend.Message, persist func(string) error) error {
+	// A canonical wire message (RFC 9078 reaction) must reach Graph unchanged,
+	// so it bypasses the typed draft. Its Message-ID is ours and was persisted
+	// with the queued draft, so there is no provider id left to record: the
+	// MIME sendMail form returns no message object.
+	if len(m.RawMIME) > 0 {
+		if err := persist(m.MessageID); err != nil {
+			return &mailsend.Error{Kind: mailsend.KindTransient, Err: fmt.Errorf("persist graph Message-ID: %w", err)}
+		}
+		return s.sendRawMIME(ctx, m.RawMIME)
+	}
 	small, large := splitAttachments(m.Attachments)
 
 	// A reply gets its threading headers from Graph via createReply; a new
@@ -128,6 +138,37 @@ func (s *Sender) SendAfterPersist(ctx context.Context, m *mailsend.Message, pers
 	if err := s.b.doJSON(ctx, http.MethodPost,
 		s.b.baseURL+s.b.mailbox+"/messages/"+url.PathEscape(draftID)+"/send", nil, nil); err != nil {
 		return classifyGraphFinalSendError(err)
+	}
+	return nil
+}
+
+// sendRawMIME uses Graph's documented MIME sendMail form. The request body is
+// standard base64 (not Gmail's base64url) and Content-Type is text/plain.
+func (s *Sender) sendRawMIME(ctx context.Context, raw []byte) error {
+	reqURL := s.b.baseURL + s.b.mailbox + "/sendMail"
+	if err := validateAuthenticatedURL(s.b.baseURL, reqURL); err != nil {
+		return &mailsend.Error{Kind: mailsend.KindPermanent, Err: fmt.Errorf("refusing graph MIME request URL: %w", err)}
+	}
+	token, err := s.b.tokenFn(ctx)
+	if err != nil {
+		return classifyGraphSendError(err)
+	}
+	body := []byte(base64.StdEncoding.EncodeToString(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return classifyGraphSendError(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "text/plain")
+	resp, err := s.b.httpClient.Do(req)
+	if err != nil {
+		return classifyGraphSendError(fmt.Errorf("graph MIME send: %w", err))
+	}
+	defer drainClose(resp)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// sendMail is irreversible: a 5xx may follow acceptance, so the
+		// outcome is ambiguous rather than safe to retry automatically.
+		return classifyGraphFinalSendError(newStatusError(resp))
 	}
 	return nil
 }

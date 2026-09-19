@@ -3,6 +3,32 @@ import XCTest
 
 final class ModelTests: XCTestCase {
 
+    func testThreadMessageDecodesReactionMetadata() throws {
+        let data = Data(#"{"id":"local:42","account":"work","can_react":true,"from":"sender@test","date":"Thu, 27 Aug 2026 12:00:00 +0000","timestamp":1,"body":"Hello"}"#.utf8)
+        let message = try JSONDecoder().decode(ThreadMessage.self, from: data)
+        XCTAssertEqual(message.id, "local:42")
+        XCTAssertEqual(message.owningAccount, "work")
+        XCTAssertTrue(message.canReact)
+        XCTAssertFalse(message.isReaction)
+    }
+
+    func testThreadMessageReactionMetadataIsBackwardCompatible() throws {
+        let data = Data(#"{"id":"message@test","from":"sender@test","date":"Thu, 27 Aug 2026 12:00:00 +0000","timestamp":1,"body":"Hello"}"#.utf8)
+        let message = try JSONDecoder().decode(ThreadMessage.self, from: data)
+        XCTAssertNil(message.owningAccount)
+        // An older server that predates the field cannot say the row is a
+        // reaction target, so the palette stays off rather than guessing.
+        XCTAssertFalse(message.canReact)
+        XCTAssertFalse(message.isReaction)
+    }
+
+    func testThreadMessageMarksReceivedReaction() throws {
+        let data = Data(#"{"id":"local:7","account":"work","can_react":false,"is_reaction":true,"from":"sender@test","date":"Thu, 27 Aug 2026 12:00:00 +0000","timestamp":1,"body":"\#u{1F44D}"}"#.utf8)
+        let message = try JSONDecoder().decode(ThreadMessage.self, from: data)
+        XCTAssertTrue(message.isReaction)
+        XCTAssertFalse(message.canReact)
+    }
+
     // MARK: - MailFolder (tag init)
 
     func testInboxTagIsSpecial() {

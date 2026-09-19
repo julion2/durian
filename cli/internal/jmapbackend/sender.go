@@ -50,6 +50,17 @@ func NewSender(account *config.AccountConfig) (*Sender, error) {
 }
 
 func (s *Sender) Send(ctx context.Context, message *mailsend.Message) error {
+	// A structured Email is rebuilt by the server from typed fields, which
+	// cannot express an RFC 9078 single-part body carrying
+	// "Content-Disposition: reaction". A reaction therefore keeps the raw
+	// import path: Email/import stores the canonical MIME blob byte for byte
+	// and EmailSubmission/set delivers that exact object.
+	if len(message.RawMIME) > 0 {
+		if err := s.b.sendRaw(ctx, message.RawMIME); err != nil {
+			return classifySendError(err)
+		}
+		return nil
+	}
 	draft, err := structuredEmail(message)
 	if err != nil {
 		return &mailsend.Error{Kind: mailsend.KindPermanent, Err: err}

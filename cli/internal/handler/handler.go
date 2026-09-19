@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/contacts"
 	"github.com/julion2/durian/cli/internal/mail"
@@ -50,6 +51,10 @@ type Handler struct {
 	calendarSyncer CalendarEventSyncer          // optional targeted calendar sync
 	tagSync        *tagsync.Client              // optional remote tag sync client
 	tagSyncEnabled bool                         // true when tag sync is configured (enables journal)
+	// newBackend builds the provider backend for an account. Nil means the
+	// real composition root (backendfactory); tests substitute a fake so the
+	// on-demand reaction header fetch runs without a provider.
+	newBackend func(*config.AccountConfig) (backend.Backend, error)
 }
 
 // New creates a Handler that reads from the SQLite store.

@@ -31,6 +31,7 @@ type OutboxUpdateEvent struct {
 	Error   string `json:"error,omitempty"`
 	Subject string `json:"subject,omitempty"`
 	To      string `json:"to,omitempty"`
+	Kind    string `json:"kind,omitempty"`
 }
 
 // CalendarUpdatedEvent is broadcast over SSE after a background calendar

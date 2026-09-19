@@ -26,6 +26,8 @@ struct ThreadMessageCardView: View {
     /// draft the user clicked rather than from the thread aggregate.
     var onEditDraft: ((ThreadMessage) -> Void)? = nil
 
+    @ObservedObject private var sendingManager = EmailSendingManager.shared
+
     // Each card manages its own expanded state
     @State private var isDetailsExpanded: Bool = false
     @State private var downloadStates: [Int: AttachmentDownloadState] = [:]
@@ -164,6 +166,10 @@ struct ThreadMessageCardView: View {
                 .font(.system(size: 14))
                 .foregroundColor(Color.Detail.textTertiary)
                 .lineLimit(1)
+
+            if !message.isDraft, !message.isReaction {
+                reactionMenu
+            }
         }
     }
 
@@ -601,7 +607,45 @@ struct ThreadMessageCardView: View {
         }
     }
 
-    // MARK: - Action Footer
+    // MARK: - Message Actions
+
+    @ViewBuilder
+    private var reactionMenu: some View {
+        Menu {
+            ForEach(EmailSendingManager.reactionOptions) { option in
+                Button(option.emoji) {
+                    Task {
+                        await sendingManager.sendReaction(
+                            messageId: message.id,
+                            emoji: option.emoji,
+                            threadId: email.id
+                        )
+                    }
+                }
+                .accessibilityLabel("React with \(option.label)")
+            }
+        } label: {
+            Image(systemName: "face.smiling")
+                .font(.system(size: 16))
+                .foregroundColor(Color.Detail.textTertiary)
+                .frame(width: 28, height: 28)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .disabled(!message.canReact || reactionPending)
+        .help(reactionHelp)
+        .accessibilityLabel("React to this message")
+    }
+
+    private var reactionHelp: String {
+        if reactionPending { return "Reaction pending" }
+        if !message.canReact { return "This message cannot be reacted to" }
+        return "React with emoji"
+    }
+
+    private var reactionPending: Bool {
+        sendingManager.isReactionPending(messageId: message.id)
+    }
 
     @ViewBuilder
     private var actionFooter: some View {

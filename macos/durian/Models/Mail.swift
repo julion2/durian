@@ -26,6 +26,9 @@ struct AttachmentInfo: Decodable, Equatable {
 struct ThreadMessage: Decodable, Identifiable, Equatable {
     let id: String
     let attachment_cache_id: String?
+    let account: String?
+    let can_react: Bool?
+    let is_reaction: Bool?
     let from: String
     let to: String?
     let cc: String?
@@ -52,6 +55,21 @@ struct ThreadMessage: Decodable, Identifiable, Equatable {
     var isDraft: Bool {
         tags?.contains("draft") ?? false
     }
+
+    /// The account that owns this exact row. The server derives the reply
+    /// recipient from it, so the GUI never chooses one.
+    var owningAccount: String? {
+        guard let account, !account.isEmpty else { return nil }
+        return account
+    }
+
+    /// Whether this row is a reaction target. The server resolves the reply
+    /// recipient when the reaction is posted, fetching the message's Reply-To
+    /// from the provider if it was never indexed, so the palette stays enabled
+    /// for messages synced before that marker existed.
+    var canReact: Bool { can_react ?? false }
+
+    var isReaction: Bool { is_reaction ?? false }
 }
 
 // MARK: - Email Body State

@@ -112,7 +112,10 @@ func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matc
 	// Store selected headers for rule matching and analysis (builtin set
 	// plus user-added entries from config.pkl sync.indexed_headers).
 	for _, hdrName := range s.headerSet() {
-		if v := parsed.Header.Get(hdrName); v != "" {
+		// Reaction markers are stored even when absent: an indexed empty
+		// Reply-To proves the reply recipient is known, which a missing row
+		// does not.
+		if v := parsed.Header.Get(hdrName); v != "" || selectedHeaderNeedsMarker(hdrName) {
 			if err := s.store.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v); err != nil {
 				return "", fmt.Errorf("insert header %q: %w", hdrName, err)
 			}

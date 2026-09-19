@@ -1,13 +1,16 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/mail"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +18,7 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/gorilla/mux"
 
+	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/encoding"
 	imapClient "github.com/julion2/durian/cli/internal/imap"
@@ -26,19 +30,41 @@ import (
 
 // OutboxDraft is the JSON payload for enqueuing an email to the outbox.
 type OutboxDraft struct {
-	IdempotencyKey string             `json:"idempotency_key"`
-	MessageID      string             `json:"message_id"`
-	From           string             `json:"from"`
-	To             []string           `json:"to"`
-	CC             []string           `json:"cc"`
-	BCC            []string           `json:"bcc"`
-	Subject        string             `json:"subject"`
-	Body           string             `json:"body"`
-	IsHTML         bool               `json:"is_html"`
-	InReplyTo      string             `json:"in_reply_to"`
-	References     string             `json:"references"`
-	Attachments    []OutboxAttachment `json:"attachments"`
-	DelaySeconds   int                `json:"delay_seconds"`
+	IdempotencyKey string `json:"idempotency_key"`
+	MessageID      string `json:"message_id"`
+	// Kind is "reaction" for an RFC 9078 emoji reply, which is built as
+	// canonical MIME and submitted unchanged. Empty means normal compose.
+	Kind string `json:"kind,omitempty"`
+	// Account and TargetID name the exact stored row a reaction answers, so
+	// the worker resolves the sending account without matching on From.
+	Account      string             `json:"account,omitempty"`
+	TargetID     string             `json:"target_message_id,omitempty"`
+	From         string             `json:"from"`
+	To           []string           `json:"to"`
+	CC           []string           `json:"cc"`
+	BCC          []string           `json:"bcc"`
+	Subject      string             `json:"subject"`
+	Body         string             `json:"body"`
+	IsHTML       bool               `json:"is_html"`
+	InReplyTo    string             `json:"in_reply_to"`
+	References   string             `json:"references"`
+	Attachments  []OutboxAttachment `json:"attachments"`
+	DelaySeconds int                `json:"delay_seconds"`
+}
+
+const (
+	outboxKindReaction = "reaction"
+	reactionSendDelay  = 10
+)
+
+type reactionRequest struct {
+	Account string `json:"account"`
+	Emoji   string `json:"emoji"`
+	// IdempotencyKey identifies one user action, exactly as compose does.
+	// Retrying a request after a lost response reuses it; reacting again after
+	// an Undo is a new action and must carry a new key. Older clients omit it
+	// and fall back to a content-derived key.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 // OutboxAttachment represents a base64-encoded attachment in the outbox payload.
@@ -97,6 +123,240 @@ func (h *Handler) EnqueueOutboxHandler(w http.ResponseWriter, r *http.Request) {
 	slog.Info("Enqueued outbox item", "module", "OUTBOX", "id", id, "recipient_count", len(draft.To), "is_html", draft.IsHTML, "body_len", len(draft.Body), "send_after", sendAfter) // encgrep:allow body_len + draft.To are length/count, not content
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id, "send_after": sendAfter})
+}
+
+// EnqueueReactionHandler handles POST /api/v1/messages/{message_id}/reactions.
+// The client supplies only the target message and emoji; the sending account,
+// reply recipient and threading metadata are derived from that exact stored
+// row, which is addressed by the opaque local identifier the thread view
+// returns.
+func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var request reactionRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeReactionError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if h.cfg == nil {
+		writeReactionError(w, http.StatusServiceUnavailable, "Mail configuration unavailable")
+		return
+	}
+	if !mailsend.IsReactionEmoji(request.Emoji) {
+		writeReactionError(w, http.StatusBadRequest, "Unsupported reaction emoji")
+		return
+	}
+	target, err := h.store.GetByIdentifier(strings.Trim(mux.Vars(r)["message_id"], "<>"))
+	if err != nil {
+		writeReactionError(w, http.StatusBadRequest, "Failed to resolve target message")
+		return
+	}
+	if target == nil {
+		writeReactionError(w, http.StatusNotFound, "Message not found")
+		return
+	}
+	// The stored row owns the account: it decides which mailbox the reply
+	// threads into and which credentials send it. An explicit account is only
+	// accepted when it names that same account.
+	account, err := h.cfg.GetAccountByIdentifier(target.Account)
+	if err != nil {
+		writeReactionError(w, http.StatusBadRequest, "Unknown account")
+		return
+	}
+	if request.Account != "" {
+		requested, err := h.cfg.GetAccountByIdentifier(request.Account)
+		if err != nil || requested.AccountIdentifier() != account.AccountIdentifier() {
+			writeReactionError(w, http.StatusNotFound, "Message not found for account")
+			return
+		}
+	}
+	replyToIndexed, err := h.store.HasHeader(target.ID, "reply-to")
+	if err != nil {
+		writeReactionError(w, http.StatusInternalServerError, "Failed to inspect Reply-To status")
+		return
+	}
+	if !replyToIndexed {
+		if err := h.resolveReactionHeaders(r.Context(), target, account); err != nil {
+			switch {
+			case errors.Is(err, errReactionHeadersUnfetchable):
+				writeReactionError(w, http.StatusConflict, "Reply-To status is unavailable for this message")
+			case errors.Is(err, backend.ErrRefGone):
+				writeReactionError(w, http.StatusConflict, "Message no longer exists on the mail server")
+			default:
+				// The provider error is deliberately absent: it can echo the
+				// fetched message, and no header value may reach a log.
+				slog.Warn("Failed to resolve reaction headers on demand", "module", "OUTBOX", "account", account.AccountIdentifier(), "timeout", errors.Is(err, context.DeadlineExceeded)) // encgrep:allow account identifier (config name); no header value or provider text is logged
+				writeReactionError(w, http.StatusBadGateway, "Failed to fetch the message's Reply-To from the mail server")
+			}
+			return
+		}
+	}
+
+	recipient := target.FromAddr
+	if replyTo, err := h.store.GetHeader(target.ID, "reply-to"); err != nil {
+		writeReactionError(w, http.StatusInternalServerError, "Failed to resolve Reply-To")
+		return
+	} else if strings.TrimSpace(replyTo) != "" {
+		recipient = replyTo
+	}
+	parsedRecipients, err := mail.ParseAddressList(recipient)
+	if err != nil || len(parsedRecipients) != 1 {
+		writeReactionError(w, http.StatusBadRequest, "Message has no single valid reply recipient")
+		return
+	}
+	recipient = parsedRecipients[0].String()
+
+	references, err := mailsend.ReactionReferences(target.Refs, target.MessageID)
+	if err != nil {
+		writeReactionError(w, http.StatusBadRequest, "Message has invalid threading headers")
+		return
+	}
+	draft := OutboxDraft{
+		Kind:     outboxKindReaction,
+		Account:  account.AccountIdentifier(),
+		TargetID: target.MessageID,
+		// Repeating one reaction request, including after a lost HTTP response,
+		// returns the queued row and its original schedule instead of sending
+		// the emoji twice.
+		IdempotencyKey: reactionIdempotencyKey(request, account.AccountIdentifier(), target.ID),
+		MessageID:      mailsend.GenerateMessageID(account.Email),
+		From:           account.Email,
+		To:             []string{recipient},
+		Subject:        mailsend.ReplySubject(target.Subject),
+		Body:           request.Emoji,
+		InReplyTo:      target.MessageID,
+		References:     references,
+	}
+
+	draftJSON, err := json.Marshal(draft)
+	if err != nil {
+		writeReactionError(w, http.StatusInternalServerError, "Failed to encode reaction")
+		return
+	}
+	// A client that gave up during the header fetch has already told the user
+	// the reaction failed and will never show the Undo countdown; queueing it
+	// now would send an emoji the user believes was not sent.
+	if err := r.Context().Err(); err != nil {
+		writeReactionError(w, http.StatusBadGateway, "Client went away before the reaction could be queued")
+		return
+	}
+	id, sendAfter, err := h.store.EnqueueIdempotent(string(draftJSON), time.Now().Unix()+reactionSendDelay, draft.IdempotencyKey)
+	if err != nil {
+		slog.Error("Failed to enqueue reaction", "module", "OUTBOX", "err", err)
+		writeReactionError(w, http.StatusInternalServerError, "Failed to enqueue reaction")
+		return
+	}
+	slog.Info("Enqueued reaction", "module", "OUTBOX", "id", id, "account", draft.Account, "send_after", sendAfter) // encgrep:allow account identifier (config name); no emoji, recipient or subject is logged
+	writeJSON(w, map[string]any{"ok": true, "id": id, "send_after": sendAfter, "recipient": recipient})
+}
+
+// errReactionHeadersUnfetchable reports that this row carries no provider
+// handle the header fetch could use. Only legacy IMAP rows land here, and the
+// IMAP syncer backfills their markers on its own schedule.
+var errReactionHeadersUnfetchable = errors.New("message has no provider handle for a header fetch")
+
+// reactionHeaderFetchTimeout bounds the one provider roundtrip an old message
+// pays on its first reaction. A user is waiting on the click, so this is far
+// shorter than the attachment path's 60s download budget. A variable so a
+// test can shrink it.
+var reactionHeaderFetchTimeout = 10 * time.Second
+
+// resolveReactionHeaders fetches the target message through its account's
+// backend and writes the Reply-To and Content-Disposition markers for that
+// row, exactly as syncengine.Ingest does for freshly synced messages —
+// including empty values, which record that the header was inspected and
+// absent. Rows synced before the reaction feature existed have no markers and
+// no backfill will ever produce them on the provider-neutral engine, so the
+// first reaction resolves them here instead of refusing.
+func (h *Handler) resolveReactionHeaders(ctx context.Context, target *store.Message, account *config.AccountConfig) error {
+	if target.RemoteRef == "" {
+		return errReactionHeadersUnfetchable
+	}
+	ctx, cancel := context.WithTimeout(ctx, reactionHeaderFetchTimeout)
+	defer cancel()
+
+	raw, err := h.fetchRawMessage(ctx, target, account)
+	if err != nil {
+		return err
+	}
+	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		return fmt.Errorf("parse message: %w", err)
+	}
+	// Reply-To is the eligibility gate (HasHeader), so it is written last:
+	// should the earlier insert fail, the next reaction fetches again rather
+	// than finding the gate open with the other marker missing.
+	for _, name := range []string{"Content-Disposition", "Reply-To"} {
+		if err := h.store.InsertHeader(target.ID, strings.ToLower(name), parsed.Header.Get(name)); err != nil {
+			return fmt.Errorf("insert header %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// fetchRawMessage streams the whole RFC822 message for target through a
+// freshly built backend and enforces ctx itself rather than trusting the
+// backend to. The HTTP backends honor ctx, but imapbackend.FetchBody ignores
+// it and imap.Client has no per-command deadline, so on an engine-IMAP
+// account a slow FETCH would otherwise outlive both this budget and the GUI's
+// request timeout — and the reaction would be queued after the user was told
+// it failed. The goroutine owns the backend and closes it when the provider
+// call returns; when the deadline wins, the caller gets ctx.Err() at once and
+// the goroutine finishes and releases the connection on its own.
+func (h *Handler) fetchRawMessage(ctx context.Context, target *store.Message, account *config.AccountConfig) ([]byte, error) {
+	type fetched struct {
+		raw []byte
+		err error
+	}
+	done := make(chan fetched, 1)
+	go func() {
+		b, err := h.mailBackend(account)
+		if err != nil {
+			done <- fetched{err: fmt.Errorf("create backend: %w", err)}
+			return
+		}
+		var buf bytes.Buffer
+		ref := backend.RemoteRef{Folder: target.Mailbox, ID: target.RemoteRef, MessageID: target.MessageID}
+		err = b.FetchBody(ctx, ref, &buf)
+		b.Close()
+		if err != nil {
+			done <- fetched{err: fmt.Errorf("fetch body: %w", err)}
+			return
+		}
+		done <- fetched{raw: buf.Bytes()}
+	}()
+
+	select {
+	case result := <-done:
+		return result.raw, result.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("fetch body: %w", ctx.Err())
+	}
+}
+
+// reactionIdempotencyKey identifies one logical reaction. A client-supplied key
+// scopes it to a single user action, so reacting again after an Undo enqueues a
+// new send. Without one, the key falls back to the target row and emoji, which
+// makes a lost response safe but permanently tombstones that combination. The
+// row id, not the RFC Message-ID, is the target identity: two provider objects
+// may legally share a Message-ID, and each must remain separately reactable.
+func reactionIdempotencyKey(request reactionRequest, account string, targetRowID int64) string {
+	identity := request.IdempotencyKey
+	if identity == "" {
+		identity = "derived\x00" + request.Emoji
+	}
+	digest := sha256.Sum256([]byte(account + "\x00" + strconv.FormatInt(targetRowID, 10) + "\x00" + identity))
+	return fmt.Sprintf("reaction-v1-%x", digest)
+}
+
+// writeReactionError returns a machine-readable body so the GUI can show the
+// server's reason — a failed Reply-To fetch in particular is worth retrying —
+// rather than a bare status code.
+func writeReactionError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": message}); err != nil {
+		slog.Error("Failed to encode reaction error response", "module", "OUTBOX", "err", err)
+	}
 }
 
 // ListOutboxHandler handles GET /api/v1/outbox.
@@ -243,8 +503,14 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 		}
 	}
 
-	// Look up account config by sender email
-	account := w.findAccount(draft.From)
+	// Reactions carry the exact target account; legacy compose payloads keep
+	// resolving by sender address for backward compatibility.
+	var account *config.AccountConfig
+	if draft.Kind == outboxKindReaction {
+		account, _ = w.cfg.GetAccountByIdentifier(draft.Account)
+	} else {
+		account = w.findAccount(draft.From)
+	}
 	if account == nil {
 		errMsg := fmt.Sprintf("no account found for sender: %s", draft.From)
 		slog.Error(errMsg, "module", "OUTBOX", "id", item.ID)
@@ -252,7 +518,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 			slog.Error("Failed to poison unrouteable outbox item", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
 			return false
 		}
-		w.broadcastStatus(item.ID, "failed", errMsg, draft.Subject, strings.Join(draft.To, ", "))
+		w.broadcastStatus(item.ID, "failed", errMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 		return true
 	}
 
@@ -274,6 +540,20 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 		InReplyTo:  draft.InReplyTo,
 		References: draft.References,
 	}
+	if draft.Kind == outboxKindReaction {
+		var err error
+		msg.RawMIME, err = mailsend.BuildReaction(msg, time.Now())
+		if err != nil {
+			safeMsg := sanitizeOutboxError(err)
+			slog.Error("Failed to build reaction MIME", "module", "OUTBOX", "id", item.ID, "err", safeMsg)
+			if transitionErr := w.store.PoisonOutboxItem(item.ID, safeMsg); transitionErr != nil {
+				slog.Error("Failed to poison unbuildable reaction", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
+				return false
+			}
+			w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
+			return true
+		}
+	}
 
 	// Decode base64 attachments
 	for _, att := range draft.Attachments {
@@ -287,7 +567,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 			}
 			// Drop the filename from the SSE broadcast too — it's
 			// user-supplied content that may carry sensitive metadata.
-			w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
+			w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 			return true
 		}
 		msg.Attachments = append(msg.Attachments, mailsend.Attachment{
@@ -308,7 +588,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 			slog.Error("Failed to record outbox sender setup failure", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
 			return false
 		}
-		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "))
+		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 		return true
 	}
 
@@ -357,7 +637,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 			return false
 		}
 		slog.Error("Delivery succeeded but Sent filing failed", "module", "OUTBOX", "id", item.ID)
-		w.broadcastStatus(item.ID, "delivered_with_warning", reason, draft.Subject, strings.Join(draft.To, ", "))
+		w.broadcastStatus(item.ID, "delivered_with_warning", reason, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 		return true
 	}
 	if err := w.store.DeleteClaimedOutboxItem(item.ID); err != nil {
@@ -365,7 +645,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 		return false
 	}
 	slog.Info("Outbox item sent successfully", "module", "OUTBOX", "id", item.ID)
-	w.broadcastStatus(item.ID, "sent", "", draft.Subject, strings.Join(draft.To, ", "))
+	w.broadcastStatus(item.ID, "sent", "", draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 	return true
 }
 
@@ -411,7 +691,7 @@ func (w *OutboxWorker) handleSendError(item *store.OutboxItem, draft *OutboxDraf
 			return false
 		}
 	}
-	w.broadcastStatus(item.ID, status, safeMsg, draft.Subject, strings.Join(draft.To, ", "))
+	w.broadcastStatus(item.ID, status, safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 	return true
 }
 
@@ -480,6 +760,18 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mail
 	if err := w.store.InsertMessage(storeMsg); err != nil {
 		return fmt.Errorf("save sent email to local store: %w", err)
 	}
+	// An empty row records that Reply-To was inspected and absent. This keeps
+	// reactions to locally sent normal messages eligible without guessing.
+	if err := w.store.InsertHeader(storeMsg.ID, "reply-to", ""); err != nil {
+		slog.Warn("Failed to mark sent message Reply-To status", "module", "OUTBOX", "err", err)
+	}
+	contentDisposition := ""
+	if draft.Kind == outboxKindReaction {
+		contentDisposition = "reaction"
+	}
+	if err := w.store.InsertHeader(storeMsg.ID, "content-disposition", contentDisposition); err != nil {
+		slog.Warn("Failed to mark sent message Content-Disposition", "module", "OUTBOX", "err", err)
+	}
 	if err := w.store.AddTag(storeMsg.ID, "sent"); err != nil {
 		return fmt.Errorf("tag sent email: %w", err)
 	}
@@ -523,7 +815,7 @@ func (w *OutboxWorker) appendToSent(account *config.AccountConfig, msg *mailsend
 }
 
 // broadcastStatus sends an outbox_update SSE event.
-func (w *OutboxWorker) broadcastStatus(itemID int64, status, errMsg, subject, to string) {
+func (w *OutboxWorker) broadcastStatus(itemID int64, status, errMsg, subject, to, kind string) {
 	if w.eventHub == nil {
 		return
 	}
@@ -533,5 +825,6 @@ func (w *OutboxWorker) broadcastStatus(itemID int64, status, errMsg, subject, to
 		Error:   errMsg,
 		Subject: subject,
 		To:      to,
+		Kind:    kind,
 	})
 }

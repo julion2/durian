@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -67,6 +68,41 @@ func TestEnqueueIdempotentReturnsOriginalItem(t *testing.T) {
 	}
 	if items, err := db.ListOutbox(); err != nil || len(items) != 0 {
 		t.Fatalf("post-delete idempotent retry recreated outbox: %#v, %v", items, err)
+	}
+}
+
+func TestEnqueueIdempotentIsAtomicAcrossConcurrentRequests(t *testing.T) {
+	// A reaction palette can be double-clicked, and the GUI retries a lost
+	// response. Concurrent requests carrying one key must produce exactly one
+	// deliverable message.
+	db := newTestDB(t)
+	const requests = 12
+	start := make(chan struct{})
+	results := make(chan int64, requests)
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			id, _, err := db.EnqueueIdempotent(`{"kind":"reaction"}`, 0, "concurrent-reaction")
+			if err != nil {
+				t.Errorf("concurrent idempotent enqueue: %v", err)
+			}
+			results <- id
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	ids := make(map[int64]struct{})
+	for id := range results {
+		ids[id] = struct{}{}
+	}
+	items, err := db.ListOutbox()
+	if err != nil || len(ids) != 1 || len(items) != 1 {
+		t.Fatalf("distinct ids=%d outbox=%#v, %v", len(ids), items, err)
 	}
 }
 
@@ -194,8 +230,7 @@ func TestPoisonOutboxItem(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := db.PoisonOutboxItem(id, "permanent failure")
-	if err != nil {
+	if err := db.PoisonOutboxItem(id, "permanent failure"); err != nil {
 		t.Fatalf("poison: %v", err)
 	}
 
@@ -212,6 +247,7 @@ func TestPoisonOutboxItem(t *testing.T) {
 	if item != nil {
 		t.Error("poisoned item should not be claimed")
 	}
+
 }
 
 func TestDeletePendingOutboxItem(t *testing.T) {

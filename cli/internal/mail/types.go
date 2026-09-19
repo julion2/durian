@@ -57,21 +57,29 @@ type MessageBody struct {
 
 // MessageInfo represents a single message within a thread
 type MessageInfo struct {
-	ID                string           `json:"id"`
-	AttachmentCacheID string           `json:"attachment_cache_id,omitempty"`
-	From              string           `json:"from"`
-	To                string           `json:"to,omitempty"`
-	CC                string           `json:"cc,omitempty"`
-	BCC               string           `json:"bcc,omitempty"`
-	Date              string           `json:"date"`
-	Timestamp         int64            `json:"timestamp"`
-	MessageID         string           `json:"message_id,omitempty"`
-	Account           string           `json:"account,omitempty"`
-	InReplyTo         string           `json:"in_reply_to,omitempty"`
-	References        string           `json:"references,omitempty"`
-	Body              string           `json:"body"`
-	HTML              string           `json:"html,omitempty"`
-	HiddenSignature   string           `json:"hidden_signature,omitempty"`
-	Attachments       []AttachmentInfo `json:"attachments,omitempty"`
-	Tags              []string         `json:"tags,omitempty"`
+	ID                string `json:"id"`
+	AttachmentCacheID string `json:"attachment_cache_id,omitempty"`
+	From              string `json:"from"`
+	To                string `json:"to,omitempty"`
+	CC                string `json:"cc,omitempty"`
+	BCC               string `json:"bcc,omitempty"`
+	Date              string `json:"date"`
+	Timestamp         int64  `json:"timestamp"`
+	MessageID         string `json:"message_id,omitempty"`
+	Account           string `json:"account,omitempty"`
+	// CanReact reports whether this exact row is a reaction target at all: a
+	// non-draft message with a sending account and a sender. The reply
+	// recipient is resolved by the reaction endpoint at click time, fetching
+	// the message's Reply-To from the provider when it was never indexed, so
+	// eligibility no longer depends on a header backfill. IsReaction marks a
+	// received RFC 9078 emoji reply, which never offers a palette of its own.
+	CanReact        bool             `json:"can_react"`
+	IsReaction      bool             `json:"is_reaction,omitempty"`
+	InReplyTo       string           `json:"in_reply_to,omitempty"`
+	References      string           `json:"references,omitempty"`
+	Body            string           `json:"body"`
+	HTML            string           `json:"html,omitempty"`
+	HiddenSignature string           `json:"hidden_signature,omitempty"`
+	Attachments     []AttachmentInfo `json:"attachments,omitempty"`
+	Tags            []string         `json:"tags,omitempty"`
 }
