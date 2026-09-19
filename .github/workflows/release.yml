@@ -62,42 +62,36 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" gui_repack/Durian.app/Contents/Info.plist 2>/dev/null || true
           cd gui_repack && zip -r $GITHUB_WORKSPACE/dist/Durian-${{ steps.version.outputs.version }}.zip Durian.app
 
-      # cyclonedx-gomod needs a host Go toolchain — Bazel ships its own
-      # but `go install` runs outside Bazel. macos-26 runner image stopped
-      # pre-installing Go, so we have to bring it ourselves.
-      - uses: actions/setup-go@v5
+      - name: Generate CLI SBOM (CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          go-version-file: cli/go.mod
-          cache: false
+          file: dist/durian-darwin-arm64
+          format: cyclonedx-json
+          output-file: dist/durian-${{ steps.version.outputs.version }}.cdx.json
+          syft-version: v1.51.0
+          upload-artifact: false
+          upload-release-assets: false
 
-      - name: Generate SBOM (CycloneDX)
-        run: |
-          # cyclonedx-gomod resolves the dependency tree (incl. transitive)
-          # of the cli/ module and emits a CycloneDX 1.5 JSON document.
-          # sync/ shares the same module so one SBOM covers both binaries.
-          # Format choice: JSON over XML for grep/jq friendliness.
-          #
-          # Stage the Pkl schema files where //go:embed schema/*.pkl in
-          # cli/internal/config/pkl.go expects them. Bazel does this via
-          # a genrule in cli/internal/config/BUILD.bazel; cyclonedx-gomod
-          # runs outside Bazel so we have to mirror the copy here, else
-          # `go list` fails with "schema/*.pkl: no matching files found".
-          mkdir -p cli/internal/config/schema
-          cp schema/*.pkl cli/internal/config/schema/
-
-          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
-          cd cli
-          cyclonedx-gomod app -main ./cmd/durian -output ../dist/durian-${{ steps.version.outputs.version }}.cdx.json -json -licenses
+      - name: Generate Sync Server SBOM (CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          file: dist/durian-sync-linux-amd64
+          format: cyclonedx-json
+          output-file: dist/durian-sync-${{ steps.version.outputs.version }}.cdx.json
+          syft-version: v1.51.0
+          upload-artifact: false
+          upload-release-assets: false
 
       - name: Package
         run: |
+          cp LICENSE dist/LICENSE
           cd dist
-          tar -czf durian-${{ steps.version.outputs.version }}-darwin-arm64.tar.gz durian-darwin-arm64
-          tar -czf durian-${{ steps.version.outputs.version }}-darwin-amd64.tar.gz durian-darwin-amd64
-          tar -czf durian-${{ steps.version.outputs.version }}-linux-amd64.tar.gz durian-linux-amd64
-          tar -czf durian-${{ steps.version.outputs.version }}-linux-arm64.tar.gz durian-linux-arm64
-          tar -czf durian-sync-${{ steps.version.outputs.version }}-linux-amd64.tar.gz durian-sync-linux-amd64
-          tar -czf durian-sync-${{ steps.version.outputs.version }}-linux-arm64.tar.gz durian-sync-linux-arm64
+          tar -czf durian-${{ steps.version.outputs.version }}-darwin-arm64.tar.gz durian-darwin-arm64 LICENSE
+          tar -czf durian-${{ steps.version.outputs.version }}-darwin-amd64.tar.gz durian-darwin-amd64 LICENSE
+          tar -czf durian-${{ steps.version.outputs.version }}-linux-amd64.tar.gz durian-linux-amd64 LICENSE
+          tar -czf durian-${{ steps.version.outputs.version }}-linux-arm64.tar.gz durian-linux-arm64 LICENSE
+          tar -czf durian-sync-${{ steps.version.outputs.version }}-linux-amd64.tar.gz durian-sync-linux-amd64 LICENSE
+          tar -czf durian-sync-${{ steps.version.outputs.version }}-linux-arm64.tar.gz durian-sync-linux-arm64 LICENSE
           shasum -a 256 *.tar.gz *.zip *.cdx.json > checksums.txt
           cat checksums.txt
 
@@ -134,6 +128,7 @@ jobs:
             dist/durian-sync-${{ steps.version.outputs.version }}-linux-arm64.tar.gz \
             dist/Durian-${{ steps.version.outputs.version }}.zip \
             dist/durian-${{ steps.version.outputs.version }}.cdx.json \
+            dist/durian-sync-${{ steps.version.outputs.version }}.cdx.json \
             dist/checksums.txt \
             --title "Durian ${{ github.ref_name }}" \
             --notes-file dist/release-notes.md
