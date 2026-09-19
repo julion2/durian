@@ -639,7 +639,7 @@ struct ThreadMessageCardView: View {
 
     private var reactionHelp: String {
         if reactionPending { return "Reaction pending" }
-        if !message.canReact { return "Backfill message headers before reacting" }
+        if !message.canReact { return "This message cannot be reacted to" }
         return "React with emoji"
     }
 

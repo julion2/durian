@@ -63,8 +63,10 @@ struct ThreadMessage: Decodable, Identifiable, Equatable {
         return account
     }
 
-    /// Whether this row's Reply-To status is indexed. A message whose headers
-    /// were never fetched cannot be reacted to without guessing a recipient.
+    /// Whether this row is a reaction target. The server resolves the reply
+    /// recipient when the reaction is posted, fetching the message's Reply-To
+    /// from the provider if it was never indexed, so the palette stays enabled
+    /// for messages synced before that marker existed.
     var canReact: Bool { can_react ?? false }
 
     var isReaction: Bool { is_reaction ?? false }

@@ -16,7 +16,8 @@ final class ModelTests: XCTestCase {
         let data = Data(#"{"id":"message@test","from":"sender@test","date":"Thu, 27 Aug 2026 12:00:00 +0000","timestamp":1,"body":"Hello"}"#.utf8)
         let message = try JSONDecoder().decode(ThreadMessage.self, from: data)
         XCTAssertNil(message.owningAccount)
-        // An older server that never indexed Reply-To must not offer a palette.
+        // An older server that predates the field cannot say the row is a
+        // reaction target, so the palette stays off rather than guessing.
         XCTAssertFalse(message.canReact)
         XCTAssertFalse(message.isReaction)
     }
