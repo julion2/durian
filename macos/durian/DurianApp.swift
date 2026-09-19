@@ -61,6 +61,7 @@ struct DurianApp: App {
     @StateObject private var settingsManager = SettingsManager.shared
     @StateObject private var appRouter = AppRouter.shared
     @StateObject private var calendarManager = CalendarManager.shared
+    @StateObject private var startupCoordinator: StartupCoordinator
     @State private var cliVersion: String = ""
 
     /// Override the macOS global appearance with the per-app
@@ -78,8 +79,9 @@ struct DurianApp: App {
     private static let notificationDelegate = NotificationDelegate()
 
     init() {
-        // Setup sync manager (creates script + launchd agent if needed)
-        SyncManager.shared.setup()
+        let coordinator = StartupCoordinator.shared
+        _startupCoordinator = StateObject(wrappedValue: coordinator)
+        coordinator.start()
 
         // Set notification delegate before requesting permission
         UNUserNotificationCenter.current().delegate = Self.notificationDelegate
@@ -102,7 +104,18 @@ struct DurianApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            Group {
+                if startupCoordinator.isReady {
+                    ContentView()
+                } else {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("Loading mail configuration…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(minWidth: 480, minHeight: 320)
+                }
+            }
                 .preferredColorScheme(appColorScheme)
         }
         .commands {
@@ -121,15 +134,22 @@ struct DurianApp: App {
 
             CommandGroup(after: .newItem) {
                 Button("Reload Keymaps") {
-                    KeymapsManager.shared.reloadKeymaps()
+                    Task {
+                        await KeymapsManager.shared.reloadKeymaps()
+                    }
                 }
                 .keyboardShortcut("k", modifiers: [.command, .shift])
+                .disabled(!startupCoordinator.allowsManualReload)
 
                 Button("Reload Config") {
-                    SettingsManager.shared.reloadSettings()
-                    ProfileManager.shared.loadProfiles()
+                    Task {
+                        async let settings: Void = SettingsManager.shared.reloadSettings()
+                        async let profiles: Void = ProfileManager.shared.reloadProfiles()
+                        _ = await (settings, profiles)
+                    }
                 }
                 .keyboardShortcut("c", modifiers: [.command, .shift])
+                .disabled(!startupCoordinator.allowsManualReload)
 
                 Divider()
 

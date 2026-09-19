@@ -154,7 +154,11 @@ func (w *WatcherManager) watchAccount(ctx context.Context, aw *accountWatcher) {
 		// outer loop reconnects with 30s backoff.
 		initOpts := &imap.SyncOptions{Quiet: true, Mailboxes: []string{"INBOX"}, Store: w.store, FilterRules: w.filterRules, Groups: w.groups, IndexedHeaders: w.indexedHeaders}
 		initSyncer := imap.NewSyncerWithClient(account, client, initOpts)
-		if _, err := initSyncer.Sync(); err != nil {
+		result, err := initSyncer.Sync()
+		if err == nil && result != nil {
+			err = result.Error
+		}
+		if err != nil {
 			w.log.Error("Initial sync failed", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		}
 
@@ -372,6 +376,9 @@ func (w *WatcherManager) syncFlagsOnly(account *config.AccountConfig, client *im
 	syncer := imap.NewSyncerWithClient(account, client, opts)
 
 	result, err := syncer.Sync()
+	if err == nil && result != nil {
+		err = result.Error
+	}
 	if err != nil {
 		w.log.Error("Upload-only sync failed", "account", account.Email, "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return
@@ -410,9 +417,11 @@ func (w *WatcherManager) syncAndNotify(account *config.AccountConfig, client *im
 
 	select {
 	case out := <-ch:
+		if out.err == nil && out.result != nil {
+			out.err = out.result.Error
+		}
 		if out.err != nil {
 			w.log.Error("Sync failed", "account", account.Email, "err", out.err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-			return
 		}
 	case <-time.After(2 * time.Minute):
 		w.log.Error("Sync timed out after 2m", "account", account.Email) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys

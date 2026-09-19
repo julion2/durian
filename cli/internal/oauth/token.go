@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 var (
@@ -96,7 +98,8 @@ func ExchangeCode(provider *Provider, clientID, clientSecret, redirectURI, code,
 	}
 
 	if tokenResp.Error != "" {
-		return nil, fmt.Errorf("token error: %s - %s", tokenResp.Error, tokenResp.ErrorDesc)
+		err := fmt.Errorf("token error: %s - %s", tokenResp.Error, tokenResp.ErrorDesc)
+		return nil, redact.ExternalError(err, "OAuth token exchange rejected: provider response "+redact.Placeholder)
 	}
 
 	return &Token{
@@ -158,7 +161,8 @@ func refreshWithScopes(provider *Provider, clientID, clientSecret string, token 
 		if tokenResp.Error == "invalid_grant" {
 			return nil, ErrTokenExpired
 		}
-		return nil, fmt.Errorf("refresh error: %s - %s", tokenResp.Error, tokenResp.ErrorDesc)
+		err := fmt.Errorf("refresh error: %s - %s", tokenResp.Error, tokenResp.ErrorDesc)
+		return nil, redact.ExternalError(err, "OAuth token refresh rejected: provider response "+redact.Placeholder)
 	}
 
 	// Keep the old refresh token if a new one wasn't provided

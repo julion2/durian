@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,13 @@ const testOwnerEmail = "me@example.com"
 // static token so no OAuth path is exercised.
 func testClient(srv *httptest.Server) *Client {
 	return NewWithToken(testOwnerEmail, srv.URL, "test-token", srv.Client())
+}
+
+func TestStatusErrorSafeLogTextOmitsResponseBody(t *testing.T) {
+	const body = "short multiword response echoing token abc123"
+	if got := (&statusError{status: http.StatusUnauthorized, body: body}).SafeLogText(); strings.Contains(got, body) {
+		t.Fatalf("SafeLogText() leaked response body: %q", got)
+	}
 }
 
 // requireBearer fails the request when the static test token is missing, so

@@ -25,9 +25,15 @@ struct AttachmentInfo: Decodable, Equatable {
 
 struct ThreadMessage: Decodable, Identifiable, Equatable {
     let id: String
+    let attachment_cache_id: String?
     let from: String
     let to: String?
     let cc: String?
+    /// Blind recipients. Only populated for a draft the user saved themselves,
+    /// and only by the full thread view — a received message has no Bcc header
+    /// and search enrichment deliberately omits the field. Dropping it here
+    /// means a reopened draft is saved without its blind recipients.
+    let bcc: String?
     let date: String
     let timestamp: Int
     let message_id: String?
@@ -38,6 +44,10 @@ struct ThreadMessage: Decodable, Identifiable, Equatable {
     let hidden_signature: String?
     let attachments: [AttachmentInfo]?
     let tags: [String]?
+
+    var attachmentCacheId: String {
+        attachment_cache_id ?? id
+    }
 
     var isDraft: Bool {
         tags?.contains("draft") ?? false
@@ -202,6 +212,7 @@ struct MailMessage: Identifiable, Hashable {
     var from: String
     var to: String?
     var cc: String?
+    var bcc: String?
     var date: String
     let timestamp: Int  // Unix timestamp for grouping
     var tags: String?
@@ -254,6 +265,28 @@ struct MailMessage: Identifiable, Hashable {
     var isDraft: Bool {
         guard let tags = tags else { return false }
         return tags.split(separator: ",").contains("draft")
+    }
+
+    /// The single projection from a decoded `ThreadMessage` onto the message
+    /// the UI reads.
+    ///
+    /// Two paths need it and they pick a different message from the thread: a
+    /// freshly loaded thread projects the newest one, cache rehydration after
+    /// a search or auto-sync projects the last one. What they must not differ
+    /// in is *which fields* they copy. When the field list was written out
+    /// twice, Bcc reached only the fresh path, so a draft opened straight from
+    /// the server kept its blind recipients while the same draft opened after
+    /// a sync silently lost them.
+    mutating func applyFields(from message: ThreadMessage) {
+        from = message.from
+        body = message.body
+        htmlBody = message.html
+        to = message.to
+        cc = message.cc
+        bcc = message.bcc
+        messageId = message.message_id
+        inReplyTo = message.in_reply_to
+        references = message.references
     }
 
     /// Body preview for list view (first ~150 chars)

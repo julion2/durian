@@ -18,7 +18,10 @@ go_library(
 go_test(
     name = "backendfactory_test",
     size = "small",
-    srcs = ["backendfactory_test.go"],
+    srcs = [
+        "backendfactory_test.go",
+        "capability_profiles_test.go",
+    ],
     embed = [":backendfactory"],
     deps = [
         "//cli/internal/backend",

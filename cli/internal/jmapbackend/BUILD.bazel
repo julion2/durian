@@ -4,7 +4,9 @@ go_library(
     name = "jmapbackend",
     srcs = [
         "client.go",
+        "cursor.go",
         "jmapbackend.go",
+        "responses.go",
         "sender.go",
     ],
     importpath = "github.com/julion2/durian/cli/internal/jmapbackend",
@@ -14,6 +16,7 @@ go_library(
         "//cli/internal/config",
         "//cli/internal/keychain",
         "//cli/internal/mailsend",
+        "//cli/internal/redact",
         "//cli/internal/smtp",
     ],
 )
@@ -23,6 +26,7 @@ go_test(
     size = "small",
     srcs = [
         "jmapbackend_test.go",
+        "operations_test.go",
         "sender_test.go",
     ],
     embed = [":jmapbackend"],
@@ -43,6 +47,7 @@ go_test(
     deps = [
         "//cli/internal/backend",
         "//cli/internal/config",
+        "//cli/internal/mail",
         "//cli/internal/mailsend",
     ],
 )

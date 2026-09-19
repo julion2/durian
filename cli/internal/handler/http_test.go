@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,11 +14,13 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/julion2/durian/cli/internal/contacts"
+	"github.com/julion2/durian/cli/internal/store"
 )
 
 // newTestRouter sets up a mux.Router with all routes, mirroring serve.go.
 func newTestRouter(h *Handler, hub *EventHub) *mux.Router {
 	r := mux.NewRouter()
+	r.UseEncodedPath()
 	r.HandleFunc("/api/v1/search", h.SearchHandler).Methods("GET")
 	r.HandleFunc("/api/v1/search/count", h.SearchCountHandler).Methods("GET")
 	r.HandleFunc("/api/v1/tags", h.ListTagsHandler).Methods("GET")
@@ -327,6 +330,69 @@ func TestDownloadAttachmentHandler_NotFound(t *testing.T) {
 	}
 }
 
+func TestDownloadAttachmentHandler_OpaqueIdentifier(t *testing.T) {
+	db := newTestStore(t)
+	msg := &store.Message{
+		StableID: "email-1", MessageID: "duplicate@example.com", Subject: "First",
+		FromAddr: "a@test", ToAddrs: "b@test", Account: "work", Mailbox: "ALL",
+		UID: 41, Date: time.Now().Unix(), CreatedAt: time.Now().Unix(), FetchedBody: true,
+	}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+	if err := db.InsertAttachment(&store.Attachment{
+		MessageDBID: msg.ID, PartID: 1, Filename: "opaque.txt", ContentType: "text/plain", Size: 7,
+	}); err != nil {
+		t.Fatalf("insert attachment: %v", err)
+	}
+
+	h := New(db, nil)
+	h.SetFetcher(&mockFetcher{data: []byte("payload")})
+	r := newTestRouter(h, nil)
+	req := httptest.NewRequest("GET", fmt.Sprintf("/api/v1/messages/local%%3A%d/attachments/1", msg.ID), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); got != "payload" {
+		t.Errorf("body = %q, want payload", got)
+	}
+}
+
+func TestDownloadAttachmentHandler_EncodedLegacyIdentifier(t *testing.T) {
+	db := newTestStore(t)
+	msg := &store.Message{
+		MessageID: "part/percent%plus+@example.com", Subject: "Legacy",
+		FromAddr: "a@test", ToAddrs: "b@test", Account: "work", Mailbox: "INBOX",
+		UID: 42, Date: time.Now().Unix(), CreatedAt: time.Now().Unix(), FetchedBody: true,
+	}
+	if err := db.InsertMessage(msg); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+	if err := db.InsertAttachment(&store.Attachment{
+		MessageDBID: msg.ID, PartID: 1, Filename: "legacy.txt", ContentType: "text/plain", Size: 7,
+	}); err != nil {
+		t.Fatalf("insert attachment: %v", err)
+	}
+
+	h := New(db, nil)
+	h.SetFetcher(&mockFetcher{data: []byte("payload")})
+	r := newTestRouter(h, nil)
+	path := fmt.Sprintf("/api/v1/messages/%s/attachments/1", url.PathEscape(msg.MessageID))
+	req := httptest.NewRequest("GET", path, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); got != "payload" {
+		t.Errorf("body = %q, want payload", got)
+	}
+}
+
 // --- Outbox ---
 
 func TestOutboxEnqueueAndList(t *testing.T) {
@@ -334,7 +400,7 @@ func TestOutboxEnqueueAndList(t *testing.T) {
 	h := New(db, nil)
 	r := newTestRouter(h, nil)
 
-	body := `{"from":"alice@x","to":["bob@x"],"subject":"Test","body":"Hello"}`
+	body := `{"idempotency_key":"send-action-1","from":"alice@x","to":["bob@x"],"subject":"Test","body":"Hello"}`
 	req := httptest.NewRequest("POST", "/api/v1/outbox/send", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -345,9 +411,22 @@ func TestOutboxEnqueueAndList(t *testing.T) {
 	}
 
 	var enqResp map[string]any
-	json.NewDecoder(w.Body).Decode(&enqResp)
+	if err := json.NewDecoder(w.Body).Decode(&enqResp); err != nil {
+		t.Fatal(err)
+	}
 	if enqResp["ok"] != true {
 		t.Errorf("enqueue ok = %v", enqResp["ok"])
+	}
+	firstID := enqResp["id"]
+	req = httptest.NewRequest("POST", "/api/v1/outbox/send", strings.NewReader(body))
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	var retryResp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&retryResp); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != http.StatusOK || retryResp["id"] != firstID {
+		t.Fatalf("idempotent enqueue retry status=%d response=%v, want original id %v", w.Code, retryResp, firstID)
 	}
 
 	// List outbox
@@ -366,6 +445,15 @@ func TestOutboxEnqueueAndList(t *testing.T) {
 	}
 	if items[0]["subject"] != "Test" {
 		t.Errorf("subject = %v", items[0]["subject"])
+	}
+	if messageID, ok := items[0]["message_id"].(string); !ok || !strings.HasPrefix(messageID, "<") || !strings.HasSuffix(messageID, "@x>") {
+		t.Errorf("message_id = %#v, want durable sender-scoped correlation ID", items[0]["message_id"])
+	}
+	if inFlight, ok := items[0]["in_flight"].(bool); !ok || inFlight {
+		t.Errorf("in_flight = %#v, want false", items[0]["in_flight"])
+	}
+	if confirmed, ok := items[0]["delivery_confirmed"].(bool); !ok || confirmed {
+		t.Errorf("delivery_confirmed = %#v, want false", items[0]["delivery_confirmed"])
 	}
 }
 
@@ -401,6 +489,22 @@ func TestOutboxEnqueue_MissingTo(t *testing.T) {
 	}
 }
 
+func TestOutboxEnqueue_MissingIdempotencyKey(t *testing.T) {
+	db := newTestStore(t)
+	h := New(db, nil)
+	r := newTestRouter(h, nil)
+
+	body := `{"from":"alice@x","to":["bob@x"],"subject":"Test"}`
+	req := httptest.NewRequest("POST", "/api/v1/outbox/send", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "idempotency_key") {
+		t.Errorf("status = %d body=%q, want missing idempotency key error", w.Code, w.Body.String())
+	}
+}
+
 func TestOutboxEnqueue_InvalidJSON(t *testing.T) {
 	db := newTestStore(t)
 	h := New(db, nil)
@@ -420,7 +524,7 @@ func TestOutboxEnqueueWithDelay(t *testing.T) {
 	h := New(db, nil)
 	r := newTestRouter(h, nil)
 
-	body := `{"from":"alice@x","to":["bob@x"],"subject":"Delayed","delay_seconds":5}`
+	body := `{"idempotency_key":"delayed-action","from":"alice@x","to":["bob@x"],"subject":"Delayed","delay_seconds":5}`
 	req := httptest.NewRequest("POST", "/api/v1/outbox/send", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -444,7 +548,7 @@ func TestOutboxDelete(t *testing.T) {
 	r := newTestRouter(h, nil)
 
 	// Enqueue first
-	body := `{"from":"alice@x","to":["bob@x"],"subject":"Delete me"}`
+	body := `{"idempotency_key":"delete-action","from":"alice@x","to":["bob@x"],"subject":"Delete me"}`
 	req := httptest.NewRequest("POST", "/api/v1/outbox/send", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -473,6 +577,30 @@ func TestOutboxDelete(t *testing.T) {
 	if len(items) != 0 {
 		t.Errorf("got %d items after delete, want 0", len(items))
 	}
+}
+
+func TestOutboxDeleteRejectsClaimedDelivery(t *testing.T) {
+	db := newTestStore(t)
+	h := New(db, nil)
+	r := newTestRouter(h, nil)
+	id, err := db.Enqueue(`{"from":"alice@x","to":["bob@x"],"subject":"Claimed"}`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item, err := db.ClaimNextOutboxItem(); err != nil || item == nil || item.ID != id {
+		t.Fatalf("claim = %#v, %v", item, err)
+	}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("DELETE", fmt.Sprintf("/api/v1/outbox/%d", id), nil))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("Undo after claim status = %d, want 409; body=%s", w.Code, w.Body.String())
+	}
+	items, err := db.ListOutbox()
+	if err != nil || len(items) != 1 || !items[0].InFlight {
+		t.Fatalf("claimed row after Undo = %#v, %v", items, err)
+	}
+
 }
 
 func TestOutboxDelete_InvalidID(t *testing.T) {

@@ -1,9 +1,9 @@
 // Package backend defines the provider-agnostic mail sync abstraction.
 //
 // IMAP, Microsoft Graph, Gmail REST, and JMAP backends implement Backend, so the
-// sync engine, store, tags and search stay provider-neutral. Message identity is
-// always the RFC822 Message-ID plus the account; RemoteRef is only the provider's
-// own transient handle for follow-up operations and is never used as a primary key.
+// sync engine, store, tags and search stay provider-neutral. Backends that expose
+// an immutable object identifier populate Message.StableID; RFC822 Message-ID is
+// retained as message metadata and as the fallback identity for older protocols.
 package backend
 
 import (
@@ -41,14 +41,16 @@ type Folder struct {
 	Selectable bool
 }
 
-// RemoteRef is a provider-specific, non-durable handle to one message inside a
-// folder. IMAP: Folder is the mailbox, ID is the decimal UID. Graph: Folder is
-// the folder id, ID is the message id. A ref MAY become invalid across syncs
-// (e.g. an IMAP UIDVALIDITY reset), so it is never persisted as a key — the
-// durable key is (Message.MessageID, account).
+// RemoteRef is a provider-specific handle to one message inside a folder. IMAP:
+// Folder is the mailbox, ID is the decimal UID. Graph: Folder is the folder id,
+// ID is the message id. A ref MAY become invalid across syncs (e.g. an IMAP
+// UIDVALIDITY reset), so it is used for follow-up operations, not as identity.
 type RemoteRef struct {
 	Folder string
 	ID     string
+	// MessageID is an optional stable identity precondition for operations on
+	// providers whose handles can be reused (notably IMAP after UIDVALIDITY).
+	MessageID string
 }
 
 // ErrRefGone reports that a RemoteRef no longer resolves to a message on the
@@ -65,6 +67,12 @@ var ErrRefGone = errors.New("remote ref no longer exists on server")
 // ref; the engine reconciles that subset, reports the error, and leaves omitted
 // refs pending without pinning message-download progress.
 var ErrPartialFlags = errors.New("some remote flags remain unresolved")
+
+// ErrSnapshotInvalidated reports that a paged authoritative snapshot no
+// longer describes one coherent provider view. The engine must discard its
+// durable staging and restart from the pre-snapshot cursor; resuming the page
+// token would otherwise fail forever or reconcile an inconsistent presence set.
+var ErrSnapshotInvalidated = errors.New("provider snapshot was invalidated while paging")
 
 // Cursor is an opaque, per-folder incremental-sync token, owned and interpreted
 // solely by the Backend that issued it. The sync engine persists it verbatim
@@ -85,7 +93,13 @@ type Flags struct {
 
 // Message is a fetched message in Durian's neutral model.
 type Message struct {
-	// MessageID is the RFC822 Message-ID header — the stable cross-provider key.
+	// StableID is an immutable, provider-owned object identifier when the
+	// protocol supplies one (for example JMAP Email.id). It is unique within the
+	// account and takes precedence over MessageID for local row identity.
+	StableID string
+	// MessageID is the RFC822 Message-ID header. It is optional and may be
+	// duplicated; it remains the fallback identity for protocols without a
+	// provider-owned stable object id.
 	MessageID string
 	// Ref is the provider handle for follow-up body/flag/move operations.
 	Ref RemoteRef
@@ -114,8 +128,8 @@ type Deletion struct {
 // in a folder since the caller's cursor, plus a fresh cursor to persist.
 type FetchResult struct {
 	// Messages are the new or updated messages, with bodies unless the backend
-	// fetches metadata-first; the engine writes them to the store keyed by
-	// (MessageID, account).
+	// fetches metadata-first; the engine writes them to the store by StableID
+	// when present and otherwise by (MessageID, account).
 	Messages []Message
 	// Deleted are messages the source no longer holds in this folder; the engine
 	// resolves each to (MessageID, account) and untags/removes it.
@@ -147,6 +161,17 @@ type FetchResult struct {
 type Capabilities struct {
 	// PushWatch reports real push/delta notifications rather than poll-only.
 	PushWatch bool
+	// BodyBatchLimit caps full message bodies retained by one provider fetch.
+	// Zero uses the engine's configured batch size. Backends whose messages can
+	// be unusually large should set this to bound peak memory independently of
+	// metadata-only snapshot batches.
+	BodyBatchLimit int
+	// InitialSnapshotIsAuthoritative reports that FetchMessages with an empty
+	// cursor emits Present refs for every page of a complete provider snapshot.
+	// When local rows already exist despite the missing cursor (for example after
+	// cursor-file loss), the engine finishes every page and reconciles stale rows
+	// instead of applying the normal first-sync message cap.
+	InitialSnapshotIsAuthoritative bool
 	// FlagChangesInDelta reports that FetchMessages already surfaces server-side
 	// flag/read-state changes (a message reappears in the delta with its new
 	// flags). The engine then reconciles flags from the delta stream instead of
@@ -158,12 +183,14 @@ type Capabilities struct {
 	// folder-role tag mapping. Durian-local tags (rules, flags) are left intact.
 	LabelsAreTags bool
 	// AnsweredUnsupported reports that the backend cannot persist the \Answered
-	// flag (Gmail has no answered label). The engine then excludes Answered from
-	// the three-way flag merge for this backend: a local "replied" tag would
-	// otherwise be uploaded (silently dropped by the provider), recorded in the
-	// baseline, then removed on the next sync when the server reports the message
-	// as un-answered — a ping-pong that flips the tag every sync. Default false
-	// keeps the full merge for IMAP/Graph, which do round-trip \Answered.
+	// flag — Gmail has no answered label, and Graph's message resource has no
+	// answered property, so its ApplyFlags translates only isRead and
+	// flagStatus. The engine then excludes Answered from the three-way flag
+	// merge for this backend: a local "replied" tag would otherwise be uploaded
+	// (silently dropped by the provider), recorded in the baseline, then removed
+	// on the next sync when the server reports the message as un-answered — a
+	// ping-pong that flips the tag every sync. Default false keeps the full
+	// merge for IMAP and JMAP, which do round-trip \Answered.
 	AnsweredUnsupported bool
 }
 
@@ -235,6 +262,33 @@ type LabelWriter interface {
 	ApplyLabels(ctx context.Context, ref RemoteRef, add, remove []string) error
 }
 
+// ArbitraryLabelWriter extends LabelWriter for a provider that can represent
+// Durian-local tags without first creating server containers. JMAP implements
+// this with custom Email keywords. The engine includes every tag accepted by
+// ManagesLabelTag in the normal durable label-baseline reconciliation.
+type ArbitraryLabelWriter interface {
+	LabelWriter
+	ManagesLabelTag(tag string) bool
+}
+
+// TagMutationWriter applies an explicit user tag intent as a provider-native
+// property patch. It is used for flag tags whose inverse semantics (notably
+// unread ↔ $seen) should not be reconstructed from ambient local state.
+type TagMutationWriter interface {
+	ApplyTagMutation(ctx context.Context, ref RemoteRef, tag string, add bool) error
+}
+
+// LegacyIdentityMigrator upgrades cursors and stable provider identities that
+// predate account scoping. The engine applies Prefix to the matching local
+// rows in one transaction before persisting Cursor and before uploading queued
+// mutations. Cursor must force an authoritative provider snapshot so absent
+// legacy rows and their queued intent are removed before any upload. A backend
+// returns ok only for a recognized legacy cursor; a non-empty, different
+// account scope is a retarget and must never migrate.
+type LegacyIdentityMigrator interface {
+	LegacyIdentityMigration(cursor Cursor) (scoped Cursor, prefix string, ok bool)
+}
+
 // SnapshotHydrator is implemented by metadata-first backends. A replacement
 // snapshot can list every remote ref cheaply; the engine then asks for full
 // messages only for refs that are not already in the local read model before it
@@ -255,4 +309,13 @@ type SnapshotHydrator interface {
 	FetchSnapshotMetadata(ctx context.Context, refs []RemoteRef) (SnapshotBatch, error)
 	// FetchSnapshotMessages returns complete messages for locally absent refs.
 	FetchSnapshotMessages(ctx context.Context, refs []RemoteRef) (SnapshotBatch, error)
+}
+
+// IdentityCursorUpdater is implemented by backends whose replacement cursor
+// stores Message-IDs alongside transient remote refs. During recovery the
+// engine may adopt a pre-reset synthetic ID after content matching; the backend
+// must write those canonical IDs into the same page cursor before it is
+// checkpointed or used to fetch the next page.
+type IdentityCursorUpdater interface {
+	AdoptMessageIdentities(cursor Cursor, identities map[string]string) (Cursor, error)
 }

@@ -29,6 +29,8 @@ import (
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/imap"
+	durianmail "github.com/julion2/durian/cli/internal/mail"
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 // roleMappings pairs IMAP SPECIAL-USE roles with their backend.Role in a fixed
@@ -59,6 +61,7 @@ type Backend struct {
 
 // Compile-time check that Backend satisfies the interface.
 var _ backend.Backend = (*Backend)(nil)
+var _ backend.IdentityCursorUpdater = (*Backend)(nil)
 
 // New creates a connected, authenticated IMAP backend for the given account.
 func New(account *config.AccountConfig) (*Backend, error) {
@@ -102,7 +105,7 @@ func (b *Backend) FetchFolders(_ context.Context) ([]backend.Folder, error) {
 
 // fetchFoldersOnce performs one folder-listing pass (no reconnect handling).
 func (b *Backend) fetchFoldersOnce() ([]backend.Folder, error) {
-	names, err := b.client.GetSyncMailboxes()
+	mailboxes, err := b.client.GetSyncMailboxInfos()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list sync mailboxes: %w", err)
 	}
@@ -110,24 +113,24 @@ func (b *Backend) fetchFoldersOnce() ([]backend.Folder, error) {
 	// Resolve special-use roles. A mailbox keeps the first role that claims it.
 	roleByName := make(map[string]backend.Role)
 	for _, m := range roleMappings {
-		name, err := b.client.FindMailboxByRole(m.imapRole)
-		if err != nil {
-			continue // Role not present on this server
+		name, roleErr := imap.FindMailboxByRoleIn(mailboxes, m.imapRole)
+		if roleErr != nil {
+			continue // This successful LIST snapshot has no mailbox for the role.
 		}
 		if _, taken := roleByName[name]; !taken {
 			roleByName[name] = m.role
 		}
 	}
 
-	folders := make([]backend.Folder, 0, len(names))
-	for _, name := range names {
-		role := roleByName[name]
-		if strings.EqualFold(name, "INBOX") {
+	folders := make([]backend.Folder, 0, len(mailboxes))
+	for _, mailbox := range mailboxes {
+		role := roleByName[mailbox.Name]
+		if strings.EqualFold(mailbox.Name, "INBOX") {
 			role = backend.RoleInbox
 		}
 		folders = append(folders, backend.Folder{
-			Name:    name,
-			Display: name,
+			Name:    mailbox.Name,
+			Display: mailbox.Name,
 			Role:    role,
 			// GetSyncMailboxes already filters \Noselect containers.
 			Selectable: true,
@@ -209,11 +212,30 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 		for _, uid := range newUIDs {
 			requested[uid] = struct{}{}
 		}
-
+		fetchedByUID := make(map[uint32]*goimap.Message, len(fetched))
 		for _, msg := range fetched {
 			if _, ok := requested[msg.Uid]; !ok {
 				return result, fmt.Errorf("fetch in %s returned unexpected or duplicate UID %d", folder, msg.Uid)
 			}
+			if _, duplicate := fetchedByUID[msg.Uid]; duplicate {
+				return result, fmt.Errorf("fetch in %s returned unexpected or duplicate UID %d", folder, msg.Uid)
+			}
+			fetchedByUID[msg.Uid] = msg
+		}
+
+		// During a replacement, reapply the requested newest-first order so
+		// duplicate identity recovery pairs the same relative copies before and
+		// after a UIDVALIDITY reset. Preserve server order in ordinary syncs.
+		ordered := fetched
+		if fullReplacement {
+			ordered = make([]*goimap.Message, 0, len(fetched))
+			for _, uid := range newUIDs {
+				if msg, ok := fetchedByUID[uid]; ok {
+					ordered = append(ordered, msg)
+				}
+			}
+		}
+		for _, msg := range ordered {
 			delete(requested, msg.Uid)
 			raw := readRawBody(msg.Body)
 			if len(raw) == 0 {
@@ -229,8 +251,7 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 
 			messageID := extractMessageID(raw)
 			if messageID == "" {
-				// Synthetic Message-ID so the message is not lost (mirrors syncer behavior).
-				messageID = fmt.Sprintf("durian-synthetic-%d-%s@%s", msg.Uid, folder, b.account.AccountIdentifier())
+				messageID = durianmail.SyntheticMessageID(status.UidValidity, msg.Uid, folder, b.account.AccountIdentifier())
 				slog.Warn("Message has no Message-ID, using synthetic ID", "module", "IMAPBACKEND",
 					"folder", folder, "uid", msg.Uid, "synthetic_id", messageID)
 			}
@@ -381,28 +402,26 @@ func (b *Backend) FetchFlags(_ context.Context, folder string, refs []backend.Re
 	return result, nil
 }
 
-// Move relocates ref into destFolder via the IMAP copy + \Deleted + expunge
-// dance. IMAP (without UIDPLUS support in go-imap v1) does not report the new
-// UID, so the returned ref has an empty ID; the next sync of destFolder
-// re-establishes the mapping via Message-ID.
+// Move relocates ref into destFolder with UID MOVE. go-imap v1 does not expose
+// the destination UID, so the returned ref has an empty ID; the next sync of
+// destFolder re-establishes the mapping via Message-ID.
 func (b *Backend) Move(_ context.Context, ref backend.RemoteRef, destFolder string) (backend.RemoteRef, error) {
 	uid, err := parseUID(ref)
 	if err != nil {
 		return backend.RemoteRef{}, err
 	}
+	if ref.MessageID == "" {
+		return backend.RemoteRef{}, fmt.Errorf("ref has no Message-ID identity")
+	}
 
 	if _, err := b.client.SelectMailbox(ref.Folder); err != nil {
 		return backend.RemoteRef{}, fmt.Errorf("failed to select %s: %w", ref.Folder, err)
 	}
-	if err := b.client.CopyToMailbox(uid, destFolder); err != nil {
-		return backend.RemoteRef{}, fmt.Errorf("failed to copy UID %d to %s: %w", uid, destFolder, err)
-	}
-	// Delete marks \Deleted and expunges (removes the source copy).
-	if err := b.client.Delete(uid); err != nil {
-		return backend.RemoteRef{}, fmt.Errorf("failed to delete source UID %d in %s: %w", uid, ref.Folder, err)
+	if err := b.client.MoveMessageToMailbox(uid, ref.MessageID, destFolder); err != nil {
+		return backend.RemoteRef{}, fmt.Errorf("failed to move UID %d to %s: %w", uid, destFolder, err)
 	}
 
-	return backend.RemoteRef{Folder: destFolder, ID: ""}, nil
+	return backend.RemoteRef{Folder: destFolder, ID: "", MessageID: ref.MessageID}, nil
 }
 
 // Append stores msg into folder. The go-imap v1 client does not expose
@@ -511,10 +530,15 @@ func (b *Backend) withReconnect(op func() error) error {
 
 	slog.Warn("Connection lost, reconnecting", "module", "IMAPBACKEND", "err", err)
 	if rerr := b.client.Reconnect(); rerr != nil {
-		return fmt.Errorf("%w (reconnect failed: %v)", err, rerr)
+		return reconnectFailure(err, rerr)
 	}
 	slog.Debug("Reconnected, retrying operation", "module", "IMAPBACKEND")
 	return op()
+}
+
+func reconnectFailure(operationErr, reconnectErr error) error {
+	err := fmt.Errorf("%w (reconnect failed: %v)", operationErr, reconnectErr)
+	return redact.ExternalError(err, "IMAP operation and reconnect failed: server responses "+redact.Placeholder)
 }
 
 // isConnectionError reports whether err is a dropped/broken IMAP connection.
@@ -604,6 +628,32 @@ func toFlagState(f backend.Flags) imap.FlagState {
 // formatUID renders a UID as the decimal RemoteRef.ID.
 func formatUID(uid uint32) string {
 	return strconv.FormatUint(uint64(uid), 10)
+}
+
+// AdoptMessageIdentities replaces the provisional synthetic IDs recorded in an
+// IMAP page cursor with the pre-reset IDs selected by the sync engine.
+func (b *Backend) AdoptMessageIdentities(cursor backend.Cursor, identities map[string]string) (backend.Cursor, error) {
+	state, replacement, err := decodeCursor(cursor)
+	if err != nil {
+		return nil, fmt.Errorf("decode cursor for identity recovery: %w", err)
+	}
+	for ref, messageID := range identities {
+		uid, err := strconv.ParseUint(ref, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid IMAP UID %q during identity recovery: %w", ref, err)
+		}
+		previous, ok := state.GetMessageID(uint32(uid))
+		if !ok {
+			return nil, fmt.Errorf("IMAP cursor has no message for recovered UID %d", uid)
+		}
+		delete(state.MessageIDToUID, previous)
+		state.SetMessageID(uint32(uid), messageID)
+	}
+	updated, err := encodeCursor(state, replacement)
+	if err != nil {
+		return nil, fmt.Errorf("encode cursor after identity recovery: %w", err)
+	}
+	return updated, nil
 }
 
 // parseUID parses the decimal UID out of a RemoteRef.

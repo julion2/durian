@@ -3,19 +3,34 @@ package smtp
 import (
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/smtp"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/redact"
 )
+
+// dataCompletionUnknown marks transport loss after the complete DATA body was
+// submitted, while waiting for the server's final acceptance response.
+type dataCompletionUnknown struct{ error }
+
+func (e dataCompletionUnknown) Unwrap() error { return e.error }
 
 const (
 	// DefaultTimeout for SMTP operations
 	DefaultTimeout = 30 * time.Second
 )
+
+func smtpServerError(err error, operation string) error {
+	return redact.ExternalError(err, operation+": SMTP server response "+redact.Placeholder)
+}
 
 // Auth represents authentication credentials
 type Auth interface {
@@ -124,7 +139,7 @@ func (c *Client) Send(msg *Message) error {
 		client, err = smtp.NewClient(conn, c.Host)
 	}
 	if err != nil {
-		return fmt.Errorf("failed to create SMTP client: %w", err)
+		return smtpServerError(fmt.Errorf("failed to create SMTP client: %w", err), "create SMTP client failed")
 	}
 	defer client.Close()
 
@@ -136,7 +151,7 @@ func (c *Client) Send(msg *Message) error {
 		}
 	}
 	if err := client.Hello(ehloHost); err != nil {
-		return fmt.Errorf("HELO failed: %w", err)
+		return smtpServerError(fmt.Errorf("HELO failed: %w", err), "SMTP HELO failed")
 	}
 
 	// Require STARTTLS for all non-implicit-TLS connections
@@ -146,7 +161,7 @@ func (c *Client) Send(msg *Message) error {
 				ServerName: c.Host,
 			}
 			if err := client.StartTLS(config); err != nil {
-				return fmt.Errorf("STARTTLS failed: %w", err)
+				return smtpServerError(fmt.Errorf("STARTTLS failed: %w", err), "SMTP STARTTLS failed")
 			}
 			slog.Debug("STARTTLS negotiated", "module", "SMTP", "host", c.Host, "port", c.Port)
 		} else {
@@ -172,7 +187,7 @@ func (c *Client) Send(msg *Message) error {
 		}
 
 		if err := client.Auth(smtpAuth); err != nil {
-			return fmt.Errorf("authentication failed: %w", err)
+			return smtpServerError(fmt.Errorf("authentication failed: %w", err), "SMTP authentication failed")
 		}
 	}
 
@@ -194,7 +209,7 @@ func (c *Client) Send(msg *Message) error {
 	// base64 (always 7-bit clean) and our addresses are ASCII, so dropping
 	// both extension declarations is a no-op for content semantics.
 	if err := mailFromPlain(client, from); err != nil {
-		return fmt.Errorf("MAIL FROM failed: %w", err)
+		return smtpServerError(fmt.Errorf("MAIL FROM failed: %w", err), "SMTP MAIL FROM failed")
 	}
 
 	// Set recipients (extract bare email from "Name <email>" format)
@@ -204,36 +219,62 @@ func (c *Client) Send(msg *Message) error {
 			return fmt.Errorf("invalid recipient address %q: %w", to, err)
 		}
 		if err := client.Rcpt(rcpt); err != nil {
-			return fmt.Errorf("RCPT TO failed for %s: %w", rcpt, err)
+			return smtpServerError(fmt.Errorf("RCPT TO failed for %s: %w", rcpt, err), "SMTP RCPT TO failed")
 		}
 	}
 
-	// Send message data
-	wc, err := client.Data()
-	if err != nil {
-		return fmt.Errorf("DATA failed: %w", err)
-	}
-
-	// Build and write message
+	// Render completely before DATA. Once DATA begins, closing its writer sends
+	// the terminating dot and can submit whatever was written, so build failures
+	// must happen before the irreversible protocol phase.
 	data, err := msg.Build()
 	if err != nil {
-		wc.Close()
 		return fmt.Errorf("failed to build message: %w", err)
 	}
 
-	if _, err := wc.Write(data); err != nil {
-		wc.Close()
-		return fmt.Errorf("failed to write message: %w", err)
+	// Send message data.
+	wc, err := client.Data()
+	if err != nil {
+		return smtpServerError(fmt.Errorf("DATA failed: %w", err), "SMTP DATA failed")
 	}
-
-	if err := wc.Close(); err != nil {
-		return fmt.Errorf("failed to complete message: %w", err)
+	if err := writeSMTPData(wc, data); err != nil {
+		return err
 	}
 
 	// Quit gracefully
 	client.Quit()
 
 	return nil
+}
+
+type smtpDataWriter interface {
+	Write([]byte) (int, error)
+	Close() error
+}
+
+func writeSMTPData(w smtpDataWriter, data []byte) error {
+	n, err := w.Write(data)
+	if err != nil {
+		// Do not close after a failed write: net/smtp's Close sends the DATA
+		// terminator and could turn a locally retryable write error into an
+		// accepted partial message. Closing the connection aborts the transaction.
+		return fmt.Errorf("failed to write message: %w", err)
+	}
+	if n != len(data) {
+		return fmt.Errorf("failed to write message: %w", io.ErrShortWrite)
+	}
+	if err := w.Close(); err != nil {
+		return classifyDataCompletionError(err)
+	}
+	return nil
+}
+
+func classifyDataCompletionError(err error) error {
+	wrapped := smtpServerError(fmt.Errorf("failed to complete message: %w", err), "complete SMTP message failed")
+	var responseErr *textproto.Error
+	if errors.As(err, &responseErr) {
+		return wrapped
+	}
+	return dataCompletionUnknown{wrapped}
 }
 
 // Send is a convenience function to send an email

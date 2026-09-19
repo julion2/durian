@@ -3,9 +3,14 @@ package oauth
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 func TestGeneratePKCE(t *testing.T) {
@@ -176,6 +181,51 @@ func TestTokenExpiry(t *testing.T) {
 
 	if !token.IsExpired() {
 		t.Error("Token should be expired")
+	}
+}
+
+func TestTokenEndpointErrorsAreMarkedSafeForLogs(t *testing.T) {
+	const providerText = "short provider description echoing authorization code secret-code"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"error":"provider_error","error_description":"` + providerText + `"}`))
+	}))
+	t.Cleanup(server.Close)
+	provider := &Provider{Name: "test", TokenEndpoint: server.URL}
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "exchange",
+			call: func() error {
+				_, err := ExchangeCode(provider, "client", "", "http://localhost/callback", "secret-code", "verifier")
+				return err
+			},
+		},
+		{
+			name: "refresh",
+			call: func() error {
+				_, err := RefreshAccessToken(provider, "client", "", &Token{RefreshToken: "secret-refresh"})
+				return err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.call()
+			if err == nil || !strings.Contains(err.Error(), providerText) {
+				t.Fatalf("error = %v, want original provider text for the caller", err)
+			}
+			var safeErr redact.SafeLogError
+			if !errors.As(err, &safeErr) {
+				t.Fatalf("error %T is not marked safe for logging", err)
+			}
+			if strings.Contains(safeErr.SafeLogText(), providerText) || !strings.Contains(safeErr.SafeLogText(), redact.Placeholder) {
+				t.Fatalf("safe log text = %q", safeErr.SafeLogText())
+			}
+		})
 	}
 }
 

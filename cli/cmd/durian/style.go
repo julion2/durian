@@ -6,9 +6,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"unicode/utf8"
+	"unicode"
 
 	"github.com/fatih/color"
+	"github.com/rivo/uniseg"
 )
 
 // Shared terminal styling for durian's runtime output. This is a thin semantic
@@ -105,7 +106,58 @@ var ansiSGRPattern = regexp.MustCompile("\x1b\\[[0-9;]*m")
 // visibleWidth returns the display width (in runes) of s with ANSI SGR
 // sequences stripped.
 func visibleWidth(s string) int {
-	return utf8.RuneCountInString(ansiSGRPattern.ReplaceAllString(s, ""))
+	return uniseg.StringWidth(ansiSGRPattern.ReplaceAllString(s, ""))
+}
+
+// humanText makes untrusted mail, contact, and calendar text safe to print to
+// a terminal. Newlines are retained only for detail bodies; terminal controls
+// and bidirectional overrides are rendered visibly instead of interpreted.
+func humanText(s string, multiline bool) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r == '\n' && multiline:
+			b.WriteRune(r)
+		case r == '\n' || r == '\r' || r == '\t':
+			b.WriteByte(' ')
+		case unicode.IsControl(r) || isBidiControl(r):
+			fmt.Fprintf(&b, "⟦U+%04X⟧", r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func isBidiControl(r rune) bool {
+	return r == '\u061c' || r == '\u200e' || r == '\u200f' ||
+		(r >= '\u202a' && r <= '\u202e') || (r >= '\u2066' && r <= '\u2069')
+}
+
+func truncate(s string, maxWidth int) string {
+	s = humanText(s, false)
+	if maxWidth <= 0 || visibleWidth(s) <= maxWidth {
+		return s
+	}
+	suffix := "..."
+	target := maxWidth - visibleWidth(suffix)
+	if target < 0 {
+		target = maxWidth
+		suffix = ""
+	}
+	var b strings.Builder
+	width := 0
+	graphemes := uniseg.NewGraphemes(s)
+	for graphemes.Next() {
+		cluster := graphemes.Str()
+		clusterWidth := uniseg.StringWidth(cluster)
+		if width+clusterWidth > target {
+			break
+		}
+		b.WriteString(cluster)
+		width += clusterWidth
+	}
+	return b.String() + suffix
 }
 
 // padVisible right-pads s with spaces to visible width w (styled text keeps

@@ -52,6 +52,9 @@ func runValidate(cmd *cobra.Command, args []string) error {
 	configPath := config.DefaultPath()
 	if cfgFile != "" {
 		configPath = cfgFile
+		if !config.Exists(configPath) {
+			return fmt.Errorf("config file not found: %s", config.ExpandPath(configPath))
+		}
 	}
 
 	if config.Exists(configPath) {

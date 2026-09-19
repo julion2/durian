@@ -32,10 +32,11 @@ type SaveResult struct {
 }
 
 // Save saves a draft to the IMAP Drafts folder
-// If replaceMessageID is provided, the old draft will be deleted first
+// If replaceMessageID is provided, the old draft is deleted only after the new
+// draft has been appended successfully.
 func (s *Service) Save(msg *smtp.Message, replaceMessageID string) (*SaveResult, error) {
 	// Build the RFC822 message
-	messageData, err := msg.Build()
+	messageData, err := msg.BuildDraft()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build message: %w", err)
 	}
@@ -60,20 +61,20 @@ func (s *Service) Save(msg *smtp.Message, replaceMessageID string) (*SaveResult,
 		return nil, fmt.Errorf("failed to find Drafts mailbox: %w", err)
 	}
 
-	// If replacing an existing draft, delete it first
-	if replaceMessageID != "" {
-		if err := s.deleteByMessageID(client, draftsMailbox, replaceMessageID); err != nil {
-			// Log but don't fail - the old draft might not exist anymore
-			slog.Warn("Failed to delete old draft", // encgrep:allow word "draft" in message text, no draft value logged
-				"module", "DRAFT", "message_id", replaceMessageID, "err", err)
-		}
-	}
-
 	// Append the new draft with \Draft and \Seen flags
 	flags := []string{imap.DraftFlag, imap.SeenFlag}
 	uid, err := client.Append(draftsMailbox, flags, time.Now(), messageData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to append draft: %w", err)
+	}
+
+	// Delete the old draft only after the replacement is safely persisted.
+	if replaceMessageID != "" {
+		if err := s.deleteByMessageID(client, draftsMailbox, replaceMessageID); err != nil {
+			// Log but don't fail - the old draft might not exist anymore.
+			slog.Warn("Failed to delete old draft", // encgrep:allow word "draft" in message text, no draft value logged
+				"module", "DRAFT", "message_id", replaceMessageID, "err", err)
+		}
 	}
 
 	return &SaveResult{
@@ -122,8 +123,9 @@ func (s *Service) deleteByMessageID(client *imapClient.Client, mailbox, messageI
 		return fmt.Errorf("message not found: %s", messageID)
 	}
 
-	// Delete the message
-	if err := client.Delete(uid); err != nil {
+	// Delete only the identity that was resolved above. The client requires
+	// UIDPLUS and uses targeted UID EXPUNGE rather than global EXPUNGE.
+	if err := client.DeleteMessage(uid, messageID); err != nil {
 		return fmt.Errorf("failed to delete message: %w", err)
 	}
 

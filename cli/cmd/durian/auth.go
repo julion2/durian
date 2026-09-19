@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -69,6 +68,9 @@ func init() {
 }
 
 func runAuthLogin(cmd *cobra.Command, args []string) error {
+	if noInput {
+		return errors.New("authentication requires input; remove --no-input")
+	}
 	identifier := args[0]
 
 	// Get config
@@ -191,6 +193,9 @@ var stdinPromptReader = bufio.NewReader(os.Stdin)
 
 // promptPassword securely prompts for a password (hides input)
 func promptPassword(prompt string) (string, error) {
+	if noInput {
+		return "", errors.New("password input is disabled by --no-input")
+	}
 	fmt.Fprint(os.Stderr, prompt)
 
 	// Check if stdin is a terminal
@@ -220,27 +225,33 @@ func runAuthStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(cfg.Accounts) == 0 {
+		if jsonOutput {
+			return writeJSON([]any{})
+		}
 		fmt.Println("No accounts configured.") // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		return nil
 	}
 
 	if jsonOutput {
 		type accountStatus struct {
-			Email    string `json:"email"`
-			Alias    string `json:"alias,omitempty"`
-			AuthType string `json:"auth_type"`
-			Status   string `json:"status"`
+			Account   string `json:"account"`
+			Canonical string `json:"canonical"`
+			Email     string `json:"email"`
+			AuthType  string `json:"auth_type"`
+			Status    string `json:"status"`
+			Default   bool   `json:"default"`
 		}
-		var statuses []accountStatus
+		statuses := make([]accountStatus, 0, len(cfg.Accounts))
 		for _, account := range cfg.Accounts {
 			statuses = append(statuses, accountStatus{
-				Email:    account.Email,
-				Alias:    account.Alias,
-				AuthType: getAuthType(&account),
-				Status:   getAccountStatusShort(&account),
+				Account: account.Alias, Canonical: account.AccountIdentifier(), Email: account.Email,
+				AuthType: getAuthType(&account), Status: getAccountStatusShort(&account), Default: account.Default,
 			})
+			if statuses[len(statuses)-1].Account == "" {
+				statuses[len(statuses)-1].Account = account.Name
+			}
 		}
-		return json.NewEncoder(os.Stdout).Encode(statuses)
+		return writeJSON(statuses)
 	}
 
 	fmt.Println("Authentication Status:")

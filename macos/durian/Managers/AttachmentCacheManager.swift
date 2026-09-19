@@ -119,7 +119,7 @@ class AttachmentCacheManager: ObservableObject {
         for message in messages {
             guard let attachments = message.attachments, !attachments.isEmpty else { continue }
             for attachment in attachments {
-                let key = cacheKey(messageId: message.id, partId: attachment.partId)
+                let key = cacheKey(messageId: message.attachmentCacheId, partId: attachment.partId)
                 guard index[key] == nil else { continue }
                 guard prefetchTasks[key] == nil else { continue }
 
@@ -131,7 +131,7 @@ class AttachmentCacheManager: ObservableObject {
                             messageId: message.id,
                             partId: attachment.partId
                         )
-                        put(messageId: message.id, partId: attachment.partId,
+                        put(messageId: message.attachmentCacheId, partId: attachment.partId,
                             filename: attachment.filename, data: data)
                         Log.debug("CACHE", "Prefetched \(attachment.filename) (\(data.count) bytes)")
                     } catch {

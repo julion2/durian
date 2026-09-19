@@ -36,7 +36,7 @@ the selected window (the next 7 days by default).`,
   durian calendar list --from 2026-08-01 --to 2026-08-31
   durian calendar list --calendar "Team" --json`,
 	Args:              cobra.ArbitraryArgs,
-	ValidArgsFunction: completeAccounts,
+	ValidArgsFunction: completeCalendarAccounts,
 	RunE:              runCalendarList,
 }
 
@@ -101,7 +101,7 @@ func init() {
 	for _, c := range []*cobra.Command{calendarListCmd, calendarSearchCmd, calendarShowCmd} {
 		c.Flags().StringArrayVar(&calAccounts, "account", nil,
 			"Only this account (repeatable; default: every account plus the local calendars)")
-		_ = c.RegisterFlagCompletionFunc("account", completeAccounts)
+		_ = c.RegisterFlagCompletionFunc("account", completeCalendarAccounts)
 	}
 	calendarShowCmd.Flags().StringVar(&calShowCalendar, "calendar", "", "Only this calendar (by display name)")
 }
@@ -249,16 +249,10 @@ func warnMisconfiguredCollections(cols []calendar.Collection, calendars []calend
 	}
 }
 
-// calendarLabel renders the calendar cell of a row. When the listing spans more
-// than one account, two accounts can each have a calendar called "Calendar" —
-// so the account is prefixed, and only then, to keep the common single-account
-// output unchanged.
-func calendarLabel(cal calendar.LocalCalendar, multiAccount bool) string {
-	name := cal.Name
-	if multiAccount && cal.Account != "" {
-		name = cal.Account + "/" + name
-	}
-	return calSwatch(cal.HexColor, name)
+// calendarLabel renders the calendar cell of a row. Account is a separate
+// column so the calendar name remains stable in single- and multi-account output.
+func calendarLabel(cal calendar.LocalCalendar) string {
+	return calSwatch(cal.HexColor, humanText(cal.Name, false))
 }
 
 // occurrence pairs an expanded event with its calendar for sorting/printing.
@@ -268,6 +262,9 @@ type occurrence struct {
 }
 
 func runCalendarList(cmd *cobra.Command, args []string) error {
+	if err := validateCalendarListWindowFlags(); err != nil {
+		return err
+	}
 	cols, _, err := calendarTargets(args)
 	if err != nil {
 		return err
@@ -302,7 +299,9 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 	if jsonOutput {
 		out := make([]calendar.CalendarEvent, 0, len(occs))
 		for _, o := range occs {
-			out = append(out, calendar.ToCalendarEvent(o.cal.Name, o.event, false))
+			dto := calendar.ToCalendarEvent(o.cal.Name, o.event, false)
+			dto.Account = o.cal.Account
+			out = append(out, dto)
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -339,11 +338,23 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 			"  " + eventTimeCol(o.event),
 			styAccent(truncate(orDash(o.event.Subject), 50)),
 			styDim(truncate(o.event.Location, 24)),
-			calendarLabel(o.cal, len(accounts) > 1) + eventMarkers(o.event),
+			calendarLabel(o.cal) + eventMarkers(o.event),
+			styDim(o.cal.Account),
+			styDim(eventRefCell(o.event.ICalUID)),
 		})
 	}
 	printColumns(os.Stdout, rows)
 	return nil
+}
+
+// eventRefCell renders the "event:<uid>" reference column.
+//
+// Shared by the list and search views so the escaping cannot be present in one
+// and missing in the other, and so it is reachable from a test — both callers
+// write straight to stdout through printColumns. A UID comes from whoever
+// produced the invitation, so it is remote text like any other cell.
+func eventRefCell(uid string) string {
+	return "event:" + humanText(uid, false)
 }
 
 // listWindow computes [from, to) from the list flags, relative to now, reusing
@@ -354,10 +365,28 @@ func listWindow(now time.Time) (from, to time.Time, err error) {
 	switch {
 	case calListToday:
 		span = 24 * time.Hour
+	case calListWeek:
+		span = 7 * 24 * time.Hour
 	case calListMonth:
 		span = 30 * 24 * time.Hour
 	}
 	return calendar.CalendarWindow(calListFrom, calListTo, span, now)
+}
+
+func validateCalendarListWindowFlags() error {
+	presets := 0
+	for _, set := range []bool{calListToday, calListWeek, calListMonth} {
+		if set {
+			presets++
+		}
+	}
+	if presets > 1 {
+		return fmt.Errorf("use only one of --today, --week, or --month")
+	}
+	if presets > 0 && (calListFrom != "" || calListTo != "") {
+		return fmt.Errorf("date presets cannot be combined with --from or --to")
+	}
+	return nil
 }
 
 // eventTimeCol renders the time column: "all-day" or "HH:MM".
@@ -407,8 +436,6 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to read local calendars: %w", err)
 	}
 	warnMisconfiguredCollections(cols, calendars)
-	multiAccount := len(contributingAccounts(calendars)) > 1
-
 	var matches []occurrence
 	for _, cal := range calendars {
 		if calSearchCalendar != "" && !strings.EqualFold(cal.Name, calSearchCalendar) {
@@ -425,7 +452,9 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 	if jsonOutput {
 		out := make([]calendar.CalendarEvent, 0, len(matches))
 		for _, o := range matches {
-			out = append(out, calendar.ToCalendarEvent(o.cal.Name, o.event, false))
+			dto := calendar.ToCalendarEvent(o.cal.Name, o.event, false)
+			dto.Account = o.cal.Account
+			out = append(out, dto)
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -439,12 +468,14 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 
 	// Header and cells are styled per cell (not per line), so printColumns can
 	// align them on their visible widths.
-	rows := [][]string{{styHeader("DATE"), styHeader("SUBJECT"), styHeader("CALENDAR")}}
+	rows := [][]string{{styHeader("EVENT"), styHeader("ACCOUNT"), styHeader("DATE"), styHeader("SUBJECT"), styHeader("CALENDAR")}}
 	for _, o := range matches {
 		rows = append(rows, []string{
+			eventRefCell(o.event.ICalUID),
+			o.cal.Account,
 			o.event.Start.Format("2006-01-02 15:04"),
 			styAccent(truncate(orDash(o.event.Subject), 50)),
-			calendarLabel(o.cal, multiAccount),
+			calendarLabel(o.cal),
 		})
 	}
 	printColumns(os.Stdout, rows)
@@ -456,9 +487,9 @@ func runCalendarShow(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	ref := strings.Join(args, " ")
+	ref := normalizeEventReference(strings.Join(args, " "))
 
-	_, e, calName, err := calendar.ResolveEventIn(cols, ref, calShowCalendar)
+	path, e, calName, err := calendar.ResolveEventIn(cols, ref, calShowCalendar)
 	if err != nil {
 		// A miss may simply mean a configured calendar points one level too
 		// high and contributed nothing to search through.
@@ -468,26 +499,31 @@ func runCalendarShow(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	account := calendar.CollectionAccountForPath(cols, path)
 	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(calendar.ToCalendarEvent(calName, e, true))
+		dto := calendar.ToCalendarEvent(calName, e, true)
+		dto.Account = account
+		return enc.Encode(dto)
 	}
 
-	printEventDetail(e, calName)
+	printEventDetail(e, calName, account)
 	return nil
 }
 
 // printEventDetail renders one event as a labeled block (see show.go's style).
-func printEventDetail(e calendar.Event, calName string) {
-	fmt.Println(styAccent(orDash(e.Subject)))
+func printEventDetail(e calendar.Event, calName, account string) {
+	fmt.Println(styAccent(humanText(orDash(e.Subject), false)))
 	fmt.Println(strings.Repeat("─", 50))
 	field := func(label, value string) {
 		if value != "" {
-			fmt.Printf("%s %s\n", styDim(fmt.Sprintf("%-11s", label+":")), value)
+			fmt.Printf("%s %s\n", styDim(fmt.Sprintf("%-11s", label+":")), humanText(value, false))
 		}
 	}
 
+	field("Event", "event:"+e.ICalUID)
+	field("Account", account)
 	field("Calendar", calName)
 	field("When", eventWhen(e))
 	field("Location", e.Location)
@@ -507,12 +543,20 @@ func printEventDetail(e calendar.Event, calName string) {
 	if len(e.Attendees) > 0 {
 		fmt.Printf("\n%s\n", styDim(fmt.Sprintf("Attendees (%d):", len(e.Attendees))))
 		for _, a := range e.Attendees {
-			fmt.Printf("  %-12s %s\n", styDim(partStatLabel(a.Response)), attendeeLabel(a))
+			fmt.Printf("  %-12s %s\n", styDim(partStatLabel(a.Response)), humanText(attendeeLabel(a), false))
 		}
 	}
 	if e.Description != "" {
-		fmt.Printf("\n%s\n%s\n", styDim("Description:"), strings.TrimSpace(e.Description))
+		fmt.Printf("\n%s\n%s\n", styDim("Description:"), humanText(strings.TrimSpace(e.Description), true))
 	}
+}
+
+func normalizeEventReference(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if len(ref) >= len("event:") && strings.EqualFold(ref[:len("event:")], "event:") {
+		return strings.TrimSpace(ref[len("event:"):])
+	}
+	return ref
 }
 
 // eventWhen renders the time span of an event for the detail view.

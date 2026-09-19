@@ -22,6 +22,11 @@ build/
 cli/durian
 bin/
 
+# Pkl schemas staged into the config package for tooling that type-checks
+# outside Bazel (golangci-lint). Bazel's copy_schemas genrule produces the
+# same files into its sandbox; //schema holds the tracked originals.
+cli/internal/config/schema/
+
 # Bazel (symlinks only — MODULE.bazel.lock is tracked for reproducibility)
 /bazel-*
 .bazelrc.user

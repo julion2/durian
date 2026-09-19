@@ -31,17 +31,44 @@ Hitting `Cmd+Return` doesn't send immediately. It writes the message to the `out
 
 The window is configurable; the GUI defaults to a few seconds.
 
+Each send action carries a client-generated idempotency key. If the HTTP response
+is lost and the client repeats the request, the server returns the original
+outbox entry instead of creating another delivery. That reservation remains
+durable after the entry is sent or cancelled.
+
 ### Queued while offline
 
 If the network is down (NetworkMonitor detects this), outbox entries stay queued and retry automatically on reconnect. You'll see them under **Outbox** in the sidebar with a status badge.
 
-The CLI also processes the same outbox — `durian send` reads from the same table, so messages queued by the GUI will eventually go out even if the GUI is closed (as long as `durian serve` runs).
+The server processes the same encrypted outbox, so messages queued by the GUI will eventually go out while `durian serve` runs.
+
+### Resolving an uncertain delivery
+
+If Durian loses the provider response after submitting a message, it cannot safely retry: the provider may already have delivered it. The entry remains claimed with status `reconciliation_required` instead. Resolve it as follows:
+
+1. Stop the Durian GUI and `durian serve` so no sender is using the claim.
+2. Run `durian outbox list` (or `durian --json outbox list`) and copy the entry's exact `Message-ID`.
+3. Search the provider's Sent mail and delivery records for that exact `Message-ID`. Do not decide from the subject or recipients, which are not unique.
+4. Record the verified outcome:
+
+```bash
+# The provider delivered the exact Message-ID: remove the durable claim.
+durian outbox reconcile <id> --outcome delivered
+
+# The provider definitively did not deliver it: release the claim for retry.
+durian outbox reconcile <id> --outcome not-delivered
+```
+
+Both commands ask for confirmation. Automation must add `--yes`; `--no-input` without `--yes` is rejected. Choosing `not-delivered` incorrectly can send a duplicate. A claim already marked `delivery-confirmed` cannot be requeued.
+
+These commands operate directly on Durian's encrypted local store. They do not require the unauthenticated localhost HTTP API to be exposed.
 
 ## CLI access
 
 ```bash
 durian search "tag:draft" -l 10        # list IMAP drafts
 durian draft delete <message-id>       # delete a draft on IMAP
+durian outbox list                     # list queued and claimed sends
 ```
 
 Local-only drafts are not visible to `durian search` — they're in a separate table.

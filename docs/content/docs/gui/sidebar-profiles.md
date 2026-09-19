@@ -42,7 +42,7 @@ Folders are saved searches. The query language is the same as the `durian search
 | `tag:inbox` | Anything tagged inbox |
 | `tag:inbox AND NOT tag:sent` | Inbox excluding self-sent |
 | `group:vip AND tag:unread` | Unread mail from VIP contacts |
-| `path:Work/Projects` | IMAP folder path |
+| `path:work` | Mail in the `work` account (this is account scope, not an IMAP folder path) |
 | `date:6m..` | Last 6 months |
 
 ## Standard folders
