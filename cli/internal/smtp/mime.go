@@ -66,6 +66,19 @@ func LoadAttachment(path string) (*Attachment, error) {
 
 // Build constructs the RFC 5322 compliant email message
 func (m *Message) Build() ([]byte, error) {
+	return m.build(false)
+}
+
+// BuildDraft builds a persisted draft, retaining its Bcc header so recipients
+// are not lost when the draft is reopened. Build omits Bcc for transport.
+func (m *Message) BuildDraft() ([]byte, error) {
+	return m.build(true)
+}
+
+func (m *Message) build(includeBCC bool) ([]byte, error) {
+	// A canonical wire message (RFC 9078 reaction) is submitted unchanged by
+	// every path, including the Sent/Drafts copy: rebuilding it would drop
+	// Content-Disposition: reaction and re-encode the body.
 	if len(m.RawMIME) > 0 {
 		return append([]byte(nil), m.RawMIME...), nil
 	}
@@ -95,7 +108,9 @@ func (m *Message) Build() ([]byte, error) {
 	if len(m.CC) > 0 {
 		fmt.Fprintf(&buf, "Cc: %s\r\n", formatAddressList(m.CC))
 	}
-	// Note: BCC is not included in headers (by design - recipients are added via RCPT TO only)
+	if includeBCC && len(m.BCC) > 0 {
+		fmt.Fprintf(&buf, "Bcc: %s\r\n", formatAddressList(m.BCC))
+	}
 	fmt.Fprintf(&buf, "Subject: %s\r\n", encodeHeader(m.Subject))
 	fmt.Fprintf(&buf, "Date: %s\r\n", date)
 	fmt.Fprintf(&buf, "Message-ID: %s\r\n", messageID)

@@ -129,7 +129,7 @@ func (h *Handler) Handle(cmd protocol.Command) protocol.Response {
 		}
 		return h.Show(cmd.File)
 	case "tag":
-		return h.Tag(cmd.Query, cmd.Tags)
+		return h.Tag(cmd.Query, cmd.Tags, nil)
 	default:
 		return protocol.FailWithMessage(protocol.ErrUnknownCmd, "unknown command: "+cmd.Cmd)
 	}

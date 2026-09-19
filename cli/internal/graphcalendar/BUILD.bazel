@@ -13,6 +13,7 @@ go_library(
         "//cli/internal/calendarsync",
         "//cli/internal/config",
         "//cli/internal/oauth",
+        "//cli/internal/redact",
     ],
 )
 

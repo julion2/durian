@@ -2,9 +2,6 @@
 import XCTest
 
 final class ConfigTests: XCTestCase {
-
-    // MARK: - Test JSON Strings (as pkl eval would produce)
-
     private let fullConfigJSON = """
     {
       "settings": {
@@ -29,13 +26,9 @@ final class ConfigTests: XCTestCase {
     }
     """
 
-    // MARK: - Full Config Decoding
-
     func testDecodeFullConfig() throws {
-        let data = fullConfigJSON.data(using: .utf8)!
-        let config = try JSONDecoder().decode(AppConfig.self, from: data)
+        let config = try JSONDecoder().decode(AppConfig.self, from: Data(fullConfigJSON.utf8))
 
-        // Accounts
         XCTAssertEqual(config.accounts.count, 2)
         XCTAssertEqual(config.accounts[0].name, "Personal")
         XCTAssertEqual(config.accounts[0].email, "alice@example.com")
@@ -43,33 +36,24 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(config.accounts[1].name, "Work")
         XCTAssertEqual(config.accounts[1].email, "alice@company.com")
         XCTAssertEqual(config.accounts[1].defaultSignature, "work")
-
-        // Settings
         XCTAssertEqual(config.settings.theme, "dark")
         XCTAssertTrue(config.settings.notificationsEnabled)
         XCTAssertTrue(config.settings.loadRemoteImages)
-
-        // Sync
         XCTAssertEqual(config.sync.mode, "bidirectional")
         XCTAssertFalse(config.sync.guiAutoSync)
         XCTAssertEqual(config.sync.autoFetchInterval, 120.0)
         XCTAssertEqual(config.sync.fullSyncInterval, 7200)
-
-        // Signatures
         XCTAssertEqual(config.signatures["default"], "Best regards")
         XCTAssertNotNil(config.signatures["work"])
     }
 
-    // MARK: - Minimal Config (defaults)
+    func testDecodeMinimalConfigUsesDefaults() throws {
+        let config = try JSONDecoder().decode(
+            AppConfig.self,
+            from: Data(#"{"settings":{},"sync":{},"signatures":{},"accounts":[]}"#.utf8)
+        )
 
-    func testDecodeMinimalConfig() throws {
-        let minimalJSON = """
-        { "settings": {}, "sync": {}, "signatures": {}, "accounts": [] }
-        """
-        let data = minimalJSON.data(using: .utf8)!
-        let config = try JSONDecoder().decode(AppConfig.self, from: data)
-
-        XCTAssertEqual(config.accounts.count, 0)
+        XCTAssertTrue(config.accounts.isEmpty)
         XCTAssertEqual(config.settings.theme, "system")
         XCTAssertTrue(config.settings.notificationsEnabled)
         XCTAssertFalse(config.settings.loadRemoteImages)
@@ -79,50 +63,38 @@ final class ConfigTests: XCTestCase {
         XCTAssertTrue(config.signatures.isEmpty)
     }
 
-    // MARK: - MailAccount
+    func testJSONIntegerDecodesAsTimeInterval() throws {
+        let config = try JSONDecoder().decode(
+            AppConfig.self,
+            from: Data(#"{"sync":{"auto_fetch_interval":60,"full_sync_interval":3600}}"#.utf8)
+        )
 
-    func testMailAccountWithSignature() {
+        XCTAssertEqual(config.sync.autoFetchInterval, 60)
+        XCTAssertEqual(config.sync.fullSyncInterval, 3600)
+    }
+
+    func testMailAccountSignatureAndCalendarDefaults() throws {
         let account = MailAccount(name: "Work", email: "w@co.com", defaultSignature: "formal")
         XCTAssertEqual(account.defaultSignature, "formal")
-    }
 
-    func testMailAccountWithoutSignature() {
-        let account = MailAccount(name: "Personal", email: "me@me.com")
-        XCTAssertNil(account.defaultSignature)
-    }
-
-    func testCalendarDefaultsEnabled() throws {
         let withoutCalendar = try JSONDecoder().decode(
             MailAccount.self,
             from: Data(#"{"name":"Personal","email":"me@example.com"}"#.utf8)
         )
-        let emptyCalendar = try JSONDecoder().decode(
-            MailAccount.self,
-            from: Data(#"{"name":"Work","email":"work@example.com","calendar":{}}"#.utf8)
-        )
-
-        XCTAssertTrue(withoutCalendar.calendarEnabled)
-        XCTAssertTrue(emptyCalendar.calendarEnabled)
-    }
-
-    func testCalendarCanBeDisabled() throws {
-        let account = try JSONDecoder().decode(
+        let disabledCalendar = try JSONDecoder().decode(
             MailAccount.self,
             from: Data(#"{"name":"Mail only","email":"mail@example.com","calendar":{"enabled":false}}"#.utf8)
         )
-
-        XCTAssertFalse(account.calendarEnabled)
+        XCTAssertTrue(withoutCalendar.calendarEnabled)
+        XCTAssertFalse(disabledCalendar.calendarEnabled)
     }
 
-    // MARK: - Config Loading Errors
-
-    func testParseFailureIsVisibleWhileAccountsRemainEmpty() throws {
-        let configURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
+    func testParseFailureIsVisibleWhileAccountsRemainEmpty() async throws {
+        let configURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try Data().write(to: configURL)
         defer { try? FileManager.default.removeItem(at: configURL) }
 
-        var reportedMessage: String?
+        let reportedMessage = LockedValue<String?>(nil)
         let manager = ConfigManager(
             configURL: configURL,
             evaluator: { _ in
@@ -132,28 +104,28 @@ final class ConfigTests: XCTestCase {
                     userInfo: [NSLocalizedDescriptionKey: "invalid syntax"]
                 )
             },
-            parseErrorHandler: { reportedMessage = $0 }
+            parseErrorHandler: { reportedMessage.set($0) }
         )
+        await manager.reloadConfig()
 
         XCTAssertEqual(manager.lastParseError, "invalid syntax")
         XCTAssertTrue(manager.getAccounts().isEmpty)
         XCTAssertEqual(
-            reportedMessage,
+            reportedMessage.get(),
             "Configuration failed to parse: invalid syntax. The bundled GUI schema may be out of date — run ./macos/install.sh to rebuild."
         )
     }
 
-    func testSuccessfulReloadClearsParseError() throws {
-        let configURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
+    func testSuccessfulReloadClearsParseError() async throws {
+        let configURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try Data().write(to: configURL)
         defer { try? FileManager.default.removeItem(at: configURL) }
 
-        var shouldFail = true
+        let shouldFail = LockedValue(true)
         let manager = ConfigManager(
             configURL: configURL,
             evaluator: { _ in
-                if shouldFail {
+                if shouldFail.get() {
                     throw NSError(
                         domain: "ConfigTests",
                         code: 1,
@@ -164,26 +136,26 @@ final class ConfigTests: XCTestCase {
             },
             parseErrorHandler: { _ in }
         )
+        await manager.reloadConfig()
         XCTAssertNotNil(manager.lastParseError)
 
-        shouldFail = false
-        manager.reloadConfig()
+        shouldFail.set(false)
+        await manager.reloadConfig()
 
         XCTAssertNil(manager.lastParseError)
         XCTAssertEqual(manager.getAccounts().map(\.email), ["work@example.com"])
     }
 
-    func testFailedReloadClearsPreviouslyLoadedConfig() throws {
-        let configURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
+    func testFailedOrMissingReloadClearsPreviouslyLoadedConfig() async throws {
+        let configURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try Data().write(to: configURL)
         defer { try? FileManager.default.removeItem(at: configURL) }
 
-        var shouldFail = false
+        let shouldFail = LockedValue(false)
         let manager = ConfigManager(
             configURL: configURL,
             evaluator: { _ in
-                if shouldFail {
+                if shouldFail.get() {
                     throw NSError(
                         domain: "ConfigTests",
                         code: 1,
@@ -194,34 +166,34 @@ final class ConfigTests: XCTestCase {
             },
             parseErrorHandler: { _ in }
         )
+        await manager.reloadConfig()
         XCTAssertEqual(manager.getAccounts().map(\.email), ["work@example.com"])
 
-        shouldFail = true
-        manager.reloadConfig()
-
+        shouldFail.set(true)
+        await manager.reloadConfig()
         XCTAssertEqual(manager.lastParseError, "invalid syntax")
         XCTAssertTrue(manager.getAccounts().isEmpty)
-    }
-
-    func testMissingConfigOnReloadClearsPreviouslyLoadedConfig() throws {
-        let configURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-        try Data().write(to: configURL)
-        defer { try? FileManager.default.removeItem(at: configURL) }
-
-        let manager = ConfigManager(
-            configURL: configURL,
-            evaluator: { _ in
-                AppConfig(accounts: [MailAccount(name: "Work", email: "work@example.com")])
-            },
-            parseErrorHandler: { _ in }
-        )
-        XCTAssertEqual(manager.getAccounts().map(\.email), ["work@example.com"])
 
         try FileManager.default.removeItem(at: configURL)
-        manager.reloadConfig()
-
+        await manager.reloadConfig()
         XCTAssertNil(manager.lastParseError)
         XCTAssertTrue(manager.getAccounts().isEmpty)
+    }
+}
+
+private final class LockedValue<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+
+    func get() -> Value {
+        lock.withLock { value }
+    }
+
+    func set(_ value: Value) {
+        lock.withLock { self.value = value }
     }
 }

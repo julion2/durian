@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/julion2/durian/cli/internal/mailsend"
@@ -114,7 +116,7 @@ func TestSenderUploadsLargeAttachment(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&draft); err != nil {
 			t.Errorf("decode draft: %v", err)
 		}
-		writeJSON(t, w, map[string]string{"id": "d1"})
+		writeJSON(t, w, map[string]string{"id": "d1", "internetMessageId": "<graph@example.com>"})
 	})
 	mux.HandleFunc("/v1.0/me/messages/d1/attachments/createUploadSession", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(t, w, map[string]string{"uploadUrl": srv.URL + "/upload"})
@@ -134,7 +136,7 @@ func TestSenderUploadsLargeAttachment(t *testing.T) {
 		sent = true
 		w.WriteHeader(http.StatusAccepted)
 	})
-	srv = httptest.NewServer(mux)
+	srv = httptest.NewTLSServer(mux)
 	defer srv.Close()
 
 	s := &Sender{b: newTestBackend(t, srv)}
@@ -155,6 +157,100 @@ func TestSenderUploadsLargeAttachment(t *testing.T) {
 	}
 	if !bytes.Equal(uploaded, large) {
 		t.Errorf("uploaded %d bytes, want %d (chunks lost/reordered?)", len(uploaded), len(large))
+	}
+}
+
+func TestPutChunkRejectsUnsafeUploadURL(t *testing.T) {
+	srv := httptest.NewServer(http.NewServeMux())
+	defer srv.Close()
+	s := &Sender{b: newTestBackend(t, srv)}
+	for _, uploadURL := range []string{
+		"http://uploads.example/chunk",
+		"/relative/chunk",
+		"https://user:password@uploads.example/chunk",
+		":not-a-url",
+	} {
+		t.Run(uploadURL, func(t *testing.T) {
+			if err := s.putChunk(t.Context(), uploadURL, []byte("secret"), 0, 6, 6); err == nil {
+				t.Fatal("putChunk() accepted unsafe upload URL")
+			}
+		})
+	}
+	if err := validateUploadURL("https://durian-upload.example/chunk?token=secret"); err != nil {
+		t.Fatalf("validateUploadURL() rejected legitimate off-origin HTTPS endpoint: %v", err)
+	}
+}
+
+func TestPutChunkRejectsInsecureRedirect(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/upload", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "http://uploads.example/chunk")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	})
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+	s := &Sender{b: newTestBackend(t, srv)}
+
+	err := s.putChunk(t.Context(), srv.URL+"/upload", []byte("secret"), 0, 6, 6)
+	if err == nil || !strings.Contains(err.Error(), "refusing graph upload redirect") {
+		t.Fatalf("putChunk() error = %v, want rejected insecure redirect", err)
+	}
+}
+
+func TestPutChunkRejectsMethodChangingRedirect(t *testing.T) {
+	reachedDestination := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/upload", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "/destination")
+		w.WriteHeader(http.StatusFound)
+	})
+	mux.HandleFunc("/destination", func(w http.ResponseWriter, _ *http.Request) {
+		reachedDestination = true
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+	s := &Sender{b: newTestBackend(t, srv)}
+
+	err := s.putChunk(t.Context(), srv.URL+"/upload", []byte("secret"), 0, 6, 6)
+	if err == nil || !strings.Contains(err.Error(), "method changed to GET") {
+		t.Fatalf("putChunk() error = %v, want rejected method-changing redirect", err)
+	}
+	if reachedDestination {
+		t.Fatal("putChunk() followed method-changing redirect")
+	}
+}
+
+func TestPutChunkFollowsCrossOriginHTTPSRedirect(t *testing.T) {
+	chunk := []byte("secret")
+	var uploaded []byte
+	destination := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("redirected upload Authorization = %q, want empty", got)
+		}
+		if r.Method != http.MethodPut {
+			t.Errorf("redirected method = %s, want PUT", r.Method)
+		}
+		uploaded, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer destination.Close()
+
+	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("initial upload Authorization = %q, want empty", got)
+		}
+		w.Header().Set("Location", destination.URL+"/chunk?sig=abc")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	s := &Sender{b: newTestBackend(t, source)}
+	if err := s.putChunk(t.Context(), source.URL+"/upload", chunk, 0, len(chunk), len(chunk)); err != nil {
+		t.Fatalf("putChunk() cross-origin HTTPS redirect: %v", err)
+	}
+	if !bytes.Equal(uploaded, chunk) {
+		t.Fatalf("redirected upload = %q, want %q", uploaded, chunk)
 	}
 }
 
@@ -231,5 +327,69 @@ func TestClassifyGraphSendError(t *testing.T) {
 		if got := mailsend.Classify(err); got != c.want {
 			t.Errorf("status %d classified %v, want %v", c.status, got, c.want)
 		}
+	}
+}
+
+func TestSenderPersistsGraphMessageIDBeforeAmbiguousFinalSend(t *testing.T) {
+	persisted := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/messages", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]string{"id": "draft1", "internetMessageId": "<graph-exact@example.test>"})
+	})
+	mux.HandleFunc("/v1.0/me/messages/draft1/send", func(http.ResponseWriter, *http.Request) {
+		if !persisted {
+			t.Error("final Graph send started before Message-ID persistence")
+		}
+		panic(http.ErrAbortHandler)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	s := &Sender{b: newTestBackend(t, server)}
+	err := s.SendAfterPersist(t.Context(), &mailsend.Message{To: []string{"recipient@example.test"}}, func(messageID string) error {
+		if messageID != "<graph-exact@example.test>" {
+			t.Fatalf("persisted Message-ID = %q", messageID)
+		}
+		persisted = true
+		return nil
+	})
+	if !persisted || mailsend.Classify(err) != mailsend.KindAmbiguous {
+		t.Fatalf("final Graph transport loss = persisted %v, error %v, kind %v", persisted, err, mailsend.Classify(err))
+	}
+}
+
+func TestSenderTreatsGraphFinalServerErrorAsAmbiguous(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/messages", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]string{"id": "draft1", "internetMessageId": "<graph-exact@example.test>"})
+	})
+	mux.HandleFunc("/v1.0/me/messages/draft1/send", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream response lost", http.StatusServiceUnavailable)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	s := &Sender{b: newTestBackend(t, server)}
+	err := s.SendAfterPersist(t.Context(), &mailsend.Message{To: []string{"recipient@example.test"}}, func(string) error { return nil })
+	if got := mailsend.Classify(err); got != mailsend.KindAmbiguous {
+		t.Fatalf("final Graph 503 classified %v, want ambiguous: %v", got, err)
+	}
+}
+
+func TestSenderDoesNotSendWhenGraphMessageIDPersistenceFails(t *testing.T) {
+	persistErr := errors.New("disk unavailable")
+	sent := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/messages", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]string{"id": "draft1", "internetMessageId": "<graph-exact@example.test>"})
+	})
+	mux.HandleFunc("/v1.0/me/messages/draft1/send", func(http.ResponseWriter, *http.Request) { sent = true })
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	s := &Sender{b: newTestBackend(t, server)}
+	err := s.SendAfterPersist(t.Context(), &mailsend.Message{To: []string{"recipient@example.test"}}, func(string) error { return persistErr })
+	if !errors.Is(err, persistErr) || sent {
+		t.Fatalf("persistence failure = error %v, sent %v", err, sent)
 	}
 }

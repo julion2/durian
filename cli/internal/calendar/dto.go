@@ -34,6 +34,7 @@ type AttendeeDTO struct {
 // description) are only filled when detail is requested — list/search emit the
 // summary, the single-event lookup emits the full form.
 type CalendarEvent struct {
+	Account          string    `json:"account,omitempty"`
 	Calendar         string    `json:"calendar"`
 	UID              string    `json:"uid"`
 	Subject          string    `json:"subject"`

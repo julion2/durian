@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 // TagChange represents a single tag add/remove event.
@@ -92,7 +94,9 @@ func (c *Client) Push(changes []TagChange) error {
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("sync push failed (%d): %s", resp.StatusCode, string(b))
+		err := fmt.Errorf("sync push failed (%d): %s", resp.StatusCode, string(b))
+		safeText := fmt.Sprintf("tag sync push failed (%d): response body %s", resp.StatusCode, redact.Placeholder)
+		return redact.ExternalError(err, safeText)
 	}
 
 	slog.Debug("Tag sync push complete", "module", "TAGSYNC", "changes", len(changes))
@@ -119,7 +123,9 @@ func (c *Client) Pull(since int64) ([]TagChange, int64, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, since, fmt.Errorf("sync pull failed (%d): %s", resp.StatusCode, string(b))
+		err := fmt.Errorf("sync pull failed (%d): %s", resp.StatusCode, string(b))
+		safeText := fmt.Sprintf("tag sync pull failed (%d): response body %s", resp.StatusCode, redact.Placeholder)
+		return nil, since, redact.ExternalError(err, safeText)
 	}
 
 	var result struct {

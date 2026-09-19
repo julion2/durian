@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -65,9 +64,21 @@ func runGroupList(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonOutput {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(groups)
+		type groupJSON struct {
+			Name        string     `json:"name"`
+			Description string     `json:"description,omitempty"`
+			Members     [][]string `json:"members"`
+		}
+		out := make([]groupJSON, 0, len(groups))
+		for name, group := range groups {
+			members := group.Members
+			if members == nil {
+				members = [][]string{}
+			}
+			out = append(out, groupJSON{Name: name, Description: group.Description, Members: members})
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+		return writeJSON(out)
 	}
 
 	if len(groups) == 0 {
@@ -91,7 +102,7 @@ func runGroupList(cmd *cobra.Command, args []string) error {
 		if desc == "" {
 			desc = "-"
 		}
-		fmt.Fprintf(w, "%s\t%d\t%s\n", name, len(group.Members), desc)
+		fmt.Fprintf(w, "%s\t%d\t%s\n", humanText(name, false), len(group.Members), humanText(desc, false))
 	}
 	w.Flush()
 
@@ -116,15 +127,21 @@ func runGroupMembers(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonOutput {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(group)
+		members := group.Members
+		if members == nil {
+			members = [][]string{}
+		}
+		return writeJSON(struct {
+			Name        string     `json:"name"`
+			Description string     `json:"description,omitempty"`
+			Members     [][]string `json:"members"`
+		}{Name: name, Description: group.Description, Members: members})
 	}
 
 	if group.Description != "" {
-		fmt.Printf("%s — %s\n", name, group.Description)
+		fmt.Printf("%s — %s\n", humanText(name, false), humanText(group.Description, false))
 	} else {
-		fmt.Println(name)
+		fmt.Println(humanText(name, false))
 	}
 
 	if len(group.Members) == 0 {
@@ -134,9 +151,9 @@ func runGroupMembers(cmd *cobra.Command, args []string) error {
 
 	for _, person := range group.Members {
 		if len(person) == 1 {
-			fmt.Printf("  %s\n", person[0])
+			fmt.Printf("  %s\n", humanText(person[0], false))
 		} else {
-			fmt.Printf("  %s\n", strings.Join(person, ", "))
+			fmt.Printf("  %s\n", humanText(strings.Join(person, ", "), false))
 		}
 	}
 

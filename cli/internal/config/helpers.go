@@ -68,8 +68,8 @@ func (c *Config) GetAccountByName(name string) (*AccountConfig, error) {
 	return nil, ErrAccountNotFound
 }
 
-// GetAccountByIdentifier finds an account by email, alias, or name (in that order)
-// The lookup is case-insensitive for alias and name.
+// GetAccountByIdentifier finds an account by email, alias, or name (in that order).
+// The lookup is case-insensitive.
 func (c *Config) GetAccountByIdentifier(identifier string) (*AccountConfig, error) {
 	if len(c.Accounts) == 0 {
 		return nil, ErrNoAccounts
@@ -80,9 +80,9 @@ func (c *Config) GetAccountByIdentifier(identifier string) (*AccountConfig, erro
 		return nil, ErrAccountNotFound
 	}
 
-	// 1. Exact email match (case-sensitive)
+	// 1. Case-insensitive email match
 	for i := range c.Accounts {
-		if c.Accounts[i].Email == identifier {
+		if strings.EqualFold(c.Accounts[i].Email, identifier) {
 			return &c.Accounts[i], nil
 		}
 	}

@@ -46,21 +46,291 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 27 {
-		t.Errorf("version = %d, want 27", version)
+	if version != 34 {
+		t.Errorf("version = %d, want 34", version)
 	}
-	var indexSQL string
-	if err := db.db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_outbox_dedupe_key'").Scan(&indexSQL); err != nil {
-		t.Fatalf("read outbox dedupe index: %v", err)
+}
+
+func TestMigrateV29AddsProviderNativeState(t *testing.T) {
+	db := newTestDB(t)
+	seed := &Message{
+		MessageID: "v29@example.com", Subject: "preserved", Date: 1, CreatedAt: 1,
+		Mailbox: "INBOX", Account: "work", BCCAddrs: "blind@example.com",
+		SyntheticIdentity: true, SyntheticFingerprint: []byte("fingerprint"), IngestPending: true,
 	}
-	if !strings.Contains(indexSQL, "attempts < 5") {
-		t.Errorf("outbox dedupe index is not scoped to active attempts: %s", indexSQL)
+	if err := db.InsertMessage(seed); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, stmt := range []string{
+		"DROP TABLE provider_tag_mutations",
+		"DROP INDEX idx_messages_stableid_acctid_uniq",
+		"DROP INDEX idx_messages_msgid_fallback_acctid_uniq",
+		"ALTER TABLE messages DROP COLUMN stable_id",
+		`CREATE UNIQUE INDEX idx_messages_msgid_acctid_uniq
+			ON messages(message_id, IFNULL(account_id, 0))`,
+		"UPDATE schema_version SET version = 29 WHERE rowid = 1",
+	} {
+		if _, err := db.db.Exec(stmt); err != nil {
+			t.Fatalf("prepare v29 schema: %v\nstmt: %s", err, stmt)
+		}
+	}
+
+	if err := db.Init(); err != nil {
+		t.Fatalf("migrate v29→latest: %v", err)
+	}
+	var version int
+	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 34 {
+		t.Fatalf("version = %d, want 34", version)
+	}
+	hasStableID, err := hasColumn(db.db, "messages", "stable_id")
+	if err != nil || !hasStableID {
+		t.Fatalf("stable_id present = %t, err=%v", hasStableID, err)
+	}
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM provider_tag_mutations").Scan(new(int)); err != nil {
+		t.Fatalf("provider mutation table missing: %v", err)
+	}
+	preserved, err := db.GetByMessageID(seed.MessageID)
+	if err != nil || preserved == nil {
+		t.Fatalf("preserved row = %+v, err=%v", preserved, err)
+	}
+	if preserved.BCCAddrs != seed.BCCAddrs || !preserved.SyntheticIdentity ||
+		string(preserved.SyntheticFingerprint) != string(seed.SyntheticFingerprint) || !preserved.IngestPending {
+		t.Fatalf("v29 fields changed during migration: %+v", preserved)
+	}
+
+	first := &Message{StableID: "email-1", MessageID: "duplicate@example.com", Account: "work"}
+	second := &Message{StableID: "email-2", MessageID: first.MessageID, Account: first.Account}
+	if err := db.InsertMessage(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessage(second); err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("stable duplicates collapsed to row %d", first.ID)
+	}
+}
+
+func TestMigrateV30AddsIngestGeneration(t *testing.T) {
+	db := newTestDB(t)
+	seed := &Message{
+		MessageID: "v30-pending@example.com", Subject: "pending", Date: 1, CreatedAt: 1,
+		Mailbox: "INBOX", Account: "work", IngestPending: true,
+	}
+	if err := db.InsertMessage(seed); err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		"ALTER TABLE messages DROP COLUMN ingest_generation",
+		"UPDATE schema_version SET version = 30 WHERE rowid = 1",
+	} {
+		if _, err := db.db.Exec(stmt); err != nil {
+			t.Fatalf("prepare v30 schema: %v\nstmt: %s", err, stmt)
+		}
+	}
+
+	if err := db.Init(); err != nil {
+		t.Fatalf("migrate v30→v31: %v", err)
+	}
+	var version int
+	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 34 {
+		t.Fatalf("version = %d, want 34", version)
+	}
+	stored, err := db.GetByMessageID(seed.MessageID)
+	if err != nil || stored == nil || !stored.IngestPending || stored.IngestGeneration != 0 {
+		t.Fatalf("migrated pending row = %+v, err=%v", stored, err)
+	}
+
+	refresh := *stored
+	refresh.ID = 0
+	refresh.StartIngestOnConflict = true
+	if err := db.InsertMessage(&refresh); err != nil {
+		t.Fatal(err)
+	}
+	if refresh.IngestGeneration != 1 {
+		t.Fatalf("claimed migrated ingest generation = %d, want 1", refresh.IngestGeneration)
+	}
+}
+
+func TestMigrateV31AddsDurableOutboxClaims(t *testing.T) {
+	db := newTestDB(t)
+	id, err := db.Enqueue(`{"subject":"preserved"}`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		"ALTER TABLE outbox DROP COLUMN delivery_confirmed",
+		"ALTER TABLE outbox DROP COLUMN in_flight",
+		"UPDATE schema_version SET version = 31 WHERE rowid = 1",
+	} {
+		if _, err := db.db.Exec(stmt); err != nil {
+			t.Fatalf("prepare v31 schema: %v\nstmt: %s", err, stmt)
+		}
+	}
+
+	if err := db.Init(); err != nil {
+		t.Fatalf("migrate v31→v32: %v", err)
+	}
+	var version int
+	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 34 {
+		t.Fatalf("version = %d, want 34", version)
+	}
+	item, err := db.ClaimNextOutboxItem()
+	if err != nil || item == nil || item.ID != id || !item.InFlight || item.DeliveryConfirmed {
+		t.Fatalf("migrated outbox claim = %#v, %v", item, err)
+	}
+}
+
+func TestMigrateV33AddsDurableOutboxIdempotency(t *testing.T) {
+	db := newTestDB(t)
+	if _, err := db.db.Exec("DROP TABLE outbox_idempotency"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("UPDATE schema_version SET version = 33 WHERE rowid = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Init(); err != nil {
+		t.Fatalf("migrate v33→v34: %v", err)
+	}
+	firstID, _, err := db.EnqueueIdempotent(`{"subject":"first"}`, 0, "migrated-send-action")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, _, err := db.EnqueueIdempotent(`{"subject":"duplicate"}`, 0, "migrated-send-action")
+	if err != nil || secondID != firstID {
+		t.Fatalf("migrated idempotency first=%d second=%d err=%v", firstID, secondID, err)
+	}
+	var version int
+	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 34 {
+		t.Fatalf("version = %d, want 34", version)
+	}
+}
+
+func TestMigrateV27MarksLegacySyntheticCandidateWithoutClaimingProvenance(t *testing.T) {
+	db := newTestDB(t)
+	const messageID = "durian-synthetic-1-INBOX@work"
+	if err := db.InsertMessage(&Message{
+		MessageID: messageID, Subject: "old row", Date: 1, CreatedAt: 1,
+		Mailbox: "INBOX", Account: "work", SyntheticIdentity: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("ALTER TABLE messages DROP COLUMN synthetic_identity"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("ALTER TABLE messages DROP COLUMN ingest_pending"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("ALTER TABLE messages DROP COLUMN synthetic_fingerprint_ct"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("UPDATE schema_version SET version = 27 WHERE rowid = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Init(); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.GetByMessageID(messageID)
+	if err != nil || stored == nil {
+		t.Fatalf("migrated row = %+v, err=%v", stored, err)
+	}
+	if stored.SyntheticIdentity {
+		t.Fatal("migration inferred provenance from Message-ID text")
+	}
+	if stored.IngestPending {
+		t.Fatal("migrated complete row marked as pending ingest")
+	}
+	var identityState int
+	if err := db.db.QueryRow("SELECT synthetic_identity FROM messages WHERE message_id = ?", messageID).Scan(&identityState); err != nil {
+		t.Fatal(err)
+	}
+	if identityState != 2 {
+		t.Fatalf("legacy identity state = %d, want recovery candidate state 2", identityState)
+	}
+	candidates, err := db.GetSyntheticMessagesForFolder("work", "INBOX")
+	if err != nil || len(candidates) != 1 || candidates[0].MessageID != messageID {
+		t.Fatalf("legacy recovery candidates = %+v, err=%v", candidates, err)
+	}
+	if err := db.InsertMessage(&Message{
+		MessageID: messageID, Subject: "recovered row", Date: 1, CreatedAt: 2,
+		Mailbox: "INBOX", Account: "work", SyntheticIdentity: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRow("SELECT synthetic_identity FROM messages WHERE message_id = ?", messageID).Scan(&identityState); err != nil {
+		t.Fatal(err)
+	}
+	if identityState != 1 {
+		t.Fatalf("recovered identity state = %d, want proven state 1", identityState)
+	}
+	var version int
+	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 34 {
+		t.Fatalf("version = %d, want 34", version)
 	}
 }
 
 func TestOpen_RejectsNilKeyring(t *testing.T) {
 	if _, err := Open(":memory:", nil); err == nil {
 		t.Error("Open(nil keyring) should error")
+	}
+}
+
+func TestOpenReadOnlyRejectsWrites(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "email.db")
+	writable, err := Open(dbPath, testKeyring(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := writable.Init(); err != nil {
+		writable.Close()
+		t.Fatalf("Init: %v", err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatalf("close writable store: %v", err)
+	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+
+	readOnly, err := OpenReadOnly(dbPath, testKeyring(t))
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	var version int
+	if err := readOnly.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
+		readOnly.Close()
+		t.Fatalf("read schema version: %v", err)
+	}
+	if _, err := readOnly.db.Exec("UPDATE schema_version SET version = version"); err == nil {
+		readOnly.Close()
+		t.Fatal("read-only store accepted a write")
+	}
+	if err := readOnly.Close(); err != nil {
+		t.Fatalf("close read-only store: %v", err)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("read-only open changed database contents")
 	}
 }
 
@@ -390,14 +660,14 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	}
 	db := sd.db
 
-	// Schema version must be at the latest migration (v27: active outbox
-	// deduplication) after Init runs every migration forward from a fresh DB.
+	// Schema version must be at the latest migration after Init runs every
+	// migration forward.
 	var version int
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 27 {
-		t.Fatalf("version = %d, want 27", version)
+	if version != 34 {
+		t.Fatalf("version = %d, want 34", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).

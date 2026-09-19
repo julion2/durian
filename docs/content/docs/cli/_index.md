@@ -23,7 +23,7 @@ subcommand has `--help`, ships a man page, and supports tab completion.
 ```bash
 durian sync                       # pull mail via IMAP, push tag/flag changes
 durian search "tag:inbox"         # query the local store (notmuch syntax)
-durian tag <thread> +todo         # add/remove tags
+durian tag "thread:<thread>" +todo  # add/remove tags
 durian show <thread>              # render a thread to stdout
 durian send --to ...              # send mail (with $EDITOR fallback)
 durian auth status                # OAuth/password state per account

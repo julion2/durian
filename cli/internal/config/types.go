@@ -378,8 +378,9 @@ type IMAPConfig struct {
 // credential itself is stored in the JMAP-specific OS keychain service under
 // the account email.
 type JMAPConfig struct {
-	SessionURL string `pkl:"session_url" json:"session_url"`
-	Auth       string `pkl:"auth" json:"auth"` // "password" or "bearer"
+	SessionURL          string `pkl:"session_url" json:"session_url"`
+	Auth                string `pkl:"auth" json:"auth"` // "password" or "bearer"
+	TrustLegacyIdentity bool   `pkl:"trust_legacy_identity" json:"trust_legacy_identity"`
 }
 
 // AuthConfig contains password-based authentication settings.

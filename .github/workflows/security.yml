@@ -1,8 +1,9 @@
 name: Security
 
 on:
+  # Unfiltered for the same reason as test.yml: a stacked PR based on the
+  # branch below it would otherwise be scanned by nothing.
   pull_request:
-    branches: [main]
   push:
     branches: [main]
   schedule:

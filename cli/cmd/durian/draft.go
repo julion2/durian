@@ -1,11 +1,9 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"time"
 
@@ -81,14 +79,6 @@ func init() {
 	draftCmd.AddCommand(draftSaveCmd)
 	draftCmd.AddCommand(draftDeleteCmd)
 	rootCmd.AddCommand(draftCmd)
-}
-
-// draftResponse is the JSON output format
-type draftResponse struct {
-	OK        bool   `json:"ok"`
-	Error     string `json:"error,omitempty"`
-	MessageID string `json:"message_id,omitempty"`
-	UID       uint32 `json:"uid,omitempty"`
 }
 
 func runDraftSave(cmd *cobra.Command, args []string) error {
@@ -185,13 +175,14 @@ func runDraftSave(cmd *cobra.Command, args []string) error {
 	// Save to local SQLite store so Drafts folder shows it immediately
 	saveDraftToLocalStore(account, result.MessageID, msg)
 
-	// Output success
-	resp := draftResponse{
-		OK:        true,
-		MessageID: result.MessageID,
-		UID:       result.UID,
+	if jsonOutput {
+		return writeJSON(struct {
+			Action    string `json:"action"`
+			MessageID string `json:"message_id"`
+		}{Action: "saved", MessageID: result.MessageID})
 	}
-	return outputJSON(resp)
+	fmt.Printf("Saved draft message:%s\n", result.MessageID) // encgrep:allow user-facing CLI prints the public Message-ID needed for later draft operations
+	return nil
 }
 
 func runDraftDelete(cmd *cobra.Command, args []string) error {
@@ -226,9 +217,14 @@ func runDraftDelete(cmd *cobra.Command, args []string) error {
 	// sent reply ends up with thread tags = sent,draft,... forever.
 	deleteDraftFromLocalStore(account, messageID)
 
-	// Output success
-	resp := draftResponse{OK: true}
-	return outputJSON(resp)
+	if jsonOutput {
+		return writeJSON(struct {
+			Action    string `json:"action"`
+			MessageID string `json:"message_id"`
+		}{Action: "deleted", MessageID: normalizeMessageReference(messageID)})
+	}
+	fmt.Printf("Deleted draft message:%s\n", normalizeMessageReference(messageID)) // encgrep:allow user-facing CLI confirms the public Message-ID supplied by the user
+	return nil
 }
 
 // deleteDraftFromLocalStore removes the local draft row mirroring the IMAP
@@ -278,6 +274,7 @@ func saveDraftToLocalStore(account *config.AccountConfig, messageID string, msg 
 		FromAddr:    fromAddr,
 		ToAddrs:     strings.Join(msg.To, ", "),
 		CCAddrs:     strings.Join(msg.CC, ", "),
+		BCCAddrs:    strings.Join(msg.BCC, ", "),
 		InReplyTo:   msg.InReplyTo,
 		Refs:        msg.References,
 		Date:        now,
@@ -300,16 +297,5 @@ func saveDraftToLocalStore(account *config.AccountConfig, messageID string, msg 
 }
 
 func outputDraftError(message string) error {
-	resp := draftResponse{
-		OK:    false,
-		Error: message,
-	}
-	outputJSON(resp)
 	return errors.New(message)
-}
-
-func outputJSON(v interface{}) error {
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(v)
 }

@@ -19,7 +19,10 @@ struct EmailDetailView: View {
     let onReplyAll: () -> Void
     let onForward: () -> Void
     let onLoadBody: () -> Void
-    var onEditDraft: (() -> Void)? = nil
+    /// Receives the specific draft message when the click came from a thread
+    /// card, or nil from the whole-email footer where no single message is
+    /// named and the aggregate is the best available source.
+    var onEditDraft: ((ThreadMessage?) -> Void)? = nil
     var currentFolder: String? = nil
     var onAddTag: ((String) -> Void)? = nil
     var onRemoveTag: ((String) -> Void)? = nil
@@ -125,7 +128,7 @@ struct EmailDetailView: View {
                         onReply: onReply,
                         onReplyAll: onReplyAll,
                         onForward: onForward,
-                        onEditDraft: onEditDraft
+                        onEditDraft: onEditDraft.map { handler in { handler($0) } }
                     )
                 }
             } else {
@@ -298,7 +301,7 @@ struct EmailDetailView: View {
             Spacer()
 
             if email.isDraft, let onEditDraft = onEditDraft {
-                Button(action: onEditDraft) {
+                Button(action: { onEditDraft(nil) }) {
                     HStack(spacing: 6) {
                         Image(systemName: "pencil")
                             .font(.system(size: 14))

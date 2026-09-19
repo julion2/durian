@@ -193,61 +193,6 @@ func TestFlagStateToTagOps(t *testing.T) {
 	}
 }
 
-func TestFlagStateMerge(t *testing.T) {
-	tests := []struct {
-		name     string
-		local    FlagState
-		server   FlagState
-		expected FlagState
-	}{
-		{
-			name:     "both empty",
-			local:    FlagState{},
-			server:   FlagState{},
-			expected: FlagState{},
-		},
-		{
-			name:     "local seen, server not",
-			local:    FlagState{Seen: true},
-			server:   FlagState{},
-			expected: FlagState{Seen: true},
-		},
-		{
-			name:     "server seen, local not",
-			local:    FlagState{},
-			server:   FlagState{Seen: true},
-			expected: FlagState{Seen: true},
-		},
-		{
-			name:     "merge flags from both",
-			local:    FlagState{Seen: true, Flagged: true},
-			server:   FlagState{Answered: true},
-			expected: FlagState{Seen: true, Flagged: true, Answered: true},
-		},
-		{
-			name:     "server wins for deleted",
-			local:    FlagState{Deleted: false},
-			server:   FlagState{Deleted: true},
-			expected: FlagState{Deleted: true},
-		},
-		{
-			name:     "local deleted ignored",
-			local:    FlagState{Deleted: true},
-			server:   FlagState{Deleted: false},
-			expected: FlagState{Deleted: false},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.local.Merge(tt.server)
-			if got != tt.expected {
-				t.Errorf("Merge() = %+v, want %+v", got, tt.expected)
-			}
-		})
-	}
-}
-
 func TestDiffFlags(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -325,10 +270,17 @@ func TestNeedsUpload(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "deleted changed - now synced",
-			local:    FlagState{Deleted: true},
-			stored:   FlagState{Deleted: false},
-			expected: true, // Deleted changes are now uploaded for trash workflow
+			// The production shape: a prior download recorded \Deleted in the
+			// baseline, and the local side reports false because no tag maps to
+			// it — FlagStateFromTags never sets Deleted, deliberately, since
+			// Durian's "deleted" means moved-to-trash while \Deleted means
+			// pending expunge. Counting that as a local change made every such
+			// row a permanent upload candidate, and before the diff stopped
+			// carrying Deleted, pushed a removal that un-marked the expunge.
+			name:     "deleted baseline is not a local change",
+			local:    FlagState{Deleted: false},
+			stored:   FlagState{Deleted: true},
+			expected: false,
 		},
 		{
 			name:     "completed suppresses flagged upload",
@@ -402,4 +354,106 @@ func slicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestResolveFlagsTruthTable walks the full three-way space for one boolean
+// flag. Every case has an unambiguous answer: where two sides agree the odd one
+// out is the change and it carries, and where all three agree there is nothing
+// to do. The rows where local and server both differ from the baseline are the
+// ones a two-way merge gets wrong; an OR gets the "both cleared it" row wrong
+// on its own.
+func TestResolveFlagsTruthTable(t *testing.T) {
+	tests := []struct {
+		name                    string
+		baseline, local, server bool
+		want                    bool
+	}{
+		{"nobody moved, all false", false, false, false, false},
+		{"nobody moved, all true", true, true, true, true},
+		{"server set it", false, false, true, true},
+		{"server cleared it", true, true, false, false},
+		{"local set it", false, true, false, true},
+		{"local cleared it", true, false, true, false},
+		{"both set it", false, true, true, true},
+		{"both cleared it", true, false, false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The same table drives all three locally-owned flags at once, so a
+			// field wired to the wrong source cannot hide behind the others.
+			got := ResolveFlags(
+				FlagState{Seen: tt.baseline, Flagged: tt.baseline, Answered: tt.baseline},
+				FlagState{Seen: tt.local, Flagged: tt.local, Answered: tt.local},
+				FlagState{Seen: tt.server, Flagged: tt.server, Answered: tt.server},
+			)
+			for name, v := range map[string]bool{
+				"Seen": got.Seen, "Flagged": got.Flagged, "Answered": got.Answered,
+			} {
+				if v != tt.want {
+					t.Errorf("%s = %v, want %v (baseline=%v local=%v server=%v)",
+						name, v, tt.want, tt.baseline, tt.local, tt.server)
+				}
+			}
+		})
+	}
+}
+
+// TestResolveFlagsIgnoresFlaggedMaskedByCompleted covers the one place a local
+// false is produced by Durian rather than by the user: ToTagOps emits "flagged"
+// only for Flagged && !Completed, so while the baseline records $Completed the
+// tag is suppressed and FlagStateFromTags reports Flagged=false.
+//
+// Resolving that as a local unstar loses the star twice over — the server's
+// still-set flag is not restored when $Completed clears, and the run after
+// that, with the mask gone from the baseline, pushes the absence as a real
+// removal. NeedsUpload already excludes this case; the resolver has to agree.
+func TestResolveFlagsIgnoresFlaggedMaskedByCompleted(t *testing.T) {
+	got := ResolveFlags(
+		FlagState{Flagged: true, Completed: true},
+		FlagState{},              // the mask suppressed the tag
+		FlagState{Flagged: true}, // server reopened the follow-up
+	)
+	if !got.Flagged {
+		t.Errorf("got %+v, want Flagged kept: the local absence is the mask, not a user unstar", got)
+	}
+	if got.Completed {
+		t.Errorf("got %+v, want Completed to follow the server's clear", got)
+	}
+
+	// Without $Completed in the baseline the same shape IS a user unstar, and
+	// must still resolve that way.
+	unmasked := ResolveFlags(
+		FlagState{Flagged: true},
+		FlagState{},
+		FlagState{Flagged: true},
+	)
+	if unmasked.Flagged {
+		t.Errorf("got %+v, want Flagged cleared: an unmasked local absence is a real change", unmasked)
+	}
+}
+
+// TestResolveFlagsKeepsDeletedAndCompletedServerOwned pins the asymmetry.
+// FlagStateFromTags can never report either flag, so a local false is the
+// absence of a representation rather than the user clearing it. Resolving them
+// like the rest would read that absence as a local change and push a removal,
+// un-marking a pending expunge the engine had only witnessed.
+func TestResolveFlagsKeepsDeletedAndCompletedServerOwned(t *testing.T) {
+	kept := ResolveFlags(
+		FlagState{Deleted: true, Completed: true},
+		FlagState{}, // what tags always imply
+		FlagState{Deleted: true, Completed: true},
+	)
+	if !kept.Deleted || !kept.Completed {
+		t.Errorf("got %+v, want Deleted and Completed kept from the server", kept)
+	}
+
+	cleared := ResolveFlags(
+		FlagState{Deleted: true, Completed: true},
+		FlagState{},
+		FlagState{},
+	)
+	if cleared.Deleted || cleared.Completed {
+		t.Errorf("got %+v, want both to follow the server's clear", cleared)
+	}
 }

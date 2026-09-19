@@ -667,19 +667,17 @@ statement. Mitigations, all part of the implementation PR:
   that name a sensitive key explicitly carry an `// encgrep:allow
   wrapper-protected slog key per redact.SensitiveSlogKeys` annotation
   so reviewers can audit the set at a glance.
-- IMAP / SMTP error paths sanitized at the log layer: server responses can
-  echo back Subject lines or quoted headers in `NO`/`BAD` errors, and `err`
-  is not a key-based redaction target. The redact `slog.Handler`
-  (`cli/internal/redact/sanitize.go`) runs every error-typed attribute value
-  — and string values at the `err` / `error` keys — through `sanitizeText`,
-  which base64-encodes any contiguous non-whitespace run longer than 80
-  characters. Short, readable diagnostics (our own error templates, library
-  messages like "connection reset by peer") pass through unchanged, so the
-  common path is untouched. **Limitation:** the heuristic targets raw
-  server-echoed data (long unbroken protocol literals); content shorter than
-  the run limit, or spread across whitespace, is not caught here — arbitrary
-  Subject text is stopped at the source by the grep gate + key-based
-  redaction above, not by this net.
+- Externally controlled errors are sanitized at the log layer. HTTP response
+  bodies, JMAP method descriptions, IMAP / SMTP server responses and OAuth
+  errors retain their full `Error()` text and unwrap chain for control flow and
+  user-facing diagnostics, but implement or carry `redact.SafeLogError`. The
+  redact `slog.Handler` substitutes that safe text while preserving Durian's
+  own `%w` context. URL userinfo, query values and fragments are removed from
+  every error, including unmarked request errors. A final one-way hash replaces
+  contiguous non-whitespace runs longer than 80 characters as defense in depth
+  for legacy string errors. Short ordinary diagnostics such as "connection
+  reset by peer" remain readable; arbitrary Subject text is stopped at the
+  source by the grep gate + key-based redaction above.
 - Stack traces are stripped of sensitive arguments by using `errors.New` /
   `fmt.Errorf("...: %w", err)` with redaction-aware `%w` wrapping; we do
   **not** use `pkg/errors.Wrap` with full struct dumps.

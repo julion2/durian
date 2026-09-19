@@ -328,29 +328,23 @@ func ResolveLocalEvent(accountDir, owner, ref, calFilter string) (path string, e
 // caller whose calendars do not live under one account directory — the
 // configured local calendars — resolves references the same way.
 func ResolveEventIn(cols []Collection, ref, calFilter string) (path string, ev Event, calendar string, err error) {
-	// Fast path: an exact UID whose file follows the "<uid>.ics" naming scheme
-	// (every synced or `new`-created event does) — read just that one file
-	// instead of parsing the whole vdir.
-	for _, col := range cols {
-		calDir := col.Dir
-		calName := collectionName(col)
-		if calFilter != "" && !strings.EqualFold(calName, calFilter) {
-			continue
-		}
-		p := filepath.Join(calDir, SanitizeName(ref)+".ics")
-		data, readErr := os.ReadFile(p)
-		if readErr != nil {
-			continue
-		}
-		if e, parseErr := ICalToEvent(data, col.Owner); parseErr == nil && e.ICalUID == ref {
-			return p, e, calName, nil
-		}
-	}
-
+	// There used to be a fast path here: read "<uid>.ics" directly and return
+	// the first collection where it parsed with a matching UID. It contradicted
+	// the contract this resolver exists to keep — the same UID in two accounts
+	// returned whichever collection came first, and the ambiguity check below
+	// was never reached.
+	//
+	// It cannot be repaired by collecting the hits either. A file named
+	// anything else can carry the same UID, so proving a single "<uid>.ics"
+	// match is unambiguous requires reading the other files anyway. An
+	// optimisation that has to do the work it exists to avoid is not one.
+	//
+	// The scan below is the whole resolution, for every kind of reference.
 	type match struct {
 		path     string
 		event    Event
 		calendar string
+		account  string
 	}
 	var exact, prefix, subject []match
 	lowerRef := strings.ToLower(ref)
@@ -365,7 +359,7 @@ func ResolveEventIn(cols []Collection, ref, calFilter string) (path string, ev E
 			return "", Event{}, "", err
 		}
 		for _, it := range items {
-			m := match{path: it.Path, event: it.Event, calendar: calName}
+			m := match{path: it.Path, event: it.Event, calendar: calName, account: col.Account}
 			switch {
 			case it.Event.ICalUID == ref:
 				exact = append(exact, m)
@@ -384,13 +378,30 @@ func ResolveEventIn(cols []Collection, ref, calFilter string) (path string, ev E
 		if len(tier) > 1 {
 			var names []string
 			for _, m := range tier {
-				names = append(names, fmt.Sprintf("%q [%s]", m.event.Subject, m.calendar))
+				candidate := fmt.Sprintf("%q [event:%s, calendar:%s", m.event.Subject, m.event.ICalUID, m.calendar)
+				if m.account != "" {
+					candidate += ", account:" + m.account
+				}
+				names = append(names, candidate+"]")
 			}
 			return "", Event{}, "", fmt.Errorf("%q matches %d events, be more specific: %s",
 				ref, len(tier), strings.Join(names, ", "))
 		}
 	}
 	return "", Event{}, "", fmt.Errorf("no event matches %q", ref)
+}
+
+// CollectionAccountForPath returns the account owning an event file resolved
+// from cols. It returns an empty string when path is outside every collection.
+func CollectionAccountForPath(cols []Collection, path string) string {
+	path = filepath.Clean(path)
+	for _, col := range cols {
+		rel, err := filepath.Rel(filepath.Clean(col.Dir), path)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return col.Account
+		}
+	}
+	return ""
 }
 
 // ParseWhen parses the date/time inputs the CLI accepts, all interpreted as

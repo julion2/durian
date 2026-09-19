@@ -179,7 +179,9 @@ func (h *Handler) CalendarEventsHandler(w http.ResponseWriter, r *http.Request) 
 			}
 			for _, e := range cal.Events {
 				if calendar.EventMatchesQuery(e, lower) {
-					events = append(events, calendar.ToCalendarEvent(cal.Name, e, false))
+					dto := calendar.ToCalendarEvent(cal.Name, e, false)
+					dto.Account = cal.Account
+					events = append(events, dto)
 				}
 			}
 		}
@@ -195,7 +197,9 @@ func (h *Handler) CalendarEventsHandler(w http.ResponseWriter, r *http.Request) 
 			}
 			for _, e := range cal.Events {
 				for _, occ := range calendar.ExpandOccurrences(e, from, to) {
-					events = append(events, calendar.ToCalendarEvent(cal.Name, occ, false))
+					dto := calendar.ToCalendarEvent(cal.Name, occ, false)
+					dto.Account = cal.Account
+					events = append(events, dto)
 				}
 			}
 		}
@@ -218,10 +222,12 @@ func (h *Handler) CalendarEventHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing required 'ref' query parameter", http.StatusBadRequest)
 		return
 	}
-	_, e, calName, err := calendar.ResolveEventIn(cols, ref, q.Get("calendar"))
+	path, e, calName, err := calendar.ResolveEventIn(cols, ref, q.Get("calendar"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	writeJSON(w, map[string]any{"ok": true, "event": calendar.ToCalendarEvent(calName, e, true)})
+	dto := calendar.ToCalendarEvent(calName, e, true)
+	dto.Account = calendar.CollectionAccountForPath(cols, path)
+	writeJSON(w, map[string]any{"ok": true, "event": dto})
 }

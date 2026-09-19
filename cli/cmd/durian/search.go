@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -13,7 +12,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var searchLimit int
+var (
+	searchLimit    int
+	searchAccounts []string
+	countAccounts  []string
+)
 
 var searchCmd = &cobra.Command{
 	Use:   "search <query>",
@@ -21,6 +24,7 @@ var searchCmd = &cobra.Command{
 	Long:  "Search the local email database using notmuch query syntax.",
 	Example: `  durian search "tag:inbox"
   durian search "tag:inbox AND tag:unread"
+	  durian search "tag:unread" --account work --account personal
   durian search "from:alice@example.com" --limit 10
   durian search "group:investor AND date:month"
   durian search "tag:unread" --json`,
@@ -32,6 +36,7 @@ var countCmd = &cobra.Command{
 	Use:   "count <query>",
 	Short: "Count threads matching a query",
 	Example: `  durian count "tag:inbox"
+	  durian count "tag:unread" --account work
   durian count "tag:unread AND from:alice"
   durian count "group:investor AND date:month"`,
 	Args: cobra.MinimumNArgs(1),
@@ -40,6 +45,10 @@ var countCmd = &cobra.Command{
 
 func init() {
 	searchCmd.Flags().IntVarP(&searchLimit, "limit", "l", 50, "maximum number of results")
+	searchCmd.Flags().StringArrayVarP(&searchAccounts, "account", "a", nil, "filter by account (repeatable)")
+	countCmd.Flags().StringArrayVarP(&countAccounts, "account", "a", nil, "filter by account (repeatable)")
+	_ = searchCmd.RegisterFlagCompletionFunc("account", completeAccounts)
+	_ = countCmd.RegisterFlagCompletionFunc("account", completeAccounts)
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(countCmd)
 }
@@ -47,6 +56,10 @@ func init() {
 func runSearch(cmd *cobra.Command, args []string) error {
 	// Join all arguments to allow unquoted queries like: durian search tag:inbox AND date:today
 	query := strings.Join(args, " ")
+	query, err := scopeQueryByAccounts(query, searchAccounts)
+	if err != nil {
+		return err
+	}
 
 	emailDB, err := openEmailDB()
 	if err != nil {
@@ -75,10 +88,33 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	return outputSearchTable(resp)
 }
 
+type searchResultJSON struct {
+	ThreadID  string   `json:"thread_id"`
+	Subject   string   `json:"subject"`
+	From      string   `json:"from"`
+	To        string   `json:"to,omitempty"`
+	Date      string   `json:"date"`
+	Timestamp int64    `json:"timestamp"`
+	Tags      []string `json:"tags"`
+}
+
+func publicSearchResults(resp protocol.Response) []searchResultJSON {
+	out := make([]searchResultJSON, 0, len(resp.Results))
+	for _, mail := range resp.Results {
+		tags := make([]string, 0)
+		if mail.Tags != "" {
+			tags = strings.Split(mail.Tags, ",")
+		}
+		out = append(out, searchResultJSON{
+			ThreadID: mail.ThreadID, Subject: mail.Subject, From: mail.From,
+			To: mail.To, Date: mail.Date, Timestamp: mail.Timestamp, Tags: tags,
+		})
+	}
+	return out
+}
+
 func outputSearchJSON(resp protocol.Response) error {
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(resp.Results)
+	return writeJSON(publicSearchResults(resp))
 }
 
 func outputSearchTable(resp protocol.Response) error {
@@ -107,6 +143,10 @@ func outputSearchTable(resp protocol.Response) error {
 
 func runCount(cmd *cobra.Command, args []string) error {
 	query := strings.Join(args, " ")
+	query, err := scopeQueryByAccounts(query, countAccounts)
+	if err != nil {
+		return err
+	}
 
 	emailDB, err := openEmailDB()
 	if err != nil {
@@ -128,18 +168,12 @@ func runCount(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("count: %w", err)
 	}
 
+	if jsonOutput {
+		return writeJSON(struct {
+			Count int `json:"count"`
+		}{Count: count})
+	}
+
 	fmt.Println(count)
 	return nil
-}
-
-func truncate(s string, maxLen int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.ReplaceAll(s, "\t", " ")
-	if len(s) <= maxLen {
-		return s
-	}
-	if maxLen <= 3 {
-		return s[:maxLen]
-	}
-	return s[:maxLen-3] + "..."
 }

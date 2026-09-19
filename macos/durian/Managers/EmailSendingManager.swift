@@ -14,6 +14,15 @@ class EmailSendingManager: ObservableObject {
 
     static let sendDelay = 10
 
+    nonisolated static func idempotencyKey(for draft: EmailDraft) -> String {
+        draft.id.uuidString
+    }
+
+    nonisolated static func undoSecondsRemaining(sendAfter: Int64, now: Date = Date()) -> Int {
+        let remaining = Double(sendAfter) - now.timeIntervalSince1970
+        return remaining > 0 ? Int(remaining.rounded(.up)) : 0
+    }
+
     @Published var isSending = false
     @Published var sendingProgress = ""
     @Published var lastError: EmailSendingError?
@@ -39,6 +48,7 @@ class EmailSendingManager: ObservableObject {
         let recipient: String
         let threadId: String?
         let timer: Timer
+        let sendAfter: Int64
         var secondsLeft: Int
         let onUndo: () -> Void
         let onConfirmedSent: () -> Void
@@ -77,16 +87,27 @@ class EmailSendingManager: ObservableObject {
         BannerManager.shared.dismiss()
     }
 
-    func isReactionPending(messageId: String, account: String) -> Bool {
-        pendingReactionKeys.contains(reactionKey(messageId: messageId, account: account))
-    }
-
     /// Starts the undo countdown banner after a successful enqueue.
-    func startCountdown(itemId: Int64, draftId: UUID, recipient: String, threadId: String?, kind: String = "email", onUndo: @escaping () -> Void, onConfirmedSent: @escaping () -> Void) {
+    func startCountdown(
+        itemId: Int64,
+        draftId: UUID,
+        recipient: String,
+        threadId: String?,
+        sendAfter: Int64,
+        kind: String = "email",
+        onUndo: @escaping () -> Void,
+        onConfirmedSent: @escaping () -> Void
+    ) {
         // Cancel any existing countdown
         pendingUndoInfo?.timer.invalidate()
 
-        let secondsLeft = Self.sendDelay
+        let secondsLeft = Self.undoSecondsRemaining(sendAfter: sendAfter)
+        guard secondsLeft > 0 else {
+            pendingUndoInfo = nil
+            BannerManager.shared.dismiss()
+            onConfirmedSent()
+            return
+        }
 
         // Create the repeating timer (fires on main run loop since we're @MainActor)
         let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
@@ -96,7 +117,7 @@ class EmailSendingManager: ObservableObject {
                     return
                 }
 
-                pending.secondsLeft -= 1
+                pending.secondsLeft = Self.undoSecondsRemaining(sendAfter: pending.sendAfter)
                 self.pendingUndoInfo = pending
 
                 if pending.secondsLeft <= 0 {
@@ -122,6 +143,7 @@ class EmailSendingManager: ObservableObject {
             recipient: recipient,
             threadId: threadId,
             timer: timer,
+            sendAfter: sendAfter,
             secondsLeft: secondsLeft,
             onUndo: onUndo,
             onConfirmedSent: onConfirmedSent,
@@ -154,26 +176,33 @@ class EmailSendingManager: ObservableObject {
         let itemId = pending.itemId
         let undoCb = pending.onUndo
 
-        // Delete from outbox, then re-show compose regardless of result
-        Task {
-            if let backend = AccountManager.shared.emailBackend {
-                let deleted = await backend.deleteOutboxItem(id: itemId)
-                if !deleted {
-                    Log.warning("EMAIL", "Failed to delete outbox item \(itemId) on undo")
-                }
+        // Reopen compose only after the backend confirms the pending row was
+        // deleted. A 409 means delivery was already claimed and may succeed.
+        Task { [weak self] in
+            guard let backend = AccountManager.shared.emailBackend else {
+                Log.warning("EMAIL", "No backend available to undo outbox item \(itemId)")
+                BannerManager.shared.showWarning(title: "Undo Failed", message: "Could not cancel delivery.")
+                return
             }
-            await MainActor.run {
-                self.finishReaction(itemId: itemId)
+            // A cancelled reaction stops being pending either way: if the
+            // delete failed the worker owns it, and the SSE result releases it.
+            self?.finishReaction(itemId: itemId)
+            if await backend.deleteOutboxItem(id: itemId) {
                 undoCb()
+            } else {
+                Log.warning("EMAIL", "Failed to delete outbox item \(itemId) on undo")
+                BannerManager.shared.showWarning(title: "Too Late to Undo", message: "Delivery has already started.")
             }
         }
     }
 
     // MARK: - Reactions
 
-    func sendReaction(messageId: String, account: String, emoji: String, threadId: String) async {
-        let key = reactionKey(messageId: messageId, account: account)
-        guard !pendingReactionKeys.contains(key) else { return }
+    /// Enqueue an emoji reaction to one stored message row. The server derives
+    /// the account, reply recipient and threading metadata from that row, so
+    /// the GUI supplies only its opaque identifier and the emoji.
+    func sendReaction(messageId: String, emoji: String, threadId: String) async {
+        guard !pendingReactionKeys.contains(messageId) else { return }
         guard Self.reactionOptions.contains(where: { $0.emoji == emoji }) else {
             BannerManager.shared.showWarning(title: "Reaction Not Sent", message: "Unsupported emoji.")
             return
@@ -187,14 +216,18 @@ class EmailSendingManager: ObservableObject {
             return
         }
 
-        pendingReactionKeys.insert(key)
-        let result = await backend.enqueueReaction(messageId: messageId, account: account, emoji: emoji)
+        pendingReactionKeys.insert(messageId)
+        // One key per user action: a retry after a lost response reuses it,
+        // while reacting again after an Undo is a new action with a new key.
+        let result = await backend.enqueueReaction(
+            messageId: messageId, emoji: emoji, idempotencyKey: UUID().uuidString
+        )
         guard result.ok, let itemId = result.id else {
-            pendingReactionKeys.remove(key)
+            pendingReactionKeys.remove(messageId)
             BannerManager.shared.showWarning(title: "Reaction Not Queued", message: result.error ?? "Unknown error")
             return
         }
-        reactionKeyByItem[itemId] = key
+        reactionKeyByItem[itemId] = messageId
         monitorReaction(itemId: itemId, sendAfter: result.sendAfter, backend: backend)
         OutboxManager.shared.refresh()
         startCountdown(
@@ -202,14 +235,15 @@ class EmailSendingManager: ObservableObject {
             draftId: UUID(),
             recipient: result.recipient ?? "",
             threadId: threadId,
+            sendAfter: result.sendAfter ?? 0,
             kind: "reaction",
             onUndo: {},
             onConfirmedSent: {}
         )
     }
 
-    private func reactionKey(messageId: String, account: String) -> String {
-        "\(account.lowercased())\u{0}\(messageId)"
+    func isReactionPending(messageId: String) -> Bool {
+        pendingReactionKeys.contains(messageId)
     }
 
     private func finishReaction(itemId: Int64) {
@@ -225,7 +259,7 @@ class EmailSendingManager: ObservableObject {
         reactionMonitors[itemId] = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(initialDelay) * 1_000_000_000)
             guard !Task.isCancelled else { return }
-            for attempt in 0..<20 {
+            for attempt in 0 ..< 20 {
                 if let items = await backend.listOutboxIfAvailable() {
                     if Self.isReactionTerminal(itemId: itemId, outbox: items) {
                         self?.finishReaction(itemId: itemId)
@@ -261,9 +295,13 @@ class EmailSendingManager: ObservableObject {
         return "Sending email in \(secondsLeft)s to \(recipient)..."
     }
 
+    /// A reaction stops being pending once it left the queue, exhausted its
+    /// attempts, or reached one of the durable terminal states the outbox keeps
+    /// for manual reconciliation. A claimed-but-unconfirmed item is still in
+    /// flight and must keep its palette entry disabled.
     nonisolated static func isReactionTerminal(itemId: Int64, outbox: [OutboxEntry]) -> Bool {
         guard let item = outbox.first(where: { $0.id == itemId }) else { return true }
-        return item.attempts >= 5
+        return item.attempts >= 5 || item.delivery_confirmed == true
     }
 
     /// Send email by enqueuing to the outbox via HTTP API.
@@ -374,6 +412,10 @@ class EmailSendingManager: ObservableObject {
 
         // Build outbox payload
         let payload = OutboxPayload(
+            // Retries after an unknown HTTP outcome must reuse the logical
+            // draft identity. Undo clones the draft with a fresh UUID, so a
+            // genuinely new send still receives a new key.
+            idempotency_key: Self.idempotencyKey(for: draft),
             from: accountEmail,
             to: draft.to,
             cc: draft.cc,
@@ -424,6 +466,7 @@ class EmailSendingManager: ObservableObject {
                 draftId: draft.id,
                 recipient: recipient,
                 threadId: draft.replyThreadId,
+                sendAfter: result.sendAfter ?? 0,
                 onUndo: onUndo,
                 onConfirmedSent: onConfirmedSent
             )

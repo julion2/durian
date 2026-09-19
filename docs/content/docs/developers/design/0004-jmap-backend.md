@@ -3,19 +3,21 @@ title: "ADR-0004: Native JMAP mail, submission, and EventSource push"
 weight: 4
 ---
 
-- **Status:** Proposed (implemented in PR #349)
+- **Status:** Implemented
 - **Date:** 2026-08-26
 - **Author:** @julion2
 
 ## TL;DR
 
 Durian supports RFC 8620 Core and RFC 8621 Mail/Submission through the existing
-provider-neutral backend and sync engine. JMAP mailbox memberships become
-canonical Durian tags, incremental synchronization follows `Email/changes`
-state tokens, and `cannotCalculateChanges` recovers through an authoritative
-ID-only replacement snapshot. Sending uses `Email/import` followed by
-`EmailSubmission/set`. `durian serve` consumes JMAP EventSource state changes;
-RFC 8887 WebSocket push is intentionally not implemented.
+provider-neutral backend and sync engine. JMAP mailbox memberships and custom
+keywords become canonical Durian tags, incremental synchronization follows
+`Email/changes` state tokens, and `cannotCalculateChanges` recovers through an
+authoritative paged replacement snapshot. Composed mail is created as a
+structured Email and submitted with `EmailSubmission/set`; raw append/import
+remains available for existing RFC 5322 messages. `durian serve` consumes JMAP
+EventSource state changes; RFC 8887 WebSocket push is intentionally not
+implemented.
 
 ## Context
 
@@ -34,25 +36,103 @@ JMAP-specific `durian-jmap` keychain service. A legacy `durian-password` entry
 is accepted once and copied only after successful JMAP discovery, preserving
 existing configurations without risking an IMAP password overwrite.
 
+The session's Core capability is operational input, not advisory metadata.
+Durian bounds `Email/get` batches by `maxObjectsInGet`, rejects API and upload
+payloads above `maxSizeRequest` and `maxSizeUpload`, and gates concurrent API
+and upload work by `maxConcurrentRequests` and `maxConcurrentUpload`. Current
+set operations contain one object, so they remain within any valid
+`maxObjectsInSet`; each request contains one method call and therefore also
+fits `maxCallsInRequest`.
+
 The backend exposes one synthetic all-mail stream. Special-use mailboxes map to
 fixed tags (`inbox`, `sent`, `draft`, `archive`, `trash`, `spam`); user mailboxes
 map to lowercase parent paths. Ambiguous normalized paths receive a stable
 mailbox-ID-derived suffix so downloads and later uploads resolve to the same
 mailbox.
 
-Initial synchronization captures an Email state and pages message IDs/bodies.
+JMAP keywords are a second, independent tag source. Mailbox tags patch
+`mailboxIds`; arbitrary Durian tags are encoded reversibly as lowercase custom
+keywords. Native keywords that cannot safely decode to a Durian tag are exposed
+under `jmap-keyword/<keyword>` to avoid collisions with mailbox tags. System
+keywords beginning with `$` remain flag/state properties and are not surfaced
+as arbitrary tags. Local `unread`, `flagged`, and `replied` edits are persisted
+as explicit mutation intent and uploaded as property patches
+(`keywords/$seen`, `keywords/$flagged`, `keywords/$answered`) before downloading
+the next delta. Mailbox and arbitrary-tag changes use the normal durable label
+baseline and their respective property patches. A JMAP account therefore does
+not require Durian's optional tag-sync server merely to round-trip normal tags.
+
+Each JMAP message is stored by its immutable `Email.id`, prefixed with a hashed
+provider-account fingerprint derived from the session authority, authenticated
+username, and discovered JMAP account ID. Remote references and sync cursors use
+the same scope. Retargeting a mutable Durian account alias therefore forces an
+authoritative replacement and cannot reuse another provider account's IDs or
+state tokens, even if their opaque values happen to collide. An unscoped JMAP
+cursor written before account scopes existed is conservatively replaced because
+it cannot prove provider-account identity. Only an operator who has verified a
+same-account upgrade may temporarily set `jmap.trust_legacy_identity = true`;
+Durian then prefixes immutable local IDs and the cursor while preserving row IDs,
+local tags, and sync baselines. The migration durably marks a replacement in
+progress before any queued provider mutation can be uploaded. The option must
+never be enabled while changing endpoint, credential, or provider account. A
+cursor that already carries a different non-empty scope is always a retarget and
+is never migrated.
+RFC 5322 Message-ID remains searchable threading metadata and is the fallback
+identity for protocols that lack a native stable identifier; it is not assumed
+to be present or unique. API thread-message identifiers are consequently opaque:
+every message uses its local row identifier, including when Message-IDs are
+missing or duplicated.
+The separate optional cross-device tag-sync protocol remains Message-ID based
+and therefore cannot distinguish such duplicates; native JMAP keywords are the
+authoritative multi-client path for JMAP tags.
+
+Initial synchronization uses the same anchored, presence-bearing replacement
+pages as recovery; legacy cursors containing pending ID arrays remain readable.
 Steady state uses `Email/changes`. When that state expires, Durian captures a
-new state, queries the complete remote ID set, refreshes flags and mailbox
-memberships for existing local messages, downloads bodies only for missing IDs,
-and reconciles absent local references. The replacement cursor is persisted
-only after hydration, deletion, label, and flag reconciliation all succeed.
+new state and enumerates an anchored `Email/query` one bounded page at a time.
+The in-process page continuation carries only query state, anchor, and counts
+rather than the complete remote ID set. Durian then refreshes flags, keywords,
+and mailbox memberships for existing local messages, downloads bodies only for
+missing IDs, and reconciles absent local references. Authoritative presence is
+staged in SQLite and local absences are keyset-paged, keeping memory bounded by
+one provider page. Each completed page is staged before its opaque continuation
+cursor is checkpointed, so an interrupted sync resumes rather than restarting
+at page zero. A changed query state or missing anchor discards staging and
+restarts from the pre-snapshot cursor instead of retrying a dead checkpoint.
+One cross-process account lock covers each complete mutating engine pass, so a
+daemon watcher and a manual sync cannot mix pages or cursor transitions from
+different replacement episodes. Hydration, deletion, and label reconciliation
+must complete before the final cursor is written. Staging is cleared only after
+that cursor is durable. A flag
+reconciliation failure holds that cursor for one bounded replacement replay;
+after a repeated failure, the cursor advances with unresolved flag references
+queued for later retries.
 The same neutral `FullSnapshot`/`Present` contract is used for Gmail history-ID
 expiry.
 
-Submission imports an RFC 5322 message into Drafts, creates an
-`EmailSubmission`, and lets the server maintain Sent. Local compose autosave,
-outbox, and undo-send work normally; the separate `durian draft save/delete`
-commands remain IMAP-only for now.
+Submission uploads attachment blobs, creates a structured Email in Drafts with
+`Email/set` (`bodyStructure`, `bodyValues`, typed address and threading
+properties), and creates an `EmailSubmission`. `onSuccessUpdateEmail`
+explicitly removes `$draft`, removes Drafts membership, and adds Sent
+membership; a missing Sent role mailbox is created first. If that implicit
+filing fails after submission is confirmed, Durian retries one idempotent direct
+patch. If that repair also fails, delivery remains accepted but the outbox item
+is marked permanently failed for manual filing remediation; it is never sent
+again automatically. The outbox atomically and durably claims every delivery
+before contacting a provider. A claim surviving a process restart likewise
+requires manual reconciliation rather than risking duplicate delivery. Undo
+deletes only unclaimed rows and returns a conflict after delivery is claimed;
+the encrypted queued draft persists its Message-ID before provider contact so
+the exact delivery can be verified. Ambiguous outcomes remain claimed and emit
+`reconciliation_required`; confirmed delivery with a Sent-filing failure emits
+`delivered_with_warning`, never "Not Sent". After provider verification,
+`durian outbox reconcile` clears or safely requeues the claim only while it
+holds the exclusive outbox lifecycle lock and delivery has not already been
+durably confirmed. The command refuses to run while the GUI/server owns the
+outbox.
+`Email/import` remains the correct path for generic raw `Append`/`Backend.Send`
+input. Local compose autosave, outbox, and undo-send work normally; the separate
+`durian draft save/delete` commands remain IMAP-only for now.
 
 Push uses RFC 8620 EventSource with `Last-Event-ID`, reconnect backoff, and a
 slow polling safety net. WebSocket push would add another transport without
@@ -62,9 +142,12 @@ improving the state-token correctness model and is therefore out of scope.
 
 - A JMAP-only account needs neither IMAP nor SMTP for sync and sending.
 - Mail remains fully available from Durian's encrypted local read model.
-- Mailbox creation is limited to the Archive mailbox required to preserve
-  JMAP's at-least-one-mailbox invariant; arbitrary local tags do not create
-  server mailboxes.
+- Mailbox creation is limited to role mailboxes needed by move/submission
+  invariants. Arbitrary local tags use JMAP keywords, not server mailboxes.
+- The neutral backend deliberately keeps Durian multi-provider, but it costs
+  JMAP fidelity: bodies are still normalized through RFC 5322 for the local
+  read model, and `threadId` is not Durian's universal threading key. Stable
+  Email IDs and keywords stay native instead of being discarded at that seam.
 - Live integration tests can run against disposable Stalwart or Fastmail
   accounts and are always compiled by the Bazel CLI suite.
 - Calendar and contacts JMAP capabilities are not part of this decision.
@@ -79,6 +162,8 @@ improving the state-token correctness model and is therefore out of scope.
   providers.
 - **Use RFC 8887 WebSocket push.** Deferred: EventSource is part of JMAP Core,
   works with the same state-token recovery, and avoids a second transport.
-- **Persist mailbox-sized ID sets as steady-state cursors.** Rejected for state
-  expiry recovery; authoritative replacement IDs are consumed as recovery
-  state and the durable steady-state cursor remains the provider's EmailState.
+- **Persist mailbox-sized ID sets as recovery cursors.** Rejected: replacement
+  IDs are emitted as bounded pages, the in-process continuation stores only the
+  query anchor/state/counts, and the durable steady-state cursor remains the
+  provider's EmailState. Authoritative presence is staged in SQLite per page,
+  and absent local rows are reconciled with bounded keyset pagination.

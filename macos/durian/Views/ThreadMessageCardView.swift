@@ -22,7 +22,9 @@ struct ThreadMessageCardView: View {
     let onReply: () -> Void
     let onReplyAll: () -> Void
     let onForward: () -> Void
-    var onEditDraft: (() -> Void)? = nil
+    /// Receives the message this card renders, so editing composes from the
+    /// draft the user clicked rather than from the thread aggregate.
+    var onEditDraft: ((ThreadMessage) -> Void)? = nil
 
     @ObservedObject private var sendingManager = EmailSendingManager.shared
 
@@ -464,7 +466,7 @@ struct ThreadMessageCardView: View {
 
     private func fetchAttachmentData(_ attachment: AttachmentInfo) async -> Data? {
         // Check cache first
-        if let cached = AttachmentCacheManager.shared.get(messageId: message.id, partId: attachment.partId) {
+        if let cached = AttachmentCacheManager.shared.get(messageId: message.attachmentCacheId, partId: attachment.partId) {
             Log.debug("ATTACHMENT", "Cache hit for \(attachment.filename)")
             return cached
         }
@@ -481,7 +483,7 @@ struct ThreadMessageCardView: View {
             )
             // Cache for future access
             AttachmentCacheManager.shared.put(
-                messageId: message.id, partId: attachment.partId,
+                messageId: message.attachmentCacheId, partId: attachment.partId,
                 filename: attachment.filename, data: data
             )
             return data
@@ -578,8 +580,13 @@ struct ThreadMessageCardView: View {
                 detailRow(label: "Tags", value: tags.joined(separator: ", "))
             }
 
-            // Message-ID (from message)
-            detailRow(label: "Message-ID", value: message.id)
+            // Message-ID (from message). Stable provider rows use an opaque
+            // local: identifier for actions; never present that as RFC metadata.
+            if let messageId = message.message_id {
+                detailRow(label: "Message-ID", value: messageId)
+            } else if !message.id.hasPrefix("local:") {
+                detailRow(label: "Message-ID", value: message.id)
+            }
         }
         .padding(.leading, 52)
         .padding(.top, 8)
@@ -605,15 +612,17 @@ struct ThreadMessageCardView: View {
     @ViewBuilder
     private var reactionMenu: some View {
         Menu {
-            if message.owningAccounts.count == 1, let account = message.owningAccounts.first {
-                reactionButtons(account: account, includeAccountInLabel: false)
-            } else {
-                ForEach(message.owningAccounts, id: \.self) { account in
-                    Menu(accountLabel(account)) {
-                        reactionButtons(account: account, includeAccountInLabel: true)
+            ForEach(EmailSendingManager.reactionOptions) { option in
+                Button("\(option.label) \(option.emoji)") {
+                    Task {
+                        await sendingManager.sendReaction(
+                            messageId: message.id,
+                            emoji: option.emoji,
+                            threadId: email.id
+                        )
                     }
-                    .disabled(!message.reactionAccounts.contains(account))
                 }
+                .accessibilityLabel("React with \(option.label)")
             }
         } label: {
             Image(systemName: "face.smiling")
@@ -623,51 +632,19 @@ struct ThreadMessageCardView: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
-        .disabled(message.reactionAccounts.isEmpty || reactionPending)
+        .disabled(!message.canReact || reactionPending)
         .help(reactionHelp)
         .accessibilityLabel("React to this message")
     }
 
     private var reactionHelp: String {
         if reactionPending { return "Reaction pending" }
-        if message.reactionAccounts.isEmpty, !message.replyToIndexed {
-            return "Backfill message headers before reacting"
-        }
+        if !message.canReact { return "Backfill message headers before reacting" }
         return "React with emoji"
     }
 
     private var reactionPending: Bool {
-        message.reactionAccounts.contains {
-            sendingManager.isReactionPending(messageId: message.id, account: $0)
-        }
-    }
-
-    @ViewBuilder
-    private func reactionButtons(account: String, includeAccountInLabel: Bool) -> some View {
-        ForEach(EmailSendingManager.reactionOptions) { option in
-            Button("\(option.label) \(option.emoji)") {
-                Task {
-                    await sendingManager.sendReaction(
-                        messageId: message.id,
-                        account: account,
-                        emoji: option.emoji,
-                        threadId: email.id
-                    )
-                }
-            }
-            .accessibilityLabel(
-                includeAccountInLabel
-                    ? "React with \(option.label) from \(accountLabel(account))"
-                    : "React with \(option.label)"
-            )
-        }
-    }
-
-    private func accountLabel(_ identifier: String) -> String {
-        guard let account = ConfigManager.shared.getAccounts().first(where: {
-            $0.name.caseInsensitiveCompare(identifier) == .orderedSame
-        }) else { return identifier }
-        return "\(account.name) (\(account.email))"
+        sendingManager.isReactionPending(messageId: message.id)
     }
 
     @ViewBuilder
@@ -676,7 +653,7 @@ struct ThreadMessageCardView: View {
             Spacer()
 
             if message.isDraft, let onEditDraft = onEditDraft {
-                Button(action: onEditDraft) {
+                Button(action: { onEditDraft(message) }) {
                     HStack(spacing: 6) {
                         Image(systemName: "pencil")
                             .font(.system(size: 14))

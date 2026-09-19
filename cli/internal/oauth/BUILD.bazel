@@ -11,7 +11,10 @@ go_library(
     ],
     importpath = "github.com/julion2/durian/cli/internal/oauth",
     visibility = ["//cli:__subpackages__"],
-    deps = ["//cli/internal/keychain"],
+    deps = [
+        "//cli/internal/keychain",
+        "//cli/internal/redact",
+    ],
 )
 
 go_test(
@@ -19,4 +22,5 @@ go_test(
     size = "small",
     srcs = ["oauth_test.go"],
     embed = [":oauth"],
+    deps = ["//cli/internal/redact"],
 )

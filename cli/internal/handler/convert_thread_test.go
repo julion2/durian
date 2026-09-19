@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +69,65 @@ func TestConvertThread_OrdersNewestFirst(t *testing.T) {
 	}
 }
 
+func TestConvertThreadKeepsDuplicateMessageIDsAddressable(t *testing.T) {
+	db := newTestStore(t)
+	now := time.Now().Unix()
+	first := &store.Message{
+		StableID: "email-1", MessageID: "duplicate@example.com", Subject: "Duplicate",
+		Date: now, CreatedAt: now, BodyText: "first body", Mailbox: "ALL", Account: "work",
+	}
+	second := &store.Message{
+		MessageID: "duplicate@example.com", Subject: "Duplicate",
+		Date: now + 1, CreatedAt: now + 1, BodyText: "second body", Mailbox: "ALL", Account: "work",
+	}
+	if err := db.InsertMessage(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMessage(second); err != nil {
+		t.Fatal(err)
+	}
+	h := New(db, nil)
+	response := h.ShowThread(first.ThreadID)
+	if !response.OK || response.Thread == nil || len(response.Thread.Messages) != 2 {
+		t.Fatalf("thread response = %+v", response)
+	}
+	seenBodies := map[string]bool{}
+	seenIDs := map[string]bool{}
+	seenCacheIDs := map[string]bool{}
+	for _, message := range response.Thread.Messages {
+		if !strings.HasPrefix(message.ID, "local:") || message.MessageID != "duplicate@example.com" {
+			t.Errorf("message identity = id %q, Message-ID %q", message.ID, message.MessageID)
+		}
+		if seenIDs[message.ID] {
+			t.Errorf("duplicate opaque id %q", message.ID)
+		}
+		seenIDs[message.ID] = true
+		if message.AttachmentCacheID == "" || strings.HasPrefix(message.AttachmentCacheID, "local:") {
+			t.Errorf("attachment cache identity = %q", message.AttachmentCacheID)
+		}
+		if seenCacheIDs[message.AttachmentCacheID] {
+			t.Errorf("duplicate attachment cache identity %q", message.AttachmentCacheID)
+		}
+		seenCacheIDs[message.AttachmentCacheID] = true
+		bodyResponse := h.ShowMessageBody(message.ID)
+		if !bodyResponse.OK || bodyResponse.MessageBody == nil {
+			t.Fatalf("body %q response = %+v", message.ID, bodyResponse)
+		}
+		seenBodies[bodyResponse.MessageBody.Body] = true
+	}
+	if !seenBodies["first body"] || !seenBodies["second body"] {
+		t.Fatalf("opaque identifiers resolved bodies %v", seenBodies)
+	}
+}
+
+func TestAttachmentCacheIDDoesNotReuseDatabaseRowIdentity(t *testing.T) {
+	oldMessage := &store.Message{ID: 1, Account: "work", StableID: "provider-object-old", MessageID: "old@example.com"}
+	newMessage := &store.Message{ID: 1, Account: "work", StableID: "provider-object-new", MessageID: "new@example.com"}
+	if oldID, newID := attachmentCacheID(oldMessage), attachmentCacheID(newMessage); oldID == newID {
+		t.Fatalf("reused database row produced the same attachment cache identity %q", oldID)
+	}
+}
+
 // --- Subject inheritance ---
 
 func TestConvertThread_SubjectFromFirstMessage(t *testing.T) {
@@ -112,6 +172,7 @@ func TestConvertThread_AllFieldsMapped(t *testing.T) {
 		BodyText: "plain body",
 		BodyHTML: "<p>html body</p>",
 		Mailbox:  "INBOX",
+		Account:  "work",
 	})
 
 	m, _ := db.GetByMessageID("fields@test")
@@ -119,11 +180,14 @@ func TestConvertThread_AllFieldsMapped(t *testing.T) {
 	resp := h.ShowThread(m.ThreadID)
 	msg := resp.Thread.Messages[0]
 
-	if msg.ID != "fields@test" {
+	if msg.ID != "local:"+strconv.FormatInt(m.ID, 10) {
 		t.Errorf("ID = %q", msg.ID)
 	}
 	if msg.MessageID != "fields@test" {
 		t.Errorf("MessageID = %q", msg.MessageID)
+	}
+	if msg.Account != "work" {
+		t.Errorf("Account = %q", msg.Account)
 	}
 	if msg.From != "alice@example.com" {
 		t.Errorf("From = %q", msg.From)
@@ -156,45 +220,55 @@ func TestConvertThread_AllFieldsMapped(t *testing.T) {
 	}
 }
 
-func TestShowThreadExposesAllOwningAccountsWithoutChoosingOne(t *testing.T) {
+func TestShowThreadScopesReactionEligibilityToEachAccountRow(t *testing.T) {
+	// Provider-native rows are never collapsed across accounts, so one thread
+	// can show the same message twice. Each row carries its own opaque
+	// identifier, and indexing Reply-To for one must not make the other
+	// reactable: the reply recipient is only known per row.
 	db := newTestStore(t)
 	for _, account := range []string{"work", "personal"} {
 		if err := db.InsertMessage(&store.Message{
-			MessageID: "shared@test", Subject: "Shared", FromAddr: "sender@test",
-			Account: account, Date: 1, CreatedAt: 1, BodyText: "same",
+			StableID: "email-" + account, MessageID: "shared@test", Subject: "Shared",
+			FromAddr: "sender@test", Account: account, Date: 1, CreatedAt: 1, BodyText: "same",
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	target, _ := db.GetByMessageIDAndAccount("shared@test", "work")
-	if err := db.InsertHeader(target.ID, "reply-to", ""); err != nil {
+	rows, err := db.GetAllByMessageID("shared@test")
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("rows = %d, err = %v", len(rows), err)
+	}
+	byAccount := map[string]*store.Message{}
+	for _, row := range rows {
+		byAccount[row.Account] = row
+	}
+	if err := db.InsertHeader(byAccount["work"].ID, "reply-to", ""); err != nil {
 		t.Fatal(err)
 	}
-	response := New(db, nil).ShowThread(target.ThreadID)
-	if !response.OK || len(response.Thread.Messages) != 1 {
+
+	response := New(db, nil).ShowThread(rows[0].ThreadID)
+	if !response.OK || len(response.Thread.Messages) != 2 {
 		t.Fatalf("response = %+v", response)
 	}
-	message := response.Thread.Messages[0]
-	if message.Account != "" || strings.Join(message.Accounts, ",") != "personal,work" {
-		t.Fatalf("account selection = %q, accounts = %v", message.Account, message.Accounts)
+	eligible := map[string]bool{}
+	for _, message := range response.Thread.Messages {
+		if message.ID != "local:"+strconv.FormatInt(byAccount[message.Account].ID, 10) {
+			t.Fatalf("identifier %q does not address the %s row", message.ID, message.Account)
+		}
+		eligible[message.Account] = message.CanReact
 	}
-	if message.ReplyToIndexed {
-		t.Fatal("ReplyToIndexed = true with one unindexed owning account")
+	if !eligible["work"] || eligible["personal"] {
+		t.Fatalf("reaction eligibility = %v, want only work", eligible)
 	}
-	if strings.Join(message.ReactionAccounts, ",") != "work" {
-		t.Fatalf("eligible reaction accounts = %v, want [work]", message.ReactionAccounts)
-	}
-	personal, _ := db.GetByMessageIDAndAccount("shared@test", "personal")
-	if err := db.InsertHeader(personal.ID, "reply-to", ""); err != nil {
+
+	if err := db.InsertHeader(byAccount["personal"].ID, "reply-to", ""); err != nil {
 		t.Fatal(err)
 	}
-	response = New(db, nil).ShowThread(target.ThreadID)
-	message = response.Thread.Messages[0]
-	if !message.ReplyToIndexed {
-		t.Fatal("ReplyToIndexed = false after every owning account was indexed")
-	}
-	if strings.Join(message.ReactionAccounts, ",") != "personal,work" {
-		t.Fatalf("eligible reaction accounts = %v, want [personal work]", message.ReactionAccounts)
+	response = New(db, nil).ShowThread(rows[0].ThreadID)
+	for _, message := range response.Thread.Messages {
+		if !message.CanReact {
+			t.Fatalf("%s row is not reactable after indexing Reply-To", message.Account)
+		}
 	}
 }
 
@@ -202,7 +276,7 @@ func TestShowThreadMarksLocallyStoredReaction(t *testing.T) {
 	db := newTestStore(t)
 	message := seedThreadMessage(t, db, &store.Message{
 		MessageID: "reaction@test", Subject: "Re: Hello", FromAddr: "me@test",
-		Account: "work", Date: 1, CreatedAt: 1, BodyText: "👍",
+		Account: "work", Date: 1, CreatedAt: 1, BodyText: "\U0001F44D",
 	})
 	if err := db.InsertHeader(message.ID, "content-disposition", "reaction"); err != nil {
 		t.Fatal(err)
@@ -269,7 +343,7 @@ func TestConvertThread_TagsPerMessage(t *testing.T) {
 
 	tagsByMsg := make(map[string][]string)
 	for _, msg := range resp.Thread.Messages {
-		tagsByMsg[msg.ID] = msg.Tags
+		tagsByMsg[msg.MessageID] = msg.Tags
 	}
 
 	hasTag := func(tags []string, want string) bool {
@@ -327,7 +401,7 @@ func TestConvertThread_AttachmentsPerMessage(t *testing.T) {
 
 	attsByMsg := make(map[string]int)
 	for _, msg := range resp.Thread.Messages {
-		attsByMsg[msg.ID] = len(msg.Attachments)
+		attsByMsg[msg.MessageID] = len(msg.Attachments)
 	}
 
 	if attsByMsg["att1@test"] != 2 {
@@ -339,7 +413,7 @@ func TestConvertThread_AttachmentsPerMessage(t *testing.T) {
 
 	// Verify attachment field mapping
 	for _, msg := range resp.Thread.Messages {
-		if msg.ID == "att1@test" {
+		if msg.MessageID == "att1@test" {
 			var pdf, png bool
 			for _, a := range msg.Attachments {
 				if a.Filename == "doc.pdf" {
@@ -491,8 +565,8 @@ func TestConvertThread_LightOmitsHTMLAndReplyHeaders(t *testing.T) {
 	if msg.References != "" {
 		t.Errorf("References should be empty in light mode, got %q", msg.References)
 	}
-	if !msg.IsReaction || !msg.ReplyToIndexed {
-		t.Errorf("light mode reaction metadata = isReaction %v, replyToIndexed %v", msg.IsReaction, msg.ReplyToIndexed)
+	if !msg.IsReaction || !msg.CanReact {
+		t.Errorf("light mode reaction metadata = isReaction %v, canReact %v", msg.IsReaction, msg.CanReact)
 	}
 }
 

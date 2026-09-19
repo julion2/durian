@@ -34,6 +34,7 @@ import (
 	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/julion2/durian/cli/internal/oauth"
+	"github.com/julion2/durian/cli/internal/redact"
 )
 
 const (
@@ -178,6 +179,12 @@ type statusError struct {
 func (e *statusError) Error() string {
 	return fmt.Sprintf("google calendar request failed: status %d: %s", e.status, e.body)
 }
+
+func (e *statusError) SafeLogText() string {
+	return fmt.Sprintf("google calendar request failed: status %d: response body %s", e.status, redact.Placeholder)
+}
+
+var _ redact.SafeLogError = (*statusError)(nil)
 
 // IsAuthError reports whether err looks like a Google authentication or
 // consent problem (expired/missing token, a 401, or a 403 such as

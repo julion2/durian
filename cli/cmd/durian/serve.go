@@ -105,6 +105,13 @@ func runServe(cmd *cobra.Command, args []string) {
 	if dbPath == "" {
 		dbPath = store.DefaultDBPath()
 	}
+	releaseOutbox, err := store.AcquireOutboxLifecycle(dbPath)
+	if err != nil {
+		slog.Error("Outbox lifecycle lock unavailable", "module", "SERVE", "err", err)
+		fmt.Fprintln(os.Stderr, "Error: another Durian process owns the outbox:", err)
+		os.Exit(1)
+	}
+	defer releaseOutbox()
 	emailDB, err := store.Open(dbPath, keyring)
 	if err != nil {
 		slog.Error("Email store required but unavailable", "module", "SERVE", "err", err)
@@ -140,6 +147,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	}
 
 	r := mux.NewRouter()
+	r.UseEncodedPath()
 	addr := fmt.Sprintf("127.0.0.1:%d", servePort)
 	allowedHost := fmt.Sprintf("localhost:%d", servePort)
 	allowedHostIP := fmt.Sprintf("127.0.0.1:%d", servePort)
@@ -228,6 +236,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	if err != nil {
 		slog.Warn("Could not load config", "module", "SERVE", "err", err)
 	} else {
+		configureStoreAccounts(emailDB, cfg)
 		h.SetConfig(cfg)
 		h.SetCalendarEventSyncer(guiCalendarSyncer{cfg: cfg})
 
@@ -402,11 +411,11 @@ func pullRemoteTags(client *tagsync.Client, db *store.DB) {
 	for _, c := range changes {
 		switch c.Action {
 		case "add":
-			if err := db.ModifyTagsByMessageIDAndAccount(c.MessageID, c.Account, []string{c.Tag}, nil); err == nil {
+			if err := db.ModifyTagsByMessageIDAndAccountAndJournal(c.MessageID, c.Account, []string{c.Tag}, nil, time.Now().Unix()); err == nil {
 				applied++
 			}
 		case "remove":
-			if err := db.ModifyTagsByMessageIDAndAccount(c.MessageID, c.Account, nil, []string{c.Tag}); err == nil {
+			if err := db.ModifyTagsByMessageIDAndAccountAndJournal(c.MessageID, c.Account, nil, []string{c.Tag}, time.Now().Unix()); err == nil {
 				applied++
 			}
 		}

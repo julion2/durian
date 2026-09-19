@@ -76,14 +76,14 @@ paths:
       summary: Get the full unstripped body of a single message
       description: >
         Returns the raw plain-text body and optional HTML body of the
-        message identified by its RFC Message-ID. Used by the compose
-        window for reply quoting — the sync path stores stripped bodies
-        to save space, but replies need the original.
+        message identified by the id returned in ThreadMessage.id. Used by
+        the compose window for reply quoting — the sync path stores stripped
+        bodies to save space, but replies need the original.
       parameters:
         - name: id
           in: query
           required: true
-          description: RFC Message-ID of the message (including angle brackets)
+          description: Message identifier returned in ThreadMessage.id; treat as opaque
           schema:
             type: string
       responses:
@@ -230,7 +230,9 @@ paths:
       summary: Download a message attachment
       description: >
         Streams the raw bytes of a MIME part. Content-Type and Content-Disposition
-        headers are derived server-side from stored message metadata.
+        headers are derived server-side from stored message metadata. The
+        message_id path component is the ThreadMessage.id value and must be
+        treated as opaque and percent-encoded as one URL path segment.
       parameters:
         - name: message_id
           in: path
@@ -346,15 +348,27 @@ paths:
                     type: integer
                     format: int64
                     description: Unix timestamp after which the worker may send the email (0 = immediate)
+                required:
+                  - ok
+                  - id
+                  - send_after
         '400':
           description: Invalid request (missing fields)
   /messages/{message_id}/reactions:
     post:
-      summary: Enqueue an account-scoped RFC 9078 emoji reply
+      summary: Enqueue an RFC 9078 emoji reply to one message
+      description: >
+        Enqueues a reaction to the exact stored message row named by the path
+        identifier. The account, reply recipient, subject and threading
+        metadata are derived server-side from that row; the client supplies
+        only the emoji.
       parameters:
         - name: message_id
           in: path
           required: true
+          description: >
+            Opaque local message identifier from ThreadMessage.id. An RFC
+            Message-ID is accepted only while it identifies exactly one row.
           schema:
             type: string
       requestBody:
@@ -371,13 +385,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/ReactionEnqueueResponse'
         '400':
-          description: Invalid account, emoji, recipient, or threading headers
+          description: >
+            Invalid identifier, emoji, account, reply recipient, or threading
+            headers
         '404':
-          description: Message not found in the requested account
+          description: Message not found, or not owned by the asserted account
         '409':
-          description: The same reaction is pending or Reply-To was never indexed
+          description: Reply-To was never indexed; run a header backfill first
         '500':
-          description: Target resolution or enqueue failed
+          description: Enqueue failed
         '503':
           description: Mail configuration is unavailable
   /outbox:
@@ -414,6 +430,8 @@ paths:
                     type: boolean
         '404':
           description: Item not found
+        '409':
+          description: Item was already claimed for delivery and can no longer be undone
   /threads/{thread_id}/tags:
     post:
       summary: Add or remove tags from an email thread
@@ -783,6 +801,18 @@ components:
           type: boolean
         error:
           type: string
+        matched_threads:
+          type: integer
+          description: >-
+            Threads the query selected. Present on success, absent on failure.
+        changed_threads:
+          type: integer
+          description: >-
+            Threads the mutation actually changed, which is at most
+            `matched_threads`. The two differ when a thread already carried the
+            requested tags, so a client that wants to report what happened has
+            to read this one rather than the match count. Present on success,
+            absent on failure.
     NewMailEvent:
       type: object
       properties:
@@ -834,31 +864,44 @@ components:
       properties:
         id:
           type: string
+          description: >
+            Opaque local message identifier. Clients must not interpret this
+            field as an RFC Message-ID.
+        attachment_cache_id:
+          type: string
+          description: >
+            Opaque content identity for persistent attachment caches. Unlike
+            id, this value remains tied to the provider object when a local
+            database is recreated.
+        message_id:
+          type: string
+          description: RFC 5322 Message-ID metadata; optional and not guaranteed unique
         account:
           type: string
-          description: Present for backward compatibility when exactly one account owns the message
-        accounts:
-          type: array
-          items:
-            type: string
-          description: All accounts that own this Message-ID
-        reaction_accounts:
-          type: array
-          items:
-            type: string
-          description: Owning accounts whose Reply-To status is indexed and can send a reaction
+          description: Account that owns this message row
+        can_react:
+          type: boolean
+          description: >
+            Whether this row's Reply-To status is indexed, so a reaction can
+            derive its reply recipient. False when the message's headers were
+            never fetched; run a header backfill first.
         is_reaction:
           type: boolean
-          description: True for a top-level RFC 9078 Content-Disposition reaction
-        reply_to_indexed:
-          type: boolean
-          description: Whether Reply-To absence or value is known for every owning account
+          description: True for a received RFC 9078 Content-Disposition reaction
         from:
           type: string
         to:
           type: string
         cc:
           type: string
+        bcc:
+          type: string
+          description: >-
+            Blind recipients. Only ever present on a draft the user has saved
+            themselves: a received message has no Bcc header, because the
+            sending server strips it before delivery. A client reopening a
+            draft for editing must restore this field, or saving again drops
+            the recipients.
         date:
           type: string
         timestamp:
@@ -912,6 +955,10 @@ components:
     OutboxDraft:
       type: object
       properties:
+        idempotency_key:
+          type: string
+          maxLength: 200
+          description: Stable unique ID for this logical send action; retries with the same value return the original outbox row.
         from:
           type: string
         to:
@@ -945,6 +992,7 @@ components:
           description: Seconds to delay before the worker may send (undo window). 0 = immediate.
           default: 0
       required:
+        - idempotency_key
         - from
         - to
         - subject
@@ -952,13 +1000,23 @@ components:
     ReactionRequest:
       type: object
       properties:
-        account:
-          type: string
         emoji:
           type: string
           enum: [👍, ❤️, 😂, 😮, 😢]
+        idempotency_key:
+          type: string
+          description: >
+            Identifies one reaction action. Retrying a request after a lost
+            response must reuse it; reacting again after an Undo is a new
+            action and needs a new key. Omitting it falls back to a key
+            derived from the target message and emoji.
+        account:
+          type: string
+          description: >
+            Optional assertion that the target message belongs to this
+            account. The server derives the sending account from the message
+            itself and rejects a mismatch with 404.
       required:
-        - account
         - emoji
     ReactionEnqueueResponse:
       type: object
@@ -997,6 +1055,9 @@ components:
         id:
           type: integer
           format: int64
+        message_id:
+          type: string
+          description: Durable RFC 5322 Message-ID used to verify ambiguous provider outcomes
         subject:
           type: string
         to:
@@ -1008,6 +1069,12 @@ components:
         created_at:
           type: integer
           format: int64
+        in_flight:
+          type: boolean
+          description: Delivery was claimed and must not be retried automatically; if it survives a process restart, verify provider delivery before deleting it.
+        delivery_confirmed:
+          type: boolean
+          description: The provider has definitely accepted delivery; a confirmed item may be removed but never requeued as not delivered.
     OutboxUpdateEvent:
       type: object
       description: SSE event broadcast when an outbox item changes status
@@ -1017,7 +1084,7 @@ components:
           format: int64
         status:
           type: string
-          enum: [sent, failed, queued]
+          enum: [sent, failed, queued, reconciliation_required, delivered_with_warning]
         error:
           type: string
         subject:

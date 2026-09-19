@@ -24,9 +24,14 @@ type Mail struct {
 
 // MailContent represents the full content of an email
 type MailContent struct {
-	From        string           `json:"from"`
-	To          string           `json:"to"`
-	CC          string           `json:"cc,omitempty"`
+	From string `json:"from"`
+	To   string `json:"to"`
+	CC   string `json:"cc,omitempty"`
+	// BCC carries the blind recipients of a draft the user is still editing.
+	// A received message never has them: the sending server strips the header
+	// before delivery, which is what makes the copy blind. They survive only
+	// on the round trip through our own Drafts mailbox.
+	BCC         string           `json:"bcc,omitempty"`
 	Subject     string           `json:"subject"`
 	Date        string           `json:"date"`
 	MessageID   string           `json:"message_id,omitempty"`
@@ -52,23 +57,26 @@ type MessageBody struct {
 
 // MessageInfo represents a single message within a thread
 type MessageInfo struct {
-	ID               string           `json:"id"`
-	Account          string           `json:"account,omitempty"`
-	Accounts         []string         `json:"accounts,omitempty"`
-	ReactionAccounts []string         `json:"reaction_accounts"`
-	IsReaction       bool             `json:"is_reaction,omitempty"`
-	ReplyToIndexed   bool             `json:"reply_to_indexed"`
-	From             string           `json:"from"`
-	To               string           `json:"to,omitempty"`
-	CC               string           `json:"cc,omitempty"`
-	Date             string           `json:"date"`
-	Timestamp        int64            `json:"timestamp"`
-	MessageID        string           `json:"message_id,omitempty"`
-	InReplyTo        string           `json:"in_reply_to,omitempty"`
-	References       string           `json:"references,omitempty"`
-	Body             string           `json:"body"`
-	HTML             string           `json:"html,omitempty"`
-	HiddenSignature  string           `json:"hidden_signature,omitempty"`
-	Attachments      []AttachmentInfo `json:"attachments,omitempty"`
-	Tags             []string         `json:"tags,omitempty"`
+	ID                string `json:"id"`
+	AttachmentCacheID string `json:"attachment_cache_id,omitempty"`
+	From              string `json:"from"`
+	To                string `json:"to,omitempty"`
+	CC                string `json:"cc,omitempty"`
+	BCC               string `json:"bcc,omitempty"`
+	Date              string `json:"date"`
+	Timestamp         int64  `json:"timestamp"`
+	MessageID         string `json:"message_id,omitempty"`
+	Account           string `json:"account,omitempty"`
+	// CanReact reports whether this exact row's Reply-To status is indexed, so
+	// a reaction can derive its recipient without guessing. IsReaction marks a
+	// received RFC 9078 emoji reply, which never offers a palette of its own.
+	CanReact        bool             `json:"can_react"`
+	IsReaction      bool             `json:"is_reaction,omitempty"`
+	InReplyTo       string           `json:"in_reply_to,omitempty"`
+	References      string           `json:"references,omitempty"`
+	Body            string           `json:"body"`
+	HTML            string           `json:"html,omitempty"`
+	HiddenSignature string           `json:"hidden_signature,omitempty"`
+	Attachments     []AttachmentInfo `json:"attachments,omitempty"`
+	Tags            []string         `json:"tags,omitempty"`
 }

@@ -28,7 +28,13 @@ import (
 
 // OutboxDraft is the JSON payload for enqueuing an email to the outbox.
 type OutboxDraft struct {
-	Kind         string             `json:"kind,omitempty"`
+	IdempotencyKey string `json:"idempotency_key"`
+	MessageID      string `json:"message_id"`
+	// Kind is "reaction" for an RFC 9078 emoji reply, which is built as
+	// canonical MIME and submitted unchanged. Empty means normal compose.
+	Kind string `json:"kind,omitempty"`
+	// Account and TargetID name the exact stored row a reaction answers, so
+	// the worker resolves the sending account without matching on From.
 	Account      string             `json:"account,omitempty"`
 	TargetID     string             `json:"target_message_id,omitempty"`
 	From         string             `json:"from"`
@@ -52,6 +58,11 @@ const (
 type reactionRequest struct {
 	Account string `json:"account"`
 	Emoji   string `json:"emoji"`
+	// IdempotencyKey identifies one user action, exactly as compose does.
+	// Retrying a request after a lost response reuses it; reacting again after
+	// an Undo is a new action and must carry a new key. Older clients omit it
+	// and fall back to a content-derived key.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 // OutboxAttachment represents a base64-encoded attachment in the outbox payload.
@@ -80,6 +91,13 @@ func (h *Handler) EnqueueOutboxHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing 'to' field", http.StatusBadRequest)
 		return
 	}
+	if draft.IdempotencyKey == "" || len(draft.IdempotencyKey) > 200 {
+		http.Error(w, "Missing or invalid 'idempotency_key' field", http.StatusBadRequest)
+		return
+	}
+	// The durable draft owns the provider-correlation ID before a worker can
+	// claim it, so crash recovery can verify this exact message with the provider.
+	draft.MessageID = mailsend.GenerateMessageID(draft.From)
 
 	draftJSON, err := json.Marshal(draft)
 	if err != nil {
@@ -92,7 +110,7 @@ func (h *Handler) EnqueueOutboxHandler(w http.ResponseWriter, r *http.Request) {
 		sendAfter = time.Now().Unix() + int64(draft.DelaySeconds)
 	}
 
-	id, err := h.store.Enqueue(string(draftJSON), sendAfter)
+	id, sendAfter, err := h.store.EnqueueIdempotent(string(draftJSON), sendAfter, draft.IdempotencyKey)
 	if err != nil {
 		slog.Error("Failed to enqueue outbox item", "module", "OUTBOX", "err", err)
 		http.Error(w, "Failed to enqueue", http.StatusInternalServerError)
@@ -106,8 +124,10 @@ func (h *Handler) EnqueueOutboxHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // EnqueueReactionHandler handles POST /api/v1/messages/{message_id}/reactions.
-// The client supplies only target account and emoji; all mail fields are
-// derived from the exact stored message row.
+// The client supplies only the target message and emoji; the sending account,
+// reply recipient and threading metadata are derived from that exact stored
+// row, which is addressed by the opaque local identifier the thread view
+// returns.
 func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var request reactionRequest
@@ -123,20 +143,29 @@ func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request)
 		writeReactionError(w, http.StatusBadRequest, "Unsupported reaction emoji")
 		return
 	}
-	account, err := h.cfg.GetAccountByIdentifier(request.Account)
+	target, err := h.store.GetByIdentifier(strings.Trim(mux.Vars(r)["message_id"], "<>"))
+	if err != nil {
+		writeReactionError(w, http.StatusBadRequest, "Failed to resolve target message")
+		return
+	}
+	if target == nil {
+		writeReactionError(w, http.StatusNotFound, "Message not found")
+		return
+	}
+	// The stored row owns the account: it decides which mailbox the reply
+	// threads into and which credentials send it. An explicit account is only
+	// accepted when it names that same account.
+	account, err := h.cfg.GetAccountByIdentifier(target.Account)
 	if err != nil {
 		writeReactionError(w, http.StatusBadRequest, "Unknown account")
 		return
 	}
-	targetID := strings.Trim(mux.Vars(r)["message_id"], "<>")
-	target, err := h.store.GetByMessageIDAndAccount(targetID, account.AccountIdentifier())
-	if err != nil {
-		writeReactionError(w, http.StatusInternalServerError, "Failed to resolve target message")
-		return
-	}
-	if target == nil {
-		writeReactionError(w, http.StatusNotFound, "Message not found for account")
-		return
+	if request.Account != "" {
+		requested, err := h.cfg.GetAccountByIdentifier(request.Account)
+		if err != nil || requested.AccountIdentifier() != account.AccountIdentifier() {
+			writeReactionError(w, http.StatusNotFound, "Message not found for account")
+			return
+		}
 	}
 	replyToIndexed, err := h.store.HasHeader(target.ID, "reply-to")
 	if err != nil {
@@ -168,15 +197,20 @@ func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	draft := OutboxDraft{
-		Kind:       outboxKindReaction,
-		Account:    account.AccountIdentifier(),
-		TargetID:   target.MessageID,
-		From:       account.Email,
-		To:         []string{recipient},
-		Subject:    mailsend.ReplySubject(target.Subject),
-		Body:       request.Emoji,
-		InReplyTo:  target.MessageID,
-		References: references,
+		Kind:     outboxKindReaction,
+		Account:  account.AccountIdentifier(),
+		TargetID: target.MessageID,
+		// Repeating one reaction request, including after a lost HTTP response,
+		// returns the queued row and its original schedule instead of sending
+		// the emoji twice.
+		IdempotencyKey: reactionIdempotencyKey(request, account.AccountIdentifier(), target.ID),
+		MessageID:      mailsend.GenerateMessageID(account.Email),
+		From:           account.Email,
+		To:             []string{recipient},
+		Subject:        mailsend.ReplySubject(target.Subject),
+		Body:           request.Emoji,
+		InReplyTo:      target.MessageID,
+		References:     references,
 	}
 
 	draftJSON, err := json.Marshal(draft)
@@ -184,26 +218,40 @@ func (h *Handler) EnqueueReactionHandler(w http.ResponseWriter, r *http.Request)
 		writeReactionError(w, http.StatusInternalServerError, "Failed to encode reaction")
 		return
 	}
-	sendAfter := time.Now().Unix() + reactionSendDelay
-	dedupeKey := sha256.Sum256([]byte(draft.Account + "\x00" + draft.TargetID + "\x00" + draft.Body))
-	id, err := h.store.EnqueueUnique(string(draftJSON), sendAfter, fmt.Sprintf("%x", dedupeKey))
-	if errors.Is(err, store.ErrOutboxDuplicate) {
-		writeReactionError(w, http.StatusConflict, "Reaction is already pending")
-		return
-	}
+	id, sendAfter, err := h.store.EnqueueIdempotent(string(draftJSON), time.Now().Unix()+reactionSendDelay, draft.IdempotencyKey)
 	if err != nil {
+		slog.Error("Failed to enqueue reaction", "module", "OUTBOX", "err", err)
 		writeReactionError(w, http.StatusInternalServerError, "Failed to enqueue reaction")
 		return
 	}
-	slog.Info("Enqueued reaction", "module", "OUTBOX", "id", id, "account", draft.Account, "send_after", sendAfter)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id, "send_after": sendAfter, "recipient": recipient})
+	slog.Info("Enqueued reaction", "module", "OUTBOX", "id", id, "account", draft.Account, "send_after", sendAfter) // encgrep:allow account identifier (config name); no emoji, recipient or subject is logged
+	writeJSON(w, map[string]any{"ok": true, "id": id, "send_after": sendAfter, "recipient": recipient})
 }
 
+// reactionIdempotencyKey identifies one logical reaction. A client-supplied key
+// scopes it to a single user action, so reacting again after an Undo enqueues a
+// new send. Without one, the key falls back to the target row and emoji, which
+// makes a lost response safe but permanently tombstones that combination. The
+// row id, not the RFC Message-ID, is the target identity: two provider objects
+// may legally share a Message-ID, and each must remain separately reactable.
+func reactionIdempotencyKey(request reactionRequest, account string, targetRowID int64) string {
+	identity := request.IdempotencyKey
+	if identity == "" {
+		identity = "derived\x00" + request.Emoji
+	}
+	digest := sha256.Sum256([]byte(account + "\x00" + strconv.FormatInt(targetRowID, 10) + "\x00" + identity))
+	return fmt.Sprintf("reaction-v1-%x", digest)
+}
+
+// writeReactionError returns a machine-readable body so the GUI can show the
+// server's reason — an unindexed Reply-To in particular is actionable — rather
+// than a bare status code.
 func writeReactionError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": message})
+	if err := json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": message}); err != nil {
+		slog.Error("Failed to encode reaction error response", "module", "OUTBOX", "err", err)
+	}
 }
 
 // ListOutboxHandler handles GET /api/v1/outbox.
@@ -216,12 +264,15 @@ func (h *Handler) ListOutboxHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type outboxEntry struct {
-		ID        int64  `json:"id"`
-		Subject   string `json:"subject"`
-		To        string `json:"to"`
-		Attempts  int    `json:"attempts"`
-		LastError string `json:"last_error,omitempty"`
-		CreatedAt int64  `json:"created_at"`
+		ID                int64  `json:"id"`
+		MessageID         string `json:"message_id"`
+		Subject           string `json:"subject"`
+		To                string `json:"to"`
+		Attempts          int    `json:"attempts"`
+		LastError         string `json:"last_error,omitempty"`
+		CreatedAt         int64  `json:"created_at"`
+		InFlight          bool   `json:"in_flight"`
+		DeliveryConfirmed bool   `json:"delivery_confirmed"`
 	}
 
 	entries := make([]outboxEntry, 0, len(items))
@@ -229,12 +280,15 @@ func (h *Handler) ListOutboxHandler(w http.ResponseWriter, r *http.Request) {
 		var draft OutboxDraft
 		json.Unmarshal([]byte(item.DraftJSON), &draft)
 		entries = append(entries, outboxEntry{
-			ID:        item.ID,
-			Subject:   draft.Subject,
-			To:        strings.Join(draft.To, ", "),
-			Attempts:  item.Attempts,
-			LastError: item.LastError,
-			CreatedAt: item.CreatedAt,
+			ID:                item.ID,
+			MessageID:         draft.MessageID,
+			Subject:           draft.Subject,
+			To:                strings.Join(draft.To, ", "),
+			Attempts:          item.Attempts,
+			LastError:         item.LastError,
+			CreatedAt:         item.CreatedAt,
+			InFlight:          item.InFlight,
+			DeliveryConfirmed: item.DeliveryConfirmed,
 		})
 	}
 
@@ -251,9 +305,16 @@ func (h *Handler) DeleteOutboxHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.DeleteOutboxItem(id); err != nil {
+	if err := h.store.DeletePendingOutboxItem(id); err != nil {
 		slog.Error("Failed to delete outbox item", "module", "OUTBOX", "id", id, "err", err)
-		http.Error(w, err.Error(), http.StatusNotFound)
+		switch {
+		case errors.Is(err, store.ErrOutboxItemInFlight):
+			http.Error(w, "Outbox item is already being sent", http.StatusConflict)
+		case errors.Is(err, store.ErrOutboxItemNotFound):
+			http.Error(w, "Outbox item not found", http.StatusNotFound)
+		default:
+			http.Error(w, "Failed to delete outbox item", http.StatusInternalServerError)
+		}
 		return
 	}
 
@@ -293,12 +354,12 @@ func (w *OutboxWorker) Start(ctx context.Context) {
 	}
 }
 
-// processQueue dequeues and sends items until the queue is empty.
+// processQueue atomically claims and sends items until the queue is empty.
 func (w *OutboxWorker) processQueue() {
 	for {
-		item, err := w.store.Dequeue()
+		item, err := w.store.ClaimNextOutboxItem()
 		if err != nil {
-			slog.Error("Failed to dequeue outbox item", "module", "OUTBOX", "err", err)
+			slog.Error("Failed to claim outbox item", "module", "OUTBOX", "err", err)
 			return
 		}
 		if item == nil {
@@ -317,8 +378,24 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 	var draft OutboxDraft
 	if err := json.Unmarshal([]byte(item.DraftJSON), &draft); err != nil {
 		slog.Error("Failed to unmarshal draft", "module", "OUTBOX", "id", item.ID, "err", err) // encgrep:allow word "draft" in message text, no draft value logged
-		w.store.MarkAttempted(item.ID, sanitizeOutboxError(err))
+		if transitionErr := w.store.MarkAttempted(item.ID, sanitizeOutboxError(err)); transitionErr != nil {
+			slog.Error("Failed to record invalid outbox draft", "module", "OUTBOX", "id", item.ID, "err", transitionErr) // encgrep:allow word "draft" is static; outbox id and store error are operational metadata
+			return false
+		}
 		return true
+	}
+	if draft.MessageID == "" {
+		// Upgrade a legacy queued draft before any provider or credential work.
+		draft.MessageID = mailsend.GenerateMessageID(draft.From)
+		updated, err := json.Marshal(draft)
+		if err != nil {
+			slog.Error("Failed to persist outbox Message-ID", "module", "OUTBOX", "id", item.ID, "err", err)
+			return false
+		}
+		if err := w.store.UpdateClaimedOutboxDraft(item.ID, string(updated)); err != nil {
+			slog.Error("Failed to persist outbox Message-ID", "module", "OUTBOX", "id", item.ID, "err", err)
+			return false
+		}
 	}
 
 	// Reactions carry the exact target account; legacy compose payloads keep
@@ -332,7 +409,10 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 	if account == nil {
 		errMsg := fmt.Sprintf("no account found for sender: %s", draft.From)
 		slog.Error(errMsg, "module", "OUTBOX", "id", item.ID)
-		w.store.PoisonOutboxItem(item.ID, errMsg)
+		if transitionErr := w.store.PoisonOutboxItem(item.ID, errMsg); transitionErr != nil {
+			slog.Error("Failed to poison unrouteable outbox item", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
+			return false
+		}
 		w.broadcastStatus(item.ID, "failed", errMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 		return true
 	}
@@ -344,7 +424,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 		from = fmt.Sprintf("%s <%s>", account.DisplayName, account.Email)
 	}
 	msg := &mailsend.Message{
-		MessageID:  mailsend.GenerateMessageID(from),
+		MessageID:  draft.MessageID,
 		From:       from,
 		To:         draft.To,
 		CC:         draft.CC,
@@ -360,7 +440,11 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 		msg.RawMIME, err = mailsend.BuildReaction(msg, time.Now())
 		if err != nil {
 			safeMsg := sanitizeOutboxError(err)
-			w.store.PoisonOutboxItem(item.ID, safeMsg)
+			slog.Error("Failed to build reaction MIME", "module", "OUTBOX", "id", item.ID, "err", safeMsg)
+			if transitionErr := w.store.PoisonOutboxItem(item.ID, safeMsg); transitionErr != nil {
+				slog.Error("Failed to poison unbuildable reaction", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
+				return false
+			}
 			w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 			return true
 		}
@@ -372,7 +456,10 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 		if err != nil {
 			slog.Error("Failed to decode attachment", "module", "OUTBOX", "id", item.ID, "filename", att.Filename, "err", err)
 			safeMsg := "attachment decode: " + sanitizeOutboxError(err)
-			w.store.MarkAttempted(item.ID, safeMsg)
+			if transitionErr := w.store.MarkAttempted(item.ID, safeMsg); transitionErr != nil {
+				slog.Error("Failed to record invalid outbox attachment", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
+				return false
+			}
 			// Drop the filename from the SSE broadcast too — it's
 			// user-supplied content that may carry sensitive metadata.
 			w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
@@ -392,7 +479,10 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 		// log sink: never let a raw error from that path reach a logging call.
 		safeMsg := "auth: " + sanitizeOutboxError(err)
 		slog.Error("Sender setup failed for outbox item", "module", "OUTBOX", "id", item.ID, "err", safeMsg)
-		w.store.MarkAttempted(item.ID, safeMsg)
+		if transitionErr := w.store.MarkAttempted(item.ID, safeMsg); transitionErr != nil {
+			slog.Error("Failed to record outbox sender setup failure", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
+			return false
+		}
 		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 		return true
 	}
@@ -401,42 +491,102 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 	defer cancel()
 
 	slog.Info("Sending outbox item", "module", "OUTBOX", "id", item.ID, "to", draft.To) // encgrep:allow recipient list is intentionally plaintext per ADR-0001 §3 (from/to/cc stay unencrypted for thread routing)
-	if err := mailSender.Send(ctx, msg); err != nil {
-		// The Kind decides retry policy; sanitize before DB/SSE so a
-		// server-echoed 5xx body never reaches the GUI.
-		safeMsg := sanitizeOutboxError(err)
-		switch mailsend.Classify(err) {
-		case mailsend.KindNetwork:
-			// Offline/timeout — don't count as an attempt, but move the item out
-			// of the ready queue so processQueue cannot dequeue it in a tight loop.
-			slog.Warn("Network error, will retry later", "module", "OUTBOX", "id", item.ID, "err", err)
-			if deferErr := w.store.DeferOutboxItem(item.ID, time.Now().Add(30*time.Second).Unix(), safeMsg); deferErr != nil {
-				slog.Error("Failed to defer outbox item", "module", "OUTBOX", "id", item.ID, "err", deferErr)
-				return false
-			}
-			return true
-		case mailsend.KindPermanent:
-			slog.Error("Send failed permanently", "module", "OUTBOX", "id", item.ID, "err", err)
-			w.store.PoisonOutboxItem(item.ID, safeMsg)
-		default:
-			slog.Error("Send failed", "module", "OUTBOX", "id", item.ID, "err", err)
-			w.store.MarkAttempted(item.ID, safeMsg)
+	send := func() error { return mailSender.Send(ctx, msg) }
+	if durable, ok := mailSender.(mailsend.DurableSender); ok {
+		send = func() error {
+			return durable.SendAfterPersist(ctx, msg, func(messageID string) error {
+				msg.MessageID = messageID
+				draft.MessageID = messageID
+				updated, err := json.Marshal(draft)
+				if err != nil {
+					return fmt.Errorf("encode provider Message-ID: %w", err)
+				}
+				if err := w.store.UpdateClaimedOutboxDraft(item.ID, string(updated)); err != nil {
+					return fmt.Errorf("persist provider Message-ID: %w", err)
+				}
+				return nil
+			})
 		}
-		w.broadcastStatus(item.ID, "failed", safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
-		return true
+	}
+	if err := send(); err != nil {
+		return w.handleSendError(item, &draft, err)
 	}
 
-	// Success — delete from outbox
+	// Record acceptance before deleting the claim. If either write or the
+	// process fails, the durable confirmation prevents a not-delivered requeue
+	// from duplicating a message the provider accepted.
+	if err := w.store.MarkOutboxDeliveryConfirmed(item.ID, ""); err != nil {
+		slog.Error("Sent outbox item could not be marked delivered; manual reconciliation required", "module", "OUTBOX", "id", item.ID, "err", err)
+		return false
+	}
+
+	// Keep the confirmed claim—and therefore its full durable payload—until all
+	// local post-delivery projection is complete. A crash or Sent filing failure
+	// can never erase the only recoverable copy of an accepted SMTP message.
+	filingErr := w.saveToLocalStore(account, msg, &draft)
+	filingErr = errors.Join(filingErr, w.appendToSent(account, msg, mailSender.SavesSentCopy()))
+	if filingErr != nil {
+		const reason = "Message was delivered, but filing it in Sent requires manual remediation."
+		if err := w.store.MarkOutboxDeliveryConfirmed(item.ID, reason); err != nil {
+			slog.Error("Delivered outbox item could not retain filing state", "module", "OUTBOX", "id", item.ID, "err", err)
+			return false
+		}
+		slog.Error("Delivery succeeded but Sent filing failed", "module", "OUTBOX", "id", item.ID)
+		w.broadcastStatus(item.ID, "delivered_with_warning", reason, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
+		return true
+	}
+	if err := w.store.DeleteClaimedOutboxItem(item.ID); err != nil {
+		slog.Error("Sent outbox item could not be deleted; manual reconciliation required", "module", "OUTBOX", "id", item.ID, "err", err)
+		return false
+	}
 	slog.Info("Outbox item sent successfully", "module", "OUTBOX", "id", item.ID)
-	w.store.DeleteOutboxItem(item.ID)
-
-	// Save to local store so the Sent view shows the mail immediately.
-	w.saveToLocalStore(account, msg, &draft)
-
 	w.broadcastStatus(item.ID, "sent", "", draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
+	return true
+}
 
-	// Append to IMAP Sent folder (best-effort; providers that auto-save skip it).
-	w.appendToSent(account, msg, mailSender.SavesSentCopy())
+func (w *OutboxWorker) handleSendError(item *store.OutboxItem, draft *OutboxDraft, err error) bool {
+	// The Kind decides retry/reconciliation policy. Provider details remain in
+	// the redacted log; DB and SSE receive only fixed or sanitized text.
+	safeMsg := sanitizeOutboxError(err)
+	status := "failed"
+	switch mailsend.Classify(err) {
+	case mailsend.KindNetwork:
+		slog.Warn("Network error, will retry later", "module", "OUTBOX", "id", item.ID, "err", err)
+		if transitionErr := w.store.DeferOutboxItem(item.ID, time.Now().Add(30*time.Second).Unix(), safeMsg); transitionErr != nil {
+			slog.Error("Failed to defer outbox item", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
+			return false
+		}
+		return true
+	case mailsend.KindAmbiguous:
+		slog.Error("Delivery outcome is unknown; manual reconciliation required", "module", "OUTBOX", "id", item.ID, "err", err)
+		safeMsg = "Delivery status is unknown. Verify the provider outcome before reconciling."
+		status = "reconciliation_required"
+		if transitionErr := w.store.MarkOutboxReconciliationRequired(item.ID, safeMsg); transitionErr != nil {
+			slog.Error("Failed to preserve ambiguous outbox claim", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
+			return false
+		}
+	case mailsend.KindDeliveredWithWarning:
+		slog.Error("Delivery succeeded with a post-delivery failure", "module", "OUTBOX", "id", item.ID, "err", err)
+		safeMsg = "Message was delivered, but filing it in Sent requires manual remediation."
+		status = "delivered_with_warning"
+		if transitionErr := w.store.MarkOutboxDeliveryConfirmed(item.ID, safeMsg); transitionErr != nil {
+			slog.Error("Failed to preserve delivered outbox claim", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
+			return false
+		}
+	case mailsend.KindPermanent:
+		slog.Error("Send failed permanently", "module", "OUTBOX", "id", item.ID, "err", err)
+		if transitionErr := w.store.PoisonOutboxItem(item.ID, safeMsg); transitionErr != nil {
+			slog.Error("Failed to poison permanently failed outbox item", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
+			return false
+		}
+	default:
+		slog.Error("Send failed", "module", "OUTBOX", "id", item.ID, "err", err)
+		if transitionErr := w.store.MarkAttempted(item.ID, safeMsg); transitionErr != nil {
+			slog.Error("Failed to record outbox send failure", "module", "OUTBOX", "id", item.ID, "err", transitionErr)
+			return false
+		}
+	}
+	w.broadcastStatus(item.ID, status, safeMsg, draft.Subject, strings.Join(draft.To, ", "), draft.Kind)
 	return true
 }
 
@@ -461,13 +611,18 @@ func (w *OutboxWorker) findAccount(from string) *config.AccountConfig {
 }
 
 // saveToLocalStore inserts the sent email into SQLite so the GUI can show it
-// immediately without waiting for the next IMAP sync. Best-effort: errors are
-// logged but do not affect the send result.
-func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mailsend.Message, draft *OutboxDraft) {
+// immediately without waiting for the next IMAP sync. A failure keeps the
+// confirmed outbox claim and its payload available for manual remediation.
+func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mailsend.Message, draft *OutboxDraft) error {
+	// Native JMAP sync uses provider-scoped Email ids as row identity. A local
+	// Message-ID-only placeholder cannot be safely promoted and would remain as
+	// a duplicate beside the server's Sent Email on the next sync.
+	if account.UsesJMAPBackend() {
+		return nil
+	}
 	messageID := strings.Trim(msg.MessageID, "<>")
 	if messageID == "" {
-		slog.Warn("No Message-ID available, skipping local store insert", "module", "OUTBOX")
-		return
+		return errors.New("no Message-ID available for local Sent projection")
 	}
 
 	now := time.Now().Unix()
@@ -481,11 +636,12 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mail
 		FromAddr:    fromAddr,
 		ToAddrs:     strings.Join(draft.To, ", "),
 		CCAddrs:     strings.Join(draft.CC, ", "),
+		BCCAddrs:    strings.Join(draft.BCC, ", "),
 		InReplyTo:   draft.InReplyTo,
 		Refs:        draft.References,
 		Date:        now,
 		CreatedAt:   now,
-		Flags:       "Seen",
+		Flags:       `\Seen`,
 		FetchedBody: true,
 		Account:     account.AccountIdentifier(),
 	}
@@ -497,8 +653,7 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mail
 	}
 
 	if err := w.store.InsertMessage(storeMsg); err != nil {
-		slog.Warn("Failed to save sent email to local store", "module", "OUTBOX", "err", err) // encgrep:allow message text, no PII attr
-		return
+		return fmt.Errorf("save sent email to local store: %w", err)
 	}
 	// An empty row records that Reply-To was inspected and absent. This keeps
 	// reactions to locally sent normal messages eligible without guessing.
@@ -513,48 +668,45 @@ func (w *OutboxWorker) saveToLocalStore(account *config.AccountConfig, msg *mail
 		slog.Warn("Failed to mark sent message Content-Disposition", "module", "OUTBOX", "err", err)
 	}
 	if err := w.store.AddTag(storeMsg.ID, "sent"); err != nil {
-		slog.Warn("Failed to tag sent email", "module", "OUTBOX", "err", err) // encgrep:allow message text, no PII attr
+		return fmt.Errorf("tag sent email: %w", err)
 	}
+	return nil
 }
 
 // appendToSent saves a copy to the IMAP Sent folder (skip for providers that auto-save).
-func (w *OutboxWorker) appendToSent(account *config.AccountConfig, msg *mailsend.Message, savedServerSide bool) {
+func (w *OutboxWorker) appendToSent(account *config.AccountConfig, msg *mailsend.Message, savedServerSide bool) error {
 	if savedServerSide {
 		slog.Debug("Skipping Sent append for native provider", "module", "OUTBOX", "engine", account.EffectiveSyncEngine()) // encgrep:allow engine name is static configuration, not message content
-		return
+		return nil
 	}
 
 	messageData, err := smtp.FromMessage(msg).Build()
 	if err != nil {
-		slog.Warn("Failed to build message for Sent folder", "module", "OUTBOX", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-		return
+		return fmt.Errorf("build message for Sent folder: %w", err)
 	}
 
 	conn := imapClient.NewClient(account)
 	if err := conn.Connect(); err != nil {
-		slog.Warn("Failed to connect IMAP for Sent folder", "module", "OUTBOX", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-		return
+		return fmt.Errorf("connect IMAP for Sent folder: %w", err)
 	}
 	defer conn.Close()
 
 	if err := conn.Authenticate(); err != nil {
-		slog.Warn("Failed to authenticate IMAP for Sent folder", "module", "OUTBOX", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-		return
+		return fmt.Errorf("authenticate IMAP for Sent folder: %w", err)
 	}
 
 	sentMailbox, err := conn.FindSentMailbox()
 	if err != nil {
-		slog.Warn("Could not find Sent mailbox", "module", "OUTBOX", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-		return
+		return fmt.Errorf("find Sent mailbox: %w", err)
 	}
 
 	flags := []string{imap.SeenFlag}
 	if _, err := conn.Append(sentMailbox, flags, time.Now(), messageData); err != nil {
-		slog.Warn("Failed to save to Sent folder", "module", "OUTBOX", "err", err) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
-		return
+		return fmt.Errorf("save to Sent folder: %w", err)
 	}
 
 	slog.Info("Saved to Sent folder", "module", "OUTBOX", "mailbox", sentMailbox) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+	return nil
 }
 
 // broadcastStatus sends an outbox_update SSE event.

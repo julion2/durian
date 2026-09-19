@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"net/mail"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,10 +55,11 @@ func (h *Handler) ShowThread(threadID string) protocol.Response {
 	return protocol.SuccessWithThread(thread)
 }
 
-// ShowMessageBody returns the full (unstripped) body of a single message by Message-ID.
+// ShowMessageBody returns the full (unstripped) body of a single message by its
+// opaque local identifier or, for older clients, by Message-ID.
 // Used for reply quoting where the conversation chain must be preserved.
-func (h *Handler) ShowMessageBody(messageID string) protocol.Response {
-	msg, err := h.store.GetByMessageID(messageID)
+func (h *Handler) ShowMessageBody(identifier string) protocol.Response {
+	msg, err := h.store.GetByIdentifier(identifier)
 	if err != nil {
 		return protocol.Fail(protocol.ErrBackendError, err)
 	}
@@ -89,32 +92,29 @@ func (h *Handler) convertThreadWithHeaders(threadID string, msgs []*store.Messag
 	var subject string
 
 	for _, msg := range msgs {
-		isReaction, reactionAccounts := reactionHeaderMetadata(msg, headerMap)
-		accounts := msg.Accounts
-		if len(accounts) == 0 && msg.Account != "" {
-			accounts = []string{msg.Account}
-		}
+		canReact, isReaction := reactionHeaderMetadata(msg, headerMap)
 		info := internmail.MessageInfo{
-			ID:               msg.MessageID,
-			Accounts:         accounts,
-			ReactionAccounts: reactionAccounts,
-			IsReaction:       isReaction,
-			ReplyToIndexed:   len(accounts) > 0 && len(reactionAccounts) == len(accounts),
-			From:             msg.FromAddr,
-			To:               msg.ToAddrs,
-			CC:               msg.CCAddrs,
-			Date:             time.Unix(msg.Date, 0).Format(time.RFC1123Z),
-			Timestamp:        msg.Date,
-			MessageID:        msg.MessageID,
-			Body:             sanitize.StripQuotedTextContent(msg.BodyText),
-		}
-		if len(accounts) == 1 {
-			info.Account = accounts[0]
+			ID:                "local:" + strconv.FormatInt(msg.ID, 10),
+			AttachmentCacheID: attachmentCacheID(msg),
+			From:              msg.FromAddr,
+			To:                msg.ToAddrs,
+			CC:                msg.CCAddrs,
+			Date:              time.Unix(msg.Date, 0).Format(time.RFC1123Z),
+			Timestamp:         msg.Date,
+			MessageID:         msg.MessageID,
+			Account:           msg.Account,
+			CanReact:          canReact,
+			IsReaction:        isReaction,
+			Body:              sanitize.StripQuotedTextContent(msg.BodyText),
 		}
 		if !light {
 			info.InReplyTo = msg.InReplyTo
 			info.References = msg.Refs
 			info.HTML = sanitize.StripQuotedContent(msg.BodyHTML)
+			// Only the full view reopens a draft for editing, which is the
+			// one caller that needs the blind recipients. Enriched search
+			// results would otherwise decrypt and ship them on every hit.
+			info.BCC = msg.BCCAddrs
 		}
 
 		if subject == "" {
@@ -209,50 +209,55 @@ func (h *Handler) convertThreadWithHeaders(threadID string, msgs []*store.Messag
 }
 
 func threadMessageRowIDs(msgs []*store.Message) []int64 {
-	var ids []int64
+	ids := make([]int64, 0, len(msgs))
 	for _, msg := range msgs {
-		if len(msg.AccountRows) > 0 {
-			for _, id := range msg.AccountRows {
-				ids = append(ids, id)
-			}
-		} else {
-			ids = append(ids, msg.ID)
-		}
+		ids = append(ids, msg.ID)
 	}
 	return ids
 }
 
-func reactionHeaderMetadata(msg *store.Message, headerMap map[int64]map[string][]string) (isReaction bool, eligibleAccounts []string) {
-	eligibleAccounts = make([]string, 0, len(msg.AccountRows))
-	rows := msg.AccountRows
-	if len(rows) == 0 && msg.Account != "" {
-		rows = map[string]int64{msg.Account: msg.ID}
-	}
-	for account, id := range rows {
-		headers := headerMap[id]
-		if _, ok := headers["Reply-To"]; ok {
-			eligibleAccounts = append(eligibleAccounts, account)
+// reactionHeaderMetadata reports whether this exact row can be reacted to and
+// whether it is itself an RFC 9078 reaction. An indexed Reply-To row — even an
+// empty one — proves the reply recipient is known rather than guessed; a row
+// whose headers were never fetched must not offer a palette.
+func reactionHeaderMetadata(msg *store.Message, headerMap map[int64]map[string][]string) (canReact, isReaction bool) {
+	headers := headerMap[msg.ID]
+	_, canReact = headers["Reply-To"]
+	for _, disposition := range headers["Content-Disposition"] {
+		disposition = strings.TrimSpace(disposition)
+		if separator := strings.IndexByte(disposition, ';'); separator >= 0 {
+			disposition = disposition[:separator]
 		}
-		for _, disposition := range headers["Content-Disposition"] {
-			disposition = strings.TrimSpace(disposition)
-			if separator := strings.IndexByte(disposition, ';'); separator >= 0 {
-				disposition = disposition[:separator]
-			}
-			if strings.EqualFold(strings.TrimSpace(disposition), "reaction") {
-				isReaction = true
-				break
-			}
+		if strings.EqualFold(strings.TrimSpace(disposition), "reaction") {
+			isReaction = true
+			break
 		}
 	}
-	sort.Strings(eligibleAccounts)
-	return isReaction, eligibleAccounts
+	return canReact, isReaction
+}
+
+func attachmentCacheID(msg *store.Message) string {
+	kind, identity := "message-id", msg.MessageID
+	if msg.StableID != "" {
+		kind, identity = "stable-id", msg.StableID
+	}
+	digest := sha256.Sum256([]byte(msg.Account + "\x00" + kind + "\x00" + identity))
+	return fmt.Sprintf("v1-%x", digest)
 }
 
 // DownloadAttachment streams a raw attachment part, setting Content-Type and
 // Content-Disposition headers from server-derived metadata.
-func (h *Handler) DownloadAttachment(messageID string, partID int, w http.ResponseWriter) error {
-	// Get attachment metadata from store
-	storeAtts, err := h.store.GetAttachmentsByMessageID(messageID)
+func (h *Handler) DownloadAttachment(identifier string, partID int, w http.ResponseWriter) error {
+	msg, err := h.store.GetByIdentifier(identifier)
+	if err != nil {
+		return fmt.Errorf("lookup message: %w", err)
+	}
+	if msg == nil {
+		return errors.New("message not found")
+	}
+
+	// Get attachment metadata from the exact local row.
+	storeAtts, err := h.store.GetAttachmentsByMessage(msg.ID)
 	if err != nil {
 		return err
 	}
@@ -271,14 +276,6 @@ func (h *Handler) DownloadAttachment(messageID string, partID int, w http.Respon
 	w.Header().Set("Content-Type", storeAtt.ContentType)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+sanitizeFilename(storeAtt.Filename)+`"`)
 
-	msg, err := h.store.GetByMessageID(messageID)
-	if err != nil {
-		return fmt.Errorf("lookup message: %w", err)
-	}
-	if msg == nil {
-		return errors.New("message not found")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -295,7 +292,7 @@ func (h *Handler) DownloadAttachment(messageID string, partID int, w http.Respon
 			_, werr := w.Write(data)
 			return werr
 		}
-		slog.Warn("Backend attachment fetch failed, falling back to IMAP", "module", "HANDLER", "message_id", messageID, "err", berr)
+		slog.Warn("Backend attachment fetch failed, falling back to IMAP", "module", "HANDLER", "message_id", msg.MessageID)
 	}
 
 	// Legacy path: break-IDLE IMAP fetch by UID.
@@ -306,7 +303,7 @@ func (h *Handler) DownloadAttachment(messageID string, partID int, w http.Respon
 		return errors.New("message missing IMAP metadata for attachment fetch")
 	}
 	return h.fetcher.FetchAttachment(ctx, msg.Account, msg.Mailbox,
-		msg.UID, messageID, storeAtt.Filename, storeAtt.ContentType, storeAtt.PartID, w)
+		msg.UID, msg.MessageID, storeAtt.Filename, storeAtt.ContentType, storeAtt.PartID, w)
 }
 
 // fetchAttachmentViaBackend fetches the message's raw body through the account's

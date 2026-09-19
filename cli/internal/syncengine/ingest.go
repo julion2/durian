@@ -2,6 +2,7 @@ package syncengine
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/mail"
@@ -18,6 +19,18 @@ import (
 // parser is the shared (stateless) RFC822 parser, same as the legacy syncer's.
 var parser = durianmail.NewParser()
 
+type postUpsertIngestError struct {
+	err error
+}
+
+func (e *postUpsertIngestError) Error() string { return e.err.Error() }
+func (e *postUpsertIngestError) Unwrap() error { return e.err }
+
+func messageUpsertCompleted(err error) bool {
+	var postUpsert *postUpsertIngestError
+	return errors.As(err, &postUpsert)
+}
+
 // builtinIndexedHeaders is a copy of imap.builtinSelectedHeaders (unexported
 // there; deliberately NOT edited into an export to keep the strangler-fig
 // constraint of touching no existing files). Keep the two lists in sync until
@@ -29,6 +42,18 @@ var builtinIndexedHeaders = []string{
 }
 
 var markerIndexedHeaders = []string{"Reply-To", "Content-Disposition"}
+
+// isMarkerIndexedHeader reports whether a header is written unconditionally,
+// including an empty value, because reaction eligibility depends on knowing
+// that it was inspected rather than merely absent.
+func isMarkerIndexedHeader(name string) bool {
+	for _, marker := range markerIndexedHeaders {
+		if strings.EqualFold(name, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 // folderTagMapping defines which tags to add/remove when a message is found in
 // a folder (mirror of imap.FolderTagMapping, keyed by backend.Role instead of
@@ -104,6 +129,10 @@ type IngestOptions struct {
 	// message's Labels are reconciled onto its tags (add/remove against the
 	// stored baseline) instead of applying folder-role tags.
 	LabelsAsTags bool
+	// IdentityRecovered marks a synthetic row adopted during an IMAP
+	// UIDVALIDITY replacement. Once its existing row is durably updated, first-
+	// ingest enrichment must not rerun rules, hooks, or attachment replacement.
+	IdentityRecovered bool
 }
 
 // headerSet returns the deduped, case-insensitive union of the builtin header
@@ -143,18 +172,25 @@ func (o IngestOptions) headerSet() []string {
 // applies the folder-role SPECIAL-USE mapping. A Google account may still opt
 // back to the legacy imap.Syncer with sync_engine="legacy".
 //
-// Returns the canonical Message-ID under which the message was stored (so the
-// engine can track RemoteRef->MessageID for deletions and flag updates) and
-// whether the row was newly created — false when the message already existed and
-// was updated in place, e.g. re-delivered by a delta because a flag changed.
-func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.Role, opts IngestOptions) (string, bool, error) {
+// Returns the canonical Message-ID, exact local row ID, and whether the row was
+// newly created. The Message-ID preserves fallback behavior for providers
+// without stable identities; the row ID addresses provider objects exactly
+// when their RFC Message-ID headers collide.
+func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.Role, opts IngestOptions) (messageID string, rowID int64, created bool, err error) {
+	coreDurable := false
+	defer func() {
+		if err != nil && coreDurable {
+			err = &postUpsertIngestError{err: err}
+		}
+	}()
 	parsed, err := mail.ReadMessage(bytes.NewReader(msg.Raw))
 	if err != nil {
-		return "", false, fmt.Errorf("parse message: %w", err)
+		return "", 0, false, fmt.Errorf("parse message: %w", err)
 	}
 
 	content := parser.Parse(parsed)
-	messageID := strings.Trim(content.MessageID, "<>")
+	messageID = strings.Trim(content.MessageID, "<>")
+	syntheticIdentity := messageID == ""
 	if messageID == "" {
 		// The backend already computed the Message-ID (possibly synthetic) —
 		// prefer it so the engine and the backend agree on message identity.
@@ -167,16 +203,11 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		slog.Warn("Message has no Message-ID, using synthetic ID", "module", "SYNCENGINE",
 			"ref", msg.Ref.ID, "folder", folderName, "synthetic_id", messageID)
 	}
-
-	// A genuinely new message vs. an update of one already stored (a delta
-	// re-delivers a message when its flags change): the caller reports the two
-	// separately so "new" counts arrivals, not re-syncs.
-	existed, err := db.MessageExistsForAccount(messageID, opts.Account)
+	releaseIngest, err := db.AcquireMessageIngest(opts.Account, messageID)
 	if err != nil {
-		return "", false, fmt.Errorf("check message existence: %w", err)
+		return "", 0, false, err
 	}
-	created := !existed
-
+	defer releaseIngest()
 	var dateUnix int64
 	if t, err := mail.ParseDate(content.Date); err == nil {
 		dateUnix = t.Unix()
@@ -190,45 +221,51 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	// byte-identical with rows written by the legacy syncer.
 	flagState := flagStateFromBackend(msg.Flags)
 	flagStr := strings.Join(flagState.ToIMAPFlags(), ",")
+	flagAdd, _ := flagState.ToTagOps()
 
-	storeMsg := &store.Message{
-		MessageID: messageID,
-		Subject:   content.Subject,
-		FromAddr:  content.From,
-		ToAddrs:   content.To,
-		CCAddrs:   content.CC,
-		InReplyTo: content.InReplyTo,
-		Refs:      content.References,
-		BodyText:  content.Body,
-		BodyHTML:  content.HTML,
-		Date:      dateUnix,
-		CreatedAt: time.Now().Unix(),
-		Mailbox:   folderName,
-		Flags:     flagStr,
-		// UID stays 0 on the engine path: the uint32 UID column is an IMAP
-		// implementation detail; the neutral RemoteRef column carries the
-		// provider handle instead.
-		UID:         0,
-		Size:        len(msg.Raw),
-		FetchedBody: true,
-		Account:     opts.Account,
-		RemoteRef:   msg.Ref.ID,
-		// The message's current server flags are the correct initial
-		// baseline: the first post-ingest flag pass is then a no-op unless
-		// the user changed something locally. joinFlags (not flagStr) so the
-		// baseline round-trips $Completed and avoids per-sync download churn.
-		SyncedFlags: joinFlags(flagState),
+	storeMsg := imap.StoreMessageFromContent(messageID, content, dateUnix, time.Now().Unix())
+	storeMsg.StableID = msg.StableID
+	storeMsg.Mailbox = folderName
+	storeMsg.Flags = flagStr
+	// UID stays 0 on the engine path: the uint32 UID column is an IMAP
+	// implementation detail; the neutral RemoteRef column carries the
+	// provider handle instead.
+	storeMsg.UID = 0
+	storeMsg.Size = len(msg.Raw)
+	storeMsg.FetchedBody = true
+	storeMsg.Account = opts.Account
+	storeMsg.RemoteRef = msg.Ref.ID
+	storeMsg.SyntheticIdentity = syntheticIdentity
+	fingerprint := durianmail.SyntheticFingerprint(content, dateUnix)
+	if syntheticIdentity {
+		storeMsg.SyntheticFingerprint = append([]byte(nil), fingerprint[:]...)
 	}
+	storeMsg.IngestPending = true
+	storeMsg.StartIngestOnConflict = !opts.LabelsAsTags && !opts.IdentityRecovered
+	// The message's current server flags are the correct initial baseline: the
+	// first post-ingest flag pass is then a no-op unless the user changed
+	// something locally. joinFlags (not flagStr) so the baseline round-trips
+	// $Completed and avoids per-sync download churn.
+	storeMsg.SyncedFlags = joinFlags(flagState)
+	storeMsg.SyncedFlagsInitialized = true
 
-	if err := db.InsertMessage(storeMsg); err != nil {
-		return "", false, fmt.Errorf("insert message: %w", err)
+	created, err = db.UpsertMessageWithInitialTags(storeMsg, flagAdd)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("insert message: %w", err)
+	}
+	coreDurable = true
+	if !created && opts.IdentityRecovered && !storeMsg.IngestPending {
+		return messageID, storeMsg.ID, false, nil
 	}
 
 	// Reply-To and Content-Disposition affect reaction eligibility and display,
 	// so persist empty markers as well as values. Existing label-backed rows
-	// acquire them on re-delivery without rewriting every indexed header.
+	// acquire them on re-delivery without rewriting every indexed header, so
+	// this runs before the label fast path returns.
 	for _, hdrName := range markerIndexedHeaders {
-		_ = db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), parsed.Header.Get(hdrName))
+		if err := db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), parsed.Header.Get(hdrName)); err != nil {
+			return "", 0, false, fmt.Errorf("insert header %q: %w", hdrName, err)
+		}
 	}
 
 	// Fast path for a message already in the store on a label backend (the
@@ -236,26 +273,20 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	// its attachments and filter-rule tags were applied on first ingest
 	// and its content is unchanged, so only the labels need re-mirroring. Skip
 	// the heavy re-processing — that is what makes the transition sync fast.
-	if !created && opts.LabelsAsTags {
-		if err := reconcileLabels(db, messageID, opts.Account, msg.Labels); err != nil {
-			return "", false, fmt.Errorf("reconcile labels: %w", err)
+	if !created && opts.LabelsAsTags && !storeMsg.IngestPending {
+		if err := reconcileLabels(db, storeMsg.ID, msg.Labels); err != nil {
+			return "", 0, false, fmt.Errorf("reconcile labels: %w", err)
 		}
-		return messageID, created, nil
+		if err := db.MarkMessageIngestComplete(storeMsg.ID, storeMsg.IngestGeneration); err != nil {
+			return "", 0, false, fmt.Errorf("complete message ingest: %w", err)
+		}
+		return messageID, storeMsg.ID, created, nil
 	}
 
-	// Store selected headers for new or fully processed messages. Empty values
-	// are omitted except for the required markers written above.
-	for _, hdrName := range opts.headerSet() {
-		if strings.EqualFold(hdrName, "Reply-To") || strings.EqualFold(hdrName, "Content-Disposition") {
-			continue
-		}
-		if v := parsed.Header.Get(hdrName); v != "" {
-			_ = db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v)
-		}
+	// Clear old attachments on upsert, then re-insert.
+	if err := db.DeleteAttachmentsByMessageDBID(storeMsg.ID); err != nil {
+		return "", 0, false, fmt.Errorf("clear attachments: %w", err)
 	}
-
-	// Clear old attachments on upsert, then re-insert
-	_ = db.DeleteAttachmentsByMessageDBID(storeMsg.ID)
 	for i, att := range content.Attachments {
 		partID := att.PartID
 		if partID == 0 {
@@ -270,7 +301,22 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 			Disposition: att.Disposition,
 			ContentID:   att.ContentID,
 		}); err != nil {
-			return "", false, fmt.Errorf("insert attachment %d: %w", i, err)
+			return "", 0, false, fmt.Errorf("insert attachment %d: %w", i, err)
+		}
+	}
+
+	// Store the remaining selected headers for rule matching and analysis
+	// (builtin set plus user-added entries from config.pkl
+	// sync.indexed_headers). The reaction markers were written above, with
+	// their empty values preserved.
+	for _, hdrName := range opts.headerSet() {
+		if isMarkerIndexedHeader(hdrName) {
+			continue
+		}
+		if v := parsed.Header.Get(hdrName); v != "" {
+			if err := db.InsertHeader(storeMsg.ID, strings.ToLower(hdrName), v); err != nil {
+				return "", 0, false, fmt.Errorf("insert header %q: %w", hdrName, err)
+			}
 		}
 	}
 
@@ -278,40 +324,32 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 	// message's labels to tags (add + remove against the baseline); everything
 	// else applies the folder-role SPECIAL-USE tag mapping.
 	if opts.LabelsAsTags {
-		if err := reconcileLabels(db, messageID, opts.Account, msg.Labels); err != nil {
-			return "", false, fmt.Errorf("reconcile labels: %w", err)
+		if err := reconcileLabels(db, storeMsg.ID, msg.Labels); err != nil {
+			return "", 0, false, fmt.Errorf("reconcile labels: %w", err)
 		}
 	} else if mapping := tagMappingForRole(role); mapping != nil {
 		for _, tag := range mapping.addTags {
 			if err := db.AddTag(storeMsg.ID, tag); err != nil {
-				return "", false, fmt.Errorf("add folder tag %q: %w", tag, err)
+				return "", 0, false, fmt.Errorf("add folder tag %q: %w", tag, err)
 			}
-		}
-	}
-
-	// Flag-based tags (unread, flagged, replied). Like the legacy insert path
-	// this only applies the add half; the engine's per-folder flag
-	// reconciliation pass applies removals so re-fetched (updated) messages
-	// shed stale flag tags.
-	flagAdd, _ := flagState.ToTagOps()
-	for _, tag := range flagAdd {
-		if err := db.AddTag(storeMsg.ID, tag); err != nil {
-			return "", false, fmt.Errorf("add flag tag %q: %w", tag, err)
 		}
 	}
 
 	// Eagerly detect calendar content
 	if bytes.Contains(msg.Raw, []byte("text/calendar")) {
 		if err := db.AddTag(storeMsg.ID, "cal"); err != nil {
-			return "", false, fmt.Errorf("add cal tag: %w", err)
+			return "", 0, false, fmt.Errorf("add cal tag: %w", err)
 		}
 	}
 
 	if err := applyFilterRules(db, storeMsg, content, parsed, opts); err != nil {
-		return "", false, err
+		return "", 0, false, err
+	}
+	if err := db.MarkMessageIngestComplete(storeMsg.ID, storeMsg.IngestGeneration); err != nil {
+		return "", 0, false, fmt.Errorf("complete message ingest: %w", err)
 	}
 
-	return messageID, created, nil
+	return messageID, storeMsg.ID, created, nil
 }
 
 // reconcileLabels mirrors a message's labels (already resolved to Durian tag
@@ -320,12 +358,12 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 // flags) untouched. The current set becomes the new baseline. Runs for both new
 // and re-ingested messages (a new message has an empty baseline, so all its
 // labels are added).
-func reconcileLabels(db *store.DB, messageID, account string, labels []string) error {
-	baselineStr, err := db.GetSyncedLabels(messageID, account)
+func reconcileLabels(db *store.DB, messageDBID int64, labels []string) error {
+	baselineStr, err := db.GetSyncedLabelsByDBID(messageDBID)
 	if err != nil {
 		return fmt.Errorf("get label baseline: %w", err)
 	}
-	baseline := splitFlags(baselineStr) // comma-split; "" -> nil
+	baseline := decodeLabelBaseline(baselineStr)
 
 	inLabels := make(map[string]bool, len(labels))
 	for _, t := range labels {
@@ -348,11 +386,15 @@ func reconcileLabels(db *store.DB, messageID, account string, labels []string) e
 		}
 	}
 	if len(add) > 0 || len(remove) > 0 {
-		if err := db.ModifyTagsByMessageIDAndAccount(messageID, account, add, remove); err != nil {
+		if err := db.ModifyTagsByMessageDBID(messageDBID, add, remove); err != nil {
 			return fmt.Errorf("reconcile label tags: %w", err)
 		}
 	}
-	return db.SetSyncedLabels(messageID, account, strings.Join(labels, ","))
+	encoded, err := encodeLabelBaseline(labels)
+	if err != nil {
+		return fmt.Errorf("encode label baseline: %w", err)
+	}
+	return db.SetSyncedLabelsByDBID(messageDBID, encoded)
 }
 
 // applyFilterRules evaluates the user's filter rules against the freshly
@@ -380,7 +422,7 @@ func applyFilterRules(db *store.DB, storeMsg *store.Message, content *durianmail
 
 		// Run exec hook if configured
 		if rule.Exec != "" {
-			currentTags, _ := db.GetTagsByMessageID(storeMsg.MessageID)
+			currentTags, _ := db.GetMessageTags(storeMsg.ID)
 			execOut, err := imap.RunExecRule(rule, storeMsg, currentTags, opts.Account)
 			if err != nil {
 				slog.Warn("Exec rule failed, using static tags", "module", "RULES", "rule", rule.Name, "err", err)
@@ -399,15 +441,8 @@ func applyFilterRules(db *store.DB, storeMsg *store.Message, content *durianmail
 			}
 		}
 
-		for _, tag := range addTags {
-			if err := db.AddTag(storeMsg.ID, tag); err != nil {
-				return fmt.Errorf("add rule tag %q: %w", tag, err)
-			}
-		}
-		for _, tag := range removeTags {
-			if err := db.RemoveTag(storeMsg.ID, tag); err != nil {
-				return fmt.Errorf("remove rule tag %q: %w", tag, err)
-			}
+		if err := db.ModifyTagsByMessageDBIDAndJournal(storeMsg.ID, addTags, removeTags, time.Now().Unix()); err != nil {
+			return fmt.Errorf("apply rule tags: %w", err)
 		}
 		slog.Debug("Applied filter rule", "module", "SYNCENGINE", "rule", rule.Name, "message_id", storeMsg.MessageID)
 	}

@@ -47,10 +47,10 @@ struct Profile: Identifiable, Equatable, Hashable {
 
 // MARK: - Config Decoding
 
-struct ProfilesConfig: Decodable {
+struct ProfilesConfig: Codable {
     let profiles: [ProfileEntry]
 
-    struct ProfileEntry: Decodable {
+    struct ProfileEntry: Codable {
         let name: String
         let accounts: [String]
         var `default`: Bool?
@@ -58,7 +58,7 @@ struct ProfilesConfig: Decodable {
         var folders: [FolderEntry]?
     }
 
-    struct FolderEntry: Decodable {
+    struct FolderEntry: Codable {
         let name: String
         var icon: String?
         var query: String?  // nil or empty = section header
@@ -73,42 +73,122 @@ class ProfileManager: ObservableObject {
 
     @Published var profiles: [Profile] = []
     @Published var currentProfile: Profile?
+    @Published private(set) var isReady = false
+
+    typealias ProfilesEvaluator = (URL) async throws -> ProfilesConfig
+
+    private let configURL: URL
+    private let evaluator: ProfilesEvaluator
+    private let fileExists: (String) -> Bool
+    private var loadTask: Task<Void, Never>?
+    private var readinessContinuations: [CheckedContinuation<Void, Never>] = []
 
     /// Default folders when none are defined in config
     static let defaultFolders: [FolderConfig] = [
         FolderConfig(name: "Inbox", icon: "tray", query: "tag:inbox", isSection: false)
     ]
 
-    init() {
-        loadProfiles()
+    init(
+        configURL: URL = FileManager.default.durianConfigURL().appendingPathComponent("profiles.pkl"),
+        evaluator: @escaping ProfilesEvaluator = { try await PklEvaluator.eval(ProfilesConfig.self, from: $0) },
+        fileExists: @escaping (String) -> Bool = FileManager.default.fileExists(atPath:)
+    ) {
+        self.configURL = configURL
+        self.evaluator = evaluator
+        self.fileExists = fileExists
     }
 
     /// Test-only initializer: inject profiles directly, skip file loading
     init(profiles: [Profile], currentProfile: Profile? = nil) {
+        configURL = FileManager.default.durianConfigURL().appendingPathComponent("profiles.pkl")
+        evaluator = { try await PklEvaluator.eval(ProfilesConfig.self, from: $0) }
+        fileExists = { _ in true }
         self.profiles = profiles
         self.currentProfile = currentProfile ?? profiles.first
+        isReady = true
     }
 
-    func loadProfiles() {
-        let configURL = FileManager.default.durianConfigURL()
-            .appendingPathComponent("profiles.pkl")
+    /// Load profiles once for startup. Concurrent callers join the same task.
+    func prepareProfiles() async {
+        guard !isReady else { return }
+        await loadProfiles()
+    }
 
-        let config: ProfilesConfig
-        do {
-            config = try PklEvaluator.evalSync(ProfilesConfig.self, from: configURL)
-        } catch {
-            Log.error("PROFILE", "Failed to load profiles.pkl: \(error)")
-            profiles = [Profile(
-                name: "All",
-                accounts: ["*"],
-                isDefault: true,
-                color: nil,
-                folders: Self.defaultFolders
-            )]
-            currentProfile = profiles.first
+    /// Wait until startup profile loading (including fallback handling) finishes.
+    func waitUntilReady() async {
+        guard !isReady else { return }
+        await withCheckedContinuation { continuation in
+            if isReady {
+                continuation.resume()
+            } else {
+                readinessContinuations.append(continuation)
+            }
+        }
+    }
+
+    /// Force a disk reload, preserving the manual Reload Config behavior.
+    func reloadProfiles() async {
+        if let loadTask {
+            await loadTask.value
+        }
+        await startProfilesLoad()
+    }
+
+    func applyEvaluatedProfiles(_ config: ProfilesConfig) {
+        apply(config)
+    }
+
+    private func loadProfiles() async {
+        if let loadTask {
+            await loadTask.value
             return
         }
 
+        await startProfilesLoad()
+    }
+
+    private func startProfilesLoad() async {
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await loadProfilesFromDisk()
+            loadTask = nil
+        }
+        loadTask = task
+        await task.value
+    }
+
+    private func loadProfilesFromDisk() async {
+        guard fileExists(configURL.path) else {
+            Log.warning("PROFILE", "profiles.pkl not found, using defaults")
+            applyFallback()
+            return
+        }
+
+        let config: ProfilesConfig
+        do {
+            config = try await evaluator(configURL)
+        } catch {
+            Log.error("PROFILE", "Failed to load profiles.pkl: \(error)")
+            applyFallback()
+            return
+        }
+
+        apply(config)
+    }
+
+    private func applyFallback() {
+        profiles = [Profile(
+            name: "All",
+            accounts: ["*"],
+            isDefault: true,
+            color: nil,
+            folders: Self.defaultFolders
+        )]
+        currentProfile = profiles.first
+        markReady()
+    }
+
+    private func apply(_ config: ProfilesConfig) {
         profiles = config.profiles.map { entry in
             let folders: [FolderConfig]
             if let entryFolders = entry.folders, !entryFolders.isEmpty {
@@ -134,6 +214,14 @@ class ProfileManager: ObservableObject {
         if let profile = currentProfile {
             Log.debug("PROFILE", "Current profile has \(profile.folders.count) folders")
         }
+        markReady()
+    }
+
+    private func markReady() {
+        isReady = true
+        let continuations = readinessContinuations
+        readinessContinuations.removeAll()
+        continuations.forEach { $0.resume() }
     }
 
     /// Resolved app-wide accent color following the precedence:
