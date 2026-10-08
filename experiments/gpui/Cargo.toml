@@ -1,0 +1,29 @@
+[package]
+name = "durian-gpui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Experimental Durian mail UI built with Zed's GPUI (Linux spike)"
+
+[[bin]]
+name = "durian-gpui"
+path = "src/main.rs"
+
+[dependencies]
+# GPUI moves fast and the crates.io release (0.2.2, Oct 2025) predates the
+# gpui_platform split, so pin both crates to the same Zed commit.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "916fc2b8cb3a815cbef4a3b40e13081be72036b6" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "916fc2b8cb3a815cbef4a3b40e13081be72036b6", features = ["wayland", "x11"] }
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
+
+[profile.dev]
+# GPUI itself is slow in unoptimized builds; keep our crate debuggable but
+# optimize dependencies so the UI stays responsive.
+opt-level = 0
+[profile.dev.package."*"]
+opt-level = 2

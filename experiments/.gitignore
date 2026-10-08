@@ -1,0 +1,6 @@
+# Keep experimental build output and local portal metadata out of source control.
+**/target/
+**/.amp/
+
+# Allow the CEF helper source despite the repository-wide bin/ rule.
+!mail-cef/src/bin/
