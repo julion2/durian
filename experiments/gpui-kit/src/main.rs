@@ -1235,6 +1235,11 @@ impl Render for MailApp {
             }))
             .on_action(cx.listener(|this, _: &FocusHtml, w, cx| {
                 this.thread_focused = true;
+                diagnostics::record("html.request", || {
+                    serde_json::json!({
+                        "content_exists": this.contents.get(this.message).is_some(),
+                    })
+                });
                 if let Some(content) = this.contents.get(this.message) {
                     content.update(cx, |content, cx| content.focus_browser(w, cx));
                 }

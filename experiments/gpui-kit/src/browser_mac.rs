@@ -320,6 +320,7 @@ enum BrowserEvent {
 struct NativeView {
     webview: WebView,
     events: mpsc::Sender<BrowserEvent>,
+    document_ready: bool,
     painted_generation: usize,
     in_view: bool,
     overlay_requested: bool,
@@ -425,7 +426,36 @@ impl BrowserBody {
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         window.focus(&self.focus, cx);
         if let Some(native) = &self.native {
-            let _ = native.borrow().webview.focus();
+            let native = native.borrow();
+            let result = native.webview.focus();
+            crate::diagnostics::record("html.focus", || {
+                let webview = native.webview.webview();
+                let view: &NSView = &webview;
+                let window = view.window();
+                let first = window.as_ref().and_then(|window| window.firstResponder());
+                let in_webkit = first.as_ref().is_some_and(|first| {
+                    first.downcast_ref::<NSView>().is_some_and(|first| {
+                        std::ptr::eq(first, view) || first.isDescendantOf(view)
+                    })
+                });
+                serde_json::json!({
+                    "native": true,
+                    "ready": native.document_ready,
+                    "in_view": native.in_view,
+                    "hidden": view.isHidden(),
+                    "overlay_requested": native.overlay_requested,
+                    "overlay_active": native.overlay_active,
+                    "width": f32::from(native.visible_bounds.size.width),
+                    "height": f32::from(native.visible_bounds.size.height),
+                    "window_present": window.is_some(),
+                    "succeeded": result.is_ok(),
+                    "first_responder_in_webkit": in_webkit,
+                })
+            });
+        } else {
+            crate::diagnostics::record("html.focus", || {
+                serde_json::json!({"native": false, "error": self.error.is_some()})
+            });
         }
     }
 
@@ -539,6 +569,7 @@ impl BrowserBody {
         let native = Rc::new(RefCell::new(NativeView {
             webview,
             events,
+            document_ready: false,
             painted_generation: 0,
             in_view: false,
             overlay_requested: false,
@@ -593,6 +624,12 @@ impl BrowserBody {
                                         if height.is_finite()
                                             && (1.0..=1_000_000.0).contains(&height) =>
                                     {
+                                        if !observed.borrow().document_ready {
+                                            observed.borrow_mut().document_ready = true;
+                                            crate::diagnostics::record("html.ready", || {
+                                                serde_json::json!({"height": height})
+                                            });
+                                        }
                                         if (this.height - height).abs() >= 0.5 {
                                             this.height = height;
                                             cx.emit(Changed);

@@ -1,6 +1,8 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreGraphics
+import CoreServices
 import Foundation
 
 struct SavedItem: Codable, Equatable { let values: [String: Data] }
@@ -30,19 +32,49 @@ func capture() throws -> [SavedItem] {
     return saved
 }
 
-func postKey(_ pid: pid_t, _ code: CGKeyCode, _ flags: CGEventFlags, _ text: String? = nil) throws {
-    let source = CGEventSource(stateID: .hidSystemState)
+// GPUI reconstructs printable keys from keyCode + the active TIS layout. A
+// Unicode payload with virtual key 0 becomes "a", not the requested character.
+// This CLI only calls TIS on its main thread and never changes the input source.
+func physicalKeys(_ text: String) throws -> [(CGKeyCode, CGEventFlags)] {
+    guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+          let property = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else {
+        throw ProbeError.failed("Active keyboard layout unavailable")
+    }
+    let data = unsafeBitCast(property, to: CFData.self)
+    let layout = unsafeBitCast(CFDataGetBytePtr(data), to: UnsafePointer<UCKeyboardLayout>.self)
+    // Ordinary ANSI positions only: exclude ISO section (10), Return (36),
+    // Tab (48), Delete (51), keypad, navigation and function-key aliases.
+    let codes: [CGKeyCode] = Array(0...9) + Array(11...35) + Array(37...47) + [49, 50]
+    var inverse: [String: (CGKeyCode, CGEventFlags)] = [:]
+    for shifted in [false, true] {
+        for code in codes {
+            var deadState: UInt32 = 0
+            var output = [UniChar](repeating: 0, count: 4)
+            var length = 0
+            let status = UCKeyTranslate(layout, code, UInt16(kUCKeyActionDown),
+                shifted ? UInt32((shiftKey >> 8) & 0xff) : 0, UInt32(LMGetKbdType()),
+                OptionBits(kUCKeyTranslateNoDeadKeysMask), &deadState,
+                output.count, &length, &output)
+            guard status == noErr, length == 1, (32...126).contains(output[0]) else { continue }
+            let character = String(utf16CodeUnits: output, count: length)
+            if inverse[character] == nil { inverse[character] = (code, shifted ? .maskShift : []) }
+        }
+    }
+    return try text.map { character in
+        guard let stroke = inverse[String(character)] else {
+            throw ProbeError.failed("Probe character not directly reachable with active layout + Shift")
+        }
+        return stroke
+    }
+}
+
+func postKey(_ pid: pid_t, _ code: CGKeyCode, _ flags: CGEventFlags) throws {
+    let source = CGEventSource(stateID: .privateState)
     for down in [true, false] {
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else {
             throw ProbeError.failed("Cannot construct keyboard event")
         }
         event.flags = flags
-        if let text {
-            let units = Array(text.utf16)
-            units.withUnsafeBufferPointer {
-                event.keyboardSetUnicodeString(stringLength: $0.count, unicodeString: $0.baseAddress!)
-            }
-        }
         event.postToPid(pid)
         usleep(20_000)
     }
@@ -68,7 +100,15 @@ func named(_ element: AXUIElement, _ names: Set<String>) -> Bool {
 
 do {
     let mode = args[1]
-    if mode == "save" {
+    if mode == "layout" {
+        // Preflight the fixed synthetic probe before launching apps or mutating
+        // the clipboard. Report strokes, never input-source identity or text.
+        let strokes = try physicalKeys("/zzdurianprobeacvtq")
+        let data = try JSONSerialization.data(withJSONObject: strokes.map {
+            ["key_code": UInt64($0.0), "flags": $0.1.rawValue]
+        }, options: [.sortedKeys])
+        print(String(data: data, encoding: .utf8)!)
+    } else if mode == "save" {
         let saved = try capture()
         let path = args[2]
         let parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
@@ -105,12 +145,14 @@ do {
             try require(NSRunningApplication(processIdentifier: pid)?.terminate() == true, "App termination request failed")
         } else if mode == "key" {
             try postKey(pid, CGKeyCode(args[3])!, CGEventFlags(rawValue: UInt64(args[4])!))
-        } else if mode == "text" {
-            try postKey(pid, 0, [], args[3])
-        } else if mode == "burst" || mode == "type" {
+        } else if mode == "chord" {
+            let strokes = try physicalKeys(args[3])
+            try require(strokes.count == 1, "A shortcut requires exactly one character")
+            try postKey(pid, strokes[0].0, strokes[0].1.union(CGEventFlags(rawValue: UInt64(args[4])!)))
+        } else if mode == "text" || mode == "burst" || mode == "type" {
             // One process; no settling delay after slash, only 20ms between edges.
-            if mode == "burst" { try postKey(pid, 0, [], "/") }
-            for character in args[3] { try postKey(pid, 0, [], String(character)) }
+            let strokes = try physicalKeys((mode == "burst" ? "/" : "") + args[3])
+            for (code, flags) in strokes { try postKey(pid, code, flags) }
         } else if mode == "ax" || mode == "ax-tree" || mode == "press-search" {
             guard AXIsProcessTrusted() else { print("{\"available\":false}"); exit(0) }
             let app = AXUIElementCreateApplication(pid)

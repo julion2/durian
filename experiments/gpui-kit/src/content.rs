@@ -199,6 +199,14 @@ fn raster_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
 
 impl MailContent {
     pub fn focus_browser(&self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::diagnostics::record("html.content", || {
+            serde_json::json!({
+                "has_html": !self.message.html.trim().is_empty(),
+                "plain": self.plain,
+                "images_loading": self.images_loading,
+                "embedded": self.embedded.is_some(),
+            })
+        });
         if let Some(browser) = &self.embedded {
             browser.update(cx, |browser, cx| browser.focus(window, cx));
         }

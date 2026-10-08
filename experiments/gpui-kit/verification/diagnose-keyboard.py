@@ -38,6 +38,42 @@ def classify(copied, ax, events, tracing):
     return "INPUT_UNOBSERVED" if tracing else "UNVERIFIED_NO_TRACE"
 
 
+def html_boundary(events):
+    """Last explicit focus request only; an earlier ready/focus is not proof."""
+    start = next((i for i in range(len(events) - 1, -1, -1)
+                  if events[i].get("stage") == "html.request"), None)
+    if start is None:
+        return "HTML_REQUEST_UNOBSERVED"
+    request = events[start].get("details", {})
+    if request.get("content_exists") is False:
+        return "HTML_CONTENT_ABSENT"
+    details = {e["stage"]: e.get("details", {}) for e in events[start:]}
+    content = details.get("html.content", {})
+    if content.get("plain") or content.get("has_html") is False:
+        return "HTML_CONTENT_NOT_HTML"
+    if content.get("images_loading"):
+        return "HTML_IMAGES_LOADING"
+    if content.get("embedded") is False:
+        return "HTML_EMBED_ABSENT"
+    focus = details.get("html.focus", {})
+    if not focus:
+        return "HTML_FOCUS_UNOBSERVED"
+    if focus.get("native") is False:
+        return "HTML_NATIVE_ABSENT"
+    if focus.get("ready") is False:
+        return "HTML_DOCUMENT_NOT_READY"
+    if focus.get("hidden") or focus.get("overlay_active") or focus.get("in_view") is False:
+        return "HTML_NOT_VISIBLE"
+    if focus.get("succeeded") is False:
+        return "HTML_FOCUS_CALL_FAILED"
+    required = {"native": True, "ready": True, "in_view": True, "hidden": False,
+                "overlay_active": False, "window_present": True, "succeeded": True,
+                "first_responder_in_webkit": True}
+    if all(focus.get(key) is value for key, value in required.items()):
+        return "HTML_RESPONDER_VERIFIED"
+    return "HTML_RESPONDER_UNVERIFIED"
+
+
 def traces(path, offset=0):
     result = []
     for line in path.read_bytes()[offset:].decode(errors="replace").splitlines():
@@ -72,6 +108,7 @@ def main(binary):
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, interrupt)
+    (here / "layout.json").write_text(helper("layout") + "\n")
     helper("save", backup)
     try:
         # Each control starts with a fresh demo app, never an inherited focus state.
@@ -100,13 +137,13 @@ def main(binary):
 
                     def key(code, flags=0, wait=0.4):
                         alive()
-                        helper("key", pid, code, flags)
+                        helper("chord" if isinstance(code, str) else "key", pid, code, flags)
                         time.sleep(wait)
 
                     def copy():
                         helper("sentinel", "DURIAN_TEST_SENTINEL_" + uuid.uuid4().hex)
-                        key(0, COMMAND)
-                        key(8, COMMAND)
+                        key("a", COMMAND)
+                        key("c", COMMAND)
                         return clipboard()
 
                     def mail_copy():
@@ -129,9 +166,23 @@ def main(binary):
                     ax("cold")
                     time.sleep(1)
                     ax("warm")
+                    result["startup_events"] = traces(log_path)
                     if phase == "webkit-burst":
-                        key(9, OPTION, 1)
-                        result["html_positive_control"] = mail_copy()
+                        # Wait for an actual document-height IPC, not a guessed
+                        # extra sleep. The focus trace checks the selected view.
+                        deadline = time.monotonic() + 5
+                        while not any(e.get("stage") == "html.ready" for e in traces(log_path)):
+                            alive()
+                            if time.monotonic() >= deadline:
+                                break
+                            time.sleep(0.1)
+                        focus_offset = log_path.stat().st_size
+                        key("v", OPTION, 1)
+                        result["html_copy_matches"] = mail_copy()
+                        result["html_focus_events"] = traces(log_path, focus_offset)
+                        result["html_boundary"] = html_boundary(result["html_focus_events"])
+                        result["html_positive_control"] = (result["html_copy_matches"]
+                            and result["html_boundary"] == "HTML_RESPONDER_VERIFIED")
                         if not result["html_positive_control"]:
                             result["status"] = "UNVERIFIED_HTML_FOCUS"
                             continue
@@ -164,16 +215,16 @@ def main(binary):
                     after = ax("after-escape")
                     result["escape_ax_verified"] = bool(state.get("search") and
                         after.get("available") and not after.get("truncated") and not after.get("search"))
-                    key(9, OPTION, 1)
+                    key("v", OPTION, 1)
                     result["html_after_escape"] = mail_copy()
-                    key(17, CONTROL | SHIFT, 1)
-                    key(9, OPTION, 1)
+                    key("t", CONTROL | SHIFT, 1)
+                    key("v", OPTION, 1)
                     result["html_after_theme"] = mail_copy()
                     result["tail_events"] = traces(log_path, tail_offset)
                     result["theme_state_verified"] = any(
                         e.get("stage") == "theme.changed" and e.get("details", {}).get("dark") is True
                         for e in result["tail_events"])
-                    key(12, CONTROL, 0.1)
+                    key("q", CONTROL, 0.1)
                     try:
                         result["normal_ctrl_q_exit"] = process.wait(timeout=8)
                     except subprocess.TimeoutExpired:

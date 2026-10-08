@@ -39,6 +39,7 @@ def assert_mail(sentinel):
     print("PASS HTML clipboard fixture assertion (contents suppressed)", flush=True)
 
 process = None
+helper("layout")  # Fail before any clipboard mutation if the layout is unsupported.
 helper("save", backup)
 try:
     env = os.environ.copy()
@@ -55,13 +56,13 @@ try:
             assert process.poll() is None, "isolated app exited unexpectedly"
         def key(code, flags=0, wait=0.6):
             alive()
-            helper("key", pid, code, flags)
+            helper("chord" if isinstance(code, str) else "key", pid, code, flags)
             time.sleep(wait)
         def copy():
             sentinel = "DURIAN_TEST_SENTINEL_" + uuid.uuid4().hex
             helper("sentinel", sentinel)
-            key(0, COMMAND)
-            key(8, COMMAND)
+            key("a", COMMAND)
+            key("c", COMMAND)
             return sentinel
         def search_state(expected, label):
             deadline = time.monotonic() + 5
@@ -93,10 +94,10 @@ try:
         print("PASS Root Search query/input/copy", flush=True)
         key(53, wait=1)
         search_state(False, "Root Search Escape")
-        key(9, OPTION, 1)
+        key("v", OPTION, 1)
         assert_mail(copy())
         # Deliberately no settling wait between slash and initial query.
-        # Unicode / avoids assuming a US physical slash key on German layouts.
+        # Active-layout physical keys match GPUI's native event reconstruction.
         helper("burst", pid, QUERY)
         time.sleep(1)
         search_state(True, "WK burst Search")
@@ -106,12 +107,12 @@ try:
         print("PASS complete rapid Search query clipboard (synthetic)", flush=True)
         key(53, wait=1)
         search_state(False, "WK Search Escape")
-        key(9, OPTION, 1)
+        key("v", OPTION, 1)
         assert_mail(copy())
-        key(17, CONTROL | SHIFT, 2)
-        key(9, OPTION, 1)
+        key("t", CONTROL | SHIFT, 2)
+        key("v", OPTION, 1)
         assert_mail(copy())
-        key(12, CONTROL, 0.1)
+        key("q", CONTROL, 0.1)
         assert process.wait(timeout=8) == 0
         print("PASS normal CtrlQ exit=0", flush=True)
 finally:
