@@ -66,6 +66,13 @@ enum SharedWebKit {
 
 /// A WKWebView subclass that passes scroll wheel events to its parent ScrollView
 class ScrollPassthroughWebView: WKWebView {
+    var onAppearanceChange: (() -> Void)?
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        onAppearanceChange?()
+    }
+
     override func scrollWheel(with event: NSEvent) {
         // Pass scroll events to parent instead of handling them
         nextResponder?.scrollWheel(with: event)
@@ -106,6 +113,10 @@ struct NonScrollingWebView: NSViewRepresentable {
 
         context.coordinator.webView = webView
         context.coordinator.parent = self
+        webView.onAppearanceChange = { [weak coordinator = context.coordinator] in
+            guard let coordinator, let html = coordinator.lastLoadedHTML else { return }
+            coordinator.loadIfNeeded(html)
+        }
 
         return webView
     }
@@ -117,19 +128,12 @@ struct NonScrollingWebView: NSViewRepresentable {
         nsView.stopLoading()
     }
 
-    func updateNSView(_ webView: WKWebView, context: Context) {
+    func updateNSView(_: WKWebView, context: Context) {
         // Update parent reference for height binding
         context.coordinator.parent = self
 
         let styledHTML = buildSecureHTML(html: html, theme: theme, loadRemoteImages: loadRemoteImages)
-
-        // Only reload if HTML actually changed - prevents infinite loop
-        // (contentHeight binding triggers re-render → updateNSView → reload → didFinish → height update → loop)
-        if context.coordinator.lastLoadedHTML != styledHTML {
-            context.coordinator.lastLoadedHTML = styledHTML
-            context.coordinator.loadedForEmailId = emailId  // Track which email this load is for
-            webView.loadHTMLString(styledHTML, baseURL: nil)
-        }
+        context.coordinator.loadIfNeeded(styledHTML)
     }
 
     private func buildSecureHTML(html: String, theme: String, loadRemoteImages: Bool) -> String {
@@ -202,6 +206,25 @@ struct NonScrollingWebView: NSViewRepresentable {
         var parent: NonScrollingWebView?
         var lastLoadedHTML: String?  // Track to prevent reload loops
         var loadedForEmailId: String?  // Track which email we loaded for (race condition prevention)
+        private var lastLoadedDarkMode: Bool?
+
+        private func usesDarkMode(_ webView: WKWebView) -> Bool {
+            parent?.theme == "dark" ||
+                (parent?.theme == "system" && webView.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+        }
+
+        func loadIfNeeded(_ html: String) {
+            guard let webView else { return }
+            let isDark = usesDarkMode(webView)
+            guard lastLoadedHTML != html || lastLoadedDarkMode != isDark else { return }
+            lastLoadedHTML = html
+            lastLoadedDarkMode = isDark
+            loadedForEmailId = parent?.emailId
+            // The dark transform mutates inline colors. Reload the pristine
+            // source on a theme change instead of transforming the mutated DOM.
+            // Height-only updates still skip reloads, avoiding layout loops.
+            webView.loadHTMLString(html, baseURL: nil)
+        }
 
         /// Reload after a WebContent process crash.
         ///
@@ -224,9 +247,7 @@ struct NonScrollingWebView: NSViewRepresentable {
             let expectedEmailId = loadedForEmailId
 
             // Apply dark mode color transformation if needed
-            let isDark = parent?.theme == "dark" ||
-                (parent?.theme == "system" && NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
-            if isDark {
+            if usesDarkMode(webView) {
                 webView.evaluateJavaScript(DarkModeTransform.js) { _, _ in
                     // Measure height after dark mode transform (colors may affect layout)
                     webView.evaluateJavaScript("document.body.scrollHeight") { [weak self] result, _ in
