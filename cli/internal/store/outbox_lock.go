@@ -32,6 +32,18 @@ func AcquireOutboxLifecycle(dbPath string) (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve outbox lock path: %w", err)
 	}
+	// The lock names the database, not the spelling used to open it. Resolve
+	// file symlinks too, otherwise two owners can lock different sidecar files
+	// while operating on the same SQLite store.
+	if resolved, resolveErr := filepath.EvalSymlinks(absPath); resolveErr == nil {
+		absPath = resolved
+	} else if !os.IsNotExist(resolveErr) {
+		return nil, fmt.Errorf("resolve outbox database path: %w", resolveErr)
+	} else if info, statErr := os.Lstat(absPath); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		// A new database may not exist yet, but a dangling file symlink must
+		// not get its own lock before its target is created by another owner.
+		return nil, fmt.Errorf("resolve outbox database symlink: %w", resolveErr)
+	}
 	dir := filepath.Dir(absPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create outbox lock directory: %w", err)
