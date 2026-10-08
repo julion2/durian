@@ -186,32 +186,45 @@ The macOS runner could not establish actual trackpad/wheel traversal across
 message boundaries or capture the complete native window. Do not infer those
 checks from successful selection/copy or standalone WebKit tests.
 
-Verification on 2026-10-08 used the exact synchronous AppKit-routing source
+The final single follow-up on 2026-10-08 used the exact instrumented source
 (`browser_mac.rs` SHA-256
-`4e138e5b0e2be81a87a45074fc16cf568348406e80dca10b90d87216a84c4420`).
-The latest `cargo build --locked` passed in 34m57s from a fresh private cache.
-The full Mac suite had **35 passed, 1 failed, 2 ignored**: a loopback Delivery
-fixture hit `WouldBlock` on `read_line`; its isolated rerun passed. Accepted
-test sockets now explicitly clear the nonblocking mode inherited on some BSD
-systems. All eight Delivery tests passed 30 parallel-suite repetitions on Linux
-after this fix; it still needs a Mac retest. Production send remains disabled.
+`1573a20c8b8882628fa1722d3d8eae94730a6080a171d81631a178dd2d25ad98`).
+The private `cargo build --locked` passed in **165 seconds with two jobs**
+using the diagnostic profile overrides below. The native Swift helper compiled.
+An earlier Mac suite hit `WouldBlock` in a loopback Delivery fixture's
+`read_line`. Accepted test sockets now explicitly clear inherited nonblocking
+mode. The final Mac suite passed **36 tests, 0 failed, 2 ignored**;
+all eight Delivery tests also passed 30 parallel-suite repetitions on both
+Linux and macOS (240 per platform). Production send remains disabled.
 
-An earlier run proved HTML focus and Cmd+A/C with fresh clipboard sentinels and
-two fixture phrases. The latest root-search positive control, before HTML focus,
-was **unverified**: AX exposed only Window/Group/Button roles, no identifiable
-Search editor. WK→Search burst, Escape/theme/normal Ctrl+Q were not reached. The
-evidence does not separate an AX coverage gap from a keyboard-dispatch problem.
-The app was reaped, clipboard restored with full Item/Type/Data equality, and
-private build data removed. Current opt-in tracing and Swift diagnostic additions
-have not been Mac-compiled or Mac-run; Linux does not compile `browser_mac.rs`.
+The previous diagnostic run found native slash arriving in GPUI as `a`
+(`Archive`), zero uniquely labelled Search AX buttons, and unproven HTML focus.
+GPUI reconstructs printable keys from physical keycodes and the active layout;
+the old Unicode-payload/keycode-0 probe was incompatible with that path. The
+probe now inverts `UCKeyTranslate` on the active layout for slash, query and
+shortcut keys, preferring ordinary unshifted/Shift ANSI positions. It never
+changes the system layout or posts global events. Unsupported layouts fail
+before clipboard mutation. This harness correction does not change production
+routing. In the final run, slash was VK26 + Shift and reached GPUI as `/`.
+
+**Verified:** Root-Slash and WK→Search burst each retained and copied the exact
+13-character synthetic query. WK was ready, visible and the actual native first
+responder before the burst. Both paths passed Escape, HTML copy after Escape
+and dark-theme change, and normal Ctrl+Q exit 0. Startup traces had no key/action
+contamination. **Still unverified:** AX reported the Search text field but not
+its editor focus; no uniquely labelled Search button was available for AX Press.
+Keyboard behavior is therefore verified independently, not full accessibility
+acceptance. No retry was performed. Full clipboard Item/Type/Data restoration,
+own-process exit and private-source/cache/runtime cleanup were confirmed.
 
 The tested helpers are preserved in `gpui-kit/verification/`. In an agreed Mac
 UI-test window, `gpui-kit/verify-macos.sh /tmp/gpui-…/target/debug/durian-gpui-kit`
 copies them into private `/tmp/gpui-*` storage, compiles the Swift helper, and
 runs only synthetic demo mail against its own PID. It preserves/restores every
 clipboard item/type and verifies the restoration; never collect or publish the
-private clipboard backup. The wrapper is shell-syntax checked, not itself run
-on macOS yet. It preserves recovery files on failure and cleans up on success.
+private clipboard backup. The diagnostic wrapper has run on macOS; this does
+not establish keyboard acceptance. It preserves recovery files on failure and
+cleans up on success.
 
 For diagnosis, start with an **existing private demo binary**; only the small
 Swift probe needs compiling. From the transferred `experiments/gpui-kit/`:
@@ -234,7 +247,11 @@ clipboard restoration and evidence transfer.
 
 An instrumented debug build adds `DURIAN_INPUT_TRACE=1`: native responder/route,
 GPUI ingress/resolved action/context, Search open/editor-focus, synthetic probe
-match and theme state. Hooks are passive and disabled for `--live` and release
+match and theme state. HTML traces distinguish missing content, pending CID
+images, absent embed/native child, document readiness, visibility/overlay state,
+focus-call result and actual native responder. The burst requires both fixture
+copy and a ready, visible WK responder; earlier views' traces cannot satisfy it.
+Hooks are passive and disabled for `--live` and release
 builds; no query, mail or clipboard text is logged. A binary without these hooks
 can still run the external controls, but missing traces are **unknown**, not a
 failed dispatch. Linux native slash/query/theme checks verified the trace path
@@ -253,10 +270,10 @@ without changing the repository profile:
 cargo --config 'profile.dev.debug=0' --config 'profile.dev.package."*".opt-level=0' build --locked
 ```
 
-The faster profile's Mac build time is **not measured** and is not a performance
-baseline. Do not change profiles on a reusable cache unnecessarily. Start a new
-Mac runner thread only after an explicit UI/build window is granted; leave the
-main checkout and other threads' `stability-*` resources untouched.
+The first clean Mac diagnostic build with these overrides took **284 seconds**;
+this is not a runtime-performance baseline. Do not change profiles on a reusable
+cache unnecessarily. Run only in an explicitly authorized UI/build window;
+leave the main checkout and all other threads' resources untouched.
 
 ### Retained CEF embedding experiment (Linux default)
 
