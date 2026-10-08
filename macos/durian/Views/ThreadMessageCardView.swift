@@ -463,7 +463,7 @@ struct ThreadMessageCardView: View {
 
     private func fetchAttachmentData(_ attachment: AttachmentInfo) async -> Data? {
         // Check cache first
-        if let cached = AttachmentCacheManager.shared.get(messageId: message.attachmentCacheId, partId: attachment.partId) {
+        if let cached = await AttachmentCacheManager.shared.get(messageId: message.attachmentCacheId, partId: attachment.partId) {
             Log.debug("ATTACHMENT", "Cache hit for \(attachment.filename)")
             return cached
         }
@@ -479,7 +479,7 @@ struct ThreadMessageCardView: View {
                 partId: attachment.partId
             )
             // Cache for future access
-            AttachmentCacheManager.shared.put(
+            await AttachmentCacheManager.shared.put(
                 messageId: message.attachmentCacheId, partId: attachment.partId,
                 filename: attachment.filename, data: data
             )

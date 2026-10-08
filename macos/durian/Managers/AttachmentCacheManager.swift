@@ -12,13 +12,11 @@ import Foundation
 class AttachmentCacheManager: ObservableObject {
     static let shared = AttachmentCacheManager()
 
-    private let fileManager = FileManager.default
-    private let indexFile: URL
-    private let cacheDir: URL
+    private let storage: AttachmentCacheStorage
     private let settingsProvider: () -> AttachmentCacheSettings
-    private var index: [String: CachedAttachment] = [:]
     private var prefetchTasks: [String: Task<Void, Never>] = [:]
     private var failedKeys: Set<String> = []
+    private var generation = 0
 
     init(cacheDir: URL? = nil,
          settingsProvider: @escaping () -> AttachmentCacheSettings = { SettingsManager.shared.attachmentCacheSettings })
@@ -30,83 +28,28 @@ class AttachmentCacheManager: ObservableObject {
             let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
             resolvedDir = caches.appendingPathComponent("org.js-lab.durian/attachments", isDirectory: true)
         }
-        self.cacheDir = resolvedDir
-        indexFile = resolvedDir.appendingPathComponent(".cache-index.json")
+        storage = AttachmentCacheStorage(cacheDir: resolvedDir)
         self.settingsProvider = settingsProvider
-        try? fileManager.createDirectory(at: resolvedDir, withIntermediateDirectories: true)
-        loadIndex()
-        evict()
     }
 
     // MARK: - Public API
 
     /// Returns cached data if available, nil otherwise.
-    func get(messageId: String, partId: Int) -> Data? {
-        let key = cacheKey(messageId: messageId, partId: partId)
-        guard var entry = index[key] else { return nil }
-
-        // TTL check — pinned entries are exempt (consistent with evict()).
-        let settings = settingsProvider()
-        if !entry.pinned && Date().timeIntervalSince(entry.cachedAt) > settings.ttl {
-            remove(key: key)
-            return nil
-        }
-
-        guard fileManager.fileExists(atPath: entry.localPath.path) else {
-            index.removeValue(forKey: key)
-            saveIndex()
-            return nil
-        }
-
-        guard let data = try? Data(contentsOf: entry.localPath) else { return nil }
-
-        // Update access metadata in-memory only; the next put/evict/clear
-        // will persist it. Avoids a JSON-encode + disk-write per cache hit.
-        entry.lastAccessDate = Date()
-        entry.accessCount += 1
-        index[key] = entry
-
-        return data
+    func get(messageId: String, partId: Int) async -> Data? {
+        await storage.get(key: cacheKey(messageId: messageId, partId: partId), settings: settingsProvider())
     }
 
     /// Store attachment data in cache.
-    func put(messageId: String, partId: Int, filename: String, data: Data) {
-        let key = cacheKey(messageId: messageId, partId: partId)
-        let safeFilename = filename.replacingOccurrences(of: "/", with: "_")
-        let localPath = cacheDir.appendingPathComponent("\(key)_\(safeFilename)")
-
-        do {
-            try data.write(to: localPath)
-        } catch {
-            Log.error("CACHE", "Failed to write \(filename): \(error)")
-            return
-        }
-
-        index[key] = CachedAttachment(
-            id: UUID(),
-            filename: filename,
-            localPath: localPath,
-            sizeBytes: Int64(data.count),
-            cachedAt: Date(),
-            lastAccessDate: Date(),
-            accessCount: 1,
-            emailUID: 0,
-            pinned: false
-        )
-        saveIndex()
-        evict()
+    func put(messageId: String, partId: Int, filename: String, data: Data) async {
+        await storage.put(key: cacheKey(messageId: messageId, partId: partId), filename: filename,
+                          data: data, settings: settingsProvider(), generation: generation)
     }
 
     /// Check if an attachment is cached (or known to be unavailable).
-    func isCached(messageId: String, partId: Int) -> Bool {
+    func isCached(messageId: String, partId: Int) async -> Bool {
         let key = cacheKey(messageId: messageId, partId: partId)
         if failedKeys.contains(key) { return false }
-        guard let entry = index[key] else { return false }
-        let settings = settingsProvider()
-        if !entry.pinned && Date().timeIntervalSince(entry.cachedAt) > settings.ttl {
-            return false
-        }
-        return fileManager.fileExists(atPath: entry.localPath.path)
+        return await storage.isCached(key: key, settings: settingsProvider())
     }
 
     /// Whether a prefetch already failed for this attachment (stale UID, etc.)
@@ -120,25 +63,33 @@ class AttachmentCacheManager: ObservableObject {
             guard let attachments = message.attachments, !attachments.isEmpty else { continue }
             for attachment in attachments {
                 let key = cacheKey(messageId: message.attachmentCacheId, partId: attachment.partId)
-                guard index[key] == nil else { continue }
                 guard prefetchTasks[key] == nil else { continue }
-
                 guard !failedKeys.contains(key) else { continue }
 
+                let startedGeneration = generation
                 prefetchTasks[key] = Task {
+                    defer {
+                        if generation == startedGeneration {
+                            prefetchTasks.removeValue(forKey: key)
+                        }
+                    }
+                    guard !Task.isCancelled else { return }
+                    if await isCached(messageId: message.attachmentCacheId, partId: attachment.partId) { return }
                     do {
+                        try Task.checkCancellation()
                         let (data, _) = try await backend.downloadAttachment(
                             messageId: message.id,
                             partId: attachment.partId
                         )
-                        put(messageId: message.attachmentCacheId, partId: attachment.partId,
-                            filename: attachment.filename, data: data)
-                        Log.debug("CACHE", "Prefetched \(attachment.filename) (\(data.count) bytes)")
+                        try Task.checkCancellation()
+                        guard generation == startedGeneration else { return }
+                        await put(messageId: message.attachmentCacheId, partId: attachment.partId,
+                                  filename: attachment.filename, data: data)
                     } catch {
+                        guard !Task.isCancelled, generation == startedGeneration else { return }
                         failedKeys.insert(key)
-                        Log.debug("CACHE", "Prefetch failed for \(attachment.filename): \(error)")
+                        Log.debug("CACHE", "Attachment prefetch failed")
                     }
-                    prefetchTasks.removeValue(forKey: key)
                 }
             }
         }
@@ -146,6 +97,7 @@ class AttachmentCacheManager: ObservableObject {
 
     /// Cancel all active prefetch tasks.
     func cancelPrefetch() {
+        generation += 1
         for (_, task) in prefetchTasks {
             task.cancel()
         }
@@ -154,23 +106,100 @@ class AttachmentCacheManager: ObservableObject {
 
     /// Total cache size in bytes.
     var totalSize: Int64 {
-        index.values.reduce(0) { $0 + $1.sizeBytes }
+        get async { await storage.size(settings: settingsProvider()) }
     }
 
     /// Clear entire cache.
-    func clearAll() {
-        for (_, entry) in index {
+    func clearAll() async {
+        cancelPrefetch()
+        failedKeys.removeAll()
+        await storage.clearAll(settings: settingsProvider(), generation: generation)
+    }
+
+    private func cacheKey(messageId: String, partId: Int) -> String {
+        "\(messageId):\(partId)"
+    }
+}
+
+/// Owns both the index and its files on a non-main serial executor. Operations
+/// never suspend mid-transaction, so a clear cannot race with a disk write.
+actor AttachmentCacheStorage {
+    private let cacheDir: URL
+    private let indexFile: URL
+    private let fileManager = FileManager.default
+    private var index: [String: CachedAttachment] = [:]
+    private var loaded = false
+    private var minimumGeneration = 0
+
+    init(cacheDir: URL) {
+        self.cacheDir = cacheDir
+        indexFile = cacheDir.appendingPathComponent(".cache-index.json")
+    }
+
+    func get(key: String, settings: AttachmentCacheSettings) -> Data? {
+        loadIfNeeded(settings: settings)
+        guard isCached(key: key, settings: settings), var entry = index[key],
+              let data = try? Data(contentsOf: entry.localPath) else { return nil }
+        entry.lastAccessDate = Date()
+        entry.accessCount += 1
+        index[key] = entry
+        return data
+    }
+
+    func put(key: String, filename: String, data: Data, settings: AttachmentCacheSettings, generation: Int) {
+        guard !Task.isCancelled, generation >= minimumGeneration else { return }
+        loadIfNeeded(settings: settings)
+        // The on-disk name is independent of untrusted filenames and message IDs.
+        let localPath = index[key]?.localPath ?? cacheDir.appendingPathComponent(UUID().uuidString)
+        do {
+            try data.write(to: localPath, options: .atomic)
+        } catch {
+            Log.error("CACHE", "Failed to write attachment cache")
+            return
+        }
+        index[key] = CachedAttachment(
+            id: UUID(), filename: filename, localPath: localPath, sizeBytes: Int64(data.count),
+            cachedAt: Date(), lastAccessDate: Date(), accessCount: 1, emailUID: 0, pinned: false
+        )
+        evict(settings: settings)
+        saveIndex()
+    }
+
+    func isCached(key: String, settings: AttachmentCacheSettings) -> Bool {
+        loadIfNeeded(settings: settings)
+        guard let entry = index[key] else { return false }
+        if (!entry.pinned && Date().timeIntervalSince(entry.cachedAt) > settings.ttl)
+            || !fileManager.fileExists(atPath: entry.localPath.path)
+        {
+            remove(key: key)
+            saveIndex()
+            return false
+        }
+        return true
+    }
+
+    func size(settings: AttachmentCacheSettings) -> Int64 {
+        loadIfNeeded(settings: settings)
+        return totalSize
+    }
+
+    func clearAll(settings: AttachmentCacheSettings, generation: Int) {
+        loadIfNeeded(settings: settings)
+        minimumGeneration = max(minimumGeneration, generation)
+        for entry in index.values {
             try? fileManager.removeItem(at: entry.localPath)
         }
         index.removeAll()
         saveIndex()
-        Log.info("CACHE", "Cache cleared")
+    }
+
+    private var totalSize: Int64 {
+        index.values.reduce(0) { $0 + $1.sizeBytes }
     }
 
     // MARK: - Eviction
 
-    private func evict() {
-        let settings = settingsProvider()
+    private func evict(settings: AttachmentCacheSettings) {
         let now = Date()
 
         // Phase 1: Remove expired entries. Snapshot the keys first — mutating
@@ -197,36 +226,36 @@ class AttachmentCacheManager: ObservableObject {
 
     // MARK: - Persistence
 
-    private func loadIndex() {
+    private func loadIfNeeded(settings: AttachmentCacheSettings) {
+        guard !loaded else { return }
+        loaded = true
+        try? fileManager.createDirectory(at: cacheDir, withIntermediateDirectories: true)
         guard fileManager.fileExists(atPath: indexFile.path) else { return }
         do {
             let data = try Data(contentsOf: indexFile)
             index = try JSONDecoder().decode([String: CachedAttachment].self, from: data)
         } catch {
-            Log.warning("CACHE", "Failed to load index: \(error)")
+            Log.warning("CACHE", "Failed to load attachment cache index")
             index = [:]
         }
+        evict(settings: settings)
+        saveIndex()
     }
 
     private func saveIndex() {
         do {
             let data = try JSONEncoder().encode(index)
-            try data.write(to: indexFile)
+            try data.write(to: indexFile, options: .atomic)
         } catch {
-            Log.error("CACHE", "Failed to save index: \(error)")
+            Log.error("CACHE", "Failed to save attachment cache index")
         }
     }
 
     // MARK: - Helpers
 
-    private func cacheKey(messageId: String, partId: Int) -> String {
-        "\(messageId):\(partId)"
-    }
-
     private func remove(key: String) {
         guard let entry = index[key] else { return }
         try? fileManager.removeItem(at: entry.localPath)
         index.removeValue(forKey: key)
-        saveIndex()
     }
 }

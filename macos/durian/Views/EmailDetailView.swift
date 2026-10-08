@@ -39,7 +39,7 @@ struct EmailDetailView: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                LazyVStack(alignment: .leading, spacing: 16) {
                     ScrollViewFinder(scrollView: $detailScrollView)
                         .frame(height: 0)
                         .id("thread-top")
@@ -109,15 +109,7 @@ struct EmailDetailView: View {
         case .loaded:
             // Use thread messages from CLI if available
             if let messages = email.threadMessages, !messages.isEmpty {
-                Color.clear.frame(height: 0)
-                    .onAppear {
-                        if let backend = AccountManager.shared.emailBackend {
-                            AttachmentCacheManager.shared.prefetch(messages: messages, backend: backend)
-                        }
-                    }
                 ForEach(Array(messages.enumerated()), id: \.element.id) { index, message in
-                    Color.clear.frame(height: 0)
-                        .id("msg-\(index)")
                     ThreadMessageCardView(
                         message: message,
                         isFirst: index == 0,
@@ -130,6 +122,12 @@ struct EmailDetailView: View {
                         onForward: { onForward(message) },
                         onEditDraft: onEditDraft.map { handler in { handler($0) } }
                     )
+                    .id("msg-\(index)")
+                    .onAppear {
+                        if let backend = AccountManager.shared.emailBackend {
+                            AttachmentCacheManager.shared.prefetch(messages: [message], backend: backend)
+                        }
+                    }
                 }
             } else {
                 // Fallback: single message with body/html directly from email
