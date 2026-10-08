@@ -25,6 +25,7 @@ go_test(
     name = "syncengine_test",
     size = "small",
     srcs = [
+        "adversarial_test.go",
         "capability_contract_test.go",
         "engine_test.go",
         "flags_paging_test.go",
