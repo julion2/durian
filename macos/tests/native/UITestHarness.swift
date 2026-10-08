@@ -81,7 +81,22 @@ private struct AXNode {
     @MainActor var frame: NSRect? {
         if let view = source as? NSView { return view.accessibilityFrame() }
         if let element = source as? NSAccessibilityElement { return element.accessibilityFrame() }
-        return nil
+        guard CFGetTypeID(source as CFTypeRef) == AXUIElementGetTypeID(),
+              let screen = NSScreen.screens.first else { return nil }
+        let element = source as! AXUIElement
+        var positionValue: CFTypeRef?
+        var sizeValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionValue) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue) == .success,
+              let positionValue, CFGetTypeID(positionValue) == AXValueGetTypeID(),
+              let sizeValue, CFGetTypeID(sizeValue) == AXValueGetTypeID() else { return nil }
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
+              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else { return nil }
+        // AX uses a top-left screen origin; AppKit uses bottom-left.
+        return NSRect(x: position.x, y: screen.frame.maxY - position.y - size.height,
+                      width: size.width, height: size.height)
     }
 }
 
@@ -487,11 +502,12 @@ private final class NativeUITestRunner {
     private func waitForVisibleAction(_ identifier: String, in rendered: RenderedView) -> Bool {
         let deadline = Date().addingTimeInterval(3)
         var consecutiveVisible = 0
+        var frames: [NSRect] = []
         while Date() < deadline {
             pumpRunLoop()
             let viewport = rendered.window.convertToScreen(rendered.hostingView.convert(rendered.hostingView.bounds, to: nil))
-            let frames = accessibilityTree(from: rendered.hostingView)
-                .filter { $0.identifier == identifier }.compactMap(\.frame)
+            let nodes = accessibilityTree(from: rendered.hostingView) + accessibilityTreeFromApplication()
+            frames = nodes.filter { $0.identifier == identifier }.compactMap(\.frame)
             if frames.contains(where: { !$0.isEmpty && viewport.contains($0) }) {
                 consecutiveVisible += 1
                 if consecutiveVisible == 3 {
@@ -503,7 +519,7 @@ private final class NativeUITestRunner {
             }
         }
         let scrollViews = allSubviews(of: rendered.hostingView).compactMap { $0 as? NSScrollView }
-        print("SCROLL_TIMEOUT: \(identifier) documents=\(scrollViews.map { $0.documentView?.frame ?? .zero }) clips=\(scrollViews.map { $0.contentView.bounds })")
+        print("SCROLL_TIMEOUT: \(identifier) frames=\(frames) documents=\(scrollViews.map { $0.documentView?.frame ?? .zero }) clips=\(scrollViews.map { $0.contentView.bounds })")
         return false
     }
 
