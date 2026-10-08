@@ -41,7 +41,7 @@ func TestConvertThread_OrdersNewestFirst(t *testing.T) {
 		Date: now - 3600, CreatedAt: now, BodyText: "oldest", Mailbox: "INBOX",
 	})
 	seedThreadMessage(t, db, &store.Message{
-		MessageID: "newest@test", Subject: "Re: Hello", FromAddr: "c@example.com",
+		MessageID: "newest@test", Subject: "FW: A different subject", FromAddr: "c@example.com",
 		InReplyTo: "<middle@test>", Refs: "<middle@test>",
 		Date: now, CreatedAt: now, BodyText: "newest", Mailbox: "INBOX",
 	})
@@ -59,6 +59,11 @@ func TestConvertThread_OrdersNewestFirst(t *testing.T) {
 	bodies := []string{resp.Thread.Messages[0].Body, resp.Thread.Messages[1].Body, resp.Thread.Messages[2].Body}
 	if bodies[0] != "newest" || bodies[1] != "middle" || bodies[2] != "oldest" {
 		t.Errorf("ordering wrong: got %v, want [newest, middle, oldest]", bodies)
+	}
+	for i, want := range []string{"FW: A different subject", "Hello", "Re: Hello"} {
+		if got := resp.Thread.Messages[i].Subject; got != want {
+			t.Errorf("message %d subject = %q, want %q", i, got, want)
+		}
 	}
 
 	// Verify timestamps are descending
@@ -319,6 +324,31 @@ func TestShowThreadMarksLocallyStoredReaction(t *testing.T) {
 }
 
 // --- Quote stripping is applied ---
+
+func TestReplyBodyPreservesConversationWhileThreadCardsStripQuotes(t *testing.T) {
+	db := newTestStore(t)
+	text := "Latest answer\n\nOn Monday, Alice wrote:\n> Original question"
+	row := seedThreadMessage(t, db, &store.Message{
+		MessageID: "reply-chain@test", Subject: "Re: Original subject",
+		FromAddr: "alice@example.com", Date: 1, CreatedAt: 1,
+		BodyText: text,
+		BodyHTML: `<p>Latest answer</p><div class="gmail_quote">Original question</div><script>alert(1)</script>`,
+	})
+	h := New(db, nil)
+	thread := h.ShowThread(row.ThreadID)
+	if !thread.OK || len(thread.Thread.Messages) != 1 {
+		t.Fatalf("thread = %+v", thread)
+	}
+	card := thread.Thread.Messages[0]
+	if strings.Contains(card.HTML, "Original question") {
+		t.Fatal("thread card must still hide duplicate quotes")
+	}
+	body := h.ShowMessageBody(card.ID)
+	if !body.OK || body.MessageBody == nil || body.MessageBody.Body != text ||
+		!strings.Contains(body.MessageBody.HTML, "Original question") || strings.Contains(body.MessageBody.HTML, "<script") {
+		t.Fatalf("reply body lost conversation or retained active HTML: %+v", body.MessageBody)
+	}
+}
 
 func TestConvertThread_StripsQuotedHTML(t *testing.T) {
 	db := newTestStore(t)

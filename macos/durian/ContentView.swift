@@ -380,10 +380,7 @@ struct ContentView: View {
             }
         } detail: {
             // Detail View - always show cursor email, with badge if multi-selected
-            if let emailId = cursorEmailId,
-               let email = accountManager.mailMessages.first(where: { $0.id == emailId })
-                            ?? searchResults.first(where: { $0.id == emailId })
-            {
+            if let email = selectedEmail {
                 ZStack(alignment: .bottomTrailing) {
                     EmailDetailView(
                         email: email,
@@ -729,8 +726,11 @@ struct ContentView: View {
     }
 
     private var selectedEmail: MailMessage? {
-        guard let emailId = markedEmails.first else { return nil }
-        return displayEmails.first(where: { $0.id == emailId })
+        // Compose actions must use the same thread as the detail pane, not an
+        // arbitrary member of the multi-selection used for batch operations.
+        guard let emailId = cursorEmailId else { return nil }
+        return accountManager.mailMessages.first(where: { $0.id == emailId })
+            ?? searchResults.first(where: { $0.id == emailId })
     }
 
     private func deleteSelectedEmails() {
@@ -800,41 +800,49 @@ struct ContentView: View {
         return ConfigManager.shared.getAccounts().first?.email
     }
 
-    func replyToSelected() {
+    private var focusedThreadMessage: ThreadMessage? {
+        guard isThreadFocused, let messages = selectedEmail?.threadMessages,
+              messages.indices.contains(focusedMessageIndex) else { return nil }
+        return messages[focusedMessageIndex]
+    }
+
+    func replyToSelected(_ targetMessage: ThreadMessage? = nil) {
         guard let email = selectedEmail,
               case .loaded = email.bodyState,
               let fromAccount = defaultFromAccount else
         {
-            Log.warning("COMPOSE", "replyToSelected guard failed — selected=\(selectedEmail != nil), bodyState=\(String(describing: selectedEmail?.bodyState)), fromAccount=\(defaultFromAccount ?? "nil")")
+            Log.warning("COMPOSE", "Reply unavailable: selected=\(selectedEmail != nil), configuredAccount=\(defaultFromAccount != nil)")
             if defaultFromAccount == nil {
                 BannerManager.shared.showWarning(title: "No Account", message: "Configure an email account to use this action.")
             }
             return
         }
 
+        let source = email.selectingMessage(targetMessage ?? focusedThreadMessage)
         Task {
-            let original = await fetchOriginalReplyBody(for: email, fromAccount: fromAccount)
-            let replyDraft = EmailDraft.createReply(from: email, fromAccount: fromAccount, originalBody: original)
+            let original = await fetchOriginalReplyBody(for: source, fromAccount: fromAccount)
+            let replyDraft = EmailDraft.createReply(from: source, fromAccount: fromAccount, originalBody: original)
             let draftId = DraftService.shared.createDraft(with: replyDraft)
             openWindow(value: draftId)
         }
     }
 
-    func replyAllToSelected() {
+    func replyAllToSelected(_ targetMessage: ThreadMessage? = nil) {
         guard let email = selectedEmail,
               case .loaded = email.bodyState,
               let fromAccount = defaultFromAccount else
         {
-            Log.warning("COMPOSE", "replyAllToSelected guard failed — selected=\(selectedEmail != nil), bodyState=\(String(describing: selectedEmail?.bodyState)), fromAccount=\(defaultFromAccount ?? "nil")")
+            Log.warning("COMPOSE", "Reply-All unavailable: selected=\(selectedEmail != nil), configuredAccount=\(defaultFromAccount != nil)")
             if defaultFromAccount == nil {
                 BannerManager.shared.showWarning(title: "No Account", message: "Configure an email account to use this action.")
             }
             return
         }
 
+        let source = email.selectingMessage(targetMessage ?? focusedThreadMessage)
         Task {
-            let original = await fetchOriginalReplyBody(for: email, fromAccount: fromAccount)
-            let replyDraft = EmailDraft.createReplyAll(from: email, fromAccount: fromAccount, originalBody: original)
+            let original = await fetchOriginalReplyBody(for: source, fromAccount: fromAccount)
+            let replyDraft = EmailDraft.createReplyAll(from: source, fromAccount: fromAccount, originalBody: original)
             let draftId = DraftService.shared.createDraft(with: replyDraft)
             openWindow(value: draftId)
         }
@@ -848,25 +856,32 @@ struct ContentView: View {
         return (body: response.body, html: response.html)
     }
 
-    func forwardSelected() {
+    func forwardSelected(_ targetMessage: ThreadMessage? = nil) {
         guard let email = selectedEmail,
               case .loaded = email.bodyState,
               let fromAccount = defaultFromAccount else
         {
-            Log.warning("COMPOSE", "forwardSelected guard failed — selected=\(selectedEmail != nil), bodyState=\(String(describing: selectedEmail?.bodyState)), fromAccount=\(defaultFromAccount ?? "nil")")
+            Log.warning("COMPOSE", "Forward unavailable: selected=\(selectedEmail != nil), configuredAccount=\(defaultFromAccount != nil)")
             if defaultFromAccount == nil {
                 BannerManager.shared.showWarning(title: "No Account", message: "Configure an email account to use this action.")
             }
             return
         }
 
+        let source = email.selectingMessage(targetMessage ?? focusedThreadMessage)
         Task {
-            var forwardDraft = EmailDraft.createForward(from: email, fromAccount: fromAccount)
+            var original: (body: String, html: String?)?
+            if source.threadMessages?.count == 1, let targetId = source.threadMessages?.first?.id,
+               let response = await AccountManager.shared.emailBackend?.fetchOriginalBody(messageId: targetId)
+            {
+                original = (response.body, response.html)
+            }
+            var forwardDraft = EmailDraft.createForward(from: source, fromAccount: fromAccount, originalBody: original)
 
             // Copy attachments from the original message(s) into the forward draft.
             // Requires the email backend to fetch attachment bytes via IMAP.
             if let backend = AccountManager.shared.emailBackend {
-                let result = await EmailDraft.collectForwardAttachments(from: email, backend: backend)
+                let result = await EmailDraft.collectForwardAttachments(from: source, backend: backend)
                 forwardDraft.attachments = result.attachments
 
                 if !result.skipped.isEmpty {

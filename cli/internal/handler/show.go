@@ -69,8 +69,8 @@ func (h *Handler) ShowMessageBody(identifier string) protocol.Response {
 	}
 
 	return protocol.SuccessWithMessageBody(&internmail.MessageBody{
-		Body: sanitize.StripQuotedTextContent(msg.BodyText),
-		HTML: sanitize.StripQuotedContent(msg.BodyHTML),
+		Body: msg.BodyText,
+		HTML: sanitize.SanitizeHTML(msg.BodyHTML),
 	})
 }
 
@@ -105,6 +105,7 @@ func (h *Handler) convertThreadWithHeaders(threadID string, msgs []*store.Messag
 		info := internmail.MessageInfo{
 			ID:                "local:" + strconv.FormatInt(msg.ID, 10),
 			AttachmentCacheID: attachmentCacheID(msg),
+			Subject:           msg.Subject,
 			From:              msg.FromAddr,
 			To:                msg.ToAddrs,
 			CC:                msg.CCAddrs,

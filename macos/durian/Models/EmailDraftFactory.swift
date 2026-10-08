@@ -79,9 +79,9 @@ extension EmailDraft {
         }
 
         // Build subject with Re: prefix (avoid Re: Re: Re:)
-        let subject = message.subject.hasPrefix("Re:")
-            ? message.subject
-            : "Re: \(message.subject)"
+        let subject = target.subject.lowercased().hasPrefix("re:")
+            ? target.subject
+            : "Re: \(target.subject)"
 
         // Build references chain from target message
         var references = target.references ?? ""
@@ -94,7 +94,7 @@ extension EmailDraft {
 
         // Use original (unstripped) body for quoting if available, otherwise fall back to stripped
         let quoteBody = originalBody?.body ?? target.body
-        let quoteHTML = originalBody?.html ?? target.html
+        let quoteHTML = originalBody == nil ? target.html : originalBody?.html
         let hasHTML = quoteHTML != nil && !quoteHTML!.isEmpty
 
         // Quote the target body (use HTML if available)
@@ -130,25 +130,13 @@ extension EmailDraft {
         // Build CC from the TARGET message's To/CC (not thread-level fields,
         // which may be from the user's own sent message)
         var ccRecipients: [String] = []
+        var seen = Set(draft.to.flatMap { parseEmailList($0) }.map { extractEmail(from: $0).lowercased() })
+        seen.insert(extractEmail(from: fromAccount).lowercased())
 
-        // Add target's To recipients (except the reply-to sender and self)
-        if let originalTo = target.to {
-            let toAddresses = parseEmailList(originalTo)
-            let senderEmail = extractEmail(from: draft.to.first ?? target.from).lowercased()
-            for address in toAddresses {
-                let emailOnly = extractEmail(from: address).lowercased()
-                if emailOnly != fromAccount.lowercased() && emailOnly != senderEmail {
-                    ccRecipients.append(address)
-                }
-            }
-        }
-
-        // Add target's CC recipients (except self)
-        if let originalCC = target.cc {
-            let ccAddresses = parseEmailList(originalCC)
-            for address in ccAddresses {
-                let emailOnly = extractEmail(from: address).lowercased()
-                if emailOnly != fromAccount.lowercased() {
+        // Keep the first display name, excluding self and anyone already in To/CC.
+        for list in [target.to, target.cc].compactMap({ $0 }) {
+            for address in parseEmailList(list) {
+                if seen.insert(extractEmail(from: address).lowercased()).inserted {
                     ccRecipients.append(address)
                 }
             }
@@ -160,9 +148,17 @@ extension EmailDraft {
 
     /// Create a forward draft from a mail message (without attachments).
     /// Use `collectForwardAttachments(from:backend:)` to populate attachments.
-    static func createForward(from message: MailMessage, fromAccount: String) -> EmailDraft {
+    static func createForward(from message: MailMessage, fromAccount: String,
+                              originalBody: (body: String, html: String?)? = nil) -> EmailDraft
+    {
+        var message = message
+        if let originalBody, (message.threadMessages?.count ?? 0) <= 1 {
+            message.body = originalBody.body
+            message.htmlBody = originalBody.html
+            message.threadMessages = nil
+        }
         // Build subject with Fwd: prefix
-        let subject = message.subject.hasPrefix("Fwd:")
+        let subject = message.subject.lowercased().hasPrefix("fwd:")
             ? message.subject
             : "Fwd: \(message.subject)"
 
@@ -289,6 +285,7 @@ extension EmailDraft {
     /// Fields needed to construct a reply from a specific thread message.
     private struct ReplyTarget {
         let bodySourceId: String?  // message ID for fetching original body
+        let subject: String
         let from: String
         let to: String?
         let cc: String?
@@ -311,6 +308,7 @@ extension EmailDraft {
         // Case 1: newest message is not from self — use as-is
         guard newestFrom == accountEmail else {
             return ReplyTarget(bodySourceId: message.threadMessages?.first?.id,
+                               subject: message.threadMessages?.first?.subject ?? message.subject,
                                from: message.from, to: message.to, cc: message.cc,
                                date: message.date, body: message.body, html: message.htmlBody,
                                messageId: message.messageId, references: message.references)
@@ -321,6 +319,7 @@ extension EmailDraft {
             for tm in threads {
                 if extractEmail(from: tm.from).lowercased() != accountEmail {
                     return ReplyTarget(bodySourceId: tm.id,
+                                       subject: tm.subject ?? message.subject,
                                        from: tm.from, to: tm.to, cc: tm.cc,
                                        date: tm.date, body: tm.body, html: tm.html,
                                        messageId: tm.message_id, references: tm.references)
@@ -330,6 +329,7 @@ extension EmailDraft {
 
         // Case 3: all messages from self — reply to original recipients
         return ReplyTarget(bodySourceId: message.threadMessages?.first?.id,
+                           subject: message.threadMessages?.first?.subject ?? message.subject,
                            from: message.to ?? message.from, to: message.to, cc: message.cc,
                            date: message.date, body: message.body, html: message.htmlBody,
                            messageId: message.messageId, references: message.references)
@@ -449,6 +449,7 @@ extension EmailDraft {
             part += "From: \(msg.from)\n"
             if let to = msg.to { part += "To: \(to)\n" }
             part += "Date: \(msg.date)\n"
+            if let subject = msg.subject { part += "Subject: \(subject)\n" }
             part += "\n"
             part += msg.body
             return part
@@ -469,11 +470,14 @@ extension EmailDraft {
             if let to = msg.to {
                 html += "<b>To:</b> \(escapeHTML(to))<br>"
             }
+            if let subject = msg.subject {
+                html += "<b>Subject:</b> \(escapeHTML(subject))<br>"
+            }
             html += """
             <b>Date:</b> \(escapeHTML(msg.date))
             </p>
             <hr style="border: none; border-top: 1px solid #ccc; margin: 8px 0;">
-            \(msg.html ?? msg.body)
+            \(msg.html ?? "<pre>\(escapeHTML(msg.body))</pre>")
             </div>
             """
             return html

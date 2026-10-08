@@ -59,6 +59,7 @@ type MessageBody struct {
 type MessageInfo struct {
 	ID                string `json:"id"`
 	AttachmentCacheID string `json:"attachment_cache_id,omitempty"`
+	Subject           string `json:"subject"`
 	From              string `json:"from"`
 	To                string `json:"to,omitempty"`
 	CC                string `json:"cc,omitempty"`

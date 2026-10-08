@@ -148,6 +148,20 @@ swift_test(
 )
 
 swift_test(
+    name = "email_draft_factory_test",
+    size = "small",
+    srcs = ["tests/EmailDraftFactoryTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
+    name = "email_draft_factory_defect_repro_test",
+    size = "small",
+    srcs = ["tests/EmailDraftFactoryDefectReproductionTests.swift"],
+    deps = [":durian_testlib"],
+)
+
+swift_test(
     name = "account_manager_test",
     size = "small",
     srcs = ["tests/AccountManagerTests.swift"],

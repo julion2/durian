@@ -99,10 +99,7 @@ struct ThreadMessageCardView: View {
                 .buttonStyle(.plain)
             }
 
-            // Action footer only on last (newest) card
-            if isLast {
-                actionFooter
-            }
+            actionFooter
         }
         // Click anywhere outside attachment chips clears selection
         .onTapGesture { selectedAttachmentId = nil }
@@ -677,6 +674,30 @@ struct ThreadMessageCardView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Reply")
+                .accessibilityLabel("Reply")
+                .accessibilityIdentifier("reply-\(message.id)")
+
+                Button(action: onReplyAll) {
+                    Image(systemName: "arrowshape.turn.up.left.2")
+                        .font(.system(size: 16))
+                        .foregroundColor(Color.Detail.textTertiary)
+                        .frame(width: 36, height: 36)
+                }
+                .buttonStyle(.plain)
+                .help("Reply All")
+                .accessibilityLabel("Reply All")
+                .accessibilityIdentifier("reply-all-\(message.id)")
+
+                Button(action: onForward) {
+                    Image(systemName: "arrowshape.turn.up.right")
+                        .font(.system(size: 16))
+                        .foregroundColor(Color.Detail.textTertiary)
+                        .frame(width: 36, height: 36)
+                }
+                .buttonStyle(.plain)
+                .help("Forward")
+                .accessibilityLabel("Forward")
+                .accessibilityIdentifier("forward-\(message.id)")
             }
         }
         .padding(.top, 8)

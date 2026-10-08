@@ -902,6 +902,9 @@ components:
         is_reaction:
           type: boolean
           description: True for a received RFC 9078 Content-Disposition reaction
+        subject:
+          type: string
+          description: Subject of this exact message, which may differ from the thread subject
         from:
           type: string
         to:
