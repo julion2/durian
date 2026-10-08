@@ -136,6 +136,22 @@ impl MailPicker {
         };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(title));
         let subscription = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
+            if matches!(this.mode, Mode::Search { .. }) {
+                crate::diagnostics::record("search.input", || {
+                    let input = this.input.read(cx);
+                    serde_json::json!({
+                        "event": match event {
+                            InputEvent::Change => "change",
+                            InputEvent::Focus => "focus",
+                            InputEvent::Blur => "blur",
+                            _ => "other",
+                        },
+                        "focused": input.focus_handle(cx).is_focused(window),
+                        "chars": input.value().chars().count(),
+                        "probe_matches": input.value().as_ref() == "zzdurianprobe",
+                    })
+                });
+            }
             if matches!(event, InputEvent::Change) {
                 this.refresh(window, cx);
             }
@@ -186,6 +202,12 @@ impl MailPicker {
     }
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         self.input.update(cx, |input, cx| input.focus(window, cx));
+        if matches!(self.mode, Mode::Search { .. }) {
+            crate::diagnostics::record("search.focus", || serde_json::json!({
+                "focused": self.input.read(cx).focus_handle(cx).is_focused(window),
+                "a11y_active": window.is_a11y_active(),
+            }));
+        }
     }
     fn count(&self) -> usize {
         match self.mode {

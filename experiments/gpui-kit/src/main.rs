@@ -15,6 +15,7 @@ mod data;
 #[allow(dead_code)]
 mod delivery;
 mod demo;
+mod diagnostics;
 mod picker;
 
 use std::collections::BTreeSet;
@@ -422,6 +423,7 @@ impl MailApp {
     }
 
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        diagnostics::record("search.open", || serde_json::json!({"a11y_active": window.is_a11y_active()}));
         let popup =
             cx.new(|cx| picker::MailPicker::search(self.mail.clone(), self.live, window, cx));
         self.popup_subscription = Some(cx.subscribe_in(&popup, window, |this, _, event, _, cx| {
@@ -1255,6 +1257,7 @@ impl Render for MailApp {
                 Theme::change(mode, Some(w), cx);
                 apply_mail_theme(cx);
                 w.focus(&this.focus, cx);
+                diagnostics::record("theme.changed", || serde_json::json!({"dark": cx.theme().is_dark()}));
             }))
             .child(
                 TitleBar::new()
@@ -1314,6 +1317,7 @@ fn main() {
             content::init(cx);
             picker::init(cx);
             browser::init(cx);
+            diagnostics::init(cx);
             const NAV: Option<&str> = Some("MailApp && !Input");
             cx.bind_keys([
                 KeyBinding::new("j", Next, NAV),

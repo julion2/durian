@@ -217,6 +217,29 @@ pub fn init(cx: &mut App) {
                         | NSEventModifierFlags::Shift,
                 )
                 && matches!(character.as_deref(), Some("a" | "c"));
+            crate::diagnostics::record("native.key", || {
+                let window = event.window(MainThreadMarker::new().expect("main thread"));
+                let first = window.as_ref().and_then(|window| window.firstResponder());
+                let first_view = first.as_ref().and_then(|first| first.downcast_ref::<NSView>());
+                let in_webkit = first_view.map(|first| WEBVIEWS.with_borrow(|views| {
+                    views.iter().filter_map(Weak::upgrade).any(|native| {
+                        let native = native.borrow();
+                        let webview = native.webview.webview();
+                        let webview: &NSView = &webview;
+                        std::ptr::eq(first, webview) || first.isDescendantOf(webview)
+                    })
+                }));
+                serde_json::json!({
+                    "slash": character.as_deref() == Some("/"),
+                    "key_length": character.as_deref().unwrap_or("").chars().count(),
+                    "flags": flags.bits(),
+                    "window_present": window.is_some(),
+                    "first_responder_present": first.is_some(),
+                    "first_responder_is_view": first_view.is_some(),
+                    "first_responder_in_webkit": in_webkit,
+                    "route_to_gpui": route,
+                })
+            });
             if !route && !copy_or_select {
                 return event as *const NSEvent as *mut NSEvent;
             }
@@ -248,7 +271,11 @@ pub fn init(cx: &mut App) {
                         // Change AppKit responder synchronously, then let it deliver
                         // this original event to GPUI. Queuing a JS shortcut can
                         // otherwise steal the first characters typed into Search.
-                        return native.webview.focus_parent().is_ok();
+                        let moved = native.webview.focus_parent().is_ok();
+                        crate::diagnostics::record("native.focus_parent", || {
+                            serde_json::json!({"succeeded": moved})
+                        });
+                        return moved;
                     } else if character.as_deref() == Some("a") {
                         let _ = native.webview.evaluate_script(SELECT_ALL_SCRIPT);
                     } else {
