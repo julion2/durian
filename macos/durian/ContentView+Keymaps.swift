@@ -437,6 +437,14 @@ extension ContentView {
             }
         }
 
+        keymapHandler.registerSimpleHandler(for: .replyAll, context: .thread) { [self] in
+            await MainActor.run { replyAllToSelected() }
+        }
+
+        keymapHandler.registerSimpleHandler(for: .forward, context: .thread) { [self] in
+            await MainActor.run { forwardSelected() }
+        }
+
         // ═══════════════════════════════════════════════════════════
         // POPUP CONTEXT HANDLERS (search, tag picker)
         // ═══════════════════════════════════════════════════════════

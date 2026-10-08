@@ -1,5 +1,4 @@
 import Foundation
-import SwiftUI
 
 // MARK: - Attachment Info (from API)
 
@@ -29,6 +28,7 @@ struct ThreadMessage: Decodable, Identifiable, Equatable {
     let account: String?
     let can_react: Bool?
     let is_reaction: Bool?
+    let subject: String?
     let from: String
     let to: String?
     let cc: String?
@@ -226,13 +226,13 @@ struct MailFolder: Identifiable, Hashable {
 /// Unified email model
 struct MailMessage: Identifiable, Hashable {
     let id: String  // thread_id
-    let subject: String
+    var subject: String
     var from: String
     var to: String?
     var cc: String?
     var bcc: String?
     var date: String
-    let timestamp: Int  // Unix timestamp for grouping
+    var timestamp: Int  // Unix timestamp for grouping
     var tags: String?
     var body: String?
     var htmlBody: String?  // HTML version of body (for WebView rendering)
@@ -305,6 +305,19 @@ struct MailMessage: Identifiable, Hashable {
         messageId = message.message_id
         inReplyTo = message.in_reply_to
         references = message.references
+    }
+
+    /// Scope a compose action to the exact card, keeping the parent thread ID
+    /// for navigation but never borrowing a newer message's subject or body.
+    func selectingMessage(_ message: ThreadMessage?) -> MailMessage {
+        guard let message else { return self }
+        var source = self
+        source.applyFields(from: message)
+        source.subject = message.subject ?? subject
+        source.date = message.date
+        source.timestamp = message.timestamp
+        source.threadMessages = [message]
+        return source
     }
 
     /// Body preview for list view (first ~150 chars)

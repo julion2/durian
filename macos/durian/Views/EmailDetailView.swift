@@ -15,9 +15,9 @@ import UniformTypeIdentifiers
 
 struct EmailDetailView: View {
     let email: MailMessage
-    let onReply: () -> Void
-    let onReplyAll: () -> Void
-    let onForward: () -> Void
+    let onReply: (ThreadMessage?) -> Void
+    let onReplyAll: (ThreadMessage?) -> Void
+    let onForward: (ThreadMessage?) -> Void
     let onLoadBody: () -> Void
     /// Receives the specific draft message when the click came from a thread
     /// card, or nil from the whole-email footer where no single message is
@@ -121,13 +121,13 @@ struct EmailDetailView: View {
                     ThreadMessageCardView(
                         message: message,
                         isFirst: index == 0,
-                        isLast: index == 0,  // Newest message (first) gets reply button
+                        isLast: index == 0,
                         email: email,
                         contentHeight: bindingForMessageId(message.id),
                         isFocused: isThreadFocused && index == focusedMessageIndex,
-                        onReply: onReply,
-                        onReplyAll: onReplyAll,
-                        onForward: onForward,
+                        onReply: { onReply(message) },
+                        onReplyAll: { onReplyAll(message) },
+                        onForward: { onForward(message) },
                         onEditDraft: onEditDraft.map { handler in { handler($0) } }
                     )
                 }
@@ -317,7 +317,7 @@ struct EmailDetailView: View {
                 .buttonStyle(.plain)
                 .help("Edit Draft")
             } else {
-                Button(action: onReply) {
+                Button(action: { onReply(nil) }) {
                     Image(systemName: "arrowshape.turn.up.left")
                         .font(.system(size: 16))
                         .foregroundColor(Color.Detail.textTertiary)
