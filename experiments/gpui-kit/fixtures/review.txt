@@ -1,0 +1,9 @@
+Dashboard review — Tuesday, 14:00
+
+1. Compare the empty state with a populated account.
+2. Check filters with a long account name.
+3. Verify the same chart scale on revenue and retention.
+4. Test keyboard focus at 125% interface scale.
+
+Owner: Alex Rivera
+Note: This is synthetic mail for the GPUI prototype.
