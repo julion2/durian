@@ -6,6 +6,9 @@ on:
   # all — not a red check, no check. Every PR runs here regardless of base;
   # the required contexts on main still decide what can merge.
   pull_request:
+  # The bounded race/repetition/fuzz suite is intentionally opt-in. It re-runs
+  # the ordinary Linux gates before stress testing and does not need a timer.
+  workflow_dispatch:
 
 jobs:
   cli:
@@ -176,3 +179,43 @@ jobs:
         run: bazel test //linux:icon_map_test //linux:thread_model_test //linux:profile_model_test --repo_env=QTDIR=/usr --test_output=errors
         env:
           QT_QPA_PLATFORM: offscreen
+
+  quality-stress:
+    name: Reliability stress (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+          cache: true
+          cache-dependency-path: cli/go.sum
+
+      - name: Install Pkl
+        run: |
+          curl --fail --silent --show-error --location \
+            https://github.com/apple/pkl/releases/download/0.31.1/pkl-linux-amd64 \
+            --output /usr/local/bin/pkl
+          chmod +x /usr/local/bin/pkl
+
+      - name: Mount Bazel cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel-disk
+          key: bazel-quality-${{ hashFiles('MODULE.bazel', 'cli/go.mod', 'cli/go.sum') }}
+          restore-keys: |
+            bazel-quality-
+            bazel-cli-
+
+      - name: Stage embedded Pkl schemas
+        run: |
+          mkdir -p cli/internal/config/schema
+          cp schema/*.pkl cli/internal/config/schema/
+
+      - name: Run bounded reliability stress suite
+        run: tools/test_quality.sh stress
