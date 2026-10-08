@@ -77,6 +77,12 @@ private struct AXNode {
     var searchableText: String {
         [label, help, value].compactMap { $0 }.joined(separator: " ")
     }
+
+    @MainActor var frame: NSRect? {
+        if let view = source as? NSView { return view.accessibilityFrame() }
+        if let element = source as? NSAccessibilityElement { return element.accessibilityFrame() }
+        return nil
+    }
 }
 
 private struct RenderedView {
@@ -464,20 +470,41 @@ private final class NativeUITestRunner {
         assert(rendered.contains("Long thread body 0"), "long-thread state exposes the newest message")
         assert(rendered.scrollDocumentHeight > loadedHeight, "long-thread scroll document is taller than a single-message document")
         print("LONG_THREAD: messages=500 render=\(duration) document_height=\(rendered.scrollDocumentHeight)")
-        focus.index = 499
-        pumpRunLoop()
-        pumpRunLoop()
-        pumpRunLoop()
-        pumpRunLoop()
-        let focusedNodes = accessibilityTree(from: rendered.hostingView) + accessibilityTreeFromApplication()
-        assert(focusedNodes.contains { $0.identifier == "reply-message-499" }, "500-message focus navigation reaches oldest card")
-        try capture(rendered.hostingView, suffix: "-500-focused-oldest")
+        for index in [499, 137, 0] {
+            focus.index = index
+            assert(waitForVisibleAction("reply-message-\(index)", in: rendered),
+                   "500-message focus navigation shows card \(index) action in viewport")
+            try capture(rendered.hostingView, suffix: "-500-focused-\(index)")
+        }
         NotificationCenter.default.post(name: .threadScrollToBottom, object: nil)
-        pumpRunLoop()
-        let nodes = accessibilityTree(from: rendered.hostingView) + accessibilityTreeFromApplication()
-        assert(nodes.contains { $0.identifier == "reply-message-499" }, "500-message scroll reaches oldest card action")
+        assert(waitForVisibleAction("reply-message-499", in: rendered), "500-message bottom scroll shows oldest card action in viewport")
         try capture(rendered.hostingView, suffix: "-500-oldest")
+        NotificationCenter.default.post(name: .threadScrollToTop, object: nil)
+        assert(waitForVisibleAction("reply-message-0", in: rendered), "500-message top scroll shows newest card action in viewport")
         return rendered
+    }
+
+    private func waitForVisibleAction(_ identifier: String, in rendered: RenderedView) -> Bool {
+        let deadline = Date().addingTimeInterval(3)
+        var consecutiveVisible = 0
+        while Date() < deadline {
+            pumpRunLoop()
+            let viewport = rendered.window.convertToScreen(rendered.hostingView.convert(rendered.hostingView.bounds, to: nil))
+            let frames = accessibilityTree(from: rendered.hostingView)
+                .filter { $0.identifier == identifier }.compactMap(\.frame)
+            if frames.contains(where: { !$0.isEmpty && viewport.contains($0) }) {
+                consecutiveVisible += 1
+                if consecutiveVisible == 3 {
+                    print("VISIBLE_ACTION: \(identifier) frames=\(frames) viewport=\(viewport)")
+                    return true
+                }
+            } else {
+                consecutiveVisible = 0
+            }
+        }
+        let scrollViews = allSubviews(of: rendered.hostingView).compactMap { $0 as? NSScrollView }
+        print("SCROLL_TIMEOUT: \(identifier) documents=\(scrollViews.map { $0.documentView?.frame ?? .zero }) clips=\(scrollViews.map { $0.contentView.bounds })")
+        return false
     }
 
     private func testComposeState() -> RenderedView {
