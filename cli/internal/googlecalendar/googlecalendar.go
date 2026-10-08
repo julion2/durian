@@ -648,7 +648,9 @@ func (c *Client) eventFromGoogle(g googleEvent) (calendar.Event, bool) {
 // parseGoogleTime parses one {date, dateTime} boundary: an all-day date
 // ("YYYY-MM-DD", end-exclusive on the end boundary, kept as-is like the Graph
 // path) becomes midnight UTC with allDay=true; a timed dateTime (RFC3339 with
-// offset) is normalized to UTC.
+// offset) retains the named IANA location from timeZone while preserving the
+// instant encoded by dateTime. Keeping the location is what lets recurrence
+// expansion advance the provider's civil time across DST.
 func parseGoogleTime(dt googleDateTime) (t time.Time, allDay bool, err error) {
 	if dt.Date != "" {
 		t, err = time.ParseInLocation(calendar.GraphDateFormat, dt.Date, time.UTC)
@@ -664,7 +666,14 @@ func parseGoogleTime(dt googleDateTime) (t time.Time, allDay bool, err error) {
 	if err != nil {
 		return time.Time{}, false, fmt.Errorf("failed to parse google dateTime %q: %w", dt.DateTime, err)
 	}
-	return t.UTC(), false, nil
+	if dt.TimeZone == "" || dt.TimeZone == "UTC" {
+		return t.UTC(), false, nil
+	}
+	loc, err := time.LoadLocation(dt.TimeZone)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("failed to load google timeZone %q: %w", dt.TimeZone, err)
+	}
+	return t.In(loc), false, nil
 }
 
 // parseGoogleTimestamp parses an RFC3339 timestamp (e.g. updated). An

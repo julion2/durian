@@ -217,6 +217,10 @@ type Action struct {
 	// Prior is the tracked ItemStatus baseline; only meaningful when Tracked.
 	Prior   ItemStatus
 	Tracked bool
+	// LegacyHashMigration marks a one-time recurrence-zone hash migration. A
+	// pending local edit inherits the remote zone before upload, then its local
+	// file is rewritten with that zone after the successful write.
+	LegacyHashMigration bool
 
 	// OwnerIsOrganizer reports whether the account owner organizes this event
 	// (from the remote event when present, else from the local file's
@@ -908,7 +912,15 @@ func planWithRemote(p CalendarProvider, cal Calendar, calDir string, status Cale
 		li, localHas := local[uid]
 		st, tracked := status.Items[uid]
 
-		remoteChanged := remoteHas && (!tracked || st.RemoteHash != eventContentHash(rev, owner))
+		legacyHash := tracked && st.HashVersion < currentHashVersion
+		remoteHash := eventContentHash(rev, owner)
+		comparisonRemoteHash := remoteHash
+		legacyRemote := rev
+		if legacyHash {
+			legacyRemote = legacyComparisonEvent(rev, owner, st)
+			comparisonRemoteHash = eventContentHash(legacyRemote, owner)
+		}
+		remoteChanged := remoteHas && (!tracked || st.RemoteHash != comparisonRemoteHash)
 		localChanged := localHas && (!tracked || st.LocalHash != li.Hash)
 		// Core-change signals: like remoteChanged/localChanged, but diffed with
 		// CoreContentHash, which drops the attendee RESPONSES. They feed ONLY
@@ -922,10 +934,33 @@ func planWithRemote(p CalendarProvider, cal Calendar, calDir string, status Cale
 		// a byte-identical local file or an unchanged remote can never register
 		// as core-edited (the local conjunct also shields against the lossy
 		// iCal re-parse of an untouched file).
+		remoteCoreHash := coreContentHash(rev, owner)
+		if legacyHash {
+			remoteCoreHash = coreContentHash(legacyRemote, owner)
+		}
 		remoteCoreChanged := remoteChanged && st.CoreHash != "" &&
-			st.CoreHash != coreContentHash(rev, owner)
+			st.CoreHash != remoteCoreHash
+		localCoreHash := coreContentHash(li.Event, owner)
+		if legacyHash {
+			localCoreHash = legacyCoreContentHash(li.Event, owner)
+		}
 		localCoreChanged := localChanged && st.CoreHash != "" &&
-			st.CoreHash != coreContentHash(li.Event, owner)
+			st.CoreHash != localCoreHash
+		// Old Google hashes retain only UTC UNTIL's date, not its hour or
+		// authoring zone. A real remote end-date edit can therefore look like
+		// the zone upgrade. Preserve both sides as a conflict rather than
+		// guessing and automatically uploading over another client's change.
+		ambiguousLegacyEnd := legacyHash && remoteHas && localHas && localChanged &&
+			rev.Recurrence != nil && rev.Recurrence.Range.Type == "endDate" &&
+			rev.Recurrence.Range.TimeZone != ""
+		// Preserve missing legacy metadata for a pending edit, including when
+		// only other attendees' responses changed remotely. Compare local core
+		// before the migration changes its range-date representation.
+		migratingLocalEdit := legacyHash && remoteHas && localHas && localChanged && !ambiguousLegacyEnd &&
+			(!remoteChanged || (st.CoreHash != "" && !remoteCoreChanged))
+		if migratingLocalEdit {
+			li.Event = inheritRemoteRecurrenceZone(li.Event, rev)
+		}
 		remoteDeleted := tracked && !remoteHas
 		localDeleted := tracked && !localHas
 
@@ -943,6 +978,7 @@ func planWithRemote(p CalendarProvider, cal Calendar, calDir string, status Cale
 		}
 
 		a := Action{UID: uid, RemoteID: st.RemoteID, Prior: st, Tracked: tracked}
+		a.LegacyHashMigration = migratingLocalEdit
 		if remoteHas {
 			a.Remote = rev
 			a.RemoteExists = true
@@ -1006,6 +1042,8 @@ func planWithRemote(p CalendarProvider, cal Calendar, calDir string, status Cale
 			// conflicts rather than being silently overwritten by a download.
 			localCoreEditWins := localCoreChanged && !remoteCoreChanged
 			switch {
+			case ambiguousLegacyEnd:
+				a.Kind = ActionConflict
 			case remoteChanged && localChanged && !localCoreEditWins:
 				a.Kind = ActionConflict
 			case localChanged && !ownerEditOnly && (localCoreEditWins || !remoteChanged):
@@ -1021,10 +1059,27 @@ func planWithRemote(p CalendarProvider, cal Calendar, calDir string, status Cale
 			case remoteChanged:
 				a.Kind = ActionDownloadUpdate
 			default:
-				// Content unchanged on both sides: owner-RSVP sub-matrix.
-				if !planRsvp(&a, li.Event, rev, st, localChanged) {
-					continue
+				// A pending owner response must run before a metadata-only hash
+				// migration; downloading the old response would erase that intent.
+				if planRsvp(&a, li.Event, rev, st, localChanged) {
+					break
 				}
+				if legacyHash {
+					// Complete the migration exactly once even when neither side
+					// changed. A newly zoned rendering is downloaded; an identical
+					// rendering only needs an Adopt-style status rebaseline.
+					data, err := EventToICal(rev)
+					if err != nil {
+						return plan, fmt.Errorf("failed to serialize remote event %s for hash migration: %w", uid, err)
+					}
+					if hashBytes(data) != li.Hash {
+						a.Kind = ActionDownloadUpdate
+					} else {
+						a.Kind = ActionAdopt
+					}
+					break
+				}
+				continue
 			}
 
 		case remoteDeleted && localDeleted:
@@ -1246,6 +1301,73 @@ func lossyRecurrence(rec *Recurrence, start time.Time) *Recurrence {
 	return out
 }
 
+const currentHashVersion = 1
+
+// legacyComparisonEvent reproduces the pre-timezone provider representation.
+// Graph already supplied civil range dates; Google derived them from UTC
+// DTSTART. This is used only for version-0 status entries. UNTIL cannot be
+// reconstructed safely from its date alone; pending edits on those series
+// remain conflicts during migration.
+func legacyComparisonEvent(e Event, owner string, st ItemStatus) Event {
+	legacy := eventWithoutRecurrenceZones(e)
+	if legacy.Recurrence == nil || eventContentHash(legacy, owner) == st.RemoteHash ||
+		(st.CoreHash != "" && coreContentHash(legacy, owner) == st.CoreHash) {
+		return legacy
+	}
+	legacy.Recurrence.Range.StartDate = e.Start.UTC().Format(calendar.GraphDateFormat)
+	return legacy
+}
+
+func legacyCoreContentHash(e Event, owner string) string {
+	legacy := eventWithoutRecurrenceZones(e)
+	return coreContentHash(legacy, owner)
+}
+
+func eventWithoutRecurrenceZones(e Event) Event {
+	legacy := e
+	legacy.Recurrence = recurrenceWithoutZone(e.Recurrence)
+	legacy.Overrides = append([]Event(nil), e.Overrides...)
+	for i := range legacy.Overrides {
+		legacy.Overrides[i].Recurrence = recurrenceWithoutZone(e.Overrides[i].Recurrence)
+	}
+	return legacy
+}
+
+func recurrenceWithoutZone(rec *Recurrence) *Recurrence {
+	if rec == nil {
+		return nil
+	}
+	legacy := *rec
+	legacy.Range.TimeZone = ""
+	return &legacy
+}
+
+// inheritRemoteRecurrenceZone adds only provider metadata that old local files
+// could not carry. It preserves every user-editable local field and instant.
+func inheritRemoteRecurrenceZone(local, remote Event) Event {
+	if local.Recurrence == nil || remote.Recurrence == nil || remote.Recurrence.Range.TimeZone == "" {
+		return local
+	}
+	// A named zone in a local file is an explicit edit, not missing legacy
+	// metadata. Do not replace it with the provider's older choice.
+	if local.Recurrence.Range.TimeZone != "" {
+		return local
+	}
+	loc, err := time.LoadLocation(remote.Recurrence.Range.TimeZone)
+	if err != nil {
+		return local
+	}
+	rec := *local.Recurrence
+	rec.Range.TimeZone = remote.Recurrence.Range.TimeZone
+	local.Recurrence = &rec
+	if !local.AllDay {
+		local.Start = local.Start.In(loc)
+		local.End = local.End.In(loc)
+		local.Recurrence.Range.StartDate = local.Start.Format(calendar.GraphDateFormat)
+	}
+	return local
+}
+
 // lossyAttendeeSet canonicalizes an attendee list (excluding the owner) with
 // the lossy iCal round-trip applied to type and response, so a remote value
 // and its local re-parse compare equal.
@@ -1418,6 +1540,7 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 			slog.Debug("Adopting identical untracked pair", "module", "CALSYNC",
 				"calendar", plan.Calendar.Name, "uid", a.UID)
 			status.Items[a.UID] = ItemStatus{
+				HashVersion:   currentHashVersion,
 				RemoteID:      a.Remote.ID,
 				RemoteHash:    eventContentHash(a.Remote, p.Owner()),
 				CoreHash:      coreContentHash(a.Remote, p.Owner()),
@@ -1466,6 +1589,11 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 			}
 
 		case ActionUploadUpdate:
+			if a.LegacyHashMigration {
+				if err = checkMigrationLocalUnchanged(a); err != nil {
+					break
+				}
+			}
 			if err = patchFromLocal(ctx, p, plan, a, status); err == nil {
 				stats.Uploaded++
 			}
@@ -1477,6 +1605,11 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 			}
 
 		case ActionRsvp:
+			if a.LegacyHashMigration {
+				if err = checkMigrationLocalUnchanged(a); err != nil {
+					break
+				}
+			}
 			st := status.Items[a.UID]
 			if a.RsvpCall {
 				slog.Info("Sending owner RSVP", "module", "CALSYNC",
@@ -1491,6 +1624,26 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 				st.OwnerResponse = a.Rsvp
 				if a.LocalExists {
 					st.LocalHash = a.LocalHash
+				}
+				if a.LegacyHashMigration {
+					if err = checkMigrationLocalUnchanged(a); err != nil {
+						break
+					}
+					data, migrationErr := EventToICal(a.LocalEvent)
+					if migrationErr != nil {
+						err = fmt.Errorf("failed to serialize migrated local event %s: %w", a.UID, migrationErr)
+					} else if migrationErr = WriteFileAtomic(a.LocalPath, data, 0o600); migrationErr != nil {
+						err = migrationErr
+					} else {
+						st.HashVersion = currentHashVersion
+						st.RemoteHash = eventContentHash(a.Remote, p.Owner())
+						st.CoreHash = coreContentHash(a.Remote, p.Owner())
+						st.LocalHash = hashBytes(data)
+						st.AttendeeHash = attendeeSetHash(a.Remote.Attendees)
+					}
+				}
+				if err != nil {
+					break
 				}
 				status.Items[a.UID] = st
 				if a.RsvpCall {
@@ -1700,6 +1853,7 @@ func writeRemoteEvent(calDir, path, uid string, ev Event, status *CalendarStatus
 		return err
 	}
 	status.Items[uid] = ItemStatus{
+		HashVersion:   currentHashVersion,
 		RemoteID:      ev.ID,
 		RemoteHash:    eventContentHash(ev, owner),
 		CoreHash:      coreContentHash(ev, owner),
@@ -1881,11 +2035,29 @@ func patchFromLocal(ctx context.Context, p CalendarProvider, plan CalendarPlan, 
 		ownerResp = settled.OwnerResponse
 		attendeeHash = attendeeSetHash(settled.Attendees)
 	}
+	localHash := a.LocalHash
+	if a.LegacyHashMigration {
+		// The upload used the remote series zone inherited into LocalEvent.
+		// Persist that exact edited representation after success so the next
+		// local edit cannot fall back to UTC and silently change DST behavior.
+		if err := checkMigrationLocalUnchanged(a); err != nil {
+			return err
+		}
+		data, err := EventToICal(a.LocalEvent)
+		if err != nil {
+			return fmt.Errorf("failed to serialize migrated local event %s: %w", a.UID, err)
+		}
+		if err := WriteFileAtomic(a.LocalPath, data, 0o600); err != nil {
+			return err
+		}
+		localHash = hashBytes(data)
+	}
 	status.Items[a.UID] = ItemStatus{
+		HashVersion:   currentHashVersion,
 		RemoteID:      a.RemoteID,
 		RemoteHash:    remoteHash,
 		CoreHash:      coreHash,
-		LocalHash:     a.LocalHash,
+		LocalHash:     localHash,
 		OwnerResponse: ownerResp,
 		AttendeeHash:  attendeeHash,
 	}
@@ -2077,6 +2249,26 @@ func checkLocalUnchanged(a Action) error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
+		}
+		return fmt.Errorf("failed to re-read %s: %w", a.LocalPath, err)
+	}
+	if hashBytes(cur) != a.LocalHash {
+		return fmt.Errorf("%w: %s", errLocalStale, a.LocalPath)
+	}
+	return nil
+}
+
+// checkMigrationLocalUnchanged is the stricter upload-side variant: a file
+// deleted after planning is stale too, because the migration would otherwise
+// upload the old content and recreate the deleted local file.
+func checkMigrationLocalUnchanged(a Action) error {
+	if !a.LocalExists || a.LocalPath == "" {
+		return nil
+	}
+	cur, err := os.ReadFile(a.LocalPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w: %s", errLocalStale, a.LocalPath)
 		}
 		return fmt.Errorf("failed to re-read %s: %w", a.LocalPath, err)
 	}

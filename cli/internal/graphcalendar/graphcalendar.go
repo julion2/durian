@@ -34,6 +34,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thommeo/winianatz"
+
 	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
@@ -58,7 +60,12 @@ const (
 	// date it replaces.
 	masterEventSelect = "id,iCalUId,subject,body,bodyPreview,start,end,isAllDay,location,recurrence,type,changeKey,lastModifiedDateTime," +
 		"attendees,organizer,responseStatus,isOnlineMeeting,onlineMeeting,onlineMeetingUrl,isCancelled,isOrganizer," +
-		"seriesMasterId,originalStart"
+		"seriesMasterId,originalStart,originalStartTimeZone"
+
+	// cancelledOccurrences is documented only on GET of one series master,
+	// not on the calendar's /events collection, so masters are enriched with a
+	// second read using this field set.
+	masterDetailSelect = masterEventSelect + ",cancelledOccurrences"
 
 	// preferUTC asks Graph to return event start/end dateTimes in UTC, so
 	// parsing never has to interpret Windows timezone names.
@@ -540,7 +547,12 @@ type graphEvent struct {
 	// was modified — the RECURRENCE-ID equivalent. Unlike start it does not
 	// move with the exception, which is what makes it the stable key.
 	OriginalStart string `json:"originalStart"`
-	Attendees     []struct {
+	// OriginalStartTimeZone preserves the event's authoring zone even though
+	// Prefer asks Graph to render start/end as UTC.
+	OriginalStartTimeZone string `json:"originalStartTimeZone"`
+	// CancelledOccurrences is returned only by a direct GET of a series master.
+	CancelledOccurrences []string `json:"cancelledOccurrences"`
+	Attendees            []struct {
 		Type         string              `json:"type"`
 		Status       graphResponseStatus `json:"status"`
 		EmailAddress graphEmailAddress   `json:"emailAddress"`
@@ -602,6 +614,40 @@ func eventFromGraph(ge graphEvent) (calendar.Event, bool) {
 		onlineMeetingURL = ge.OnlineMeeting.JoinURL
 	}
 
+	// Graph's recurrenceTimeZone and originalStartTimeZone may be Windows
+	// identifiers. Convert through CLDR's territory-001 mapping and attach the
+	// named IANA location to the UTC instant Graph returned. All-day values are
+	// dates rather than instants and must stay at midnight UTC.
+	zoneName := ge.OriginalStartTimeZone
+	var recurrence *calendar.Recurrence
+	if ge.Recurrence != nil {
+		copyRecurrence := *ge.Recurrence
+		recurrence = &copyRecurrence
+		if recurrence.Range.TimeZone != "" {
+			zoneName = recurrence.Range.TimeZone
+		}
+	}
+	if zoneName != "" {
+		loc, canonical, zoneErr := graphLocation(zoneName)
+		if zoneErr != nil {
+			slog.Warn("Keeping Graph event in UTC because its timezone is unknown", "module", "GRAPHCAL",
+				"id", ge.ID, "timezone", zoneName, "err", zoneErr)
+		} else {
+			if !ge.IsAllDay {
+				start = start.In(loc)
+				end = end.In(loc)
+			}
+			if recurrence != nil {
+				// Match ICS parsing: UTC is implicit and DATE-valued series
+				// have no TZID. Otherwise every read-back changes the hash.
+				recurrence.Range.TimeZone = ""
+				if !ge.IsAllDay && loc != time.UTC {
+					recurrence.Range.TimeZone = canonical
+				}
+			}
+		}
+	}
+
 	return calendar.Event{
 		ID:           ge.ID,
 		ICalUID:      ge.ICalUID,
@@ -614,7 +660,7 @@ func eventFromGraph(ge graphEvent) (calendar.Event, bool) {
 		LastModified: parseGraphTimestamp(ge.LastModifiedDateTime),
 		ETag:         ge.ChangeKey,
 		Type:         ge.Type,
-		Recurrence:   ge.Recurrence,
+		Recurrence:   recurrence,
 
 		Attendees:        attendees,
 		Organizer:        organizer,
@@ -688,16 +734,11 @@ func (c *Client) FetchInstances(ctx context.Context, calendarID string, from, to
 // already reproduced by the local expansion, and storing it would duplicate
 // every date of every series.
 //
-// KNOWN GAP — cancelled occurrences. Deleting one date of a Graph series
-// removes it from /events entirely rather than leaving a tombstone, so a
-// cancellation cannot be observed on this endpoint and the local calendar
-// keeps rendering that date. Graph exposes the cancelled dates as the series
-// master's cancelledOccurrences collection, but that property is only reliably
-// documented on beta, and requesting an unsupported property in $select fails
-// the whole query with a 400 — which would break every calendar, not just
-// recurring ones. Closing this needs the endpoint verified against the live
-// v1.0 API first. Google has no such gap: it returns cancelled instances as
-// records.
+// Graph returns cancelledOccurrences only when it is selected on GET of a
+// specific series master. After the collection has been fully read, every
+// master is therefore enriched through that documented v1.0 route. Any
+// enrichment failure fails the whole fetch: publishing a successful partial
+// snapshot would revive cancelled dates locally and could upload that loss.
 func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]calendar.Event, error) {
 	headers := map[string]string{"Prefer": preferMaster}
 
@@ -732,6 +773,28 @@ func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]ca
 		pageURL = page.NextLink
 	}
 
+	for id, idx := range byID {
+		if events[idx].Type != "seriesMaster" {
+			continue
+		}
+		detail, err := c.getGraphEvent(ctx, id, masterDetailSelect)
+		if err != nil {
+			return nil, fmt.Errorf("failed to enrich series master %s: %w", id, err)
+		}
+		if detail.ID != id || detail.ICalUID != events[idx].ICalUID ||
+			detail.Type != "seriesMaster" || detail.ChangeKey != events[idx].ETag {
+			return nil, fmt.Errorf("series master %s changed during cancellation enrichment; retry from a fresh snapshot", id)
+		}
+		ev, ok := eventFromGraph(detail)
+		if !ok {
+			return nil, fmt.Errorf("failed to parse enriched series master %s", id)
+		}
+		if err := attachCancelledOccurrences(&ev, detail.CancelledOccurrences); err != nil {
+			return nil, fmt.Errorf("failed to parse cancellations for series master %s: %w", id, err)
+		}
+		events[idx] = ev
+	}
+
 	attachExceptions(events, byID, exceptions)
 
 	slog.Debug("Fetched master events", "module", "GRAPHCAL",
@@ -762,6 +825,11 @@ func attachExceptions(events []calendar.Event, byID map[string]int, exceptions [
 			slog.Warn("Dropping series exception without a usable original start",
 				"module", "GRAPHCAL", "id", ge.ID, "value", ge.OriginalStart, "err", err)
 			continue
+		}
+		if ge.OriginalStartTimeZone != "" {
+			if loc, _, zoneErr := graphLocation(ge.OriginalStartTimeZone); zoneErr == nil {
+				original = original.In(loc)
+			}
 		}
 		ev, ok := eventFromGraph(ge)
 		if !ok {
@@ -796,19 +864,95 @@ func attachExceptions(events []calendar.Event, byID map[string]int, exceptions [
 // calendarID is unused: Graph event ids are mailbox-global.
 func (c *Client) GetEvent(ctx context.Context, calendarID, eventID string) (calendar.Event, error) {
 	_ = calendarID
-	reqURL := fmt.Sprintf("%s%s/events/%s?$select=%s",
-		c.baseURL, c.mailboxPath(), url.PathEscape(eventID), masterEventSelect)
-
-	var ge graphEvent
-	if err := c.doJSON(ctx, reqURL, map[string]string{"Prefer": preferMaster}, &ge); err != nil {
+	ge, err := c.getGraphEvent(ctx, eventID, masterDetailSelect)
+	if err != nil {
 		return calendar.Event{}, fmt.Errorf("failed to get event %s: %w", eventID, err)
 	}
 	ev, ok := eventFromGraph(ge)
 	if !ok {
 		return calendar.Event{}, fmt.Errorf("failed to parse event %s", eventID)
 	}
+	if ge.Type == "seriesMaster" {
+		if err := attachCancelledOccurrences(&ev, ge.CancelledOccurrences); err != nil {
+			return calendar.Event{}, fmt.Errorf("failed to parse cancellations for event %s: %w", eventID, err)
+		}
+	}
 	slog.Debug("Fetched event", "module", "GRAPHCAL", "id", ev.ID, "changeKey", ev.ETag)
 	return ev, nil
+}
+
+func (c *Client) getGraphEvent(ctx context.Context, eventID, selectFields string) (graphEvent, error) {
+	reqURL := fmt.Sprintf("%s%s/events/%s?$select=%s",
+		c.baseURL, c.mailboxPath(), url.PathEscape(eventID), selectFields)
+	var ge graphEvent
+	if err := c.doJSON(ctx, reqURL, map[string]string{"Prefer": preferMaster}, &ge); err != nil {
+		return graphEvent{}, err
+	}
+	// Date-only cancellation IDs need the original civil clock. Falling back
+	// to UTC for a custom/unknown zone would cancel the wrong occurrence.
+	if !ge.IsAllDay && len(ge.CancelledOccurrences) > 0 {
+		zone := ge.OriginalStartTimeZone
+		if ge.Recurrence != nil && ge.Recurrence.Range.TimeZone != "" {
+			zone = ge.Recurrence.Range.TimeZone
+		}
+		if _, _, err := graphLocation(zone); err != nil {
+			return graphEvent{}, fmt.Errorf("cannot resolve cancellation timezone: %w", err)
+		}
+	}
+	return ge, nil
+}
+
+// attachCancelledOccurrences validates Graph's documented occurrence-id
+// grammar and maps each date to the series' original civil start. Matching the
+// exact master prefix prevents an ID from another series deleting this one;
+// rejecting malformed values prevents a guessed date from doing the same.
+func attachCancelledOccurrences(ev *calendar.Event, ids []string) error {
+	prefix := "OID." + ev.ID + "."
+	loc := ev.Start.Location()
+	for _, id := range ids {
+		if !strings.HasPrefix(id, prefix) {
+			return fmt.Errorf("unsupported cancelled occurrence id %q", id)
+		}
+		suffix := strings.TrimPrefix(id, prefix)
+		if len(suffix) != len(calendar.GraphDateFormat) {
+			return fmt.Errorf("unsupported cancelled occurrence id %q", id)
+		}
+		day, err := time.ParseInLocation(calendar.GraphDateFormat, suffix, loc)
+		if err != nil || day.Format(calendar.GraphDateFormat) != suffix {
+			return fmt.Errorf("unsupported cancelled occurrence id %q", id)
+		}
+		if ev.AllDay {
+			ev.ExceptionDates = append(ev.ExceptionDates, day.UTC())
+			continue
+		}
+		ev.ExceptionDates = append(ev.ExceptionDates, time.Date(
+			day.Year(), day.Month(), day.Day(),
+			ev.Start.Hour(), ev.Start.Minute(), ev.Start.Second(), ev.Start.Nanosecond(), loc))
+	}
+	sort.Slice(ev.ExceptionDates, func(i, j int) bool {
+		return ev.ExceptionDates[i].Before(ev.ExceptionDates[j])
+	})
+	return nil
+}
+
+// graphLocation accepts IANA names directly and maps Windows names through
+// the authoritative CLDR territory-001 table embedded in winianatz.
+func graphLocation(name string) (*time.Location, string, error) {
+	if name == "" || strings.EqualFold(name, "UTC") {
+		return time.UTC, "UTC", nil
+	}
+	if loc, err := time.LoadLocation(name); err == nil {
+		return loc, name, nil
+	}
+	entry, err := winianatz.FromMicrosoftAliasWithTerritory(name, "001")
+	if err != nil {
+		return nil, "", fmt.Errorf("unsupported Graph timezone %q: %w", name, err)
+	}
+	loc, err := time.LoadLocation(entry.IANA)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to load mapped Graph timezone %q: %w", entry.IANA, err)
+	}
+	return loc, entry.IANA, nil
 }
 
 // ParseEventJSON decodes one raw Graph event resource into the neutral Event,

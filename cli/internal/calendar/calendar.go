@@ -407,12 +407,14 @@ type RecurrencePattern struct {
 
 // RecurrenceRange is the Graph recurrenceRange resource. Type is one of
 // noEnd, endDate, numbered. Dates are "YYYY-MM-DD" strings as Graph sends
-// them.
+// them. TimeZone is the canonical IANA zone in which those dates and the
+// recurrence's civil time are defined.
 type RecurrenceRange struct {
 	Type                string `json:"type"`
 	StartDate           string `json:"startDate,omitempty"`
 	EndDate             string `json:"endDate,omitempty"`
 	NumberOfOccurrences int    `json:"numberOfOccurrences,omitempty"`
+	TimeZone            string `json:"recurrenceTimeZone,omitempty"`
 }
 
 // SanitizeName makes a calendar name or event id safe as a single filesystem

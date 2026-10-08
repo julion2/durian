@@ -23,6 +23,7 @@ go_test(
     name = "calendar_test",
     size = "small",
     srcs = [
+        "adversarial_test.go",
         "calendar_test.go",
         "collections_test.go",
         "ical_roundtrip_test.go",

@@ -221,6 +221,12 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		merged.Subject = ev.Subject
 		merged.Start = ev.Start
 		merged.End = ev.End
+		// The API carries instants, not a timezone edit. Preserve the stored
+		// named location so a GUI edit cannot turn a wall-clock series into UTC.
+		if !ev.AllDay {
+			merged.Start = ev.Start.In(existing.Start.Location())
+			merged.End = ev.End.In(existing.End.Location())
+		}
 		merged.AllDay = ev.AllDay
 		merged.Location = ev.Location
 		merged.Description = ev.Description

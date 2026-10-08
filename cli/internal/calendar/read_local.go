@@ -198,7 +198,10 @@ func ExpandOccurrences(e Event, from, to time.Time) []Event {
 		}
 		return nil
 	}
-	opt.Dtstart = e.Start.UTC()
+	// rrule-go advances the civil clock in Dtstart's location. Converting this
+	// to UTC changes a 09:00 Europe/Berlin series to a fixed UTC hour and makes
+	// it jump to 10:00 locally after the spring transition.
+	opt.Dtstart = e.Start
 	rule, err := rrule.NewRRule(*opt)
 	if err != nil {
 		slog.Warn("Cannot build recurrence rule, showing master only", "module", "GRAPHCAL",
@@ -227,8 +230,8 @@ func ExpandOccurrences(e Event, from, to time.Time) []Event {
 		// nor the overrides of its master, only the date it happens on.
 		occ.ExceptionDates = nil
 		occ.Overrides = nil
-		occ.Start = start.UTC()
-		occ.End = start.UTC().Add(duration)
+		occ.Start = start
+		occ.End = start.Add(duration)
 		if !overlaps(occ.Start, occ.End, from, to) {
 			continue
 		}

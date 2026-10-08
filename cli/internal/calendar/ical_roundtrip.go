@@ -13,7 +13,8 @@
 //	absoluteYearly   -> FREQ=YEARLY;BYMONTH=<month>;BYMONTHDAY=<dayOfMonth>
 //	relativeYearly   -> FREQ=YEARLY;BYMONTH=<month>;BYDAY=<daysOfWeek>;BYSETPOS=<index> (best effort)
 //
-// with INTERVAL when > 1, and range endDate -> UNTIL (end of day UTC),
+// with INTERVAL when > 1, and range endDate -> UNTIL (end of day in the
+// series zone),
 // numbered -> COUNT, noEnd -> neither. The relative patterns map the Graph
 // index (first..fourth, last) to BYSETPOS 1..4 / -1; an unmappable pattern
 // yields no RRULE plus a warning rather than a wrong rule. The parse
@@ -59,8 +60,9 @@ const GraphDateFormat = "2006-01-02"
 // MARK: - Serialize
 
 // EventToICal renders one event as a VCALENDAR with a single VEVENT using
-// go-ical (CRLF output). Timed events are written as UTC date-times, all-day
-// events as VALUE=DATE with Graph's exclusive DTEND kept as-is. A seriesMaster
+// go-ical (CRLF output). Timed events retain their named location (TZID),
+// while UTC instants stay UTC; all-day events are VALUE=DATE with Graph's
+// exclusive DTEND kept as-is. A seriesMaster
 // Recurrence becomes an RRULE per the mapping documented in the file header;
 // an unmappable recurrence is dropped with a warning so the event itself still
 // round-trips.
@@ -94,8 +96,7 @@ func EventToICal(e Event) ([]byte, error) {
 			exdate.SetValueType(ical.ValueDate)
 			exdate.Value = d.UTC().Format("20060102")
 		} else {
-			exdate.SetValueType(ical.ValueDateTime)
-			exdate.Value = d.UTC().Format("20060102T150405Z")
+			exdate.SetDateTime(inEventLocation(d, e))
 		}
 		master.Props.Add(exdate)
 	}
@@ -134,8 +135,7 @@ func EventToICal(e Event) ([]byte, error) {
 			recID.SetValueType(ical.ValueDate)
 			recID.Value = o.RecurrenceID.UTC().Format("20060102")
 		} else {
-			recID.SetValueType(ical.ValueDateTime)
-			recID.Value = o.RecurrenceID.UTC().Format("20060102T150405Z")
+			recID.SetDateTime(inEventLocation(o.RecurrenceID, e))
 		}
 		comp.Props.Set(recID)
 		cal.Children = append(cal.Children, comp.Component)
@@ -193,8 +193,8 @@ func eventComponent(e Event, uid string) (*ical.Event, error) {
 		ev.Props.SetDate(ical.PropDateTimeStart, e.Start.UTC())
 		ev.Props.SetDate(ical.PropDateTimeEnd, e.End.UTC())
 	} else {
-		ev.Props.SetDateTime(ical.PropDateTimeStart, e.Start.UTC())
-		ev.Props.SetDateTime(ical.PropDateTimeEnd, e.End.UTC())
+		ev.Props.SetDateTime(ical.PropDateTimeStart, e.Start)
+		ev.Props.SetDateTime(ical.PropDateTimeEnd, e.End)
 	}
 	// A recurrence that cannot be rendered as an RRULE leaves the file without
 	// one, and a file without an RRULE parses back as "not a series" — which
@@ -255,6 +255,17 @@ func eventComponent(e Event, uid string) (*ical.Event, error) {
 	}
 
 	return ev, nil
+}
+
+// inEventLocation renders an exception identity in the same named location as
+// the master. The instant is unchanged; retaining the location lets go-ical
+// emit TZID and keeps the civil recurrence identity stable across DST.
+func inEventLocation(t time.Time, e Event) time.Time {
+	loc := e.Start.Location()
+	if loc == nil || loc == time.Local {
+		loc = time.UTC
+	}
+	return t.In(loc)
 }
 
 // NormalizeText collapses CR/CRLF to LF; go-ical escapes LF itself but would
@@ -322,8 +333,8 @@ func AttendeePartStat(response string) string {
 // MARK: - Parse
 
 // ICalToEvent parses a VCALENDAR (the inverse of EventToICal) into an Event. A
-// VALUE=DATE DTSTART marks the event all-day; all times are interpreted in
-// UTC. An RRULE is mapped back into a Graph Recurrence; an RRULE outside the
+// VALUE=DATE DTSTART marks the event all-day; TZID-qualified times retain that
+// named location. An RRULE is mapped back into a Graph Recurrence; one outside the
 // supported mapping leaves Recurrence nil with a warning. ID/ETag/Type are not
 // part of the iCal representation and stay empty.
 //
@@ -668,8 +679,8 @@ func eventFromComponent(ev *ical.Event, accountEmail string) (Event, error) {
 		Subject:      subject,
 		Location:     location,
 		Description:  description,
-		Start:        start.UTC(),
-		End:          end.UTC(),
+		Start:        start,
+		End:          end,
 		AllDay:       allDay,
 		LastModified: lastModified.UTC(),
 		Recurrence:   recurrence,
@@ -798,13 +809,18 @@ func RecurrenceToROption(rec Recurrence) (*rrule.ROption, error) {
 
 	switch rec.Range.Type {
 	case "endDate":
-		endDate, err := time.ParseInLocation(GraphDateFormat, rec.Range.EndDate, time.UTC)
+		loc, err := recurrenceLocation(rec.Range.TimeZone)
+		if err != nil {
+			return nil, err
+		}
+		endDate, err := time.ParseInLocation(GraphDateFormat, rec.Range.EndDate, loc)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse recurrence end date %q: %w", rec.Range.EndDate, err)
 		}
 		// Graph's endDate is the inclusive last day; UNTIL is an inclusive
-		// instant, so use the end of that day to cover timed occurrences.
-		opt.Until = endDate.Add(24*time.Hour - time.Second)
+		// instant, so use the final civil second of that day. AddDate is used
+		// instead of 24h because a DST transition day is not always 24h long.
+		opt.Until = endDate.AddDate(0, 0, 1).Add(-time.Second)
 	case "numbered":
 		opt.Count = rec.Range.NumberOfOccurrences
 	case "noEnd", "":
@@ -814,6 +830,17 @@ func RecurrenceToROption(rec Recurrence) (*rrule.ROption, error) {
 	}
 
 	return opt, nil
+}
+
+func recurrenceLocation(name string) (*time.Location, error) {
+	if name == "" || name == "UTC" {
+		return time.UTC, nil
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load recurrence timezone %q: %w", name, err)
+	}
+	return loc, nil
 }
 
 // setRelative applies the nth-weekday part of a relativeMonthly/relativeYearly
@@ -918,14 +945,17 @@ func ROptionToRecurrence(opt *rrule.ROption, start time.Time) (*Recurrence, erro
 		return nil, fmt.Errorf("unsupported rrule with both UNTIL and COUNT")
 	case !opt.Until.IsZero():
 		rec.Range.Type = "endDate"
-		rec.Range.EndDate = opt.Until.UTC().Format(GraphDateFormat)
+		rec.Range.EndDate = opt.Until.In(start.Location()).Format(GraphDateFormat)
 	case opt.Count > 0:
 		rec.Range.Type = "numbered"
 		rec.Range.NumberOfOccurrences = opt.Count
 	default:
 		rec.Range.Type = "noEnd"
 	}
-	rec.Range.StartDate = start.UTC().Format(GraphDateFormat)
+	rec.Range.StartDate = start.Format(GraphDateFormat)
+	if loc := start.Location(); loc != nil && loc != time.UTC && loc != time.Local {
+		rec.Range.TimeZone = loc.String()
+	}
 
 	return rec, nil
 }

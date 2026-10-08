@@ -519,6 +519,40 @@ func TestCalendarPutUpdatePreservesMeetingFields(t *testing.T) {
 	}
 }
 
+func TestCalendarPutPreservesSeriesZoneAcrossDST(t *testing.T) {
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, dir := newCalendarHandler(t)
+	writeCalendarTestEvent(t, dir, calendar.Event{
+		ICalUID: "zoned-series", Subject: "Weekly review",
+		Start: time.Date(2026, 3, 22, 9, 0, 0, 0, berlin),
+		End:   time.Date(2026, 3, 22, 10, 0, 0, 0, berlin),
+		Recurrence: &calendar.Recurrence{
+			Pattern: calendar.RecurrencePattern{Type: "weekly", Interval: 1, DaysOfWeek: []string{"sunday"}},
+			Range:   calendar.RecurrenceRange{Type: "numbered", StartDate: "2026-03-22", NumberOfOccurrences: 2, TimeZone: "Europe/Berlin"},
+		},
+	})
+	// The GUI sends UTC instants even when the series uses a named zone.
+	body := `{"account":"work","calendar":"Calendar","uid":"zoned-series","subject":"Edited review","start":"2026-03-22T08:00:00Z","end":"2026-03-22T09:00:00Z"}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", w.Code, w.Body.String())
+	}
+	onDisk := readCalendarTestEvent(t, dir, "zoned-series")
+	if onDisk.Subject != "Edited review" || onDisk.Start.Location().String() != "Europe/Berlin" {
+		t.Fatalf("GUI edit lost stored zone: %+v", onDisk)
+	}
+	occurrences := calendar.ExpandOccurrences(onDisk,
+		time.Date(2026, 3, 21, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 3, 30, 0, 0, 0, 0, time.UTC))
+	if len(occurrences) != 2 || occurrences[1].Start.UTC().Format(time.RFC3339) != "2026-03-29T07:00:00Z" {
+		t.Fatalf("GUI edit broke 09:00 civil recurrence: %+v", occurrences)
+	}
+}
+
 func TestCalendarPutAttendeeEditPreservesOrganizerEntry(t *testing.T) {
 	r, calDir := newCalendarHandler(t)
 	writeCalendarTestEvent(t, calDir, calendar.Event{

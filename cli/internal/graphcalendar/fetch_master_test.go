@@ -34,6 +34,20 @@ func TestFetchMasterEvents(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/me/events/master1", func(w http.ResponseWriter, r *http.Request) {
+		preferHeaders = append(preferHeaders, r.Header.Get("Prefer"))
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"id":"master1","iCalUId":"ical-master1","subject":"Weekly sync",
+			"body":{"contentType":"html","content":"<p>hi</p>"},"bodyPreview":"hi",
+			"start":{"dateTime":"2026-07-20T09:00:00.0000000","timeZone":"UTC"},
+			"end":{"dateTime":"2026-07-20T09:30:00.0000000","timeZone":"UTC"},
+			"isAllDay":false,"location":{"displayName":"Zoom"},"type":"seriesMaster",
+			"changeKey":"ck-master1","lastModifiedDateTime":"2026-07-21T10:00:00Z",
+			"recurrence":{"pattern":{"type":"weekly","interval":2,"daysOfWeek":["monday","wednesday"],"firstDayOfWeek":"sunday"},
+			"range":{"type":"endDate","startDate":"2026-07-20","endDate":"2026-11-02"}},
+			"cancelledOccurrences":[]}`)
+	})
 	mux.HandleFunc("/me/calendars/cal1/events", func(w http.ResponseWriter, r *http.Request) {
 		preferHeaders = append(preferHeaders, r.Header.Get("Prefer"))
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
@@ -89,8 +103,8 @@ func TestFetchMasterEvents(t *testing.T) {
 		t.Fatalf("FetchMasterEvents: %v", err)
 	}
 
-	if len(preferHeaders) != 2 {
-		t.Fatalf("expected 2 pages fetched, got %d", len(preferHeaders))
+	if len(preferHeaders) != 3 {
+		t.Fatalf("expected 2 pages and 1 series detail fetched, got %d", len(preferHeaders))
 	}
 	for i, h := range preferHeaders {
 		if h != `outlook.timezone="UTC", IdType="ImmutableId"` {
