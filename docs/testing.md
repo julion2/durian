@@ -37,7 +37,8 @@ bazel test //cli/internal/jmapbackend:jmapbackend_live_integration_test \
   --test_output=all
 ```
 
-Native UI render and action tests require macOS 26 and Xcode. Run:
+Native UI render and action tests require macOS 26, Xcode, and Ripgrep
+(`brew install ripgrep`, installed by CI). Run:
 
 ```sh
 tools/native_ui_test.sh
