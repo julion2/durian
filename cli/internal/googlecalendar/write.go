@@ -66,7 +66,7 @@ func classifyWriteError(err error) error {
 // eventFromGoogle. All-day events use start/end date boundaries (exclusive
 // end, as the model stores); because Google rejects an all-day event whose
 // end is not after its start, such an end date is snapped to start + 1 day.
-// Timed events are written as RFC3339 UTC dateTimes with timeZone "UTC". The
+// Timed events are written as RFC3339 dateTimes in their named IANA zone. The
 // recurrence key is always present — the RRULE line of a series, or an empty
 // list so a PATCH clears the recurrence when the local file dropped its
 // RRULE.
@@ -88,13 +88,15 @@ func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
 		start = map[string]string{"date": startDay.Format(calendar.GraphDateFormat)}
 		end = map[string]string{"date": endDay.Format(calendar.GraphDateFormat)}
 	} else {
+		startZone := googleTimeZone(ev.Start)
+		endZone := googleTimeZone(ev.End)
 		start = map[string]string{
-			"dateTime": ev.Start.UTC().Format(time.RFC3339),
-			"timeZone": "UTC",
+			"dateTime": ev.Start.Format(time.RFC3339),
+			"timeZone": startZone,
 		}
 		end = map[string]string{
-			"dateTime": ev.End.UTC().Format(time.RFC3339),
-			"timeZone": "UTC",
+			"dateTime": ev.End.Format(time.RFC3339),
+			"timeZone": endZone,
 		}
 	}
 
@@ -120,14 +122,20 @@ func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
 	return body
 }
 
+func googleTimeZone(t time.Time) string {
+	if loc := t.Location(); loc != nil && loc != time.Local {
+		return loc.String()
+	}
+	return "UTC"
+}
+
 // recurrenceToGoogle renders the neutral series definition as the Calendar API
 // recurrence line list: a single RRULE line built via the shared rrule-go
 // bridge (RRULE only — Google forbids a DTSTART line, the event start carries
 // it), followed by one EXDATE line per cancelled occurrence.
 //
-// The exception dates are written as UTC instants, matching how durian stores
-// every timestamp; Google accepts a bare UTC EXDATE against a series whose
-// RRULE it resolved in another zone.
+// Timed exception dates use the recurrence's named zone; all-day exceptions
+// remain date-valued. UTC is used only when the recurrence has no usable zone.
 //
 // A nil recurrence yields an empty list, which clears the series on PATCH; a
 // recurrence outside the supported mapping is dropped the same way, with a
@@ -153,7 +161,12 @@ func recurrenceToGoogle(rec *calendar.Recurrence, exDates []time.Time, allDay bo
 		if allDay {
 			lines = append(lines, "EXDATE;VALUE=DATE:"+d.UTC().Format("20060102"))
 		} else {
-			lines = append(lines, "EXDATE:"+d.UTC().Format("20060102T150405Z"))
+			loc, err := time.LoadLocation(rec.Range.TimeZone)
+			if err == nil && loc != time.UTC {
+				lines = append(lines, "EXDATE;TZID="+rec.Range.TimeZone+":"+d.In(loc).Format("20060102T150405"))
+			} else {
+				lines = append(lines, "EXDATE:"+d.UTC().Format("20060102T150405Z"))
+			}
 		}
 	}
 	return lines

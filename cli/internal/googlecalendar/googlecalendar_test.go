@@ -28,6 +28,25 @@ func TestStatusErrorSafeLogTextOmitsResponseBody(t *testing.T) {
 	}
 }
 
+func TestGoogleTimedEventPreservesNamedZoneOnReadAndWrite(t *testing.T) {
+	dt := googleDateTime{
+		DateTime: "2026-03-22T09:00:00+01:00",
+		TimeZone: "Europe/Berlin",
+	}
+	start, allDay, err := parseGoogleTime(dt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allDay || start.Location().String() != "Europe/Berlin" || start.Hour() != 9 {
+		t.Fatalf("parsed start = %s (%s), allDay=%v", start, start.Location(), allDay)
+	}
+	body := eventToGoogle(calendar.Event{Start: start, End: start.Add(time.Hour)}, false)
+	gotStart := body["start"].(map[string]string)
+	if gotStart["timeZone"] != "Europe/Berlin" || gotStart["dateTime"] != "2026-03-22T09:00:00+01:00" {
+		t.Errorf("written start = %#v, want named Berlin wall time", gotStart)
+	}
+}
+
 // requireBearer fails the request when the static test token is missing, so
 // every endpoint asserts the Authorization header.
 func requireBearer(t *testing.T, w http.ResponseWriter, r *http.Request) bool {

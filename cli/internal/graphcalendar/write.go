@@ -31,6 +31,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"time"
+
+	"github.com/thommeo/winianatz"
 
 	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/julion2/durian/cli/internal/calendarsync"
@@ -59,8 +62,8 @@ func classifyWriteError(err error) error {
 }
 
 // EventToGraphBody builds the Graph event resource JSON for a create (POST)
-// or update (PATCH) from a parsed local Event. Start/end are written as
-// zone-less UTC dateTimes with timeZone "UTC"; all-day events use the date at
+// or update (PATCH) from a parsed local Event. Start/end retain their named
+// timezone and civil time; all-day events use the date at
 // 00:00:00 (Graph requires midnight boundaries together with isAllDay), and —
 // because Graph rejects an all-day event spanning less than one full day —
 // an all-day end date that is not after the start date is snapped to
@@ -77,6 +80,7 @@ func classifyWriteError(err error) error {
 // requested by CreateEvent via extra keys when the engine asks for one).
 func EventToGraphBody(e calendar.Event, includeAttendees bool) map[string]any {
 	var startDT, endDT string
+	startZone, endZone := "UTC", "UTC"
 	if e.AllDay {
 		// Midnight date boundaries; Graph rejects an all-day event shorter
 		// than 24h, so an end date not after the start date snaps to the
@@ -89,15 +93,15 @@ func EventToGraphBody(e calendar.Event, includeAttendees bool) map[string]any {
 		startDT = startDay.Format(calendar.GraphDateFormat) + "T00:00:00"
 		endDT = endDay.Format(calendar.GraphDateFormat) + "T00:00:00"
 	} else {
-		startDT = e.Start.UTC().Format(graphWriteDateFormat)
-		endDT = e.End.UTC().Format(graphWriteDateFormat)
+		startDT, startZone = graphWriteTime(e.Start)
+		endDT, endZone = graphWriteTime(e.End)
 	}
 
 	body := map[string]any{
 		"subject":  e.Subject,
 		"body":     map[string]string{"contentType": "text", "content": e.Description},
-		"start":    map[string]string{"dateTime": startDT, "timeZone": "UTC"},
-		"end":      map[string]string{"dateTime": endDT, "timeZone": "UTC"},
+		"start":    map[string]string{"dateTime": startDT, "timeZone": startZone},
+		"end":      map[string]string{"dateTime": endDT, "timeZone": endZone},
 		"isAllDay": e.AllDay,
 		"location": map[string]string{"displayName": e.Location},
 	}
@@ -110,7 +114,7 @@ func EventToGraphBody(e calendar.Event, includeAttendees bool) map[string]any {
 		slog.Warn("Omitting recurrence from upload: remote rule is not representable",
 			"module", "GRAPHCAL", "id", e.ID, "uid", e.ICalUID)
 	case e.Recurrence != nil:
-		body["recurrence"] = e.Recurrence
+		body["recurrence"] = recurrenceToGraph(e.Recurrence)
 	default:
 		body["recurrence"] = nil
 	}
@@ -118,6 +122,33 @@ func EventToGraphBody(e calendar.Event, includeAttendees bool) map[string]any {
 		body["attendees"] = attendeesToGraph(e.Attendees)
 	}
 	return body
+}
+
+func graphWriteTime(t time.Time) (string, string) {
+	zone := t.Location().String()
+	if zone == "" || t.Location() == time.Local {
+		return t.UTC().Format(graphWriteDateFormat), "UTC"
+	}
+	return t.Format(graphWriteDateFormat), graphWriteZone(zone)
+}
+
+func graphWriteZone(zone string) string {
+	if zone != "" && zone != "UTC" {
+		if entry, err := winianatz.FromIANAWithTerritory(zone, "001"); err == nil {
+			return entry.MicrosoftAlias
+		}
+	}
+	return zone
+}
+
+// recurrenceToGraph keeps the neutral model in IANA names while sending the
+// CLDR territory-001 Windows identifier Graph expects. Unknown/custom IANA
+// names are left untouched because Graph also accepts IANA zones on supported
+// mailbox configurations.
+func recurrenceToGraph(rec *calendar.Recurrence) *calendar.Recurrence {
+	copyRecurrence := *rec
+	copyRecurrence.Range.TimeZone = graphWriteZone(copyRecurrence.Range.TimeZone)
+	return &copyRecurrence
 }
 
 // attendeesToGraph renders the attendee list as Graph attendee resources:

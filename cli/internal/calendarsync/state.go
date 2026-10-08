@@ -28,6 +28,11 @@ import (
 // ItemStatus is the last-synced snapshot of one calendar item (keyed by its
 // iCalendar UID) on both sides.
 type ItemStatus struct {
+	// HashVersion identifies the event-content hash schema used by RemoteHash
+	// and CoreHash. Version 0 is legacy state written before recurrence zones
+	// were hashed; it is accepted only for one migration comparison and every
+	// successful baseline write upgrades it to currentHashVersion.
+	HashVersion int `json:"hash_version,omitempty"`
 	// RemoteID is the provider's event id, needed to address the remote event
 	// for future uploads/deletes. The JSON tag keeps the historical "graph_id"
 	// name so existing state files stay valid.

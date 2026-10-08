@@ -23,6 +23,7 @@ go_test(
     name = "calendarsync_test",
     size = "small",
     srcs = [
+        "adversarial_test.go",
         "corechange_test.go",
         "deltaplan_test.go",
         "downloadonly_test.go",

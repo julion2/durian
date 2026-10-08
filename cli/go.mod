@@ -15,6 +15,7 @@ require (
 	github.com/rivo/uniseg v0.4.7
 	github.com/spf13/cobra v1.10.2
 	github.com/teambition/rrule-go v1.8.2
+	github.com/thommeo/winianatz v0.0.2
 	golang.org/x/net v0.55.0
 	golang.org/x/term v0.43.0
 	golang.org/x/text v0.39.0

@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/julion2/durian/cli/internal/calendarsync"
 )
 
@@ -256,6 +257,244 @@ func TestRecreatedSameNameCalendarDoesNotClaimDeletedCollection(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestLegacyZoneHashMigrationPreservesLocalEditAndThenDetectsZoneChange(t *testing.T) {
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := remoteEvent("g1", "uid-zone", "Baseline")
+	remote.Type = "seriesMaster"
+	remote.Start = time.Date(2026, 3, 22, 9, 0, 0, 0, berlin)
+	remote.End = remote.Start.Add(time.Hour)
+	remote.Recurrence = &Recurrence{
+		Pattern: RecurrencePattern{Type: "weekly", Interval: 1, DaysOfWeek: []string{"sunday"}},
+		Range:   RecurrenceRange{Type: "noEnd", StartDate: "2026-03-22", TimeZone: "Europe/Berlin"},
+	}
+
+	// Reconstruct the pre-upgrade baseline and file: equal instants, UTC
+	// DTSTART and no recurrenceTimeZone in the content hash.
+	legacyRemote := remote
+	legacyRecurrence := *remote.Recurrence
+	legacyRecurrence.Range.TimeZone = ""
+	legacyRemote.Recurrence = &legacyRecurrence
+	legacyRemote.Start = remote.Start.UTC()
+	legacyRemote.End = remote.End.UTC()
+	calDir := t.TempDir()
+	path := writeLocalICS(t, calDir, legacyRemote)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := CalendarStatus{Items: map[string]ItemStatus{"uid-zone": {
+		RemoteID: "g1", RemoteHash: calendar.EventContentHash(legacyRemote, testOwnerEmail),
+		CoreHash: calendar.CoreContentHash(legacyRemote, testOwnerEmail), LocalHash: hashBytes(data),
+	}}}
+
+	localEdit := legacyRemote
+	localEdit.Subject = "Pending local edit"
+	writeLocalICS(t, calDir, localEdit)
+	p := &fakeProvider{events: []Event{remote}}
+	// A local file that already names a different zone is an explicit edit,
+	// not metadata to overwrite during the upgrade.
+	london, err := time.LoadLocation("Europe/London")
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitZoneEdit := localEdit
+	explicitZoneEdit.Start = localEdit.Start.In(london)
+	explicitZoneEdit.End = localEdit.End.In(london)
+	explicitRecurrence := *localEdit.Recurrence
+	explicitRecurrence.Range.TimeZone = "Europe/London"
+	explicitZoneEdit.Recurrence = &explicitRecurrence
+	writeLocalICS(t, calDir, explicitZoneEdit)
+	zonePlan, err := calendarsync.Plan(context.Background(), p, Calendar{ID: "cal1", Name: "Work"}, calDir, status)
+	if err != nil || len(zonePlan.Actions) != 1 || zonePlan.Actions[0].Kind != ActionUploadUpdate ||
+		zonePlan.Actions[0].LocalEvent.Recurrence.Range.TimeZone != "Europe/London" {
+		t.Fatalf("explicit zone edit lost during migration: actions=%+v err=%v", zonePlan.Actions, err)
+	}
+	writeLocalICS(t, calDir, localEdit)
+	plan, err := calendarsync.Plan(context.Background(), p, Calendar{ID: "cal1", Name: "Work"}, calDir, status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 1 || plan.Actions[0].Kind != ActionUploadUpdate {
+		t.Fatalf("migration plan = %+v, want pending local edit uploaded", plan.Actions)
+	}
+	if got := plan.Actions[0].LocalEvent.Recurrence.Range.TimeZone; got != "Europe/Berlin" {
+		t.Fatalf("upload recurrence zone = %q, want inherited Europe/Berlin", got)
+	}
+	if stats, err := calendarsync.Apply(context.Background(), p, plan, &status, SyncOptions{}); err != nil || stats.Uploaded != 1 || stats.Failed != 0 {
+		t.Fatalf("migration apply: stats=%+v err=%v", stats, err)
+	}
+	migrated, err := ICalToEvent(mustReadFile(t, path), testOwnerEmail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated.Subject != "Pending local edit" || migrated.Start.Location().String() != "Europe/Berlin" ||
+		migrated.Recurrence.Range.TimeZone != "Europe/Berlin" {
+		t.Fatalf("migrated local event lost edit or zone: %+v", migrated)
+	}
+	if status.Items["uid-zone"].HashVersion == 0 {
+		t.Fatal("successful migration did not version the hash baseline")
+	}
+
+	// Once versioned, a real zone-only provider change is no longer accepted
+	// through the legacy comparator; it must download as a remote change.
+	changed := remote
+	changed.Subject = localEdit.Subject
+	p.events = []Event{changed}
+	unchanged, err := calendarsync.Plan(context.Background(), p, Calendar{ID: "cal1", Name: "Work"}, calDir, status)
+	if err != nil || len(unchanged.Actions) != 0 {
+		t.Fatalf("settled migration has unexpected actions=%+v err=%v", unchanged.Actions, err)
+	}
+	changedRecurrence := *remote.Recurrence
+	changedRecurrence.Range.TimeZone = "Europe/London"
+	changed.Recurrence = &changedRecurrence
+	changed.Start = remote.Start.In(london)
+	changed.End = remote.End.In(london)
+	p.events = []Event{changed}
+	plan, err = calendarsync.Plan(context.Background(), p, Calendar{ID: "cal1", Name: "Work"}, calDir, status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 1 || plan.Actions[0].Kind != ActionDownloadUpdate {
+		t.Fatalf("post-migration zone change plan = %+v, want download-update", plan.Actions)
+	}
+}
+
+func TestLegacyGoogleDateBoundaryMigrationPreservesPendingEdit(t *testing.T) {
+	for _, tc := range []struct {
+		zone, oldStart, oldEnd, rangeType string
+		hour                              int
+	}{
+		{"America/Los_Angeles", "2026-03-23", "2026-04-06", "endDate", 23},
+		{"Europe/Berlin", "2026-03-21", "2026-04-05", "endDate", 0},
+		{"America/Los_Angeles", "2026-03-23", "", "noEnd", 23},
+		{"Europe/Berlin", "2026-03-21", "", "noEnd", 0},
+	} {
+		t.Run(tc.zone+"/"+tc.rangeType, func(t *testing.T) {
+			loc, err := time.LoadLocation(tc.zone)
+			if err != nil {
+				t.Fatal(err)
+			}
+			remote := remoteEvent("master", "date-boundary", "Unchanged remote")
+			remote.Start = time.Date(2026, 3, 22, tc.hour, 30, 0, 0, loc)
+			remote.End = remote.Start.Add(time.Hour)
+			remote.Attendees = []Attendee{{Email: "other@example.com", Type: "required", Response: "none"}}
+			remote.Recurrence = &Recurrence{
+				Pattern: RecurrencePattern{Type: "weekly", Interval: 1, DaysOfWeek: []string{"sunday"}},
+				Range:   RecurrenceRange{Type: tc.rangeType, StartDate: "2026-03-22", TimeZone: tc.zone},
+			}
+			if tc.rangeType == "endDate" {
+				remote.Recurrence.Range.EndDate = "2026-04-05"
+			}
+			// Before the upgrade Google's RRULE was decoded using UTC start
+			// and UNTIL dates, unlike Graph's directly supplied civil dates.
+			legacy := remote
+			legacy.Start, legacy.End = remote.Start.UTC(), remote.End.UTC()
+			oldRecurrence := *remote.Recurrence
+			oldRecurrence.Range = RecurrenceRange{Type: tc.rangeType, StartDate: tc.oldStart, EndDate: tc.oldEnd}
+			legacy.Recurrence = &oldRecurrence
+			dir := t.TempDir()
+			path := writeLocalICS(t, dir, legacy)
+			status := CalendarStatus{Items: map[string]ItemStatus{remote.ICalUID: {
+				RemoteID: remote.ID, RemoteHash: calendar.EventContentHash(legacy, testOwnerEmail),
+				CoreHash: calendar.CoreContentHash(legacy, testOwnerEmail), LocalHash: hashBytes(mustReadFile(t, path)),
+			}}}
+			legacy.Subject = "Pending local edit"
+			writeLocalICS(t, dir, legacy)
+			p := &fakeProvider{events: []Event{remote}}
+			plan, err := calendarsync.Plan(t.Context(), p, Calendar{ID: "cal1", Name: "Work"}, dir, status)
+			if tc.rangeType == "endDate" {
+				if err != nil || len(plan.Actions) != 1 || plan.Actions[0].Kind != ActionConflict {
+					t.Fatalf("ambiguous end-date migration must conflict: actions=%+v err=%v", plan.Actions, err)
+				}
+				// A real remote end-date edit can match the old UTC date.
+				// It must never become a silent local-wins upload on upgrade.
+				remote.Recurrence.Range.EndDate = tc.oldEnd
+				plan, err = calendarsync.Plan(t.Context(), p, Calendar{ID: "cal1", Name: "Work"}, dir, status)
+				if err != nil || len(plan.Actions) != 1 || plan.Actions[0].Kind != ActionConflict {
+					t.Fatalf("remote range edit mistaken for migration: actions=%+v err=%v", plan.Actions, err)
+				}
+				stats, err := calendarsync.Apply(t.Context(), p, plan, &status, SyncOptions{})
+				if err != nil || stats.Conflicts != 1 || stats.Failed != 0 || len(p.updateSpecs) != 0 || len(p.responds) != 0 {
+					t.Fatalf("ambiguous migration mutated provider: stats=%+v err=%v", stats, err)
+				}
+				backups, err := filepath.Glob(path + ".conflict-*")
+				if err != nil || len(backups) != 1 {
+					t.Fatalf("pending edit not backed up: paths=%v err=%v", backups, err)
+				}
+				backup, err := ICalToEvent(mustReadFile(t, backups[0]), testOwnerEmail)
+				if err != nil || backup.Subject != legacy.Subject || backup.Recurrence.Range.EndDate != tc.oldEnd {
+					t.Fatalf("backup lost pending edit: %+v err=%v", backup, err)
+				}
+				return
+			}
+			if err != nil || len(plan.Actions) != 1 || plan.Actions[0].Kind != ActionUploadUpdate {
+				t.Fatalf("date-boundary migration lost pending edit: actions=%+v err=%v", plan.Actions, err)
+			}
+			upload := plan.Actions[0].LocalEvent
+			if upload.Subject != legacy.Subject || upload.Recurrence.Range != remote.Recurrence.Range {
+				t.Fatalf("migration changed local edit or recurrence dates: subject=%q range=%+v", upload.Subject, upload.Recurrence.Range)
+			}
+			// An unrelated attendee's new RSVP must not disable the migration
+			// of our pending content edit or upload the old UTC series again.
+			p.events[0].Attendees = []Attendee{{Email: "other@example.com", Type: "required", Response: "accepted"}}
+			plan, err = calendarsync.Plan(t.Context(), p, Calendar{ID: "cal1", Name: "Work"}, dir, status)
+			if err != nil || len(plan.Actions) != 1 || plan.Actions[0].Kind != ActionUploadUpdate ||
+				plan.Actions[0].LocalEvent.Recurrence.Range != remote.Recurrence.Range {
+				t.Fatalf("remote RSVP broke date migration: actions=%+v err=%v", plan.Actions, err)
+			}
+			stats, err := calendarsync.Apply(t.Context(), p, plan, &status, SyncOptions{})
+			if err != nil || stats.Uploaded != 1 || stats.Failed != 0 {
+				t.Fatalf("migration apply: stats=%+v err=%v", stats, err)
+			}
+			got, err := ICalToEvent(mustReadFile(t, path), testOwnerEmail)
+			if err != nil || got.Subject != legacy.Subject || got.Recurrence.Range != remote.Recurrence.Range {
+				t.Fatalf("migration persisted wrong event: %+v err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestLegacyHashMigrationPreservesPendingOwnerRSVP(t *testing.T) {
+	remote := remoteEvent("meeting", "uid-rsvp-upgrade", "Invitation")
+	remote.Organizer = &Person{Email: "organizer@example.com"}
+	remote.Attendees = []Attendee{{Email: testOwnerEmail, Type: "required", Response: "none"}}
+	dir := t.TempDir()
+	path := writeLocalICS(t, dir, remote)
+	status := CalendarStatus{Items: map[string]ItemStatus{remote.ICalUID: {
+		RemoteID: remote.ID, RemoteHash: calendar.EventContentHash(remote, testOwnerEmail),
+		CoreHash: calendar.CoreContentHash(remote, testOwnerEmail), LocalHash: hashBytes(mustReadFile(t, path)),
+	}}}
+	local := remote
+	local.OwnerResponse = calendarsync.OwnerRespAccepted
+	local.Attendees = []Attendee{{Email: testOwnerEmail, Type: "required", Response: "accepted"}}
+	writeLocalICS(t, dir, local)
+	p := &fakeProvider{events: []Event{remote}}
+	plan, err := calendarsync.Plan(t.Context(), p, Calendar{ID: "cal1", Name: "Work"}, dir, status)
+	if err != nil || len(plan.Actions) != 1 || plan.Actions[0].Kind != calendarsync.ActionRsvp || !plan.Actions[0].RsvpCall {
+		t.Fatalf("pending RSVP erased by hash upgrade: actions=%+v err=%v", plan.Actions, err)
+	}
+	stats, err := calendarsync.Apply(t.Context(), p, plan, &status, SyncOptions{})
+	if err != nil || stats.Rsvps != 1 || stats.Failed != 0 || p.responds[remote.ID] != calendarsync.OwnerRespAccepted {
+		t.Fatalf("RSVP migration: stats=%+v responds=%v err=%v", stats, p.responds, err)
+	}
+	got, err := ICalToEvent(mustReadFile(t, path), testOwnerEmail)
+	if err != nil || got.OwnerResponse != calendarsync.OwnerRespAccepted || status.Items[remote.ICalUID].HashVersion == 0 {
+		t.Fatalf("local RSVP or migrated baseline lost: response=%v status=%+v err=%v", got.OwnerResponse, status.Items[remote.ICalUID], err)
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func TestRemoteCalendarDeletionPrunesUnchangedCollection(t *testing.T) {

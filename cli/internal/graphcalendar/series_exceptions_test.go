@@ -63,6 +63,19 @@ const seriesWithExceptionPage = `{
 
 func TestFetchMasterEventsFoldsExceptions(t *testing.T) {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/me/events/evt-series", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// The direct master read has the same master fields and no cancelled
+		// occurrences; modified occurrences still come from the list.
+		_, _ = w.Write([]byte(`{
+			"id":"evt-series","iCalUId":"ical-series","subject":"Standup",
+			"body":{"contentType":"text","content":"series body"},
+			"start":{"dateTime":"2026-08-03T09:00:00.0000000","timeZone":"UTC"},
+			"end":{"dateTime":"2026-08-03T10:00:00.0000000","timeZone":"UTC"},
+			"type":"seriesMaster","changeKey":"ck-series","lastModifiedDateTime":"2026-08-01T09:00:00Z",
+			"recurrence":{"pattern":{"type":"weekly","interval":1,"daysOfWeek":["monday"]},
+			"range":{"type":"noEnd","startDate":"2026-08-03"}},"cancelledOccurrences":[]}`))
+	})
 	mux.HandleFunc("/me/calendars/cal1/events", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 			t.Errorf("Authorization = %q, want bearer test-token", got)
