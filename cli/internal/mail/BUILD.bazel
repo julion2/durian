@@ -20,6 +20,7 @@ go_test(
     name = "mail_test",
     size = "small",
     srcs = [
+        "adversarial_test.go",
         "attachment_test.go",
         "identity_test.go",
         "parser_test.go",
