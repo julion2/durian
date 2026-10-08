@@ -33,27 +33,28 @@ struct EmailDetailView: View {
 
     @State private var messageHeights: [String: CGFloat] = [:]  // Use message ID as key
     @State private var detailScrollView: NSScrollView?
+    @State private var scrollPosition = ScrollPosition(idType: String.self)
 
     // MARK: - Body
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 16) {
-                    ScrollViewFinder(scrollView: $detailScrollView)
-                        .frame(height: 0)
-                        .id("thread-top")
-                    headerSection
-                    messageCards
-                }
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 16) {
+                ScrollViewFinder(scrollView: $detailScrollView)
+                    .frame(height: 0)
+                headerSection
+                messageCards
             }
-            .onChange(of: focusedMessageIndex) { _, newIndex in
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    if newIndex == 0 {
-                        proxy.scrollTo("thread-top", anchor: .top)
-                    } else {
-                        proxy.scrollTo("msg-\(newIndex)", anchor: .top)
-                    }
+            .scrollTargetLayout()
+        }
+        // Keep the semantic target as lazy cards replace estimated heights.
+        .scrollPosition($scrollPosition)
+        .onChange(of: focusedMessageIndex) { _, newIndex in
+            withAnimation(.easeInOut(duration: 0.15)) {
+                if newIndex == 0 {
+                    scrollPosition.scrollTo(edge: .top)
+                } else {
+                    scrollPosition.scrollTo(id: "msg-\(newIndex)", anchor: .top)
                 }
             }
         }
@@ -66,16 +67,10 @@ struct EmailDetailView: View {
             scrollBy(-80)
         }
         .onReceive(NotificationCenter.default.publisher(for: .threadScrollToTop)) { _ in
-            guard let sv = detailScrollView else { return }
-            sv.contentView.setBoundsOrigin(.zero)
-            sv.reflectScrolledClipView(sv.contentView)
+            scrollPosition.scrollTo(edge: .top)
         }
         .onReceive(NotificationCenter.default.publisher(for: .threadScrollToBottom)) { _ in
-            guard let sv = detailScrollView,
-                  let docView = sv.documentView else { return }
-            let maxY = max(docView.frame.height - sv.contentView.bounds.height, 0)
-            sv.contentView.setBoundsOrigin(NSPoint(x: 0, y: maxY))
-            sv.reflectScrolledClipView(sv.contentView)
+            scrollPosition.scrollTo(edge: .bottom)
         }
         .onAppear {
             // Auto-load body if not loaded
