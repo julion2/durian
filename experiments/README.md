@@ -217,6 +217,44 @@ Keyboard behavior is therefore verified independently, not full accessibility
 acceptance. No retry was performed. Full clipboard Item/Type/Data restoration,
 own-process exit and private-source/cache/runtime cleanup were confirmed.
 
+**Orb-only accessibility follow-up (no further Mac run):** two separate causes
+were found in the exact Cargo.lock releases; downloaded crate checksums matched
+the lockfile.
+
+- **Command names are app-owned.** Durian's icon-only `command` helper set a
+  tooltip, not an accessible name. GPUI Component 0.6.4 derives button names
+  from `accessibility_label` or the visible `label`, never the tooltip
+  ([implementation](https://github.com/longbridge/gpui-kit/blob/3c387ae0a3e9b14ee39fe98be2b51a882800aa16/crates/component/src/button/button.rs#L694-L697)).
+  The helper now uses the existing label for both. On an isolated Linux
+  Xvfb/D-Bus session, AT-SPI found zero named Search buttons before the fix and
+  exactly one afterward; its `click` action opened the `Search all mail` entry.
+  `cargo build --locked` and tests passed (32 passed, 2 ignored). This verifies
+  the shared name and action path, not the new macOS AXTitle/AXPress result.
+- **Editor accessibility focus is library-owned.** Component `Input` attaches
+  `Role::TextInput` and the name/value to an outer frame tracking a private
+  `frame_focus_handle`, not the input state's actual keyboard focus handle
+  ([frame](https://github.com/longbridge/gpui-kit/blob/3c387ae0a3e9b14ee39fe98be2b51a882800aa16/crates/component/src/input/input.rs#L619-L691)).
+  The inner `InputBaseState` tracks the real handle with `id("input-state")`
+  but no accessibility role
+  ([editor](https://github.com/longbridge/gpui-kit/blob/3c387ae0a3e9b14ee39fe98be2b51a882800aa16/crates/base/src/input/base/state.rs#L4174-L4177)).
+  GPUI 0.3.5 only reports focus on an existing node; otherwise its
+  [tree builder](https://docs.rs/crate/gpui-pre/0.3.5/source/src/window/a11y.rs)
+  falls back to the window root. The Linux run logged `search.focus=true` and
+  `focused element ... has an id but no role`; AT-SPI focus stayed false.
+  GPUI forwards that `TreeUpdate` to AccessKit macOS. AccessKit's
+  [focus resolver](https://github.com/AccessKit/accesskit/blob/c88605b96d04431f9c3c792464a0f2f253480e94/platforms/macos/src/adapter.rs#L248-L263)
+  returns no focused child for a window-root focus, consistent with the earlier
+  AXWindow result. This gap exists before AppKit, not only in the Mac harness.
+
+No input-focus workaround, dependency patch or version change was made. The
+appropriate next step is a GPUI Kit regression test and fix associating the
+editable accessibility node with the real editor focus, without duplicating
+keyboard-focus handles or breaking suffix/clear-button navigation. Prefer a
+verified upstream release; a pinned dependency patch needs separate approval
+and platform verification. The orb's extra AT-SPI `EditableText` probe found
+that interface unavailable; it did not verify accessible text editing. Native
+macOS confirmation of the button fix also requires a separately approved run.
+
 The tested helpers are preserved in `gpui-kit/verification/`. In an agreed Mac
 UI-test window, `gpui-kit/verify-macos.sh /tmp/gpui-…/target/debug/durian-gpui-kit`
 copies them into private `/tmp/gpui-*` storage, compiles the Swift helper, and

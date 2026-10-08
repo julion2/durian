@@ -122,6 +122,7 @@ fn command(id: &'static str, icon: IconName, label: &'static str, action: impl A
         .ghost()
         .small()
         .icon(icon)
+        .accessibility_label(label)
         .tooltip(label)
         .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
 }
