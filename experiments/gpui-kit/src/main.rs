@@ -11,6 +11,9 @@ mod compose;
 mod content;
 #[path = "../../gpui/src/data.rs"]
 mod data;
+// Backend state is verified independently before enabling composer writes.
+#[allow(dead_code)]
+mod delivery;
 mod demo;
 mod picker;
 
