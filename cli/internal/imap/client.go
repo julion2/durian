@@ -2,6 +2,7 @@ package imap
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -85,6 +86,7 @@ var defaultRoleFallbacks = map[SpecialUseRole][]string{
 type Client struct {
 	account          *config.AccountConfig
 	conn             *client.Client
+	transport        net.Conn
 	timeout          time.Duration
 	fetchGmailLabels bool // When true, include X-GM-LABELS in FETCH requests
 }
@@ -99,11 +101,18 @@ func NewClient(account *config.AccountConfig) *Client {
 
 // Connect establishes a TLS connection to the IMAP server
 func (c *Client) Connect() error {
+	return c.ConnectContext(context.Background())
+}
+
+// ConnectContext includes dialing, TLS negotiation and the server greeting in
+// the caller's cancellation scope. As with commands, callers serialize access
+// to this client; cancellation closes only the captured transport.
+func (c *Client) ConnectContext(ctx context.Context) error {
 	addr := net.JoinHostPort(c.account.IMAP.Host, strconv.Itoa(c.account.IMAP.Port))
 
 	// Connect with timeout
 	dialer := &net.Dialer{Timeout: c.timeout}
-	conn, err := dialer.Dial("tcp", addr)
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to connect to %s: %w", addr, err)
 	}
@@ -120,15 +129,48 @@ func (c *Client) Connect() error {
 		ServerName: c.account.IMAP.Host,
 	}
 	tlsConn := tls.Client(conn, tlsConfig)
+	c.transport = tlsConn
 
 	// Create IMAP client
-	c.conn, err = client.New(tlsConn)
+	err = c.WithContext(ctx, func() error {
+		var err error
+		c.conn, err = client.New(tlsConn)
+		return err
+	})
 	if err != nil {
-		conn.Close()
+		_ = tlsConn.Close()
 		return imapServerError(fmt.Errorf("failed to create IMAP client: %w", err), "create IMAP client failed")
 	}
 
 	return nil
+}
+
+// WithContext interrupts blocking protocol I/O by closing its exact transport.
+// op must drain its response channels and must not reconnect; the callback is
+// stopped or joined before the caller can reuse/reconnect the client. This is
+// not a license to run concurrent commands on go-imap's selected mailbox.
+func (c *Client) WithContext(ctx context.Context, op func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	transport := c.transport
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(done)
+		if transport != nil {
+			_ = transport.Close()
+		}
+	})
+	defer func() {
+		if !stop() {
+			<-done
+		}
+	}()
+	err := op()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 // Authenticate authenticates with the IMAP server using OAuth2 or password
@@ -1116,15 +1158,16 @@ func (c *Client) Close() error {
 	if c.conn == nil {
 		return nil
 	}
+	// go-imap Close sends the mailbox CLOSE command (including EXPUNGE).
+	// Terminate closes the socket and does not mutate mailbox contents.
+	defer func() { _ = c.conn.Terminate() }()
 
 	// Logout gracefully
 	if err := c.conn.Logout(); err != nil {
-		// Still try to close the connection
-		c.conn.Close()
 		return imapServerError(err, "IMAP logout failed")
 	}
 
-	return c.conn.Close()
+	return nil
 }
 
 // IsConnected returns true if the connection is still alive
@@ -1138,19 +1181,28 @@ func (c *Client) IsConnected() bool {
 
 // Reconnect closes the current connection and establishes a new one
 func (c *Client) Reconnect() error {
+	return c.ReconnectContext(context.Background())
+}
+
+// ReconnectContext abandons the old transport without a protocol command and
+// connects/authenticates within ctx. It must run after WithContext returns.
+func (c *Client) ReconnectContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Close existing connection if any
 	if c.conn != nil {
-		c.conn.Close()
+		_ = c.conn.Terminate()
 		c.conn = nil
 	}
 
 	// Connect and authenticate
-	if err := c.Connect(); err != nil {
+	if err := c.ConnectContext(ctx); err != nil {
 		return fmt.Errorf("reconnect failed: %w", err)
 	}
 
-	if err := c.Authenticate(); err != nil {
-		c.Close()
+	if err := c.WithContext(ctx, c.Authenticate); err != nil {
+		_ = c.conn.Terminate()
 		return fmt.Errorf("reconnect auth failed: %w", err)
 	}
 
