@@ -40,10 +40,54 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 // MARK: - App Lifecycle Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Nightly-only main-thread stall detector (no-op in release). Owned by
+    /// the delegate so it lives exactly as long as the app. It runs only while
+    /// the app is active and awake so sleep/background never reads as a stall.
+    private let uiHeartbeat = UIHeartbeat(diagnostics: .shared)
+    private var isSystemAsleep = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard NightlyDiagnostics.shared.isEnabled else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(self, selector: #selector(systemWillSleep), name: NSWorkspace.willSleepNotification, object: nil)
+        center.addObserver(self, selector: #selector(systemDidWake), name: NSWorkspace.didWakeNotification, object: nil)
+        updateHeartbeat()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        updateHeartbeat()
+    }
+
+    func applicationDidResignActive(_ notification: Notification) {
+        uiHeartbeat.stop()
+    }
+
+    @objc private func systemWillSleep(_ notification: Notification) {
+        isSystemAsleep = true
+        uiHeartbeat.stop()
+    }
+
+    @objc private func systemDidWake(_ notification: Notification) {
+        isSystemAsleep = false
+        updateHeartbeat()
+    }
+
+    /// AppKit delivers app-delegate and NSWorkspace sleep/wake notifications on
+    /// the main thread.
+    private func updateHeartbeat() {
+        let isActive = MainActor.assumeIsolated { NSApp.isActive }
+        if isActive && !isSystemAsleep {
+            uiHeartbeat.start()
+        } else {
+            uiHeartbeat.stop()
+        }
+    }
+
     /// Terminate the child `durian serve` on a normal app quit so it never
     /// orphans and holds the port. Force-quit / crash is covered server-side by
     /// serve's --exit-when-orphaned poll.
     func applicationWillTerminate(_ notification: Notification) {
+        uiHeartbeat.stop()
         MainActor.assumeIsolated {
             AccountManager.shared.emailBackend?.terminateServerSync()
         }

@@ -530,16 +530,35 @@ class EmailBackend: ObservableObject, SearchBackend, OutboxBackend {
         var status = "Error"
         defer { signposter.endInterval("Request", state, "\(status)") }
 
+        // Nightly diagnostics: static route category, outcome, HTTP status and
+        // duration only — never the endpoint, IDs, query or error text.
+        let diagnosticOperation = DiagnosticOperation.http(method: method, endpoint: endpoint)
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        var diagnosticOutcome = DiagnosticOutcome.transportError
+        var httpStatus = 0
+        defer {
+            NightlyDiagnostics.shared.record(
+                diagnosticOperation, diagnosticOutcome, status: httpStatus,
+                durationMs: NightlyDiagnostics.elapsedMilliseconds(since: startedAt)
+            )
+        }
+
         do {
-            let (data, _) = try await session.data(for: request)
+            let (data, urlResponse) = try await session.data(for: request)
+            httpStatus = (urlResponse as? HTTPURLResponse)?.statusCode ?? 0
+            let isHTTPSuccess = httpStatus == 0 || (200...299).contains(httpStatus)
+            diagnosticOutcome = isHTTPSuccess ? .decodeError : .httpError
             let response = try decoder.decode(T.self, from: data)
             status = "OK"
+            diagnosticOutcome = isHTTPSuccess ? .ok : .httpError
             return response
         } catch is CancellationError {
             status = "Cancelled"
+            diagnosticOutcome = .cancelled
             return nil
         } catch let error as URLError where error.code == .cancelled {
             status = "Cancelled"
+            diagnosticOutcome = .cancelled
             return nil
         } catch {
             Log.error("BACKEND", "Request to \(endpoint) failed: \(error)")

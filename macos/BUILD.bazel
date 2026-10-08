@@ -273,6 +273,13 @@ swift_test(
     deps = [":durian_testlib"],
 )
 
+swift_test(
+    name = "nightly_diagnostics_test",
+    size = "small",
+    srcs = ["tests/NightlyDiagnosticsTests.swift"],
+    deps = [":durian_testlib"],
+)
+
 genrule(
     name = "StampedInfoPlist",
     srcs = ["Info.plist"],
