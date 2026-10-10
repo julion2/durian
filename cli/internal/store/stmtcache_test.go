@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -60,28 +61,38 @@ func TestStmtCache_BadQueryIsNotCached(t *testing.T) {
 	}
 }
 
-// Searches run concurrently from the HTTP handlers.
+// Distinct query shapes exceed the cache capacity while other HTTP searches
+// are starting. Eviction must not close a statement before its query starts.
 func TestStmtCache_ConcurrentSearches(t *testing.T) {
 	db := seedSearchDB(t)
 	var wg sync.WaitGroup
-	errs := make(chan error, 64)
-	for i := 0; i < 16; i++ {
+	start := make(chan struct{})
+	for i := range 240 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			for _, q := range []string{"tag:inbox", "tag:unread", "from:alice", "tag:inbox AND NOT tag:unread"} {
-				if _, err := db.Search(q, 10+i); err != nil {
-					errs <- err
+			<-start
+			q := strings.Repeat("NOT ", i) + "from:alice"
+			want := 3 // Alice appears in three threads; Bob/Charlie in two.
+			if i%2 != 0 {
+				want = 2
+			}
+			for range 20 {
+				count, err := db.SearchCount(q)
+				if err != nil {
+					t.Errorf("SearchCount with %d negations: %v", i, err)
+				} else if count != want {
+					t.Errorf("SearchCount with %d negations: %d threads, want %d", i, count, want)
 				}
-				if _, err := db.SearchCount(q); err != nil {
-					errs <- err
-				}
+			}
+			results, err := db.Search(q, 50)
+			if err != nil {
+				t.Errorf("Search with %d negations: %v", i, err)
+			} else if len(results) != want {
+				t.Errorf("Search with %d negations: %d threads, want %d", i, len(results), want)
 			}
 		}(i)
 	}
+	close(start)
 	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Error(err)
-	}
 }
