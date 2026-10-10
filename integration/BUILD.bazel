@@ -9,6 +9,7 @@ sh_test(
     ],
     data = [
         "testdata/config.pkl",
+        "testdata/profiles.pkl",
         "//cli/cmd/durian",
         "//cli/cmd/testseeder",
     ],

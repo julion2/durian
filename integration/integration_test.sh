@@ -162,6 +162,17 @@ assert_jq "GET /tags .tags is array" "$RESP" '.tags | type == "array"'
 assert_jq "GET /tags .tags contains inbox" "$RESP" '.tags | index("inbox") != null'
 
 # ─────────────────────────────────────────────
+# 4b. Profiles (profiles.pkl beside the -c config, accounts resolved)
+# ─────────────────────────────────────────────
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/profiles")
+assert_jq "GET /profiles .ok is true" "$RESP" '.ok == true'
+assert_jq "GET /profiles has both profiles" "$RESP" '[.profiles[].name] == ["All", "Test"]'
+assert_jq "GET /profiles * expands to all accounts" "$RESP" '.profiles[0].all_accounts == true and .profiles[0].accounts[0].email == "test@example.com"'
+assert_jq "GET /profiles standard folders evaluated" "$RESP" '.profiles[0].folders | length > 0 and all(.query | type == "string")'
+assert_jq "GET /profiles alias resolves to the account" "$RESP" '.profiles[1].accounts == [{"name":"Test","email":"test@example.com","alias":"test","default":true}]'
+assert_jq "GET /profiles keeps transport settings out" "$RESP" 'tostring | (contains("smtp.example.com") or contains("imap.example.com")) | not'
+
+# ─────────────────────────────────────────────
 # 5. Show thread (DurianResponse + ThreadContent + ThreadMessage)
 # ─────────────────────────────────────────────
 THREAD_ID=$(curl -sf "${AUTH[@]}" "$BASE/search?query=tag:inbox&limit=1" | jq -r '.results[0].thread_id')

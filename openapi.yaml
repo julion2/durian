@@ -113,6 +113,28 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TagsResponse'
+  /profiles:
+    get:
+      summary: List the profiles from profiles.pkl, with their accounts resolved
+      description: >-
+        Profiles group accounts and carry their own folders (a name, an icon and
+        a query). Account references are resolved against config.pkl by name,
+        alias or address, and "*" expands to every account. A reference that
+        matches no account comes back by name only. Credentials and transport
+        settings are never included. The file is read per request, so an edit
+        applies without a restart. If profiles.pkl doesn't exist, the list is
+        empty.
+      responses:
+        '200':
+          description: The profiles, and every configured account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfilesResponse'
+        '500':
+          description: profiles.pkl could not be evaluated
+        '503':
+          description: config.pkl is not loaded
   /local-drafts:
     get:
       summary: List all local crash-recovery drafts
@@ -801,6 +823,70 @@ components:
           type: array
           items:
             type: string
+    ProfilesResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        profiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Profile'
+        accounts:
+          type: array
+          description: Every configured account, in config order
+          items:
+            $ref: '#/components/schemas/ProfileAccount'
+    Profile:
+      type: object
+      required: [name, accounts, folders]
+      properties:
+        name:
+          type: string
+        default:
+          type: boolean
+        color:
+          type: string
+          description: Color as "#RRGGBB" (omitted when none)
+        all_accounts:
+          type: boolean
+          description: The profile is written as accounts = { "*" }
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProfileAccount'
+        folders:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProfileFolder'
+    ProfileAccount:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: The account name; scope searches with path:<name>/**
+        display_name:
+          type: string
+        email:
+          type: string
+          description: Omitted for a reference that matches no configured account
+        alias:
+          type: string
+        default:
+          type: boolean
+    ProfileFolder:
+      type: object
+      required: [name, query]
+      properties:
+        name:
+          type: string
+        icon:
+          type: string
+          description: An SF Symbols name
+        query:
+          type: string
+          description: A search query, as for /search
     TagRequest:
       type: object
       properties:
