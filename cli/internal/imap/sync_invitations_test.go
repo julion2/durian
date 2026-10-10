@@ -310,15 +310,16 @@ func TestFillInvitations_StalledServerAndSkippedModes(t *testing.T) {
 				<-done
 				t.Fatal("catch-up remained blocked beyond its budget")
 			}
-			if mode == "deadline" {
+			switch mode {
+			case "deadline":
 				if line := <-command; !strings.Contains(line, "SELECT") {
 					t.Fatalf("expected a stalled SELECT, got %q", line)
 				}
-			} else if mode == "backlog" {
+			case "backlog":
 				if err := conn.Noop(); err != nil {
 					t.Fatalf("budget expiry killed the responsive caller-owned connection: %v", err)
 				}
-			} else {
+			default:
 				select {
 				case line := <-command:
 					t.Fatalf("skipped catch-up sent %q", line)
