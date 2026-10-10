@@ -788,7 +788,12 @@ func (d *DB) fieldToSQL(f *fieldExpr) (string, []interface{}, error) {
 			[]interface{}{"subject_tok:(" + toks + ")"}, nil
 
 	case "tag":
-		return "EXISTS (SELECT 1 FROM tags WHERE tags.message_id = m.id AND tags.tag = ?)",
+		// Uncorrelated on purpose: SQLite evaluates the subquery once through
+		// idx_tags_tag and looks the messages up by rowid. The correlated
+		// EXISTS form scanned every message and probed tags per row, a fixed
+		// 100-500 ms on large mailboxes (seconds with a cold page cache),
+		// whatever the limit.
+		return "m.id IN (SELECT message_id FROM tags WHERE tag = ?)",
 			[]interface{}{f.value}, nil
 
 	case "date":

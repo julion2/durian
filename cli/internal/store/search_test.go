@@ -895,3 +895,38 @@ func TestPostDecryptFilterORMixedDropsCollision(t *testing.T) {
 		t.Errorf("kept a collision candidate: got %v, want [%d] (bob is neither from alice nor contains hawaii)", got, alice.ID)
 	}
 }
+
+// A tag query must start from the tag index, not scan every message: the
+// scan cost a fixed 100-500 ms per search on a real mailbox.
+func TestSearch_TagQueryUsesTagIndex(t *testing.T) {
+	db := seedSearchDB(t)
+	for _, query := range []string{"tag:inbox", "tag:inbox AND NOT tag:sent", "tag:inbox AND from:alice"} {
+		where, params, _, _, err := db.parseQueryWithTerms(query)
+		if err != nil {
+			t.Fatalf("parse %q: %v", query, err)
+		}
+		rows, err := db.db.Query("EXPLAIN QUERY PLAN SELECT m.id FROM messages m WHERE "+where, params...)
+		if err != nil {
+			t.Fatalf("plan %q: %v", query, err)
+		}
+		var plan []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				t.Fatalf("scan plan: %v", err)
+			}
+			plan = append(plan, detail)
+		}
+		rows.Close()
+		joined := strings.Join(plan, " | ")
+		if !strings.Contains(joined, "idx_tags_tag") {
+			t.Errorf("%q: plan doesn't use idx_tags_tag: %s", query, joined)
+		}
+		for _, step := range plan {
+			if strings.HasPrefix(step, "SCAN m") {
+				t.Errorf("%q: plan scans messages: %s", query, joined)
+			}
+		}
+	}
+}
