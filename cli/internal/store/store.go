@@ -25,6 +25,8 @@ type DB struct {
 	accountAliases map[string]string
 	ingestLocks    *ingestLocks
 	syncLocks      *accountSyncLocks
+	// stmts keeps prepared statements for queries that repeat (searches)
+	stmts stmtCache
 }
 
 // SetAccountAliases configures user-facing account identifiers (aliases,
@@ -249,6 +251,7 @@ func freelistTriggersVacuum(pageCount, freelist int64) bool {
 
 // Close closes the database connection.
 func (d *DB) Close() error {
+	d.stmts.close()
 	return d.db.Close()
 }
 

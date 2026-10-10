@@ -1,6 +1,7 @@
 package store
 
 import (
+	"cmp"
 	"database/sql"
 	"fmt"
 	"slices"
@@ -28,7 +29,7 @@ func (d *DB) SearchCount(query string) (int, error) {
 			q += " WHERE " + where
 		}
 		var count int
-		if err := d.db.QueryRow(q, params...).Scan(&count); err != nil {
+		if err := d.queryRow(q, params...).Scan(&count); err != nil {
 			return 0, fmt.Errorf("search count: %w", err)
 		}
 		return count, nil
@@ -148,30 +149,10 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 	// picked lexicographically max subject which approximated "the
 	// Re: variant"; the latest-by-date subquery here is a closer
 	// match to what mail clients show as the thread title.
-	q := `
-		SELECT
-			m.thread_id,
-			(SELECT m3.subject_ct FROM messages m3
-			 WHERE m3.thread_id = m.thread_id
-			 ORDER BY m3.date DESC LIMIT 1) AS subject_ct,
-			GROUP_CONCAT(DISTINCT m.from_addr) AS authors,
-			MAX(m.date) AS max_date,
-			(SELECT m2.to_addrs FROM messages m2
-			 WHERE m2.thread_id = m.thread_id
-			 ORDER BY m2.date DESC LIMIT 1) AS recipients
-		FROM messages m
-	`
-	if where != "" {
-		q += " WHERE " + where
-	}
-	q += `
-		GROUP BY m.thread_id
-		ORDER BY max_date DESC
-		LIMIT ?
-	`
+	q := searchPageQuery(where)
 	params = append(params, limit)
 
-	rows, err := d.db.Query(q, params...)
+	rows, err := d.query(q, params...)
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
 	}
@@ -199,6 +180,13 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 		return nil, fmt.Errorf("iterate search results: %w", err)
 	}
 	rows.Close()
+	// the page's order, as the CTE chose it: newest first, ties by thread
+	slices.SortFunc(results, func(a, b SearchResult) int {
+		if a.Timestamp != b.Timestamp {
+			return cmp.Compare(b.Timestamp, a.Timestamp)
+		}
+		return strings.Compare(a.Thread, b.Thread)
+	})
 
 	// Fetch tags for all threads in one batch query instead of per-thread.
 	// Scope to queried accounts so cross-account threads only show
@@ -255,6 +243,45 @@ func (d *DB) resolveAccountIDs(names []string) ([]int64, error) {
 		out = append(out, id)
 	}
 	return out, nil
+}
+
+// searchPageQuery is Search's query: the page first – which threads, newest
+// first – then the per-thread columns for those threads only. Computed in one
+// SELECT, the latest subject and recipients ran for every matching thread
+// (two lookups each, a thousand threads for an inbox) before LIMIT cut to the
+// page. thread_id breaks ties, so a page is deterministic. The rows come back
+// unordered: Search sorts the page in Go, which costs nothing for one page and
+// spares SQLite a second sorter (measurable on small, selective searches). The
+// last parameter is the limit.
+func searchPageQuery(where string) string {
+	q := `
+		WITH page AS (
+			SELECT
+				m.thread_id,
+				GROUP_CONCAT(DISTINCT m.from_addr) AS authors,
+				MAX(m.date) AS max_date
+			FROM messages m
+	`
+	if where != "" {
+		q += " WHERE " + where
+	}
+	return q + `
+			GROUP BY m.thread_id
+			ORDER BY max_date DESC, m.thread_id
+			LIMIT ?
+		)
+		SELECT
+			p.thread_id,
+			(SELECT m3.subject_ct FROM messages m3
+			 WHERE m3.thread_id = p.thread_id
+			 ORDER BY m3.date DESC LIMIT 1) AS subject_ct,
+			p.authors,
+			p.max_date,
+			(SELECT m2.to_addrs FROM messages m2
+			 WHERE m2.thread_id = p.thread_id
+			 ORDER BY m2.date DESC LIMIT 1) AS recipients
+		FROM page p
+	`
 }
 
 // getThreadTagsBatch returns distinct tags for multiple threads in a single query.
