@@ -1,9 +1,11 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1195,5 +1197,134 @@ func TestSearch_ScopedTagsStartFromThreads(t *testing.T) {
 	got := plan(q, params...)
 	if !strings.Contains(got, "idx_messages_thread_id") || strings.Contains(got, "idx_messages_account_id") {
 		t.Errorf("tag lookup doesn't start from the threads: %s", got)
+	}
+}
+
+// The page-first query returns what the one-SELECT form it replaced did: the
+// same threads with the same subject, authors, date and recipients, newest
+// first. The old form left ties unordered; the new one orders them by thread
+// id, which the reference is sorted into before comparing.
+func TestSearch_PageFirstMatchesOneSelect(t *testing.T) {
+	oneSelect := func(db *DB, where string, params []any, limit int) []string {
+		q := `SELECT m.thread_id,
+			(SELECT m3.subject_ct FROM messages m3 WHERE m3.thread_id = m.thread_id ORDER BY m3.date DESC LIMIT 1),
+			GROUP_CONCAT(DISTINCT m.from_addr), MAX(m.date) AS max_date,
+			(SELECT m2.to_addrs FROM messages m2 WHERE m2.thread_id = m.thread_id ORDER BY m2.date DESC LIMIT 1)
+			FROM messages m`
+		if where != "" {
+			q += " WHERE " + where
+		}
+		q += " GROUP BY m.thread_id ORDER BY max_date DESC LIMIT ?"
+		rows, err := db.db.Query(q, append(params, limit)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var thread, authors string
+			var subject []byte
+			var date int64
+			var recipients sql.NullString
+			if err := rows.Scan(&thread, &subject, &authors, &date, &recipients); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, fmt.Sprintf("%d|%s|%x|%s|%s", date, thread, subject, authors, recipients.String))
+		}
+		return out
+	}
+	byDateThenThread := func(rows []string) []string {
+		sorted := slices.Clone(rows)
+		slices.SortStableFunc(sorted, func(a, b string) int {
+			da, _ := strconv.ParseInt(strings.SplitN(a, "|", 2)[0], 10, 64)
+			db, _ := strconv.ParseInt(strings.SplitN(b, "|", 2)[0], 10, 64)
+			if da != db {
+				return int(db - da)
+			}
+			return strings.Compare(a, b)
+		})
+		return sorted
+	}
+	for name, db := range map[string]*DB{"search": seedSearchDB(t), "driver": seedDriverDB(t)} {
+		for _, query := range []string{"tag:inbox", "tag:common", "from:alice", "tag:inbox AND NOT tag:unread", "invoice", "tag:common AND path:main/**", "*"} {
+			for _, limit := range []int{1, 2, 50} {
+				where, params, _, _, err := db.parseQueryWithTerms(query)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// the old form's full result, ties ordered by thread: the first rows
+				// of it are what a page must be
+				all := byDateThenThread(oneSelect(db, where, slices.Clone(params), 1_000_000))
+				want := all[:min(limit, len(all))]
+				if got := pageFirstRows(t, db, where, params, limit); !slices.Equal(got, want) {
+					t.Errorf("%s %q limit %d:\n got  %v\n want %v", name, query, limit, got, want)
+				}
+			}
+		}
+	}
+}
+
+// pageFirstRows runs Search's query shape (see Search) and renders rows like
+// the reference above.
+func pageFirstRows(t *testing.T, db *DB, where string, params []any, limit int) []string {
+	t.Helper()
+	q := searchPageQuery(where)
+	rows, err := db.db.Query(q, append(slices.Clone(params), limit)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var thread, authors string
+		var subject []byte
+		var date int64
+		var recipients sql.NullString
+		if err := rows.Scan(&thread, &subject, &authors, &date, &recipients); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, fmt.Sprintf("%d|%s|%x|%s|%s", date, thread, subject, authors, recipients.String))
+	}
+	// Search sorts the page in Go: the same order, date then thread
+	slices.SortStableFunc(out, func(a, b string) int {
+		da, _ := strconv.ParseInt(strings.SplitN(a, "|", 2)[0], 10, 64)
+		db, _ := strconv.ParseInt(strings.SplitN(b, "|", 2)[0], 10, 64)
+		if da != db {
+			return int(db - da)
+		}
+		return strings.Compare(a, b)
+	})
+	return out
+}
+
+// Threads with the same latest date come in thread-id order, on every call.
+func TestSearch_TiesAreOrderedByThread(t *testing.T) {
+	db := newTestDB(t)
+	at := time.Date(2026, 10, 5, 12, 0, 0, 0, time.Local).Unix()
+	for i := 0; i < 5; i++ {
+		m := &Message{MessageID: fmt.Sprintf("tie%d@x", i), Subject: "Same", FromAddr: "a@example.com", ToAddrs: "b@example.com",
+			Date: at, CreatedAt: at, BodyText: "x", Mailbox: "INBOX", FetchedBody: true}
+		if err := db.InsertMessage(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	results, err := db.Search("*", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var threads []string
+	for _, r := range results {
+		threads = append(threads, r.Thread)
+	}
+	if !slices.IsSorted(threads) || len(threads) != 5 {
+		t.Errorf("ties not in thread order: %v", threads)
+	}
+	// a page that cuts through the ties takes the first threads by id
+	page, err := db.Search("*", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 2 || page[0].Thread != threads[0] || page[1].Thread != threads[1] {
+		t.Errorf("limit 2 = %v %v, want %v", page[0].Thread, page[1].Thread, threads[:2])
 	}
 }
