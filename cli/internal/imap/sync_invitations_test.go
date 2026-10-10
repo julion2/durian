@@ -3,7 +3,6 @@ package imap
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -250,23 +249,47 @@ func TestFetchCalendarPart_FetchError(t *testing.T) {
 }
 
 func TestFillInvitations_StalledServerAndSkippedModes(t *testing.T) {
-	for _, mode := range []string{"deadline", "upload-only", "dry-run"} {
+	for _, mode := range []string{"deadline", "upload-only", "dry-run", "backlog"} {
 		t.Run(mode, func(t *testing.T) {
 			db := newFlagTestDB(t)
-			m := &store.Message{MessageID: "old@example.com", Account: "work", Mailbox: "INBOX", UID: 1, Date: 1}
-			if err := db.InsertMessage(m); err != nil {
-				t.Fatal(err)
+			count := 1
+			if mode == "backlog" {
+				count = 50
 			}
-			if err := db.AddTag(m.ID, store.CalendarTag); err != nil {
-				t.Fatal(err)
+			for i := 1; i <= count; i++ {
+				m := &store.Message{MessageID: fmt.Sprintf("old%d@example.com", i), Account: "work", Mailbox: "INBOX", UID: uint32(i), Date: 1}
+				if err := db.InsertMessage(m); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.AddTag(m.ID, store.CalendarTag); err != nil {
+					t.Fatal(err)
+				}
 			}
 			local, remote := net.Pipe()
 			t.Cleanup(func() { local.Close(); remote.Close() })
 			command := make(chan string, 1)
 			go func() {
 				fmt.Fprint(remote, "* PREAUTH [CAPABILITY IMAP4rev1] ready\r\n")
-				line, _ := bufio.NewReader(remote).ReadString('\n')
-				command <- line // deliberately never answer SELECT
+				reader := bufio.NewReader(remote)
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if mode != "backlog" {
+						command <- line // deliberately never answer SELECT
+						return
+					}
+					// Responsive commands, but more work than fits in one run.
+					time.Sleep(15 * time.Millisecond)
+					fields := strings.Fields(line)
+					if fields[1] == "SELECT" {
+						fmt.Fprint(remote, "* 50 EXISTS\r\n* OK [UIDVALIDITY 1] valid\r\n")
+					} else if fields[1] == "UID" && fields[2] == "FETCH" {
+						fmt.Fprintf(remote, "* 1 FETCH (UID %s BODYSTRUCTURE (\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 1 1))\r\n", fields[3])
+					}
+					fmt.Fprintf(remote, "%s OK completed\r\n", fields[0])
+				}
 			}()
 			conn, err := client.New(local)
 			if err != nil {
@@ -278,10 +301,8 @@ func TestFillInvitations_StalledServerAndSkippedModes(t *testing.T) {
 			if mode == "upload-only" {
 				s.options.Mode = SyncUploadOnly
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			defer cancel()
 			done := make(chan struct{})
-			go func() { s.fillInvitations(ctx); close(done) }()
+			go func() { s.fillInvitations(100 * time.Millisecond); close(done) }()
 			select {
 			case <-done:
 			case <-time.After(time.Second):
@@ -293,6 +314,10 @@ func TestFillInvitations_StalledServerAndSkippedModes(t *testing.T) {
 				if line := <-command; !strings.Contains(line, "SELECT") {
 					t.Fatalf("expected a stalled SELECT, got %q", line)
 				}
+			} else if mode == "backlog" {
+				if err := conn.Noop(); err != nil {
+					t.Fatalf("budget expiry killed the responsive caller-owned connection: %v", err)
+				}
 			} else {
 				select {
 				case line := <-command:
@@ -300,8 +325,8 @@ func TestFillInvitations_StalledServerAndSkippedModes(t *testing.T) {
 				default:
 				}
 			}
-			missing, err := db.MissingInvitations("work", store.ByUID, nil, 10)
-			if err != nil || len(missing) != 1 {
+			missing, err := db.MissingInvitations("work", store.ByUID, nil, count)
+			if err != nil || len(missing) == 0 || (mode == "backlog" && len(missing) >= count) {
 				t.Fatalf("message must remain retryable: %v, %v", missing, err)
 			}
 		})

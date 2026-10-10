@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	goimap "github.com/emersion/go-imap"
 	"github.com/julion2/durian/cli/internal/invitationsync"
@@ -16,31 +17,37 @@ import (
 // fillInvitations catches up on the invitations of mail synced before they
 // were kept (see invitationsync). Of each message it fetches the structure and
 // the calendar part only, not the whole mail with its attachments.
-func (s *Syncer) fillInvitations(ctx context.Context) {
+// Stop starting work after budget; the last fetch has its own budget to finish
+// without killing a healthy caller-owned connection (at most 2*budget total).
+func (s *Syncer) fillInvitations(budget time.Duration) {
 	if s.options.DryRun || s.options.Mode == SyncUploadOnly {
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, invitationsync.Budget)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	// Legacy IMAP calls have no context API. Abort the connection to unblock
-	// an outstanding command when the catch-up budget expires. Stop and join
-	// the callback before returning so it cannot close a later connection.
-	conn := s.client.conn
-	done := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() {
-		if conn != nil {
-			_ = conn.Terminate()
-		}
-		close(done)
-	})
-	defer func() {
-		if !stop() {
-			<-done
-		}
-	}()
 	selected := ""
 	stored, err := invitationsync.Fill(ctx, s.store, s.accountName(), store.ByUID,
-		func(_ context.Context, m store.MissingInvitation) (string, error) {
+		func(ctx context.Context, m store.MissingInvitation) (string, error) {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			// Only a stalled fetch closes the socket, not normal exhaustion
+			// of the scheduling budget. Legacy commands have no context API.
+			fetchCtx, cancelFetch := context.WithTimeout(context.Background(), budget)
+			defer cancelFetch()
+			conn := s.client.conn
+			done := make(chan struct{})
+			stop := context.AfterFunc(fetchCtx, func() {
+				if conn != nil {
+					_ = conn.Terminate()
+				}
+				close(done)
+			})
+			defer func() {
+				if !stop() {
+					<-done
+				}
+			}()
 			if m.Mailbox != selected {
 				if _, err := s.client.SelectMailbox(m.Mailbox); err != nil {
 					return "", err
