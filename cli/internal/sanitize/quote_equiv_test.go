@@ -1,6 +1,7 @@
 package sanitize
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -68,6 +69,7 @@ func refStripQuotedContent(html string) string {
 // quoteEdgeCases hit the corners of the scanner and the prefilters.
 var quoteEdgeCases = []string{
 	"", " ", "<", ">", "<>", "a<b", "a < b > c", "&nbsp", "&nbsp;", "&NBSP;", "&nbsp;&nbsp;x",
+	"< \t&nbsp;<<\n&NBSP;\v", "<done> < \t&nbsp;<<\n",
 	"\v  x", "\t\n\f\r x", "<p>\n</p>", "<p", "x<p>y<", "<<>>", "<a\n href=x>",
 	"\xff<\xfe>\xfd", "a\x00b",
 	"<p>Sent from my iPhone</p><blockquote>q</blockquote>",
@@ -169,6 +171,23 @@ func BenchmarkStripQuotedContent(b *testing.B) {
 			for b.Loop() {
 				for _, in := range inputs {
 					c.fn(in)
+				}
+			}
+		})
+	}
+}
+
+// Unclosed tags before a quote must not cause repeated suffix scans.
+func BenchmarkStripQuotedContent_UnclosedTags(b *testing.B) {
+	for _, size := range []int{64 << 10, 256 << 10, 1 << 20, 4 << 20} {
+		b.Run(fmt.Sprintf("%dKiB", size>>10), func(b *testing.B) {
+			want := "visible" + strings.Repeat("<", size)
+			in := want + `<div class="gmail_quote">quoted</div>`
+			b.SetBytes(int64(len(in)))
+			b.ResetTimer()
+			for b.Loop() {
+				if got := StripQuotedContent(in); got != want {
+					b.Fatal("quoted content was not stripped correctly")
 				}
 			}
 		})

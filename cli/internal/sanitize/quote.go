@@ -269,12 +269,17 @@ func collapseTagsAndSpace(html, repl string) string {
 	var out strings.Builder
 	out.Grow(len(html))
 	inRun := false
+	noMoreTags := false
 	for i := 0; i < len(html); {
 		n := 0 // bytes of tag, space or &nbsp; at i
 		switch c := html[i]; {
-		case c == '<':
+		case c == '<' && !noMoreTags:
 			if end := strings.IndexByte(html[i+1:], '>'); end >= 0 {
 				n = end + 2
+			} else {
+				// No later '<' can close either. Avoid rescanning the suffix,
+				// but keep collapsing whitespace and entities within it.
+				noMoreTags = true
 			}
 		case c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r':
 			n = 1
