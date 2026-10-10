@@ -137,3 +137,37 @@ func TestProfilesHandler(t *testing.T) {
 		t.Errorf("missing file: %d %s", code, body["profiles"])
 	}
 }
+
+func TestProfilesHandlerAccountPrecedence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profiles.json")
+	if err := os.WriteFile(path, []byte(`{"profiles":[{"name":"Alias","accounts":[" WORK "]},{"name":"Email","accounts":["SHARED@EXAMPLE.COM"]}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Accounts: []config.AccountConfig{
+		{Name: "work", Email: "personal@example.com", Alias: "personal"},
+		{Name: "shared@example.com", Email: "other@example.com"},
+		{Name: "company", Email: "shared@example.com", Alias: "work"},
+	}}
+	if err := cfg.ValidateAliases(); err != nil {
+		t.Fatal(err)
+	}
+	h := New(newTestStore(t), nil)
+	h.SetConfig(cfg)
+	h.SetProfilesPath(path)
+	code, body, raw := profilesRequest(t, h)
+	if code != http.StatusOK {
+		t.Fatalf("status %d: %s", code, raw)
+	}
+	var profiles []profileResponse
+	if err := json.Unmarshal(body["profiles"], &profiles); err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 2 {
+		t.Fatalf("got %d profiles, want 2", len(profiles))
+	}
+	for _, p := range profiles {
+		if len(p.Accounts) != 1 || p.Accounts[0].Name != "company" || p.Accounts[0].Email != "shared@example.com" {
+			t.Errorf("profile %s: got accounts %+v, want company", p.Name, p.Accounts)
+		}
+	}
+}

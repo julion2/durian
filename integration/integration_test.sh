@@ -11,7 +11,12 @@ DURIAN="$2"
 TEST_CONFIG="$3"
 PORT=19723
 TMPDIR=$(mktemp -d /tmp/durian-inttest-XXXXXX)
-export HOME="${HOME:-$TMPDIR}"
+# Exercise the CLI's own tilde expansion, including sibling profiles.pkl.
+export HOME="$TMPDIR/home"
+mkdir -p "$HOME/config"
+cp "$TEST_CONFIG" "$HOME/config/config.pkl"
+cp "$(dirname "$TEST_CONFIG")/profiles.pkl" "$HOME/config/profiles.pkl"
+TEST_CONFIG='~/config/config.pkl'
 # Point the calendar vdir (config.DefaultDataDir → XDG_DATA_HOME/durian) at the
 # temp dir and seed one calendar with one event for the read-only calendar API.
 export XDG_DATA_HOME="$TMPDIR/data"

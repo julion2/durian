@@ -77,17 +77,7 @@ func publicAccount(a *config.AccountConfig) profileAccount {
 // matches no account is kept by name only, so a client can still scope by it
 // and show that it's unknown.
 func resolveProfiles(profiles []config.ProfileConfig, accounts []config.AccountConfig) []profileResponse {
-	find := func(ref string) (*config.AccountConfig, bool) {
-		for i := range accounts {
-			a := &accounts[i]
-			for _, key := range []string{a.Name, a.Alias, a.Email} {
-				if key != "" && strings.EqualFold(key, ref) {
-					return a, true
-				}
-			}
-		}
-		return nil, false
-	}
+	cfg := config.Config{Accounts: accounts}
 	out := make([]profileResponse, 0, len(profiles))
 	for _, p := range profiles {
 		resp := profileResponse{
@@ -114,7 +104,7 @@ func resolveProfiles(profiles []config.ProfileConfig, accounts []config.AccountC
 				}
 			case "":
 			default:
-				if a, ok := find(ref); ok {
+				if a, err := cfg.GetAccountByIdentifier(ref); err == nil {
 					add(publicAccount(a))
 				} else {
 					add(profileAccount{Name: ref})

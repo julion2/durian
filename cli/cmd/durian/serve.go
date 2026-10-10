@@ -241,7 +241,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		h.SetConfig(cfg)
 		// profiles.pkl lives beside the config file in use (-c), like a client expects
 		if cfgFile != "" {
-			h.SetProfilesPath(filepath.Join(filepath.Dir(cfgFile), "profiles.pkl"))
+			h.SetProfilesPath(filepath.Join(filepath.Dir(config.ExpandPath(cfgFile)), "profiles.pkl"))
 		}
 		h.SetCalendarEventSyncer(guiCalendarSyncer{cfg: cfg})
 
