@@ -46,8 +46,8 @@ func TestOpenAndInit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 34 {
-		t.Errorf("version = %d, want 34", version)
+	if version != 35 {
+		t.Errorf("version = %d, want 35", version)
 	}
 }
 
@@ -83,8 +83,8 @@ func TestMigrateV29AddsProviderNativeState(t *testing.T) {
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 34 {
-		t.Fatalf("version = %d, want 34", version)
+	if version != 35 {
+		t.Fatalf("version = %d, want 35", version)
 	}
 	hasStableID, err := hasColumn(db.db, "messages", "stable_id")
 	if err != nil || !hasStableID {
@@ -140,8 +140,8 @@ func TestMigrateV30AddsIngestGeneration(t *testing.T) {
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 34 {
-		t.Fatalf("version = %d, want 34", version)
+	if version != 35 {
+		t.Fatalf("version = %d, want 35", version)
 	}
 	stored, err := db.GetByMessageID(seed.MessageID)
 	if err != nil || stored == nil || !stored.IngestPending || stored.IngestGeneration != 0 {
@@ -182,8 +182,8 @@ func TestMigrateV31AddsDurableOutboxClaims(t *testing.T) {
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 34 {
-		t.Fatalf("version = %d, want 34", version)
+	if version != 35 {
+		t.Fatalf("version = %d, want 35", version)
 	}
 	item, err := db.ClaimNextOutboxItem()
 	if err != nil || item == nil || item.ID != id || !item.InFlight || item.DeliveryConfirmed {
@@ -214,8 +214,8 @@ func TestMigrateV33AddsDurableOutboxIdempotency(t *testing.T) {
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 34 {
-		t.Fatalf("version = %d, want 34", version)
+	if version != 35 {
+		t.Fatalf("version = %d, want 35", version)
 	}
 }
 
@@ -280,8 +280,8 @@ func TestMigrateV27MarksLegacySyntheticCandidateWithoutClaimingProvenance(t *tes
 	if err := db.db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 34 {
-		t.Fatalf("version = %d, want 34", version)
+	if version != 35 {
+		t.Fatalf("version = %d, want 35", version)
 	}
 }
 
@@ -666,8 +666,8 @@ func TestMigrateV9_PopulatesMailboxesAndAccounts(t *testing.T) {
 	if err := db.QueryRow("SELECT version FROM schema_version WHERE rowid = 1").Scan(&version); err != nil {
 		t.Fatalf("read version: %v", err)
 	}
-	if version != 34 {
-		t.Fatalf("version = %d, want 34", version)
+	if version != 35 {
+		t.Fatalf("version = %d, want 35", version)
 	}
 
 	// mailboxes must contain exactly INBOX and Drafts (case-collapsed).

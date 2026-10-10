@@ -346,6 +346,14 @@ func (e *Engine) Sync(ctx context.Context, b backend.Backend) (*Result, error) {
 		providerMutationErrorsFiltered = true
 	}
 
+	// Catch up on invitations of mail synced before they were kept, after
+	// the new mail and within what's left of the sync's time.
+	if !e.opts.DryRun && e.opts.Mode != UploadOnly {
+		fillCtx, cancel := contextWithDeadline(ctx, deadline)
+		e.fillInvitations(fillCtx, b)
+		cancel()
+	}
+
 	slog.Info("Sync complete", "module", "SYNCENGINE", "account", e.opts.Account, // encgrep:allow account identifier (config name) and counts, not an encrypted column
 		"folders", result.Folders, "new", result.New, "deleted", result.Deleted,
 		"moved", result.Moved, "errors", len(result.Errors), "dry_run", e.opts.DryRun)

@@ -1054,6 +1054,27 @@ components:
           type: array
           items:
             type: string
+        invitation:
+          $ref: '#/components/schemas/Invitation'
+    Invitation:
+      type: object
+      description: >
+        The calendar invitation a message carries (its iCalendar part), in
+        GET /threads/{thread_id} only. Absent for mail without one, and for
+        mail synced before invitations were kept until sync has caught up on
+        it. To answer, use POST /calendars/rsvp with event.uid.
+      properties:
+        method:
+          type: string
+          description: iTIP method in upper case (REQUEST, CANCEL, REPLY, ...); omitted when the part names none
+        event:
+          $ref: '#/components/schemas/CalendarEvent'
+        occurrence:
+          type: boolean
+          description: >
+            True when the mail is about one occurrence of a series only (an
+            update or cancellation of that date); event is that occurrence.
+            Answering event.uid answers the whole series.
     Contact:
       type: object
       properties:

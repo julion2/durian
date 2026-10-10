@@ -134,5 +134,21 @@ func (d *DB) migrateProviderNative(version int) error {
 		}
 	}
 
+	if version < 35 {
+		// The iCalendar part of invitations, kept so a client can show and
+		// answer one without the raw message. See invitations.go.
+		stmts := []string{
+			`CREATE TABLE IF NOT EXISTS message_invitations (
+				message_db_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+				ics_ct BLOB)`,
+			`UPDATE schema_version SET version = 35 WHERE rowid = 1`,
+		}
+		for _, stmt := range stmts {
+			if _, err := d.db.Exec(stmt); err != nil {
+				return fmt.Errorf("migrate v34→v35: %w", err)
+			}
+		}
+	}
+
 	return nil
 }

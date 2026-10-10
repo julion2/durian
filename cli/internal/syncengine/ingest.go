@@ -335,10 +335,15 @@ func Ingest(db *store.DB, msg backend.Message, folderName string, role backend.R
 		}
 	}
 
-	// Eagerly detect calendar content
-	if bytes.Contains(msg.Raw, []byte("text/calendar")) {
-		if err := db.AddTag(storeMsg.ID, "cal"); err != nil {
+	// Eagerly detect calendar content, and keep the invitation – or that
+	// there is none – so sync never fetches this message for it again
+	// (store.MissingInvitations).
+	if content.Calendar != "" || bytes.Contains(msg.Raw, []byte("text/calendar")) {
+		if err := db.AddTag(storeMsg.ID, store.CalendarTag); err != nil {
 			return "", 0, false, fmt.Errorf("add cal tag: %w", err)
+		}
+		if err := db.SetInvitation(storeMsg.ID, content.Calendar); err != nil {
+			return "", 0, false, err
 		}
 	}
 

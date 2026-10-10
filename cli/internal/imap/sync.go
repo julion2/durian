@@ -264,6 +264,7 @@ func (s *Syncer) Sync() (*SyncResult, error) {
 	// Automatically backfill reaction-critical headers once per mailbox.
 	if !s.options.DryRun {
 		s.backfillHeaders(mailboxes)
+		s.fillInvitations()
 	}
 
 	result.Duration = time.Since(start)
