@@ -55,6 +55,9 @@ type Handler struct {
 	// real composition root (backendfactory); tests substitute a fake so the
 	// on-demand reaction header fetch runs without a provider.
 	newBackend func(*config.AccountConfig) (backend.Backend, error)
+	// profilesPath is profiles.pkl next to the config serve runs with (empty:
+	// the default config directory).
+	profilesPath string
 }
 
 // New creates a Handler that reads from the SQLite store.

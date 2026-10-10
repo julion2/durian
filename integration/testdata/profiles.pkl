@@ -1,0 +1,12 @@
+import "modulepath:/Profiles.pkl" as P
+
+profiles: Listing<P.ProfileConfig> = new {
+  new { name = "All"; accounts = new { "*" }; folders = P.standardFolders }
+  new {
+    name = "Test"
+    accounts = new { "test" }
+    default = true
+    color = "#3b82f6"
+    folders = new { new { name = "Inbox"; icon = "tray"; query = "tag:inbox" } }
+  }
+}

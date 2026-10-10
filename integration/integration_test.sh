@@ -11,7 +11,12 @@ DURIAN="$2"
 TEST_CONFIG="$3"
 PORT=19723
 TMPDIR=$(mktemp -d /tmp/durian-inttest-XXXXXX)
-export HOME="${HOME:-$TMPDIR}"
+# Exercise the CLI's own tilde expansion, including sibling profiles.pkl.
+export HOME="$TMPDIR/home"
+mkdir -p "$HOME/config"
+cp "$TEST_CONFIG" "$HOME/config/config.pkl"
+cp "$(dirname "$TEST_CONFIG")/profiles.pkl" "$HOME/config/profiles.pkl"
+TEST_CONFIG='~/config/config.pkl'
 # Point the calendar vdir (config.DefaultDataDir → XDG_DATA_HOME/durian) at the
 # temp dir and seed one calendar with one event for the read-only calendar API.
 export XDG_DATA_HOME="$TMPDIR/data"
@@ -160,6 +165,17 @@ RESP=$(curl -sf "${AUTH[@]}" "$BASE/tags")
 assert_jq "GET /tags .ok is true" "$RESP" '.ok == true'
 assert_jq "GET /tags .tags is array" "$RESP" '.tags | type == "array"'
 assert_jq "GET /tags .tags contains inbox" "$RESP" '.tags | index("inbox") != null'
+
+# ─────────────────────────────────────────────
+# 4b. Profiles (profiles.pkl beside the -c config, accounts resolved)
+# ─────────────────────────────────────────────
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/profiles")
+assert_jq "GET /profiles .ok is true" "$RESP" '.ok == true'
+assert_jq "GET /profiles has both profiles" "$RESP" '[.profiles[].name] == ["All", "Test"]'
+assert_jq "GET /profiles * expands to all accounts" "$RESP" '.profiles[0].all_accounts == true and .profiles[0].accounts[0].email == "test@example.com"'
+assert_jq "GET /profiles standard folders evaluated" "$RESP" '.profiles[0].folders | length > 0 and all(.query | type == "string")'
+assert_jq "GET /profiles alias resolves to the account" "$RESP" '.profiles[1].accounts == [{"name":"Test","email":"test@example.com","alias":"test","default":true}]'
+assert_jq "GET /profiles keeps transport settings out" "$RESP" 'tostring | (contains("smtp.example.com") or contains("imap.example.com")) | not'
 
 # ─────────────────────────────────────────────
 # 5. Show thread (DurianResponse + ThreadContent + ThreadMessage)

@@ -184,6 +184,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	r.HandleFunc("/api/v1/message/body", h.ShowMessageBodyHandler).Methods("GET")
 	r.HandleFunc("/api/v1/messages/{message_id}/attachments/{part_id}", h.DownloadAttachmentHandler).Methods("GET")
 	r.HandleFunc("/api/v1/groups", h.ListGroupsHandler).Methods("GET")
+	r.HandleFunc("/api/v1/profiles", h.ProfilesHandler).Methods("GET")
 	r.HandleFunc("/api/v1/contacts/search", h.SearchContactsHandler).Methods("GET")
 	r.HandleFunc("/api/v1/contacts/usage", h.IncrementContactUsageHandler).Methods("POST")
 	r.HandleFunc("/api/v1/contacts", h.ListContactsHandler).Methods("GET")
@@ -238,6 +239,10 @@ func runServe(cmd *cobra.Command, args []string) {
 	} else {
 		configureStoreAccounts(emailDB, cfg)
 		h.SetConfig(cfg)
+		// profiles.pkl lives beside the config file in use (-c), like a client expects
+		if cfgFile != "" {
+			h.SetProfilesPath(filepath.Join(filepath.Dir(config.ExpandPath(cfgFile)), "profiles.pkl"))
+		}
 		h.SetCalendarEventSyncer(guiCalendarSyncer{cfg: cfg})
 
 		// Optional: set up remote tag sync client
