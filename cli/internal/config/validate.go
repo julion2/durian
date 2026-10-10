@@ -38,7 +38,7 @@ func ValidateConfig(cfg *Config) []ValidationError {
 	}
 
 	// Settings validation
-	if cfg.Settings.AccentColor != "" {
+	if cfg.Settings != nil && cfg.Settings.AccentColor != "" {
 		hexColor := regexp.MustCompile(`^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$`)
 		if !hexColor.MatchString(cfg.Settings.AccentColor) {
 			add("settings.accent_color", fmt.Sprintf("invalid hex color: %q (expected #RGB or #RRGGBB)", cfg.Settings.AccentColor))

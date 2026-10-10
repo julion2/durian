@@ -7,7 +7,7 @@ import (
 
 // Config represents the complete Durian configuration
 type Config struct {
-	Settings   SettingsConfig    `pkl:"settings" json:"settings"`
+	Settings   *SettingsConfig   `pkl:"settings" json:"settings"`
 	Sync       SyncConfig        `pkl:"sync" json:"sync"`
 	Contacts   ContactsConfig    `pkl:"contacts" json:"contacts"`
 	Calendar   CalendarConfig    `pkl:"calendar" json:"calendar"`
