@@ -248,11 +248,12 @@ func (p *Parser) extractMultipart(r io.Reader, boundary string) (string, string,
 		transferEncoding := part.Header.Get("Content-Transfer-Encoding")
 		charset := encoding.GetCharset(contentType)
 		mediaType, params, _ := mime.ParseMediaType(contentType)
+		dispositionType, _, _ := mime.ParseMediaType(contentDisp)
 
-		if strings.Contains(contentDisp, "attachment") || (part.FileName() != "" && !strings.HasPrefix(mediaType, "text/")) {
+		if dispositionType == "attachment" || (part.FileName() != "" && !strings.HasPrefix(mediaType, "text/")) {
 			name := encoding.DecodeHeader(part.FileName())
 			disposition := "attachment"
-			if strings.Contains(contentDisp, "inline") {
+			if dispositionType == "inline" {
 				disposition = "inline"
 			}
 			attBody, _ := io.ReadAll(part)

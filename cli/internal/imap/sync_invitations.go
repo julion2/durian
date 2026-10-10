@@ -16,9 +16,28 @@ import (
 // fillInvitations catches up on the invitations of mail synced before they
 // were kept (see invitationsync). Of each message it fetches the structure and
 // the calendar part only, not the whole mail with its attachments.
-func (s *Syncer) fillInvitations() {
-	ctx, cancel := context.WithTimeout(context.Background(), invitationsync.Budget)
+func (s *Syncer) fillInvitations(ctx context.Context) {
+	if s.options.DryRun || s.options.Mode == SyncUploadOnly {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, invitationsync.Budget)
 	defer cancel()
+	// Legacy IMAP calls have no context API. Abort the connection to unblock
+	// an outstanding command when the catch-up budget expires. Stop and join
+	// the callback before returning so it cannot close a later connection.
+	conn := s.client.conn
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		if conn != nil {
+			_ = conn.Terminate()
+		}
+		close(done)
+	})
+	defer func() {
+		if !stop() {
+			<-done
+		}
+	}()
 	selected := ""
 	stored, err := invitationsync.Fill(ctx, s.store, s.accountName(), store.ByUID,
 		func(_ context.Context, m store.MissingInvitation) (string, error) {
@@ -98,14 +117,16 @@ func calendarParts(bs *goimap.BodyStructure) []calendarPart {
 	walk = func(parts []*goimap.BodyStructure, prefix []int) {
 		for i, part := range parts {
 			path := append(append([]int(nil), prefix...), i+1)
+			// Attachment containers are opaque to the parser, too.
+			isAttached := strings.EqualFold(part.Disposition, "attachment") ||
+				(part.DispositionParams["filename"] != "" && !strings.EqualFold(part.MIMEType, "text"))
 			if strings.EqualFold(part.MIMEType, "multipart") {
-				walk(part.Parts, path)
+				if !isAttached {
+					walk(part.Parts, path)
+				}
 				continue
 			}
 			if isCalendarPart(part) {
-				// the parser's attachment test for a part of a multipart
-				isAttached := strings.EqualFold(part.Disposition, "attachment") ||
-					(part.DispositionParams["filename"] != "" && !strings.EqualFold(part.MIMEType, "text"))
 				add(part, path, isAttached)
 			}
 		}

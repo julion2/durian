@@ -59,5 +59,6 @@ go_test(
         "//cli/internal/store",
         "//cli/internal/syncidentity",
         "@com_github_emersion_go_imap//:go-imap",
+        "@com_github_emersion_go_imap//client",
     ],
 )

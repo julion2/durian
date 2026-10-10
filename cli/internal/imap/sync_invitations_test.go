@@ -1,11 +1,14 @@
 package imap
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"mime/quotedprintable"
+	"net"
 	"net/mail"
 	"slices"
 	"sort"
@@ -14,6 +17,7 @@ import (
 	"time"
 
 	goimap "github.com/emersion/go-imap"
+	"github.com/emersion/go-imap/client"
 	"github.com/julion2/durian/cli/internal/config"
 	durianmail "github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/store"
@@ -171,6 +175,10 @@ func invitationCases() []struct {
 	inlineICS := attachedICS("application", "ics", ics("inline-named"), "BASE64")
 	inlineICS.disp = "inline"
 	forwarded := leaf("message", "rfc822", "Content-Type: text/calendar\r\n\r\n"+ics("forwarded"))
+	attachedMultipart := multi("mixed", calendar(ics("inside-attachment"), "BASE64"))
+	attachedMultipart.disp = "attachment"
+	upperAttachment := attachedICS("text", "calendar", ics("attached-first"), "BASE64")
+	upperAttachment.disp = "ATTACHMENT"
 	return []struct {
 		name string
 		msg  *mimePart
@@ -204,6 +212,8 @@ func invitationCases() []struct {
 		{"charset is decoded", latin9, "BEGIN:VCALENDAR\r\nSUMMARY:5 €\r\nEND:VCALENDAR\r\n"},
 		{"mentioning text/calendar is no invitation", multi("alternative", leaf("text", "plain", "Send it as text/calendar please")), ""},
 		{"a forwarded message's invitation isn't this one's", multi("mixed", leaf("text", "plain", "fwd"), forwarded), ""},
+		{"an attached multipart is not this message's invitation", multi("mixed", attachedMultipart), ""},
+		{"disposition is case insensitive", multi("mixed", upperAttachment, calendar(ics("actual-inline"), "BASE64")), ics("actual-inline")},
 	}
 }
 
@@ -236,6 +246,65 @@ func TestFetchCalendarPart_FetchError(t *testing.T) {
 	failing := func([]int) ([]byte, error) { return nil, errors.New("connection reset") }
 	if _, err := fetchCalendarPart(msg.structure(), failing); err == nil {
 		t.Fatal("a failed section fetch must be reported, not stored as no invitation")
+	}
+}
+
+func TestFillInvitations_StalledServerAndSkippedModes(t *testing.T) {
+	for _, mode := range []string{"deadline", "upload-only", "dry-run"} {
+		t.Run(mode, func(t *testing.T) {
+			db := newFlagTestDB(t)
+			m := &store.Message{MessageID: "old@example.com", Account: "work", Mailbox: "INBOX", UID: 1, Date: 1}
+			if err := db.InsertMessage(m); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.AddTag(m.ID, store.CalendarTag); err != nil {
+				t.Fatal(err)
+			}
+			local, remote := net.Pipe()
+			t.Cleanup(func() { local.Close(); remote.Close() })
+			command := make(chan string, 1)
+			go func() {
+				fmt.Fprint(remote, "* PREAUTH [CAPABILITY IMAP4rev1] ready\r\n")
+				line, _ := bufio.NewReader(remote).ReadString('\n')
+				command <- line // deliberately never answer SELECT
+			}()
+			conn, err := client.New(local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := NewSyncer(&config.AccountConfig{Name: "work"}, &SyncOptions{Store: db, Quiet: true})
+			s.client.conn = conn
+			s.options.DryRun = mode == "dry-run"
+			if mode == "upload-only" {
+				s.options.Mode = SyncUploadOnly
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			done := make(chan struct{})
+			go func() { s.fillInvitations(ctx); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				local.Close()
+				<-done
+				t.Fatal("catch-up remained blocked beyond its budget")
+			}
+			if mode == "deadline" {
+				if line := <-command; !strings.Contains(line, "SELECT") {
+					t.Fatalf("expected a stalled SELECT, got %q", line)
+				}
+			} else {
+				select {
+				case line := <-command:
+					t.Fatalf("skipped catch-up sent %q", line)
+				default:
+				}
+			}
+			missing, err := db.MissingInvitations("work", store.ByUID, nil, 10)
+			if err != nil || len(missing) != 1 {
+				t.Fatalf("message must remain retryable: %v, %v", missing, err)
+			}
+		})
 	}
 }
 
