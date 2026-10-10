@@ -45,6 +45,7 @@ type Handler struct {
 	parser         *mail.Parser
 	contacts       *contacts.DB
 	cfg            *config.Config               // application config (for outbox worker)
+	configPath     string                       // config file serve runs with, re-read by /settings
 	groups         map[string]config.GroupEntry // contact groups for query expansion
 	fetcher        AttachmentFetcher            // optional IMAP attachment fetcher
 	syncTrigger    SyncTrigger                  // optional sync trigger for tag changes

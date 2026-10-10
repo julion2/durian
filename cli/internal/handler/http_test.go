@@ -45,6 +45,7 @@ func newTestRouter(h *Handler, hub *EventHub) *mux.Router {
 	r.HandleFunc("/api/v1/search", h.SearchHandler).Methods("GET")
 	r.HandleFunc("/api/v1/search/count", h.SearchCountHandler).Methods("GET")
 	r.HandleFunc("/api/v1/tags", h.ListTagsHandler).Methods("GET")
+	r.HandleFunc("/api/v1/settings", h.SettingsHandler).Methods("GET")
 	r.HandleFunc("/api/v1/threads/{thread_id}", h.ShowThreadHandler).Methods("GET")
 	r.HandleFunc("/api/v1/threads/{thread_id}/tags", h.TagThreadHandler).Methods("POST")
 	r.HandleFunc("/api/v1/message/body", h.ShowMessageBodyHandler).Methods("GET")
