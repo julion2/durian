@@ -52,11 +52,17 @@ func (h *Handler) ShowThread(threadID string) protocol.Response {
 		return protocol.Fail(protocol.ErrNotFound, errors.New("no messages found for thread"))
 	}
 
-	// tags and attachments in one query each, not two per message; a failed
-	// batch leaves its map nil and convertThread queries per message
+	// Load tags and attachments in one query each. Discard partial batch
+	// results on error so convertThread falls back to per-message queries.
 	ids := threadMessageRowIDs(msgs)
-	tagMap, _ := h.store.GetMessageTagsBatch(ids)
-	attMap, _ := h.store.GetAttachmentsByMessages(ids)
+	tagMap, err := h.store.GetMessageTagsBatch(ids)
+	if err != nil {
+		tagMap = nil
+	}
+	attMap, err := h.store.GetAttachmentsByMessages(ids)
+	if err != nil {
+		attMap = nil
+	}
 	thread := h.convertThread(threadID, msgs, false, tagMap, attMap)
 	return protocol.SuccessWithThread(thread)
 }
