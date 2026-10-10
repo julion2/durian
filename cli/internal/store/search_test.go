@@ -2,6 +2,8 @@ package store
 
 import (
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1052,5 +1054,141 @@ func TestSearch_TagCombinationsMatch(t *testing.T) {
 		if got := count(query); got != want {
 			t.Errorf("%q: %d threads, want %d", query, got, want)
 		}
+	}
+}
+
+// A common tag with a date range or account that holds a single message:
+// the date or account index drives, the tag is probed. When the tag is the
+// rarer side, it drives.
+func seedDriverDB(t *testing.T) *DB {
+	t.Helper()
+	db := newTestDB(t)
+	now := time.Now().Unix()
+	lone := time.Date(2026, 10, 1, 12, 0, 0, 0, time.Local).Unix()
+	for i := 0; i < 6; i++ {
+		m := &Message{MessageID: fmt.Sprintf("c%d@x", i), Subject: "Status", FromAddr: "a@example.com", ToAddrs: "b@example.com",
+			Date: now - int64(i), CreatedAt: now, BodyText: "routine", Mailbox: "INBOX", Account: "main", FetchedBody: true}
+		if err := db.InsertMessage(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := &Message{MessageID: "lone@x", Subject: "Status", FromAddr: "a@example.com", ToAddrs: "b@example.com",
+		Date: lone, CreatedAt: now, BodyText: "routine", Mailbox: "INBOX", Account: "small", FetchedBody: true}
+	if err := db.InsertMessage(m); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.db.Query("SELECT id, message_id FROM messages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type row struct {
+		id  int64
+		mid string
+	}
+	var all []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.mid); err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, r)
+	}
+	rows.Close()
+	for _, r := range all {
+		db.AddTag(r.id, "common")
+		if r.mid == "c0@x" {
+			db.AddTag(r.id, "rare")
+		}
+	}
+	return db
+}
+
+func TestSearch_DateAndAccountDrive(t *testing.T) {
+	db := seedDriverDB(t)
+	for _, c := range []struct {
+		query    string
+		tagIndex int
+		uses     string
+		threads  int
+		avoids   string
+	}{
+		{"tag:common AND date:2026-10-01..2026-10-01", 0, "idx_messages_date", 1, ""},
+		{"tag:common AND path:small/**", 0, "idx_messages_account_id", 1, ""},
+		{"tag:common AND (path:small/** OR date:2026-10-01..2026-10-01)", 0, "idx_messages_account_id", 1, ""},
+		{"date:2026-10-01..2026-10-01 AND tag:common", 0, "idx_messages_date", 1, ""},
+		// the tag is the smaller side: it drives, and SQLite mustn't start from
+		// the account after all (it would, taking the equality for selective)
+		{"tag:rare AND path:main/**", 1, "", 1, "idx_messages_account_id"},
+		{"tag:rare AND date:2026-10-01..2026-10-10", 1, "", 1, "idx_messages_date"},
+		// an account that doesn't exist matches nothing (1=0), counts 0 and drives
+		{"tag:common AND path:nosuchaccount/**", 0, "", 0, ""},
+	} {
+		plan := queryPlan(t, db, c.query)
+		if got := strings.Count(plan, "idx_tags_tag"); got != c.tagIndex {
+			t.Errorf("%q: idx_tags_tag used %d times, want %d: %s", c.query, got, c.tagIndex, plan)
+		}
+		if c.uses != "" && !strings.Contains(plan, c.uses) {
+			t.Errorf("%q: plan doesn't use %s: %s", c.query, c.uses, plan)
+		}
+		if c.avoids != "" && strings.Contains(plan, c.avoids) {
+			t.Errorf("%q: plan uses %s: %s", c.query, c.avoids, plan)
+		}
+		n, err := db.SearchCount(c.query)
+		if err != nil {
+			t.Fatalf("%q: %v", c.query, err)
+		}
+		if n != c.threads {
+			t.Errorf("%q: %d threads, want %d", c.query, n, c.threads)
+		}
+	}
+}
+
+// A scoped search loads its threads' tags from the thread ids, not by reading
+// the whole account (SQLite takes the account equality for selective).
+func TestSearch_ScopedTagsStartFromThreads(t *testing.T) {
+	db := seedDriverDB(t)
+	results, err := db.Search("tag:common AND path:main/**", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 6 {
+		t.Fatalf("%d results, want 6", len(results))
+	}
+	for _, r := range results {
+		if !slices.Contains(r.Tags, "common") {
+			t.Errorf("thread %s: tags %v lack common", r.Thread, r.Tags)
+		}
+	}
+	ids, err := db.resolveAccountIDs([]string{"main"})
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("account: %v %v", ids, err)
+	}
+	plan := func(q string, args ...any) string {
+		rows, err := db.db.Query("EXPLAIN QUERY PLAN "+q, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var a, b, c int
+			var d string
+			if err := rows.Scan(&a, &b, &c, &d); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, d)
+		}
+		return strings.Join(out, " | ")
+	}
+	// a page of threads: from ten ids on SQLite prefers the account index
+	threads := make([]string, 20)
+	for i := range threads {
+		threads[i] = fmt.Sprintf("%016x", i)
+	}
+	threads[0], threads[1] = results[0].Thread, results[1].Thread
+	q, params := threadTagsQuery(threads, ids)
+	got := plan(q, params...)
+	if !strings.Contains(got, "idx_messages_thread_id") || strings.Contains(got, "idx_messages_account_id") {
+		t.Errorf("tag lookup doesn't start from the threads: %s", got)
 	}
 }

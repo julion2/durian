@@ -46,10 +46,12 @@ func seedTagBench(copies, inbox int) (*DB, string, error) {
 		return nil, "", err
 	}
 	now := time.Now().Unix()
+	// the needle is also the only message on 2026-10-01 and in account "small"
+	lone := time.Date(2026, 10, 1, 12, 0, 0, 0, time.Local).Unix()
 	template := &Message{MessageID: "template@x", Subject: "Status", FromAddr: "a@example.com", ToAddrs: "b@example.com",
-		Date: now, CreatedAt: now, BodyText: "routine status update", Mailbox: "INBOX", FetchedBody: true}
+		Date: now, CreatedAt: now, BodyText: "routine status update", Mailbox: "INBOX", Account: "main", FetchedBody: true}
 	needle := &Message{MessageID: "needle@x", Subject: "Status", FromAddr: "a@example.com", ToAddrs: "b@example.com",
-		Date: now, CreatedAt: now, BodyText: "the uniqueneedle is here", Mailbox: "INBOX", FetchedBody: true}
+		Date: lone, CreatedAt: now, BodyText: "the uniqueneedle is here", Mailbox: "INBOX", Account: "small", FetchedBody: true}
 	for _, m := range []*Message{template, needle} {
 		if err := db.InsertMessage(m); err != nil {
 			return nil, "", err
@@ -118,6 +120,10 @@ func BenchmarkTagSearch(b *testing.B) {
 		{"tag:archive AND thread", "tag:archive AND thread:" + thread},
 		{"tag:archive AND (uniqueneedle OR missingneedle)", "tag:archive AND (uniqueneedle OR missingneedle)"},
 		{"tag:archive AND (thread OR thread:missing)", "tag:archive AND (thread:" + thread + " OR thread:missing)"},
+		{"tag:archive AND date:2026-10-01..2026-10-01", "tag:archive AND date:2026-10-01..2026-10-01"},
+		{"tag:archive AND path:small/**", "tag:archive AND path:small/**"},
+		// a profile's scope with a folder: the bigger account and the smaller tag
+		{"path:main/** AND tag:inbox", "path:main/** AND tag:inbox"},
 	} {
 		b.Run(c.name, func(b *testing.B) {
 			for b.Loop() {

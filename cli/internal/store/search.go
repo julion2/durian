@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -264,17 +265,7 @@ func (d *DB) getThreadTagsBatch(threadIDs []string, accounts ...string) (map[str
 		return make(map[string][]string), nil
 	}
 
-	placeholders := make([]string, len(threadIDs))
-	params := make([]interface{}, 0, len(threadIDs)+len(accounts))
-	for i, id := range threadIDs {
-		placeholders[i] = "?"
-		params = append(params, id)
-	}
-
-	q := `SELECT DISTINCT m.thread_id, t.tag FROM tags t
-		JOIN messages m ON m.id = t.message_id
-		WHERE m.thread_id IN (` + strings.Join(placeholders, ",") + `)`
-
+	var accountIDs []int64
 	if len(accounts) > 0 {
 		ids, err := d.resolveAccountIDs(accounts)
 		if err != nil {
@@ -283,15 +274,9 @@ func (d *DB) getThreadTagsBatch(threadIDs []string, accounts ...string) (map[str
 		if len(ids) == 0 {
 			return make(map[string][]string), nil
 		}
-		acctPH := make([]string, len(ids))
-		for i, id := range ids {
-			acctPH[i] = "?"
-			params = append(params, id)
-		}
-		q += " AND m.account_id IN (" + strings.Join(acctPH, ",") + ")"
+		accountIDs = ids
 	}
-	q += " ORDER BY m.thread_id, t.tag"
-
+	q, params := threadTagsQuery(threadIDs, accountIDs)
 	rows, err := d.db.Query(q, params...)
 	if err != nil {
 		return nil, err
@@ -307,6 +292,32 @@ func (d *DB) getThreadTagsBatch(threadIDs []string, accounts ...string) (map[str
 		result[threadID] = append(result[threadID], tag)
 	}
 	return result, rows.Err()
+}
+
+// threadTagsQuery selects the distinct tags of the given threads, limited to
+// the accounts when there are any.
+func threadTagsQuery(threadIDs []string, accountIDs []int64) (string, []interface{}) {
+	params := make([]interface{}, 0, len(threadIDs)+len(accountIDs))
+	threadPH := make([]string, len(threadIDs))
+	for i, id := range threadIDs {
+		threadPH[i] = "?"
+		params = append(params, id)
+	}
+	q := `SELECT DISTINCT m.thread_id, t.tag FROM tags t
+		JOIN messages m ON m.id = t.message_id
+		WHERE m.thread_id IN (` + strings.Join(threadPH, ",") + `)`
+	if len(accountIDs) > 0 {
+		acctPH := make([]string, len(accountIDs))
+		for i, id := range accountIDs {
+			acctPH[i] = "?"
+			params = append(params, id)
+		}
+		// unary +: the thread ids are the selective side; without it SQLite,
+		// having no statistics, starts from the account index and reads every
+		// message of the account (~30 ms on 60k messages instead of ~0.3)
+		q += " AND +m.account_id IN (" + strings.Join(acctPH, ",") + ")"
+	}
+	return q + " ORDER BY m.thread_id, t.tag", params
 }
 
 // getThreadTags returns distinct tags for messages in a thread.
@@ -329,7 +340,8 @@ func (d *DB) getThreadTags(threadID string, accounts ...string) ([]string, error
 			placeholders[i] = "?"
 			params = append(params, id)
 		}
-		q += " AND m.account_id IN (" + strings.Join(placeholders, ",") + ")"
+		// unary +: start from the thread, not from the whole account
+		q += " AND +m.account_id IN (" + strings.Join(placeholders, ",") + ")"
 	}
 	q += " ORDER BY t.tag"
 	rows, err := d.db.Query(q, params...)
@@ -364,6 +376,11 @@ type fieldExpr struct {
 	// compiles to a set the planner reads through idx_tags_tag. Every other
 	// tag leaf compiles to a per-candidate probe.
 	drive bool
+	// noIndex marks a date:/path: leaf that lost to a driving tag set: it is
+	// written with a unary + (same predicate, no index), so SQLite – which
+	// has no statistics and takes an equality for selective – doesn't start
+	// from it after all.
+	noIndex bool
 }
 
 type bareExpr struct {
@@ -768,27 +785,49 @@ func (d *DB) parseQueryWithTerms(query string) (where string, params []interface
 	return where, params, node, terms, nil
 }
 
-// tagDriverSampleCap bounds the size count that settles which of two tags
-// drives: it only has to tell small from large.
-const tagDriverSampleCap = 2000
+// driverSampleSteps are the caps of the counts that settle which side of an
+// AND drives. Both sides are counted up to the first cap, then the next,
+// until one stays below it: a common tag against a one-message date range
+// reads 16 index entries, not thousands. The last cap only has to tell
+// small from large.
+var driverSampleSteps = []int{16, 256, 2000}
 
 // chooseTagDriver decides which tag leaves, if any, the query starts from:
 // those compile to sets SQLite reads through idx_tags_tag, every other tag
-// leaf to a per-candidate probe. See driverPlan for the rule.
+// leaf to a per-candidate probe. When tags drive, the date:/path: filters
+// that lost are written so SQLite can't start from them either. See
+// driverPlan for the rule.
 func (d *DB) chooseTagDriver(node exprNode) error {
-	tags, ok, err := d.driverPlan(node, map[string]int{})
-	if err != nil || !ok {
+	plan, ok, err := d.driverPlan(node, map[*fieldExpr]sample{})
+	if err != nil || !ok || len(plan.tags) == 0 {
 		return err
 	}
-	for _, leaf := range tags {
+	for _, leaf := range plan.tags {
 		leaf.drive = true
+	}
+	var leaves []*fieldExpr
+	collectSQLLeaves(node, &leaves)
+	for _, leaf := range leaves {
+		if (leaf.field == "date" || leaf.field == "path") && !slices.Contains(plan.indexed, leaf) {
+			leaf.noIndex = true
+		}
 	}
 	return nil
 }
 
+// driver is how a subexpression produces its candidates from indexes: tag
+// leaves read as sets through idx_tags_tag, and date:/path: leaves whose
+// own index (idx_messages_date, idx_messages_account_id) SQLite starts from
+// once the tags are probes. Both empty: a self-driving subexpression.
+type driver struct {
+	tags    []*fieldExpr
+	indexed []*fieldExpr
+}
+
 // selfDriving reports a subexpression that narrows candidates through its own
-// index, no tag set needed: full text, subject:, thread: – and AND / OR of
-// them (an AND needs one such side, an OR both). Structural only: no query.
+// index and is selective by nature: full text, subject:, thread: – and AND /
+// OR of them (an AND needs one such side, an OR both). Decided from the query
+// alone, without counting anything.
 func selfDriving(node exprNode) bool {
 	switch n := node.(type) {
 	case *bareExpr:
@@ -804,37 +843,48 @@ func selfDriving(node exprNode) bool {
 	return false
 }
 
-// driverPlan is how a subexpression can produce its candidates from an index
-// instead of a scan, and the tag leaves that takes as sets; ok is false when
-// it can't.
+// driverPlan is how a subexpression can produce its candidates from indexes
+// instead of a scan; ok is false when it can't.
 //
-//   - full text, subject:, thread:  drive on their own index, no tags
+//   - full text, subject:, thread:  drive on their own index, free
 //   - a positive tag                 drives as its set
+//   - date:, path:<account>          drive on idx_messages_date /
+//     idx_messages_account_id
 //   - a OR b                         drives only if both sides do (the union)
-//   - a AND b                        a self-driving side wins (tags stay
-//     probes); else the side that can drive; if both can, the one whose tag
-//     sets are smaller – the only case that counts anything
+//   - a AND b                        a self-driving side wins without
+//     counting; else the side that can drive; if both can, the one that
+//     reads fewer messages – counted through each side's own index in
+//     growing steps (driverSampleSteps), and only in this case
 //   - NOT, and every other field     can't drive (their SQL filters candidates)
-func (d *DB) driverPlan(node exprNode, sizes map[string]int) (tags []*fieldExpr, ok bool, err error) {
+func (d *DB) driverPlan(node exprNode, counts map[*fieldExpr]sample) (driver, bool, error) {
 	if selfDriving(node) {
-		return nil, true, nil
+		return driver{}, true, nil
 	}
 	switch n := node.(type) {
 	case *fieldExpr:
-		if n.field == "tag" {
-			return []*fieldExpr{n}, true, nil
+		switch n.field {
+		case "tag":
+			return driver{tags: []*fieldExpr{n}}, true, nil
+		case "date":
+			return driver{indexed: []*fieldExpr{n}}, true, nil
+		case "path":
+			// a path without an account matches everything: nothing to drive
+			if extractAccountFromPath(n.value) != "" {
+				return driver{indexed: []*fieldExpr{n}}, true, nil
+			}
 		}
 	case *binaryExpr:
-		left, leftOK, err := d.driverPlan(n.left, sizes)
+		left, leftOK, err := d.driverPlan(n.left, counts)
 		if err != nil {
-			return nil, false, err
+			return driver{}, false, err
 		}
-		right, rightOK, err := d.driverPlan(n.right, sizes)
+		right, rightOK, err := d.driverPlan(n.right, counts)
 		if err != nil {
-			return nil, false, err
+			return driver{}, false, err
 		}
 		if n.op == "OR" {
-			return append(left, right...), leftOK && rightOK, nil
+			union := driver{tags: append(left.tags, right.tags...), indexed: append(left.indexed, right.indexed...)}
+			return union, leftOK && rightOK, nil
 		}
 		if !leftOK || !rightOK {
 			if leftOK {
@@ -842,38 +892,67 @@ func (d *DB) driverPlan(node exprNode, sizes map[string]int) (tags []*fieldExpr,
 			}
 			return right, rightOK, nil
 		}
-		leftSize, err := d.tagSetSize(left, sizes)
-		if err != nil {
-			return nil, false, err
+		for i, limit := range driverSampleSteps {
+			leftSize, err := d.driverSize(left, limit, counts)
+			if err != nil {
+				return driver{}, false, err
+			}
+			rightSize, err := d.driverSize(right, limit, counts)
+			if err != nil {
+				return driver{}, false, err
+			}
+			if leftSize < limit || rightSize < limit || i == len(driverSampleSteps)-1 {
+				if rightSize < leftSize {
+					return right, true, nil
+				}
+				return left, true, nil
+			}
 		}
-		rightSize, err := d.tagSetSize(right, sizes)
-		if err != nil {
-			return nil, false, err
-		}
-		if rightSize < leftSize {
-			return right, true, nil
-		}
-		return left, true, nil
 	}
-	return nil, false, nil
+	return driver{}, false, nil
 }
 
-// tagSetSize sums the tags' sizes, each counted through idx_tags_tag up to
-// tagDriverSampleCap, once per tag and query.
-func (d *DB) tagSetSize(tags []*fieldExpr, sizes map[string]int) (int, error) {
+// sample is a leaf's count and the cap it was taken with: below the cap it
+// is exact.
+type sample struct{ n, limit int }
+
+// driverSize counts the messages a driver reads, each leaf through its own
+// index and up to limit; a count taken before is reused when it answers.
+func (d *DB) driverSize(plan driver, limit int, counts map[*fieldExpr]sample) (int, error) {
 	total := 0
-	for _, leaf := range tags {
-		size, ok := sizes[leaf.value]
-		if !ok {
-			err := d.db.QueryRow("SELECT COUNT(*) FROM (SELECT 1 FROM tags WHERE tag = ? LIMIT ?)", leaf.value, tagDriverSampleCap).Scan(&size)
+	for _, leaf := range append(append([]*fieldExpr{}, plan.tags...), plan.indexed...) {
+		c, ok := counts[leaf]
+		if !ok || (c.n >= c.limit && c.limit < limit) {
+			n, err := d.leafSize(leaf, limit)
 			if err != nil {
-				return 0, fmt.Errorf("tag size: %w", err)
+				return 0, err
 			}
-			sizes[leaf.value] = size
+			c = sample{n, limit}
+			counts[leaf] = c
 		}
-		total += size
+		total += min(c.n, limit)
 	}
 	return total, nil
+}
+
+func (d *DB) leafSize(leaf *fieldExpr, limit int) (int, error) {
+	var size int
+	if leaf.field == "tag" {
+		err := d.db.QueryRow("SELECT COUNT(*) FROM (SELECT 1 FROM tags WHERE tag = ? LIMIT ?)", leaf.value, limit).Scan(&size)
+		if err != nil {
+			return 0, fmt.Errorf("driver size (tag): %w", err)
+		}
+		return size, nil
+	}
+	where, params, err := d.fieldToSQL(leaf)
+	if err != nil {
+		return 0, fmt.Errorf("driver size (%s): %w", leaf.field, err)
+	}
+	args := append(params, limit)
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM (SELECT 1 FROM messages m WHERE "+where+" LIMIT ?)", args...).Scan(&size); err != nil {
+		return 0, fmt.Errorf("driver size (%s): %w", leaf.field, err)
+	}
+	return size, nil
 }
 
 // fieldToSQL converts a field expression into a SQL clause. Method on
@@ -918,7 +997,11 @@ func (d *DB) fieldToSQL(f *fieldExpr) (string, []interface{}, error) {
 			[]interface{}{f.value}, nil
 
 	case "date":
-		return parseDateRange(f.value)
+		where, params, err := parseDateRange(f.value)
+		if f.noIndex {
+			where = strings.ReplaceAll(where, "m.date", "+m.date")
+		}
+		return where, params, err
 
 	case "path":
 		account := extractAccountFromPath(f.value)
@@ -929,6 +1012,9 @@ func (d *DB) fieldToSQL(f *fieldExpr) (string, []interface{}, error) {
 			}
 			if len(ids) == 0 {
 				return "1=0", nil, nil
+			}
+			if f.noIndex {
+				return "+m.account_id = ?", []interface{}{ids[0]}, nil
 			}
 			return "m.account_id = ?", []interface{}{ids[0]}, nil
 		}
