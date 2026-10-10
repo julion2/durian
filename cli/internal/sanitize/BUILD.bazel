@@ -17,6 +17,7 @@ go_test(
     size = "small",
     srcs = [
         "fixture_test.go",
+        "quote_equiv_test.go",
         "quote_test.go",
         "sanitize_test.go",
         "signature_test.go",
