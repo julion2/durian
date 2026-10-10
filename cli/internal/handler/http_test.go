@@ -52,6 +52,7 @@ func newTestRouter(h *Handler, hub *EventHub) *mux.Router {
 	r.HandleFunc("/api/v1/contacts/search", h.SearchContactsHandler).Methods("GET")
 	r.HandleFunc("/api/v1/contacts/usage", h.IncrementContactUsageHandler).Methods("POST")
 	r.HandleFunc("/api/v1/contacts", h.ListContactsHandler).Methods("GET")
+	r.HandleFunc("/api/v1/profiles", h.ProfilesHandler).Methods("GET")
 	if hub != nil {
 		r.Handle("/api/v1/events", hub).Methods("GET")
 	}
