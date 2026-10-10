@@ -149,10 +149,15 @@ func (s *Syncer) storeInsertMessage(mailboxName string, uidValidity uint32, matc
 		}
 	}
 
-	// Eagerly detect calendar content
-	if bytes.Contains(msgBody, []byte("text/calendar")) {
-		if err := s.store.AddTag(storeMsg.ID, "cal"); err != nil {
+	// Eagerly detect calendar content, and keep the invitation – or that
+	// there is none – so sync never fetches this message for it again
+	// (store.MissingInvitations).
+	if content.Calendar != "" || bytes.Contains(msgBody, []byte("text/calendar")) {
+		if err := s.store.AddTag(storeMsg.ID, store.CalendarTag); err != nil {
 			return "", fmt.Errorf("add cal tag: %w", err)
+		}
+		if err := s.store.SetInvitation(storeMsg.ID, content.Calendar); err != nil {
+			return "", err
 		}
 	}
 

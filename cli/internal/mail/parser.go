@@ -63,6 +63,48 @@ type Parser struct {
 	attnCount    int
 	capturedData []byte
 	capturedType string
+
+	// calendar is the message's iCalendar part, calendarRank how it was sent
+	// (see noteCalendar).
+	calendar     string
+	calendarRank int
+}
+
+// MaxCalendarBytes bounds the iCalendar part kept from a message. An
+// invitation is a few KB; anything this big is a calendar export someone
+// attached, not an invitation to answer.
+const MaxCalendarBytes = 512 << 10
+
+// noteCalendar keeps the message's iCalendar part. An inline text/calendar
+// part – the iMIP form of an invitation – wins over an attached .ics, which
+// some senders add as a copy of it; among equals the first wins.
+func (p *Parser) noteCalendar(rawBody []byte, transferEncoding, charset string, attached bool) {
+	rank := 2
+	if attached {
+		rank = 1
+	}
+	if rank <= p.calendarRank {
+		return
+	}
+	if ics := DecodeCalendar(rawBody, transferEncoding, charset); ics != "" {
+		p.calendar, p.calendarRank = ics, rank
+	}
+}
+
+// DecodeCalendar decodes an iCalendar part as sent; "" when it is empty or
+// larger than MaxCalendarBytes. Sync uses it for a part fetched on its own,
+// so it is kept exactly as when parsed with the whole message.
+func DecodeCalendar(rawBody []byte, transferEncoding, charset string) string {
+	ics := encoding.DecodeBody(rawBody, transferEncoding, charset)
+	if len(ics) > MaxCalendarBytes {
+		return ""
+	}
+	return ics
+}
+
+// isCalendarType reports whether a part's media type carries iCalendar data.
+func isCalendarType(mediaType string) bool {
+	return mediaType == "text/calendar" || mediaType == "application/ics"
 }
 
 // noteAttachment is called once per attachment in parse order. It counts
@@ -99,6 +141,7 @@ func (p *Parser) Parse(msg *mail.Message) *MailContent {
 	content.Body = textBody
 	content.HTML = sanitize.SanitizeHTML(htmlBody)
 	content.Attachments = attachments
+	content.Calendar = p.calendar
 
 	return content
 }
@@ -106,6 +149,7 @@ func (p *Parser) Parse(msg *mail.Message) *MailContent {
 // extractBody extracts text, HTML and attachments from a mail message
 func (p *Parser) extractBody(msg *mail.Message) (string, string, []AttachmentInfo) {
 	p.attnCount = 0
+	p.calendar, p.calendarRank = "", 0
 	contentType := msg.Header.Get("Content-Type")
 	transferEncoding := msg.Header.Get("Content-Transfer-Encoding")
 	charset := encoding.GetCharset(contentType)
@@ -174,10 +218,16 @@ func (p *Parser) extractBody(msg *mail.Message) (string, string, []AttachmentInf
 			ContentID:   msg.Header.Get("Content-Id"),
 		})
 		p.noteAttachment(body, transferEncoding, mediaType)
+		if isCalendarType(mediaType) {
+			p.noteCalendar(body, transferEncoding, charset, true)
+		}
 		return "", "", attachments
 	}
 
 	body, _ := io.ReadAll(msg.Body)
+	if isCalendarType(mediaType) {
+		p.noteCalendar(body, transferEncoding, charset, false)
+	}
 	return encoding.DecodeBody(body, transferEncoding, charset), "", attachments
 }
 
@@ -198,11 +248,12 @@ func (p *Parser) extractMultipart(r io.Reader, boundary string) (string, string,
 		transferEncoding := part.Header.Get("Content-Transfer-Encoding")
 		charset := encoding.GetCharset(contentType)
 		mediaType, params, _ := mime.ParseMediaType(contentType)
+		dispositionType, _, _ := mime.ParseMediaType(contentDisp)
 
-		if strings.Contains(contentDisp, "attachment") || (part.FileName() != "" && !strings.HasPrefix(mediaType, "text/")) {
+		if dispositionType == "attachment" || (part.FileName() != "" && !strings.HasPrefix(mediaType, "text/")) {
 			name := encoding.DecodeHeader(part.FileName())
 			disposition := "attachment"
-			if strings.Contains(contentDisp, "inline") {
+			if dispositionType == "inline" {
 				disposition = "inline"
 			}
 			attBody, _ := io.ReadAll(part)
@@ -230,11 +281,17 @@ func (p *Parser) extractMultipart(r io.Reader, boundary string) (string, string,
 				ContentID:   part.Header.Get("Content-Id"),
 			})
 			p.noteAttachment(attBody, transferEncoding, mediaType)
+			if isCalendarType(mediaType) {
+				p.noteCalendar(attBody, transferEncoding, charset, true)
+			}
 			continue
 		}
 
 		body, _ := io.ReadAll(part)
 
+		if isCalendarType(mediaType) {
+			p.noteCalendar(body, transferEncoding, charset, false)
+		}
 		if strings.HasPrefix(mediaType, "text/plain") && textContent == "" {
 			textContent = encoding.DecodeBody(body, transferEncoding, charset)
 		} else if strings.HasPrefix(mediaType, "text/html") && htmlContent == "" {

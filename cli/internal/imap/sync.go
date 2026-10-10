@@ -11,6 +11,7 @@ import (
 	goimap "github.com/emersion/go-imap"
 
 	"github.com/julion2/durian/cli/internal/config"
+	"github.com/julion2/durian/cli/internal/invitationsync"
 	durianmail "github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/store"
 )
@@ -264,6 +265,7 @@ func (s *Syncer) Sync() (*SyncResult, error) {
 	// Automatically backfill reaction-critical headers once per mailbox.
 	if !s.options.DryRun {
 		s.backfillHeaders(mailboxes)
+		s.fillInvitations(invitationsync.Budget)
 	}
 
 	result.Duration = time.Since(start)

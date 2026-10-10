@@ -136,6 +136,9 @@ type applyFlagsCall struct {
 type fakeBackend struct {
 	folders []backend.Folder
 	scripts map[string][]backend.FetchResult
+	// bodies serves FetchBody by RemoteRef.ID; bodyFetches counts the calls.
+	bodies      map[string][]byte
+	bodyFetches int
 	// fetchByCursor, when set, models a provider state machine whose response
 	// is selected by the persisted opaque cursor rather than call order.
 	fetchByCursor    func(folder string, cursor backend.Cursor) backend.FetchResult
@@ -327,7 +330,13 @@ func (f *fakeBackend) FetchMessages(ctx context.Context, folder string, cursor b
 }
 
 func (f *fakeBackend) FetchBody(ctx context.Context, ref backend.RemoteRef, w io.Writer) error {
-	return fmt.Errorf("fakeBackend: FetchBody not scripted")
+	f.bodyFetches++
+	body, ok := f.bodies[ref.ID]
+	if !ok {
+		return fmt.Errorf("fakeBackend: FetchBody not scripted")
+	}
+	_, err := w.Write(body)
+	return err
 }
 
 func (f *fakeBackend) FetchSnapshotMessages(_ context.Context, refs []backend.RemoteRef) (backend.SnapshotBatch, error) {

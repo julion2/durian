@@ -62,6 +62,7 @@ go_test(
         "error_sanitize_test.go",
         "handler_test.go",
         "http_test.go",
+        "invitation_test.go",
         "profiles_test.go",
         "ratelimit_test.go",
         "settings_test.go",

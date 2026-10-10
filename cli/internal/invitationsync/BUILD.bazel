@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "invitationsync",
+    srcs = ["fill.go"],
+    importpath = "github.com/julion2/durian/cli/internal/invitationsync",
+    visibility = ["//cli:__subpackages__"],
+    deps = ["//cli/internal/store"],
+)
+
+go_test(
+    name = "invitationsync_test",
+    size = "small",
+    srcs = ["fill_test.go"],
+    embed = [":invitationsync"],
+    deps = [
+        "//cli/internal/dbcrypto",
+        "//cli/internal/store",
+    ],
+)

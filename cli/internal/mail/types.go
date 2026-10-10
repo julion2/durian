@@ -1,5 +1,7 @@
 package mail
 
+import "github.com/julion2/durian/cli/internal/calendar"
+
 // AttachmentInfo represents metadata about a single email attachment
 type AttachmentInfo struct {
 	PartID      int    `json:"part_id"`
@@ -40,6 +42,9 @@ type MailContent struct {
 	Body        string           `json:"body"`
 	HTML        string           `json:"html,omitempty"`
 	Attachments []AttachmentInfo `json:"attachments,omitempty"`
+	// Calendar is the iCalendar part of an invitation (see Parser), kept by
+	// sync; it is not part of the mail as shown.
+	Calendar string `json:"-"`
 }
 
 // ThreadContent represents a complete email thread with all messages
@@ -82,4 +87,7 @@ type MessageInfo struct {
 	HiddenSignature string           `json:"hidden_signature,omitempty"`
 	Attachments     []AttachmentInfo `json:"attachments,omitempty"`
 	Tags            []string         `json:"tags,omitempty"`
+	// Invitation is the calendar invitation the message carries, in the
+	// full thread view only.
+	Invitation *calendar.Invitation `json:"invitation,omitempty"`
 }

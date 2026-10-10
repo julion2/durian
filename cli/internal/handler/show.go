@@ -18,6 +18,7 @@ import (
 
 	"github.com/julion2/durian/cli/internal/backend"
 	"github.com/julion2/durian/cli/internal/backendfactory"
+	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/julion2/durian/cli/internal/config"
 	internmail "github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/protocol"
@@ -102,6 +103,10 @@ func (h *Handler) convertThread(threadID string, msgs []*store.Message, light bo
 func (h *Handler) convertThreadWithHeaders(threadID string, msgs []*store.Message, light bool, tagMap map[int64][]string, attMap map[int64][]store.Attachment, headerMap map[int64]map[string][]string) *internmail.ThreadContent {
 	messages := make([]internmail.MessageInfo, 0, len(msgs))
 	var subject string
+	var invitations map[int64]string
+	if !light {
+		invitations, _ = h.store.InvitationsByMessages(threadMessageRowIDs(msgs))
+	}
 
 	for _, msg := range msgs {
 		// Tags decide draft status, which decides reaction eligibility, so
@@ -135,6 +140,9 @@ func (h *Handler) convertThreadWithHeaders(threadID string, msgs []*store.Messag
 			// one caller that needs the blind recipients. Enriched search
 			// results would otherwise decrypt and ship them on every hit.
 			info.BCC = msg.BCCAddrs
+			if ics, ok := invitations[msg.ID]; ok {
+				info.Invitation = h.invitation(msg, ics)
+			}
 		}
 
 		if subject == "" {
@@ -366,4 +374,23 @@ func extractSenderEmail(from string) string {
 		}
 	}
 	return lower
+}
+
+// invitation reads a message's stored iCalendar part for the thread view; nil
+// when it doesn't parse. The owner's response is read for the account the
+// message reached.
+func (h *Handler) invitation(msg *store.Message, ics string) *calendar.Invitation {
+	owner := ""
+	if h.cfg != nil {
+		if account, err := h.cfg.GetAccountByIdentifier(msg.Account); err == nil {
+			owner = account.Email
+		}
+	}
+	inv, err := calendar.ParseInvitation([]byte(ics), owner)
+	if err != nil {
+		slog.Debug("Unreadable invitation", "module", "HANDLER", "err", err)
+		return nil
+	}
+	inv.Event.Account = msg.Account
+	return inv
 }

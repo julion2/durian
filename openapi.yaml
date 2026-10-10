@@ -1054,6 +1054,32 @@ components:
           type: array
           items:
             type: string
+        invitation:
+          $ref: '#/components/schemas/Invitation'
+    Invitation:
+      type: object
+      description: >
+        The calendar invitation a message carries (its iCalendar part), in
+        GET /threads/{thread_id} only. Absent for mail without one, and for
+        mail synced before invitations were kept until sync has caught up on
+        it. This is a snapshot from the mail, not the current calendar state.
+        POST /calendars/rsvp accepts event.uid as ref and event.account as
+        account only when the event already exists in a writable local calendar
+        and the account owner is an attendee. It does not import invitations
+        or send an email reply; calendar sync propagates the local response.
+      properties:
+        method:
+          type: string
+          description: iTIP method in upper case (REQUEST, CANCEL, REPLY, ...); omitted when the part names none
+        event:
+          $ref: '#/components/schemas/CalendarEvent'
+        occurrence:
+          type: boolean
+          description: >
+            True when the mail is about one occurrence of a series only (an
+            update or cancellation of that date); event is that occurrence.
+            The RSVP endpoint cannot answer this occurrence independently:
+            answering event.uid changes the existing local series instead.
     Contact:
       type: object
       properties:
