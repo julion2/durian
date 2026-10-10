@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -647,5 +648,63 @@ func TestConvertThread_ThreadIDPropagated(t *testing.T) {
 	resp := h.ShowThread(m.ThreadID)
 	if resp.Thread.ThreadID != m.ThreadID {
 		t.Errorf("ThreadID = %q, want %q", resp.Thread.ThreadID, m.ThreadID)
+	}
+}
+
+// ShowThread loads tags and attachments for the whole thread at once; the
+// result must be what loading them per message gives, including for messages
+// with none.
+func TestShowThread_BatchMatchesPerMessage(t *testing.T) {
+	db := newTestStore(t)
+	at := time.Date(2026, 10, 5, 9, 0, 0, 0, time.UTC).Unix()
+	root := seedThreadMessage(t, db, &store.Message{
+		MessageID: "root@test", Subject: "Plan", FromAddr: "a@example.com",
+		Date: at, CreatedAt: at, BodyText: "root", BodyHTML: "<p>root</p>", Mailbox: "INBOX",
+	})
+	tagged := seedThreadMessage(t, db, &store.Message{
+		MessageID: "tagged@test", Subject: "Re: Plan", FromAddr: "b@example.com",
+		InReplyTo: "<root@test>", Refs: "<root@test>",
+		Date: at + 60, CreatedAt: at, BodyText: "tagged", Mailbox: "INBOX",
+	})
+	attached := seedThreadMessage(t, db, &store.Message{
+		MessageID: "attached@test", Subject: "Re: Plan", FromAddr: "c@example.com",
+		InReplyTo: "<tagged@test>", Refs: "<root@test> <tagged@test>",
+		Date: at + 120, CreatedAt: at, BodyText: "attached", Mailbox: "INBOX",
+	})
+	for _, tag := range []string{"unread", "inbox", "flagged"} {
+		if err := db.AddTag(tagged.ID, tag); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.AddTag(attached.ID, "inbox"); err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range []int{3, 2} {
+		att := &store.Attachment{MessageDBID: attached.ID, PartID: part, Filename: "f" + strconv.Itoa(part) + ".pdf", ContentType: "application/pdf", Size: 10, Disposition: "attachment"}
+		if err := db.InsertAttachment(att); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	logo := &store.Attachment{MessageDBID: root.ID, PartID: 2, Filename: "logo.png", ContentType: "image/png", Size: 5, Disposition: "inline", ContentID: "logo@test"}
+	if err := db.InsertAttachment(logo); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(db, nil)
+	resp := h.ShowThread(root.ThreadID)
+	if !resp.OK {
+		t.Fatalf("ShowThread failed: %s", resp.Error)
+	}
+	msgs, err := db.GetByThread(root.ThreadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := h.convertThread(root.ThreadID, msgs, false, nil, nil)
+	if !reflect.DeepEqual(resp.Thread, want) {
+		t.Fatalf("batched thread differs from per-message loading:\n got %+v\nwant %+v", resp.Thread, want)
+	}
+	if len(want.Messages) != 3 || len(want.Messages[0].Attachments) != 2 || len(want.Messages[1].Tags) != 3 || len(want.Messages[2].Attachments) != 1 {
+		t.Fatalf("fixture lost its tags or attachments: %+v", want.Messages)
 	}
 }

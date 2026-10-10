@@ -52,7 +52,12 @@ func (h *Handler) ShowThread(threadID string) protocol.Response {
 		return protocol.Fail(protocol.ErrNotFound, errors.New("no messages found for thread"))
 	}
 
-	thread := h.convertThread(threadID, msgs, false, nil, nil)
+	// tags and attachments in one query each, not two per message; a failed
+	// batch leaves its map nil and convertThread queries per message
+	ids := threadMessageRowIDs(msgs)
+	tagMap, _ := h.store.GetMessageTagsBatch(ids)
+	attMap, _ := h.store.GetAttachmentsByMessages(ids)
+	thread := h.convertThread(threadID, msgs, false, tagMap, attMap)
 	return protocol.SuccessWithThread(thread)
 }
 

@@ -63,6 +63,7 @@ go_test(
         "http_test.go",
         "profiles_test.go",
         "ratelimit_test.go",
+        "show_bench_test.go",
         "watcher_test.go",
     ],
     embed = [":handler"],
