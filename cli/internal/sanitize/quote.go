@@ -97,7 +97,7 @@ func StripQuotedContent(html string) string {
 		return html
 	}
 
-	htmlLower := strings.ToLower(html)
+	htmlLower := lowerASCII(html)
 
 	earliestIdx := -1
 	for _, pattern := range quotePatterns {
@@ -193,6 +193,22 @@ func StripQuotedTextContent(text string) string {
 		}
 	}
 	return stripped
+}
+
+// lowerASCII lowercases A-Z and keeps every other byte, so an index into the
+// result is one into s. strings.ToLower isn't: it rewrites invalid UTF-8 and
+// changes the length of some letters (İ, K), and cutting the HTML where the
+// quote starts in its result cut mail in the wrong place.
+func lowerASCII(s string) string {
+	b := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b[i] = c
+	}
+	return string(b)
 }
 
 // htmlTagOrSpace matches HTML tags and whitespace.
