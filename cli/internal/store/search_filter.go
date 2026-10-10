@@ -190,7 +190,11 @@ func (d *DB) sqlLeafSets(node exprNode, ids []int64) (map[*fieldExpr]map[int64]b
 
 	sets := make(map[*fieldExpr]map[int64]bool, len(leaves))
 	for _, leaf := range leaves {
-		where, params, err := d.fieldToSQL(leaf)
+		// the candidates are given: every leaf is a probe here, never a set
+		// (a driving tag would load all of its message ids again)
+		probe := *leaf
+		probe.drive = false
+		where, params, err := d.fieldToSQL(&probe)
 		if err != nil {
 			return nil, fmt.Errorf("sql leaf recheck (%s): %w", leaf.field, err)
 		}

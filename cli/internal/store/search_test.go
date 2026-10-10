@@ -896,37 +896,113 @@ func TestPostDecryptFilterORMixedDropsCollision(t *testing.T) {
 	}
 }
 
-// A tag query must start from the tag index, not scan every message: the
-// scan cost a fixed 100-500 ms per search on a real mailbox.
-func TestSearch_TagQueryUsesTagIndex(t *testing.T) {
+// queryPlan returns SQLite's plan for the WHERE clause a query compiles to.
+func queryPlan(t *testing.T, db *DB, query string) string {
+	t.Helper()
+	where, params, _, _, err := db.parseQueryWithTerms(query)
+	if err != nil {
+		t.Fatalf("parse %q: %v", query, err)
+	}
+	rows, err := db.db.Query("EXPLAIN QUERY PLAN SELECT m.id FROM messages m WHERE "+where, params...)
+	if err != nil {
+		t.Fatalf("plan %q: %v", query, err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan plan: %v", err)
+		}
+		plan = append(plan, detail)
+	}
+	return strings.Join(plan, " | ")
+}
+
+// Tag-only searches start from the tag index; when something else narrows the
+// candidates (full text, thread:) tags are probed per candidate instead of
+// loading every message id of the tag; negated tags are always probes.
+func TestSearch_TagDriverPlans(t *testing.T) {
 	db := seedSearchDB(t)
-	for _, query := range []string{"tag:inbox", "tag:inbox AND NOT tag:sent", "tag:inbox AND from:alice"} {
-		where, params, _, _, err := db.parseQueryWithTerms(query)
+	m, err := db.GetByMessageID("s2@x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		query    string
+		tagIndex int // idx_tags_tag uses: 1 when a tag drives, 0 when tags are probes
+		uses     string
+	}{
+		{"tag:inbox", 1, ""},
+		{"tag:inbox AND NOT tag:unread", 1, "sqlite_autoindex_tags_1"},
+		{"tag:inbox AND from:alice", 1, ""},
+		{"tag:inbox OR tag:unread", 2, ""},
+		{"tag:inbox AND invoice", 0, "messages_blind_fts"},
+		{"tag:inbox AND subject:meeting", 0, "messages_blind_fts"},
+		{"tag:inbox AND thread:" + m.ThreadID, 0, "idx_messages_thread_id"},
+		{"NOT tag:unread AND thread:" + m.ThreadID, 0, "idx_messages_thread_id"},
+	} {
+		plan := queryPlan(t, db, c.query)
+		if got := strings.Count(plan, "idx_tags_tag"); got != c.tagIndex {
+			t.Errorf("%q: idx_tags_tag used %d times, want %d: %s", c.query, got, c.tagIndex, plan)
+		}
+		if c.uses != "" && !strings.Contains(plan, c.uses) {
+			t.Errorf("%q: plan doesn't use %s: %s", c.query, c.uses, plan)
+		}
+		if c.tagIndex > 0 && strings.Contains(plan, "SCAN m ") {
+			t.Errorf("%q: a tag-driven plan scans messages: %s", c.query, plan)
+		}
+	}
+}
+
+// Of several positive tags the smallest drives, whatever the order written.
+func TestSearch_SmallestTagDrives(t *testing.T) {
+	db := seedSearchDB(t) // inbox: 5 messages, unread: 1
+	for _, query := range []string{"tag:inbox AND tag:unread", "tag:unread AND tag:inbox"} {
+		node, err := parse(lex(query))
 		if err != nil {
-			t.Fatalf("parse %q: %v", query, err)
+			t.Fatal(err)
 		}
-		rows, err := db.db.Query("EXPLAIN QUERY PLAN SELECT m.id FROM messages m WHERE "+where, params...)
+		if err := db.chooseTagDriver(node); err != nil {
+			t.Fatal(err)
+		}
+		var leaves []*fieldExpr
+		collectSQLLeaves(node, &leaves)
+		for _, leaf := range leaves {
+			if want := leaf.value == "unread"; leaf.drive != want {
+				t.Errorf("%q: tag:%s drive = %v, want %v", query, leaf.value, leaf.drive, want)
+			}
+		}
+	}
+}
+
+// Both forms find the same messages.
+func TestSearch_TagCombinationsMatch(t *testing.T) {
+	db := seedSearchDB(t)
+	count := func(query string) int {
+		t.Helper()
+		n, err := db.SearchCount(query)
 		if err != nil {
-			t.Fatalf("plan %q: %v", query, err)
+			t.Fatalf("%q: %v", query, err)
 		}
-		var plan []string
-		for rows.Next() {
-			var id, parent, unused int
-			var detail string
-			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
-				t.Fatalf("scan plan: %v", err)
-			}
-			plan = append(plan, detail)
-		}
-		rows.Close()
-		joined := strings.Join(plan, " | ")
-		if !strings.Contains(joined, "idx_tags_tag") {
-			t.Errorf("%q: plan doesn't use idx_tags_tag: %s", query, joined)
-		}
-		for _, step := range plan {
-			if strings.HasPrefix(step, "SCAN m") {
-				t.Errorf("%q: plan scans messages: %s", query, joined)
-			}
+		return n
+	}
+	for query, want := range map[string]int{
+		"tag:inbox":                         4, // five messages, s2/s3 share a thread
+		"tag:unread":                        1,
+		"tag:inbox AND tag:unread":          1,
+		"tag:unread AND tag:inbox":          1,
+		"tag:inbox OR tag:unread":           4,
+		"tag:inbox AND NOT tag:unread":      3,
+		"tag:inbox AND invoice":             2, // s1 and s4 mention it
+		"tag:unread AND invoice":            1,
+		"NOT tag:unread AND invoice":        1,
+		"tag:inbox AND from:alice":          3,
+		"tag:inbox AND NOT tag:nonexistent": 4,
+	} {
+		if got := count(query); got != want {
+			t.Errorf("%q: %d threads, want %d", query, got, want)
 		}
 	}
 }
