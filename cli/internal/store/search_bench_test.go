@@ -108,25 +108,23 @@ func seedTagBench(copies, inbox int) (*DB, string, error) {
 // go test ./internal/store -run '^$' -bench TagSearch -benchtime 20x
 func BenchmarkTagSearch(b *testing.B) {
 	db, thread := tagBenchMailbox(b)
-	for _, c := range []struct {
-		name, query string
-		count       bool
-	}{
-		{"count/tag:inbox", "tag:inbox", true},
-		{"search/tag:inbox", "tag:inbox", false},
-		{"search/tag:archive AND uniqueneedle", "tag:archive AND uniqueneedle", false},
-		{"search/tag:archive AND thread", "tag:archive AND thread:" + thread, false},
-		{"search/tag:inbox AND NOT tag:archive", "tag:inbox AND NOT tag:archive", false},
+	// each op: Search and SearchCount, as a client lists and counts a view
+	for _, c := range []struct{ name, query string }{
+		{"tag:inbox", "tag:inbox"},
+		{"tag:inbox AND NOT tag:archive", "tag:inbox AND NOT tag:archive"},
+		// two tags compete: the only case that counts (the smaller drives)
+		{"tag:archive AND tag:inbox", "tag:archive AND tag:inbox"},
+		{"tag:archive AND uniqueneedle", "tag:archive AND uniqueneedle"},
+		{"tag:archive AND thread", "tag:archive AND thread:" + thread},
+		{"tag:archive AND (uniqueneedle OR missingneedle)", "tag:archive AND (uniqueneedle OR missingneedle)"},
+		{"tag:archive AND (thread OR thread:missing)", "tag:archive AND (thread:" + thread + " OR thread:missing)"},
 	} {
 		b.Run(c.name, func(b *testing.B) {
 			for b.Loop() {
-				var err error
-				if c.count {
-					_, err = db.SearchCount(c.query)
-				} else {
-					_, err = db.Search(c.query, 50)
+				if _, err := db.Search(c.query, 50); err != nil {
+					b.Fatal(err)
 				}
-				if err != nil {
+				if _, err := db.SearchCount(c.query); err != nil {
 					b.Fatal(err)
 				}
 			}

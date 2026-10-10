@@ -360,9 +360,9 @@ type fieldExpr struct {
 	field  string
 	value  string
 	phrase bool // double-quoted value → use bigram phrase tokenization
-	// drive marks the tag leaf the query starts from (see chooseTagDriver):
-	// it compiles to a set the planner reads through idx_tags_tag. Every
-	// other tag leaf compiles to a per-candidate probe.
+	// drive marks a tag leaf the query starts from (see driverPlan): it
+	// compiles to a set the planner reads through idx_tags_tag. Every other
+	// tag leaf compiles to a per-candidate probe.
 	drive bool
 }
 
@@ -768,96 +768,112 @@ func (d *DB) parseQueryWithTerms(query string) (where string, params []interface
 	return where, params, node, terms, nil
 }
 
-// tagDriverSampleCap bounds the cardinality probe in chooseTagDriver: past
-// this many messages a tag is "large", and counting further would cost more
-// than the choice saves.
-const tagDriverSampleCap = 10000
+// tagDriverSampleCap bounds the size count that settles which of two tags
+// drives: it only has to tell small from large.
+const tagDriverSampleCap = 2000
 
-// chooseTagDriver decides which tag leaf, if any, a query starts from.
-//
-// The query's top-level conjuncts (the AND chain) are the candidates. If one
-// of them is selective through its own index – full text, subject:, thread:
-// – it drives, and every tag leaf stays a per-candidate probe. Otherwise the
-// smallest positive tag conjunct drives: a tag leaf, or an OR of tag leaves.
-// Its size is counted through idx_tags_tag, capped at tagDriverSampleCap,
-// so the result doesn't depend on the order the query was written in.
-// Negated tags never drive: NOT of a set would load the whole set.
+// chooseTagDriver decides which tag leaves, if any, the query starts from:
+// those compile to sets SQLite reads through idx_tags_tag, every other tag
+// leaf to a per-candidate probe. See driverPlan for the rule.
 func (d *DB) chooseTagDriver(node exprNode) error {
-	var conjuncts []exprNode
-	flattenAnd(node, &conjuncts)
-	for _, c := range conjuncts {
-		if selectiveDriver(c) {
-			return nil
-		}
+	tags, ok, err := d.driverPlan(node, map[string]int{})
+	if err != nil || !ok {
+		return err
 	}
-	var best []*fieldExpr
-	bestSize := -1
-	for _, c := range conjuncts {
-		leaves, ok := positiveTagLeaves(c)
-		if !ok {
-			continue
-		}
-		size := 0
-		for _, leaf := range leaves {
-			var n int
-			err := d.db.QueryRow(
-				"SELECT COUNT(*) FROM (SELECT 1 FROM tags WHERE tag = ? LIMIT ?)",
-				leaf.value, tagDriverSampleCap,
-			).Scan(&n)
-			if err != nil {
-				return fmt.Errorf("tag size: %w", err)
-			}
-			size += n
-		}
-		if bestSize < 0 || size < bestSize {
-			best, bestSize = leaves, size
-		}
-	}
-	for _, leaf := range best {
+	for _, leaf := range tags {
 		leaf.drive = true
 	}
 	return nil
 }
 
-func flattenAnd(node exprNode, out *[]exprNode) {
-	if b, ok := node.(*binaryExpr); ok && b.op == "AND" {
-		flattenAnd(b.left, out)
-		flattenAnd(b.right, out)
-		return
-	}
-	*out = append(*out, node)
-}
-
-// selectiveDriver reports a conjunct that narrows candidates through its own
-// index: a full-text term (bare or subject:) or a thread.
-func selectiveDriver(node exprNode) bool {
+// selfDriving reports a subexpression that narrows candidates through its own
+// index, no tag set needed: full text, subject:, thread: – and AND / OR of
+// them (an AND needs one such side, an OR both). Structural only: no query.
+func selfDriving(node exprNode) bool {
 	switch n := node.(type) {
 	case *bareExpr:
 		return true
 	case *fieldExpr:
 		return n.field == "subject" || n.field == "thread"
+	case *binaryExpr:
+		if n.op == "AND" {
+			return selfDriving(n.left) || selfDriving(n.right)
+		}
+		return selfDriving(n.left) && selfDriving(n.right)
 	}
 	return false
 }
 
-// positiveTagLeaves returns the leaves of a conjunct that is a tag, or an OR
-// of tags; ok is false for anything else.
-func positiveTagLeaves(node exprNode) (leaves []*fieldExpr, ok bool) {
+// driverPlan is how a subexpression can produce its candidates from an index
+// instead of a scan, and the tag leaves that takes as sets; ok is false when
+// it can't.
+//
+//   - full text, subject:, thread:  drive on their own index, no tags
+//   - a positive tag                 drives as its set
+//   - a OR b                         drives only if both sides do (the union)
+//   - a AND b                        a self-driving side wins (tags stay
+//     probes); else the side that can drive; if both can, the one whose tag
+//     sets are smaller – the only case that counts anything
+//   - NOT, and every other field     can't drive (their SQL filters candidates)
+func (d *DB) driverPlan(node exprNode, sizes map[string]int) (tags []*fieldExpr, ok bool, err error) {
+	if selfDriving(node) {
+		return nil, true, nil
+	}
 	switch n := node.(type) {
 	case *fieldExpr:
 		if n.field == "tag" {
-			return []*fieldExpr{n}, true
+			return []*fieldExpr{n}, true, nil
 		}
 	case *binaryExpr:
-		if n.op == "OR" {
-			left, okLeft := positiveTagLeaves(n.left)
-			right, okRight := positiveTagLeaves(n.right)
-			if okLeft && okRight {
-				return append(left, right...), true
-			}
+		left, leftOK, err := d.driverPlan(n.left, sizes)
+		if err != nil {
+			return nil, false, err
 		}
+		right, rightOK, err := d.driverPlan(n.right, sizes)
+		if err != nil {
+			return nil, false, err
+		}
+		if n.op == "OR" {
+			return append(left, right...), leftOK && rightOK, nil
+		}
+		if !leftOK || !rightOK {
+			if leftOK {
+				return left, true, nil
+			}
+			return right, rightOK, nil
+		}
+		leftSize, err := d.tagSetSize(left, sizes)
+		if err != nil {
+			return nil, false, err
+		}
+		rightSize, err := d.tagSetSize(right, sizes)
+		if err != nil {
+			return nil, false, err
+		}
+		if rightSize < leftSize {
+			return right, true, nil
+		}
+		return left, true, nil
 	}
-	return nil, false
+	return nil, false, nil
+}
+
+// tagSetSize sums the tags' sizes, each counted through idx_tags_tag up to
+// tagDriverSampleCap, once per tag and query.
+func (d *DB) tagSetSize(tags []*fieldExpr, sizes map[string]int) (int, error) {
+	total := 0
+	for _, leaf := range tags {
+		size, ok := sizes[leaf.value]
+		if !ok {
+			err := d.db.QueryRow("SELECT COUNT(*) FROM (SELECT 1 FROM tags WHERE tag = ? LIMIT ?)", leaf.value, tagDriverSampleCap).Scan(&size)
+			if err != nil {
+				return 0, fmt.Errorf("tag size: %w", err)
+			}
+			sizes[leaf.value] = size
+		}
+		total += size
+	}
+	return total, nil
 }
 
 // fieldToSQL converts a field expression into a SQL clause. Method on

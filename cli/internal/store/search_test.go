@@ -942,6 +942,12 @@ func TestSearch_TagDriverPlans(t *testing.T) {
 		{"tag:inbox AND subject:meeting", 0, "messages_blind_fts"},
 		{"tag:inbox AND thread:" + m.ThreadID, 0, "idx_messages_thread_id"},
 		{"NOT tag:unread AND thread:" + m.ThreadID, 0, "idx_messages_thread_id"},
+		// compound filters drive when both sides of an OR can
+		{"tag:inbox AND (invoice OR missingword)", 0, "messages_blind_fts"},
+		{"tag:inbox AND (thread:" + m.ThreadID + " OR thread:missing)", 0, "idx_messages_thread_id"},
+		{"tag:inbox AND ((invoice AND tag:unread) OR thread:missing)", 0, "messages_blind_fts"},
+		// an OR one side of which can't drive leaves the tag in charge
+		{"tag:inbox AND (invoice OR from:alice)", 1, ""},
 	} {
 		plan := queryPlan(t, db, c.query)
 		if got := strings.Count(plan, "idx_tags_tag"); got != c.tagIndex {
@@ -952,6 +958,48 @@ func TestSearch_TagDriverPlans(t *testing.T) {
 		}
 		if c.tagIndex > 0 && strings.Contains(plan, "SCAN m ") {
 			t.Errorf("%q: a tag-driven plan scans messages: %s", c.query, plan)
+		}
+	}
+}
+
+// Which tag leaves become sets, for compound queries: the recursive rule in
+// driverPlan (inbox has 5 messages, unread 1).
+func TestSearch_DriverPlanCompound(t *testing.T) {
+	db := seedSearchDB(t)
+	for query, want := range map[string]string{
+		"tag:inbox":                                "inbox",
+		"tag:inbox AND tag:unread":                 "unread",
+		"tag:inbox AND (invoice OR meeting)":       "",
+		"tag:inbox AND (thread:a OR thread:b)":     "",
+		"tag:inbox AND (invoice OR tag:unread)":    "unread",
+		"tag:inbox AND (tag:inbox OR tag:unread)":  "inbox",
+		"(tag:inbox AND invoice) OR tag:unread":    "unread",
+		"tag:inbox AND NOT (invoice OR meeting)":   "inbox",
+		"tag:inbox AND (invoice OR from:alice)":    "inbox",
+		"NOT tag:inbox":                            "",
+		"from:alice":                               "",
+		"tag:inbox OR from:alice":                  "",
+		"(tag:inbox OR tag:unread) AND thread:a":   "",
+		"(tag:inbox OR tag:unread) AND from:alice": "inbox,unread",
+	} {
+		node, err := parse(lex(query))
+		if err != nil {
+			t.Fatalf("%q: %v", query, err)
+		}
+		if err := db.chooseTagDriver(node); err != nil {
+			t.Fatalf("%q: %v", query, err)
+		}
+		var leaves []*fieldExpr
+		collectSQLLeaves(node, &leaves)
+		var driving []string
+		for _, leaf := range leaves {
+			if leaf.drive {
+				driving = append(driving, leaf.value)
+			}
+		}
+		// "tag:inbox AND (tag:inbox OR tag:unread)": inbox alone (5) is cheaper than the OR (6)
+		if got := strings.Join(driving, ","); got != want {
+			t.Errorf("%q: driving tags %q, want %q", query, got, want)
 		}
 	}
 }
