@@ -45,7 +45,9 @@ func seedTagBench(copies, inbox int) (*DB, string, error) {
 	if err := db.Init(); err != nil {
 		return nil, "", err
 	}
-	now := time.Now().Unix()
+	// fixed dates: the date benchmarks need the needle's day to hold only the
+	// needle; the copies sit on 2026-10-09/10, wherever the clock is
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.Local).Unix()
 	// the needle is also the only message on 2026-10-01 and in account "small"
 	lone := time.Date(2026, 10, 1, 12, 0, 0, 0, time.Local).Unix()
 	template := &Message{MessageID: "template@x", Subject: "Status", FromAddr: "a@example.com", ToAddrs: "b@example.com",

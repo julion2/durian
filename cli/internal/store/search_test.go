@@ -1063,7 +1063,8 @@ func TestSearch_TagCombinationsMatch(t *testing.T) {
 func seedDriverDB(t *testing.T) *DB {
 	t.Helper()
 	db := newTestDB(t)
-	now := time.Now().Unix()
+	// fixed dates: the tests filter by date ranges, which mustn't move with the clock
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.Local).Unix()
 	lone := time.Date(2026, 10, 1, 12, 0, 0, 0, time.Local).Unix()
 	for i := 0; i < 6; i++ {
 		m := &Message{MessageID: fmt.Sprintf("c%d@x", i), Subject: "Status", FromAddr: "a@example.com", ToAddrs: "b@example.com",
@@ -1095,9 +1096,13 @@ func seedDriverDB(t *testing.T) *DB {
 	}
 	rows.Close()
 	for _, r := range all {
-		db.AddTag(r.id, "common")
+		if err := db.AddTag(r.id, "common"); err != nil {
+			t.Fatal(err)
+		}
 		if r.mid == "c0@x" {
-			db.AddTag(r.id, "rare")
+			if err := db.AddTag(r.id, "rare"); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	return db
