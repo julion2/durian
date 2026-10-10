@@ -179,6 +179,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	r.HandleFunc("/api/v1/search", h.SearchHandler).Methods("GET")
 	r.HandleFunc("/api/v1/search/count", h.SearchCountHandler).Methods("GET")
 	r.HandleFunc("/api/v1/tags", h.ListTagsHandler).Methods("GET")
+	r.HandleFunc("/api/v1/settings", h.SettingsHandler).Methods("GET")
 	r.HandleFunc("/api/v1/threads/{thread_id}", h.ShowThreadHandler).Methods("GET")
 	r.HandleFunc("/api/v1/threads/{thread_id}/tags", h.TagThreadHandler).Methods("POST")
 	r.HandleFunc("/api/v1/message/body", h.ShowMessageBodyHandler).Methods("GET")
@@ -233,6 +234,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		slog.Info("Loaded contact groups", "module", "SERVE", "count", len(groups))
 	}
 
+	h.SetConfigPath(cfgFile)
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		slog.Warn("Could not load config", "module", "SERVE", "err", err)

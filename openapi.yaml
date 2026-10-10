@@ -135,6 +135,23 @@ paths:
           description: profiles.pkl could not be evaluated
         '503':
           description: config.pkl is not loaded
+  /settings:
+    get:
+      summary: App settings from config.pkl
+      description: >
+        The settings section of the config serve runs with, read on each
+        request so an edit applies without a restart. Clients use it to
+        follow the user's choices (whether to load remote images in mail,
+        theme, accent color) without evaluating pkl themselves.
+      responses:
+        '200':
+          description: The settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsResponse'
+        '500':
+          description: The config could not be loaded
   /local-drafts:
     get:
       summary: List all local crash-recovery drafts
@@ -887,6 +904,25 @@ components:
         query:
           type: string
           description: A search query, as for /search
+    SettingsResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        settings:
+          type: object
+          properties:
+            theme:
+              type: string
+              enum: [light, dark, system]
+            notifications_enabled:
+              type: boolean
+            load_remote_images:
+              type: boolean
+              description: Load remote images (tracking pixels included) when showing HTML mail
+            accent_color:
+              type: string
+              description: Omitted when not set
     TagRequest:
       type: object
       properties:

@@ -166,6 +166,38 @@ assert_jq "GET /tags .ok is true" "$RESP" '.ok == true'
 assert_jq "GET /tags .tags is array" "$RESP" '.tags | type == "array"'
 assert_jq "GET /tags .tags contains inbox" "$RESP" '.tags | index("inbox") != null'
 
+# Settings: the config serve runs with, schema defaults filled in by pkl
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/settings")
+assert_jq "GET /settings .ok is true" "$RESP" '.ok == true'
+assert_jq "GET /settings .settings.notifications_enabled from the config" "$RESP" '.settings.notifications_enabled == true'
+assert_jq "GET /settings .settings.load_remote_images defaults to false" "$RESP" '.settings.load_remote_images == false'
+assert_jq "GET /settings .settings.theme defaults to system" "$RESP" '.settings.theme == "system"'
+assert_jq "GET /settings carries the settings only" "$RESP" '.settings | keys == ["load_remote_images", "notifications_enabled", "theme"]'
+
+# A config may omit settings entirely. Exercise both fresh evaluation and the
+# cached result, then edits in both directions without restarting serve.
+cp "$HOME/config/config.pkl" "$HOME/config/config.pkl.bak"
+sed '/^settings: C.SettingsConfig = new {/,/^}/d' "$HOME/config/config.pkl.bak" > "$HOME/config/config.pkl"
+for attempt in 1 2; do
+    RESP=$(curl -sf "${AUTH[@]}" "$BASE/settings")
+    assert_jq "GET /settings without a block uses defaults ($attempt)" "$RESP" '.settings == {"theme":"system","notifications_enabled":true,"load_remote_images":false}'
+done
+cat >> "$HOME/config/config.pkl" <<'PKL'
+settings: C.SettingsConfig = new {
+  theme = "dark"
+  notifications_enabled = false
+  load_remote_images = true
+  accent_color = "#ff8800"
+}
+PKL
+for attempt in 1 2; do
+    RESP=$(curl -sf "${AUTH[@]}" "$BASE/settings")
+    assert_jq "GET /settings follows explicit settings ($attempt)" "$RESP" '.settings == {"theme":"dark","notifications_enabled":false,"load_remote_images":true,"accent_color":"#ff8800"}'
+done
+mv "$HOME/config/config.pkl.bak" "$HOME/config/config.pkl"
+RESP=$(curl -sf "${AUTH[@]}" "$BASE/settings")
+assert_jq "GET /settings follows restored defaults" "$RESP" '.settings == {"theme":"system","notifications_enabled":true,"load_remote_images":false}'
+
 # ─────────────────────────────────────────────
 # 4b. Profiles (profiles.pkl beside the -c config, accounts resolved)
 # ─────────────────────────────────────────────

@@ -20,6 +20,11 @@ func Load(path string) (*Config, error) {
 	if err := cachedLoad(path, &cfg, func() error { return loadInto(path, &cfg) }); err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
+	// A missing block has no Pkl schema defaults. Normalize after decoding
+	// (including cache hits), without overriding explicit false settings.
+	if cfg.Settings == nil {
+		cfg.Settings = &SettingsConfig{Theme: "system", NotificationsEnabled: true}
+	}
 
 	// Validate aliases
 	if err := cfg.ValidateAliases(); err != nil {
