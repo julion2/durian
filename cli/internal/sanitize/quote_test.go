@@ -495,3 +495,30 @@ func TestIsEmptyHTML(t *testing.T) {
 		}
 	}
 }
+
+// The quote is found in a lowercased copy and cut from the original, so the
+// lowercasing must keep every byte where it is. strings.ToLower didn't for
+// "İ" (2 bytes, lowercased 3), "K" (Kelvin, 3 bytes, lowercased 1) and invalid
+// UTF-8, and the cut landed inside the markup or the text.
+func TestStripQuotedContent_CutsAtTheQuoteWhateverTheLetters(t *testing.T) {
+	quote := `<div class="gmail_quote">On Monday someone wrote: q</div>`
+	for _, keep := range []string{
+		"<p>İstanbul</p>",
+		"<p>The sample is at 5 \u212A now</p>",
+		"<p>" + strings.Repeat("İ", 40) + "</p>",
+		"<p>bad \xff\xfe bytes</p>",
+		"<p>Größe ẞ</p>",
+	} {
+		if got := StripQuotedContent(keep + quote); got != keep {
+			t.Errorf("StripQuotedContent(%q + quote) = %q, want %q", keep, got, keep)
+		}
+	}
+}
+
+func TestLowerASCII(t *testing.T) {
+	in := "@AZ[`az{ İKſ \xff<DIV>"
+	want := "@az[`az{ İKſ \xff<div>"
+	if got := lowerASCII(in); got != want {
+		t.Errorf("lowerASCII(%q) = %q, want %q", in, got, want)
+	}
+}

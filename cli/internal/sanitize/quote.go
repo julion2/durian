@@ -63,6 +63,22 @@ var mobileSignatures = []string{
 
 // quoteRegexPatterns defines regex patterns for quoted content that can't be matched
 // with simple string patterns (e.g. inline styles with variable values).
+// quoteRegexNeedles are, per quoteRegexPatterns entry, literals every match
+// contains (lowercase). A body lacking one can't match, so the regex is
+// skipped – most mail lacks most of them, and each regex otherwise runs over
+// the whole HTML. The needles avoid "k" and "s": under (?i) those also match
+// U+212A (K) and U+017F (ſ), which lowerASCII keeps.
+var quoteRegexNeedles = [][]string{
+	{"border-top:", "padding:"},
+	{"border-", "none"},
+	{"<hr", "</b>"},
+	{"---", "ngliche nachricht"},
+	{"---", "original"},
+	{"color:", "#555"},
+	{"wrote:", "<br", "<bloc"},
+	{"border-left:", "trong>"},
+}
+
 var quoteRegexPatterns = []*regexp.Regexp{
 	// Outlook Desktop: <div style="border: none; border-top: solid #E1E1E1 1.0pt; padding: ...">
 	regexp.MustCompile(`(?i)<div[^>]*style="[^"]*border-top:\s*solid\s[^"]*padding:[^"]*">`),
@@ -97,17 +113,14 @@ func StripQuotedContent(html string) string {
 		return html
 	}
 
-	htmlLower := strings.ToLower(html)
+	htmlLower := lowerASCII(html)
 
-	earliestIdx := -1
-	for _, pattern := range quotePatterns {
-		idx := strings.Index(htmlLower, strings.ToLower(pattern))
-		if idx != -1 && (earliestIdx == -1 || idx < earliestIdx) {
-			earliestIdx = idx
+	earliestIdx := earliestQuotePattern(htmlLower)
+
+	for i, re := range quoteRegexPatterns {
+		if !containsAll(htmlLower, quoteRegexNeedles[i]) {
+			continue
 		}
-	}
-
-	for _, re := range quoteRegexPatterns {
 		loc := re.FindStringIndex(html)
 		if loc != nil && (earliestIdx == -1 || loc[0] < earliestIdx) {
 			earliestIdx = loc[0]
@@ -195,19 +208,109 @@ func StripQuotedTextContent(text string) string {
 	return stripped
 }
 
-// htmlTagOrSpace matches HTML tags and whitespace.
-var htmlTagOrSpace = regexp.MustCompile(`(?:<[^>]*>|\s|&nbsp;)+`)
+// lowerASCII lowercases A-Z and keeps every other byte, so an index into the
+// result is one into s. strings.ToLower isn't: it rewrites invalid UTF-8 and
+// changes the length of some letters (İ, K), and cutting the HTML where the
+// quote starts in its result cut mail in the wrong place.
+func lowerASCII(s string) string {
+	b := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b[i] = c
+	}
+	return string(b)
+}
+
+// quotePatternsLower are quotePatterns lowercased, to match htmlLower.
+var quotePatternsLower = func() []string {
+	lower := make([]string, len(quotePatterns))
+	for i, p := range quotePatterns {
+		lower[i] = strings.ToLower(p)
+	}
+	return lower
+}()
+
+// earliestQuotePattern returns where the first of quotePatterns occurs in
+// htmlLower, or -1. Each pattern opens a tag, so one pass over the '<' finds
+// it – the first hit is the earliest – instead of one search per pattern
+// through the whole HTML.
+func earliestQuotePattern(htmlLower string) int {
+	for i := 0; ; i++ {
+		next := strings.IndexByte(htmlLower[i:], '<')
+		if next < 0 {
+			return -1
+		}
+		i += next
+		for _, p := range quotePatternsLower {
+			if strings.HasPrefix(htmlLower[i:], p) {
+				return i
+			}
+		}
+	}
+}
+
+func containsAll(s string, needles []string) bool {
+	for _, n := range needles {
+		if !strings.Contains(s, n) {
+			return false
+		}
+	}
+	return true
+}
+
+// collapseTagsAndSpace replaces every run of HTML tags, whitespace and
+// "&nbsp;" with repl – what the regexp `(?:<[^>]*>|\s|&nbsp;)+` with
+// ReplaceAllString did (\s being [\t\n\f\r ]), in one pass without the
+// regexp engine: on a long HTML part that took most of a /threads request.
+func collapseTagsAndSpace(html, repl string) string {
+	var out strings.Builder
+	out.Grow(len(html))
+	inRun := false
+	noMoreTags := false
+	for i := 0; i < len(html); {
+		n := 0 // bytes of tag, space or &nbsp; at i
+		switch c := html[i]; {
+		case c == '<' && !noMoreTags:
+			if end := strings.IndexByte(html[i+1:], '>'); end >= 0 {
+				n = end + 2
+			} else {
+				// No later '<' can close either. Avoid rescanning the suffix,
+				// but keep collapsing whitespace and entities within it.
+				noMoreTags = true
+			}
+		case c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r':
+			n = 1
+		case c == '&' && strings.HasPrefix(html[i:], "&nbsp;"):
+			n = len("&nbsp;")
+		}
+		if n == 0 {
+			inRun = false
+			out.WriteByte(html[i])
+			i++
+			continue
+		}
+		if !inRun {
+			out.WriteString(repl)
+			inRun = true
+		}
+		i += n
+	}
+	return out.String()
+}
 
 // isEmptyHTML returns true if the HTML contains no visible text content.
 func isEmptyHTML(html string) bool {
-	return strings.TrimSpace(htmlTagOrSpace.ReplaceAllString(html, "")) == ""
+	return strings.TrimSpace(collapseTagsAndSpace(html, "")) == ""
 }
 
 // isEffectivelyEmpty returns true if the HTML contains no meaningful user
 // content — either truly empty or only an auto-generated mobile signature.
 func isEffectivelyEmpty(html string) bool {
 	// Strip all tags and entities to get plain text
-	text := htmlTagOrSpace.ReplaceAllString(html, " ")
+	text := collapseTagsAndSpace(html, " ")
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return true
