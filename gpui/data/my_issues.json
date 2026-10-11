@@ -1,0 +1,819 @@
+{
+  "workspace": {
+    "name": "habric"
+  },
+  "user": {
+    "name": "Julian Schenker",
+    "avatar": "images/avatar.png"
+  },
+  "labels": [
+    {
+      "name": "Improvement",
+      "color": "rgb(78, 167, 252)"
+    },
+    {
+      "name": "Bug",
+      "color": "rgb(235, 87, 87)"
+    },
+    {
+      "name": "Feature",
+      "color": "rgb(187, 135, 252)"
+    }
+  ],
+  "projects": [
+    {
+      "name": "Advisory Meeting 05.10.2026",
+      "icon": "project_advisory_meeting_05_10_2026",
+      "color": "rgb(235, 87, 87)"
+    },
+    {
+      "name": "App Interface",
+      "icon": "project_app_interface",
+      "color": "rgb(149, 162, 179)"
+    },
+    {
+      "name": "Prepare App for User Testing",
+      "icon": "project_prepare_app_for_user_testing",
+      "color": "lch(48 59.31 288.43)"
+    },
+    {
+      "name": "Simulation, Algorithm Optimization & SIL Validation",
+      "icon": "project_simulation_algorithm_optimization_sil_va",
+      "color": "lch(67.969 19.321 31.72)"
+    },
+    {
+      "name": "Blind Sonar v1 — QMS & CE",
+      "icon": "project_blind_sonar_v1_qms_ce",
+      "color": "rgb(235, 87, 87)"
+    },
+    {
+      "name": "Pre-Seed Round",
+      "icon": "project_pre_seed_round",
+      "color": "lch(48 59.31 288.43)"
+    },
+    {
+      "name": "Blind Sonar Clinical Validation and Ethics Approval",
+      "icon": "project_blind_sonar_clinical_validation_and_ethi",
+      "color": "rgb(235, 87, 87)"
+    },
+    {
+      "name": "Serverless Cloud Infrastructure for DACH Launch",
+      "icon": "project_serverless_cloud_infrastructure_for_dach",
+      "color": "lch(67.969 62.082 61.651)"
+    },
+    {
+      "name": "Hiring",
+      "icon": "project_hiring",
+      "color": "lch(67.969 62.082 61.651)"
+    }
+  ],
+  "favorites": [
+    {
+      "kind": "document",
+      "title": "Advisory Board Agenda 5.10 Draft",
+      "subtitle": "Advisory Meeting 05.10.2026",
+      "icon": "document",
+      "color": "rgb(235, 87, 87)"
+    },
+    {
+      "kind": "folder",
+      "title": "Views",
+      "children": [
+        {
+          "kind": "view",
+          "title": "My Projects Timeline",
+          "icon": "view_timeline"
+        },
+        {
+          "kind": "view",
+          "title": "Update needed",
+          "icon": "view_update"
+        },
+        {
+          "kind": "view",
+          "title": "Overdue",
+          "icon": "view_overdue"
+        }
+      ]
+    }
+  ],
+  "teams": [
+    {
+      "name": "Habric",
+      "key": "HAB",
+      "icon": "team_chart",
+      "color": "rgb(255, 0, 128)"
+    }
+  ],
+  "issues": [
+    {
+      "identifier": "HAB-254",
+      "title": "Send meeting notes",
+      "priority": "urgent",
+      "status": {
+        "name": "In Progress",
+        "kind": "started",
+        "color": "lch(80% 90 85)",
+        "progress": 0.5
+      },
+      "project": "Advisory Meeting 05.10.2026",
+      "labels": [],
+      "due": {
+        "label": "Yesterday",
+        "urgency": "overdue"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Oct 5"
+    },
+    {
+      "identifier": "HAB-138",
+      "title": "Validate the iOS user-testing release on TestFlight, devices, and VoiceOver",
+      "priority": "urgent",
+      "status": {
+        "name": "Todo",
+        "kind": "unstarted",
+        "color": "lch(67.969% 0 139.088)",
+        "progress": 0
+      },
+      "project": "App Interface",
+      "labels": [],
+      "due": {
+        "label": "Oct 1",
+        "urgency": "overdue"
+      },
+      "blocked_by": 1,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 21"
+    },
+    {
+      "identifier": "HAB-137",
+      "title": "Implement consent-based raw-data capture, private storage, and anonymization lifecycle",
+      "priority": "high",
+      "status": {
+        "name": "Todo",
+        "kind": "unstarted",
+        "color": "lch(67.969% 0 139.088)",
+        "progress": 0
+      },
+      "project": "Prepare App for User Testing",
+      "labels": [],
+      "due": {
+        "label": "Sep 28",
+        "urgency": "overdue"
+      },
+      "blocked_by": 0,
+      "blocking": 1,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 21"
+    },
+    {
+      "identifier": "HAB-71",
+      "title": "Define the first end-to-end algorithm evaluation experiment",
+      "priority": "high",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": "Simulation, Algorithm Optimization & SIL Validation",
+      "labels": [],
+      "due": {
+        "label": "Tomorrow",
+        "urgency": "soon"
+      },
+      "blocked_by": 1,
+      "blocking": 1,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 20"
+    },
+    {
+      "identifier": "HAB-70",
+      "title": "Review firmware foundations and robotics-lab integration gaps",
+      "priority": "high",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": "Simulation, Algorithm Optimization & SIL Validation",
+      "labels": [],
+      "due": {
+        "label": "Tomorrow",
+        "urgency": "soon"
+      },
+      "blocked_by": 0,
+      "blocking": 1,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 20"
+    },
+    {
+      "identifier": "HAB-146",
+      "title": "Assign QMS roles and establish PRRC coverage",
+      "priority": "none",
+      "status": {
+        "name": "In Progress",
+        "kind": "started",
+        "color": "lch(80% 90 85)",
+        "progress": 0.5
+      },
+      "project": "Blind Sonar v1 — QMS & CE",
+      "labels": [],
+      "due": {
+        "label": "Yesterday",
+        "urgency": "overdue"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 21"
+    },
+    {
+      "identifier": "HAB-282",
+      "title": "Check whether Oliver has proposed a meeting date",
+      "priority": "high",
+      "status": {
+        "name": "Todo",
+        "kind": "unstarted",
+        "color": "lch(67.969% 0 139.088)",
+        "progress": 0
+      },
+      "project": "Pre-Seed Round",
+      "labels": [],
+      "due": {
+        "label": "Oct 13",
+        "urgency": "soon"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Oct 8"
+    },
+    {
+      "identifier": "HAB-278",
+      "title": "Draft CLA with MS for Andreas CIP Investment",
+      "priority": "high",
+      "status": {
+        "name": "Todo",
+        "kind": "unstarted",
+        "color": "lch(67.969% 0 139.088)",
+        "progress": 0
+      },
+      "project": "Blind Sonar Clinical Validation and Ethics Approval",
+      "labels": [],
+      "due": {
+        "label": "Tomorrow",
+        "urgency": "soon"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Oct 7"
+    },
+    {
+      "identifier": "HAB-277",
+      "title": "Intro to Amos Bocelli",
+      "priority": "high",
+      "status": {
+        "name": "Todo",
+        "kind": "unstarted",
+        "color": "lch(67.969% 0 139.088)",
+        "progress": 0
+      },
+      "project": null,
+      "labels": [],
+      "due": {
+        "label": "Oct 18",
+        "urgency": "normal"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Oct 7"
+    },
+    {
+      "identifier": "HAB-72",
+      "title": "Refine simulation milestones and derive actionable follow-up work",
+      "priority": "medium",
+      "status": {
+        "name": "Todo",
+        "kind": "unstarted",
+        "color": "lch(67.969% 0 139.088)",
+        "progress": 0
+      },
+      "project": "Simulation, Algorithm Optimization & SIL Validation",
+      "labels": [],
+      "due": {
+        "label": "Tomorrow",
+        "urgency": "soon"
+      },
+      "blocked_by": 1,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 20"
+    },
+    {
+      "identifier": "HAB-36",
+      "title": "robotics-lab: enforce G4 vGPU cost limits when utilization is unavailable",
+      "priority": "medium",
+      "status": {
+        "name": "Todo",
+        "kind": "unstarted",
+        "color": "lch(67.969% 0 139.088)",
+        "progress": 0
+      },
+      "project": "Simulation, Algorithm Optimization & SIL Validation",
+      "labels": [],
+      "due": {
+        "label": "Tomorrow",
+        "urgency": "soon"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 17"
+    },
+    {
+      "identifier": "HAB-34",
+      "title": "Decommission Mongo now that the PostgreSQL cutover is complete",
+      "priority": "medium",
+      "status": {
+        "name": "Todo",
+        "kind": "unstarted",
+        "color": "lch(67.969% 0 139.088)",
+        "progress": 0
+      },
+      "project": "Serverless Cloud Infrastructure for DACH Launch",
+      "labels": [
+        "Improvement"
+      ],
+      "due": {
+        "label": "Nov 1",
+        "urgency": "normal"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 17"
+    },
+    {
+      "identifier": "HAB-65",
+      "title": "Run core-bazel-test from a prebuilt image (51–862 s spread, bazelisk downloaded every run)",
+      "priority": "low",
+      "status": {
+        "name": "Todo",
+        "kind": "unstarted",
+        "color": "lch(67.969% 0 139.088)",
+        "progress": 0
+      },
+      "project": null,
+      "labels": [
+        "Improvement"
+      ],
+      "due": {
+        "label": "Sep 25",
+        "urgency": "overdue"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 20"
+    },
+    {
+      "identifier": "HAB-279",
+      "title": "Intro durch Fabi Rieth",
+      "priority": "none",
+      "status": {
+        "name": "Todo",
+        "kind": "unstarted",
+        "color": "lch(67.969% 0 139.088)",
+        "progress": 0
+      },
+      "project": null,
+      "labels": [],
+      "due": {
+        "label": "Today",
+        "urgency": "today"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Oct 7"
+    },
+    {
+      "identifier": "HAB-220",
+      "title": "Switch Altium plan to Develop",
+      "priority": "none",
+      "status": {
+        "name": "Todo",
+        "kind": "unstarted",
+        "color": "lch(67.969% 0 139.088)",
+        "progress": 0
+      },
+      "project": null,
+      "labels": [],
+      "due": {
+        "label": "Oct 1",
+        "urgency": "overdue"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Oct 1"
+    },
+    {
+      "identifier": "HAB-149",
+      "title": "Approve the intended purpose and MDR classification rationale",
+      "priority": "none",
+      "status": {
+        "name": "Todo",
+        "kind": "unstarted",
+        "color": "lch(67.969% 0 139.088)",
+        "progress": 0
+      },
+      "project": "Blind Sonar v1 — QMS & CE",
+      "labels": [],
+      "due": null,
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 21"
+    },
+    {
+      "identifier": "HAB-77",
+      "title": "Decide: keep Cloud SQL ZONAL or move to REGIONAL",
+      "priority": "high",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": "Serverless Cloud Infrastructure for DACH Launch",
+      "labels": [
+        "Improvement"
+      ],
+      "due": {
+        "label": "Oct 31",
+        "urgency": "normal"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 20"
+    },
+    {
+      "identifier": "HAB-58",
+      "title": "Bot addresses bounce on every reviewer notification, degrading Resend sender reputation",
+      "priority": "high",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": null,
+      "labels": [
+        "Bug"
+      ],
+      "due": {
+        "label": "Sep 25",
+        "urgency": "overdue"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 20"
+    },
+    {
+      "identifier": "HAB-53",
+      "title": "Track MDR and RED infrastructure controls",
+      "priority": "high",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": "Serverless Cloud Infrastructure for DACH Launch",
+      "labels": [],
+      "due": {
+        "label": "Nov 28",
+        "urgency": "normal"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 20"
+    },
+    {
+      "identifier": "HAB-51",
+      "title": "Operationalize monitoring, backups, and restore testing",
+      "priority": "high",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": "Serverless Cloud Infrastructure for DACH Launch",
+      "labels": [],
+      "due": {
+        "label": "Nov 5",
+        "urgency": "normal"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 20"
+    },
+    {
+      "identifier": "HAB-39",
+      "title": "Cloudflare: replace the account-wide API token on gerrit-prod, zuul-prod and gitlab-prod with a DNS-edit token scoped to habric.org",
+      "priority": "high",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": "Serverless Cloud Infrastructure for DACH Launch",
+      "labels": [
+        "Improvement"
+      ],
+      "due": {
+        "label": "Oct 22",
+        "urgency": "normal"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 19"
+    },
+    {
+      "identifier": "HAB-243",
+      "title": "Skalo: Reconnect end of Q1 2027",
+      "priority": "medium",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": null,
+      "labels": [],
+      "due": {
+        "label": "Mar 15",
+        "urgency": "normal"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Oct 4"
+    },
+    {
+      "identifier": "HAB-66",
+      "title": "Rotate the Amp Gerrit token before 13 Dec 2026",
+      "priority": "medium",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": null,
+      "labels": [
+        "Improvement"
+      ],
+      "due": {
+        "label": "Dec 6",
+        "urgency": "normal"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 20"
+    },
+    {
+      "identifier": "HAB-52",
+      "title": "Validate serverless performance and database connections",
+      "priority": "low",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": "Serverless Cloud Infrastructure for DACH Launch",
+      "labels": [],
+      "due": {
+        "label": "Nov 12",
+        "urgency": "normal"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 20"
+    },
+    {
+      "identifier": "HAB-50",
+      "title": "Provision staging environment with IaC",
+      "priority": "low",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": "Serverless Cloud Infrastructure for DACH Launch",
+      "labels": [],
+      "due": {
+        "label": "Today",
+        "urgency": "today"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 20"
+    },
+    {
+      "identifier": "HAB-211",
+      "title": "Send an emotional update email to the advisors",
+      "priority": "none",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": null,
+      "labels": [],
+      "due": {
+        "label": "Sep 28",
+        "urgency": "overdue"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 26"
+    },
+    {
+      "identifier": "HAB-200",
+      "title": "Agree next steps for advertising the published job openings",
+      "priority": "none",
+      "status": {
+        "name": "Backlog",
+        "kind": "backlog",
+        "color": "lch(67.969% 3.577 260.65)",
+        "progress": 0
+      },
+      "project": "Hiring",
+      "labels": [],
+      "due": null,
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 25"
+    },
+    {
+      "identifier": "HAB-134",
+      "title": "Habric Field: internal test-protocol workflow, access and data policy",
+      "priority": "urgent",
+      "status": {
+        "name": "Done",
+        "kind": "completed",
+        "color": "lch(48% 59.31 288.43)",
+        "progress": 1
+      },
+      "project": "Prepare App for User Testing",
+      "labels": [],
+      "due": null,
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": {
+        "done": 1,
+        "total": 2
+      },
+      "assignee": "Julian Schenker",
+      "created": "Sep 21"
+    },
+    {
+      "identifier": "HAB-276",
+      "title": "Oliver anrufen wegen morgen",
+      "priority": "high",
+      "status": {
+        "name": "Done",
+        "kind": "completed",
+        "color": "lch(48% 59.31 288.43)",
+        "progress": 1
+      },
+      "project": null,
+      "labels": [],
+      "due": null,
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Oct 7"
+    },
+    {
+      "identifier": "HAB-253",
+      "title": "Update Timo Hammer",
+      "priority": "high",
+      "status": {
+        "name": "Done",
+        "kind": "completed",
+        "color": "lch(48% 59.31 288.43)",
+        "progress": 1
+      },
+      "project": "Advisory Meeting 05.10.2026",
+      "labels": [],
+      "due": {
+        "label": "Yesterday",
+        "urgency": "normal"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Oct 5"
+    },
+    {
+      "identifier": "HAB-35",
+      "title": "Customer Operations: Field protocol storage and rollout boundaries",
+      "priority": "medium",
+      "status": {
+        "name": "Done",
+        "kind": "completed",
+        "color": "lch(48% 59.31 288.43)",
+        "progress": 1
+      },
+      "project": "Prepare App for User Testing",
+      "labels": [
+        "Feature"
+      ],
+      "due": null,
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": {
+        "done": 1,
+        "total": 1
+      },
+      "assignee": "Julian Schenker",
+      "created": "Sep 17"
+    },
+    {
+      "identifier": "HAB-132",
+      "title": "IGP Vollantrag t-0,5M",
+      "priority": "urgent",
+      "status": {
+        "name": "Canceled",
+        "kind": "canceled",
+        "color": "#95a2b3",
+        "progress": 0
+      },
+      "project": null,
+      "labels": [],
+      "due": {
+        "label": "Oct 6",
+        "urgency": "overdue"
+      },
+      "blocked_by": 0,
+      "blocking": 0,
+      "sub_issues": null,
+      "assignee": "Julian Schenker",
+      "created": "Sep 20"
+    }
+  ]
+}

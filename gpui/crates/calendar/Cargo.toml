@@ -1,0 +1,12 @@
+[package]
+name = "calendar"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Calendar views on GPUI: day / week time grid, month, agenda, event details"
+
+[dependencies]
+ui = { path = "../ui" }
+gpui.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1", features = ["derive"] }

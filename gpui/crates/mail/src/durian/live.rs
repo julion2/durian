@@ -1,0 +1,1133 @@
+//! The connection to durian at runtime. Every list is a server search: the view's base query
+//! plus the translated search, refined locally (`translate`). The UI thread never waits on the
+//! network – requests run on the background executor and their answers are applied when
+//! they're still wanted:
+//!
+//! - **searches** carry a generation; an answer for anything but the latest is dropped.
+//!   Keystrokes in quick succession are debounced, a single change goes out at once.
+//! - **paging**: the list asks for `PAGE` more rows when the selection or the scroll gets
+//!   near its end (until durian has cursors this re-requests the longer list, see
+//!   `docs/durian-api-notes.md`).
+//! - **threads** load when opened, a few ahead are prefetched, at most `IN_FLIGHT` at once,
+//!   never twice. Full threads stay in a bounded cache, checked against the search row.
+//! - **calendar**: the shown period's events load with a margin around it, again when the
+//!   view leaves it. An event's guests and organizer (whose event is it, what did you answer)
+//!   load when it's selected, once per series.
+//!
+//! Logging names counts, ids and timings – never subjects, addresses or bodies.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use calendar::model::{Attendee, CalendarInfo, Rsvp, Schedule, ScheduleEvent};
+use chrono::{Local, NaiveDate};
+use gpui::{Context, Entity, EventEmitter, SharedString, Subscription, Task};
+
+use super::cache::{Stamp, ThreadCache};
+use super::client::{self, Client};
+use super::translate::{account_scope, combine, translate};
+use super::profiles::{self, Profile};
+use super::{EventRef, api, calendar_event, calendar_id, event_detail, hashed_color, parse_address};
+use crate::attachments::{self, Use, safe_name};
+use crate::model::{Account, Attachment, Contact, Loading, Mailbox, MailboxEvent, Remote, Tag, Thread};
+use crate::query::{Query, Term};
+use crate::trace;
+
+/// What an empty search shows.
+pub const INBOX: &str = "tag:inbox";
+/// Rows per page: many screens' worth, small enough to answer quickly.
+pub const PAGE: usize = 200;
+/// Threads that arrive with their content in a first page (open without a wait).
+const ENRICH: usize = 50;
+/// Full threads kept in memory.
+const CACHE: usize = 300;
+/// Thread requests at once: the open one always goes, prefetch fills up to this.
+const IN_FLIGHT: usize = 4;
+/// Threads below the selection loaded ahead of time.
+const PREFETCH: usize = 3;
+/// Rows from the end of the list at which the next page is requested.
+const PAGE_AHEAD: usize = 30;
+/// Query changes closer together than this are one search (typing).
+const DEBOUNCE: Duration = Duration::from_millis(150);
+/// A word left unfinished this long counts as complete: the server only matches whole words.
+const SETTLE: Duration = Duration::from_millis(600);
+/// Days of events loaded before and after the shown period (navigating a few weeks either
+/// way needs no request).
+const CALENDAR_BEHIND: i64 = 28;
+const CALENDAR_AHEAD: i64 = 56;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Status {
+    Connecting,
+    Connected { version: SharedString },
+    Failed(SharedString),
+}
+
+/// What the user should hear about that isn't a list's or a thread's state.
+pub enum LiveEvent {
+    Problem(SharedString),
+    /// an attachment went to ~/Downloads, here
+    Downloaded(std::path::PathBuf),
+}
+
+/// An event's detail: description, guests, your answer.
+type Detail = (Option<SharedString>, Vec<Attendee>, Rsvp);
+
+/// The connect, started before the window exists (`Live::preconnect` at the top of `main`):
+/// window bring-up (~150–450 ms) and the first requests overlap instead of adding up.
+pub struct Preconnect {
+    client: Arc<Client>,
+    identity: Receiver<client::Result<Identity>>,
+    /// what the start thread reports, in order
+    start: Receiver<Start>,
+    started: Instant,
+}
+
+/// The start thread's reports, in this order: the profiles it starts with (the server's, else
+/// profiles.pkl from the cache), the start folder's first page (and the query it answers), and
+/// – only when profiles.pkl had to be evaluated – the evaluated profiles. One task applies
+/// them in order, so a page never arrives before its profiles.
+enum Start {
+    Profiles(Vec<Profile>),
+    Page(String, client::Result<api::SearchResponse>),
+    Problem(String),
+}
+
+type Receiver<T> = std::sync::mpsc::Receiver<T>;
+
+pub struct Live {
+    client: Arc<Client>,
+    /// the connect started before the window, until it's been waited for
+    preconnect: Option<Preconnect>,
+    /// applies the start thread's reports
+    start_task: Option<Task<()>>,
+    /// MAIL_FOLDER applies to the first profiles only
+    profiles_applied: bool,
+    mailbox: Entity<Mailbox>,
+    schedule: Entity<Schedule>,
+    pub status: Status,
+    /// your addresses on the server, for `from:me` / `to:me`
+    me: Vec<SharedString>,
+    generation: u64,
+    last_change: Option<Instant>,
+    /// the search in flight (dropping it drops its answer)
+    search: Option<Task<()>>,
+    /// waits for typing to pause, then searches for the unfinished word too
+    settle: Option<Task<()>>,
+    connect: Option<Task<()>>,
+    fetches: HashMap<SharedString, Task<()>>,
+    cache: ThreadCache,
+    /// the latest search row of every listed thread (what a fetched thread is cached under)
+    stamps: HashMap<SharedString, Stamp>,
+    /// days whose events are listed [from, to), and the window on its way
+    calendar_loaded: Option<(NaiveDate, NaiveDate)>,
+    calendar_pending: Option<(NaiveDate, NaiveDate)>,
+    calendar_task: Option<Task<()>>,
+    /// where each listed event lives on the server
+    refs: HashMap<SharedString, EventRef>,
+    /// details by iCalUID: loaded (kept across reloads of the window) and in flight
+    details: HashMap<String, Detail>,
+    detail_tasks: HashMap<String, Task<()>>,
+    /// attachments on their way, by (message, part)
+    attachment_tasks: HashMap<(SharedString, i64), Task<()>>,
+    /// embedded images being fetched, per thread
+    image_tasks: HashMap<SharedString, Task<()>>,
+    /// the start folder's first page, fetched while connecting, and its query: the first
+    /// search, if it's that one
+    first_page: Option<(String, api::SearchResponse)>,
+    /// how mail HTML is shown, from the server's settings once connected
+    policy: crate::html_doc::Policy,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<LiveEvent> for Live {}
+
+/// The empty, loading list a live mailbox starts with.
+pub fn initial_remote() -> Remote {
+    Remote { server_query: String::new(), refine: Query::default(), limit: PAGE, loading: Some(Loading::Pending), complete: false, threads: HashMap::new() }
+}
+
+impl Live {
+    /// Start connecting on threads of their own, before GPUI or the window exist: the inbox's
+    /// first page and who you are, independently – the list shows as soon as its page is in.
+    ///
+    /// The start folder is the default profile's first one – known right away when the
+    /// profiles come from the cache; else the plain inbox until they're evaluated.
+    pub fn preconnect(client: Client) -> Preconnect {
+        let started = Instant::now();
+        let client = Arc::new(client);
+        let (start_tx, start) = std::sync::mpsc::channel();
+        let (identity_tx, identity) = std::sync::mpsc::channel();
+        let (c1, c2) = (client.clone(), client.clone());
+        std::thread::spawn(move || {
+            let _ = identity_tx.send(identify(&c1));
+        });
+        std::thread::spawn(move || {
+            // profiles: the server's; from a server without /profiles (or none reachable),
+            // profiles.pkl – cached, or evaluated after the first page (pkl takes 1–2 s)
+            let cache = crate::cache_dir("durian");
+            let mut evaluate = None;
+            let profiles = match c2.profiles() {
+                Ok(response) => Some(profiles::from_api(&response)),
+                Err(_) => {
+                    let config = profiles::config_dir();
+                    let cached = config.as_deref().and_then(|config| profiles::cached(config, &cache));
+                    if cached.is_none() {
+                        evaluate = config;
+                    }
+                    cached
+                }
+            };
+            if let Some(profiles) = &profiles {
+                let _ = start_tx.send(Start::Profiles(profiles.clone()));
+            }
+            let home = profiles.as_deref().and_then(|p| profiles::default_index(p).map(|ix| &p[ix]));
+            let first = compose(home.and_then(profiles::scope).as_deref(), home.and_then(|p| p.home()).map(|f| f.query.as_ref()), "");
+            let page = c2.search(&first, PAGE, ENRICH);
+            let _ = start_tx.send(Start::Page(first, page));
+            if let Some(config) = evaluate {
+                match profiles::evaluate(&config, &cache) {
+                    Ok(Some(profiles)) => drop(start_tx.send(Start::Profiles(profiles))),
+                    Ok(None) => {}
+                    Err(message) => drop(start_tx.send(Start::Problem(message))),
+                }
+            }
+        });
+        Preconnect { client, identity, start, started }
+    }
+
+    pub fn new(preconnect: Preconnect, mailbox: Entity<Mailbox>, schedule: Entity<Schedule>, cx: &mut Context<Self>) -> Self {
+        let subscriptions = vec![
+            // the shown period moved (or anything else changed): load its events if needed
+            cx.observe(&schedule, |this, _, cx| this.ensure_calendar(cx)),
+            cx.subscribe(&schedule, |this, _, event, cx| {
+                if let ScheduleEvent::SelectionChanged = event {
+                    this.event_selected(cx);
+                }
+            }),
+            cx.subscribe(&mailbox, Self::mailbox_event),
+        ];
+        let mut this = Self {
+            client: preconnect.client.clone(),
+            preconnect: Some(preconnect),
+            start_task: None,
+            profiles_applied: false,
+            mailbox,
+            schedule,
+            status: Status::Connecting,
+            me: Vec::new(),
+            generation: 0,
+            last_change: None,
+            search: None,
+            settle: None,
+            connect: None,
+            fetches: HashMap::new(),
+            cache: ThreadCache::new(CACHE),
+            stamps: HashMap::new(),
+            calendar_loaded: None,
+            calendar_pending: None,
+            calendar_task: None,
+            refs: HashMap::new(),
+            details: HashMap::new(),
+            detail_tasks: HashMap::new(),
+            attachment_tasks: HashMap::new(),
+            image_tasks: HashMap::new(),
+            first_page: None,
+            policy: Default::default(),
+            _subscriptions: subscriptions,
+        };
+        this.connect(cx);
+        this
+    }
+
+    fn mailbox_event(&mut self, _: Entity<Mailbox>, event: &MailboxEvent, cx: &mut Context<Self>) {
+        match event {
+            MailboxEvent::QueryChanged => self.query_changed(cx),
+            MailboxEvent::SelectionChanged => self.selection_changed(cx),
+            MailboxEvent::MoreWanted => self.load_more(cx),
+            MailboxEvent::ThreadLoaded(_) | MailboxEvent::ReadOnly => {}
+        }
+    }
+
+    fn update_remote(&self, cx: &mut Context<Self>, f: impl FnOnce(&mut Remote)) {
+        self.mailbox.update(cx, |m, cx| {
+            if let Some(remote) = m.remote.as_mut() {
+                f(remote);
+                cx.notify();
+            }
+        });
+    }
+
+    /// Who you are and what there is: version, tags, accounts, your addresses. Then the
+    /// first search.
+    fn connect(&mut self, cx: &mut Context<Self>) {
+        self.status = Status::Connecting;
+        self.update_remote(cx, |r| r.loading = Some(Loading::Pending));
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        let ended = || client::Error::Decode("connect thread ended".into());
+        match self.preconnect.take() {
+            // the first time: the answers of the connect already under way
+            Some(Preconnect { identity, start, started, .. }) => {
+                let reports = executor.clone();
+                self.start_task = Some(cx.spawn(async move |this, cx| {
+                    let mut start = start;
+                    loop {
+                        let (report, back) = reports
+                            .spawn(async move {
+                                let report = start.recv().ok();
+                                (report, start)
+                            })
+                            .await;
+                        start = back;
+                        let Some(report) = report else { break };
+                        let applied = this.update(cx, |this, cx| match report {
+                            Start::Profiles(profiles) => this.apply_profiles(profiles, started.elapsed(), cx),
+                            Start::Page(query, page) => this.early_page(query, page, started.elapsed(), cx),
+                            Start::Problem(message) => cx.emit(LiveEvent::Problem(message.into())),
+                        });
+                        if applied.is_err() {
+                            break;
+                        }
+                    }
+                }));
+                self.connect = Some(cx.spawn(async move |this, cx| {
+                    let identity = executor.spawn(async move { identity.recv().unwrap_or_else(|_| Err(ended())) }).await;
+                    this.update(cx, |this, cx| this.connected(identity, started.elapsed(), cx)).ok();
+                }));
+            }
+            // a retry asks again
+            None => {
+                self.connect = Some(cx.spawn(async move |this, cx| {
+                    let started = Instant::now();
+                    let identity = executor.spawn(async move { identify(&client) }).await;
+                    this.update(cx, |this, cx| this.connected(identity, started.elapsed(), cx)).ok();
+                }));
+            }
+        }
+        cx.notify();
+    }
+
+    /// The inbox's first page from the early connect: shown right away if nothing was searched
+    /// yet and the inbox is what's asked for; else kept for the first search to use.
+    fn early_page(&mut self, query: String, page: client::Result<api::SearchResponse>, took: Duration, cx: &mut Context<Self>) {
+        // failures are the connect's to report
+        let Ok(page) = page else { return };
+        // a search for this very query may have started meanwhile (the identity can arrive
+        // first): the page answers it, and that search's late answer is dropped as stale
+        let same_in_flight = self.mailbox.read(cx).remote.as_ref().is_some_and(|r| r.loading == Some(Loading::Pending) && r.server_query == query);
+        if self.generation != 0 && !same_in_flight {
+            return;
+        }
+        // the list may have moved on (a search typed, another profile, fresh profiles)
+        if self.planned(false, cx).0 != query {
+            self.first_page = Some((query, page));
+            return;
+        }
+        trace::note(&format!("durian: start page in {took:.0?}, before the identity"));
+        self.update_remote(cx, |r| {
+            r.server_query = query;
+            r.limit = PAGE;
+        });
+        self.generation += 1;
+        self.searched(self.generation, PAGE, Ok(page), Duration::ZERO, cx);
+    }
+
+    /// Profiles from the start thread (the server's, or profiles.pkl): the switcher and folders
+    /// follow. Applied again only if they changed (an evaluation after the cache missed).
+    fn apply_profiles(&mut self, profiles: Vec<Profile>, took: Duration, cx: &mut Context<Self>) {
+        trace::note(&format!("durian: {} profiles in {took:.0?}", profiles.len()));
+        let first = !self.profiles_applied;
+        self.profiles_applied = true;
+        if self.mailbox.read(cx).profiles == profiles {
+            return;
+        }
+        self.mailbox.update(cx, |m, cx| {
+            m.set_profiles(profiles, cx);
+            // MAIL_FOLDER=<name>: start in that folder (testing against a real mailbox)
+            if first
+                && let Ok(name) = std::env::var("MAIL_FOLDER")
+                && let Some(ix) = m.active_profile().and_then(|p| p.folders.iter().position(|f| f.name.eq_ignore_ascii_case(&name)))
+            {
+                m.open_folder(ix, cx);
+            }
+        });
+    }
+
+    /// The server query and local refinement for the current list. `settled`: the word being
+    /// typed counts as complete.
+    fn planned(&self, settled: bool, cx: &Context<Self>) -> (String, Query) {
+        let mailbox = self.mailbox.read(cx);
+        let query = if settled { settle(&mailbox.query) } else { complete_known_tags(&mailbox.query, &mailbox.tags) };
+        let translated = translate(&query, &self.me);
+        let scope = match (mailbox.active_profile(), &mailbox.account_filter) {
+            (Some(profile), _) => profiles::scope(profile),
+            (None, Some(account)) => Some(account_scope(account)),
+            (None, None) => None,
+        };
+        (compose(scope.as_deref(), mailbox.active_folder().map(|f| f.query.as_ref()), &translated.server), translated.refine)
+    }
+
+    fn connected(&mut self, identity: client::Result<Identity>, took: Duration, cx: &mut Context<Self>) {
+        self.connect = None;
+        let identity = match identity {
+            Ok(identity) => identity,
+            Err(e) => {
+                trace::note(&format!("durian: connect failed after {took:.0?}: {}", kind(&e)));
+                let message: SharedString = e.to_string().into();
+                self.status = Status::Failed(message.clone());
+                self.update_remote(cx, |r| r.loading = Some(Loading::Failed(message)));
+                cx.notify();
+                return;
+            }
+        };
+        trace::note(&format!("durian {}: {} accounts, {} addresses, {} tags in {took:.0?}", identity.version, identity.accounts.len(), identity.addresses.len(), identity.tags.len()));
+        self.status = Status::Connected { version: identity.version };
+        self.apply_settings(&identity.settings, cx);
+        self.me = identity.addresses;
+        // now pictures may be looked up: whose not to is known
+        crate::avatars::set_own(self.me.iter().map(|a| a.as_ref()));
+        // the early inbox page is already listed: the plan below keeps it unless the query
+        // changed meanwhile
+        let shown = self.generation != 0;
+        let me = self.me.clone();
+        self.schedule.update(cx, |s, cx| {
+            s.me = me;
+            cx.notify();
+        });
+        self.mailbox.update(cx, |m, cx| {
+            m.me = identity.me;
+            m.accounts = identity.accounts;
+            m.tags = identity.tags;
+            if let Some(remote) = m.remote.as_mut().filter(|_| !shown) {
+                // nothing listed yet: whatever was planned before, the first search goes out now
+                remote.server_query.clear();
+            }
+            cx.notify();
+        });
+        self.plan(false, Duration::ZERO, cx);
+        self.ensure_calendar(cx);
+        cx.notify();
+    }
+
+    /// Follow the server's settings. Threads loaded before they were known (the open one and
+    /// those prefetched after it, while connecting) were shown with the defaults; if those
+    /// differ, the cache is dropped and those threads are fetched again.
+    fn apply_settings(&mut self, settings: &api::Settings, cx: &mut Context<Self>) {
+        let policy = super::html_policy(settings);
+        if policy == self.policy {
+            return;
+        }
+        self.policy = policy;
+        self.cache = ThreadCache::new(CACHE);
+        let loaded: Vec<SharedString> = self.mailbox.read(cx).threads.iter().filter(|t| !t.partial).map(|t| t.id.clone()).collect();
+        for id in loaded {
+            self.fetches.remove(&id);
+            self.image_tasks.remove(&id);
+            self.fetch(id, cx);
+        }
+    }
+
+    /// Retry what failed: the connection, the list, or the open thread.
+    pub fn retry(&mut self, cx: &mut Context<Self>) {
+        match self.status {
+            Status::Failed(_) => self.connect(cx),
+            Status::Connecting => {}
+            Status::Connected { .. } => {
+                let mailbox = self.mailbox.read(cx);
+                let list_failed = mailbox.remote.as_ref().is_some_and(|r| matches!(r.loading, Some(Loading::Failed(_))));
+                let thread_failed = mailbox.selected_thread().map(|t| t.id.clone()).filter(|id| matches!(mailbox.thread_loading(id), Some(Loading::Failed(_))));
+                if list_failed {
+                    self.update_remote(cx, |r| r.loading = Some(Loading::Pending));
+                    self.search(Duration::ZERO, cx);
+                }
+                if let Some(id) = thread_failed {
+                    self.update_remote(cx, |r| {
+                        r.threads.remove(&id);
+                    });
+                    self.selection_changed(cx);
+                }
+            }
+        }
+    }
+
+    fn query_changed(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let typing = self.last_change.is_some_and(|at| now - at < DEBOUNCE);
+        self.last_change = Some(now);
+        self.settle = None;
+        self.plan(false, if typing { DEBOUNCE } else { Duration::ZERO }, cx);
+        // an unfinished word only narrows locally; once typing pauses it goes out as a word
+        let query = self.mailbox.read(cx).query.clone();
+        if settle(&query) != query {
+            let executor = cx.background_executor().clone();
+            self.settle = Some(cx.spawn(async move |this, cx| {
+                executor.timer(SETTLE).await;
+                this.update(cx, |this, cx| this.plan(true, Duration::ZERO, cx)).ok();
+            }));
+        }
+    }
+
+    /// Split the current query into what the server answers and what's refined here; search
+    /// again if the server's part changed. `settled`: the word being typed counts as complete.
+    fn plan(&mut self, settled: bool, delay: Duration, cx: &mut Context<Self>) {
+        if !matches!(self.status, Status::Connected { .. }) {
+            // `connected` plans the first search
+            return;
+        }
+        let (server, refine) = self.planned(settled, cx);
+        let changed = self.mailbox.read(cx).remote.as_ref().is_some_and(|r| r.server_query != server);
+        self.mailbox.update(cx, |m, cx| {
+            if changed && let Some(remote) = m.remote.as_mut() {
+                remote.server_query = server;
+                remote.limit = PAGE;
+                remote.complete = false;
+                remote.loading = Some(Loading::Pending);
+            }
+            m.set_refine(refine, cx);
+        });
+        if changed {
+            self.search(delay, cx);
+        }
+    }
+
+    /// Ask for the current server query; the answer replaces the list if nothing newer was
+    /// asked meanwhile.
+    fn search(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        let Some(remote) = self.mailbox.read(cx).remote.as_ref() else { return };
+        let (query, limit) = (remote.server_query.clone(), remote.limit);
+        // the page fetched while connecting answers the first search, if that's still the inbox
+        if let Some((_, page)) = self.first_page.take().filter(|(q, _)| *q == query && limit == PAGE) {
+            self.generation += 1;
+            self.search = None;
+            return self.searched(self.generation, limit, Ok(page), Duration::ZERO, cx);
+        }
+        // the first page brings the top threads' content; further pages only rows (the top
+        // ones are cached by then)
+        let enrich = if limit <= PAGE { ENRICH } else { 0 };
+        self.generation += 1;
+        let generation = self.generation;
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        self.search = Some(cx.spawn(async move |this, cx| {
+            if !delay.is_zero() {
+                executor.timer(delay).await;
+            }
+            let started = Instant::now();
+            let result = executor.spawn(async move { client.search(&query, limit, enrich) }).await;
+            this.update(cx, |this, cx| this.searched(generation, limit, result, started.elapsed(), cx)).ok();
+        }));
+    }
+
+    fn searched(&mut self, generation: u64, limit: usize, result: client::Result<api::SearchResponse>, took: Duration, cx: &mut Context<Self>) {
+        if generation != self.generation {
+            trace::note(&format!("durian: dropped search #{generation} (#{} is current)", self.generation));
+            return;
+        }
+        self.search = None;
+        let response = match result {
+            Ok(response) => response,
+            Err(e) => {
+                trace::note(&format!("durian: search #{generation} failed after {took:.0?}: {}", kind(&e)));
+                // what's listed stays; the list says the refresh failed
+                let message: SharedString = e.to_string().into();
+                self.update_remote(cx, |r| r.loading = Some(Loading::Failed(message)));
+                return;
+            }
+        };
+        let now = Local::now().timestamp();
+        let stamps: HashMap<SharedString, Stamp> = response.results.iter().map(|r| (r.thread_id.clone().into(), Stamp::new(r.timestamp, &r.tags))).collect();
+        // a full thread we have beats the content that came along: search content is a
+        // preview (durian sends no HTML with it), good for the list, opened via /threads
+        let threads: Vec<_> = response
+            .results
+            .iter()
+            .map(|r| {
+                self.cache.get(&r.thread_id, &stamps[r.thread_id.as_str()]).unwrap_or_else(|| {
+                    let preview = response.threads.get(&r.thread_id).and_then(|content| super::thread(content, now, self.policy));
+                    preview.map(|t| Thread { partial: true, ..t }).unwrap_or_else(|| super::summary(r, now))
+                })
+            })
+            .collect();
+        let full = threads.iter().filter(|t| !t.partial).count();
+        trace::note(&format!("durian: search #{generation}: {} rows ({full} full, {} cached) in {took:.0?}", threads.len(), self.cache.len()));
+        self.stamps = stamps;
+        let complete = threads.len() < limit;
+        self.mailbox.update(cx, |m, cx| {
+            if let Some(remote) = m.remote.as_mut() {
+                remote.loading = None;
+                remote.complete = complete;
+            }
+            m.replace_threads(threads, cx);
+        });
+        self.selection_changed(cx);
+    }
+
+    /// The next page, unless everything is listed or a search is on its way.
+    pub fn load_more(&mut self, cx: &mut Context<Self>) {
+        let ready = matches!(self.status, Status::Connected { .. });
+        let Some(remote) = self.mailbox.read(cx).remote.as_ref() else { return };
+        if !ready || remote.complete || remote.loading.is_some() {
+            return;
+        }
+        self.update_remote(cx, |r| {
+            r.limit += PAGE;
+            r.loading = Some(Loading::Pending);
+        });
+        self.search(Duration::ZERO, cx);
+    }
+
+    /// The open thread loads (if it's only a row), the next few are prefetched; near the end
+    /// of the list, the next page.
+    fn selection_changed(&mut self, cx: &mut Context<Self>) {
+        let mailbox = self.mailbox.read(cx);
+        let visible: Vec<usize> = mailbox.visible().collect();
+        let Some(position) = mailbox.selected.and_then(|s| visible.iter().position(|&v| v == s)) else { return };
+        let wanted: Vec<SharedString> = visible[position..]
+            .iter()
+            .take(1 + PREFETCH)
+            .map(|&ix| &mailbox.threads[ix])
+            .filter(|t| t.partial && mailbox.thread_loading(&t.id).is_none())
+            .map(|t| t.id.clone())
+            .collect();
+        let selected_id = mailbox.threads[visible[position]].id.clone();
+        let near_end = visible.len() - position <= PAGE_AHEAD;
+        for id in wanted {
+            // the open thread always goes; prefetch only into free slots
+            if id == selected_id || self.fetches.len() < IN_FLIGHT {
+                self.fetch(id, cx);
+            }
+        }
+        if near_end {
+            self.load_more(cx);
+        }
+    }
+
+    fn fetch(&mut self, id: SharedString, cx: &mut Context<Self>) {
+        if self.fetches.contains_key(&id) {
+            return;
+        }
+        self.update_remote(cx, |r| {
+            r.threads.insert(id.clone(), Loading::Pending);
+        });
+        let stamp = self.stamps.get(&id).cloned();
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        let key = id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let started = Instant::now();
+            let result = executor
+                .spawn({
+                    let key = key.clone();
+                    async move { client.thread(&key) }
+                })
+                .await;
+            this.update(cx, |this, cx| this.fetched(key, stamp, result, started.elapsed(), cx)).ok();
+        });
+        self.fetches.insert(id, task);
+    }
+
+    fn fetched(&mut self, id: SharedString, stamp: Option<Stamp>, result: client::Result<api::ThreadContent>, took: Duration, cx: &mut Context<Self>) {
+        self.fetches.remove(&id);
+        let thread = result.and_then(|content| {
+            let thread = super::thread(&content, Local::now().timestamp(), self.policy).ok_or_else(|| client::Error::Decode("a thread without messages".into()))?;
+            Ok((thread, content))
+        });
+        match thread {
+            Ok((thread, content)) => {
+                trace::note(&format!("durian: thread {id} in {took:.0?}"));
+                // shown now; messages embedding images get their HTML once those are in
+                let waiting = content.messages.iter().any(|m| !super::embedded_parts(m).is_empty());
+                if !waiting && let Some(stamp) = stamp.clone() {
+                    self.cache.insert(stamp, thread.clone());
+                }
+                self.mailbox.update(cx, |m, cx| m.fill_thread(thread, cx));
+                if waiting {
+                    self.fetch_images(id.clone(), content, stamp, cx);
+                }
+            }
+            Err(e) => {
+                trace::note(&format!("durian: thread {id} failed after {took:.0?}: {}", kind(&e)));
+                let message: SharedString = e.to_string().into();
+                self.update_remote(cx, |r| {
+                    r.threads.insert(id, Loading::Failed(message));
+                });
+            }
+        }
+        // a slot is free: keep prefetching
+        self.selection_changed(cx);
+    }
+}
+
+impl Live {
+    /// Load the events around the shown period, unless they're listed or on their way.
+    fn ensure_calendar(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.status, Status::Connected { .. }) {
+            return;
+        }
+        let days = self.schedule.read(cx).days();
+        let (Some(&first), Some(&last)) = (days.first(), days.last()) else { return };
+        let covers = |window: Option<(NaiveDate, NaiveDate)>| window.is_some_and(|(from, to)| from <= first && last < to);
+        if covers(self.calendar_loaded) || covers(self.calendar_pending) {
+            return;
+        }
+        let accounts: Vec<SharedString> = self.mailbox.read(cx).accounts.iter().map(|a| a.id.clone()).collect();
+        if accounts.is_empty() {
+            // calendars are per account; a server that names none has none to show
+            return;
+        }
+        let (from, to) = (first - chrono::Duration::days(CALENDAR_BEHIND), last + chrono::Duration::days(1 + CALENDAR_AHEAD));
+        self.calendar_pending = Some((from, to));
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        self.calendar_task = Some(cx.spawn(async move |this, cx| {
+            let started = Instant::now();
+            let result = executor.spawn(async move { calendars(&client, &accounts, from, to) }).await;
+            this.update(cx, |this, cx| this.calendar_loaded(from, to, result, started.elapsed(), cx)).ok();
+        }));
+    }
+
+    fn calendar_loaded(&mut self, from: NaiveDate, to: NaiveDate, result: client::Result<Vec<AccountCalendars>>, took: Duration, cx: &mut Context<Self>) {
+        self.calendar_pending = None;
+        self.calendar_task = None;
+        let accounts = match result {
+            Ok(accounts) => accounts,
+            Err(e) => {
+                trace::note(&format!("durian: calendar {from}..{to} failed after {took:.0?}: {}", kind(&e)));
+                cx.emit(LiveEvent::Problem(format!("Calendar didn't load: {e}").into()));
+                return;
+            }
+        };
+        let (mut calendars, mut events) = (Vec::new(), Vec::new());
+        for (account, list, found) in accounts {
+            for c in list {
+                let color = c.color.as_deref().and_then(ui::theme::parse_css_color).unwrap_or_else(|| hashed_color(&c.name));
+                calendars.push(CalendarInfo { id: calendar_id(&account, &c.name), name: c.name.into(), account: account.clone(), color });
+            }
+            for e in &found {
+                let Some((mut event, at)) = calendar_event(&account, e) else { continue };
+                // guests already known survive the reload
+                if let Some((description, attendees, rsvp)) = self.details.get(&at.uid) {
+                    (event.description, event.attendees, event.rsvp) = (description.clone(), attendees.clone(), *rsvp);
+                }
+                self.refs.insert(event.id.clone(), at);
+                events.push(event);
+            }
+        }
+        trace::note(&format!("durian: calendar {from}..{to}: {} calendars, {} events in {took:.0?}", calendars.len(), events.len()));
+        self.schedule.update(cx, |s, cx| s.load_window(calendars, from, to, events, cx));
+        let listed: HashSet<SharedString> = self.schedule.read(cx).events.iter().map(|e| e.id.clone()).collect();
+        self.refs.retain(|id, _| listed.contains(id));
+        self.calendar_loaded = Some((from, to));
+        self.event_selected(cx);
+    }
+
+    /// The selected event's guests and organizer, once per series.
+    fn event_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(at) = self.schedule.read(cx).selected.as_ref().and_then(|id| self.refs.get(id)).cloned() else { return };
+        if self.details.contains_key(&at.uid) || self.detail_tasks.contains_key(&at.uid) {
+            return;
+        }
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        let uid = at.uid.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let request = at.clone();
+            let result = executor.spawn(async move { client.event(&request.account, &request.calendar, &request.uid) }).await;
+            this.update(cx, |this, cx| this.detail_loaded(at, result, cx)).ok();
+        });
+        self.detail_tasks.insert(uid, task);
+    }
+
+    fn detail_loaded(&mut self, at: EventRef, result: client::Result<api::CalendarEvent>, cx: &mut Context<Self>) {
+        self.detail_tasks.remove(&at.uid);
+        let detail = match result {
+            Ok(detail) => detail,
+            Err(e) => {
+                // the summary stays: it's what the event looked like before
+                trace::note(&format!("durian: event detail failed: {}", kind(&e)));
+                return;
+            }
+        };
+        let ids: Vec<SharedString> = self.refs.iter().filter(|(_, r)| r.uid == at.uid).map(|(id, _)| id.clone()).collect();
+        let fallback = ids.first().and_then(|id| self.schedule.read(cx).event(id)).map_or(Rsvp::Accepted, |e| e.rsvp);
+        let (description, attendees, rsvp) = event_detail(&detail, &self.me, fallback);
+        trace::note(&format!("durian: event detail: {} guests, {} occurrences", attendees.len(), ids.len()));
+        self.details.insert(at.uid, (description.clone(), attendees.clone(), rsvp));
+        self.schedule.update(cx, |s, cx| s.fill_detail(&ids, description, attendees, rsvp, cx));
+    }
+}
+
+impl Live {
+    /// Bring an attachment into the session folder, remember the copy, then use it. A second
+    /// request while it's on its way is ignored.
+    pub fn fetch_attachment(&mut self, attachment: Attachment, use_: Use, cx: &mut Context<Self>) {
+        let Some(part) = attachment.remote.clone() else { return };
+        let key = (part.message.clone(), part.part);
+        if self.attachment_tasks.contains_key(&key) {
+            return;
+        }
+        // one folder per part: two attachments may share a name
+        let folder: String = part.message.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        let path = crate::session_dir(&format!("attachments/{folder}-{}", part.part)).join(safe_name(&attachment.name));
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        let name = attachment.name.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let started = Instant::now();
+            let request = part.clone();
+            let target = path.clone();
+            let result = executor
+                .spawn(async move {
+                    let bytes = client.attachment(&request.message, request.part).map_err(|e| e.to_string())?;
+                    std::fs::write(&target, &bytes).map_err(|e| e.to_string())?;
+                    Ok::<usize, String>(bytes.len())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.attachment_tasks.remove(&(part.message.clone(), part.part));
+                match result {
+                    Ok(bytes) => {
+                        trace::note(&format!("durian: attachment {} part {} ({bytes} bytes) in {:.0?}", part.message, part.part, started.elapsed()));
+                        this.mailbox.update(cx, |m, cx| m.set_attachment_path(&part, path.clone(), cx));
+                        match use_ {
+                            Use::QuickLook => attachments::quick_look_path(&path),
+                            Use::Download => match attachments::copy_to_downloads(&path, &name) {
+                                Some(saved) => cx.emit(LiveEvent::Downloaded(saved)),
+                                None => cx.emit(LiveEvent::Problem("Couldn't save to Downloads".into())),
+                            },
+                        }
+                    }
+                    Err(e) => cx.emit(LiveEvent::Problem(format!("Attachment didn't load: {e}").into())),
+                }
+            })
+            .ok();
+        });
+        self.attachment_tasks.insert(key, task);
+    }
+}
+
+/// One account's calendars and their events in the window.
+type AccountCalendars = (SharedString, Vec<api::Calendar>, Vec<api::CalendarEvent>);
+
+/// Every account's calendars and events in [from, to). An account without calendars (or one
+/// whose calendar isn't synced yet: 404 / 409) is skipped, any other failure fails the load.
+fn calendars(client: &Client, accounts: &[SharedString], from: NaiveDate, to: NaiveDate) -> client::Result<Vec<AccountCalendars>> {
+    let (from, to) = (from.to_string(), to.to_string());
+    let one = |account: &SharedString| -> client::Result<Option<AccountCalendars>> {
+        let list = match client.calendars(account) {
+            Ok(list) => list,
+            Err(client::Error::NotFound(_) | client::Error::Server { status: 409, .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(Some((account.clone(), list, client.events(account, &from, &to)?)))
+    };
+    // accounts at once: each request is mostly the server's fixed cost
+    let results: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = accounts.iter().map(|a| s.spawn(move || one(a))).collect();
+        handles.into_iter().map(joined).collect()
+    });
+    results.into_iter().filter_map(Result::transpose).collect()
+}
+
+impl Live {
+    /// The images a thread's HTML embeds (`cid:`), all at once, then each message's HTML with
+    /// them inlined – the renderer has no network. Best effort: one that fails stays a broken
+    /// image. The finished thread goes into the cache.
+    fn fetch_images(&mut self, thread_id: SharedString, content: api::ThreadContent, stamp: Option<Stamp>, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let policy = self.policy;
+        let executor = cx.background_executor().clone();
+        let key = thread_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let started = Instant::now();
+            let htmls: Vec<(String, Option<String>, usize)> = executor
+                .spawn(async move {
+                    std::thread::scope(|s| {
+                        let messages: Vec<_> = content
+                            .messages
+                            .iter()
+                            .filter(|m| !super::embedded_parts(m).is_empty())
+                            .map(|m| {
+                                let parts: Vec<_> = super::embedded_parts(m)
+                                    .into_iter()
+                                    .map(|part| (part, s.spawn(|| client.attachment(&m.id, part.part_id))))
+                                    .collect();
+                                (m, parts)
+                            })
+                            .collect();
+                        messages
+                            .into_iter()
+                            .map(|(m, parts)| {
+                                let images: Vec<_> = parts.into_iter().filter_map(|(part, handle)| Some((part, joined(handle).ok()?))).collect();
+                                (m.id.clone(), super::prepared_html(m, &images, policy), images.len())
+                            })
+                            .collect()
+                    })
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let images: usize = htmls.iter().map(|(_, _, n)| n).sum();
+                trace::note(&format!("durian: {images} embedded images for {thread_id} in {:.0?}", started.elapsed()));
+                this.mailbox.update(cx, |m, cx| {
+                    for (message, html, _) in htmls {
+                        if let Some(html) = html {
+                            m.set_html(&thread_id, &message, html.into(), cx);
+                        }
+                    }
+                });
+                // only the full thread (a search may have put its list row back meanwhile)
+                let thread = this.mailbox.read(cx).threads.iter().find(|t| t.id == thread_id && !t.partial).cloned();
+                if let (Some(stamp), Some(thread)) = (stamp, thread) {
+                    this.cache.insert(stamp, thread);
+                }
+                this.image_tasks.remove(&thread_id);
+            })
+            .ok();
+        });
+        self.image_tasks.insert(key, task);
+    }
+}
+
+/// The error's kind for logs (its message may quote the server, which may quote the query).
+fn kind(e: &client::Error) -> String {
+    match e {
+        client::Error::Unreachable(_) => "unreachable".into(),
+        client::Error::Unauthorized => "unauthorized".into(),
+        client::Error::NotFound(path) => format!("not found ({path})"),
+        client::Error::Server { status, .. } => format!("server error {status}"),
+        client::Error::Decode(_) => "unexpected answer".into(),
+    }
+}
+
+/// The server query for a list: the profile's scope, then the open folder's query with the
+/// translated search inside it. Without folders (a server without profiles) an empty search
+/// is the inbox and a search covers all mail.
+pub fn compose(scope: Option<&str>, folder: Option<&str>, search: &str) -> String {
+    let base = match folder {
+        Some(folder) => combine(folder, search),
+        None if search.trim().is_empty() => INBOX.to_string(),
+        None => search.to_string(),
+    };
+    match scope {
+        Some(scope) => combine(scope, &base),
+        None => base,
+    }
+}
+
+/// The query with its last word counted as typed out, once typing pauses – for the server,
+/// which can't match a word by its beginning. Every kind of clause: a `tag:` or `from:` left
+/// unfinished would otherwise only ever narrow what's already listed, never search.
+pub fn settle(query: &Query) -> Query {
+    let mut query = query.clone();
+    if let Some(last) = query.clauses.last_mut() {
+        last.prefix = false;
+    }
+    query
+}
+
+/// A `tag:` naming a tag there is is complete as typed: it searches right away instead of
+/// after the pause.
+pub fn complete_known_tags(query: &Query, tags: &[Tag]) -> Query {
+    let mut query = query.clone();
+    if let Some(last) = query.clauses.last_mut().filter(|c| c.prefix)
+        && let Term::Tag(name) = &last.term
+        && tags.iter().any(|t| t.name.eq_ignore_ascii_case(name))
+    {
+        last.prefix = false;
+    }
+    query
+}
+
+/// Who the user is on this server.
+struct Identity {
+    version: SharedString,
+    settings: api::Settings,
+    me: Contact,
+    /// every address you send from, for `from:me` / `to:me`
+    addresses: Vec<SharedString>,
+    accounts: Vec<Account>,
+    tags: Vec<Tag>,
+}
+
+/// Sent mail is the only place durian tells who you are (there's no `/accounts` yet).
+const SENT_SAMPLE: usize = 50;
+
+/// A request run on its own thread (a panic there is an error here, not a crash).
+fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, client::Result<T>>) -> client::Result<T> {
+    handle.join().unwrap_or_else(|_| Err(client::Error::Decode("request thread panicked".into())))
+}
+
+/// Who you are on this server: version, tags, and – from sent mail – accounts and addresses.
+/// After the version check the requests run at once (each server query costs ~100–400 ms).
+fn identify(client: &Client) -> client::Result<Identity> {
+    // version first: it answers "reachable, and the token works?" cheaply
+    let version = client.version()?.version.into();
+    let (tags, who, settings) = std::thread::scope(|s| {
+        let tags = s.spawn(|| client.tags());
+        let settings = s.spawn(|| client.settings());
+        // the configured accounts, where the server serves them; else guessed from sent mail
+        let who = match client.profiles() {
+            Ok(response) => Ok(configured_identities(&response)),
+            Err(client::Error::NotFound(_)) => client.search("tag:sent", SENT_SAMPLE, SENT_SAMPLE).map(|sent| identities(sent.threads.values())),
+            Err(e) => Err(e),
+        };
+        (joined(tags), who, joined(settings))
+    });
+    // settings are optional: a server without them (or failing them) gets the defaults
+    let settings = settings.unwrap_or_else(|e| {
+        if !matches!(e, client::Error::NotFound(_)) {
+            trace::note(&format!("durian: settings failed: {}", kind(&e)));
+        }
+        api::Settings::default()
+    });
+    let tags = tags?.into_iter().filter(|t| !super::SYSTEM_TAGS.contains(&t.as_str())).map(|t| Tag { color: hashed_color(&t), name: t.into() }).collect();
+    let (me, addresses, accounts) = who?;
+    Ok(Identity { version, settings, me, addresses, accounts, tags })
+}
+
+/// You and your accounts as configured (`GET /profiles`): the default account is you; every
+/// account's address is yours. Account ids are durian's (the lowercased name).
+fn configured_identities(response: &api::ProfilesResponse) -> (Contact, Vec<SharedString>, Vec<Account>) {
+    let accounts: Vec<Account> = response
+        .accounts
+        .iter()
+        .map(|a| Account {
+            id: a.name.to_lowercase().into(),
+            name: a.name.clone().into(),
+            email: a.email.clone().into(),
+            aliases: Vec::new(),
+            color: hashed_color(&a.name.to_lowercase()),
+        })
+        .collect();
+    let addresses: Vec<SharedString> = response.accounts.iter().filter(|a| !a.email.is_empty()).map(|a| a.email.clone().into()).collect();
+    let me = response.accounts.iter().find(|a| a.default).or(response.accounts.first()).map_or_else(
+        || Contact { name: "Me".into(), email: SharedString::default(), avatar: None },
+        |a| Contact { name: if a.display_name.is_empty() { a.name.clone() } else { a.display_name.clone() }.into(), email: a.email.clone().into(), avatar: None },
+    );
+    (me, addresses, accounts)
+}
+
+/// From your sent mail: you (the address you send from most), all your addresses, and per
+/// account the address it sends from most (the others are its aliases).
+fn identities<'a>(sent: impl Iterator<Item = &'a api::ThreadContent>) -> (Contact, Vec<SharedString>, Vec<Account>) {
+    // (account, address) → (contact, messages); first-seen order keeps the result stable
+    let mut seen: Vec<(String, Contact, usize)> = Vec::new();
+    for m in sent.flat_map(|t| &t.messages).filter(|m| m.tags.iter().any(|t| t == "sent")) {
+        let contact = parse_address(&m.from);
+        let account = m.account.clone().unwrap_or_default();
+        match seen.iter_mut().find(|(a, c, _)| *a == account && c.email.eq_ignore_ascii_case(&contact.email)) {
+            Some(entry) => entry.2 += 1,
+            None => seen.push((account, contact, 1)),
+        }
+    }
+    let me = seen.iter().max_by_key(|(_, _, n)| *n).map(|(_, c, _)| c.clone()).unwrap_or_else(|| Contact { name: "Me".into(), email: SharedString::default(), avatar: None });
+    let mut addresses: Vec<SharedString> = Vec::new();
+    for (_, c, _) in &seen {
+        if !addresses.iter().any(|a| a.eq_ignore_ascii_case(&c.email)) {
+            addresses.push(c.email.clone());
+        }
+    }
+    let mut accounts: Vec<Account> = Vec::new();
+    for (name, ..) in seen.iter().filter(|(a, ..)| !a.is_empty()) {
+        if accounts.iter().any(|a| a.id == name.as_str()) {
+            continue;
+        }
+        let mut own: Vec<&(String, Contact, usize)> = seen.iter().filter(|(a, ..)| a == name).collect();
+        own.sort_by_key(|(_, _, n)| std::cmp::Reverse(*n));
+        accounts.push(Account {
+            id: name.clone().into(),
+            name: name.clone().into(),
+            email: own[0].1.email.clone(),
+            aliases: own[1..].iter().map(|(_, c, _)| c.email.clone()).collect(),
+            color: hashed_color(name),
+        });
+    }
+    (me, addresses, accounts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lists_are_folder_and_search_within_the_profile() {
+        assert_eq!(compose(None, None, ""), INBOX);
+        assert_eq!(compose(None, None, "from:mara"), "from:mara", "no folders: a search covers all mail");
+        assert_eq!(compose(Some("path:work/**"), Some("tag:inbox AND NOT tag:sent"), ""), "(path:work/**) (tag:inbox AND NOT tag:sent)");
+        assert_eq!(compose(Some("path:work/**"), Some("tag:sent"), "from:mara"), "(path:work/**) ((tag:sent) (from:mara))");
+    }
+
+    #[test]
+    fn the_last_clause_settles_whatever_it_is() {
+        // a field typed without a trailing space must reach the server too, not only narrow
+        // what's listed
+        for q in ["invoi", "tag:newsletter", "from:mara", "to:jo", "is:unread"] {
+            let settled = settle(&Query::parse(q));
+            assert!(!settled.clauses[0].prefix, "{q}");
+            assert!(!translate(&settled, &[]).server.is_empty(), "{q} goes to the server");
+        }
+        assert_eq!(settle(&Query::parse("invoice ")), Query::parse("invoice "));
+    }
+
+    #[test]
+    fn a_known_tag_searches_without_waiting() {
+        let tags = [Tag { name: "Newsletter".into(), color: gpui::black() }];
+        let q = complete_known_tags(&Query::parse("tag:newsletter"), &tags);
+        assert!(!q.clauses[0].prefix);
+        assert_eq!(translate(&q, &[]).server, "tag:newsletter");
+        // still being typed: narrows locally until the pause
+        assert!(complete_known_tags(&Query::parse("tag:news"), &tags).clauses[0].prefix);
+    }
+
+    #[test]
+    fn identities_come_from_the_configuration_when_served() {
+        let json = r#"{"ok":true,"profiles":[],"accounts":[
+            {"name":"Home","email":"ada@home.org"},
+            {"name":"Work","display_name":"Ada Lovelace","email":"ada@work.dev","default":true},
+            {"name":"Shared"}]}"#;
+        let response: api::ProfilesResponse = serde_json::from_str(json).unwrap();
+        let (me, addresses, accounts) = configured_identities(&response);
+        assert_eq!((me.name.as_ref(), me.email.as_ref()), ("Ada Lovelace", "ada@work.dev"), "the default account is you");
+        assert_eq!(addresses, ["ada@home.org", "ada@work.dev"], "accounts without an address add none");
+        assert_eq!(accounts.iter().map(|a| a.id.as_ref()).collect::<Vec<_>>(), ["home", "work", "shared"], "durian's account ids");
+    }
+
+    #[test]
+    fn identities_come_from_sent_mail() {
+        let json = r#"{"a":{"thread_id":"a","messages":[
+            {"id":"1","from":"Ada <ada@work.dev>","account":"work","tags":["sent"]},
+            {"id":"2","from":"Ada <ada@work.dev>","account":"work","tags":["sent"]},
+            {"id":"3","from":"Ada <hello@work.dev>","account":"work","tags":["sent"]},
+            {"id":"4","from":"ada@home.org","account":"home","tags":["sent"]},
+            {"id":"5","from":"Bob <bob@x>","account":"work","tags":["inbox"]}]}}"#;
+        let threads: HashMap<String, api::ThreadContent> = serde_json::from_str(json).unwrap();
+        let (me, addresses, accounts) = identities(threads.values());
+        assert_eq!(me.email.as_ref(), "ada@work.dev");
+        assert_eq!(addresses, ["ada@work.dev", "hello@work.dev", "ada@home.org"]);
+        let work = &accounts[0];
+        assert_eq!((work.id.as_ref(), work.email.as_ref()), ("work", "ada@work.dev"));
+        assert_eq!(work.aliases, ["hello@work.dev"]);
+        assert_eq!(accounts[1].email.as_ref(), "ada@home.org");
+    }
+}
+
+/// Writes a thread's raw and prepared HTML for renderer benchmarks:
+/// `DURIAN_URL=… DURIAN_THREAD=<id> DURIAN_OUT=/tmp/dir cargo test -p mail dump_html -- --ignored`
+/// (private mail: delete the output afterwards).
+#[cfg(test)]
+mod dump {
+    #[test]
+    #[ignore]
+    fn dump_html() {
+        let (Ok(url), Ok(id), Ok(out)) = (std::env::var("DURIAN_URL"), std::env::var("DURIAN_THREAD"), std::env::var("DURIAN_OUT")) else { return };
+        let content = super::Client::new(&url, None).thread(&id).unwrap();
+        for (n, m) in content.messages.iter().enumerate() {
+            if let Some(raw) = &m.html {
+                std::fs::write(format!("{out}/{n}.raw.html"), raw).unwrap();
+                std::fs::write(format!("{out}/{n}.prepared.html"), super::super::prepared_html(m, &[], Default::default()).unwrap_or_default()).unwrap();
+            }
+        }
+    }
+}

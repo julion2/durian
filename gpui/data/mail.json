@@ -1,0 +1,996 @@
+{
+  "me": {
+    "name": "Julian Schenker",
+    "email": "julian@habric.com",
+    "avatar": {
+      "path": "avatars/77ce21170cf02227.png",
+      "logo": false
+    }
+  },
+  "tags": [
+    {
+      "name": "review",
+      "color": "lch(48% 59.31 288.43)"
+    },
+    {
+      "name": "infra",
+      "color": "lch(66% 80 48)"
+    },
+    {
+      "name": "rfc",
+      "color": "rgb(78, 167, 252)"
+    },
+    {
+      "name": "billing",
+      "color": "lch(67.969% 62.082 61.651)"
+    },
+    {
+      "name": "hiring",
+      "color": "rgb(187, 135, 252)"
+    },
+    {
+      "name": "waiting",
+      "color": "lch(67.969% 3.577 260.65)"
+    },
+    {
+      "name": "oss",
+      "color": "rgb(76, 183, 130)"
+    },
+    {
+      "name": "alerts",
+      "color": "rgb(235, 87, 87)"
+    },
+    {
+      "name": "incident",
+      "color": "rgb(235, 87, 87)"
+    },
+    {
+      "name": "newsletter",
+      "color": "rgb(242, 153, 74)"
+    }
+  ],
+  "views": [
+    {
+      "name": "Needs reply",
+      "query": "is:unread -from:me tag:waiting"
+    },
+    {
+      "name": "GitHub",
+      "query": "from:github.com"
+    },
+    {
+      "name": "On call",
+      "query": "tag:alerts newer:24h"
+    }
+  ],
+  "threads": [
+    {
+      "id": "incident",
+      "subject": "Postmortem: EU API outage on Oct 7 (draft for review)",
+      "tags": [
+        "incident",
+        "infra",
+        "review"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Tobias Brandt",
+            "email": "tobias@habric.com"
+          },
+          "to": [
+            "Mara Lindqvist",
+            "Julian Schenker",
+            "Sofia Marques"
+          ],
+          "cc": [
+            "Priya Raman",
+            "Felix Okonkwo",
+            "Daniel Kraus",
+            "Emma Novak",
+            "eng-leads@habric.com"
+          ],
+          "at": "Wed, Oct 7 · 16:05",
+          "ago": "1d",
+          "read": true,
+          "body": "Hi all,\n\nhere is the first draft of the postmortem for yesterday's outage. Please read it before Thursday's review and add comments inline in the doc, or reply here if it's quicker.\n\nSummary\nBetween 07:41 and 08:29 UTC the EU API returned 503 for roughly 38% of requests. The deploy at 07:41 introduced a Cloud SQL proxy sidecar that started after the application container. The app crashed on boot, the readiness probe kept failing and the automatic rollback only covered the first region.\n\nTimeline (UTC)\n07:41  r-2026-10-08-0741 rolls out to europe-west3\n07:44  automatic rollback in europe-west3 finishes\n07:47  europe-west1 picks up the same release from the second wave\n07:53  first customer report in #support\n08:02  on-call paged (alert fired 6 minutes after threshold)\n08:29  manual rollback in europe-west1 finished, error rate back to baseline\n\nImpact\nAbout 41,000 failed requests, 212 affected workspaces, 19 support tickets. No data loss.\n\nRoot cause and action items are in the doc. I've left owners blank on purpose so we can decide on Thursday.\n\nTobias",
+          "attachments": [
+            {
+              "name": "postmortem-eu-outage-v1.pdf",
+              "size": "418 KB"
+            }
+          ]
+        },
+        {
+          "kind": "event",
+          "actor": "You",
+          "text": "added tag",
+          "target": "incident",
+          "icon": "label",
+          "ago": "1d"
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Priya Raman",
+            "email": "priya@habric.com"
+          },
+          "to": [
+            "Tobias Brandt",
+            "Mara Lindqvist",
+            "Julian Schenker"
+          ],
+          "cc": [
+            "Felix Okonkwo",
+            "Daniel Kraus",
+            "Emma Novak",
+            "eng-leads@habric.com",
+            "Sofia Marques"
+          ],
+          "at": "Wed, Oct 7 · 16:48",
+          "ago": "1d",
+          "read": true,
+          "body": "Thanks Tobias, this reads well. Two things I'd like to understand before Thursday:\n\n1. Why did the alert fire six minutes late? Our SLO burn-rate alert should have caught 38% errors within two minutes.\n2. Why did the second wave start at all? I thought the rollout controller halts all waves when any region rolls back.\n\nIf (2) is a bug in the controller, I'd rather fix that first than add more probes.",
+          "quoted": "On Wed, Oct 7, 2026 at 16:05, Tobias Brandt <tobias@habric.com> wrote:\n> Hi all,\n>\n> here is the first draft of the postmortem for yesterday's outage."
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Mara Lindqvist",
+            "email": "mara@habric.com"
+          },
+          "to": [
+            "Tobias Brandt",
+            "Julian Schenker",
+            "Sofia Marques"
+          ],
+          "cc": [
+            "Priya Raman",
+            "Felix Okonkwo",
+            "Daniel Kraus",
+            "Emma Novak",
+            "eng-leads@habric.com"
+          ],
+          "at": "Wed, Oct 7 · 17:20",
+          "ago": "1d",
+          "read": true,
+          "body": "On (1): the burn-rate alert uses a 5 minute window with a 2 minute \"for\" clause. With traffic still ramping up after 07:30 the error ratio crossed the threshold at 07:56, not 07:44. So the alert did what it was told, the rule was just too slow for a cold-start morning.\n\nI'd propose a second, faster rule:\n\n```yaml\n- alert: ApiErrorBurstEU\n  expr: sum(rate(http_requests_total{region=~\"europe-.*\",code=~\"5..\"}[1m]))\n      / sum(rate(http_requests_total{region=~\"europe-.*\"}[1m])) > 0.2\n  for: 1m\n```\n\nOn (2) I don't know, Daniel wrote the controller.",
+          "quoted": "> 1. Why did the alert fire six minutes late?\n> 2. Why did the second wave start at all?"
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Felix Okonkwo",
+            "email": "felix@habric.com"
+          },
+          "to": [
+            "Tobias Brandt",
+            "Mara Lindqvist",
+            "Julian Schenker"
+          ],
+          "cc": [
+            "Priya Raman",
+            "Daniel Kraus",
+            "Emma Novak",
+            "eng-leads@habric.com",
+            "Sofia Marques"
+          ],
+          "at": "Wed, Oct 7 · 18:02",
+          "ago": "1d",
+          "read": true,
+          "body": "Customer side: 19 tickets, 3 of them from enterprise accounts with an SLA. Two asked for an RCA in writing. I promised them something by Monday.\n\nCould whoever owns comms make sure the public version doesn't mention the sidecar by name? One of them is evaluating us against a competitor that had a very similar incident last month."
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Julian Schenker",
+            "email": "julian@habric.com",
+            "avatar": {
+              "path": "avatars/77ce21170cf02227.png",
+              "logo": false
+            }
+          },
+          "to": [
+            "Tobias Brandt",
+            "Mara Lindqvist",
+            "Sofia Marques"
+          ],
+          "cc": [
+            "Priya Raman",
+            "Felix Okonkwo",
+            "Daniel Kraus",
+            "Emma Novak",
+            "eng-leads@habric.com"
+          ],
+          "at": "Wed, Oct 7 · 19:31",
+          "ago": "1d",
+          "read": true,
+          "body": "Thanks everyone. My take on owners so we can skip that part on Thursday:\n\n- Startup probe for the SQL proxy: Sofia\n- Rollout controller halting all waves on rollback: Daniel\n- Faster burn-rate rule (Mara's proposal): Mara\n- Written RCA for the three SLA customers: Felix with Emma\n- Public status page post-mortem: Emma\n\nTobias, can you own the doc until it's published? I'd like it out by Friday."
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Sofia Marques",
+            "email": "sofia@habric.com"
+          },
+          "to": [
+            "Tobias Brandt",
+            "Mara Lindqvist",
+            "Julian Schenker"
+          ],
+          "cc": [
+            "Priya Raman",
+            "Felix Okonkwo",
+            "Daniel Kraus",
+            "Emma Novak",
+            "eng-leads@habric.com"
+          ],
+          "at": "Thu, Oct 8 · 08:15",
+          "ago": "2h",
+          "read": true,
+          "body": "Taking the probe. PR will be up today, it's a five line change plus a test that boots the pod without the proxy."
+        },
+        {
+          "kind": "event",
+          "actor": "Mara Lindqvist",
+          "text": "snoozed until",
+          "target": "Thu 10:00",
+          "icon": "clock",
+          "ago": "2h"
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Daniel Kraus",
+            "email": "daniel@habric.com"
+          },
+          "to": [
+            "Tobias Brandt",
+            "Mara Lindqvist",
+            "Julian Schenker"
+          ],
+          "cc": [
+            "Priya Raman",
+            "Felix Okonkwo",
+            "Emma Novak",
+            "eng-leads@habric.com",
+            "Sofia Marques"
+          ],
+          "at": "Thu, Oct 8 · 08:40",
+          "ago": "1h",
+          "read": true,
+          "body": "Found it. The controller does halt all waves, but only for rollbacks it initiated itself. The europe-west3 rollback was triggered by the platform's health check, which the controller sees as a regular new revision. So from its point of view the rollout was still healthy.\n\nFix: treat any revision change during an active rollout as a halt signal. I'll also add a dry-run mode so we can replay yesterday's event log against the new logic before shipping it.",
+          "quoted": "> Rollout controller halting all waves on rollback: Daniel"
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Tobias Brandt",
+            "email": "tobias@habric.com"
+          },
+          "to": [
+            "Mara Lindqvist",
+            "Julian Schenker",
+            "Sofia Marques"
+          ],
+          "cc": [
+            "Priya Raman",
+            "Felix Okonkwo",
+            "Daniel Kraus",
+            "Emma Novak",
+            "eng-leads@habric.com"
+          ],
+          "at": "Thu, Oct 8 · 09:10",
+          "ago": "50m",
+          "read": true,
+          "body": "Draft v2 is up. **Changes:**\n\n- Added Daniel's explanation of the controller behavior to root cause\n- Added Mara's alert rule as action item 3\n- Owners filled in as Julian proposed\n- Customer-facing summary moved to an appendix so Emma can lift it",
+          "attachments": [
+            {
+              "name": "postmortem-eu-outage-v2.pdf",
+              "size": "431 KB"
+            }
+          ]
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Emma Novak",
+            "email": "emma@habric.com"
+          },
+          "to": [
+            "Tobias Brandt",
+            "Mara Lindqvist",
+            "Julian Schenker"
+          ],
+          "cc": [
+            "Priya Raman",
+            "Felix Okonkwo",
+            "Daniel Kraus",
+            "eng-leads@habric.com",
+            "Sofia Marques"
+          ],
+          "at": "Thu, Oct 8 · 09:34",
+          "ago": "26m",
+          "read": false,
+          "body": "For the status page I'd go with: \"A configuration change in a deployment caused elevated error rates for EU customers between 07:41 and 08:29 UTC. We have rolled back the change and are adding safeguards so that a failing region stops the rollout everywhere.\"\n\nNo sidecar, no vendor names, as Felix asked. Felix, does that work for the SLA customers too or do they need more detail?"
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Tobias Brandt",
+            "email": "tobias@habric.com"
+          },
+          "to": [
+            "Mara Lindqvist",
+            "Julian Schenker",
+            "Sofia Marques"
+          ],
+          "cc": [
+            "Priya Raman",
+            "Felix Okonkwo",
+            "Daniel Kraus",
+            "Emma Novak",
+            "eng-leads@habric.com"
+          ],
+          "at": "Thu, Oct 8 · 09:52",
+          "ago": "8m",
+          "read": false,
+          "body": "Final call: I'll publish v3 internally on Friday at 10:00 unless someone objects. Emma's wording is in, Priya's questions are answered in the root cause section.\n\nJulian, you're the approver on this one.",
+          "attachments": [
+            {
+              "name": "postmortem-eu-outage-v3.pdf",
+              "size": "436 KB"
+            },
+            {
+              "name": "timeline-raw.csv",
+              "size": "22 KB"
+            }
+          ],
+          "quoted": "On Thu, Oct 8, 2026 at 09:34, Emma Novak <emma@habric.com> wrote:\n> For the status page I'd go with: \"A configuration change in a deployment caused\n> elevated error rates for EU customers between 07:41 and 08:29 UTC.\""
+        }
+      ],
+      "account": "work"
+    },
+    {
+      "id": "invite-postmortem",
+      "subject": "Invitation: Postmortem review: EU API outage @ Fri 14:00 – 15:00",
+      "tags": [
+        "incident"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Tobias Brandt",
+            "email": "tobias@habric.com"
+          },
+          "to": [
+            "Julian Schenker",
+            "Emma Novak",
+            "Priya Raman",
+            "Felix Okonkwo",
+            "Sofia Marques",
+            "Daniel Kraus"
+          ],
+          "at": "Thu, Oct 8 · 17:12",
+          "ago": "7h",
+          "read": false,
+          "body": "Let's walk through v3 of the postmortem together before it goes out internally on Friday. Timeline, root cause and the follow-ups with owners.\n\nIf the slot doesn't work, propose another one.",
+          "invite": "postmortem-review"
+        }
+      ],
+      "account": "work"
+    },
+    {
+      "id": "rfc-tags",
+      "subject": "RFC: tag-based routing for mailcli",
+      "tags": [
+        "rfc",
+        "waiting"
+      ],
+      "starred": true,
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Mara Lindqvist",
+            "email": "mara@habric.com"
+          },
+          "to": [
+            "Julian Schenker",
+            "Tobias Brandt"
+          ],
+          "at": "Mon, Oct 5 · 09:12",
+          "ago": "3d",
+          "read": true,
+          "body": "Hey both,\n\nI wrote up the routing RFC we talked about on Friday. Short version: no folders at all. Every message gets tags from rules, the inbox is just `tag:inbox -tag:done`, and the CLI and the app share the exact same rule engine.\n\nOpen questions are at the bottom of the doc. Biggest one: do rules run on the server or on the client?\n\nMara",
+          "attachments": [
+            {
+              "name": "rfc-0007-tag-routing.md",
+              "size": "14 KB"
+            }
+          ]
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Tobias Brandt",
+            "email": "tobias@habric.com"
+          },
+          "to": [
+            "Mara Lindqvist",
+            "Julian Schenker"
+          ],
+          "at": "Mon, Oct 5 · 11:40",
+          "ago": "3d",
+          "read": true,
+          "body": "Server, definitely. Otherwise the CLI and the app drift the moment someone runs an old binary.\n\nOne thing I'd add: rules should be plain text in the repo, so we can review them like code.",
+          "quoted": "On Mon, Oct 5, 2026 at 09:12, Mara Lindqvist <mara@habric.com> wrote:\n> Hey both,\n>\n> I wrote up the routing RFC we talked about on Friday. Short version: no folders at all.\n> Every message gets tags from rules, the inbox is just `tag:inbox -tag:done`.\n>\n> Mara"
+        },
+        {
+          "kind": "event",
+          "actor": "You",
+          "text": "added tag",
+          "target": "rfc",
+          "icon": "label",
+          "ago": "3d"
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Julian Schenker",
+            "email": "julian@habric.com",
+            "avatar": {
+              "path": "avatars/77ce21170cf02227.png",
+              "logo": false
+            }
+          },
+          "to": [
+            "Mara Lindqvist",
+            "Tobias Brandt"
+          ],
+          "at": "Mon, Oct 5 · 14:03",
+          "ago": "3d",
+          "read": true,
+          "body": "+1 on server-side and rules in the repo. I'd keep a dry-run mode in the CLI though: `mailcli rules test --since 7d` should show which tags *would* change before we deploy a rule.\n\nCan we also get rid of \"archive\"? Archive is just removing `inbox`.",
+          "quoted": "> Server, definitely. Otherwise the CLI and the app drift the moment someone runs an old binary.\n\nAgreed, that's the whole point."
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Mara Lindqvist",
+            "email": "mara@habric.com"
+          },
+          "to": [
+            "Julian Schenker",
+            "Tobias Brandt"
+          ],
+          "at": "Tue, Oct 6 · 08:55",
+          "ago": "2d",
+          "read": true,
+          "body": "Dry-run is in. I also added `mailcli rules diff` that prints the tag delta per thread, works nicely with `less`.\n\nArchive = `-inbox`: yes, I'll update the section on keyboard shortcuts so `e` maps to that.",
+          "quoted": "-- \nMara Lindqvist\nhabric · platform"
+        },
+        {
+          "kind": "event",
+          "actor": "You",
+          "text": "snoozed until",
+          "target": "Thu 09:00",
+          "icon": "clock",
+          "ago": "2d"
+        },
+        {
+          "kind": "event",
+          "actor": "Tobias Brandt",
+          "text": "forwarded to",
+          "target": "eng-leads@habric.com",
+          "icon": "forward",
+          "ago": "1d"
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Tobias Brandt",
+            "email": "tobias@habric.com"
+          },
+          "to": [
+            "Mara Lindqvist",
+            "Julian Schenker"
+          ],
+          "at": "Thu, Oct 8 · 09:02",
+          "ago": "1h",
+          "read": false,
+          "body": "Ran the dry-run against my last 30 days: 2,184 threads, 31 tag changes, all of them look right except newsletters from GitHub that also match `tag:review`.\n\nJulian, can you sign off on the RFC today so I can start the migration on Monday? The only thing left is your call on the rate limit for rule evaluation (I'd say 50 rules / account).",
+          "attachments": [
+            {
+              "name": "dry-run-30d.txt",
+              "size": "212 KB"
+            }
+          ],
+          "quoted": "On Tue, Oct 6, 2026 at 08:55, Mara Lindqvist <mara@habric.com> wrote:\n> Dry-run is in. I also added `mailcli rules diff` that prints the tag delta per thread.\n>\n> On Mon, Oct 5, 2026 at 14:03, Julian Schenker wrote:\n>> +1 on server-side and rules in the repo."
+        }
+      ],
+      "account": "work"
+    },
+    {
+      "id": "newsletter",
+      "subject": "Systems Weekly #142: GPU-rendered UIs are eating the desktop",
+      "tags": [
+        "newsletter"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Systems Weekly",
+            "email": "hello@systemsweekly.dev",
+            "avatar": {
+              "path": "avatars/systemsweekly.dev.png",
+              "logo": false
+            }
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Thu, Oct 8 · 07:00",
+          "ago": "3h",
+          "read": false,
+          "body": "This week: GPU-rendered UIs are eating the desktop. Zed's GPUI, Warp, and a new wave of native mail and calendar clients: why teams are leaving Electron, and what it costs them.",
+          "html_source": "mail-html/systems-weekly-142.html"
+        }
+      ],
+      "account": "personal"
+    },
+    {
+      "id": "nl-rust-digest-88",
+      "subject": "Rust Digest #88: Async closures are finally stable",
+      "tags": [
+        "newsletter"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Rust Digest",
+            "email": "hello@rustdigest.example"
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Thu, Oct 8 · 06:30",
+          "ago": "3h",
+          "read": false,
+          "body": "Async closures are finally stable. What changed in 1.95, how the borrow checker sees async closures now, and three crates that already dropped their workarounds.",
+          "html_source": "mail-html/rust-digest-88.html"
+        }
+      ],
+      "account": "oss"
+    },
+    {
+      "id": "nl-postgres-weekly-610",
+      "subject": "Postgres Weekly #610: Logical replication without the pain",
+      "tags": [
+        "newsletter"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Postgres Weekly",
+            "email": "hello@postgresweekly.example"
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Thu, Oct 8 · 06:00",
+          "ago": "4h",
+          "read": false,
+          "body": "Logical replication without the pain. Postgres 19 adds failover slots by default. A practical guide to zero-downtime major upgrades in managed clouds.",
+          "html_source": "mail-html/postgres-weekly-610.html"
+        }
+      ],
+      "account": "personal"
+    },
+    {
+      "id": "sentry",
+      "subject": "New issue in api-eu: PoolTimeout: could not acquire connection within 5s",
+      "tags": [
+        "alerts",
+        "infra"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Sentry",
+            "email": "noreply@sentry.io",
+            "avatar": {
+              "path": "avatars/sentry.io.ico",
+              "logo": true
+            }
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Thu, Oct 8 · 07:46",
+          "ago": "2h",
+          "read": false,
+          "body": "PoolTimeout: could not acquire connection within 5s\n\napi-eu · production · first seen 2 hours ago · 1,284 events · 212 users\n\n  File \"services/api/db/pool.py\", line 88, in acquire\n    raise PoolTimeout(f\"could not acquire connection within {timeout}s\")\n  File \"services/api/handlers/workspaces.py\", line 41, in get_workspace\n    async with pool.acquire() as conn:\n\nRelease r-2026-10-08-0741 · environment production · region europe-west3"
+        }
+      ],
+      "account": "work"
+    },
+    {
+      "id": "deploy",
+      "subject": "Deploy failed: api-prod (europe-west3), rollback finished",
+      "tags": [
+        "alerts",
+        "infra"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Cloud Deploy",
+            "email": "noreply@deploy.habric.com",
+            "avatar": {
+              "path": "avatars/habric.com.png",
+              "logo": true
+            }
+          },
+          "to": [
+            "oncall@habric.com"
+          ],
+          "at": "Thu, Oct 8 · 07:41",
+          "ago": "2h",
+          "read": false,
+          "body": "Release r-2026-10-08-0741 failed health checks on 3/3 instances.\n\nReadiness probe: GET /healthz -> 503 (database: connection refused)\nAutomatic rollback to r-2026-10-07-1820 finished at 07:44 UTC.\n\nLogs: https://console.habric.com/deploys/r-2026-10-08-0741"
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Tobias Brandt",
+            "email": "tobias@habric.com"
+          },
+          "to": [
+            "oncall@habric.com"
+          ],
+          "at": "Thu, Oct 8 · 07:58",
+          "ago": "2h",
+          "read": false,
+          "body": "Root cause: the new Cloud SQL proxy sidecar starts after the app container. Fix is a startup probe on the proxy, PR incoming.",
+          "quoted": "> Readiness probe: GET /healthz -> 503 (database: connection refused)"
+        }
+      ],
+      "account": "work"
+    },
+    {
+      "id": "gpui-pr",
+      "subject": "[zed-industries/zed] gpui: measure list items against available width (#40211)",
+      "tags": [
+        "review",
+        "oss"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "GitHub",
+            "email": "notifications@github.com",
+            "avatar": {
+              "path": "avatars/github.com.png",
+              "logo": true
+            }
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Wed, Oct 7 · 16:20",
+          "ago": "18h",
+          "read": true,
+          "body": "@ninaokafor requested your review on this pull request.\n\nList items without an explicit width were measured with a min-content constraint, which made rows shrink-wrap their children. This passes the list's width as a definite available space."
+        },
+        {
+          "kind": "event",
+          "actor": "You",
+          "text": "added tag",
+          "target": "review",
+          "icon": "label",
+          "ago": "18h"
+        },
+        {
+          "kind": "message",
+          "from": {
+            "name": "Nina Okafor",
+            "email": "notifications@github.com",
+            "avatar": {
+              "path": "avatars/github.com.png",
+              "logo": true
+            }
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Thu, Oct 8 · 08:10",
+          "ago": "1h",
+          "read": false,
+          "body": "@ninaokafor commented on this pull request.\n\nAdded a test that reproduces the shrink-wrapped rows from your report: it renders a list whose items have no explicit width inside a 400px container and asserts the row bounds match the container.\n\nWhile doing that I noticed uniform_list had the same problem when the first item is measured, so I fixed it there too. That one is a separate commit in case you want to review it on its own.\n\nMind taking another look? CI is green on macOS and Linux."
+        }
+      ],
+      "account": "oss"
+    },
+    {
+      "id": "stripe",
+      "subject": "Your receipt from habric GmbH #2291-0047",
+      "tags": [
+        "billing"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Stripe",
+            "email": "receipts@stripe.com",
+            "avatar": {
+              "path": "avatars/stripe.com.ico",
+              "logo": true
+            }
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Wed, Oct 7 · 12:14",
+          "ago": "1d",
+          "read": true,
+          "body": "Receipt #2291-0047\n\nAmount paid: €1,190.00\nDate paid: October 7, 2026\nPayment method: SEPA Direct Debit ···· 4417\n\nTeam plan, 20 seats × €59.50 (Oct 7 – Nov 6, 2026)",
+          "attachments": [
+            {
+              "name": "Receipt-2291-0047.pdf",
+              "size": "64 KB"
+            }
+          ]
+        }
+      ],
+      "account": "work"
+    },
+    {
+      "id": "nl-frontend-signal-212",
+      "subject": "Frontend Signal #212: The return of the native app",
+      "tags": [
+        "newsletter"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Frontend Signal",
+            "email": "hello@frontendsignal.example"
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Wed, Oct 7 · 09:00",
+          "ago": "1d",
+          "read": true,
+          "body": "The return of the native app. GPU UI toolkits are closing the gap with the web. We compared startup time, memory and input latency of six editors.",
+          "html_source": "mail-html/frontend-signal-212.html"
+        }
+      ],
+      "account": "personal"
+    },
+    {
+      "id": "invoice",
+      "subject": "Invoice 2026-0412 for your cloud servers",
+      "tags": [
+        "billing"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Hetzner Online",
+            "email": "billing@hetzner.com",
+            "avatar": {
+              "path": "avatars/hetzner.com.png",
+              "logo": true
+            }
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Wed, Oct 7 · 06:00",
+          "ago": "1d",
+          "read": true,
+          "body": "Dear customer,\n\nyour invoice for September 2026 is attached. The amount of 184.27 EUR will be debited from your account on Oct 14.",
+          "attachments": [
+            {
+              "name": "Invoice-2026-0412.pdf",
+              "size": "86 KB"
+            }
+          ]
+        }
+      ],
+      "account": "work"
+    },
+    {
+      "id": "recruiter",
+      "subject": "Staff Engineer, Rust / GPU rendering (remote, EU)",
+      "tags": [
+        "hiring"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Lena Hoffmann",
+            "email": "lena.hoffmann@gmail.com"
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Tue, Oct 6 · 15:31",
+          "ago": "2d",
+          "read": true,
+          "body": "Hi Julian,\n\nI came across your work on GPUI-based tooling and wanted to reach out. I'm helping a Berlin-based devtools company (about 40 people, Series B, profitable) find a Staff Engineer for their rendering team.\n\nWhat they're working on: a native, GPU-accelerated editor for data pipelines. The core is Rust, the UI layer is their own retained-mode toolkit and they are considering moving parts of it to GPUI. You'd own the text layout and rendering stack.\n\nRemote in the EU, two on-sites per quarter, salary band 120–145k plus equity.\n\nWould you be open to a 20 minute call next week? Happy to share more details on the team first if that's easier.\n\nBest,\nLena"
+        }
+      ],
+      "account": "personal"
+    },
+    {
+      "id": "ci",
+      "subject": "[habric/mailcli] CI: 2 checks failed on main",
+      "tags": [
+        "oss",
+        "alerts"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "GitHub Actions",
+            "email": "notifications@github.com",
+            "avatar": {
+              "path": "avatars/github.com.png",
+              "logo": true
+            }
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Tue, Oct 6 · 11:02",
+          "ago": "2d",
+          "read": true,
+          "body": "clippy (stable): 1 error in src/rules/eval.rs\ntest (macos-14): rules::tests::dry_run_respects_since failed"
+        }
+      ],
+      "account": "oss"
+    },
+    {
+      "id": "linear",
+      "subject": "HAB-255 Migrate the QMS from SharePoint to Confluence was marked blocking",
+      "tags": [],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Linear",
+            "email": "notifications@linear.app",
+            "avatar": {
+              "path": "avatars/linear.app.ico",
+              "logo": true
+            }
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Mon, Oct 5 · 19:08",
+          "ago": "3d",
+          "read": true,
+          "body": "julian marked HAB-255 as blocking HAB-147 Finalize document control and release the initial QMS baseline.\n\nView issue: https://linear.app/habric/issue/HAB-255"
+        }
+      ],
+      "account": "work"
+    },
+    {
+      "id": "lunch",
+      "subject": "Lunch Thursday?",
+      "tags": [],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Jonas Weber",
+            "email": "jonas.weber@gmail.com"
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Mon, Oct 5 · 18:44",
+          "ago": "3d",
+          "read": true,
+          "body": "Free on Thursday around 12:30? The ramen place near the office reopened."
+        }
+      ],
+      "account": "personal"
+    },
+    {
+      "id": "nl-systems-weekly-141",
+      "subject": "Systems Weekly #141: Local-first sync, two years later",
+      "tags": [
+        "newsletter"
+      ],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "Systems Weekly",
+            "email": "hello@systemsweekly.example"
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Thu, Oct 1 · 07:00",
+          "ago": "7d",
+          "read": true,
+          "body": "Local-first sync, two years later. CRDTs in production: what broke, what scaled and why most teams ended up with a server anyway.",
+          "html_source": "mail-html/systems-weekly-141.html"
+        }
+      ],
+      "account": "personal"
+    },
+    {
+      "id": "advisory",
+      "subject": "crates.io weekly: 3 new security advisories",
+      "tags": [],
+      "items": [
+        {
+          "kind": "message",
+          "from": {
+            "name": "RustSec",
+            "email": "digest@rustsec.org",
+            "avatar": {
+              "path": "avatars/rustsec.org.ico",
+              "logo": true
+            }
+          },
+          "to": [
+            "Julian Schenker"
+          ],
+          "at": "Mon, Oct 5 · 07:00",
+          "ago": "3d",
+          "read": true,
+          "body": "RUSTSEC-2026-0091: use-after-free in `bumpalo` reset with outstanding references\nRUSTSEC-2026-0092: unsound `Send` impl in `tokio-tungstenite` 0.27\nRUSTSEC-2026-0093: DoS in `quick-xml` entity expansion"
+        }
+      ],
+      "account": "oss"
+    }
+  ],
+  "accounts": [
+    {
+      "id": "work",
+      "name": "Work",
+      "email": "julian@habric.com",
+      "color": "lch(48% 59.31 288.43)",
+      "aliases": [
+        "team@habric.com"
+      ]
+    },
+    {
+      "id": "personal",
+      "name": "Personal",
+      "email": "julian@home.example",
+      "color": "rgb(76, 183, 130)",
+      "aliases": [
+        "j@home.example"
+      ]
+    },
+    {
+      "id": "oss",
+      "name": "Open source",
+      "email": "julian@oss.example",
+      "color": "lch(66% 80 48)",
+      "aliases": []
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+[package]
+name = "mail"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Mail client views on GPUI: sidebar, thread list, thread view, composer, drafts, command menu"
+
+[dependencies]
+ui = { path = "../ui" }
+gpui.workspace = true
+anyhow = "1"
+libc = "0.2"
+md5 = "0.7"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures = "0.3"
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+ureq = "3"
+
+# MAIL_TRACE reads the current NSEvent's OS timestamp
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSEvent", "NSResponder", "NSView", "NSWindow", "NSImage", "NSGraphics"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSProcessInfo", "NSError", "NSData", "NSGeometry", "NSString"] }
+# HTML mail in a live WKWebView, an AppKit child of the GPUI window (webview.rs)
+wry = "=0.57.0"
+block2 = "0.6"
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "WKWebView", "WKSnapshotConfiguration"] }
+# overlay snapshots arrive as TIFF
+image = { version = "0.25", default-features = false, features = ["tiff"] }
+
+[dependencies.calendar]
+path = "../calendar"

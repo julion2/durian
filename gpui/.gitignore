@@ -1,0 +1,23 @@
+# Rust build output
+/target
+
+# macOS
+.DS_Store
+._*
+
+# Editors / IDEs
+.idea/
+.vscode/
+.zed/
+*.swp
+*~
+
+# Local environment / secrets
+.env
+.env.*
+
+# Node tooling (tools/*.mjs)
+node_modules/
+
+# Screenshots / traces produced by local tooling
+*.log

@@ -1,0 +1,142 @@
+{
+  "calendars": [
+    { "id": "habric", "name": "Habric", "account": "work", "color": "#5e6ad2" },
+    { "id": "personal", "name": "Personal", "account": "personal", "color": "#4cb782" },
+    { "id": "oss", "name": "OSS", "account": "oss", "color": "#f2994a" },
+    { "id": "holidays", "name": "Holidays (DE)", "account": "personal", "color": "#a78bfa" }
+  ],
+  "events": [
+    {
+      "id": "standup", "calendar": "habric", "title": "Standup", "day": -4, "start": "09:30", "end": "09:45",
+      "repeat": "weekdays", "until_day": 11, "recurrence": "Every weekday",
+      "conference": "meet.habric.com/standup",
+      "attendees": [
+        { "name": "Tobias Brandt", "email": "tobias@habric.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Mara Lindqvist", "email": "mara@habric.com", "rsvp": "accepted" },
+        { "name": "Emma Novak", "email": "emma@habric.com", "rsvp": "accepted" },
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "accepted" }
+      ]
+    },
+    { "id": "unity", "calendar": "holidays", "title": "Tag der Deutschen Einheit", "day": -6, "all_day": true },
+    { "id": "dentist", "calendar": "personal", "title": "Dentist", "day": -10, "start": "08:30", "end": "09:15", "location": "Praxis Dr. Albers, Kastanienallee 12" },
+    {
+      "id": "board", "calendar": "habric", "title": "Board meeting", "day": -7, "start": "15:00", "end": "17:00", "location": "Office, 4th floor",
+      "attendees": [
+        { "name": "Felix Okonkwo", "email": "felix@habric.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "accepted" }
+      ]
+    },
+    {
+      "id": "planning", "calendar": "habric", "title": "Planning: Q4 mail roadmap", "day": -4, "start": "10:00", "end": "11:30",
+      "conference": "meet.habric.com/planning",
+      "description": "Agenda:\n- tag rules engine (RFC)\n- **search** across accounts\n- calendar in the client",
+      "attendees": [
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Tobias Brandt", "email": "tobias@habric.com", "rsvp": "accepted" },
+        { "name": "Mara Lindqvist", "email": "mara@habric.com", "rsvp": "accepted" },
+        { "name": "Priya Raman", "email": "priya@habric.com", "rsvp": "tentative" }
+      ]
+    },
+    { "id": "focus-mon", "calendar": "habric", "title": "Focus: HTML renderer pool", "day": -4, "start": "13:00", "end": "16:00" },
+    {
+      "id": "incident", "calendar": "habric", "title": "Incident: EU API outage", "day": -3, "start": "07:41", "end": "08:29",
+      "description": "Rollout paused in europe-west3. See the postmortem thread.",
+      "attendees": [
+        { "name": "Tobias Brandt", "email": "tobias@habric.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "accepted" }
+      ]
+    },
+    {
+      "id": "one-on-one", "calendar": "habric", "title": "1:1 Tobias", "day": -3, "start": "11:00", "end": "11:30", "recurrence": "Weekly on Tuesday",
+      "attendees": [
+        { "name": "Tobias Brandt", "email": "tobias@habric.com", "rsvp": "accepted" },
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "accepted", "organizer": true }
+      ]
+    },
+    {
+      "id": "postmortem-draft", "calendar": "habric", "title": "Postmortem draft review", "day": -3, "start": "15:00", "end": "16:00",
+      "attendees": [
+        { "name": "Tobias Brandt", "email": "tobias@habric.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Emma Novak", "email": "emma@habric.com", "rsvp": "accepted" },
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "accepted" }
+      ]
+    },
+    {
+      "id": "design-crit", "calendar": "habric", "title": "Design crit: thread view", "day": -3, "start": "15:30", "end": "16:30",
+      "attendees": [
+        { "name": "Sofia Marques", "email": "sofia@habric.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "tentative" }
+      ], "rsvp": "tentative"
+    },
+    { "id": "meetup-gpui", "calendar": "oss", "title": "GPUI meetup", "day": -2, "start": "18:30", "end": "21:00", "location": "c-base, Rungestraße 20, Berlin" },
+    { "id": "gym", "calendar": "personal", "title": "Gym", "day": -1, "start": "07:00", "end": "08:00" },
+    {
+      "id": "interview-lena", "calendar": "habric", "title": "Interview: Lena Hoffmann (Staff Engineer)", "day": -1, "start": "14:00", "end": "15:00",
+      "conference": "meet.habric.com/interview-lh",
+      "description": "Focus on GPU rendering and text layout. Scorecard in the hiring folder.",
+      "attendees": [
+        { "name": "Lena Hoffmann", "email": "lena.hoffmann@gmail.com", "rsvp": "accepted" },
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Sofia Marques", "email": "sofia@habric.com", "rsvp": "accepted" }
+      ]
+    },
+    {
+      "id": "rfc-signoff", "calendar": "habric", "title": "RFC sign-off: tag-based routing", "day": 0, "start": "11:00", "end": "11:30",
+      "attendees": [
+        { "name": "Mara Lindqvist", "email": "mara@habric.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Tobias Brandt", "email": "tobias@habric.com", "rsvp": "accepted" },
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "accepted" }
+      ]
+    },
+    {
+      "id": "postmortem-review", "calendar": "habric", "title": "Postmortem review: EU API outage", "day": 0, "start": "14:00", "end": "15:00",
+      "conference": "meet.habric.com/postmortem",
+      "description": "Walk through **v3** of the postmortem before it goes out internally.\n\n- timeline\n- root cause\n- follow-ups and owners",
+      "rsvp": "needs_action",
+      "attendees": [
+        { "name": "Tobias Brandt", "email": "tobias@habric.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Emma Novak", "email": "emma@habric.com", "rsvp": "accepted" },
+        { "name": "Priya Raman", "email": "priya@habric.com", "rsvp": "tentative" },
+        { "name": "Felix Okonkwo", "email": "felix@habric.com", "rsvp": "accepted" },
+        { "name": "Sofia Marques", "email": "sofia@habric.com", "rsvp": "needs_action" },
+        { "name": "Daniel Kraus", "email": "daniel@habric.com", "rsvp": "declined" },
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "needs_action" }
+      ]
+    },
+    {
+      "id": "customer-call", "calendar": "habric", "title": "Customer call: Northwind", "day": 0, "start": "14:30", "end": "15:00",
+      "conference": "meet.habric.com/northwind",
+      "attendees": [
+        { "name": "Daniel Kraus", "email": "daniel@habric.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "accepted" }
+      ]
+    },
+    { "id": "focus-fri", "calendar": "habric", "title": "Focus time", "day": 0, "start": "15:30", "end": "17:30" },
+    { "id": "dinner", "calendar": "personal", "title": "Dinner at Nobelhart", "day": 0, "start": "19:30", "end": "22:00", "location": "Nobelhart & Schmutzig, Friedrichstraße 218" },
+    { "id": "climbing", "calendar": "personal", "title": "Climbing", "day": 1, "start": "10:00", "end": "12:00", "location": "Berta Block" },
+    { "id": "freeze", "calendar": "habric", "title": "Release freeze", "day": 3, "all_day": true, "days": 2 },
+    {
+      "id": "sprint-review", "calendar": "habric", "title": "Sprint review", "day": 3, "start": "16:00", "end": "17:00",
+      "attendees": [
+        { "name": "Tobias Brandt", "email": "tobias@habric.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "accepted" }
+      ]
+    },
+    {
+      "id": "vendor-demo", "calendar": "habric", "title": "Vendor demo: transactional mail API", "day": 4, "start": "10:00", "end": "10:45", "rsvp": "declined",
+      "attendees": [
+        { "name": "Daniel Kraus", "email": "daniel@habric.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Julian Schenker", "email": "julian@habric.com", "rsvp": "declined" }
+      ]
+    },
+    { "id": "rust-berlin", "calendar": "oss", "title": "Rust Berlin: async closures", "day": 5, "start": "19:00", "end": "21:30", "location": "Ableton, Schönhauser Allee 6" },
+    {
+      "id": "lunch-jonas", "calendar": "personal", "title": "Lunch with Jonas", "day": 6, "start": "12:30", "end": "13:30", "rsvp": "tentative", "location": "Ramen place near the office",
+      "attendees": [
+        { "name": "Jonas Weber", "email": "jonas.weber@gmail.com", "rsvp": "accepted", "organizer": true },
+        { "name": "Julian Schenker", "email": "julian@home.example", "rsvp": "tentative" }
+      ]
+    },
+    { "id": "offsite", "calendar": "habric", "title": "Team offsite", "day": 7, "all_day": true }
+  ]
+}
