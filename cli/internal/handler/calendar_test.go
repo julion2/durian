@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -228,6 +229,109 @@ func TestCalendarEventDetail(t *testing.T) {
 	}
 	if resp.Event.Account != "work" {
 		t.Errorf("account = %q, want work", resp.Event.Account)
+	}
+}
+
+func TestCalendarExactUIDSelection(t *testing.T) {
+	for _, method := range []string{"GET", "DELETE", "POST"} {
+		for _, tc := range []struct {
+			name  string
+			query string
+			want  int
+		}{
+			{"exact", "uid=foo-bar", http.StatusOK},
+			{"missing UID never matches prefix", "uid=foo", http.StatusNotFound},
+			{"UID never matches subject", "uid=Planning", http.StatusNotFound},
+			{"UID is case sensitive", "uid=FOO-BAR", http.StatusNotFound},
+			{"wrong calendar", "uid=foo-bar&calendar=Excluded", http.StatusNotFound},
+			{"wrong account", "uid=foo-bar&account=unknown", http.StatusNotFound},
+			{"excluded calendar", "uid=excluded-only&calendar=Excluded", http.StatusNotFound},
+			{"both selectors", "uid=foo&ref=foo-bar", http.StatusBadRequest},
+			{"empty UID", "uid=", http.StatusBadRequest},
+			{"empty UID cannot fall back", "uid=&ref=foo-bar", http.StatusBadRequest},
+			{"empty ref with UID", "uid=foo-bar&ref=", http.StatusBadRequest},
+			{"missing selector", "", http.StatusBadRequest},
+			{"legacy exact", "ref=foo-bar", http.StatusOK},
+			{"legacy prefix", "ref=foo", http.StatusOK},
+			{"legacy subject", "ref=Planning", http.StatusOK},
+		} {
+			t.Run(method+"/"+tc.name, func(t *testing.T) {
+				r, dir := newCalendarHandler(t)
+				event := calendar.Event{
+					ICalUID: "foo-bar", Subject: "Planning",
+					Start:     time.Date(2026, 8, 7, 9, 0, 0, 0, time.UTC),
+					End:       time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC),
+					Organizer: &calendar.Person{Email: "organizer@example.com"},
+					Attendees: []calendar.Attendee{
+						{Email: "me@example.com", Type: "required", Response: "none"},
+						{Email: "other@example.com", Type: "required", Response: "tentative"},
+					},
+				}
+				writeCalendarTestEvent(t, dir, event)
+				event.ICalUID = "excluded-only"
+				writeCalendarTestEvent(t, filepath.Join(filepath.Dir(dir), "Excluded"), event)
+				path := filepath.Join(dir, "foo-bar.ics")
+				before, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				q, err := url.ParseQuery(tc.query)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !q.Has("account") {
+					q.Set("account", "work")
+				}
+				if !q.Has("calendar") {
+					q.Set("calendar", "Calendar")
+				}
+				request := httptest.NewRequest(method, "/api/v1/calendars/event?"+q.Encode(), nil)
+				if method == "POST" {
+					body := map[string]string{"response": "accepted"}
+					for key := range q {
+						body[key] = q.Get(key)
+					}
+					data, err := json.Marshal(body)
+					if err != nil {
+						t.Fatal(err)
+					}
+					request = httptest.NewRequest(method, "/api/v1/calendars/rsvp", bytes.NewReader(data))
+				}
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, request)
+				if w.Code != tc.want {
+					t.Errorf("status %d, want %d: %s", w.Code, tc.want, w.Body.String())
+				}
+				if tc.want != http.StatusOK || method == "GET" {
+					after, err := os.ReadFile(path)
+					if err != nil || !bytes.Equal(before, after) {
+						t.Fatalf("unrelated event changed: %v", err)
+					}
+				}
+				if w.Code == http.StatusOK && method != "DELETE" {
+					var response struct {
+						Event calendar.CalendarEvent `json:"event"`
+					}
+					if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+						t.Fatal(err)
+					}
+					if response.Event.UID != "foo-bar" || response.Event.Calendar != "Calendar" {
+						t.Fatalf("wrong event returned: %+v", response.Event)
+					}
+				}
+				if tc.want == http.StatusOK && method == "POST" {
+					stored := readCalendarTestEvent(t, dir, "foo-bar")
+					if stored.OwnerResponse != calendar.OwnerRespAccepted {
+						t.Fatalf("RSVP not persisted: %+v", stored)
+					}
+				} else if tc.want == http.StatusOK && method == "DELETE" {
+					if _, err := os.Stat(path); !os.IsNotExist(err) {
+						t.Fatalf("event not deleted: %v", err)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -516,6 +620,66 @@ func TestCalendarPutUpdatePreservesMeetingFields(t *testing.T) {
 	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("PUT calendar move = %d, want 400", w.Code)
+	}
+}
+
+func TestCalendarPutUIDIsScopedToCalendar(t *testing.T) {
+	r, calDir := newCalendarHandler(t)
+	// Both calendars must be included, unlike the excluded fixture collection.
+	otherDir := filepath.Join(filepath.Dir(calDir), "Other")
+	if err := os.MkdirAll(otherDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h := New(nil, nil)
+	h.SetConfig(&config.Config{
+		Calendar: config.CalendarConfig{VdirPath: filepath.Dir(filepath.Dir(calDir))},
+		Accounts: []config.AccountConfig{{Name: "Work", Email: "me@example.com", Alias: "work"}},
+	})
+	r = newTestRouter(h, nil)
+	for _, dir := range []string{calDir, otherDir} {
+		writeCalendarTestEvent(t, dir, calendar.Event{
+			ICalUID: "shared-uid", Subject: filepath.Base(dir),
+			Start:     time.Date(2026, 8, 7, 9, 0, 0, 0, time.UTC),
+			End:       time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC),
+			Organizer: &calendar.Person{Email: "me@example.com"},
+			Attendees: []calendar.Attendee{{Email: "alice@example.com", Type: "optional", Response: "accepted"}},
+		})
+	}
+	otherBefore, err := os.ReadFile(filepath.Join(otherDir, "shared-uid.ics"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"account":"work","calendar":"Calendar","uid":"shared-uid","subject":"Edited","start":"2026-08-07T11:00:00Z","end":"2026-08-07T12:00:00Z"}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT = %d: %s", w.Code, w.Body.String())
+	}
+	got := readCalendarTestEvent(t, calDir, "shared-uid")
+	if got.Subject != "Edited" || got.Organizer == nil || len(got.Attendees) != 1 || got.Attendees[0].Response != "accepted" {
+		t.Fatalf("scoped edit lost meeting metadata: %+v", got)
+	}
+	otherAfter, err := os.ReadFile(filepath.Join(otherDir, "shared-uid.ics"))
+	if err != nil || !bytes.Equal(otherBefore, otherAfter) {
+		t.Fatalf("other calendar changed: %v", err)
+	}
+
+	// An ambiguous display name is not permission to take the create path.
+	if err := os.WriteFile(filepath.Join(otherDir, "displayname"), []byte("Calendar\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(calDir, "shared-uid.ics"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+	if w.Code < 400 {
+		t.Fatalf("ambiguous PUT = %d: %s", w.Code, w.Body.String())
+	}
+	after, err := os.ReadFile(filepath.Join(calDir, "shared-uid.ics"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("ambiguous edit changed stored event: %v", err)
 	}
 }
 

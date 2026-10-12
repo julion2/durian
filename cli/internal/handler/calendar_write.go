@@ -206,11 +206,13 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 	// OpaqueRecurrence collapses a series into a single appointment. Starting
 	// from `existing` makes preservation the default and enumerates only what
 	// the client may change.
-	if path, existing, calName, resolveErr := calendar.ResolveEventIn(cols, req.UID, ""); resolveErr == nil && existing.ICalUID == req.UID {
-		if !strings.EqualFold(calName, req.Calendar) {
-			http.Error(w, "event belongs to a different calendar; moving events between calendars is not supported", http.StatusBadRequest)
-			return
-		}
+	path, existing, calName, resolveErr := calendar.ResolveUIDIn(cols, req.UID, req.Calendar)
+	if resolveErr != nil && !errors.Is(resolveErr, calendar.ErrEventNotFound) {
+		slog.Error("Failed to resolve calendar event for update", "module", "API", "err", logSafe(resolveErr.Error()))
+		http.Error(w, "failed to resolve event; no changes made", http.StatusInternalServerError)
+		return
+	}
+	if resolveErr == nil {
 		// A read-only calendar must refuse an update too (WriteEventIn only
 		// guards create), or "durian never edits this folder" would hold for
 		// create but not update.
@@ -259,6 +261,17 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Preserve the no-move contract when the selected calendar has no such UID.
+	// A scoped match above is authoritative even if another calendar shares it.
+	if _, _, _, err := calendar.ResolveUIDIn(cols, req.UID, ""); err == nil {
+		http.Error(w, "event belongs to a different calendar; moving events between calendars is not supported", http.StatusBadRequest)
+		return
+	} else if !errors.Is(err, calendar.ErrEventNotFound) {
+		slog.Error("Failed to resolve calendar event before create", "module", "API", "err", logSafe(err.Error()))
+		http.Error(w, "failed to resolve event; no changes made", http.StatusInternalServerError)
+		return
+	}
+
 	if _, err := calendar.WriteEventIn(cols, req.Calendar, ev); err != nil {
 		slog.Error("Failed to write local event", "module", "API", "err", logSafe(err.Error()))
 		status := http.StatusBadRequest
@@ -273,9 +286,9 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 
 // calendarRsvpRequest is the POST /calendars/rsvp request body (snake_case).
 type calendarRsvpRequest struct {
+	calendarEventSelector
 	Account  string `json:"account"`
 	Calendar string `json:"calendar"`
-	Ref      string `json:"ref"`
 	Response string `json:"response"`
 }
 
@@ -295,18 +308,13 @@ func (h *Handler) CalendarRsvpHandler(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if req.Ref == "" {
-		http.Error(w, "missing required 'ref'", http.StatusBadRequest)
-		return
-	}
 	resp, err := calendar.ParseRSVPVerb(req.Response)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	path, event, calName, err := calendar.ResolveEventIn(cols, req.Ref, req.Calendar)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+	path, event, calName, ok := req.calendarEventSelector.resolve(w, cols, req.Calendar)
+	if !ok {
 		return
 	}
 	if refuseReadOnly(w, cols, calName) {
@@ -341,22 +349,16 @@ func (h *Handler) CalendarRsvpHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "event": calendar.ToCalendarEvent(calName, event, true)})
 }
 
-// CalendarDeleteEventHandler removes a local .ics by reference. A caller may
-// follow it with targeted sync, or leave propagation to the next full sync.
+// CalendarDeleteEventHandler removes a local .ics by exact UID or legacy ref.
+// A caller may follow it with targeted sync, or leave propagation to the next full sync.
 func (h *Handler) CalendarDeleteEventHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	cols, ok := h.resolveCalendarCollections(w, q.Get("account"))
 	if !ok {
 		return
 	}
-	ref := q.Get("ref")
-	if ref == "" {
-		http.Error(w, "missing required 'ref' query parameter", http.StatusBadRequest)
-		return
-	}
-	path, _, calName, err := calendar.ResolveEventIn(cols, ref, q.Get("calendar"))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+	path, _, calName, ok := calendarSelectorFromQuery(r).resolve(w, cols, q.Get("calendar"))
+	if !ok {
 		return
 	}
 	if refuseReadOnly(w, cols, calName) {

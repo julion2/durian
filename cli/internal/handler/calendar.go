@@ -208,23 +208,56 @@ func (h *Handler) CalendarEventsHandler(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, map[string]any{"ok": true, "events": events})
 }
 
-// CalendarEventHandler serves GET /api/v1/calendars/event?account=&ref=[&calendar].
-// ref matches an event by iCalUID (exact or prefix) or a unique subject
-// substring; the full (detail) event is returned, or 404 when none/ambiguous.
+// Machine clients use UID; Ref retains the CLI's prefix/subject shorthand.
+// Pointers distinguish an absent selector from an explicitly empty one.
+type calendarEventSelector struct {
+	Ref *string `json:"ref"`
+	UID *string `json:"uid"`
+}
+
+func calendarSelectorFromQuery(r *http.Request) calendarEventSelector {
+	q := r.URL.Query()
+	var selector calendarEventSelector
+	if q.Has("ref") {
+		ref := q.Get("ref")
+		selector.Ref = &ref
+	}
+	if q.Has("uid") {
+		uid := q.Get("uid")
+		selector.UID = &uid
+	}
+	return selector
+}
+
+func (s calendarEventSelector) resolve(w http.ResponseWriter, cols []calendar.Collection, calFilter string) (path string, event calendar.Event, calName string, ok bool) {
+	if (s.Ref == nil) == (s.UID == nil) || s.Ref != nil && *s.Ref == "" || s.UID != nil && *s.UID == "" {
+		http.Error(w, "provide exactly one non-empty 'uid' or 'ref'", http.StatusBadRequest)
+		return
+	}
+	var err error
+	if s.UID != nil {
+		path, event, calName, err = calendar.ResolveUIDIn(cols, *s.UID, calFilter)
+	} else {
+		path, event, calName, err = calendar.ResolveEventIn(cols, *s.Ref, calFilter)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	return path, event, calName, true
+}
+
+// CalendarEventHandler serves GET /api/v1/calendars/event?account=[&calendar]
+// with exactly one selector: uid (exact only), or ref (legacy UID/prefix/subject).
+// The full event is returned, or 404 when none/ambiguous.
 func (h *Handler) CalendarEventHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	cols, ok := h.resolveCalendarCollections(w, q.Get("account"))
 	if !ok {
 		return
 	}
-	ref := q.Get("ref")
-	if ref == "" {
-		http.Error(w, "missing required 'ref' query parameter", http.StatusBadRequest)
-		return
-	}
-	path, e, calName, err := calendar.ResolveEventIn(cols, ref, q.Get("calendar"))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+	path, e, calName, ok := calendarSelectorFromQuery(r).resolve(w, cols, q.Get("calendar"))
+	if !ok {
 		return
 	}
 	dto := calendar.ToCalendarEvent(calName, e, true)

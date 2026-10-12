@@ -27,6 +27,10 @@ import (
 // generic 400.
 var ErrReadOnly = errors.New("calendar is read-only")
 
+// ErrEventNotFound distinguishes a missing event from an ambiguous reference or
+// an unreadable collection. Only a missing UID permits an upsert to create.
+var ErrEventNotFound = errors.New("no event matches")
+
 // LocalCalendar is one calendar directory of the vdir, with its display name,
 // color (from the displayname/color meta files) and the master events parsed
 // from its .ics files.
@@ -328,6 +332,16 @@ func ResolveLocalEvent(accountDir, owner, ref, calFilter string) (path string, e
 // caller whose calendars do not live under one account directory — the
 // configured local calendars — resolves references the same way.
 func ResolveEventIn(cols []Collection, ref, calFilter string) (path string, ev Event, calendar string, err error) {
+	return resolveEventIn(cols, ref, calFilter, false)
+}
+
+// ResolveUIDIn resolves an exact wire UID without the CLI's prefix/subject
+// matching. A new UID that happens to prefix an existing one is still new.
+func ResolveUIDIn(cols []Collection, uid, calFilter string) (path string, ev Event, calendar string, err error) {
+	return resolveEventIn(cols, uid, calFilter, true)
+}
+
+func resolveEventIn(cols []Collection, ref, calFilter string, exactOnly bool) (path string, ev Event, calendar string, err error) {
 	// There used to be a fast path here: read "<uid>.ics" directly and return
 	// the first collection where it parsed with a matching UID. It contradicted
 	// the contract this resolver exists to keep — the same UID in two accounts
@@ -363,9 +377,9 @@ func ResolveEventIn(cols []Collection, ref, calFilter string) (path string, ev E
 			switch {
 			case it.Event.ICalUID == ref:
 				exact = append(exact, m)
-			case strings.HasPrefix(it.Event.ICalUID, ref):
+			case !exactOnly && strings.HasPrefix(it.Event.ICalUID, ref):
 				prefix = append(prefix, m)
-			case strings.Contains(strings.ToLower(it.Event.Subject), lowerRef):
+			case !exactOnly && strings.Contains(strings.ToLower(it.Event.Subject), lowerRef):
 				subject = append(subject, m)
 			}
 		}
@@ -388,7 +402,7 @@ func ResolveEventIn(cols []Collection, ref, calFilter string) (path string, ev E
 				ref, len(tier), strings.Join(names, ", "))
 		}
 	}
-	return "", Event{}, "", fmt.Errorf("no event matches %q", ref)
+	return "", Event{}, "", fmt.Errorf("%w %q", ErrEventNotFound, ref)
 }
 
 // CollectionAccountForPath returns the account owning an event file resolved

@@ -589,6 +589,10 @@ paths:
   /calendars/event:
     get:
       summary: Get one calendar event in detail (read-only, from the local vdir)
+      description: >-
+        Supply exactly one non-empty selector: uid for an exact, case-sensitive
+        iCalendar UID, or ref for the legacy UID/prefix/subject lookup. An unknown
+        uid returns 404 and never falls back to a prefix or subject match.
       parameters:
         - name: account
           in: query
@@ -601,10 +605,16 @@ paths:
             type: string
         - name: ref
           in: query
-          required: true
-          description: Event reference — iCalUID (exact or prefix) or a unique subject substring
+          description: Legacy event reference — iCalUID (exact or prefix) or a unique subject substring. Mutually exclusive with uid.
           schema:
             type: string
+            minLength: 1
+        - name: uid
+          in: query
+          description: Exact, case-sensitive iCalendar UID. Mutually exclusive with ref; use with calendar to scope the identity.
+          schema:
+            type: string
+            minLength: 1
         - name: calendar
           in: query
           description: Restrict the lookup to a single calendar by display name
@@ -618,7 +628,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/CalendarEventResponse'
         '400':
-          description: Missing account or ref
+          description: Missing account, missing/empty selector, or both uid and ref supplied
         '404':
           description: Account or event not found (or ambiguous reference)
         '409':
@@ -667,6 +677,10 @@ paths:
           description: Local calendar data could not be read or written
     delete:
       summary: Delete an event locally
+      description: >-
+        Supply exactly one non-empty selector: uid for an exact, case-sensitive
+        iCalendar UID, or ref for the legacy UID/prefix/subject lookup. An unknown
+        uid returns 404 without deleting a prefix or subject match.
       parameters:
         - name: account
           in: query
@@ -675,10 +689,16 @@ paths:
             type: string
         - name: ref
           in: query
-          required: true
-          description: Event reference — iCalUID (exact or prefix) or a unique subject substring
+          description: Legacy event reference — iCalUID (exact or prefix) or a unique subject substring. Mutually exclusive with uid.
           schema:
             type: string
+            minLength: 1
+        - name: uid
+          in: query
+          description: Exact, case-sensitive iCalendar UID. Mutually exclusive with ref; use with calendar to scope the identity.
+          schema:
+            type: string
+            minLength: 1
         - name: calendar
           in: query
           schema:
@@ -687,7 +707,7 @@ paths:
         '200':
           description: Deleted
         '400':
-          description: Missing account or ref
+          description: Missing account, missing/empty selector, or both uid and ref supplied
         '404':
           description: Account or event not found
         '409':
@@ -719,8 +739,8 @@ paths:
                 $ref: '#/components/schemas/CalendarEventResponse'
         '400':
           description: >-
-            Missing account/ref, unknown response verb, owner is the organizer,
-            or owner is not an attendee of the event
+            Missing account, missing/empty selector, both uid and ref supplied,
+            unknown response verb, owner is the organizer, or owner is not an attendee
         '404':
           description: Account or event not found (or ambiguous reference)
         '409':
@@ -1453,7 +1473,10 @@ components:
       required: [account, calendar, subject, start, end]
     CalendarRsvpRequest:
       type: object
-      description: Body for POST /calendars/rsvp (local-first owner RSVP).
+      description: >-
+        Body for POST /calendars/rsvp (local-first owner RSVP). Supply exactly one
+        non-empty selector: uid for an exact, case-sensitive iCalendar UID, or ref
+        for the legacy lookup. An unknown uid returns 404 without modifying another event.
       properties:
         account:
           type: string
@@ -1466,13 +1489,21 @@ components:
           description: Restrict the event lookup to a single calendar by display name
         ref:
           type: string
-          description: Event reference — iCalUID (exact or prefix) or a unique subject substring
+          minLength: 1
+          description: Legacy event reference — iCalUID (exact or prefix) or a unique subject substring. Mutually exclusive with uid.
+        uid:
+          type: string
+          minLength: 1
+          description: Exact, case-sensitive iCalendar UID. Mutually exclusive with ref; use with calendar to scope the identity.
         response:
           type: string
           description: >-
             The owner's response — accept/decline/tentative or the Graph-style
             accepted/declined/tentativelyAccepted (case-insensitive)
-      required: [account, ref, response]
+      required: [account, response]
+      oneOf:
+        - required: [uid]
+        - required: [ref]
     CalendarEventSyncRequest:
       type: object
       description: Body for POST /calendars/sync/event.
