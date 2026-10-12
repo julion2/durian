@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -128,6 +129,21 @@ func (d *DB) postDecryptFilter(candidateIDs []int64, node exprNode) ([]int64, er
 	if node == nil || len(candidateIDs) == 0 || !needsPostDecryptFilter(node) {
 		return candidateIDs, nil
 	}
+	// Keep decrypted bodies short-lived rather than retaining the whole mailbox
+	// while verifying a broad FTS hit. Every candidate still passes the same AST
+	// and collision checks; batching changes neither pagination nor the count.
+	surviving := candidateIDs[:0]
+	for start := 0; start < len(candidateIDs); start += 512 {
+		batch, err := d.filterCandidateBatch(candidateIDs[start:min(start+512, len(candidateIDs))], node)
+		if err != nil {
+			return nil, err
+		}
+		surviving = append(surviving, batch...)
+	}
+	return surviving, nil
+}
+
+func (d *DB) filterCandidateBatch(candidateIDs []int64, node exprNode) ([]int64, error) {
 	var hs map[int64]haystacks
 	var err error
 	if hasFTSLeaf(node) {
@@ -180,13 +196,8 @@ func (d *DB) sqlLeafSets(node exprNode, ids []int64) (map[*fieldExpr]map[int64]b
 	if len(leaves) == 0 {
 		return nil, nil
 	}
-	idPH := make([]string, len(ids))
-	idArgs := make([]any, len(ids))
-	for i, id := range ids {
-		idPH[i] = "?"
-		idArgs[i] = id
-	}
-	idIn := "m.id IN (" + strings.Join(idPH, ",") + ")"
+	idArray := sqlIDArray(ids)
+	idIn := "m.id IN (SELECT value FROM json_each(?))"
 
 	sets := make(map[*fieldExpr]map[int64]bool, len(leaves))
 	for _, leaf := range leaves {
@@ -198,7 +209,7 @@ func (d *DB) sqlLeafSets(node exprNode, ids []int64) (map[*fieldExpr]map[int64]b
 		if err != nil {
 			return nil, fmt.Errorf("sql leaf recheck (%s): %w", leaf.field, err)
 		}
-		args := append(append([]any{}, idArgs...), params...)
+		args := append([]any{idArray}, params...)
 		rows, err := d.db.Query("SELECT m.id FROM messages m WHERE "+idIn+" AND ("+where+")", args...)
 		if err != nil {
 			return nil, fmt.Errorf("sql leaf recheck (%s): %w", leaf.field, err)
@@ -303,24 +314,27 @@ func termMatchesHay(t ftsTerm, hay string) bool {
 	return true
 }
 
-// postDecryptFetch loads subject + body plaintext for every id in one
-// query and returns a map keyed by id. Uses an IN (?,?,?) param list;
-// SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 which dwarfs any
-// realistic candidate set from a single search. Callers that paginate
-// must keep the chunk size below that bound.
+// ASCII needs no contextual Unicode casing. Keep the existing full caser for
+// any non-ASCII input (e.g. Greek final sigma); strings.ToLower is not equivalent
+// there. Check the entire input, including non-ASCII characters after long text.
+func lowerSearchText(lower cases.Caser, text string) string {
+	for i := 0; i < len(text); i++ {
+		if text[i] >= utf8.RuneSelf {
+			return lower.String(text)
+		}
+	}
+	return strings.ToLower(text)
+}
+
+// postDecryptFetch loads one batch's subject + body plaintext and returns a map
+// keyed by id. The JSON ID set uses one SQL variable independent of batch size.
 func (d *DB) postDecryptFetch(ids []int64) (map[int64]haystacks, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	placeholders := make([]string, len(ids))
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
 	q := `SELECT id, subject_ct, body_text_ct, body_html_ct FROM messages
-		WHERE id IN (` + strings.Join(placeholders, ",") + `)`
-	rows, err := d.db.Query(q, args...)
+		WHERE id IN (SELECT value FROM json_each(?))`
+	rows, err := d.db.Query(q, sqlIDArray(ids))
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
 	}
@@ -346,8 +360,8 @@ func (d *DB) postDecryptFetch(ids []int64) (map[int64]haystacks, error) {
 			return nil, fmt.Errorf("decrypt body_html id=%d: %w", id, err)
 		}
 		out[id] = haystacks{
-			subjectLower: lower.String(subj),
-			bodyLower:    lower.String(bodyText) + " " + lower.String(bodyHTML),
+			subjectLower: lowerSearchText(lower, subj),
+			bodyLower:    lowerSearchText(lower, bodyText) + " " + lowerSearchText(lower, bodyHTML),
 		}
 	}
 	return out, rows.Err()

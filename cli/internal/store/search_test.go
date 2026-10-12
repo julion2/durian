@@ -58,6 +58,216 @@ func TestSearch_All(t *testing.T) {
 	}
 }
 
+func TestSearch_TagPagesKeepOlderAuthorsAndBoundaryTies(t *testing.T) {
+	db, _, err := seedTagBench(9000, 6000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	at := time.Date(2026, 10, 10, 12, 0, 0, 0, time.Local).Unix()
+	// Inbox has copies 3001..9000, newest first. Older replies must still
+	// contribute authors; a newer nonmatching reply supplies display fields
+	// but must not change matching dates, membership or scoped authors/tags.
+	for _, msg := range []*Message{
+		{MessageID: "old-main@x", Subject: "Old main", FromAddr: "older@example.com", Account: "main", Date: at - 20000},
+		{MessageID: "old-other@x", Subject: "Old other", FromAddr: "other@example.com", Account: "other", Date: at - 19000},
+		{MessageID: "new-other@x", Subject: "Newest global", FromAddr: "new@example.com", Account: "other", Date: at + 10},
+	} {
+		msg.ToAddrs = "latest@example.com"
+		msg.CreatedAt, msg.Mailbox, msg.FetchedBody = at, "INBOX", true
+		msg.InReplyTo, msg.Refs = "<bench-3001@x>", "<bench-3001@x>"
+		if err := db.InsertMessage(msg); err != nil {
+			t.Fatal(err)
+		}
+		stored, err := db.GetByMessageID(msg.MessageID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if msg.Date < at {
+			if err := db.AddTag(stored.ID, "inbox"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if msg.Account == "other" {
+			if err := db.AddTag(stored.ID, "other-only"); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// A limit of 200 cuts a three-thread date tie; take the first thread IDs.
+	if _, err := db.db.Exec("UPDATE messages SET date = ? WHERE message_id IN ('bench-3199@x', 'bench-3200@x', 'bench-3201@x')", at-3199); err != nil {
+		t.Fatal(err)
+	}
+	checkPage := func(query string, limit int) []SearchResult {
+		t.Helper()
+		rows, err := db.Search(query, limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != min(limit, 6000) {
+			t.Fatalf("%q limit %d: %d rows", query, limit, len(rows))
+		}
+		for i, row := range rows {
+			if want := fmt.Sprintf("%016x", 3001+i); row.Thread != want {
+				t.Fatalf("%q row %d: %s, want %s", query, i, row.Thread, want)
+			}
+		}
+		return rows
+	}
+	for _, query := range []string{"tag:inbox", "tag:inbox AND path:main/**"} {
+		rows := checkPage(query, 200)
+		first := rows[0]
+		wantAuthors := []string{"a@example.com", "older@example.com"}
+		if query == "tag:inbox" {
+			wantAuthors = append(wantAuthors, "other@example.com")
+		}
+		authors := strings.Split(first.Authors, ",")
+		slices.Sort(authors)
+		if !slices.Equal(authors, wantAuthors) || first.Subject != "Newest global" ||
+			first.Recipients != "latest@example.com" || first.Timestamp != at-3001 ||
+			slices.Contains(first.Tags, "other-only") != (query == "tag:inbox") {
+			t.Fatalf("%q incorrect first row: %+v", query, first)
+		}
+		// The window has too few threads for 2000, and a full page must fall
+		// back. A larger-than-mailbox request must return every matching row.
+		checkPage(query, 2000)
+		checkPage(query, 10000)
+		count, err := db.SearchCount(query)
+		if err != nil || count != 6000 {
+			t.Fatalf("%q count = %d, %v", query, count, err)
+		}
+	}
+	// A date tie wider than the candidate budget cannot be partially admitted.
+	if _, err := db.db.Exec("UPDATE messages SET date = ?", at); err != nil {
+		t.Fatal(err)
+	}
+	checkPage("tag:inbox", 200)
+	if rows, err := db.Search("tag:inbox AND from:missing", 200); err != nil || len(rows) != 0 {
+		t.Fatalf("empty filtered folder: %d rows, %v", len(rows), err)
+	}
+}
+
+// Exceed SQLite's 32766-variable limit at every candidate/page boundary.
+// Copy encrypted rows in SQL, like the tag benchmark, to avoid quadratic
+// thread resolution while seeding a realistic broad-search mailbox.
+func TestSearch_BroadEncryptedCandidates(t *testing.T) {
+	const copies = 33000
+	db, needleThread, err := seedTagBench(copies, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	tmpl, err := db.GetByMessageID("template@x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every row, including the needle whose plaintext lacks "routine", is
+	// indexed as a hit. The needle models a blind-token collision.
+	subj, from, to, body := db.blindTokens("Status", "a@example.com", "b@example.com", "routine status update")
+	if _, err := db.db.Exec("DELETE FROM messages_blind_fts"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`INSERT INTO messages_blind_fts(rowid, subject_tok, from_tok, to_tok, body_tok)
+		SELECT id, ?, ?, ?, ? FROM messages`, subj, from, to, body); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertAttachment(&Attachment{MessageDBID: tmpl.ID, PartID: 1, Filename: "report.pdf", ContentType: "application/pdf"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`INSERT INTO attachments(message_db_id, part_id, filename_ct, content_type_ct, size_ct, disposition, content_id)
+		SELECT m.id, a.part_id, a.filename_ct, a.content_type_ct, a.size_ct, a.disposition, a.content_id
+		FROM messages m, attachments a WHERE a.message_db_id = ? AND m.message_id LIKE 'bench-%'`, tmpl.ID); err != nil {
+		t.Fatal(err)
+	}
+	needle, err := db.GetByMessageID("needle@x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertAttachment(&Attachment{MessageDBID: needle.ID, PartID: 1, Filename: "notes.txt", ContentType: "text/plain"}); err != nil {
+		t.Fatal(err)
+	}
+	// A newer, nonmatching message from another account in the same thread
+	// must still determine the thread's display fields and global ordering.
+	if err := db.InsertMessage(&Message{MessageID: "reply@x", Subject: "Latest reply", FromAddr: "other@example.com",
+		ToAddrs: "latest@example.com", InReplyTo: "<template@x>", Refs: "<template@x>",
+		Date: tmpl.Date + 100, CreatedAt: tmpl.Date, BodyText: "unrelated reply", Account: "other", FetchedBody: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		query  string
+		count  int
+		needle bool
+	}{
+		{"routine", copies + 1, false},
+		{"routine OR from:nobody", copies + 1, false},
+		{"routine OR path:small/**", copies + 2, true},
+		{"routine AND tag:inbox", 7, false},
+		{"routine OR NOT tag:archive", copies + 1, false},
+		{"has:attachment:pdf", copies + 1, false},
+		{"has:attachment:pdf OR path:small/**", copies + 2, true},
+		{"has:attachment:pdf AND NOT tag:inbox", copies - 6, false},
+		{"path:main/** AND routine", copies + 1, false},
+		{"*", copies + 2, true},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			count, err := db.SearchCount(tc.query)
+			if err != nil {
+				t.Fatalf("SearchCount: %v", err)
+			}
+			if count != tc.count {
+				t.Fatalf("SearchCount = %d, want %d", count, tc.count)
+			}
+			results, err := db.Search(tc.query, copies+10)
+			if err != nil {
+				t.Fatalf("Search: %v", err)
+			}
+			if len(results) != tc.count {
+				t.Fatalf("Search returned %d threads, want %d", len(results), tc.count)
+			}
+			seen := make(map[string]bool)
+			for i, r := range results {
+				if seen[r.Thread] {
+					t.Fatalf("duplicate thread %s", r.Thread)
+				}
+				seen[r.Thread] = true
+				wantTags := []string{"archive"}
+				if n, err := strconv.ParseUint(r.Thread, 16, 64); err == nil && n > copies-7 && n <= copies {
+					wantTags = append(wantTags, "inbox")
+				}
+				// Existing path: semantics scope displayed tags even in an OR;
+				// main-account matches remain visible but have no small tags.
+				if strings.Contains(tc.query, "path:small/**") && r.Thread != needleThread {
+					wantTags = nil
+				}
+				if !slices.Equal(r.Tags, wantTags) {
+					t.Fatalf("thread %s tags = %v, want %v", r.Thread, r.Tags, wantTags)
+				}
+				if i > 0 && (results[i-1].Timestamp < r.Timestamp ||
+					(results[i-1].Timestamp == r.Timestamp && results[i-1].Thread > r.Thread)) {
+					t.Fatal("results not globally ordered")
+				}
+			}
+			if seen[needleThread] != tc.needle {
+				t.Fatalf("needle present = %v, want %v", seen[needleThread], tc.needle)
+			}
+			if seen[tmpl.ThreadID] {
+				r := results[0]
+				if r.Thread != tmpl.ThreadID || r.Subject != "Latest reply" || r.Timestamp != tmpl.Date+100 ||
+					r.Recipients != "latest@example.com" || !strings.Contains(r.Authors, "other@example.com") {
+					t.Fatalf("lost global thread display semantics: %+v", r)
+				}
+			}
+			page, err := db.Search(tc.query, 5)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.EqualFunc(page, results[:5], func(a, b SearchResult) bool { return a.Thread == b.Thread }) {
+				t.Fatal("limited page differs from global first five threads")
+			}
+		})
+	}
+}
+
 func TestSearch_FromField(t *testing.T) {
 	db := seedSearchDB(t)
 	results, err := db.Search("from:alice", 10)
@@ -255,6 +465,33 @@ func TestSearch_PhraseWordOrder(t *testing.T) {
 	}
 	if len(phrase) != 1 {
 		t.Fatalf(`phrase "quick brown fox" got %d hits, want 1`, len(phrase))
+	}
+}
+
+// ASCII normalization must not replace contextual Unicode casing. In
+// particular, a final Greek sigma differs from strings.ToLower's simple case.
+func TestSearch_UnicodeAndASCIICasing(t *testing.T) {
+	db := newTestDB(t)
+	for i, text := range []string{"HELLO WORLD", strings.Repeat("plain ", 1000) + "ΟΣ"} {
+		if err := db.InsertMessage(&Message{
+			MessageID: fmt.Sprintf("casing-%d@x", i), Subject: text,
+			FromAddr: "a@x", Date: int64(i + 1), CreatedAt: 1,
+			BodyText: text, FetchedBody: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, query := range []string{`"hello world"`, `subject:"HELLO WORLD"`, `"ΟΣ"`, `subject:"ΟΣ"`} {
+		t.Run(query, func(t *testing.T) {
+			rows, err := db.Search(query, 10)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("Search: %v, %v", rows, err)
+			}
+			count, err := db.SearchCount(query)
+			if err != nil || count != 1 {
+				t.Fatalf("SearchCount: %d, %v", count, err)
+			}
+		})
 	}
 }
 

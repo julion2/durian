@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"fmt"
 	"strconv"
-	"strings"
 )
 
 // DeleteAttachmentsByMessageDBID removes all attachments for a message DB row.
@@ -116,17 +115,10 @@ func (d *DB) GetAttachmentsByMessages(ids []int64) (map[int64][]Attachment, erro
 		return make(map[int64][]Attachment), nil
 	}
 
-	placeholders := make([]string, len(ids))
-	params := make([]interface{}, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		params[i] = id
-	}
+	q := "SELECT " + attachmentSelectColumns + ` FROM attachments
+		WHERE message_db_id IN (SELECT value FROM json_each(?)) ORDER BY message_db_id, part_id`
 
-	q := "SELECT " + attachmentSelectColumns + " FROM attachments WHERE message_db_id IN (" +
-		strings.Join(placeholders, ",") + ") ORDER BY message_db_id, part_id"
-
-	rows, err := d.db.Query(q, params...)
+	rows, err := d.db.Query(q, sqlIDArray(ids))
 	if err != nil {
 		return nil, fmt.Errorf("query attachments batch: %w", err)
 	}

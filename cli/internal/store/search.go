@@ -3,6 +3,7 @@ package store
 import (
 	"cmp"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strconv"
@@ -11,6 +12,15 @@ import (
 
 	"github.com/julion2/durian/cli/internal/dbcrypto"
 )
+
+// sqlIDArray binds an arbitrarily large ID set as one JSON parameter for
+// IN (SELECT value FROM json_each(?)), rather than one variable per ID.
+// These concrete scalar types cannot fail JSON marshaling; strings are escaped
+// and int64 values remain exact SQLite integers (no float conversion).
+func sqlIDArray[T string | int64](ids []T) string {
+	data, _ := json.Marshal(ids)
+	return string(data)
+}
 
 // SearchCount returns the number of threads matching a query. Queries involving
 // blind-FTS terms or encrypted attachment metadata are counted from the
@@ -120,7 +130,7 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 	// fts_token sub-key one bit at a time.
 	// Typed attachment filters use the same path because their filename and
 	// content-type predicates cannot be evaluated over encrypted SQL columns.
-	var threadFilter string
+	var results []SearchResult
 	if len(terms) > 0 || hasTypedAttachmentFilter(node) {
 		threadIDs, err := d.filteredThreadIDs(where, params, node)
 		if err != nil {
@@ -133,53 +143,21 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 		// strictly tighter than `where` (it's the intersection of
 		// `where` and the post-decrypt recheck) and dropping the
 		// FTS subquery saves a second index lookup.
-		placeholders := make([]string, len(threadIDs))
-		params = params[:0]
-		for i, tid := range threadIDs {
-			placeholders[i] = "?"
-			params = append(params, tid)
-		}
-		threadFilter = "m.thread_id IN (" + strings.Join(placeholders, ",") + ")"
-		where = threadFilter
-	}
-
-	// ADR-0001 step 7e: messages.subject (plaintext) is dropped; the
-	// per-thread display subject comes from the latest message's
-	// subject_ct, decrypted in Go after the query. Older `MAX(m.subject)`
-	// picked lexicographically max subject which approximated "the
-	// Re: variant"; the latest-by-date subquery here is a closer
-	// match to what mail clients show as the thread title.
-	q := searchPageQuery(where)
-	params = append(params, limit)
-
-	rows, err := d.query(q, params...)
-	if err != nil {
-		return nil, fmt.Errorf("search: %w", err)
-	}
-
-	// Collect results first and close rows before making additional queries.
-	// With SetMaxOpenConns(1), nested queries while rows are open would deadlock.
-	var results []SearchResult
-	for rows.Next() {
-		var r SearchResult
-		var subjectCT []byte
-		err := rows.Scan(&r.Thread, &subjectCT, &r.Authors, &r.Timestamp, &r.Recipients)
+		params = []any{sqlIDArray(threadIDs)}
+		where = "m.thread_id IN (SELECT value FROM json_each(?))"
+	} else {
+		results, err = d.recentSearchPage(node, limit)
 		if err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("scan search result: %w", err)
-		}
-		if r.Subject, err = d.decryptSubject("", subjectCT); err != nil {
-			rows.Close()
 			return nil, err
 		}
-		r.DateRelative = formatDateRelative(r.Timestamp)
-		results = append(results, r)
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, fmt.Errorf("iterate search results: %w", err)
+
+	if len(results) == 0 {
+		results, err = d.readSearchPage(searchPageQuery(where), append(params, limit))
+		if err != nil {
+			return nil, err
+		}
 	}
-	rows.Close()
 	// the page's order, as the CTE chose it: newest first, ties by thread
 	slices.SortFunc(results, func(a, b SearchResult) int {
 		if a.Timestamp != b.Timestamp {
@@ -204,6 +182,32 @@ func (d *DB) Search(query string, limit int) ([]SearchResult, error) {
 		results[i].Tags = tagMap[results[i].Thread]
 	}
 
+	return results, nil
+}
+
+// readSearchPage closes rows before another query can use our single connection.
+func (d *DB) readSearchPage(q string, params []any) ([]SearchResult, error) {
+	rows, err := d.query(q, params...)
+	if err != nil {
+		return nil, fmt.Errorf("search: %w", err)
+	}
+	defer rows.Close()
+	var results []SearchResult
+	for rows.Next() {
+		var r SearchResult
+		var subjectCT []byte
+		if err := rows.Scan(&r.Thread, &subjectCT, &r.Authors, &r.Timestamp, &r.Recipients); err != nil {
+			return nil, fmt.Errorf("scan search result: %w", err)
+		}
+		if r.Subject, err = d.decryptSubject("", subjectCT); err != nil {
+			return nil, err
+		}
+		r.DateRelative = formatDateRelative(r.Timestamp)
+		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate search results: %w", err)
+	}
 	return results, nil
 }
 
@@ -270,18 +274,91 @@ func searchPageQuery(where string) string {
 			ORDER BY max_date DESC, m.thread_id
 			LIMIT ?
 		)
+	` + searchPageColumns("p.authors")
+}
+
+// Both plans display the latest global subject/recipients, even when the
+// matching date and authors come from older messages in a scoped account.
+func searchPageColumns(authors string) string {
+	return `
 		SELECT
 			p.thread_id,
 			(SELECT m3.subject_ct FROM messages m3
 			 WHERE m3.thread_id = p.thread_id
 			 ORDER BY m3.date DESC LIMIT 1) AS subject_ct,
-			p.authors,
+			` + authors + `,
 			p.max_date,
 			(SELECT m2.to_addrs FROM messages m2
 			 WHERE m2.thread_id = p.thread_id
 			 ORDER BY m2.date DESC LIMIT 1) AS recipients
 		FROM page p
 	`
+}
+
+const recentSearchMessages = 4096
+
+// requiredDrivingTag finds a positive tag that the existing selectivity planner
+// chose. An OR/NOT is not a required tag; selective date/account/FTS plans stay
+// untouched. Counting only this tag's capped index entries avoids probing small
+// folders with a scan of unrelated recent messages.
+func requiredDrivingTag(node exprNode) *fieldExpr {
+	switch n := node.(type) {
+	case *fieldExpr:
+		if n.field == "tag" && n.drive {
+			return n
+		}
+	case *binaryExpr:
+		if n.op == "AND" {
+			if tag := requiredDrivingTag(n.left); tag != nil {
+				return tag
+			}
+			return requiredDrivingTag(n.right)
+		}
+	}
+	return nil
+}
+
+// recentSearchPage is an optional, bounded probe, never a truncated search.
+// All messages strictly newer than the 4096th newest date fit in this window.
+// If it contains a full page of matching threads, older messages cannot displace
+// any of them. Excluding the entire boundary date handles arbitrarily large ties
+// without scanning them. Otherwise return no page and use the original plan.
+// The boundary, page and full matching authors share one SQLite read snapshot.
+func (d *DB) recentSearchPage(node exprNode, limit int) ([]SearchResult, error) {
+	if limit >= recentSearchMessages {
+		return nil, nil
+	}
+	tag := requiredDrivingTag(node)
+	if tag == nil {
+		return nil, nil
+	}
+	size, err := d.leafSize(tag, recentSearchMessages)
+	if err != nil || size < recentSearchMessages {
+		return nil, err
+	}
+	// Date/thread indexes drive this probe. A tag set inside each author lookup
+	// would intersect thousands of IDs per thread instead of testing each row.
+	tag.drive = false
+	where, params, err := d.exprToSQL(node)
+	tag.drive = true
+	if err != nil {
+		return nil, err
+	}
+	q := `WITH page AS (
+		SELECT m.thread_id, MAX(m.date) AS max_date
+		FROM messages m INDEXED BY idx_messages_date
+		WHERE m.date > (SELECT MIN(date) FROM (
+			SELECT date FROM messages ORDER BY date DESC LIMIT ?
+		)) AND (` + where + `)
+		GROUP BY m.thread_id ORDER BY max_date DESC, m.thread_id LIMIT ?
+	)` + searchPageColumns(`(SELECT GROUP_CONCAT(DISTINCT m.from_addr)
+		FROM messages m WHERE m.thread_id = p.thread_id AND (`+where+`))`) + `
+		WHERE (SELECT COUNT(*) FROM page) = ?`
+	args := append([]any{recentSearchMessages}, params...)
+	args = append(args, limit)
+	args = append(args, params...)
+	args = append(args, limit)
+	return d.readSearchPage(q, args)
 }
 
 // getThreadTagsBatch returns distinct tags for multiple threads in a single query.
@@ -324,25 +401,16 @@ func (d *DB) getThreadTagsBatch(threadIDs []string, accounts ...string) (map[str
 // threadTagsQuery selects the distinct tags of the given threads, limited to
 // the accounts when there are any.
 func threadTagsQuery(threadIDs []string, accountIDs []int64) (string, []interface{}) {
-	params := make([]interface{}, 0, len(threadIDs)+len(accountIDs))
-	threadPH := make([]string, len(threadIDs))
-	for i, id := range threadIDs {
-		threadPH[i] = "?"
-		params = append(params, id)
-	}
+	params := []any{sqlIDArray(threadIDs)}
 	q := `SELECT DISTINCT m.thread_id, t.tag FROM tags t
 		JOIN messages m ON m.id = t.message_id
-		WHERE m.thread_id IN (` + strings.Join(threadPH, ",") + `)`
+		WHERE m.thread_id IN (SELECT value FROM json_each(?))`
 	if len(accountIDs) > 0 {
-		acctPH := make([]string, len(accountIDs))
-		for i, id := range accountIDs {
-			acctPH[i] = "?"
-			params = append(params, id)
-		}
+		params = append(params, sqlIDArray(accountIDs))
 		// unary +: the thread ids are the selective side; without it SQLite,
 		// having no statistics, starts from the account index and reads every
 		// message of the account (~30 ms on 60k messages instead of ~0.3)
-		q += " AND +m.account_id IN (" + strings.Join(acctPH, ",") + ")"
+		q += " AND +m.account_id IN (SELECT value FROM json_each(?))"
 	}
 	return q + " ORDER BY m.thread_id, t.tag", params
 }
