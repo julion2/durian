@@ -60,12 +60,17 @@ scroll_preview() {
   xdotool mousemove --window "$WINDOW" 420 450
   for _ in {1..90}; do
     screen scrolling
-    row=$(sed -nE 's/.*Preview row ([0-9]{3}).*/\1/p' "$ROOT/list.txt" | head -1)
+    # Use a fully visible row, and its snippet from the SAME frame. The first
+    # row can be clipped, and wheel momentum can move it out before another OCR.
+    row=$(sed -nE 's/.*Preview row ([0-9]{3}).*/\1/p' "$ROOT/list.txt" | sed -n '3p')
     if [[ -n "$row" ]] && ((10#$row >= target)); then
-      expect_list "row-$row" "Snippetnumber $row"
-      return
+      if grep -qi "Snippetnumber $row" "$ROOT/list.txt"; then
+        cp "$CASE_OUT/scrolling.png" "$CASE_OUT/row-$row.png"
+        echo "PASS native startup $CASE/row-$row"; return
+      fi
+    else
+      xdotool click --repeat 5 --delay 15 5
     fi
-    xdotool click --repeat 5 --delay 15 5
     sleep 0.1
   done
   echo "FAIL did not scroll to preview row $target" >&2; return 1

@@ -52,6 +52,10 @@ pub struct ThreadView {
     /// attachment chip under the pointer – Space previews it
     hovered_attachment: Option<Attachment>,
     scroll: gpui::ScrollHandle,
+    /// Stable message identity, not a timeline index (events are not messages).
+    focused_message: Option<SharedString>,
+    message_anchor: gpui::ScrollAnchor,
+    reveal_message: bool,
     /// live views of the open thread's expanded HTML messages, by message and theme
     #[cfg(target_os = "macos")]
     webviews: std::collections::HashMap<SharedString, Entity<crate::webview::MailWebView>>,
@@ -107,6 +111,8 @@ impl ThreadView {
                 this.show_plain.clear();
                 this.show_all = false;
                 this.hovered_link = None;
+                this.focused_message = None;
+                this.reveal_message = false;
                 this.restore_reply(cx);
                 cx.notify();
             }
@@ -122,10 +128,44 @@ impl ThreadView {
             _ => {}
         })
         .detach();
-        Self { mailbox, renderer, schedule, selection: ui::Selection::new(), reply: None, hovered_attachment: None, scroll: gpui::ScrollHandle::new(), toggled: HashSet::default(), show_quoted: HashSet::default(), show_plain: HashSet::default(), show_all: false, hovered_link: None, #[cfg(target_os = "macos")] webviews: Default::default(), #[cfg(target_os = "macos")] webviews_wanted: Default::default() }
+        let scroll = gpui::ScrollHandle::new();
+        let message_anchor = gpui::ScrollAnchor::for_handle(scroll.clone());
+        Self { mailbox, renderer, schedule, selection: ui::Selection::new(), reply: None, hovered_attachment: None, scroll, focused_message: None, message_anchor, reveal_message: false, toggled: HashSet::default(), show_quoted: HashSet::default(), show_plain: HashSet::default(), show_all: false, hovered_link: None, #[cfg(target_os = "macos")] webviews: Default::default(), #[cfg(target_os = "macos")] webviews_wanted: Default::default() }
     }
 
-    /// What Space previews: the hovered attachment, else the latest message's first one.
+    pub fn scroll_by(&mut self, count: isize, page: bool, cx: &mut Context<Self>) {
+        let step = if page { f32::from(self.scroll.bounds().size.height) / 2. } else { 40. };
+        let mut offset = self.scroll.offset();
+        offset.y -= px(step * count as f32);
+        self.scroll.set_offset(offset);
+        cx.notify();
+    }
+
+    pub fn message_edge(&mut self, last: bool, cx: &mut Context<Self>) {
+        let Some(thread) = self.mailbox.read(cx).selected_thread().filter(|t| !t.partial) else { return };
+        let id = if last { thread.messages().next_back() } else { thread.messages().next() }.map(|m| m.id.clone());
+        if last && id.is_some() && self.focused_message == id {
+            self.reveal_message = false;
+            self.scroll.scroll_to_bottom();
+        } else {
+            self.focused_message = id;
+            self.reveal_message = self.focused_message.is_some();
+        }
+        cx.notify();
+    }
+
+    pub fn navigate_message(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(thread) = self.mailbox.read(cx).selected_thread().filter(|t| !t.partial) else { return };
+        let messages: Vec<_> = thread.messages().collect();
+        if messages.is_empty() { return }
+        let current = messages.iter().position(|m| Some(&m.id) == self.focused_message.as_ref()).unwrap_or(0);
+        let target = (current as isize + delta).clamp(0, messages.len() as isize - 1) as usize;
+        self.focused_message = Some(messages[target].id.clone());
+        self.reveal_message = true;
+        cx.notify();
+    }
+
+    /// The hovered attachment, else the latest message's first one.
     pub fn attachment_to_preview(&self, cx: &App) -> Option<Attachment> {
         self.hovered_attachment.clone().or_else(|| {
             let thread = self.mailbox.read(cx).selected_thread()?;
@@ -229,6 +269,9 @@ impl ThreadView {
             )
             .child(IconButton::new("thread-options", IconName::More))
             .child(div().flex_1())
+            .children(thread.messages().position(|m| Some(&m.id) == self.focused_message.as_ref()).map(|ix| {
+                div().text_size(px(SIZE_MINI)).text_color(theme.text_tertiary).child(format!("Message {} of {}", ix + 1, thread.messages().count()))
+            }))
             .child(IconButton::new("reply", IconName::MailReply))
             .child(IconButton::new("snooze", IconName::MailSnooze))
             .child(IconButton::new("archive", IconName::MailDone).on_click({
@@ -527,7 +570,7 @@ impl ThreadView {
         card(theme)
             .id(("card", ix))
             .on_mouse_down(gpui::MouseButton::Right, move |event, window, cx| {
-                context_menus::open(event.position, context_menus::message(menu_body.clone(), menu_sender.clone(), menu_email.clone()), window, cx);
+                context_menus::open(event.position, context_menus::message(menu_body.clone(), menu_sender.clone(), menu_email.clone(), cx), window, cx);
             })
             .group("message-card")
             .when(mine, |s| s.ml(px(OWN_INDENT)))
@@ -1106,7 +1149,7 @@ impl ThreadView {
                                     }
                                 }
                                 crate::webview::MailWebViewEvent::ContextMenu { position, link, selection } => {
-                                    let items = context_menus::html_body(selection.clone(), link.clone(), body.clone(), sender.clone(), email.clone());
+                                    let items = context_menus::html_body(selection.clone(), link.clone(), body.clone(), sender.clone(), email.clone(), cx);
                                     context_menus::open(*position, items, window, cx);
                                 }
                             })
@@ -1131,9 +1174,26 @@ impl ThreadView {
                 return div().size_full().into_any_element();
             }
             return ui::EmptyState::new(IconName::MailEmail, "No thread selected")
-                .hint(div().flex().items_center().gap(px(4.)).child(Kbd::new("J")).child(Kbd::new("K")).child("to move through the list"))
+                .hint(div().flex().items_center().gap(px(4.))
+                    .children(crate::commands::keys_for(&crate::SelectNext, &[crate::keymaps::Context::List, crate::keymaps::Context::Thread], cx).into_iter().map(Kbd::new))
+                    .children(crate::commands::keys_for(&crate::SelectPrev, &[crate::keymaps::Context::List, crate::keymaps::Context::Thread], cx).into_iter().map(Kbd::new))
+                    .child("Select a thread from the list"))
                 .into_any_element();
         };
+        if !thread.partial && self.focused_message.is_some() {
+            if let Some(ix) = thread.items.iter().position(|item| matches!(item, ThreadItem::Message(m) if Some(&m.id) == self.focused_message.as_ref())) {
+                // Reveal on navigation, not on every repaint: clicking a card or
+                // collapsing all must still work after keyboard navigation.
+                if self.reveal_message {
+                    self.show_all = true;
+                    if self.base_expanded(&thread, ix, cx) { self.toggled.remove(&ix); }
+                    else { self.toggled.insert(ix); }
+                }
+            } else {
+                self.focused_message = None;
+                self.reveal_message = false;
+            }
+        }
         // selectable blocks register in reading order: the subject first, then the messages
         self.selection.begin();
         let subject_text = ui::SelectableText::plain(&self.selection, thread.subject.clone(), cx.theme().font_family, WEIGHT_SEMIBOLD, cx.theme().text_primary);
@@ -1158,11 +1218,15 @@ impl ThreadView {
                 Block::Card(ix) | Block::Collapsed(ix) => {
                     let ThreadItem::Message(m) = &thread.items[ix] else { unreachable!() };
                     let mine = self.mailbox.read(cx).is_me(&m.from);
-                    if matches!(block, Block::Card(_)) {
+                    let content = if matches!(block, Block::Card(_)) {
                         self.render_card(&thread, ix, m, mine, &theme, cx)
                     } else {
                         self.render_collapsed(ix, m, mine, &theme, cx)
-                    }
+                    };
+                    let focused = self.focused_message.as_ref() == Some(&m.id);
+                    div().id(SharedString::from(format!("message-focus:{}", m.id))).anchor_scroll(focused.then(|| self.message_anchor.clone()))
+                        .rounded(theme.radius.md).border_l_2().border_color(if focused { theme.accent } else { gpui::transparent_black() })
+                        .child(content).into_any_element()
                 }
                 Block::Fold { hidden } => self.render_fold(hidden, &theme, cx),
             })
@@ -1194,6 +1258,10 @@ impl ThreadView {
                 .truncate()
                 .child(url)
         });
+        if self.reveal_message && !thread.partial {
+            self.reveal_message = false;
+            self.message_anchor.scroll_to(window, cx);
+        }
 
         // size_full, not flex_1: as a cached view our parent is a plain box, not a flex row
         div()

@@ -1,6 +1,8 @@
 //! Mail domain model. Tag-based: a thread has no folder, only tags. "Inbox" and "archive" are
 //! just the presence/absence of a tag, which keeps the app and the CLI on the same rule engine.
 
+use std::collections::HashSet;
+
 use gpui::{Context, EventEmitter, Hsla, SharedString};
 use serde::{Deserialize, Deserializer};
 
@@ -337,6 +339,16 @@ pub struct Remote {
     pub threads: std::collections::HashMap<SharedString, Loading>,
 }
 
+/// Selection semantics, independent of the keys that invoke them. Ranges derive from
+/// the current visible order; explicit marks follow stable IDs across refresh/paging.
+#[derive(Default)]
+enum ListSelection {
+    #[default]
+    Single,
+    Range { anchor: SharedString },
+    Toggle { marked: HashSet<SharedString> },
+}
+
 /// Shared mailbox state. Views hold an `Entity<Mailbox>` and re-render on `cx.notify()`.
 pub struct Mailbox {
     pub me: Contact,
@@ -351,6 +363,7 @@ pub struct Mailbox {
     pub views: Vec<SavedView>,
     pub threads: Vec<Thread>,
     pub selected: Option<usize>,
+    selection: ListSelection,
     pub drafts: Vec<Draft>,
     /// The messages that were unread when their thread was opened (thread id, item indices):
     /// they stay expanded while you read, even though opening marked them read.
@@ -396,7 +409,7 @@ impl Mailbox {
     pub fn new(data: MailData) -> Self {
         let MailData { me, accounts, tags, views, threads } = data;
         let selected = (!threads.is_empty()).then_some(0);
-        Self { me, accounts, account_filter: None, query_text: SharedString::default(), query: Default::default(), view_title: "Inbox".into(), tags, views, threads, selected, drafts: Vec::new(), unread_on_open: None, remote: None, profiles: Vec::new(), profile: None, folder: None, server_counts: std::collections::HashMap::new(), pending_tags: Default::default(), confirmed_tags: Default::default(), writes_available: false, unread_by_user: None, next_draft_id: 1 }
+        Self { me, accounts, account_filter: None, query_text: SharedString::default(), query: Default::default(), view_title: "Inbox".into(), tags, views, threads, selected, selection: ListSelection::Single, drafts: Vec::new(), unread_on_open: None, remote: None, profiles: Vec::new(), profile: None, folder: None, server_counts: std::collections::HashMap::new(), pending_tags: Default::default(), confirmed_tags: Default::default(), writes_available: false, unread_by_user: None, next_draft_id: 1 }
     }
 
     /// An empty mailbox whose threads a server provides.
@@ -434,6 +447,7 @@ impl Mailbox {
         if self.selected.is_none() {
             self.keep_selection_visible(cx);
         }
+        self.reconcile_selection();
         cx.notify();
     }
 
@@ -515,7 +529,8 @@ impl Mailbox {
         match keep {
             Some(ix) => {
                 self.profile = Some(ix);
-                self.folder = self.folder.filter(|f| *f < self.profiles[ix].folders.len()).or(Some(0));
+                // None is an explicit tag/view destination, not an uninitialized folder.
+                self.folder = self.folder.map(|f| if f < self.profiles[ix].folders.len() { f } else { 0 });
                 cx.emit(MailboxEvent::QueryChanged);
                 cx.notify();
             }
@@ -537,6 +552,7 @@ impl Mailbox {
     /// Open a folder of the active profile (its query becomes the list's base).
     pub fn open_folder(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(folder) = self.active_profile().and_then(|p| p.folders.get(ix)).cloned() else { return };
+        self.selection = ListSelection::Single;
         self.folder = Some(ix);
         self.view_title = folder.name;
         cx.emit(MailboxEvent::QueryChanged);
@@ -629,6 +645,7 @@ impl Mailbox {
 
     /// Apply a query (search bar, view, tag click). `title` names it in the list header.
     pub fn set_query(&mut self, text: SharedString, title: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.query_text != text { self.selection = ListSelection::Single; }
         self.query = crate::query::Query::parse(&text);
         self.view_title = title.unwrap_or_else(|| if text.trim().is_empty() { "Inbox".into() } else { "Search".into() });
         self.query_text = text;
@@ -662,10 +679,12 @@ impl Mailbox {
                 cx.emit(MailboxEvent::SelectionChanged);
             }
         }
+        self.reconcile_selection();
     }
 
     pub fn set_account_filter(&mut self, filter: Option<SharedString>, cx: &mut Context<Self>) {
         crate::trace::note(&format!("account filter: {filter:?}"));
+        if self.account_filter != filter { self.selection = ListSelection::Single; }
         self.account_filter = filter;
         if self.remote.is_some() {
             cx.emit(MailboxEvent::QueryChanged);
@@ -704,6 +723,71 @@ impl Mailbox {
         self.selected.and_then(|ix| self.threads.get(ix))
     }
 
+    pub fn selection_mode(&self) -> Option<&'static str> {
+        match self.selection {
+            ListSelection::Single => None,
+            ListSelection::Range { .. } => Some("Visual"),
+            ListSelection::Toggle { .. } => Some("Toggle"),
+        }
+    }
+
+    /// The action target, in list order. Hidden rows are never acted on. Counts
+    /// extend a single cursor only; a marked selection always means exactly its IDs.
+    pub fn selected_ids(&self, count: usize) -> Vec<SharedString> {
+        let Some(cursor) = self.selected else { return Vec::new() };
+        let visible: Vec<_> = self.visible().collect();
+        match &self.selection {
+            ListSelection::Single => visible.into_iter().skip_while(|&ix| ix != cursor).take(count).map(|ix| self.threads[ix].id.clone()).collect(),
+            ListSelection::Range { anchor } => {
+                let start = visible.iter().position(|&ix| self.threads[ix].id == *anchor);
+                let end = visible.iter().position(|&ix| ix == cursor);
+                match start.zip(end) {
+                    Some((a, b)) => visible[a.min(b)..=a.max(b)].iter().map(|&ix| self.threads[ix].id.clone()).collect(),
+                    None => Vec::new(),
+                }
+            }
+            ListSelection::Toggle { marked } => visible.into_iter().filter_map(|ix| {
+                let id = &self.threads[ix].id;
+                marked.contains(id).then(|| id.clone())
+            }).collect(),
+        }
+    }
+
+    pub fn begin_selection(&mut self, toggle: bool, cx: &mut Context<Self>) {
+        if self.selection_mode().is_some() { return }
+        let Some(id) = self.selected_ids(1).pop() else { return };
+        self.selection = if toggle { ListSelection::Toggle { marked: [id].into() } } else { ListSelection::Range { anchor: id } };
+        cx.notify();
+    }
+
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selection = ListSelection::Single;
+        cx.notify();
+    }
+
+    pub fn toggle_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_thread().map(|t| t.id.clone()) else { return };
+        let ListSelection::Toggle { marked } = &mut self.selection else { return };
+        if !marked.contains(&id) { marked.insert(id); }
+        else if marked.len() > 1 { marked.remove(&id); }
+        self.select_relative(1, cx);
+        cx.notify();
+    }
+
+    fn reconcile_selection(&mut self) {
+        if self.selection_mode().is_none() { return }
+        let visible: HashSet<_> = self.visible().map(|ix| self.threads[ix].id.clone()).collect();
+        let reset = match &mut self.selection {
+            ListSelection::Single => false,
+            ListSelection::Range { anchor } => !visible.contains(anchor),
+            ListSelection::Toggle { marked } => {
+                marked.retain(|id| visible.contains(id));
+                marked.is_empty()
+            }
+        };
+        if reset { self.selection = ListSelection::Single; }
+    }
+
     pub fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix < self.threads.len() && self.selected != Some(ix) {
             self.selected = Some(ix);
@@ -726,6 +810,9 @@ impl Mailbox {
 
     /// Opening a thread reads it.
     pub fn mark_selected_read(&mut self, cx: &mut Context<Self>) {
+        // Moving the multi-select cursor is selection, not an instruction to read
+        // every passing thread (or undo a bulk mark-unread operation).
+        if self.selection_mode().is_some() { return }
         // Filtering can temporarily remove selection. That isn't viewing a
         // different thread and must not undo an explicit mark-unread intent.
         let Some(selected_id) = self.selected_thread().map(|t| t.id.clone()) else { return };
@@ -756,15 +843,16 @@ impl Mailbox {
     /// "Archive" = drop the thread from the inbox view (in the real app: remove `tag:inbox`).
     pub fn archive_selected(&mut self, cx: &mut Context<Self>) {
         if self.remote.is_some() {
-            if let Some(id) = self.selected_thread().map(|t| t.id.clone()) { self.request_tags(id, "+archive -inbox -trash".into(), cx); }
+            self.tag_selected("+archive -inbox -trash", 1, cx);
             return;
         }
         if self.refuse(cx) {
             return;
         }
-        let Some(ix) = self.selected else { return };
-        let removed = self.threads.remove(ix);
-        crate::trace::note(&format!("done: {}", removed.id));
+        let ids = self.selected_ids(1);
+        let Some(ix) = self.threads.iter().position(|t| ids.contains(&t.id)) else { return };
+        self.threads.retain(|t| !ids.contains(&t.id));
+        self.selection = ListSelection::Single;
         // next visible thread below, else the one above
         let visible: Vec<usize> = self.visible().collect();
         self.selected = visible.iter().find(|&&v| v >= ix).or(visible.last()).copied();
@@ -772,30 +860,48 @@ impl Mailbox {
         cx.notify();
     }
 
+    /// A keymap tag_op or counted delete targets stable IDs, not a moving selection.
+    pub fn tag_selected(&mut self, ops: &str, count: usize, cx: &mut Context<Self>) {
+        if ops.trim().is_empty() || ops.split_whitespace().any(|op| op.len() < 2 || !op.starts_with(['+', '-']) || op[1..].starts_with(['+', '-'])) {
+            cx.emit(MailboxEvent::WriteProblem("tag_op needs operations such as +todo -inbox".into()));
+            return;
+        }
+        if self.refuse(cx) { return }
+        if self.remote.is_some() && !self.writes_available {
+            cx.emit(MailboxEvent::WriteProblem("Backend unavailable; no tags changed".into()));
+            return;
+        }
+        let ids = self.selected_ids(count);
+        let removes = ops.split_whitespace().any(|op| matches!(op, "-inbox" | "+trash" | "+archive"));
+        let next = removes.then(|| {
+            let visible: Vec<_> = self.visible().collect();
+            let first = visible.iter().position(|&ix| ids.contains(&self.threads[ix].id))?;
+            visible[first..].iter().chain(visible[..first].iter().rev()).copied().find(|&ix| !ids.contains(&self.threads[ix].id))
+        }).flatten();
+        let unread_op = ops.split_whitespace().filter(|op| matches!(*op, "+unread" | "-unread")).last();
+        if self.selected_thread().is_some_and(|t| ids.contains(&t.id)) && unread_op.is_some() {
+            self.unread_by_user = (unread_op == Some("+unread")).then(|| self.selected_thread().unwrap().id.clone());
+        }
+        for id in ids {
+            if self.remote.is_some() { self.request_tags(id, ops.into(), cx); }
+            else if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) { crate::durian::writes::apply_tags(thread, ops); }
+        }
+        if removes {
+            self.selection = ListSelection::Single;
+            if let Some(ix) = next { self.select(ix, cx); }
+        }
+        cx.notify();
+    }
+
     pub fn toggle_tag_selected(&mut self, name: &SharedString, cx: &mut Context<Self>) {
-        if self.remote.is_some() {
-            if name.is_empty() || name.chars().any(char::is_whitespace) || name.starts_with(['+', '-']) {
-                cx.emit(MailboxEvent::WriteProblem("Tag names cannot contain spaces or start with + or -".into()));
-                return;
-            }
-            if let Some(thread) = self.selected_thread() {
-                let ops = format!("{}{name}", if thread.tags.contains(name) { '-' } else { '+' });
-                self.request_tags(thread.id.clone(), ops, cx);
-            }
+        if name.is_empty() || name.chars().any(char::is_whitespace) || name.starts_with(['+', '-']) {
+            cx.emit(MailboxEvent::WriteProblem("Tag names cannot contain spaces or start with + or -".into()));
             return;
         }
-        if self.refuse(cx) {
-            return;
-        }
-        if let Some(thread) = self.selected.and_then(|ix| self.threads.get_mut(ix)) {
-            if let Some(pos) = thread.tags.iter().position(|t| t == name) {
-                thread.tags.remove(pos);
-            } else {
-                thread.tags.push(name.clone());
-            }
-            crate::trace::note(&format!("tags of {}: {:?}", thread.id, thread.tags));
-            cx.notify();
-        }
+        let ids = self.selected_ids(1);
+        let all = !ids.is_empty() && self.threads.iter().filter(|t| ids.contains(&t.id)).all(|t| t.tags.contains(name));
+        // Mixed selections converge: add to all unless all already have the tag.
+        self.tag_selected(&format!("{}{name}", if all { '-' } else { '+' }), 1, cx);
     }
 
     /// New tags get a color from a fixed palette, picked by name so it is stable.
@@ -1126,7 +1232,13 @@ impl Mailbox {
 
     /// `u`: unread threads become read; read threads get their latest message marked unread.
     pub fn toggle_read_selected(&mut self, cx: &mut Context<Self>) {
-        if self.remote.is_some() {
+        if self.remote.is_some() || self.selection_mode().is_some() {
+            if self.selection_mode().is_some() {
+                let ids = self.selected_ids(1);
+                let any_unread = self.threads.iter().any(|t| ids.contains(&t.id) && t.unread());
+                self.tag_selected(if any_unread { "-unread" } else { "+unread" }, 1, cx);
+                return;
+            }
             if let Some(thread) = self.selected_thread() {
                 let ops = if thread.unread() { "-unread" } else { "+unread" };
                 let id = thread.id.clone();
@@ -1151,11 +1263,10 @@ impl Mailbox {
     }
 
     pub fn toggle_star_selected(&mut self, cx: &mut Context<Self>) {
-        if self.remote.is_some() {
-            if let Some(thread) = self.selected_thread() {
-                let ops = if thread.starred { "-flagged" } else { "+flagged" };
-                self.request_tags(thread.id.clone(), ops.into(), cx);
-            }
+        if self.remote.is_some() || self.selection_mode().is_some() {
+            let ids = self.selected_ids(1);
+            let all = !ids.is_empty() && self.threads.iter().filter(|t| ids.contains(&t.id)).all(|t| t.starred);
+            self.tag_selected(if all { "-flagged" } else { "+flagged" }, 1, cx);
             return;
         }
         if self.refuse(cx) {

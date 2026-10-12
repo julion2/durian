@@ -85,6 +85,21 @@ sh_test(
 )
 
 sh_test(
+    name = "gpui_keymaps_ui_test",
+    size = "medium",
+    srcs = ["gpui_keymaps_ui_test.sh"],
+    args = ["$(location //gpui:durian)", "$(location //cli/cmd/testseeder)", "$(location testdata/config.pkl)"],
+    data = [
+        "testdata/config.pkl",
+        "testdata/profiles.pkl",
+        "//cli/cmd/testseeder",
+        "//gpui:durian",
+    ],
+    tags = ["integration", "local", "manual"],
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+sh_test(
     name = "gpui_calendar_ui_test",
     size = "medium",
     srcs = ["gpui_calendar_ui_test.sh"],

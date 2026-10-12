@@ -43,9 +43,12 @@ export DURIAN_MASTER_KEY_HEX_SECRET="0123456789abcdef0123456789abcdef0123456789a
 "$SEEDER" "$XDG_DATA_HOME/durian/email.db" "$XDG_DATA_HOME/durian/contacts.db"
 for uid in lost lost-neighbor; do
   title=LostTarget
-  if [[ "$uid" == lost-neighbor ]]; then title=KeepNeighbor; fi
+  start=today
+  # Distinct starts make counted navigation deterministic, not dependent on
+  # the backend's order for equal-time events. Both remain visible today.
+  if [[ "$uid" == lost-neighbor ]]; then title=KeepNeighbor; start=yesterday; fi
   printf 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//durian//test//EN\r\nBEGIN:VEVENT\r\nUID:%s\r\nSUMMARY:%s\r\nDTSTART;VALUE=DATE:%s\r\nDTEND;VALUE=DATE:%s\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n' \
-    "$uid" "$title" "$(date +%Y%m%d)" "$(date -d tomorrow +%Y%m%d)" > "$ROOT/calendar/$uid.ics"
+    "$uid" "$title" "$(date -d "$start" +%Y%m%d)" "$(date -d tomorrow +%Y%m%d)" > "$ROOT/calendar/$uid.ics"
 done
 sha256sum "$ROOT/calendar/lost-neighbor.ics" | cut -d' ' -f1 > "$ROOT/neighbor.sha"
 "$CLI" serve --port 19725 --exit-when-orphaned > "$ROOT/ready.log" 2> "$ROOT/server.log" &
@@ -97,11 +100,13 @@ expect_screen() {
 click_word() {
   screen control
   local position
+  # Consume all TSV output. Exiting awk at the first match can SIGPIPE
+  # Tesseract under pipefail even though it found the requested control.
   position=$(tesseract "$ROOT/ocr.png" stdout --psm 11 tsv 2>/dev/null |
-    awk -F '\t' -v word="$1" '$12 == word && (word != "Recover" || $7/3 < 300) { print int(($7+$9/2)/3), int(($8+$10/2)/3); exit }')
+    awk -F '\t' -v word="$1" '!found && $12 == word && (word != "Recover" || $7/3 < 300) { print int(($7+$9/2)/3), int(($8+$10/2)/3); found=1 }')
   if [[ -z "$position" ]]; then
     position=$(tesseract "$ROOT/buttons.png" stdout --psm 11 tsv 2>/dev/null |
-      awk -F '\t' -v word="$1" '$12 == word && (word != "Recover" || $7/3 < 300) { print int(($7+$9/2)/3), int(($8+$10/2)/3); exit }')
+      awk -F '\t' -v word="$1" '!found && $12 == word && (word != "Recover" || $7/3 < 300) { print int(($7+$9/2)/3), int(($8+$10/2)/3); found=1 }')
   fi
   [[ -n "$position" ]] || { echo "FAIL missing control $1" >&2; return 1; }
   read -r x y <<< "$position"
@@ -113,9 +118,11 @@ xdotool key --clearmodifiers ctrl+0
 xdotool key --clearmodifiers g c
 xdotool key a
 expect_screen calendar-ready 'LostTarget'
-click_word LostTarget
+# With no selection, 2j selects the second event, not just the first one.
+# The following real delete verifies the target by file identity and bytes.
+xdotool key --clearmodifiers 2 j
 printf 'DELETE /api/v1/calendars/event after\n' > "$ROOT/fault"
-xdotool key --clearmodifiers Delete
+xdotool key --clearmodifiers d d
 expect_screen delete-confirm 'Delete this event'
 xdotool key Return
 for _ in {1..100}; do [[ ! -e "$ROOT/calendar/lost.ics" ]] && break; sleep 0.05; done
@@ -134,7 +141,7 @@ echo 'PASS recovery reconciles exact local identity without another DELETE or pr
 # the action visible; a later successful read must not delete the still-present event.
 click_word KeepNeighbor
 printf 'DELETE /api/v1/calendars/event before\n' > "$ROOT/fault"
-xdotool key --clearmodifiers Delete
+xdotool key --clearmodifiers d d
 expect_screen unsubmitted-confirm 'Delete this event'
 xdotool key Return
 expect_screen unsubmitted-uncertain 'Recover calendar changes'
@@ -154,7 +161,7 @@ printf 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//durian//test//EN\r\nBEGIN:VE
   "$(date -d tomorrow +%Y%m%d)" "$(date -d tomorrow +%Y%m%d)" > "$ROOT/calendar/other-conflict.ics"
 xdotool key --clearmodifiers ctrl+r
 expect_screen conflict-loaded 'OtherConflict'
-xdotool key --clearmodifiers Escape c
+xdotool key --clearmodifiers Escape n
 expect_screen create-empty 'New event'
 xdotool type --clearmodifiers --delay 15 'NativeCreated'
 xdotool key Tab ctrl+a
@@ -180,7 +187,7 @@ grep -q 'Preserve calendar notes' "$CREATED"
 echo 'PASS native create retry preserves stable UID, description and next-day midnight end'
 
 click_word NativeCreated
-xdotool key --clearmodifiers e
+xdotool key --clearmodifiers i
 expect_screen edit-open 'Edit event'
 xdotool key ctrl+a
 xdotool type --clearmodifiers --delay 15 'NativeEdited'
@@ -198,7 +205,7 @@ expect_screen edit-saved 'NativeEdited' 'Edit event'
 [[ "$(sed -n 's/\r$//;s/^SUMMARY://p' "$CREATED")" == NativeEdited ]]
 grep -q "DTEND:$(date -d '2 days' +%Y%m%d)T000000Z" "$CREATED"
 [[ "$(find "$ROOT/calendar" -maxdepth 1 -name '*.ics' | wc -l)" == 3 ]]
-xdotool key --clearmodifiers Delete
+xdotool key --clearmodifiers d d
 expect_screen acknowledged-delete-confirm 'Delete this event'
 xdotool key Return
 xdotool key t

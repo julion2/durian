@@ -20,9 +20,7 @@ const CONTEXT: &str = "Picker";
 pub fn bind_picker_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("down", SelectNextItem, Some(CONTEXT)),
-        KeyBinding::new("ctrl-n", SelectNextItem, Some(CONTEXT)),
         KeyBinding::new("up", SelectPrevItem, Some(CONTEXT)),
-        KeyBinding::new("ctrl-p", SelectPrevItem, Some(CONTEXT)),
         KeyBinding::new("enter", ConfirmItem, Some(CONTEXT)),
         KeyBinding::new("escape", Dismiss, Some(CONTEXT)),
     ]);

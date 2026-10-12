@@ -1,5 +1,4 @@
-//! One table drives both the key bindings and the command menu, so a shortcut shown in ⌘K is
-//! always the one that is actually bound.
+//! Command metadata. Configurable shortcuts come from the effective keymaps, not this table.
 
 use gpui::{Action, App, DummyKeyboardMapper, Entity, KeyBinding, KeyBindingContextPredicate, SharedString, Window};
 
@@ -45,7 +44,7 @@ pub const COMMANDS: &[Command] = &[
     Command { scope: Scope::Any, label: "Show account 3", icon: IconName::MailInbox, keys: &["cmd-3"], action: || Box::new(ShowAccount3), in_menu: false, group: "Accounts" },
     Command { scope: Scope::Any, label: "Toggle dark mode", icon: IconName::Display, keys: &[], action: || Box::new(ToggleDarkMode), in_menu: true, group: "General" },
     Command { scope: Scope::Any, label: "Use system appearance", icon: IconName::Display, keys: &[], action: || Box::new(UseSystemAppearance), in_menu: true, group: "General" },
-    Command { scope: Scope::Any, label: "Toggle sidebar", icon: IconName::SidebarToggle, keys: &["[", "cmd-\\"], action: || Box::new(ToggleSidebar), in_menu: true, group: "General" },
+    Command { scope: Scope::Any, label: "Toggle sidebar", icon: IconName::SidebarToggle, keys: &["cmd-\\"], action: || Box::new(ToggleSidebar), in_menu: true, group: "General" },
     Command { scope: Scope::Any, label: "Go to drafts", icon: IconName::MailDraft, keys: &["g d"], action: || Box::new(GoToDrafts), in_menu: true, group: "Navigation" },
     Command { scope: Scope::Any, label: "Go to inbox", icon: IconName::MailInbox, keys: &["g i"], action: || Box::new(GoToInbox), in_menu: true, group: "Navigation" },
     Command { scope: Scope::Mail, label: "Add or remove tags…", icon: IconName::MailLabel, keys: &["l"], action: || Box::new(OpenTagPicker), in_menu: true, group: "Thread" },
@@ -53,7 +52,7 @@ pub const COMMANDS: &[Command] = &[
     Command { scope: Scope::Mail, label: "Star / unstar", icon: IconName::MailStar, keys: &["s"], action: || Box::new(ToggleStar), in_menu: true, group: "Thread" },
     Command { scope: Scope::Mail, label: "Expand / collapse all messages", icon: IconName::MailExpand, keys: &[";"], action: || Box::new(ToggleExpandAll), in_menu: true, group: "Thread" },
     Command { scope: Scope::Mail, label: "Toggle list layout", icon: IconName::Display, keys: &[], action: || Box::new(ToggleListLayout), in_menu: true, group: "Navigation" },
-    Command { scope: Scope::Mail, label: "Toggle focus mode", icon: IconName::PanelRight, keys: &["f", "enter"], action: || Box::new(ToggleFocusMode), in_menu: true, group: "Navigation" },
+    Command { scope: Scope::Mail, label: "Toggle focus mode", icon: IconName::PanelRight, keys: &["enter"], action: || Box::new(ToggleFocusMode), in_menu: true, group: "Navigation" },
     Command { scope: Scope::Mail, label: "Next thread", icon: IconName::ArrowRight, keys: &["j", "down"], action: || Box::new(SelectNext), in_menu: true, group: "Navigation" },
     Command { scope: Scope::Mail, label: "Previous thread", icon: IconName::ArrowLeft, keys: &["k", "up"], action: || Box::new(SelectPrev), in_menu: true, group: "Navigation" },
     Command { scope: Scope::Mail, label: "Back to split view", icon: IconName::SidebarToggle, keys: &["escape"], action: || Box::new(ExitFocusMode), in_menu: false, group: "Navigation" },
@@ -75,8 +74,9 @@ pub const COMMANDS: &[Command] = &[
     Command { scope: Scope::Calendar, label: "Agenda", icon: IconName::Calendar, keys: &["a"], action: || Box::new(calendar::ShowAgenda), in_menu: true, group: "Calendar" },
     Command { scope: Scope::Any, label: "Copy selected text", icon: IconName::MailEmail, keys: &["cmd-c"], action: || Box::new(CopySelection), in_menu: false, group: "General" },
     Command { scope: Scope::Any, label: "Select all text", icon: IconName::MailEmail, keys: &["cmd-a"], action: || Box::new(SelectAllText), in_menu: false, group: "General" },
-    Command { scope: Scope::Any, label: "Keyboard shortcuts", icon: IconName::Display, keys: &["?", "shift-/"], action: || Box::new(ToggleShortcutHelp), in_menu: true, group: "General" },
+    Command { scope: Scope::Any, label: "Keyboard shortcuts", icon: IconName::Display, keys: &["?"], action: || Box::new(ToggleShortcutHelp), in_menu: true, group: "General" },
     Command { scope: Scope::Any, label: "Command menu", icon: IconName::Search, keys: &["cmd-k"], action: || Box::new(OpenCommandMenu), in_menu: false, group: "General" },
+    Command { scope: Scope::Any, label: "Reload keymaps", icon: IconName::Display, keys: &["cmd-alt-r", "ctrl-alt-r"], action: || Box::new(ReloadKeymaps), in_menu: true, group: "General" },
 ];
 
 /// Shortcuts are suspended while a picker or any text field owns the keyboard. The workspace
@@ -99,6 +99,7 @@ pub fn bind_keys(cx: &mut App) {
         .collect();
     let bindings = COMMANDS
         .iter()
+        .filter(|c| pkl_name((c.action)().as_ref(), c.scope).is_none())
         .flat_map(|c| c.keys.iter().map(move |k| (k, c)))
         .map(|(k, c)| {
             let predicate = predicates.iter().find(|(s, _)| *s == c.scope).map(|(_, p)| p.clone());
@@ -113,14 +114,53 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// Keycaps of the binding for `action`, from the same table that binds the keys.
-pub fn keys_for(action: &dyn Action) -> Vec<SharedString> {
+/// Keycaps from the effective config, including removed/rebound defaults.
+/// A surface shared between areas shows only a shortcut that works in all of them.
+pub fn keys_for(action: &dyn Action, contexts: &[crate::keymaps::Context], cx: &App) -> Vec<SharedString> {
     COMMANDS
         .iter()
         .find(|c| (c.action)().name() == action.name())
-        .and_then(|c| c.keys.first())
-        .map(|k| keycaps(k))
+        .and_then(|c| {
+            let (&first, rest) = contexts.split_first()?;
+            shortcuts(c, first, cx).into_iter().find(|key| rest.iter().all(|context| shortcuts(c, *context, cx).contains(key)))
+        })
+        .map(|k| keycaps(&k))
         .unwrap_or_default()
+}
+
+pub fn shortcuts(command: &Command, context: crate::keymaps::Context, cx: &App) -> Vec<String> {
+    let Some(name) = pkl_name((command.action)().as_ref(), command.scope) else {
+        return command.keys.iter().map(|k| k.to_string()).collect();
+    };
+    let maps = cx.global::<crate::keymaps::Keymaps>();
+    maps.for_context(context).filter(|b| b.entry.action == name).map(|b| b.strokes.join(" ")).collect()
+}
+
+/// Native application commands (reload, clipboard) remain usable with keymaps disabled.
+pub fn pkl_name(action: &dyn Action, _scope: Scope) -> Option<&'static str> {
+    Some(match action.name().rsplit("::").next()? {
+        "SelectNext" => "next_email", "SelectPrev" => "prev_email", "Archive" => "archive",
+        "ToggleStar" => "toggle_star", "ToggleRead" => "toggle_read", "Reply" => "reply", "ReplyAll" => "reply_all",
+        "Forward" => "forward", "NewMessage" => "compose", "FocusSearch" => "search", "Retry" => "reload_inbox",
+        "GoToInbox" => "go_inbox", "GoToDrafts" => "go_drafts", "GoToCalendar" => "go_calendar",
+        "OpenTagPicker" => "tag_picker", "OpenThread" => "enter_thread", "ExitFocusMode" => "close_detail",
+        "ToggleFocusMode" => "toggle_focus_mode", "ToggleExpandAll" => "toggle_expand_all",
+        "ToggleListLayout" => "toggle_list_layout", "ToggleSidebar" => "toggle_sidebar",
+        "ToggleShortcutHelp" => "shortcut_help", "OpenCommandMenu" => "command_menu",
+        "PreviewAttachment" => "preview_attachment", "EventFromThread" => "event_from_thread",
+        "ShowAllAccounts" => "show_all_accounts", "ShowAccount1" => "show_account_1",
+        "ShowAccount2" => "show_account_2", "ShowAccount3" => "show_account_3",
+        "ToggleDarkMode" => "toggle_dark_mode", "UseSystemAppearance" => "system_appearance",
+        "EditEvent" => "calendar_edit", "DeleteEvent" => "calendar_delete", "NewEvent" => "calendar_new",
+        "NextPeriod" => "calendar_next_period", "PrevPeriod" => "calendar_prev_period", "GoToToday" => "calendar_today",
+        "ShowDay" => "calendar_view_day", "ShowWeek" => "calendar_view_week", "ShowMonth" => "calendar_view_month",
+        "ShowAgenda" => "calendar_view_agenda", "DuplicateEvent" => "calendar_duplicate",
+        _ => return None,
+    })
+}
+
+pub fn action_for(name: &str) -> Option<Box<dyn Action>> {
+    COMMANDS.iter().find(|c| pkl_name((c.action)().as_ref(), c.scope) == Some(name)).map(|c| (c.action)())
 }
 
 /// "cmd-k" → ["⌘", "K"], "e" → ["E"], "enter" → ["↵"]
@@ -157,6 +197,7 @@ pub struct CommandMenu {
     pub mailbox: Entity<Mailbox>,
     pub schedule: Entity<calendar::model::Schedule>,
     pub scope: Scope,
+    pub key_context: crate::keymaps::Context,
     /// called with the new event's id after "Create event"
     pub on_event_created: std::rc::Rc<dyn Fn(SharedString, &mut Window, &mut App)>,
 }
@@ -225,7 +266,7 @@ impl PickerDelegate for CommandMenu {
                 let score = fuzzy_score(query, c.label)?;
                 let mut item = PickerItem::new(format!("cmd:{ix}"), c.label);
                 item.leading = Leading::Icon(c.icon.into());
-                item.keys = c.keys.first().map(|k| keycaps(k)).unwrap_or_default();
+                item.keys = shortcuts(c, self.key_context, cx).first().map(|k| keycaps(k)).unwrap_or_default();
                 item.section = (!query.is_empty()).then(|| "Commands".into());
                 Some((score, item))
             })
@@ -313,7 +354,7 @@ impl PickerDelegate for CommandMenu {
     }
 }
 
-/// `l`: toggle tags on the open thread; typing a new name offers to create it.
+/// Toggle tags on the open thread; typing a new name offers to create it.
 pub struct TagPicker {
     pub mailbox: Entity<Mailbox>,
 }
@@ -324,13 +365,18 @@ impl PickerDelegate for TagPicker {
     }
 
     fn context(&self, cx: &App) -> Option<(SharedString, SharedString)> {
-        let thread = self.mailbox.read(cx).selected_thread()?;
+        let mailbox = self.mailbox.read(cx);
+        if mailbox.selection_mode().is_some() {
+            return Some(("Tags".into(), format!("{} selected threads", mailbox.selected_ids(1).len()).into()));
+        }
+        let thread = mailbox.selected_thread()?;
         Some(("Tags".into(), thread.subject.clone()))
     }
 
     fn items(&self, query: &str, cx: &App) -> Vec<PickerItem> {
         let mailbox = self.mailbox.read(cx);
-        let applied = mailbox.selected_thread().map(|t| t.tags.clone()).unwrap_or_default();
+        let ids = mailbox.selected_ids(1);
+        let selected: Vec<_> = mailbox.threads.iter().filter(|t| ids.contains(&t.id)).collect();
         let mut tags: Vec<(i32, PickerItem)> = mailbox
             .tags
             .iter()
@@ -338,7 +384,7 @@ impl PickerDelegate for TagPicker {
                 let score = fuzzy_score(query, &tag.name)?;
                 let mut item = PickerItem::new(format!("tag:{}", tag.name), tag.name.clone());
                 item.leading = Leading::Dot(tag.color);
-                item.checked = Some(applied.contains(&tag.name));
+                item.checked = Some(!selected.is_empty() && selected.iter().all(|t| t.tags.contains(&tag.name)));
                 Some((score, item))
             })
             .collect();

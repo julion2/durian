@@ -283,7 +283,14 @@ impl Render for MailSidebar {
             .bg(bg)
             .child(mail_titlebar(true, cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ToggleSidebar))))
             .when(self.menu_open, |s| {
-                let row = |id: SharedString, leading: AnyElement, label: SharedString, detail: Option<SharedString>, count: Option<SharedString>, key: Option<&'static str>, selected: bool| {
+                let account_keys = |n: usize| -> Vec<SharedString> {
+                    let action: Box<dyn gpui::Action> = match n {
+                        0 => Box::new(crate::ShowAllAccounts), 1 => Box::new(crate::ShowAccount1),
+                        2 => Box::new(crate::ShowAccount2), 3 => Box::new(crate::ShowAccount3), _ => return Vec::new(),
+                    };
+                    crate::commands::keys_for(action.as_ref(), &[crate::keymaps::Context::List, crate::keymaps::Context::Thread, crate::keymaps::Context::Calendar], cx)
+                };
+                let row = |id: SharedString, leading: AnyElement, label: SharedString, detail: Option<SharedString>, count: Option<SharedString>, keys: Vec<SharedString>, selected: bool| {
                     div()
                         .id(id)
                         .flex()
@@ -298,7 +305,7 @@ impl Render for MailSidebar {
                         .child(div().flex_none().text_size(px(SIZE_SMALL)).font_weight(WEIGHT_MEDIUM).text_color(theme.text_primary).child(label))
                         .child(div().flex_1().min_w_0().truncate().text_size(px(SIZE_MINI)).text_color(theme.text_tertiary).children(detail))
                         .children(count.map(|count| div().text_size(px(SIZE_MINI)).text_color(theme.text_quaternary).child(count)))
-                        .children(key.map(|k| Kbd::new(k)))
+                        .children(keys.into_iter().map(Kbd::new))
                 };
                 let current = active.as_ref().map(|a| a.id.clone());
                 let menu = div()
@@ -312,21 +319,21 @@ impl Render for MailSidebar {
                 let menu = if profiles.is_empty() {
                     let mut menu = menu
                         .child(
-                            row("acct-all".into(), Icon::new(IconName::MailInbox).color(theme.text_tertiary).into_any_element(), "All accounts".into(), None, count_label(all_unread), Some("⌘0"), current.is_none())
+                            row("acct-all".into(), Icon::new(IconName::MailInbox).color(theme.text_tertiary).into_any_element(), "All accounts".into(), None, count_label(all_unread), account_keys(0), current.is_none())
                                 .on_click(cx.listener(|this, _, _, cx| this.pick(None, cx))),
                         )
                         .child(div().h(px(1.)).my(px(4.)).bg(theme.border_card));
                     for (n, (account, unread)) in accounts.iter().enumerate() {
                         let id = account.id.clone();
                         let selected = current.as_ref() == Some(&account.id);
-                        let key = ["⌘1", "⌘2", "⌘3"].get(n).copied();
+                        let key = account_keys(n + 1);
                         menu = menu.child(
                             row(format!("acct-{}", account.id).into(), div().size(px(8.)).rounded_full().bg(account.color).into_any_element(), account.name.clone(), Some(account.email.clone()), count_label(*unread), key, selected)
                                 .on_click(cx.listener(move |this, _, _, cx| this.pick(Some(id.clone()), cx))),
                         );
                     }
                     menu.child(div().h(px(1.)).my(px(4.)).bg(theme.border_card))
-                        .child(row("acct-add".into(), Icon::new(IconName::Plus).color(theme.text_tertiary).into_any_element(), "Add account…".into(), None, None, None, false))
+                        .child(row("acct-add".into(), Icon::new(IconName::Plus).color(theme.text_tertiary).into_any_element(), "Add account…".into(), None, None, Vec::new(), false))
                 } else {
                     // profiles as configured in durian (profiles.pkl): name, accounts, ⌘1…
                     menu.children(profiles.iter().enumerate().map(|(n, p)| {
@@ -335,7 +342,7 @@ impl Render for MailSidebar {
                             Some(color) => div().size(px(8.)).rounded_full().bg(color).into_any_element(),
                             None => Icon::new(IconName::MailInbox).color(theme.text_tertiary).into_any_element(),
                         };
-                        let key = ["⌘1", "⌘2", "⌘3"].get(n).copied();
+                        let key = account_keys(n + 1);
                         row(format!("profile-{n}").into(), leading, p.name.clone(), Some(accounts), None, key, profile_ix == Some(n))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.menu_open = false;

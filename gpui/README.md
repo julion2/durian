@@ -102,6 +102,68 @@ with the new token; same-session SSE disconnects reconnect automatically.
   across workspace replacements. Old-session results are rejected; already-running HTTP
   requests retain their 8 s timeout. Decoding rejects dimensions above 2048×2048.
 
+## User keymaps
+
+The client reads the same `keymaps.pkl` as Swift through authenticated `GET /api/v1/keymaps`.
+The Go server evaluates the file beside the active `config.pkl` (including `-c`), using the
+shared embedded schema; the GUI neither evaluates a second format nor writes configuration.
+Use the packaged CLI from this build: older servers without this endpoint show a warning
+and keep built-in defaults. Mail loading does not wait for the keymap request; configurable
+shortcuts wait for its initial answer so disabled keys cannot briefly execute defaults.
+
+Bindings merge by **key + sorted modifiers + context**, not by action. A new key adds another
+binding; remove the old one explicitly with `enabled = false`. Last duplicate wins. Missing
+fields use Swift's defaults. Contexts are `list`, `thread`, `search`, `tag_picker`, `calendar`
+and `compose_normal`. Multi-key sequences such as `gg`, `dd` and `gi` do not require the
+legacy `sequence` flag; exact matches take precedence over prefixes. Counts are capped at
+999 and apply only to actions with `supports_count` in that context. Timeout, unmatched
+keys, focus/context changes, mouse clicks and reload clear unfinished sequences. Unmodified
+character bindings in search/tag text fields do not steal typing.
+
+Reload via **Reload keymaps** in the command menu, or Cmd-Alt-R / Ctrl-Alt-R while no editor
+or popup has focus. There is no file watcher yet. Deleting the file restores defaults;
+an invalid edit shows a warning and keeps the last working map (unlike Swift's reset to
+defaults). `keymaps_enabled = false` suspends configurable bindings, not text editing,
+clipboard, Quit or Reload. `?`, command hints and context-menu hints use effective bindings;
+shared menus omit shortcuts that differ between contexts.
+
+Swift defaults replace the prototype's conflicting keys: `a` archives, `R` replies to all,
+`f` forwards, `t` opens tags, `l` enters thread mode, `h` returns. `gg`/`G` select the first/last
+**loaded** list thread, or focus the first/last message in a thread; repeated `G` scrolls to
+the bottom. `n`/`N` navigate actual messages (not timeline events), with clamped counts and
+stable message identities across refresh. The target expands and scrolls into view.
+Ctrl-D/U move half a viewport.
+`gi`/`gs`/`ga`, `g1`–`g9`, `J`/`K` and `gf` navigate profile folders without losing account
+scope. `tag_op` and counted `dd` use the existing durable tag-write queue. In Calendar,
+`n`/`o`/`O` create, `i` edits, `dd` deletes and `H`/`L` change periods. Existing buttons/menu
+actions remain; Cmd-R (also Ctrl-R on Linux) refreshes list, thread or calendar.
+
+`v` selects the inclusive range from an anchor to the cursor; `V` starts individual marks.
+In Toggle mode, Space toggles the current mark (keeping at least one) and advances the cursor
+without marking the next row. Escape returns to a single cursor. Marked backgrounds and a
+separate cursor border distinguish selection from navigation in both list layouts.
+Archive, delete, tag operations, read/unread and stars act on the selected IDs through the
+existing write queue. Mixed tags/stars are added to all; all-selected tags/stars are removed.
+Read/unread marks all read if any are unread, otherwise all unread. Multi-select navigation
+does not auto-read threads. This intentionally makes stars a bulk action, unlike Swift's
+first-mark-only implementation. Normal reply/forward still address the cursor thread.
+Refresh/paging retains explicit marks by ID; changed searches/folders/accounts and opening
+thread mode clear them. Right-click selects only the named thread, not other marks.
+
+This is not full Swift action parity. Help lists unavailable bindings explicitly; invoking
+one warns rather than substituting an unrelated action. Missing: compose-normal/`exit_insert`, calendar day/time cursor,
+`calendar_detail`, `calendar_command` and `calendar_toggle_declined`. Other unknown user
+actions are also shown as unavailable. GPUI additions (command/help menus, layouts, appearance,
+account selection, calendar views/duplicate and attachment preview) use the same override
+mechanism. They cannot shadow a Swift key or sequence prefix. Native macOS key-event/layout
+acceptance remains separate from the Linux tests below.
+
+Compose modal editing is deliberately not tied to a Vim engine yet. Key-sequence dispatch
+and selection/actions remain separate; a later editor design must allow selection-first
+editing (Kakoune-style) as well as Vim's operator-first grammar. No modal-editor dependency
+or new configuration format has been added. Remaining Swift calendar cursor/detail/command
+modes are not scheduled for a parity port; their interaction needs a separate design.
+
 ## Write behavior and limits
 
 - Thread tags intentionally use global thread identity, without an account qualifier. Optimistic
@@ -186,6 +248,7 @@ bazel test //gpui/... //integration:gpui_test
 bazel test //cli/... //integration:integration_test
 bazel test //integration:gpui_ui_test --nocache_test_results
 bazel test //integration:gpui_startup_ui_test --nocache_test_results
+bazel test //integration:gpui_keymaps_ui_test --nocache_test_results
 bazel test //integration:gpui_calendar_ui_test --nocache_test_results
 bazel test //integration:mailrender_test //integration:gpui_html_ui_test --nocache_test_results
 ```
@@ -222,6 +285,14 @@ The calendar UI contract injects lost create/delete acknowledgements, rejected e
 failed reconciliation and failed scoped sync against the real Go server. It verifies exact
 neighbor preservation, stable create UID, editor/notes retention, native clipboard shortcuts,
 midnight end time, own-versus-other conflicts and explicit recovery without repeated writes.
+The keymaps UI contract evaluates real Pkl through the owned Go server, then exercises native
+overrides/disabled defaults, counts, sequences/timeouts, text/picker/thread contexts, durable
+tag operations, reload/error retention, deletion/default restoration and folder navigation.
+It also checks range/toggle multi-selection, mixed-state bulk tags/stars/read flags, selection
+retention through refresh, bulk archive/delete and counted navigation of distinct messages
+sharing an RFC Message-ID. Rendered message positions and bodies are checked together.
+Rendered help is checked independently of command execution. All fixtures disable provider
+transports; these tests do not send mail.
 Screenshots/logs go to Bazel's undeclared test outputs;
 `DURIAN_UI_ARTIFACT_DIR` overrides that location when running the script directly. These are
 synthetic fixtures, not a test of IMAP/SMTP providers or the user's mailbox.
@@ -267,10 +338,10 @@ are separate from the earlier matrices, not a replacement for their observations
    re-requests the row prefix, but not unchanged bodies. Broad encrypted search, cursor
    pagination and a compact list-ready API remain work; even a bounded conversation batch
    can exceed the unchanged response byte cap for exceptionally large threads.
-2. Port user keymaps from Swift: the same `keymaps.pkl`, action/context semantics, overrides,
-   disabled bindings, sequences/counts, timeouts and reload behavior. No second user format.
-   Go already loads/validates keymaps, but has no HTTP endpoint; its schema/validator also lack
-   Swift's calendar context. Agree any API/schema extension before implementing that boundary.
+2. Design compose modal editing without locking selection/actions to Vim's operator-first
+   grammar. Multi-selection and message navigation work; remaining Swift calendar modes
+   are deliberately not a parity target. macOS keyboard-layout acceptance and automatic
+   keymap reload remain.
 3. Rename the client directory separately from behavioral changes. Prefer `app/` over `ui/`:
    it contains application/backend lifecycle as well as views; `crates/ui` is the widget layer.
 4. Agree durable calendar recovery across app exit and finish provider/macOS write

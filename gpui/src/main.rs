@@ -15,6 +15,18 @@ use crate::assets::Assets;
 
 gpui::actions!(durian, [Quit]);
 
+fn bind_keys(cx: &mut App) {
+    // Rebuild rather than appending unbind tombstones. Deleting an override must
+    // reveal the default again without accumulating old bindings across reloads.
+    cx.clear_key_bindings();
+    ui::bind_keys(cx);
+    mail::bind_keys(cx);
+    cx.bind_keys([
+        gpui::KeyBinding::new("cmd-q", Quit, None),
+        gpui::KeyBinding::new("ctrl-q", Quit, None),
+    ]);
+}
+
 enum Startup {
     Ready(mail::durian::live::Preconnect),
     Reconnecting(usize),
@@ -204,11 +216,9 @@ fn main() {
             _ => {}
         }
         ui::theme::apply_appearance(cx);
-        mail::bind_keys(cx);
-        cx.bind_keys([
-            gpui::KeyBinding::new("cmd-q", Quit, None),
-            gpui::KeyBinding::new("ctrl-q", Quit, None),
-        ]);
+        cx.set_global(mail::keymaps::Keymaps::default());
+        bind_keys(cx);
+        cx.observe_global::<mail::keymaps::Keymaps>(bind_keys).detach();
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() { cx.quit(); }

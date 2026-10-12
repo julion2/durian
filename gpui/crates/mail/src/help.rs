@@ -1,6 +1,5 @@
 //! Keyboard shortcuts panel (`?`): a sheet on the right with a filter field and
-//! grouped shortcuts. Everything bindable comes from `COMMANDS`, so it can't drift from the real
-//! key bindings; composer-only keys (not actions of the mail view) are listed alongside.
+//! grouped shortcuts from the effective keymap. Missing Swift actions are explicit.
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding, MouseButton, Render, SharedString,
@@ -27,13 +26,12 @@ const EXTRA: &[(&str, &str, &[&str])] = &[
     ("Composer", "Bold / italic / code", &["cmd-b", "cmd-i", "cmd-e"]),
     ("Composer", "Next / previous field", &["tab", "shift-tab"]),
     ("Composer", "Close (asks to save a draft)", &["escape"]),
-    ("Navigation", "Move by N threads", &["5", "j"]),
     ("Search", "Accept completion", &["tab"]),
     ("Search", "Back to the list", &["enter"]),
     ("Search", "Clear search", &["escape"]),
 ];
 
-const GROUP_ORDER: &[&str] = &["General", "Navigation", "Calendar", "Thread", "Writing", "Composer", "Search", "Accounts"];
+const GROUP_ORDER: &[&str] = &["General", "List", "Calendar", "Thread", "Search", "Tag picker", "Composer", "Compose normal", "Unavailable"];
 
 struct Row {
     group: &'static str,
@@ -42,26 +40,48 @@ struct Row {
 }
 
 /// The shortcuts of the area the sheet was opened in (plus the ones that work everywhere).
-fn rows(scope: Scope) -> Vec<Row> {
+fn rows(scope: Scope, cx: &App) -> Vec<Row> {
     let mut rows: Vec<Row> = COMMANDS
         .iter()
-        .filter(|c| !c.keys.is_empty() && (c.scope == Scope::Any || c.scope == scope))
+        .filter(|c| crate::commands::pkl_name((c.action)().as_ref(), c.scope).is_none())
         .map(|c| Row {
-            group: c.group,
+            group: "General",
             label: c.label.into(),
             // alternatives like "j / ↓" – but not the duplicate "?" / "shift-/" spelling
             keys: c.keys.iter().filter(|k| **k != "shift-/").map(|k| keycaps(k)).collect(),
         })
         .collect();
+    let maps = cx.global::<crate::keymaps::Keymaps>();
+    for b in &maps.bindings {
+        use crate::keymaps::Context;
+        if (scope == Scope::Calendar) != (b.entry.context == Context::Calendar) { continue }
+        let available = crate::keymap_actions::available(&b.entry);
+        let label = match (b.entry.context, b.entry.action.as_str()) {
+            (Context::List, "first_email") => "First loaded thread".into(),
+            (Context::List, "last_email") => "Last loaded thread".into(),
+            (Context::List, "enter_visual_mode") => "Select range".into(),
+            (Context::List, "enter_toggle_mode") => "Select individual threads".into(),
+            (Context::List, "toggle_selection") => "Toggle mark and advance".into(),
+            (Context::List, "exit_visual_mode") => "Clear selection".into(),
+            (Context::Thread, "next_message") => "Next message".into(),
+            (Context::Thread, "prev_message") => "Previous message".into(),
+            (Context::Thread, "first_email") => "First message".into(),
+            (Context::Thread, "last_email") => "Last message / end".into(),
+            _ => COMMANDS.iter().find(|c| (c.scope == Scope::Any || c.scope == scope)
+                && crate::commands::pkl_name((c.action)().as_ref(), c.scope) == Some(b.entry.action.as_str()))
+                .map(|c| c.label.to_string()).unwrap_or_else(|| b.entry.action.replace('_', " ")),
+        };
+        let label = if available { label } else { format!("{}: {label} (not yet available)", b.entry.context.label()) };
+        let group = if available { b.entry.context.label() } else { "Unavailable" };
+        let keys = if maps.settings.keymaps_enabled { vec![keycaps(&b.strokes.join(" "))] } else { Vec::new() };
+        if let Some(row) = rows.iter_mut().find(|r| r.group == group && r.label.as_ref() == label) { row.keys.extend(keys); }
+        else { rows.push(Row { group, label: label.into(), keys }); }
+    }
     // composer and search keys belong to the mail area
     rows.extend(EXTRA.iter().filter(|_| scope == Scope::Mail).map(|(group, label, keys)| Row {
         group,
         label: (*label).into(),
-        keys: if *label == "Move by N threads" {
-            vec![vec!["5".into(), "J".into()]]
-        } else {
-            keys.iter().map(|k| keycaps(k)).collect()
-        },
+        keys: keys.iter().map(|k| keycaps(k)).collect(),
     }));
     rows
 }
@@ -94,7 +114,7 @@ impl Render for ShortcutHelp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let query = self.filter.read(cx).text().to_string();
-        let rows: Vec<Row> = rows(self.scope).into_iter().filter(|r| fuzzy_score(&query, &r.label).is_some() || fuzzy_score(&query, r.group).is_some()).collect();
+        let rows: Vec<Row> = rows(self.scope, cx).into_iter().filter(|r| fuzzy_score(&query, &r.label).is_some() || fuzzy_score(&query, r.group).is_some()).collect();
 
         let sections = GROUP_ORDER.iter().filter_map(|group| {
             let items: Vec<&Row> = rows.iter().filter(|r| r.group == *group).collect();
@@ -108,13 +128,16 @@ impl Render for ShortcutHelp {
                         div()
                             .flex()
                             .items_center()
-                            .h(px(30.))
+                            .min_h(px(30.))
+                            .py(px(4.))
+                            .gap(px(8.))
                             .text_size(px(SIZE_SMALL))
                             .text_color(theme.text_secondary)
                             .child(div().flex_1().min_w_0().truncate().child(row.label.clone()))
-                            .child(div().flex().items_center().gap(px(6.)).children(row.keys.iter().enumerate().map(|(i, combo)| {
+                            .child(div().flex().flex_wrap().justify_end().max_w(px(200.)).items_center().gap(px(6.)).children(row.keys.iter().enumerate().map(|(i, combo)| {
                                 div()
                                     .flex()
+                                    .flex_none()
                                     .items_center()
                                     .gap(px(3.))
                                     .when(i > 0, |s| s.child(div().text_size(px(SIZE_MINI)).text_color(theme.text_quaternary).child("or")))

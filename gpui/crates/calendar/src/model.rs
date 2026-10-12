@@ -398,10 +398,12 @@ impl Schedule {
         let current = self.selected.as_ref().and_then(|id| visible.iter().position(|e| e.id == *id));
         let next = match current {
             Some(ix) => (ix as isize + delta).clamp(0, visible.len() as isize - 1) as usize,
-            // nothing selected: start at what's on now or next (or the first one)
+            // The first step selects what's on now/next; remaining counted steps
+            // move from there, just like repeated single-key navigation.
             None => {
                 let now = chrono::Local::now().naive_local();
-                visible.iter().position(|e| e.end > now && !e.all_day).unwrap_or(0)
+                let start = visible.iter().position(|e| e.end > now && !e.all_day).unwrap_or(0);
+                (start as isize + delta - delta.signum()).clamp(0, visible.len() as isize - 1) as usize
             }
         };
         let id = visible[next].id.clone();

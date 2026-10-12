@@ -13,6 +13,8 @@ mod drafts_view;
 mod event_compose;
 mod help;
 mod invite;
+pub mod keymaps;
+mod keymap_actions;
 pub mod html_doc;
 pub mod html_render;
 mod mime;
@@ -47,6 +49,7 @@ use compose::{ComposeDialog, ComposeEvent, ComposeSeed};
 use thread_view::{ThreadView, ThreadViewEvent};
 
 actions!(mail, [SelectNext, SelectPrev, Archive, ToggleStar, ToggleFocusMode, ExitFocusMode, ToggleExpandAll, OpenCommandMenu, OpenTagPicker, Reply, ReplyAll, NewMessage, Forward, GoToDrafts, GoToInbox, PreviewAttachment, ToggleSidebar, ShowAllAccounts, ShowAccount1, ShowAccount2, ShowAccount3, ToggleDarkMode, UseSystemAppearance, ShowContextMenu, ToggleRead, FocusSearch, ToggleShortcutHelp, ToggleListLayout, OpenThread, GoToCalendar, NewEvent, ComposeHere, EventFromThread, CopySelection, SelectAllText, Retry]);
+actions!(keymaps, [ReloadKeymaps]);
 
 /// Menu requested by a view (see `context_menus::open`), picked up by the workspace.
 pub struct PendingMenu(pub Option<(gpui::Point<gpui::Pixels>, Vec<ui::MenuItem>)>);
@@ -158,10 +161,12 @@ pub fn contact_avatar(contact: &Contact) -> Avatar {
 }
 
 pub fn bind_keys(cx: &mut App) {
+    if !cx.has_global::<keymaps::Keymaps>() { cx.set_global(keymaps::Keymaps::default()); }
     commands::bind_keys(cx);
     compose::bind_keys(cx);
     thread_list::bind_search_keys(cx);
     help::bind_keys(cx);
+    cx.global::<keymaps::Keymaps>().clone().bind(cx);
 }
 
 pub struct MailWorkspace {
@@ -175,12 +180,16 @@ pub struct MailWorkspace {
     /// `Split`: list + thread side by side. `List`: the list alone; the thread opens full width.
     layout: Layout,
     renderer: Entity<HtmlRenderer>,
-    /// vim-style count prefix: `5j` moves five threads
-    pending_count: Option<usize>,
+    key_engine: keymaps::Engine,
+    key_timer: Option<gpui::Task<()>>,
+    key_load: Option<gpui::Task<()>>,
+    key_focus: Option<FocusHandle>,
+    keymaps_ready: bool,
     /// last direction of travel, so prefetching looks ahead where the user is going
     direction: isize,
     /// open ⌘K / tag picker; owns the keyboard while present
     picker: Option<(AnyView, Subscription)>,
+    tag_picker: bool,
     compose: Option<(Entity<ComposeDialog>, Subscription)>,
     event_compose: Option<(Entity<event_compose::EventComposer>, Subscription)>,
     confirm_delete: Option<Vec<SharedString>>,
@@ -349,11 +358,14 @@ impl MailWorkspace {
             }
         })));
         this.live = Some(live);
+        this.keymaps_ready = false;
+        this.reload_keymaps(false, cx);
         this
     }
 
     pub fn reconnect(&mut self, preconnect: durian::live::Preconnect, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(live) = &self.live { live.update(cx, |live, cx| live.reconnect(preconnect, cx)); }
+        self.reload_keymaps(false, cx);
         if let Some((dialog, _)) = &self.compose {
             let client = self.live.as_ref().map(|live| live.read(cx).client());
             dialog.update(cx, |dialog, cx| dialog.set_contact_client(client, cx));
@@ -449,7 +461,18 @@ impl MailWorkspace {
         let sidebar = cx.new(|cx| MailSidebar::new(mailbox.clone(), cx));
         // the sidebar is a cached view: repaint it when the window (de)activates, its active
         // item dims in the background
-        cx.observe_window_activation(window, |this, _, cx| this.sidebar.update(cx, |_, cx| cx.notify())).detach();
+        cx.observe_window_activation(window, |this, _, cx| {
+            this.clear_key_sequence();
+            this.sidebar.update(cx, |_, cx| cx.notify());
+        }).detach();
+        cx.observe_global::<keymaps::Keymaps>(|this, cx| {
+            this.clear_key_sequence();
+            this.list.update(cx, |_, cx| cx.notify());
+            this.thread.update(cx, |_, cx| cx.notify());
+            this.sidebar.update(cx, |_, cx| cx.notify());
+            if let Some((help, _)) = &this.help { help.update(cx, |_, cx| cx.notify()); }
+            cx.notify();
+        }).detach();
         let sidebar_subscription = cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
             SidebarEvent::Navigate(key) => this.navigate(key.clone(), window, cx),
             SidebarEvent::ToggleSidebar => {
@@ -493,9 +516,14 @@ impl MailWorkspace {
             focus_mode: false,
             layout: Layout::Split,
             renderer,
-            pending_count: None,
+            key_engine: keymaps::Engine::default(),
+            key_timer: None,
+            key_load: None,
+            key_focus: None,
+            keymaps_ready: true,
             direction: 1,
             picker: None,
+            tag_picker: false,
         };
         this.prefetch(cx);
         this
@@ -507,6 +535,11 @@ impl MailWorkspace {
     }
 
     fn set_focus_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.clear_key_sequence();
+        if on && !self.focus_mode {
+            self.mailbox.update(cx, |m, cx| m.clear_selection(cx));
+            self.thread.update(cx, |t, cx| t.message_edge(false, cx));
+        }
         self.focus_mode = on;
         if self.thread_visible() {
             self.mailbox.update(cx, |m, cx| m.mark_selected_read(cx));
@@ -550,7 +583,8 @@ impl MailWorkspace {
         let subscription = cx.subscribe_in(&picker, window, |this, _, event, window, cx| match event {
             PickerEvent::Dismissed => this.close_picker(window, cx),
         });
-        self.pending_count = None;
+        self.clear_key_sequence();
+        self.tag_picker = false;
         trace::note(&format!("picker open: {}", std::any::type_name::<D>().rsplit("::").next().unwrap_or("?")));
         self.picker = Some((picker.into(), subscription));
         cx.notify();
@@ -737,7 +771,11 @@ impl MailWorkspace {
             },
         };
         self.mode = Mode::Inbox;
+        // Sidebar views/tags are destinations, not searches inside the old folder.
+        // The profile/account remains the scope; typed search still keeps its folder.
+        self.mailbox.update(cx, |m, _| m.folder = None);
         self.list.update(cx, |list, cx| list.apply_query(query.into(), Some(title.into()), cx));
+        self.sidebar.update(cx, |s, cx| s.set_active(key, cx));
         self.focus_area(window, cx);
         cx.notify();
     }
@@ -862,9 +900,6 @@ impl MailWorkspace {
         });
     }
 
-    fn take_count(&mut self) -> isize {
-        self.pending_count.take().unwrap_or(1) as isize
-    }
 }
 
 impl Focusable for MailWorkspace {
@@ -899,29 +934,25 @@ impl Render for MailWorkspace {
         div()
             // "Workspace" carries the shortcuts that work everywhere, "Mail" the mail area's; the
             // calendar view adds its own "Calendar" context below
-            .key_context(if self.mode == Mode::Calendar { "Workspace" } else { "Workspace Mail" })
+            .key_context(if self.mode == Mode::Calendar { "Workspace" } else if self.focus_mode { "Workspace Mail ThreadKeys" } else { "Workspace Mail" })
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                // digits build a count for the next motion (`12j`); 0 only continues a count.
-                // Only when the mail view itself has focus – never while typing in a field.
-                let ks = &event.keystroke;
-                if !this.focus_handle.is_focused(window) || ks.modifiers.modified() {
-                    return;
-                }
-                if let Some(digit) = ks.key.parse::<usize>().ok().filter(|d| *d > 0 || this.pending_count.is_some()) {
-                    this.pending_count = Some((this.pending_count.unwrap_or(0) * 10 + digit).min(999));
-                    cx.stop_propagation();
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| { this.clear_key_sequence(); cx.notify(); }))
+            .on_key_down(cx.listener(|this, _: &KeyDownEvent, _, cx| {
+                // An unbound key breaks a sequence; it must not leave a destructive prefix armed.
+                if !this.key_engine.display().is_empty() {
+                    this.clear_key_sequence();
                     cx.notify();
                 }
             }))
+            .on_action(cx.listener(Self::key_stroke))
+            .on_action(cx.listener(|this, _: &ReloadKeymaps, _, cx| this.reload_keymaps(true, cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
                 trace::input("j");
                 if this.mode == Mode::Calendar {
                     return this.schedule.update(cx, |s, cx| s.select_relative(1, cx));
                 }
-                let n = this.take_count();
                 this.direction = 1;
-                this.mailbox.update(cx, |m, cx| m.select_relative(n, cx));
+                this.mailbox.update(cx, |m, cx| m.select_relative(1, cx));
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| {
@@ -929,9 +960,8 @@ impl Render for MailWorkspace {
                 if this.mode == Mode::Calendar {
                     return this.schedule.update(cx, |s, cx| s.select_relative(-1, cx));
                 }
-                let n = this.take_count();
                 this.direction = -1;
-                this.mailbox.update(cx, |m, cx| m.select_relative(-n, cx));
+                this.mailbox.update(cx, |m, cx| m.select_relative(-1, cx));
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &Retry, _, cx| {
@@ -979,13 +1009,15 @@ impl Render for MailWorkspace {
                         }
                     });
                 });
-                let delegate = commands::CommandMenu { mailbox: this.mailbox.clone(), schedule: this.schedule.clone(), scope: this.scope(), on_event_created };
+                let key_context = if this.mode == Mode::Calendar { keymaps::Context::Calendar } else if this.focus_mode { keymaps::Context::Thread } else { keymaps::Context::List };
+                let delegate = commands::CommandMenu { mailbox: this.mailbox.clone(), schedule: this.schedule.clone(), scope: this.scope(), key_context, on_event_created };
                 this.open_picker(delegate, 640., window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenTagPicker, window, cx| {
                 if this.mailbox.read(cx).selected_thread().is_some() {
                     let delegate = commands::TagPicker { mailbox: this.mailbox.clone() };
                     this.open_picker(delegate, 440., window, cx);
+                    this.tag_picker = true;
                 }
             }))
             .on_action(cx.listener(|this, _: &GoToDrafts, window, cx| this.set_mode(Mode::Drafts, window, cx)))
@@ -1126,7 +1158,7 @@ impl Render for MailWorkspace {
                     this.set_mode(Mode::Inbox, window, cx);
                 }
                 this.focus_mode = false;
-                this.pending_count = None;
+                this.clear_key_sequence();
                 cx.notify();
             }))
             // pane resizing: follow the mouse anywhere in the window, settle on release
@@ -1219,9 +1251,9 @@ impl Render for MailWorkspace {
                                         }
                                     }),
                             )
-                            // pending vim count, like vim's showcmd
-                            .children(self.pending_count.map(|n| {
-                                div().absolute().right(px(12.)).bottom(px(12.)).child(Kbd::new(n.to_string()))
+                            // pending count/sequence, like vim's showcmd
+                            .children((!self.key_engine.display().is_empty()).then(|| {
+                                div().absolute().right(px(12.)).bottom(px(12.)).child(Kbd::new(self.key_engine.display()))
                             })),
                     ),
             )
@@ -1334,6 +1366,7 @@ impl Render for MailWorkspace {
             // picker overlay: transparent backdrop (no dimming), click outside closes
             .children(self.picker.as_ref().map(|(view, _)| {
                 div()
+                    .key_context(if self.tag_picker { "TagKeys" } else { "SearchKeys" })
                     .id("picker-backdrop")
                     .absolute()
                     .inset_0()

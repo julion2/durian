@@ -291,6 +291,12 @@ impl Client {
         self.get("/profiles", &[])
     }
 
+    pub fn keymaps(&self) -> Result<Option<crate::keymaps::File>> {
+        #[derive(serde::Deserialize)]
+        struct Response { config: Option<crate::keymaps::File> }
+        Ok(self.get::<Response>("/keymaps", &[])?.config)
+    }
+
     /// The app settings (durian ≥ #439; older ones answer NotFound).
     pub fn settings(&self) -> Result<Settings> {
         Ok(self.get::<SettingsResponse>("/settings", &[])?.settings)

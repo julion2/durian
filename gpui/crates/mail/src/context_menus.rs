@@ -14,8 +14,9 @@ pub fn open(position: Point<Pixels>, items: Vec<MenuItem>, window: &mut Window, 
     window.dispatch_action(Box::new(ShowContextMenu), cx);
 }
 
-fn cmd(label: &str, icon: IconName, action: Box<dyn gpui::Action>) -> MenuItem {
-    let keys = keys_for(action.as_ref());
+fn cmd(label: &str, icon: IconName, action: Box<dyn gpui::Action>, cx: &App) -> MenuItem {
+    // Message menus are shared by split-list and full-thread views.
+    let keys = keys_for(action.as_ref(), &[keymaps::Context::List, keymaps::Context::Thread], cx);
     MenuItem::action(label.to_string(), icon, keys, action)
 }
 
@@ -25,7 +26,11 @@ fn copy(label: &str, icon: IconName, text: impl Into<String>) -> MenuItem {
 }
 
 /// Thread row in the list (right-click also selects it, so commands act on it).
-pub fn thread(thread: &Thread) -> Vec<MenuItem> {
+pub fn thread(thread: &Thread, cx: &App) -> Vec<MenuItem> {
+    let cmd = |label: &str, icon, action: Box<dyn gpui::Action>| {
+        let keys = keys_for(action.as_ref(), &[keymaps::Context::List], cx);
+        MenuItem::action(label.to_string(), icon, keys, action)
+    };
     vec![
         cmd("Reply", IconName::MailReply, Box::new(Reply)),
         cmd("Reply all", IconName::MailReply, Box::new(ReplyAll)),
@@ -47,7 +52,8 @@ pub fn thread(thread: &Thread) -> Vec<MenuItem> {
 }
 
 /// A message card in the thread.
-pub fn message(body: SharedString, sender: SharedString, email: SharedString) -> Vec<MenuItem> {
+pub fn message(body: SharedString, sender: SharedString, email: SharedString, cx: &App) -> Vec<MenuItem> {
+    let cmd = |label: &str, icon, action: Box<dyn gpui::Action>| cmd(label, icon, action, cx);
     vec![
         cmd("Reply", IconName::MailReply, Box::new(Reply)),
         cmd("Reply all", IconName::MailReply, Box::new(ReplyAll)),
@@ -84,7 +90,7 @@ pub fn attachment(attachment: Attachment) -> Vec<MenuItem> {
 
 /// Right-click in an HTML message: the selection, the link under the pointer (if it may be
 /// opened), then what the message itself offers.
-pub fn html_body(selection: String, link: Option<SharedString>, body: SharedString, sender: SharedString, email: SharedString) -> Vec<MenuItem> {
+pub fn html_body(selection: String, link: Option<SharedString>, body: SharedString, sender: SharedString, email: SharedString, cx: &App) -> Vec<MenuItem> {
     let mut items = Vec::new();
     if !selection.trim().is_empty() {
         items.push(copy("Copy", IconName::MailEmail, selection));
@@ -94,7 +100,7 @@ pub fn html_body(selection: String, link: Option<SharedString>, body: SharedStri
         items.extend(self::link(url));
         items.push(MenuItem::Separator);
     }
-    items.extend(message(body, sender, email));
+    items.extend(message(body, sender, email, cx));
     items
 }
 

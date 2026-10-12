@@ -117,6 +117,13 @@ pub struct ThreadList {
 }
 
 impl ThreadList {
+    /// Ctrl-d/u move half the visible pane, in the current row density.
+    pub fn page_size(&self, window: &Window) -> usize {
+        let height = f32::from(window.viewport_size().height) - ui::TITLEBAR_HEIGHT - 96.;
+        let row_height = if self.layout == Layout::Split { ROW_HEIGHT } else { WIDE_ROW_HEIGHT };
+        (height / row_height / 2.).max(1.) as usize
+    }
+
     pub fn new(mailbox: Entity<Mailbox>, cx: &mut Context<Self>) -> Self {
         cx.observe(&mailbox, |this, _, cx| {
             this.refresh_visible(cx);
@@ -372,7 +379,7 @@ impl ThreadList {
                             this.set_search(SharedString::default(), None, cx);
                         })))
                     })
-                    .when(!has_query, |s| s.child(Kbd::new("/"))),
+                    .when(!has_query, |s| s.children(crate::commands::keys_for(&crate::FocusSearch, &[crate::keymaps::Context::List], cx).into_iter().map(Kbd::new))),
             )
             .when(has_query && !saved, |s| {
                 s.child(
@@ -402,6 +409,8 @@ impl ThreadList {
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let title = self.mailbox.read(cx).view_title.clone();
+        let mailbox = self.mailbox.read(cx);
+        let selection = mailbox.selection_mode().map(|mode| format!("{mode} · {}", mailbox.selected_ids(1).len()));
         div()
             .flex()
             .flex_col()
@@ -425,6 +434,7 @@ impl ThreadList {
                     )
                     .child(IconButton::new("inbox-options", IconName::More))
                     .child(div().flex_1())
+                    .children(selection.map(|label| div().text_size(px(SIZE_MINI)).text_color(theme.accent).child(label)))
                     .child(IconButton::new("unread-only", IconName::MailUnreadOnly).on_click(cx.listener(|this, _, _, cx| {
                         // toggles `is:unread` in the current query
                         let text = this.search.read(cx).text().to_string();
@@ -489,6 +499,8 @@ fn render_row(ix: usize, thread: &Thread, mailbox: &Mailbox, selected: bool, the
             .px(px(8.))
             .rounded(theme.radius.md)
             .map(|s| if selected { s.bg(selected_bg) } else { s.hover(|s| s.bg(hover_bg)) })
+            .border_l_2()
+            .border_color(if mailbox.selection_mode().is_some() && mailbox.selected == Some(ix) { accent } else { gpui::transparent_black() })
             .flex()
             .items_start()
             .gap(px(12.))
@@ -577,10 +589,12 @@ fn row_mouse(row: Stateful<Div>, ix: usize, mailbox: &Entity<Mailbox>) -> Statef
         .on_mouse_down(MouseButton::Right, move |event, window, cx| {
             // selecting reads the thread; do it now so the menu's labels match its state
             menu.update(cx, |m, cx| {
+                // This menu names one thread; never silently act on other marks.
+                m.clear_selection(cx);
                 m.select(ix, cx);
                 m.mark_selected_read(cx);
             });
-            let items = context_menus::thread(&menu.read(cx).threads[ix]);
+            let items = context_menus::thread(&menu.read(cx).threads[ix], cx);
             context_menus::open(event.position, items, window, cx);
         })
 }
@@ -622,6 +636,8 @@ fn render_wide_row(ix: usize, thread: &Thread, mailbox: &Mailbox, selected: bool
             .pr(px(12.))
             .rounded(theme.radius.md)
             .map(|s| if selected { s.bg(theme.bg_selected) } else { s.hover(|s| s.bg(theme.bg_group)) })
+            .border_l_2()
+            .border_color(if mailbox.selection_mode().is_some() && mailbox.selected == Some(ix) { theme.accent } else { gpui::transparent_black() })
             .flex()
             .items_center()
             .gap(px(10.))
@@ -721,9 +737,10 @@ impl Render for ThreadList {
                 let started = std::time::Instant::now();
                 let mailbox_ref = mailbox.read(cx);
                 let theme = cx.theme();
+                let marked: std::collections::HashSet<_> = mailbox_ref.selected_ids(1).into_iter().collect();
                 let rows = range
                     .filter_map(|row| visible.get(row).copied())
-                    .map(|ix| row_mouse(render_row(ix, &mailbox_ref.threads[ix], mailbox_ref, mailbox_ref.selected == Some(ix), theme), ix, &mailbox))
+                    .map(|ix| row_mouse(render_row(ix, &mailbox_ref.threads[ix], mailbox_ref, marked.contains(&mailbox_ref.threads[ix].id), theme), ix, &mailbox))
                     .collect();
                 crate::trace::slow("list rows", started);
                 rows
@@ -733,6 +750,7 @@ impl Render for ThreadList {
             .into_any_element(),
             Layout::List => {
                 let this = cx.entity().downgrade();
+                let marked: std::collections::HashSet<_> = self.mailbox.read(cx).selected_ids(1).into_iter().collect();
                 list(self.list_state.clone(), move |row, _window, cx| {
                     let Some(this) = this.upgrade() else { return div().into_any_element() };
                     let (row, collapsed, mailbox) = {
@@ -748,9 +766,12 @@ impl Render for ThreadList {
                             .into_any_element(),
                         Row::Thread(ix) => {
                             let m = mailbox.read(cx);
-                            row_mouse(render_wide_row(ix, &m.threads[ix], m, m.selected == Some(ix), &theme), ix, &mailbox)
+                            let selecting = m.selection_mode().is_some();
+                            row_mouse(render_wide_row(ix, &m.threads[ix], m, marked.contains(&m.threads[ix].id), &theme), ix, &mailbox)
                                 // a click opens the thread full width (Enter does the same)
-                                .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenThread), cx))
+                                .on_click(move |_, window, cx| {
+                                    if !selecting { window.dispatch_action(Box::new(crate::OpenThread), cx); }
+                                })
                                 .into_any_element()
                         }
                     }

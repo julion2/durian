@@ -196,7 +196,7 @@ BACKEND_PID=$(pgrep -P "$APP_PID" -x durian-cli)
 expect_inbox_count live 0
 echo 'PASS packaged sibling backend and opening a thread marks it read'
 
-xdotool key --clearmodifiers e
+xdotool key --clearmodifiers a
 expect_screen archived 'Different thread' 'Reply body'
 [[ "$("$CLI" count 'tag:inbox')" == 1 ]]
 [[ "$("$CLI" count 'subject:Hello AND tag:archive')" == 1 ]]

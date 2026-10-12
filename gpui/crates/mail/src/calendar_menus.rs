@@ -18,8 +18,8 @@ use crate::commands::keys_for;
 use crate::event_compose::EventSeed;
 use crate::*;
 
-fn cmd(label: &str, icon: IconName, action: Box<dyn gpui::Action>) -> MenuItem {
-    let keys = keys_for(action.as_ref());
+fn cmd(label: &str, icon: IconName, action: Box<dyn gpui::Action>, cx: &App) -> MenuItem {
+    let keys = keys_for(action.as_ref(), &[keymaps::Context::Calendar], cx);
     MenuItem::action(label.to_string(), icon, keys, action)
 }
 
@@ -118,6 +118,7 @@ fn plan(e: &Event, schedule: &Schedule, has_invitation: bool) -> Vec<Entry> {
 }
 
 fn event(e: Event, schedule: &Entity<Schedule>, workspace: WeakEntity<MailWorkspace>, cx: &App) -> Vec<MenuItem> {
+    let cmd = |label: &str, icon, action: Box<dyn gpui::Action>| cmd(label, icon, action, cx);
     let has_invitation = workspace.upgrade().is_some_and(|ws| ws.read(cx).invitation_thread(&e.id, cx).is_some());
     let me = schedule.read(cx).me.clone();
     let others: Vec<SharedString> = e.attendees.iter().filter(|a| !me.iter().any(|m| m.eq_ignore_ascii_case(&a.email))).map(|a| a.email.clone()).collect();

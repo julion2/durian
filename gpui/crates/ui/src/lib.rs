@@ -44,12 +44,17 @@ use gpui::{AbsoluteLength, Animation, App, Styled, ease_out_quint, px};
 /// Fonts + key bindings for the components. Call before opening a window.
 pub fn init(cx: &mut App) -> anyhow::Result<()> {
     Assets::load_fonts(cx)?;
+    bind_keys(cx);
+    Ok(())
+}
+
+/// Reinstall component bindings after the host clears its keymap for a config reload.
+pub fn bind_keys(cx: &mut App) {
     bind_text_input_keys(cx);
     bind_text_area_keys(cx);
     bind_picker_keys(cx);
     bind_dialog_keys(cx);
     bind_context_menu_keys(cx);
-    Ok(())
 }
 
 /// Entrance motion shared by overlays (menus, pickers, dialogs, sheets, toasts): short and
