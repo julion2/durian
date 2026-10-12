@@ -1,0 +1,7 @@
+import "modulepath:/Profiles.pkl" as P
+
+profiles: Listing<P.ProfileConfig> = new {
+  new { name = "Synthetic All"; accounts = new { "*" }; default = true; folders = P.standardFolders }
+  new { name = "Alpha"; accounts = new { "alpha" }; folders = P.standardFolders }
+  new { name = "Beta and Gamma"; accounts = new { "beta"; "gamma" }; folders = P.standardFolders }
+}

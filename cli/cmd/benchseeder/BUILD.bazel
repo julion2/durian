@@ -1,0 +1,19 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "benchseeder_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/julion2/durian/cli/cmd/benchseeder",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//cli/internal/contacts",
+        "//cli/internal/dbcrypto",
+        "//cli/internal/store",
+    ],
+)
+
+go_binary(
+    name = "benchseeder",
+    embed = [":benchseeder_lib"],
+    visibility = ["//visibility:public"],
+)

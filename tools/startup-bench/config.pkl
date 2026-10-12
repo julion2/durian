@@ -1,0 +1,10 @@
+import "modulepath:/Config.pkl" as C
+
+settings: C.SettingsConfig = new { notifications_enabled = false; load_remote_images = false }
+sync: C.SyncConfig = new { gui_auto_sync = false; tag_sync = null }
+calendar: C.CalendarConfig = new { autosync = false }
+contacts: C.ContactsConfig = new {}
+signatures: Mapping<String, String> = new {}
+// Empty configured accounts: no SMTP, IMAP, JMAP, Graph or calendar providers.
+// Synthetic database accounts remain available to local read-only searches.
+accounts: Listing<C.AccountConfig> = new {}
