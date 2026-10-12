@@ -60,9 +60,11 @@ with the new token; same-session SSE disconnects reconnect automatically.
   the startup answer. A failed startup search shows an explicit retry, not a duplicate request.
   Old servers can fall back to cached/evaluated profile configuration.
 - Search runs on the server, with local refinement only for terms the API cannot express.
-  Generations reject obsolete answers. The first page is 200 rows, with previews for the first
-  50; later pages increase the limit without enrichment. A full thread replaces its preview,
-  preserving full HTML and provider-scoped message identity.
+  Generations reject obsolete answers. The first page has 50 rows, all with previews. Paging
+  fetches the lightweight row prefix and batches only missing/changed previews; already-visible
+  content stays in memory. Batches respect the server's 1024-byte query cap and the client's
+  unchanged 10 MiB response cap. Superseded searches stop further preview requests. A full
+  thread replaces its preview, preserving full HTML and provider-scoped message identity.
 - Timed response reads interrupted by Linux signals resume on the same connection with the
   remaining deadline. This never replays an HTTP request or retries a transmission; the normal
   20 s request deadline remains. TLS/proxy connection setup has no added retry behavior.
@@ -75,8 +77,16 @@ with the new token; same-session SSE disconnects reconnect automatically.
   catches dropped hints and external tag changes that do not broadcast SSE. Cmd-R/Ctrl-R is
   an explicit refresh; failures keep the old list visible with an error.
 - Sidebar badges use scoped server count queries, not the loaded page or current search.
-  Unknown counts remain unknown and transient failures retain the last known values. Only HTTP
-  429 retries automatically, with four attempts and bounded 500 ms / 1 s / 2 s backoff.
+  Unknown counts remain unknown and transient failures retain the last known values. Searches
+  and counts share client admission at eight requests/s, below Go's unchanged ten/s limiter;
+  waiting foreground searches go before waiting counts. The first read has no pacing delay.
+  Only explicit HTTP 429 search/count responses retry (four total attempts), sharing the
+  server's `Retry-After` cooldown (seconds or HTTP date; otherwise 1 s / 2 s / 4 s).
+  Admission waits are bounded to 20 s; a longer advertised cooldown is not shortened to retry.
+  Superseded count batches cancel while waiting. Other reads and mutations are not paced or
+  retried by this mechanism. Large sidebar batches take longer to fill instead of exhausting
+  the search budget. Refreshes of unchanged queries coalesce into one follow-up batch rather
+  than repeatedly restarting a long batch; the 60 s/manual/SSE triggers remain active.
   On an empty startup list, the initial count batch waits for the first search response so it
   cannot crowd the single SQLite connection before useful mail; search failure also releases it.
 - Calendar windows include local calendars. Details and occurrences are scoped by account,
@@ -198,6 +208,16 @@ The startup UI contract holds real Go response bodies behind explicit barriers. 
 initial request, navigation away/back with pending responses, refresh after a real tag change,
 visible failure with manual retry, and an empty inbox releasing sidebar counts. The fixture is
 already read, so legitimate mark-read writes/refreshes cannot be mistaken for startup duplicates.
+It also starts with 80 configured folder queries, searches and repeatedly refreshes while
+badges are filling; every count must finish and no response may be HTTP 429. The backend
+contract independently runs 80 counts plus eight foreground searches against Go's real limiter.
+Scroll-only cases verify actual body snippets beyond row 50 and after paging beyond row 200,
+then repeat after refresh without selecting those messages. The larger fixture has 64 KiB
+bodies, so enriching the whole prefix exceeds the response bound. A held paging response also
+checks navigation and cancellation of remaining preview requests. Startup shares one `/profiles`
+answer between identity and folder scope. Go batches light conversation reads without fetching
+HTML/Bcc blobs. Corrupt preview bodies fail the search explicitly instead of silently omitting
+their content. The HTTP format is unchanged.
 The calendar UI contract injects lost create/delete acknowledgements, rejected edits/RSVP,
 failed reconciliation and failed scoped sync against the real Go server. It verifies exact
 neighbor preservation, stable create UID, editor/notes retention, native clipboard shortcuts,
@@ -240,16 +260,25 @@ are separate from the earlier matrices, not a replacement for their observations
 
 ## Remaining parity work, in order
 
-1. Agree durable calendar recovery across app exit and finish provider/macOS write
+1. Improve useful-mail startup, not just the empty window's first frame. Preview loss beyond
+   row 50/paging is fixed and native-tested; measure CLI readiness, metadata, search, preview
+   and rendering separately on macOS rather than assuming a cache miss explains the delay.
+   Keep mail content in memory only, not in a second persisted list snapshot. Paging still
+   re-requests the row prefix, but not unchanged bodies. Broad encrypted search, cursor
+   pagination and a compact list-ready API remain work; even a bounded conversation batch
+   can exceed the unchanged response byte cap for exceptionally large threads.
+2. Port user keymaps from Swift: the same `keymaps.pkl`, action/context semantics, overrides,
+   disabled bindings, sequences/counts, timeouts and reload behavior. No second user format.
+   Go already loads/validates keymaps, but has no HTTP endpoint; its schema/validator also lack
+   Swift's calendar context. Agree any API/schema extension before implementing that boundary.
+3. Rename the client directory separately from behavioral changes. Prefer `app/` over `ui/`:
+   it contains application/backend lifecycle as well as views; `crates/ui` is the widget layer.
+4. Agree durable calendar recovery across app exit and finish provider/macOS write
    acceptance. Larger durable attachments require extending the Go draft storage contract,
    rather than using temporary paths or pretending an oversized draft was saved.
-2. Profile and improve startup and broad search on large encrypted stores. The 400–500 ms goal
-   remains unmet in the measured Linux baseline. Paging still re-fetches the prefix
-   because the API has no cursor; selected-thread priority is not a strict bound on all HTTP work.
-3. Add custom keymaps, settings reload, notifications,
-   account/auth management and complete message-header inspection.
+5. Add settings reload, notifications, account/auth management and complete message-header inspection.
    Existing Swift managers and tests are the reference for behavior, not a second backend.
-4. Finish Linux distribution installation packaging and Wayland acceptance. Exercise macOS
+6. Finish Linux distribution installation packaging and Wayland acceptance. Exercise macOS
    packaging/WebKit on macOS separately; Linux tests cannot establish native macOS behavior.
 
 The imported prototype's historical design/API notes live under `docs/`; this README describes

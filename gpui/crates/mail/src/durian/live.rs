@@ -38,10 +38,8 @@ use crate::trace;
 
 /// What an empty search shows.
 pub const INBOX: &str = "tag:inbox";
-/// Rows per page: many screens' worth, small enough to answer quickly.
-pub const PAGE: usize = 200;
-/// Threads that arrive with their content in a first page (open without a wait).
-const ENRICH: usize = 50;
+/// Several screens with previews, rather than a large, mostly empty first page.
+pub const PAGE: usize = 50;
 /// Full threads kept in memory.
 const CACHE: usize = 300;
 /// Thread requests at once: the open one always goes, prefetch fills up to this.
@@ -158,6 +156,8 @@ pub struct Live {
     last_change: Option<Instant>,
     /// the search in flight (dropping it drops its answer)
     search: Option<Task<()>>,
+    /// Also stop superseded preview batches still running off the UI thread.
+    search_cancel: Option<Arc<AtomicBool>>,
     /// waits for typing to pause, then searches for the unfinished word too
     settle: Option<Task<()>>,
     connect: Option<Task<()>>,
@@ -188,6 +188,9 @@ impl EventEmitter<LiveEvent> for Live {}
 
 impl Drop for Live {
     fn drop(&mut self) {
+        if let Some(cancel) = &self.search_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
         if let Some(cancel) = &self.count_cancel {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -210,16 +213,21 @@ impl Live {
         let client = Arc::new(client);
         let (start_tx, start) = std::sync::mpsc::channel();
         let (identity_tx, identity) = std::sync::mpsc::channel();
+        let (profiles_tx, profiles_rx) = std::sync::mpsc::channel();
         let (c1, c2) = (client.clone(), client.clone());
         std::thread::spawn(move || {
-            let _ = identity_tx.send(identify(&c1));
+            let _ = identity_tx.send(identify(&c1, || profiles_rx.recv().unwrap_or_else(|_| Err(client::Error::Decode("profiles thread ended".into())))));
         });
         std::thread::spawn(move || {
             // profiles: the server's; from a server without /profiles (or none reachable),
             // profiles.pkl – cached, or evaluated after the first page (pkl takes 1–2 s)
             let cache = crate::cache_dir("durian");
             let mut evaluate = None;
-            let profiles = match c2.profiles() {
+            // Scope and identity must use the same configuration answer, not two
+            // concurrent evaluations which can even observe different file revisions.
+            let response = c2.profiles();
+            let _ = profiles_tx.send(response.clone());
+            let profiles = match response {
                 Ok(response) => Some(profiles::from_api(&response)),
                 Err(_) => {
                     let config = profiles::config_dir();
@@ -233,7 +241,7 @@ impl Live {
             let home = profiles.as_deref().and_then(|p| profiles::default_index(p).map(|ix| &p[ix]));
             let first = compose(home.and_then(profiles::scope).as_deref(), home.and_then(|p| p.home()).map(|f| f.query.as_ref()), "");
             let _ = start_tx.send(Start::Searching(first.clone(), profiles));
-            let page = c2.search(&first, PAGE, ENRICH);
+            let page = c2.search(&first, PAGE, PAGE);
             let _ = start_tx.send(Start::Page(first, page));
             if let Some(config) = evaluate {
                 match profiles::evaluate(&config, &cache) {
@@ -286,6 +294,7 @@ impl Live {
             forward_task: None,
             last_change: None,
             search: None,
+            search_cancel: None,
             settle: None,
             connect: None,
             fetches: HashMap::new(),
@@ -350,6 +359,7 @@ impl Live {
         self.events = None;
         self.event_task = None;
         self.search = None;
+        if let Some(cancel) = self.search_cancel.take() { cancel.store(true, Ordering::Relaxed); }
         self.settle = None;
         self.mail_refreshing = true;
         self.generation += 1;
@@ -622,7 +632,7 @@ impl Live {
                 self.first_page = FirstPage::Done;
                 self.connect = Some(cx.spawn(async move |this, cx| {
                     let started = Instant::now();
-                    let identity = executor.spawn(async move { identify(&client) }).await;
+                    let identity = executor.spawn(async move { identify(&client, || client.profiles()) }).await;
                     this.update(cx, |this, cx| this.connected(identity, started.elapsed(), cx)).ok();
                 }));
             }
@@ -823,16 +833,22 @@ impl Live {
         }
     }
 
-    /// One bounded batch at a time. A newer scope/SSE refresh queues one replacement
-    /// batch and supersedes old replies without creating another set of workers.
+    /// One bounded batch at a time. A changed scope supersedes old replies;
+    /// refreshes of the same queries coalesce into one follow-up batch.
     fn refresh_counts(&mut self, force: bool, cx: &mut Context<Self>) {
         if !matches!(self.status, Status::Connected { .. }) {
             return;
         }
         let m = self.mailbox.read(cx);
         let context = (m.profile, m.account_filter.clone(), m.count_queries());
-        if !force && self.count_context.as_ref() == Some(&context) {
-            return;
+        if self.count_context.as_ref() == Some(&context) {
+            if !force { return; }
+            if self.count_task.is_some() {
+                // A large paced sidebar may take longer than the reconciliation
+                // interval. Restarting it for every hint would starve its tail.
+                self.count_pending = true;
+                return;
+            }
         }
         self.count_context = Some(context);
         self.count_generation += 1;
@@ -968,6 +984,7 @@ impl Live {
     fn search(&mut self, delay: Duration, cx: &mut Context<Self>) {
         let Some(remote) = self.mailbox.read(cx).remote.as_ref() else { return };
         let (query, limit) = (remote.server_query.clone(), remote.limit);
+        if let Some(cancel) = self.search_cancel.take() { cancel.store(true, Ordering::Relaxed); }
         if limit == PAGE && matches!(&self.first_page, FirstPage::Pending(pending) if *pending == query) {
             // Returning to the startup query also supersedes another search.
             self.generation += 1;
@@ -983,19 +1000,24 @@ impl Live {
             self.search = None;
             return self.searched(self.generation, limit, Ok(page), Duration::ZERO, cx);
         }
-        // the first page brings the top threads' content; further pages only rows (the top
-        // ones are cached by then)
-        let enrich = if limit <= PAGE { ENRICH } else { 0 };
+        // Reuse only actual content, not summary stand-ins. A freshness refresh clears
+        // stamps, so same-date/same-tag edits still fetch new previews.
+        let known: HashMap<SharedString, Stamp> = self.mailbox.read(cx).threads.iter()
+            .filter(|t| !t.latest().id.is_empty())
+            .filter_map(|t| self.stamps.get(&t.id).map(|stamp| (t.id.clone(), stamp.clone())))
+            .collect();
         self.generation += 1;
         let generation = self.generation;
         let client = self.client.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.search_cancel = Some(cancel.clone());
         let executor = cx.background_executor().clone();
         self.search = Some(cx.spawn(async move |this, cx| {
             if !delay.is_zero() {
                 executor.timer(delay).await;
             }
             let started = Instant::now();
-            let result = executor.spawn(async move { client.search(&query, limit, enrich) }).await;
+            let result = executor.spawn(async move { search_page(&client, &query, limit, &known, &cancel) }).await;
             this.update(cx, |this, cx| this.searched(generation, limit, result, started.elapsed(), cx)).ok();
         }));
     }
@@ -1006,6 +1028,7 @@ impl Live {
             return;
         }
         self.search = None;
+        if let Some(cancel) = self.search_cancel.take() { cancel.store(true, Ordering::Relaxed); }
         let response = match result {
             Ok(response) => response,
             Err(e) => {
@@ -1021,13 +1044,17 @@ impl Live {
         let stamps: HashMap<SharedString, Stamp> = response.results.iter().map(|r| (r.thread_id.clone().into(), Stamp::new(r.timestamp, &r.tags))).collect();
         // a full thread we have beats the content that came along: search content is a
         // preview (durian sends no HTML with it), good for the list, opened via /threads
+        let previous: HashMap<_, _> = self.mailbox.read(cx).threads.iter().map(|t| (t.id.as_ref(), t)).collect();
         let threads: Vec<_> = response
             .results
             .iter()
             .map(|r| {
                 self.cache.get(&r.thread_id, &stamps[r.thread_id.as_str()]).unwrap_or_else(|| {
                     let preview = response.threads.get(&r.thread_id).and_then(|content| super::thread(content, now, self.policy));
-                    preview.map(|t| Thread { partial: true, ..t }).unwrap_or_else(|| super::summary(r, now))
+                    preview.map(|t| Thread { partial: true, ..t }).or_else(|| {
+                        (self.stamps.get(r.thread_id.as_str()) == stamps.get(r.thread_id.as_str()))
+                            .then(|| previous.get(r.thread_id.as_str()).map(|t| (*t).clone())).flatten()
+                    }).unwrap_or_else(|| super::summary(r, now))
                 })
             })
             .collect();
@@ -1312,37 +1339,54 @@ impl Live {
 /// One account's calendars and their events in the window.
 type AccountCalendars = (SharedString, Vec<api::Calendar>, Vec<api::CalendarEvent>);
 
+/// The first page arrives in one request. Later pages fetch the lightweight row prefix,
+/// then only missing/changed content, at most PAGE conversations per HTTP response.
+/// Never raise the response byte cap to accommodate a growing prefix of message bodies.
+fn search_page(client: &Client, query: &str, limit: usize, known: &HashMap<SharedString, Stamp>, cancel: &AtomicBool) -> client::Result<api::SearchResponse> {
+    if limit <= PAGE {
+        return client.search_cancellable(query, limit, limit, cancel);
+    }
+    let mut page = client.search_cancellable(query, limit, 0, cancel)?;
+    let missing: Vec<_> = page.results.iter()
+        .filter(|row| known.get(row.thread_id.as_str()) != Some(&Stamp::new(row.timestamp, &row.tags)))
+        .map(|row| row.thread_id.as_str()).collect();
+    let mut remaining = missing.as_slice();
+    while !remaining.is_empty() {
+        let mut query = String::new();
+        let mut count = 0;
+        for id in remaining.iter().take(PAGE) {
+            let term = format!("thread:{}", super::translate::quoted(id));
+            let separator = if query.is_empty() { "" } else { " OR " };
+            // The existing Go search contract caps decoded queries at 1024 bytes.
+            if query.len() + separator.len() + term.len() > 1024 { break }
+            query.push_str(separator);
+            query.push_str(&term);
+            count += 1;
+        }
+        if count == 0 { return Err(client::Error::Decode("thread id exceeds search query limit".into())) }
+        let (batch, rest) = remaining.split_at(count);
+        let mut response = client.search_cancellable(&query, batch.len(), batch.len(), cancel)?;
+        for id in batch {
+            let content = response.threads.remove(*id).ok_or_else(|| client::Error::Decode("search preview missing; refresh to retry".into()))?;
+            page.threads.insert((*id).to_string(), content);
+        }
+        remaining = rest;
+    }
+    Ok(page)
+}
+
 /// A failure affects only its query; callers retain that query's last known count.
-/// Cancellation stops between waves; at most four already-active GETs finish.
+/// At most four GETs are active; the client paces admissions with foreground priority.
+/// Cancellation also stops workers still waiting for a rate slot or server cooldown.
 fn counts(client: &Client, queries: &[String], cancel: &AtomicBool) -> Vec<(String, client::Result<u64>)> {
     queries.chunks(COUNT_IN_FLIGHT).take_while(|_| !cancel.load(Ordering::Relaxed)).flat_map(|batch| {
         std::thread::scope(|s| {
             let handles: Vec<_> = batch.iter().map(|q| s.spawn(move || {
-                (q.clone(), count_with_backoff(client, q, cancel))
+                (q.clone(), client.count_cancellable(q, cancel))
             })).collect();
             handles.into_iter().map(|h| h.join().expect("count worker panicked")).collect::<Vec<_>>()
         })
     }).collect()
-}
-
-/// Search and count share Go's rate limit. A large sidebar can exhaust its
-/// startup burst even with four flights, so retry only explicit 429 reads.
-/// Keep backoff cancellable and bounded; mutations never use this retry path.
-fn count_with_backoff(client: &Client, query: &str, cancel: &AtomicBool) -> client::Result<u64> {
-    let cancelled = || client::Error::Unreachable("count refresh superseded".into());
-    for attempt in 0..4 {
-        if cancel.load(Ordering::Relaxed) { return Err(cancelled()); }
-        let result = client.count(query);
-        if attempt == 3 || !matches!(result, Err(client::Error::Server { status: 429, .. })) {
-            return result;
-        }
-        let until = Instant::now() + Duration::from_millis(500 << attempt);
-        while Instant::now() < until {
-            if cancel.load(Ordering::Relaxed) { return Err(cancelled()); }
-            std::thread::sleep(Duration::from_millis(25).min(until.saturating_duration_since(Instant::now())));
-        }
-    }
-    unreachable!("the last attempt returns its result")
 }
 
 /// Every account's calendars and events in [from, to). An account without calendars (or one
@@ -1499,14 +1543,14 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, client::Result<T>>) -> cl
 
 /// Who you are on this server: version, tags, and – from sent mail – accounts and addresses.
 /// After the version check the requests run at once (each server query costs ~100–400 ms).
-fn identify(client: &Client) -> client::Result<Identity> {
+fn identify(client: &Client, profiles: impl FnOnce() -> client::Result<api::ProfilesResponse>) -> client::Result<Identity> {
     // version first: it answers "reachable, and the token works?" cheaply
     let version = client.version()?.version.into();
     let (tags, who, settings) = std::thread::scope(|s| {
         let tags = s.spawn(|| client.tags());
         let settings = s.spawn(|| client.settings());
         // the configured accounts, where the server serves them; else guessed from sent mail
-        let who = match client.profiles() {
+        let who = match profiles() {
             Ok(response) => Ok(configured_identities(&response)),
             Err(client::Error::NotFound(_)) => client.search("tag:sent", SENT_SAMPLE, SENT_SAMPLE).map(|sent| identities(sent.threads.values())),
             Err(e) => Err(e),
@@ -1725,7 +1769,7 @@ mod tests {
             let result = counts(&client, &queries, &cancel);
             assert_eq!(result.len(), expected);
             let peak = server.join().unwrap();
-            assert!((2..=4).contains(&peak), "count concurrency was {peak}, expected bounded parallel requests");
+            assert!((1..=4).contains(&peak), "count concurrency was {peak}, expected bounded requests");
             let result: HashMap<_, _> = result.into_iter().collect();
             assert!(matches!(result["tag:failed"], Err(client::Error::Server { status: 500, .. })));
             assert!(matches!(result["tag:unknown"], Err(client::Error::Unauthorized)));

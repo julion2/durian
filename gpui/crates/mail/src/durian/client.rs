@@ -1,8 +1,8 @@
 //! Authenticated durian HTTP API. Blocking (ureq): call it off the UI thread.
 
 use std::fmt;
-use std::sync::{Arc, atomic::AtomicBool};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -45,12 +45,25 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Largest attachment read into memory (mail servers cap messages well below this).
 const ATTACHMENT_LIMIT: u64 = 256 << 20;
 
+/// Go shares 10 requests/s (burst 30) between search and count. Keep below that
+/// sustained rate instead of spending the burst on background sidebar badges.
+const READ_SPACING: Duration = Duration::from_millis(125);
+const READ_WAIT_LIMIT: Duration = Duration::from_secs(20);
+
+struct ReadBudget {
+    next: Instant,
+    paused_until: Instant,
+    waiting_searches: usize,
+}
+
 pub struct Client {
     /// e.g. "http://127.0.0.1:9723/api/v1"
     base: String,
     /// bearer token printed by `durian serve` (none with `--no-auth`)
     token: Option<String>,
     agent: ureq::Agent,
+    /// Shared by preconnect, interactive searches and every count worker.
+    reads: Mutex<ReadBudget>,
 }
 
 /// Percent-encode one path segment (ids are opaque and may contain ':' or '/').
@@ -76,7 +89,11 @@ impl Client {
         // reads after connecting; a POST/PUT is never sent a second time.
         let connector = DefaultConnector::default().chain(super::transport::InterruptedConnector);
         let agent = ureq::Agent::with_parts(config, connector, DefaultResolver::default());
-        Self { base: format!("{}/api/v1", server.trim_end_matches('/')), token, agent }
+        let now = Instant::now();
+        Self {
+            base: format!("{}/api/v1", server.trim_end_matches('/')), token, agent,
+            reads: Mutex::new(ReadBudget { next: now, paused_until: now, waiting_searches: 0 }),
+        }
     }
 
     fn call(&self, path: &str, query: &[(&str, &str)]) -> Result<ureq::http::Response<ureq::Body>> {
@@ -105,6 +122,64 @@ impl Client {
     fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T> {
         let mut response = self.call(path, query)?;
         Self::decode(path, &mut response)
+    }
+
+    /// Wait off the UI thread, without reserving a queue of future count slots.
+    /// A newly requested mail list goes before any counts still waiting for admission.
+    /// Already-sent reads finish normally; superseded counts never start another GET.
+    fn wait_read(&self, foreground: bool, cancel: Option<&AtomicBool>) -> Result<()> {
+        let deadline = Instant::now() + READ_WAIT_LIMIT;
+        let mut budget = self.reads.lock().unwrap();
+        if foreground { budget.waiting_searches += 1; }
+        loop {
+            let now = Instant::now();
+            let cancelled = cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed));
+            if cancelled || now >= deadline {
+                if foreground { budget.waiting_searches -= 1; }
+                return Err(Error::Unreachable(if cancelled { "search refresh superseded" } else { "search admission timed out" }.into()));
+            }
+            let ready = budget.next.max(budget.paused_until);
+            if now >= ready && (foreground || budget.waiting_searches == 0) {
+                if foreground { budget.waiting_searches -= 1; }
+                budget.next = now + READ_SPACING;
+                return Ok(());
+            }
+            let delay = if now < ready { ready - now } else { Duration::from_millis(25) };
+            drop(budget);
+            std::thread::sleep(delay.min(Duration::from_millis(25)));
+            budget = self.reads.lock().unwrap();
+        }
+    }
+
+    /// Only explicit 429 responses from these idempotent reads retry. Share the
+    /// server's cooldown, so four count workers cannot independently rush it again.
+    /// Transport errors, other statuses and all mutations keep their original behavior.
+    fn search_get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)], cancel: Option<&AtomicBool>) -> Result<T> {
+        for attempt in 0..4 {
+            self.wait_read(path == "/search", cancel)?;
+            let mut response = self.call(path, query)?;
+            if response.status().as_u16() != 429 {
+                return Self::decode(path, &mut response);
+            }
+            let retry = response.headers().get("retry-after").and_then(|value| value.to_str().ok()).and_then(|value| {
+                value.trim().parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(value).ok()
+                        .map(|date| (date.with_timezone(&chrono::Utc) - chrono::Utc::now()).to_std().unwrap_or_default())
+                })
+            }).unwrap_or(Duration::from_secs(1 << attempt));
+            let Some(until) = Instant::now().checked_add(retry) else { return Self::decode(path, &mut response) };
+            {
+                let mut budget = self.reads.lock().unwrap();
+                budget.paused_until = budget.paused_until.max(until);
+            }
+            crate::trace::note(&format!("durian: {path} rate limited; cooldown {retry:.1?}, attempt {} of 4", attempt + 1));
+            // Do not wait indefinitely for an external server; nor shorten its
+            // Retry-After to force an early retry. Return the actual 429 instead.
+            if attempt == 3 || retry >= READ_WAIT_LIMIT {
+                return Self::decode(path, &mut response);
+            }
+        }
+        unreachable!("the last attempt returns its result")
     }
 
     /// Shared authenticated JSON transport for mail and calendar writes. Never retries
@@ -178,11 +253,19 @@ impl Client {
 
     /// Threads matching a durian query, newest first; the first `enrich` come with content.
     pub fn search(&self, query: &str, limit: usize, enrich: usize) -> Result<SearchResponse> {
-        self.get("/search", &[("query", query), ("limit", &limit.to_string()), ("enrich", &enrich.to_string())])
+        self.search_get("/search", &[("query", query), ("limit", &limit.to_string()), ("enrich", &enrich.to_string())], None)
+    }
+
+    pub(super) fn search_cancellable(&self, query: &str, limit: usize, enrich: usize, cancel: &AtomicBool) -> Result<SearchResponse> {
+        self.search_get("/search", &[("query", query), ("limit", &limit.to_string()), ("enrich", &enrich.to_string())], Some(cancel))
     }
 
     pub fn count(&self, query: &str) -> Result<u64> {
-        Ok(self.get::<SearchCount>("/search/count", &[("query", query)])?.count)
+        Ok(self.search_get::<SearchCount>("/search/count", &[("query", query)], None)?.count)
+    }
+
+    pub(super) fn count_cancellable(&self, query: &str, cancel: &AtomicBool) -> Result<u64> {
+        Ok(self.search_get::<SearchCount>("/search/count", &[("query", query)], Some(cancel))?.count)
     }
 
     pub fn contacts(&self, query: &str) -> Result<Vec<Contact>> {
@@ -351,6 +434,122 @@ mod tests {
         // nothing listening
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         assert!(matches!(Client::new(&format!("http://127.0.0.1:{port}"), None).version().unwrap_err(), Error::Unreachable(_)));
+    }
+
+    #[test]
+    fn search_preempts_counts_after_shared_retry_after_and_writes_never_retry() {
+        use std::io::Read;
+
+        for date_header in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let client = Client::new(&format!("http://{}", listener.local_addr().unwrap()), Some("budget-token".into()));
+            let (limited_tx, limited_rx) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let mut not_before = Instant::now();
+                let mut previous_read = None;
+                // Initial count 429, unrelated version, non-replayed write 429,
+                // foreground search, then the retried count and three other counts.
+                for index in 0..8 {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                            Err(e) => panic!("read-budget accept: {e}"),
+                        }
+                    };
+                    let arrived = Instant::now();
+                    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request = String::new();
+                    loop {
+                        let mut line = String::new();
+                        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                        if line == "\r\n" { break }
+                        request.push_str(&line);
+                    }
+                    assert!(request.to_lowercase().contains("authorization: bearer budget-token"));
+                    let (status, body) = match index {
+                        0 => { assert!(request.starts_with("GET /api/v1/search/count?")); (429, r#"{"ok":false,"error":"rate limited"}"#) }
+                        1 => { assert!(request.starts_with("GET /api/v1/version ")); (200, r#"{"ok":true,"version":"budget-test"}"#) }
+                        2 => {
+                            assert!(request.starts_with("POST /api/v1/threads/one/tags "));
+                            let length: usize = request.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|n| n.trim().parse().unwrap())).unwrap();
+                            let mut body = vec![0; length];
+                            reader.read_exact(&mut body).unwrap();
+                            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({"tags": "+flagged"}));
+                            (429, r#"{"ok":false,"error":"write refused"}"#)
+                        }
+                        3 => {
+                            assert!(request.starts_with("GET /api/v1/search?"), "queued counts must not take the foreground's slot: {request}");
+                            (200, r#"{"ok":true,"results":[],"threads":{}}"#)
+                        }
+                        _ => { assert!(request.starts_with("GET /api/v1/search/count?")); (200, r#"{"ok":true,"count":7}"#) }
+                    };
+                    if index >= 3 {
+                        assert!(arrived >= not_before, "a different reader ignored the shared Retry-After");
+                        if let Some(previous) = previous_read {
+                            assert!(arrived.duration_since(previous) >= Duration::from_millis(100), "background reads still burst after cooldown");
+                        }
+                        previous_read = Some(arrived);
+                    }
+                    let header = if index == 0 && date_header {
+                        let at = chrono::Utc::now() + chrono::Duration::seconds(3);
+                        // HTTP dates have second precision. Compare wire arrivals
+                        // to the actual advertised instant, not the client's parser.
+                        let delay = Duration::from_millis((at.timestamp() * 1000 - chrono::Utc::now().timestamp_millis()) as u64);
+                        not_before = Instant::now() + delay;
+                        format!("Retry-After: {}\r\n", at.format("%a, %d %b %Y %H:%M:%S GMT"))
+                    } else if index == 0 {
+                        not_before = Instant::now() + Duration::from_secs(1);
+                        "Retry-After: 1\r\n".into()
+                    } else { String::new() };
+                    write!(stream, "HTTP/1.1 {status} X\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    if index == 0 { limited_tx.send(()).unwrap(); }
+                }
+            });
+            std::thread::scope(|scope| {
+                let first = scope.spawn(|| client.count("tag:inbox"));
+                limited_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(client.version().unwrap().version, "budget-test", "unrelated reads must not wait for search cooldown");
+                assert_eq!(client.tag_thread("one", "+flagged"), Err(Error::Server { status: 429, message: "write refused".into() }));
+                let counts: Vec<_> = (0..3).map(|_| scope.spawn(|| client.count("tag:inbox"))).collect();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let stop = cancel.clone();
+                let cancellable_client = &client;
+                let cancelled = scope.spawn(move || cancellable_client.count_cancellable("tag:cancelled", &cancel));
+                std::thread::sleep(Duration::from_millis(50));
+                stop.store(true, Ordering::Relaxed);
+                assert!(cancelled.join().unwrap().is_err());
+                assert!(client.search("tag:inbox", 7, 0).unwrap().results.is_empty());
+                assert_eq!(first.join().unwrap(), Ok(7));
+                for count in counts { assert_eq!(count.join().unwrap(), Ok(7)); }
+            });
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn search_rate_limit_retries_are_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = Client::new(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" { break }
+                }
+                let body = r#"{"ok":false,"error":"still limited"}"#;
+                write!(stream, "HTTP/1.1 429 X\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        assert!(matches!(client.search("tag:inbox", 7, 0), Err(Error::Server { status: 429, message }) if message == "still limited"));
+        server.join().unwrap();
     }
 
     #[cfg(target_os = "linux")]

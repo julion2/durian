@@ -53,7 +53,25 @@ search_charlie() {
   search_count 1
 }
 
-for CASE in ${DURIAN_STARTUP_CASES:-initial headers navigation return return-pending refresh failure empty}; do
+# Scroll, never select: opening a row fetches its full thread and hides missing
+# search previews. Find the row number in the actual list's glyphs, not an API.
+scroll_preview() {
+  local target="$1" row
+  xdotool mousemove --window "$WINDOW" 420 450
+  for _ in {1..90}; do
+    screen scrolling
+    row=$(sed -nE 's/.*Preview row ([0-9]{3}).*/\1/p' "$ROOT/list.txt" | head -1)
+    if [[ -n "$row" ]] && ((10#$row >= target)); then
+      expect_list "row-$row" "Snippetnumber $row"
+      return
+    fi
+    xdotool click --repeat 5 --delay 15 5
+    sleep 0.1
+  done
+  echo "FAIL did not scroll to preview row $target" >&2; return 1
+}
+
+for CASE in ${DURIAN_STARTUP_CASES:-initial headers navigation return return-pending refresh failure empty rate-limit previews previews-page previews-cancel}; do
   ROOT="$BASE/$CASE"; CASE_OUT="$OUT/$CASE"
   mkdir -p "$ROOT" "$CASE_OUT"
   export HOME="$ROOT/home" XDG_DATA_HOME="$ROOT/data" XDG_STATE_HOME="$ROOT/state"
@@ -67,12 +85,35 @@ for CASE in ${DURIAN_STARTUP_CASES:-initial headers navigation return return-pen
   chmod 700 "$TMPDIR" "$XDG_RUNTIME_DIR"
   sed -e '/    smtp {/d' -e '/    imap {/d' -e '/    auth {/d' "$CONFIG" > "$XDG_CONFIG_HOME/durian/config.pkl"
   cp "$(dirname "$CONFIG")/profiles.pkl" "$XDG_CONFIG_HOME/durian/profiles.pkl"
-  "$SEEDER" "$XDG_DATA_HOME/durian/email.db" "$XDG_DATA_HOME/durian/contacts.db"
+  SEED_ARGS=()
+  [[ "$CASE" == previews* ]] && SEED_ARGS=(-list-rows 300)
+  # The growing enriched prefix exceeds ureq's 10 MiB response bound at 200 rows.
+  # A 50-row batch fits; paging must not redownload all preceding message bodies.
+  [[ "$CASE" == previews-page ]] && SEED_ARGS+=(-list-body-bytes 65536)
+  "$SEEDER" "${SEED_ARGS[@]}" "$XDG_DATA_HOME/durian/email.db" "$XDG_DATA_HOME/durian/contacts.db"
   # Opening unread mail legitimately writes tags and refreshes. Isolate startup
   # reads here; the full native mail suite covers mark-read freshness separately.
   "$CLI" tag --all '*' -unread > "$CASE_OUT/read-fixture.log"
   if [[ "$CASE" == empty ]]; then
     "$CLI" tag --all '*' -inbox > "$CASE_OUT/empty-fixture.log"
+  fi
+  if [[ "$CASE" == rate-limit ]]; then
+    # Many configured folder badges without changing the visible message rows.
+    {
+      cat <<'EOF'
+import "modulepath:/Profiles.pkl" as P
+profiles: Listing<P.ProfileConfig> = new {
+  new { name = "All"; accounts = new { "*" }; folders = new {
+EOF
+      for ((i = 0; i < 80; i++)); do
+        printf '    new { name = "Budget %s"; query = "tag:inbox AND NOT tag:missing-%s" }\n' "$i" "$i"
+      done
+      cat <<'EOF'
+  } }
+  new { name = "Test"; accounts = new { "test" }; default = true; folders = new { new { name = "Inbox"; query = "tag:inbox" } } }
+}
+EOF
+    } > "$XDG_CONFIG_HOME/durian/profiles.pkl"
   fi
   # Separate from the backend/calendar contracts' 19724/19725 ports.
   PORT=19726
@@ -109,6 +150,7 @@ for CASE in ${DURIAN_STARTUP_CASES:-initial headers navigation return return-pen
   sleep 0.5
   # Identity/profile completion must not dispatch another copy of the held request.
   search_count 0
+  jq -se '[.[] | select(.path == "/api/v1/profiles")] | length == 1' "$CASE_OUT/requests.jsonl" > /dev/null
   case "$CASE" in
     initial|headers)
       touch "$ROOT/fault.release"
@@ -174,6 +216,68 @@ for CASE in ${DURIAN_STARTUP_CASES:-initial headers navigation return return-pen
       search_count 1
       # Empty success still releases the queued sidebar count batch.
       jq -se 'any(.[]; .path == "/api/v1/search/count" and .status == 200)' "$CASE_OUT/requests.jsonl" > /dev/null
+      ;;
+    rate-limit)
+      touch "$ROOT/fault.release"
+      expect_list ready 'Hello World'
+      # Navigate while the large sidebar is still filling, not after it settles.
+      xdotool key --clearmodifiers slash
+      xdotool type --clearmodifiers --delay 15 'from:charlie '
+      xdotool key Return
+      expect_list foreground 'Other Thread' 'Hello World'
+      # Frequent same-scope refreshes must queue a follow-up, not restart the
+      # long batch forever and leave its tail permanently unknown.
+      for _ in {1..20}; do
+        grep -q 'sidebar counts, 0 failed' "$CASE_OUT/app.log" && break
+        kill -0 "$APP_PID"
+        xdotool key --clearmodifiers ctrl+r
+        sleep 1
+      done
+      grep -q 'sidebar counts, 0 failed' "$CASE_OUT/app.log"
+      jq -se '[.[] | select(.path == "/api/v1/search/count" and .status == 200) | .query] | unique | length >= 80' "$CASE_OUT/requests.jsonl" > /dev/null
+      jq -se 'all(.[]; .status != 429)' "$CASE_OUT/requests.jsonl" > /dev/null
+      echo 'PASS native large sidebar and foreground search without any HTTP 429'
+      ;;
+    previews|previews-page)
+      touch "$ROOT/fault.release"
+      expect_list ready 'Hello World'
+      target=60; [[ "$CASE" == previews-page ]] && target=220
+      scroll_preview "$target"
+      # A refresh must not replace the scrolled page with blank summaries either.
+      completed=$(grep -cE 'durian: search #[0-9]+: .* rows' "$CASE_OUT/app.log")
+      xdotool key --clearmodifiers ctrl+r
+      for _ in {1..400}; do
+        [[ $(grep -cE 'durian: search #[0-9]+: .* rows' "$CASE_OUT/app.log") -gt "$completed" ]] && break
+        kill -0 "$APP_PID"; sleep 0.025
+      done
+      [[ $(grep -cE 'durian: search #[0-9]+: .* rows' "$CASE_OUT/app.log") -gt "$completed" ]]
+      scroll_preview "$target"
+      if [[ "$CASE" == previews-page ]]; then
+        # Earlier unselected rows must retain their previews after more pages arrive.
+        xdotool click --repeat 600 --delay 2 4
+        expect_list retained-top 'Hello World'
+        scroll_preview 60
+      fi
+      jq -se 'all(.[]; .status != 429)' "$CASE_OUT/requests.jsonl" > /dev/null
+      ;;
+    previews-cancel)
+      touch "$ROOT/fault.release"
+      expect_list ready 'Hello World'
+      rm "$ROOT/fault.held" "$ROOT/fault.release"
+      echo 'GET /api/v1/search hold' > "$ROOT/fault"
+      xdotool mousemove --window "$WINDOW" 420 450
+      xdotool click --repeat 60 --delay 15 5
+      wait_file "$ROOT/fault.held"
+      xdotool key --clearmodifiers slash
+      xdotool type --clearmodifiers --delay 15 'from:charlie '
+      xdotool key Return
+      expect_list navigated 'Other Thread' 'Preview row'
+      search_count 2
+      touch "$ROOT/fault.release"
+      sleep 0.5
+      expect_list late-page 'Other Thread' 'Preview row'
+      # Superseded paging must not start its remaining preview GETs.
+      search_count 3
       ;;
   esac
   xdotool key --clearmodifiers ctrl+q

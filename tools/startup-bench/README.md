@@ -150,6 +150,79 @@ the identical uncached full-suite command passed **42/42 targets** (all CLI, fou
 and five integration contracts; Rust: 129 passed / 5 ignored). All logs are retained; the
 initial window-discovery failure is not a claimed fixed application bug.
 
+## Complete previews: later client and Go comparison
+
+The client previously requested 200 rows but only 50 enriched conversations initially, then
+disabled enrichment entirely on paging. Scrolling without selecting a row therefore displayed
+empty body snippets. It now requests 50 fully enriched rows initially. Later pages fetch row
+metadata, reuse unchanged visible content and batch missing previews through existing exact
+`thread:` search terms. Batches cap both conversation count and decoded query length (1024 bytes);
+the client's 10 MiB response cap is unchanged. Supersession cancels remaining preview requests.
+Go batches light conversation reads and skips HTML/Bcc blobs omitted from this response format.
+Identity and startup scope share one `/profiles` request instead of two. No HTTP/schema/dependency
+changes or disk mail snapshot. Tag/header batch reads bind one JSON ID array, so enrichment cannot exceed
+SQLite's variable limit and silently lose reaction headers or fall back to per-message tags.
+The preceding client-side 429 pacing fix is present on **both** sides of this comparison.
+
+Three warm and three targeted-file-cold launches per corpus/side (24 launches), with the same
+original 10k/100k corpora, optimized GUI/owned CLI, 8 CPUs/16 GB and Xvfb/Openbox/llvmpipe.
+These timing copies include the GUI and its CLI, **not the optional renderer**: both sides use
+plaintext fallback. Unlike earlier HTML-capable matrices, these do not measure HTML readiness.
+There are no concurrent builds/tests during timing. Medians in milliseconds:
+
+| Corpus / condition | Useful list before | Useful list after | Expanded plaintext before | Expanded plaintext after |
+| --- | ---: | ---: | ---: | ---: |
+| 10k warm | 442 | 376 | 604 | 495 |
+| 10k targeted cold | 955 | 968 | 1051 | 1077 |
+| 100k warm | 478 | 429 | 478 | 429 |
+| 100k targeted cold | 892 | 912 | 1001 | 976 |
+
+This establishes complete previews without a large observed startup change, **not a general
+speedup or a 500 ms guarantee**. Both cold list medians and the 10k cold body median are slightly
+worse; three samples are not a reliable tail estimate. Before/after initial
+payloads differ (200 rows/50 previews versus 50 rows/50 previews), while the selected message
+and OCR anchor geometry remain identical. Paging avoids redownloading unchanged bodies, but
+still reloads row prefixes and holds conversations for previews. A compact list-ready/cursor
+API remains work; exceptionally large conversations can still exceed the per-response byte cap.
+
+On the final build, 100k CLI READY medians are 15 ms warm / 75 ms targeted-cold, versus first
+native frames at 308 / 777 ms. Starting the CLI is not the dominant delay in this Linux check.
+Profile/page application timestamps include time waiting for the UI; do not mislabel those
+as server/network durations or extrapolate these numbers to the owner's Mac.
+
+All 24 runs pass an independent audit of exact row count, selected thread, OCR, sampling
+bounds, nonblank captures, residency (all targeted pages warm / zero cold) and normal quit with
+owned CLI reaping. Evidence is under `.amp/in/artifacts/list-previews/`, including `before-*`
+and `bounded-final-*` raw reports, `bounded-final-audit.json`, binary hashes and native failures/successes.
+Earlier after-change launches remain in `after-*` and `final-*`; the table uses the final
+bounded-paging binaries, byte-identical to those in the last complete test run.
+The native regression scrolls to rows 062 and 223 without opening them, checks their body snippets,
+and repeats after refresh and scrolling back. A held paging response cannot replace a newer query
+or start remaining preview GETs after cancellation. The final uncached combined CLI/GPUI/native
+run passes all 41 test targets (`bounded-final-suites.log`).
+Eight authenticated HTTP comparisons on 100k, including 50/200/400-row enrichment, account
+scopes, empty results and disabled enrichment, return identical full JSON before/after.
+That Python comparison bypasses the Rust byte cap: 400 enriched rows total 11,508,374 JSON bytes.
+The first whole-prefix fix therefore failed the larger native fixture (300 rows, 64 KiB bodies),
+stopping before row 220 with a response error. Its evidence is retained in `oversize-before*`.
+The first bounded attempt also hit the Go query-length cap (`bounded-native.log`, HTTP 400).
+Final bounded queries pass the same native fixture, all recorded responses are HTTP 200, and
+the longest preview query is 1022 bytes (`bounded-native-final*`). Neither limit was raised.
+The handler regression also checks message order, tags, attachments and full HTML/Bcc on open.
+A 33,000-ID metadata regression reproduces both SQL-variable failures before the fix and passes
+after it, including selective and empty controls. An initial rebuild caught a leftover unused
+import from the header-query rewrite; it was removed before final verification.
+
+Reproduce each timing side with separate copied binaries and fresh evidence destinations:
+
+```sh
+DISPLAY=:99 /usr/bin/python3 tools/startup-bench/run.py \
+  --app /tmp/preview-before/durian --corpus /tmp/startup-opt/corpora/100k \
+  --work /tmp/preview-runtime-100k --output /tmp/preview-evidence-before-100k --runs 3
+# Repeat with /tmp/preview-bounded-final/durian and another output path, then the 10k corpus.
+# Each app directory contains that revision's optimized durian and durian-cli only.
+```
+
 ## Measured baseline
 
 Exact parent's unpushed `gpui-next-base.tar.gz`, plus its authorized shared-first-name sender fix (`thread_list.rs` SHA256 `cff898ed2191639e14377a0f88381a566ebf878a55007010ef028d071c72f3f1`). **All startup timings precede the later four-file CLI search correctness fix.**

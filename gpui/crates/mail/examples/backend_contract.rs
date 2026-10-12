@@ -82,6 +82,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(client.count("tag:unread")?, 0);
     println!("PASS external tag change reconciles cache; new message invalidates full content");
 
+    // More than Go's shared 30-request burst: a large sidebar must not make
+    // ordinary searches fail. Check actual values, not just HTTP success.
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for worker in 0..4 {
+            let client = &client;
+            workers.push(scope.spawn(move || {
+                for index in 0..20 {
+                    let (query, expected) = if (index + worker) % 3 == 0 { ("tag:unread", 0) } else { ("tag:inbox", 2) };
+                    assert_eq!(client.count(query).unwrap(), expected);
+                }
+            }));
+        }
+        for _ in 0..8 {
+            let page = client.search("from:charlie", 7, 0).unwrap();
+            assert_eq!(page.results.len(), 1);
+            assert_eq!(page.results[0].subject, "Other Thread");
+        }
+        for worker in workers { worker.join().unwrap(); }
+    });
+    println!("PASS 80 sidebar counts plus 8 concurrent foreground searches against Go's unchanged rate limiter");
+
     let calendars = client.calendars("test")?;
     assert!(calendars.iter().any(|c| c.name == "Work"));
     let events = client.events("test", "2026-08-01", "2026-08-02")?;
