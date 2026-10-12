@@ -17,7 +17,7 @@
 //! Logging names counts, ids and timings – never subjects, addresses or bodies.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
 use calendar::model::{Attendee, CalendarInfo, Rsvp, Schedule, ScheduleEvent};
@@ -26,6 +26,8 @@ use gpui::{Context, Entity, EventEmitter, SharedString, Subscription, Task};
 
 use super::cache::{Stamp, ThreadCache};
 use super::client::{self, Client};
+use super::events;
+use super::writes::{self, Intent, Outcome};
 use super::translate::{account_scope, combine, translate};
 use super::profiles::{self, Profile};
 use super::{EventRef, api, calendar_event, calendar_id, event_detail, hashed_color, parse_address};
@@ -56,6 +58,11 @@ const SETTLE: Duration = Duration::from_millis(600);
 /// way needs no request).
 const CALENDAR_BEHIND: i64 = 28;
 const CALENDAR_AHEAD: i64 = 56;
+/// SSE drops frames and external tag edits don't broadcast. Reconcile even a
+/// healthy stream every 60 seconds; postpone while a list request is active.
+const RECONCILE: Duration = Duration::from_secs(60);
+/// Count requests at once, independently of the mail list's search/prefetch.
+const COUNT_IN_FLIGHT: usize = 4;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -67,6 +74,10 @@ pub enum Status {
 /// What the user should hear about that isn't a list's or a thread's state.
 pub enum LiveEvent {
     Problem(SharedString),
+    Queued { draft_id: usize, item: api::Enqueued },
+    Undone(usize),
+    Delivery { item_id: i64, state: writes::Delivery },
+    ForwardReady(usize),
     /// an attachment went to ~/Downloads, here
     Downloaded(std::path::PathBuf),
 }
@@ -84,17 +95,33 @@ pub struct Preconnect {
     started: Instant,
 }
 
-/// The start thread's reports, in this order: the profiles it starts with (the server's, else
+/// The start thread's reports, in this order: its query and profiles (the server's, else
 /// profiles.pkl from the cache), the start folder's first page (and the query it answers), and
 /// – only when profiles.pkl had to be evaluated – the evaluated profiles. One task applies
 /// them in order, so a page never arrives before its profiles.
 enum Start {
+    Searching(String, Option<Vec<Profile>>),
     Profiles(Vec<Profile>),
     Page(String, client::Result<api::SearchResponse>),
     Problem(String),
 }
 
 type Receiver<T> = std::sync::mpsc::Receiver<T>;
+
+/// The speculative startup request owns its query until it answers or a refresh
+/// invalidates it. A different user query need not wait for that request.
+enum FirstPage {
+    Planning,
+    Pending(String),
+    Ready(String, api::SearchResponse),
+    Done,
+}
+
+impl FirstPage {
+    fn pending(&self) -> bool {
+        matches!(self, Self::Planning | Self::Pending(_))
+    }
+}
 
 pub struct Live {
     client: Arc<Client>,
@@ -110,6 +137,24 @@ pub struct Live {
     /// your addresses on the server, for `from:me` / `to:me`
     me: Vec<SharedString>,
     generation: u64,
+    /// Independent of search generations: paging doesn't invalidate full threads.
+    thread_epoch: u64,
+    calendar_epoch: u64,
+    mail_refreshing: bool,
+    events: Option<events::Worker>,
+    event_task: Option<Task<()>>,
+    reconciled_at: Instant,
+    count_context: Option<(Option<usize>, Option<SharedString>, Vec<String>)>,
+    count_generation: u64,
+    count_pending: bool,
+    count_task: Option<Task<()>>,
+    count_cancel: Option<Arc<AtomicBool>>,
+    write_queue: writes::Queue,
+    write_tasks: HashMap<String, Task<()>>,
+    draft_task: Option<Task<()>>,
+    outbox_task: Option<Task<()>>,
+    delivery: HashMap<i64, writes::Delivery>,
+    forward_task: Option<Task<()>>,
     last_change: Option<Instant>,
     /// the search in flight (dropping it drops its answer)
     search: Option<Task<()>>,
@@ -126,22 +171,28 @@ pub struct Live {
     calendar_task: Option<Task<()>>,
     /// where each listed event lives on the server
     refs: HashMap<SharedString, EventRef>,
-    /// details by iCalUID: loaded (kept across reloads of the window) and in flight
-    details: HashMap<String, Detail>,
-    detail_tasks: HashMap<String, Task<()>>,
+    /// details by account/calendar/iCalUID: loaded and in flight
+    details: HashMap<EventRef, Detail>,
+    detail_tasks: HashMap<EventRef, Task<()>>,
     /// attachments on their way, by (message, part)
     attachment_tasks: HashMap<(SharedString, i64), Task<()>>,
     /// embedded images being fetched, per thread
     image_tasks: HashMap<SharedString, Task<()>>,
-    /// the start folder's first page, fetched while connecting, and its query: the first
-    /// search, if it's that one
-    first_page: Option<(String, api::SearchResponse)>,
+    first_page: FirstPage,
     /// how mail HTML is shown, from the server's settings once connected
     policy: crate::html_doc::Policy,
     _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<LiveEvent> for Live {}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.count_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
 
 /// The empty, loading list a live mailbox starts with.
 pub fn initial_remote() -> Remote {
@@ -179,11 +230,9 @@ impl Live {
                     cached
                 }
             };
-            if let Some(profiles) = &profiles {
-                let _ = start_tx.send(Start::Profiles(profiles.clone()));
-            }
             let home = profiles.as_deref().and_then(|p| profiles::default_index(p).map(|ix| &p[ix]));
             let first = compose(home.and_then(profiles::scope).as_deref(), home.and_then(|p| p.home()).map(|f| f.query.as_ref()), "");
+            let _ = start_tx.send(Start::Searching(first.clone(), profiles));
             let page = c2.search(&first, PAGE, ENRICH);
             let _ = start_tx.send(Start::Page(first, page));
             if let Some(config) = evaluate {
@@ -218,6 +267,23 @@ impl Live {
             status: Status::Connecting,
             me: Vec::new(),
             generation: 0,
+            thread_epoch: 0,
+            calendar_epoch: 0,
+            mail_refreshing: false,
+            events: None,
+            event_task: None,
+            reconciled_at: Instant::now(),
+            count_context: None,
+            count_generation: 0,
+            count_pending: false,
+            count_task: None,
+            count_cancel: None,
+            write_queue: Default::default(),
+            write_tasks: HashMap::new(),
+            draft_task: None,
+            outbox_task: None,
+            delivery: HashMap::new(),
+            forward_task: None,
             last_change: None,
             search: None,
             settle: None,
@@ -233,7 +299,7 @@ impl Live {
             detail_tasks: HashMap::new(),
             attachment_tasks: HashMap::new(),
             image_tasks: HashMap::new(),
-            first_page: None,
+            first_page: FirstPage::Planning,
             policy: Default::default(),
             _subscriptions: subscriptions,
         };
@@ -243,11 +309,242 @@ impl Live {
 
     fn mailbox_event(&mut self, _: Entity<Mailbox>, event: &MailboxEvent, cx: &mut Context<Self>) {
         match event {
-            MailboxEvent::QueryChanged => self.query_changed(cx),
+            MailboxEvent::QueryChanged => {
+                self.query_changed(cx);
+                // The count context excludes typed text and the selected folder:
+                // keystrokes/paging don't request counts, scope changes do.
+                self.refresh_counts(false, cx);
+            }
             MailboxEvent::SelectionChanged => self.selection_changed(cx),
             MailboxEvent::MoreWanted => self.load_more(cx),
-            MailboxEvent::ThreadLoaded(_) | MailboxEvent::ReadOnly => {}
+            MailboxEvent::WriteRequested(intent) => {
+                self.queue_write(intent.clone(), cx);
+                self.start_writes(cx);
+            }
+            MailboxEvent::ThreadLoaded(_) | MailboxEvent::ReadOnly | MailboxEvent::DraftSaved(_) | MailboxEvent::DraftDeleted(_) | MailboxEvent::WriteProblem(_) | MailboxEvent::SendFinished { .. } => {}
         }
+    }
+
+    pub fn client(&self) -> Arc<Client> { self.client.clone() }
+    pub fn backend_available(&self) -> bool { matches!(self.status, Status::Connected { .. }) }
+    pub fn delivery(&self, item_id: i64) -> Option<&writes::Delivery> { self.delivery.get(&item_id) }
+
+    fn queue_write(&mut self, intent: Intent, cx: &mut Context<Self>) {
+        if let Err(error) = self.write_queue.push(intent.clone()) { self.write_finished(intent, Err(error), cx); }
+    }
+
+    /// Keep writer tasks/queue and mailbox/editors alive across backend replacement.
+    /// Tasks already dispatched finish against their captured client; new requests
+    /// use the replacement. Unknown sends keep their durable original key/payload.
+    pub fn reconnect(&mut self, preconnect: Preconnect, cx: &mut Context<Self>) {
+        self.backend_unavailable("Reconnecting to durian".into(), cx);
+        self.client = preconnect.client.clone();
+        self.preconnect = Some(preconnect);
+        self.connect(cx);
+    }
+
+    pub fn backend_unavailable(&mut self, message: SharedString, cx: &mut Context<Self>) {
+        self.status = Status::Failed(message.clone());
+        self.connect = None;
+        self.start_task = None;
+        self.events = None;
+        self.event_task = None;
+        self.search = None;
+        self.settle = None;
+        self.mail_refreshing = true;
+        self.generation += 1;
+        self.invalidate_threads(cx);
+        self.refresh_calendar(cx);
+        self.count_generation += 1;
+        self.count_pending = false;
+        if let Some(cancel) = &self.count_cancel { cancel.store(true, Ordering::Relaxed); }
+        self.draft_task = None;
+        self.outbox_task = None;
+        self.update_remote(cx, |remote| remote.loading = Some(Loading::Failed(message)));
+        self.mailbox.update(cx, |m, cx| { m.writes_available = false; cx.notify(); });
+        cx.notify();
+    }
+
+    fn start_writes(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.status, Status::Connected { .. }) { return }
+        while let Some((key, mut intent)) = self.write_queue.next() {
+            let client = self.client.clone();
+            let executor = cx.background_executor().clone();
+            let task_key = key.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let (intent, result) = executor.spawn(async move {
+                    let result = writes::execute(&client, &mut intent);
+                    (intent, result)
+                }).await;
+                this.update(cx, |this, cx| {
+                    this.write_tasks.remove(&task_key);
+                    this.write_queue.finished(&task_key);
+                    this.write_finished(intent, result, cx);
+                    this.start_writes(cx);
+                }).ok();
+            });
+            self.write_tasks.insert(key, task);
+        }
+    }
+
+    fn write_finished(&mut self, intent: Intent, result: client::Result<Outcome>, cx: &mut Context<Self>) {
+        let problem = result.as_ref().err().map(ToString::to_string);
+        match intent {
+            Intent::Save { draft } => {
+                if result.is_ok() {
+                    self.mailbox.update(cx, |m, cx| {
+                        if let Some(d) = m.drafts.iter().find(|d| d.wire == draft) { cx.emit(MailboxEvent::DraftSaved(d.id)); }
+                    });
+                }
+            }
+            Intent::Delete { local_id, .. } => {
+                self.mailbox.update(cx, |m, cx| {
+                    if result.is_ok() { m.drafts.retain(|d| d.id != local_id); cx.emit(MailboxEvent::DraftDeleted(local_id)); }
+                    else if let Some(d) = m.drafts.iter_mut().find(|d| d.id == local_id) { d.deleting = false; }
+                    cx.notify();
+                });
+            }
+            Intent::Send { draft, local_id, .. } => {
+                let sent = match result { Ok(Outcome::Sent(item)) => Ok(item), Err(e) => Err(e), _ => unreachable!() };
+                self.mailbox.update(cx, |m, cx| {
+                    if let Some(d) = m.drafts.iter_mut().find(|d| d.id == local_id) {
+                        d.wire = draft;
+                        d.sending = false;
+                        d.queued = sent.as_ref().ok().cloned();
+                        if d.queued.is_some() {
+                            // The receipt remains recoverable in Drafts, but is
+                            // no longer the inline editor for the next reply.
+                            d.kind = crate::model::DraftKind::New {
+                                account: d.wire.account_id.clone().unwrap_or_default().into(), from: d.wire.from.clone().into(),
+                                to: d.wire.to.iter().cloned().map(Into::into).collect(), cc: d.wire.cc.iter().cloned().map(Into::into).collect(),
+                                bcc: d.wire.bcc.iter().cloned().map(Into::into).collect(), subject: d.wire.subject.clone().into(),
+                            };
+                        }
+                    }
+                    cx.emit(MailboxEvent::SendFinished { draft_id: local_id, result: sent.clone() });
+                    cx.notify();
+                });
+                if let Ok(item) = sent {
+                    let state = self.delivery.entry(item.id).or_insert(writes::Delivery::Queued).clone();
+                    if state == writes::Delivery::Queued { cx.emit(LiveEvent::Queued { draft_id: local_id, item }); }
+                    else { cx.emit(LiveEvent::Delivery { item_id: item.id, state }); }
+                    self.reconcile_outbox(cx);
+                }
+            }
+            Intent::Undo { id, draft, local_id } => {
+                if let Ok(Outcome::Undone { persisted }) = result {
+                    self.delivery.remove(&id);
+                    self.mailbox.update(cx, |m, cx| {
+                        if let Some(d) = m.drafts.iter_mut().find(|d| d.id == local_id) { d.wire = draft; d.queued = None; d.sending = false; }
+                        cx.notify();
+                    });
+                    cx.emit(LiveEvent::Undone(local_id));
+                    if !persisted { cx.emit(LiveEvent::Problem("Delivery cancelled, but draft recovery save failed; keep this editor open and save again.".into())); }
+                }
+            }
+            Intent::Tags { thread, ops } => {
+                self.mailbox.update(cx, |m, _| {
+                    if result.is_ok() {
+                        if let Some(confirmed) = m.confirmed_tags.get_mut(thread.as_str()) { writes::apply_tags(confirmed, &ops); }
+                    }
+                });
+                if !self.write_queue.pending_thread(&thread) {
+                    self.mailbox.update(cx, |m, cx| {
+                        m.pending_tags.remove(thread.as_str());
+                        if let Some(confirmed) = m.confirmed_tags.remove(thread.as_str()) {
+                            if let Some(shown) = m.threads.iter_mut().find(|t| t.id == thread) { *shown = confirmed; }
+                        }
+                        cx.notify();
+                    });
+                    self.refresh_mail(cx);
+                }
+            }
+        }
+        if let Some(problem) = problem {
+            self.mailbox.update(cx, |_, cx| cx.emit(MailboxEvent::WriteProblem(problem.clone().into())));
+        }
+    }
+
+    pub fn undo_send(&mut self, local_id: usize, cx: &mut Context<Self>) {
+        if !matches!(self.status, Status::Connected { .. }) { cx.emit(LiveEvent::Problem("Backend unavailable; cancellation not confirmed".into())); return }
+        let Some(draft) = self.mailbox.read(cx).drafts.iter().find(|d| d.id == local_id).cloned() else { return };
+        let Some(item) = draft.queued else { return };
+        self.queue_write(Intent::Undo { id: item.id, draft: draft.wire, local_id }, cx);
+        self.start_writes(cx);
+    }
+
+    pub fn forward_selected(&mut self, cx: &mut Context<Self>) {
+        if !self.backend_available() { cx.emit(LiveEvent::Problem("Backend unavailable; forward not loaded".into())); return }
+        if self.forward_task.is_some() { return }
+        let mailbox = self.mailbox.read(cx);
+        let Some(thread) = mailbox.selected_thread() else { return };
+        if thread.partial { cx.emit(LiveEvent::Problem("Wait for the full thread before forwarding".into())); return }
+        let message = thread.latest();
+        let Some(account) = message.account.as_ref().and_then(|id| mailbox.account(id)).or_else(|| mailbox.sending_account(Some(thread))) else { return };
+        let (thread_id, target, account, from) = (thread.id.to_string(), message.id.to_string(), account.id.to_string(), account.email.to_string());
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        self.forward_task = Some(cx.spawn(async move |this, cx| {
+            let result = executor.spawn(async move { writes::forward(&client, &thread_id, &target, account, from) }).await;
+            this.update(cx, |this, cx| {
+                this.forward_task = None;
+                match result {
+                    Ok(wire) => {
+                        let kind = crate::model::DraftKind::New { account: wire.account_id.clone().unwrap_or_default().into(), from: wire.from.clone().into(),
+                            to: Vec::new(), cc: Vec::new(), bcc: Vec::new(), subject: wire.subject.clone().into() };
+                        if let Some(id) = this.mailbox.update(cx, |m, cx| m.save_draft_content(None, kind, wire.body.clone().into(), wire, cx)) {
+                            cx.emit(LiveEvent::ForwardReady(id));
+                        }
+                    }
+                    Err(e) => cx.emit(LiveEvent::Problem(format!("Forward not created: {e}").into())),
+                }
+            }).ok();
+        }));
+    }
+
+    fn load_drafts(&mut self, cx: &mut Context<Self>) {
+        if self.draft_task.is_some() { return }
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        self.draft_task = Some(cx.spawn(async move |this, cx| {
+            let result = executor.spawn(async move { client.drafts() }).await;
+            this.update(cx, |this, cx| {
+                this.draft_task = None;
+                match result {
+                    Ok(drafts) => this.mailbox.update(cx, |m, cx| m.load_drafts(drafts, cx)),
+                    Err(e) => cx.emit(LiveEvent::Problem(format!("Draft recovery unavailable: {e}").into())),
+                }
+                this.reconcile_outbox(cx);
+            }).ok();
+        }));
+    }
+
+    pub fn reconcile_outbox(&mut self, cx: &mut Context<Self>) {
+        if self.outbox_task.is_some() || !self.backend_available() { return }
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        self.outbox_task = Some(cx.spawn(async move |this, cx| {
+            let result = executor.spawn(async move { client.outbox() }).await;
+            this.update(cx, |this, cx| {
+                this.outbox_task = None;
+                let Ok(entries) = result else { return }; // keep known status on transient errors
+                let ids: Vec<i64> = this.mailbox.read(cx).drafts.iter().filter_map(|d| d.queued.as_ref().map(|q| q.id)).collect();
+                for id in ids {
+                    let state = writes::Delivery::reconcile(this.delivery.get(&id), entries.iter().find(|e| e.id == id));
+                    this.apply_delivery(id, state, cx);
+                }
+            }).ok();
+        }));
+    }
+
+    fn apply_delivery(&mut self, item_id: i64, state: writes::Delivery, cx: &mut Context<Self>) {
+        if self.delivery.get(&item_id) == Some(&state) { return }
+        if self.delivery.len() >= 128 && !self.delivery.contains_key(&item_id) {
+            if let Some(id) = self.delivery.keys().next().copied() { self.delivery.remove(&id); }
+        }
+        self.delivery.insert(item_id, state.clone());
+        let tracked = self.mailbox.read(cx).drafts.iter().any(|d| d.queued.as_ref().is_some_and(|q| q.id == item_id));
+        if tracked { cx.emit(LiveEvent::Delivery { item_id, state }); }
     }
 
     fn update_remote(&self, cx: &mut Context<Self>, f: impl FnOnce(&mut Remote)) {
@@ -283,6 +580,17 @@ impl Live {
                         start = back;
                         let Some(report) = report else { break };
                         let applied = this.update(cx, |this, cx| match report {
+                            Start::Searching(query, profiles) => {
+                                // Install ownership before applying profiles: their
+                                // QueryChanged event can otherwise dispatch a duplicate.
+                                if matches!(this.first_page, FirstPage::Planning) {
+                                    this.first_page = FirstPage::Pending(query);
+                                }
+                                if let Some(profiles) = profiles {
+                                    this.apply_profiles(profiles, started.elapsed(), cx);
+                                }
+                                this.plan(false, Duration::ZERO, cx);
+                            }
                             Start::Profiles(profiles) => this.apply_profiles(profiles, started.elapsed(), cx),
                             Start::Page(query, page) => this.early_page(query, page, started.elapsed(), cx),
                             Start::Problem(message) => cx.emit(LiveEvent::Problem(message.into())),
@@ -291,6 +599,18 @@ impl Live {
                             break;
                         }
                     }
+                    this.update(cx, |this, cx| {
+                        this.start_task = None;
+                        // A worker ending without its page must not leave a loading
+                        // list forever. Normal errors arrive through Start::Page.
+                        if this.first_page.pending() {
+                            this.first_page = FirstPage::Done;
+                            this.plan(false, Duration::ZERO, cx);
+                            if this.backend_available() && this.search.is_none() {
+                                this.search(Duration::ZERO, cx);
+                            }
+                        }
+                    }).ok();
                 }));
                 self.connect = Some(cx.spawn(async move |this, cx| {
                     let identity = executor.spawn(async move { identity.recv().unwrap_or_else(|_| Err(ended())) }).await;
@@ -299,6 +619,7 @@ impl Live {
             }
             // a retry asks again
             None => {
+                self.first_page = FirstPage::Done;
                 self.connect = Some(cx.spawn(async move |this, cx| {
                     let started = Instant::now();
                     let identity = executor.spawn(async move { identify(&client) }).await;
@@ -312,26 +633,29 @@ impl Live {
     /// The inbox's first page from the early connect: shown right away if nothing was searched
     /// yet and the inbox is what's asked for; else kept for the first search to use.
     fn early_page(&mut self, query: String, page: client::Result<api::SearchResponse>, took: Duration, cx: &mut Context<Self>) {
-        // failures are the connect's to report
-        let Ok(page) = page else { return };
-        // a search for this very query may have started meanwhile (the identity can arrive
-        // first): the page answers it, and that search's late answer is dropped as stale
-        let same_in_flight = self.mailbox.read(cx).remote.as_ref().is_some_and(|r| r.loading == Some(Loading::Pending) && r.server_query == query);
-        if self.generation != 0 && !same_in_flight {
+        // A reconnect refresh (or new HTML policy) supersedes the startup snapshot too.
+        if !matches!(&self.first_page, FirstPage::Pending(pending) if *pending == query) {
             return;
         }
+        self.first_page = FirstPage::Done;
         // the list may have moved on (a search typed, another profile, fresh profiles)
         if self.planned(false, cx).0 != query {
-            self.first_page = Some((query, page));
+            if let Ok(page) = page {
+                self.first_page = FirstPage::Ready(query, page);
+            }
             return;
         }
-        trace::note(&format!("durian: start page in {took:.0?}, before the identity"));
+        // Paging or a settled search must not be replaced by an older first page.
+        if self.mailbox.read(cx).remote.as_ref().is_some_and(|r| r.limit != PAGE || (!r.server_query.is_empty() && r.server_query != query)) {
+            return;
+        }
+        trace::note(&format!("durian: start page in {took:.0?}"));
         self.update_remote(cx, |r| {
             r.server_query = query;
             r.limit = PAGE;
         });
         self.generation += 1;
-        self.searched(self.generation, PAGE, Ok(page), Duration::ZERO, cx);
+        self.searched(self.generation, PAGE, page, Duration::ZERO, cx);
     }
 
     /// Profiles from the start thread (the server's, or profiles.pkl): the switcher and folders
@@ -400,6 +724,7 @@ impl Live {
             m.me = identity.me;
             m.accounts = identity.accounts;
             m.tags = identity.tags;
+            m.writes_available = true;
             if let Some(remote) = m.remote.as_mut().filter(|_| !shown) {
                 // nothing listed yet: whatever was planned before, the first search goes out now
                 remote.server_query.clear();
@@ -407,8 +732,169 @@ impl Live {
             cx.notify();
         });
         self.plan(false, Duration::ZERO, cx);
+        // Replacing the server keeps the current query and list. That unchanged
+        // query still needs a fresh answer; plan() only dispatches changed ones.
+        if !self.first_page.pending() && self.search.is_none() && self.mailbox.read(cx).remote.as_ref().is_some_and(|r| r.loading == Some(Loading::Pending)) {
+            self.refresh_mail(cx);
+        } else {
+            self.refresh_counts(true, cx);
+        }
         self.ensure_calendar(cx);
+        self.start_events(cx);
+        self.load_drafts(cx);
+        self.start_writes(cx);
         cx.notify();
+    }
+
+    fn start_events(&mut self, cx: &mut Context<Self>) {
+        if self.events.is_some() {
+            return;
+        }
+        match events::Worker::start(self.client.clone()) {
+            Ok(worker) => self.events = Some(worker),
+            Err(e) => {
+                cx.emit(LiveEvent::Problem(e.to_string().into()));
+                return;
+            }
+        }
+        let executor = cx.background_executor().clone();
+        self.event_task = Some(cx.spawn(async move |this, cx| loop {
+            executor.timer(Duration::from_millis(100)).await;
+            if this.update(cx, |this, cx| {
+                let Some(worker) = &this.events else { return };
+                let changes = worker.changes();
+                if let Some(e) = changes.failure {
+                    trace::note(&format!("durian: event stream retry: {}", kind(&e)));
+                }
+                if changes.connected {
+                    trace::note("durian: event stream connected; refreshing without replay");
+                }
+                for update in changes.outbox {
+                    if let Some(state) = writes::Delivery::from_update(&update) { this.apply_delivery(update.item_id, state, cx); }
+                }
+                if changes.mail {
+                    this.refresh_mail(cx);
+                    this.reconcile_outbox(cx);
+                }
+                if changes.calendar {
+                    this.refresh_calendar(cx);
+                }
+                if this.reconciled_at.elapsed() >= RECONCILE && this.search.is_none() {
+                    this.reconcile(cx);
+                }
+            }).is_err() {
+                break;
+            }
+        }));
+    }
+
+    fn invalidate_threads(&mut self, cx: &mut Context<Self>) {
+        self.first_page = FirstPage::Done;
+        self.thread_epoch += 1;
+        self.cache.clear();
+        self.fetches.clear();
+        self.image_tasks.clear();
+        self.update_remote(cx, |r| r.threads.clear());
+    }
+
+    /// Ask for the current query, even if its string and row stamps haven't changed.
+    /// The old list stays visible until a successful answer replaces it.
+    fn refresh_mail(&mut self, cx: &mut Context<Self>) {
+        self.mail_refreshing = true;
+        self.stamps.clear();
+        self.invalidate_threads(cx);
+        self.update_remote(cx, |r| r.loading = Some(Loading::Pending));
+        self.search(Duration::ZERO, cx);
+        self.refresh_counts(true, cx);
+    }
+
+    /// Fixed low-rate reconciliation and manual refresh share the same path. It
+    /// doesn't change the query, limit or selection; replacements follow thread ids.
+    fn reconcile(&mut self, cx: &mut Context<Self>) {
+        self.reconciled_at = Instant::now();
+        self.reconcile_outbox(cx);
+        if self.search.is_none() {
+            self.refresh_mail(cx);
+        } else {
+            self.refresh_counts(true, cx);
+        }
+        if self.calendar_task.is_none() {
+            self.refresh_calendar(cx);
+        }
+    }
+
+    /// One bounded batch at a time. A newer scope/SSE refresh queues one replacement
+    /// batch and supersedes old replies without creating another set of workers.
+    fn refresh_counts(&mut self, force: bool, cx: &mut Context<Self>) {
+        if !matches!(self.status, Status::Connected { .. }) {
+            return;
+        }
+        let m = self.mailbox.read(cx);
+        let context = (m.profile, m.account_filter.clone(), m.count_queries());
+        if !force && self.count_context.as_ref() == Some(&context) {
+            return;
+        }
+        self.count_context = Some(context);
+        self.count_generation += 1;
+        self.count_pending = true;
+        if let Some(cancel) = &self.count_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if self.count_task.is_none() {
+            self.start_counts(cx);
+        }
+    }
+
+    fn start_counts(&mut self, cx: &mut Context<Self>) {
+        let Some((_, _, queries)) = &self.count_context else { return };
+        // The Go store has one SQLite connection. A sidebar fanout before the
+        // first page competes with useful mail (especially on a cold database).
+        // Keep the newest count context queued; searched() releases it on either
+        // success or failure, including an empty inbox. Later refreshes stay live.
+        let mailbox = self.mailbox.read(cx);
+        if mailbox.threads.is_empty() && mailbox.remote.as_ref().is_some_and(|r| r.loading == Some(Loading::Pending)) {
+            return;
+        }
+        let queries = queries.clone();
+        self.count_pending = false;
+        let generation = self.count_generation;
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.count_cancel = Some(cancel.clone());
+        self.count_task = Some(cx.spawn(async move |this, cx| {
+            let results = executor.spawn(async move { counts(&client, &queries, &cancel) }).await;
+            this.update(cx, |this, cx| {
+                this.count_task = None;
+                if generation == this.count_generation {
+                    let failed = results.iter().filter(|(_, r)| r.is_err()).count();
+                    trace::note(&format!("durian: {} sidebar counts, {failed} failed", results.len()));
+                    this.mailbox.update(cx, |m, cx| {
+                        m.update_counts(results.into_iter().map(|(q, r)| (q, r.ok())));
+                        cx.notify();
+                    });
+                }
+                if this.count_pending {
+                    this.start_counts(cx);
+                }
+            }).ok();
+        }));
+    }
+
+    pub(super) fn refresh_calendar(&mut self, cx: &mut Context<Self>) {
+        self.calendar_epoch += 1;
+        self.calendar_loaded = None;
+        self.calendar_pending = None;
+        self.calendar_task = None;
+        self.details.clear();
+        self.detail_tasks.clear();
+        self.refs.clear();
+        // Old events may remain visible on failure, but no range is known fresh.
+        self.schedule.update(cx, |s, cx| {
+            s.loaded = Some(Vec::new());
+            cx.notify();
+        });
+        self.ensure_calendar(cx);
     }
 
     /// Follow the server's settings. Threads loaded before they were known (the open one and
@@ -420,35 +906,20 @@ impl Live {
             return;
         }
         self.policy = policy;
-        self.cache = ThreadCache::new(CACHE);
         let loaded: Vec<SharedString> = self.mailbox.read(cx).threads.iter().filter(|t| !t.partial).map(|t| t.id.clone()).collect();
+        self.invalidate_threads(cx);
         for id in loaded {
-            self.fetches.remove(&id);
-            self.image_tasks.remove(&id);
             self.fetch(id, cx);
         }
+        self.selection_changed(cx);
     }
 
-    /// Retry what failed: the connection, the list, or the open thread.
+    /// Retry a failed connection, or authoritatively refresh a connected mailbox.
     pub fn retry(&mut self, cx: &mut Context<Self>) {
         match self.status {
             Status::Failed(_) => self.connect(cx),
             Status::Connecting => {}
-            Status::Connected { .. } => {
-                let mailbox = self.mailbox.read(cx);
-                let list_failed = mailbox.remote.as_ref().is_some_and(|r| matches!(r.loading, Some(Loading::Failed(_))));
-                let thread_failed = mailbox.selected_thread().map(|t| t.id.clone()).filter(|id| matches!(mailbox.thread_loading(id), Some(Loading::Failed(_))));
-                if list_failed {
-                    self.update_remote(cx, |r| r.loading = Some(Loading::Pending));
-                    self.search(Duration::ZERO, cx);
-                }
-                if let Some(id) = thread_failed {
-                    self.update_remote(cx, |r| {
-                        r.threads.remove(&id);
-                    });
-                    self.selection_changed(cx);
-                }
-            }
+            Status::Connected { .. } => self.reconcile(cx),
         }
     }
 
@@ -472,8 +943,8 @@ impl Live {
     /// Split the current query into what the server answers and what's refined here; search
     /// again if the server's part changed. `settled`: the word being typed counts as complete.
     fn plan(&mut self, settled: bool, delay: Duration, cx: &mut Context<Self>) {
-        if !matches!(self.status, Status::Connected { .. }) {
-            // `connected` plans the first search
+        if !matches!(self.status, Status::Connected { .. }) || matches!(self.first_page, FirstPage::Planning) {
+            // Wait for identity and startup scope, not the startup search result.
             return;
         }
         let (server, refine) = self.planned(settled, cx);
@@ -497,8 +968,17 @@ impl Live {
     fn search(&mut self, delay: Duration, cx: &mut Context<Self>) {
         let Some(remote) = self.mailbox.read(cx).remote.as_ref() else { return };
         let (query, limit) = (remote.server_query.clone(), remote.limit);
+        if limit == PAGE && matches!(&self.first_page, FirstPage::Pending(pending) if *pending == query) {
+            // Returning to the startup query also supersedes another search.
+            self.generation += 1;
+            self.search = None;
+            return;
+        }
         // the page fetched while connecting answers the first search, if that's still the inbox
-        if let Some((_, page)) = self.first_page.take().filter(|(q, _)| *q == query && limit == PAGE) {
+        if matches!(self.first_page, FirstPage::Ready(..))
+            && let FirstPage::Ready(cached, page) = std::mem::replace(&mut self.first_page, FirstPage::Done)
+            && cached == query && limit == PAGE
+        {
             self.generation += 1;
             self.search = None;
             return self.searched(self.generation, limit, Ok(page), Duration::ZERO, cx);
@@ -533,6 +1013,7 @@ impl Live {
                 // what's listed stays; the list says the refresh failed
                 let message: SharedString = e.to_string().into();
                 self.update_remote(cx, |r| r.loading = Some(Loading::Failed(message)));
+                if self.count_pending && self.count_task.is_none() { self.start_counts(cx); }
                 return;
             }
         };
@@ -553,6 +1034,7 @@ impl Live {
         let full = threads.iter().filter(|t| !t.partial).count();
         trace::note(&format!("durian: search #{generation}: {} rows ({full} full, {} cached) in {took:.0?}", threads.len(), self.cache.len()));
         self.stamps = stamps;
+        self.mail_refreshing = false;
         let complete = threads.len() < limit;
         self.mailbox.update(cx, |m, cx| {
             if let Some(remote) = m.remote.as_mut() {
@@ -562,6 +1044,7 @@ impl Live {
             m.replace_threads(threads, cx);
         });
         self.selection_changed(cx);
+        if self.count_pending && self.count_task.is_none() { self.start_counts(cx); }
     }
 
     /// The next page, unless everything is listed or a search is on its way.
@@ -581,6 +1064,9 @@ impl Live {
     /// The open thread loads (if it's only a row), the next few are prefetched; near the end
     /// of the list, the next page.
     fn selection_changed(&mut self, cx: &mut Context<Self>) {
+        if self.mail_refreshing {
+            return; // Don't start new fetches from the pre-refresh snapshot.
+        }
         let mailbox = self.mailbox.read(cx);
         let visible: Vec<usize> = mailbox.visible().collect();
         let Some(position) = mailbox.selected.and_then(|s| visible.iter().position(|&v| v == s)) else { return };
@@ -615,6 +1101,7 @@ impl Live {
         let client = self.client.clone();
         let executor = cx.background_executor().clone();
         let key = id.clone();
+        let epoch = self.thread_epoch;
         let task = cx.spawn(async move |this, cx| {
             let started = Instant::now();
             let result = executor
@@ -623,7 +1110,11 @@ impl Live {
                     async move { client.thread(&key) }
                 })
                 .await;
-            this.update(cx, |this, cx| this.fetched(key, stamp, result, started.elapsed(), cx)).ok();
+            this.update(cx, |this, cx| {
+                if epoch == this.thread_epoch {
+                    this.fetched(key, stamp, result, started.elapsed(), cx);
+                }
+            }).ok();
         });
         self.fetches.insert(id, task);
     }
@@ -672,19 +1163,24 @@ impl Live {
         if covers(self.calendar_loaded) || covers(self.calendar_pending) {
             return;
         }
-        let accounts: Vec<SharedString> = self.mailbox.read(cx).accounts.iter().map(|a| a.id.clone()).collect();
-        if accounts.is_empty() {
-            // calendars are per account; a server that names none has none to show
-            return;
+        let mut accounts: Vec<SharedString> = self.mailbox.read(cx).accounts.iter().map(|a| a.id.clone()).collect();
+        // Local-only calendars belong to no mail account (also works with zero accounts).
+        if !accounts.iter().any(|a| a == "local") {
+            accounts.push("local".into());
         }
         let (from, to) = (first - chrono::Duration::days(CALENDAR_BEHIND), last + chrono::Duration::days(1 + CALENDAR_AHEAD));
         self.calendar_pending = Some((from, to));
         let client = self.client.clone();
         let executor = cx.background_executor().clone();
+        let epoch = self.calendar_epoch;
         self.calendar_task = Some(cx.spawn(async move |this, cx| {
             let started = Instant::now();
             let result = executor.spawn(async move { calendars(&client, &accounts, from, to) }).await;
-            this.update(cx, |this, cx| this.calendar_loaded(from, to, result, started.elapsed(), cx)).ok();
+            this.update(cx, |this, cx| {
+                if epoch == this.calendar_epoch {
+                    this.calendar_loaded(from, to, result, started.elapsed(), cx);
+                }
+            }).ok();
         }));
     }
 
@@ -708,7 +1204,7 @@ impl Live {
             for e in &found {
                 let Some((mut event, at)) = calendar_event(&account, e) else { continue };
                 // guests already known survive the reload
-                if let Some((description, attendees, rsvp)) = self.details.get(&at.uid) {
+                if let Some((description, attendees, rsvp)) = self.details.get(&at) {
                     (event.description, event.attendees, event.rsvp) = (description.clone(), attendees.clone(), *rsvp);
                 }
                 self.refs.insert(event.id.clone(), at);
@@ -726,22 +1222,27 @@ impl Live {
     /// The selected event's guests and organizer, once per series.
     fn event_selected(&mut self, cx: &mut Context<Self>) {
         let Some(at) = self.schedule.read(cx).selected.as_ref().and_then(|id| self.refs.get(id)).cloned() else { return };
-        if self.details.contains_key(&at.uid) || self.detail_tasks.contains_key(&at.uid) {
+        if self.details.contains_key(&at) || self.detail_tasks.contains_key(&at) {
             return;
         }
         let client = self.client.clone();
         let executor = cx.background_executor().clone();
-        let uid = at.uid.clone();
+        let key = at.clone();
+        let epoch = self.calendar_epoch;
         let task = cx.spawn(async move |this, cx| {
             let request = at.clone();
             let result = executor.spawn(async move { client.event(&request.account, &request.calendar, &request.uid) }).await;
-            this.update(cx, |this, cx| this.detail_loaded(at, result, cx)).ok();
+            this.update(cx, |this, cx| {
+                if epoch == this.calendar_epoch {
+                    this.detail_loaded(at, result, cx);
+                }
+            }).ok();
         });
-        self.detail_tasks.insert(uid, task);
+        self.detail_tasks.insert(key, task);
     }
 
     fn detail_loaded(&mut self, at: EventRef, result: client::Result<api::CalendarEvent>, cx: &mut Context<Self>) {
-        self.detail_tasks.remove(&at.uid);
+        self.detail_tasks.remove(&at);
         let detail = match result {
             Ok(detail) => detail,
             Err(e) => {
@@ -750,11 +1251,11 @@ impl Live {
                 return;
             }
         };
-        let ids: Vec<SharedString> = self.refs.iter().filter(|(_, r)| r.uid == at.uid).map(|(id, _)| id.clone()).collect();
+        let ids: Vec<SharedString> = self.refs.iter().filter(|(_, r)| **r == at).map(|(id, _)| id.clone()).collect();
         let fallback = ids.first().and_then(|id| self.schedule.read(cx).event(id)).map_or(Rsvp::Accepted, |e| e.rsvp);
         let (description, attendees, rsvp) = event_detail(&detail, &self.me, fallback);
         trace::note(&format!("durian: event detail: {} guests, {} occurrences", attendees.len(), ids.len()));
-        self.details.insert(at.uid, (description.clone(), attendees.clone(), rsvp));
+        self.details.insert(at, (description.clone(), attendees.clone(), rsvp));
         self.schedule.update(cx, |s, cx| s.fill_detail(&ids, description, attendees, rsvp, cx));
     }
 }
@@ -811,6 +1312,39 @@ impl Live {
 /// One account's calendars and their events in the window.
 type AccountCalendars = (SharedString, Vec<api::Calendar>, Vec<api::CalendarEvent>);
 
+/// A failure affects only its query; callers retain that query's last known count.
+/// Cancellation stops between waves; at most four already-active GETs finish.
+fn counts(client: &Client, queries: &[String], cancel: &AtomicBool) -> Vec<(String, client::Result<u64>)> {
+    queries.chunks(COUNT_IN_FLIGHT).take_while(|_| !cancel.load(Ordering::Relaxed)).flat_map(|batch| {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = batch.iter().map(|q| s.spawn(move || {
+                (q.clone(), count_with_backoff(client, q, cancel))
+            })).collect();
+            handles.into_iter().map(|h| h.join().expect("count worker panicked")).collect::<Vec<_>>()
+        })
+    }).collect()
+}
+
+/// Search and count share Go's rate limit. A large sidebar can exhaust its
+/// startup burst even with four flights, so retry only explicit 429 reads.
+/// Keep backoff cancellable and bounded; mutations never use this retry path.
+fn count_with_backoff(client: &Client, query: &str, cancel: &AtomicBool) -> client::Result<u64> {
+    let cancelled = || client::Error::Unreachable("count refresh superseded".into());
+    for attempt in 0..4 {
+        if cancel.load(Ordering::Relaxed) { return Err(cancelled()); }
+        let result = client.count(query);
+        if attempt == 3 || !matches!(result, Err(client::Error::Server { status: 429, .. })) {
+            return result;
+        }
+        let until = Instant::now() + Duration::from_millis(500 << attempt);
+        while Instant::now() < until {
+            if cancel.load(Ordering::Relaxed) { return Err(cancelled()); }
+            std::thread::sleep(Duration::from_millis(25).min(until.saturating_duration_since(Instant::now())));
+        }
+    }
+    unreachable!("the last attempt returns its result")
+}
+
 /// Every account's calendars and events in [from, to). An account without calendars (or one
 /// whose calendar isn't synced yet: 404 / 409) is skipped, any other failure fails the load.
 fn calendars(client: &Client, accounts: &[SharedString], from: NaiveDate, to: NaiveDate) -> client::Result<Vec<AccountCalendars>> {
@@ -840,6 +1374,7 @@ impl Live {
         let policy = self.policy;
         let executor = cx.background_executor().clone();
         let key = thread_id.clone();
+        let epoch = self.thread_epoch;
         let task = cx.spawn(async move |this, cx| {
             let started = Instant::now();
             let htmls: Vec<(String, Option<String>, usize)> = executor
@@ -868,6 +1403,9 @@ impl Live {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if epoch != this.thread_epoch {
+                    return; // Late HTML must never patch or cache a refreshed thread.
+                }
                 let images: usize = htmls.iter().map(|(_, _, n)| n).sum();
                 trace::note(&format!("durian: {images} embedded images for {thread_id} in {:.0?}", started.elapsed()));
                 this.mailbox.update(cx, |m, cx| {
@@ -1110,6 +1648,96 @@ mod tests {
         assert_eq!((work.id.as_ref(), work.email.as_ref()), ("work", "ada@work.dev"));
         assert_eq!(work.aliases, ["hello@work.dev"]);
         assert_eq!(accounts[1].email.as_ref(), "ada@home.org");
+    }
+
+    #[test]
+    fn count_transport_is_bounded_preserves_errors_and_stops_superseded_batches() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::{Barrier, atomic::AtomicUsize};
+
+        for supersede in [false, true] {
+            let queries: Vec<String> = ["tag:failed", "tag:unknown", "path:home/ tag:inbox", "tag:inbox", "tag:zero", "path:work/ tag:inbox", "tag:waiting", "tag:limited"].map(String::from).to_vec();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = format!("http://{}", listener.local_addr().unwrap());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let stop = cancel.clone();
+            let expected = if supersede { 4 } else { queries.len() };
+            let server = std::thread::spawn(move || {
+                let active = AtomicUsize::new(0);
+                let peak = AtomicUsize::new(0);
+                let limited = AtomicUsize::new(0);
+                let barrier = Barrier::new(4);
+                std::thread::scope(|s| {
+                    for _ in 0..(expected + usize::from(!supersede)) {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        let mut stream = loop {
+                            match listener.accept() {
+                                Ok((stream, _)) => break stream,
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                                Err(e) => panic!("count accept: {e}"),
+                            }
+                        };
+                        let (active, peak, barrier, stop, limited) = (&active, &peak, &barrier, &stop, &limited);
+                        s.spawn(move || {
+                            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                            let mut reader = BufReader::new(stream.try_clone().unwrap());
+                            let mut request = String::new();
+                            loop {
+                                let mut line = String::new();
+                                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                                if line == "\r\n" { break }
+                                request.push_str(&line);
+                            }
+                            assert!(request.starts_with("GET /api/v1/search/count?query="));
+                            assert!(request.to_lowercase().contains("authorization: bearer count-test"));
+                            let target = request.lines().next().unwrap().split_whitespace().nth(1).unwrap();
+                            // Inspect the actual encoded transport query, independently
+                            // of the model's query builders.
+                            let (status, count) = if target.contains("tag%3Afailed") { (500, 0) }
+                                else if target.contains("tag%3Aunknown") { (401, 0) }
+                                else if target.contains("path%3Ahome") { (200, 7) }
+                                else if target.contains("path%3Awork") { (200, 501) }
+                                else if target.contains("tag%3Azero") { (200, 0) }
+                                else if target.contains("tag%3Awaiting") { (200, 19) }
+                                else if target.contains("tag%3Alimited") {
+                                    if limited.fetch_add(1, Ordering::SeqCst) == 0 { (429, 0) } else { (200, 43) }
+                                }
+                                else { (200, 1026) };
+                            let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(n, Ordering::SeqCst);
+                            if supersede {
+                                barrier.wait(); // All four are already active before cancellation.
+                                stop.store(true, Ordering::Relaxed);
+                            }
+                            std::thread::sleep(Duration::from_millis(40));
+                            let body = format!(r#"{{"ok":true,"count":{count}}}"#);
+                            write!(stream, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                            active.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    }
+                });
+                assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock), "a superseded batch must not issue its remaining queries");
+                peak.load(Ordering::SeqCst)
+            });
+            let client = Client::new(&address, Some("count-test".into()));
+            let result = counts(&client, &queries, &cancel);
+            assert_eq!(result.len(), expected);
+            let peak = server.join().unwrap();
+            assert!((2..=4).contains(&peak), "count concurrency was {peak}, expected bounded parallel requests");
+            let result: HashMap<_, _> = result.into_iter().collect();
+            assert!(matches!(result["tag:failed"], Err(client::Error::Server { status: 500, .. })));
+            assert!(matches!(result["tag:unknown"], Err(client::Error::Unauthorized)));
+            assert_eq!(result["path:home/ tag:inbox"], Ok(7));
+            assert_eq!(result["tag:inbox"], Ok(1026));
+            if !supersede {
+                assert_eq!(result["tag:zero"], Ok(0));
+                assert_eq!(result["path:work/ tag:inbox"], Ok(501));
+                assert_eq!(result["tag:waiting"], Ok(19));
+                assert_eq!(result["tag:limited"], Ok(43), "a transient rate limit must not leave a sidebar count unknown");
+            }
+        }
     }
 }
 

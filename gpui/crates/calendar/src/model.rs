@@ -103,10 +103,23 @@ impl View {
     }
 }
 
+/// User intentions are separate from authoritative server answers. A remote
+/// schedule never treats a local edit as a successful persistence operation.
+#[derive(Clone, Debug)]
+pub enum WriteIntent {
+    Save { event: Event, new: bool },
+    Delete(Vec<Event>),
+    Rsvp { event: Event, response: Rsvp },
+}
+
 pub enum ScheduleEvent {
     SelectionChanged,
     /// A change was asked for, but the calendar is only read from a server (nothing changed).
     ReadOnly,
+    WriteRequested(WriteIntent),
+    WriteFinished { id: SharedString, result: Result<SharedString, SharedString> },
+    EditRequested(SharedString),
+    EditReady(Event),
 }
 
 /// The calendar state every view reads: data, the visible period and the selection.
@@ -119,7 +132,7 @@ pub struct Schedule {
     pub anchor: NaiveDate,
     pub selected: Option<SharedString>,
     pub today: NaiveDate,
-    /// Events come from a server this client only reads (for now): every change is refused.
+    /// A host can disable writes until its persistence controller is ready.
     pub read_only: bool,
     /// The periods whose events are here [from, to), when they come in windows from a
     /// server; None: all of them are (fixtures).
@@ -237,6 +250,16 @@ impl Schedule {
         if self.refuse(cx) {
             return;
         }
+        if self.loaded.is_some() {
+            cx.emit(ScheduleEvent::WriteRequested(WriteIntent::Save { event, new: true }));
+            return;
+        }
+        self.apply_event(event, cx);
+    }
+
+    /// A confirmed write or demo edit, never a new write intention.
+    pub fn apply_event(&mut self, event: Event, cx: &mut Context<Self>) {
+        self.events.retain(|e| e.id != event.id);
         let at = self.events.partition_point(|e| (e.start, std::cmp::Reverse(e.end)) <= (event.start, std::cmp::Reverse(event.end)));
         self.anchor = event.start.date();
         let id = event.id.clone();
@@ -282,6 +305,12 @@ impl Schedule {
         if self.refuse(cx) {
             return Vec::new();
         }
+        if self.loaded.is_some() {
+            let events = self.events.iter().filter(|e| ids.contains(&e.id)).cloned().collect();
+            cx.emit(ScheduleEvent::WriteRequested(WriteIntent::Delete(events)));
+            // No local Undo: deletion may already notify guests on the server.
+            return Vec::new();
+        }
         let (removed, kept): (Vec<Event>, Vec<Event>) = std::mem::take(&mut self.events).into_iter().partition(|e| ids.contains(&e.id));
         self.events = kept;
         if self.selected.as_ref().is_some_and(|s| ids.contains(s)) {
@@ -294,6 +323,12 @@ impl Schedule {
     /// Undo of `remove_events`.
     pub fn restore_events(&mut self, events: Vec<Event>, cx: &mut Context<Self>) {
         if self.refuse(cx) {
+            return;
+        }
+        if self.loaded.is_some() {
+            for event in events {
+                cx.emit(ScheduleEvent::WriteRequested(WriteIntent::Save { event, new: false }));
+            }
             return;
         }
         self.events.extend(events);
@@ -328,15 +363,23 @@ impl Schedule {
         if self.refuse(cx) {
             return;
         }
-        let id = event.id.clone();
-        self.events.retain(|e| e.id != id);
-        self.add_event(event, cx);
+        if self.loaded.is_some() {
+            cx.emit(ScheduleEvent::WriteRequested(WriteIntent::Save { event, new: false }));
+            return;
+        }
+        self.apply_event(event, cx);
     }
 
     /// The user's answer to an invitation. Local and optimistic; the data source hears about it
     /// once intents exist.
     pub fn set_rsvp(&mut self, id: &str, rsvp: Rsvp, cx: &mut Context<Self>) {
         if self.refuse(cx) {
+            return;
+        }
+        if self.loaded.is_some() {
+            if let Some(event) = self.event(id).cloned() {
+                cx.emit(ScheduleEvent::WriteRequested(WriteIntent::Rsvp { event, response: rsvp }));
+            }
             return;
         }
         if let Some(event) = self.events.iter_mut().find(|e| e.id == id) {

@@ -20,10 +20,13 @@ pub mod query;
 mod quote;
 pub mod model;
 mod sidebar;
+mod storage;
 mod thread_list;
 mod thread_view;
 #[cfg(target_os = "macos")]
 pub mod webview;
+
+pub use storage::{clear_session, default_cache_root, init_session, session_dir};
 
 use gpui::{
     AnimationExt, AnyView, App, Context, KeyDownEvent, SharedString, StyleRefinement, Subscription, Entity, FocusHandle, Focusable, IntoElement, Render, Window, actions, div, prelude::*,
@@ -122,44 +125,13 @@ pub mod trace {
 /// Avatar for a contact: pre-downloaded gravatar or company logo, else initials.
 static CACHE_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-/// Where rendered HTML, the outbox and similar per-user files go. Set once at startup by the
-/// app (its own cache folder); defaults to ~/Library/Caches/mail.
+/// Persistent configuration and demo caches. Decrypted live mail uses `session_dir` instead.
 pub fn set_cache_root(root: std::path::PathBuf) {
     let _ = CACHE_ROOT.set(root);
 }
 
 pub fn cache_dir(sub: &str) -> std::path::PathBuf {
-    CACHE_ROOT
-        .get_or_init(|| std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Library/Caches/mail"))
-        .join(sub)
-}
-
-/// Files that live only as long as the app: what a live mailbox decrypts onto disk (opened
-/// attachments, rendered HTML). A private (0700) folder per process in the temp dir, removed
-/// on quit; what a crashed or killed run left behind goes at the next start. The server keeps mail
-/// encrypted at rest – this keeps the client from undoing that.
-pub fn session_dir(sub: &str) -> std::path::PathBuf {
-    let dir = session_root().join(sub);
-    use std::os::unix::fs::DirBuilderExt;
-    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
-    dir
-}
-
-fn session_root() -> &'static std::path::Path {
-    static SESSION: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    SESSION.get_or_init(|| {
-        let parent = std::env::temp_dir().join("mail-session");
-        // what runs that ended without quitting left behind (a crash, a kill): folders are
-        // named by process id, and a process that's gone needs none
-        let alive = |pid: i32| unsafe { libc::kill(pid, 0) == 0 || *libc::__error() == libc::EPERM };
-        for entry in std::fs::read_dir(&parent).into_iter().flatten().flatten() {
-            let pid = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok());
-            if pid.is_none_or(|pid| !alive(pid)) {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
-        parent.join(std::process::id().to_string())
-    })
+    CACHE_ROOT.get_or_init(default_cache_root).join(sub)
 }
 
 /// Whether HTML mail is shown as pictures from the `mailrender` helper – everywhere but on
@@ -169,11 +141,6 @@ pub fn uses_snapshots() -> bool {
     return !webview::available();
     #[cfg(not(target_os = "macos"))]
     return true;
-}
-
-/// Remove this process's session files (on quit).
-pub fn clear_session() {
-    let _ = std::fs::remove_dir_all(session_root());
 }
 
 pub fn contact_avatar(contact: &Contact) -> Avatar {
@@ -216,6 +183,8 @@ pub struct MailWorkspace {
     picker: Option<(AnyView, Subscription)>,
     compose: Option<(Entity<ComposeDialog>, Subscription)>,
     event_compose: Option<(Entity<event_compose::EventComposer>, Subscription)>,
+    confirm_delete: Option<Vec<SharedString>>,
+    confirm_focus: FocusHandle,
     context_menu: Option<(Entity<ContextMenu>, Subscription)>,
     help: Option<(Entity<help::ShortcutHelp>, Subscription)>,
     drafts: Entity<DraftsView>,
@@ -232,6 +201,7 @@ pub struct MailWorkspace {
     _toast_timer: Option<gpui::Task<()>>,
     /// the server the threads come from (None: the data handed to `new`)
     live: Option<Entity<durian::Live>>,
+    calendar_writes: Option<Entity<durian::calendar_write::CalendarWrites>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -242,6 +212,7 @@ enum ToastAction {
     /// jump to the calendar, where the event is already selected
     ShowEvent(SharedString),
     OpenDraft(usize),
+    UndoSend(usize),
     Reveal(std::path::PathBuf),
     /// just the message
     None,
@@ -327,7 +298,7 @@ impl MailWorkspace {
         Self::build(Mailbox::new(data), calendar_data, renderer, window, cx)
     }
 
-    /// Mail from a durian server (read-only): the window opens at once, the lists fill in as
+    /// Mail from a durian server: the window opens at once, the lists fill in as
     /// the server answers.
     pub fn live(connect: durian::live::Preconnect, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let empty = model::MailData {
@@ -344,16 +315,30 @@ impl MailWorkspace {
         cx.on_app_quit(|_, _| async { clear_session() }).detach();
         let mut this = Self::build(Mailbox::remote(empty, durian::live::initial_remote()), calendar, renderer, window, cx);
         this.schedule.update(cx, |s, _| {
-            s.read_only = true;
             // events come in windows, nothing known before the first
             s.loaded = Some(Vec::new());
         });
         let (mailbox, schedule) = (this.mailbox.clone(), this.schedule.clone());
         let live = cx.new(|cx| durian::Live::new(connect, mailbox, schedule, cx));
+        let writes = cx.new(|cx| durian::calendar_write::CalendarWrites::new(live.clone(), this.schedule.clone(), cx));
+        cx.observe(&writes, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&writes, |this, _, event, cx| match event {
+            durian::calendar_write::WriteEvent::Notice(message) => this.show_toast(message.clone(), ToastAction::None, cx),
+        }).detach();
+        this.calendar_writes = Some(writes);
         cx.observe(&live, |_, _, cx| cx.notify()).detach();
-        cx.subscribe(&live, |this, _, event, cx| match event {
+        cx.subscribe_in(&live, window, |this, _, event, window, cx| match event {
             durian::live::LiveEvent::Problem(message) => this.show_toast(message.clone(), ToastAction::None, cx),
             durian::live::LiveEvent::Downloaded(path) => this.show_toast("Saved to Downloads".into(), ToastAction::Reveal(path.clone()), cx),
+            durian::live::LiveEvent::Queued { draft_id, item } => {
+                this.show_queued(*draft_id, item.send_after, cx);
+            }
+            durian::live::LiveEvent::Undone(id) => this.show_toast("Delivery cancelled; draft restored".into(), ToastAction::OpenDraft(*id), cx),
+            durian::live::LiveEvent::Delivery { item_id, state } => {
+                let id = this.mailbox.read(cx).drafts.iter().find(|d| d.queued.as_ref().is_some_and(|q| q.id == *item_id)).map(|d| d.id);
+                this.show_toast(state.message().into(), id.map(ToastAction::OpenDraft).unwrap_or(ToastAction::None), cx);
+            }
+            durian::live::LiveEvent::ForwardReady(id) => this.open_draft(*id, window, cx),
         })
         .detach();
         // attachments live on the server: opening one fetches it first
@@ -365,6 +350,23 @@ impl MailWorkspace {
         })));
         this.live = Some(live);
         this
+    }
+
+    pub fn reconnect(&mut self, preconnect: durian::live::Preconnect, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(live) = &self.live { live.update(cx, |live, cx| live.reconnect(preconnect, cx)); }
+        if let Some((dialog, _)) = &self.compose {
+            let client = self.live.as_ref().map(|live| live.read(cx).client());
+            dialog.update(cx, |dialog, cx| dialog.set_contact_client(client, cx));
+        }
+        cx.notify();
+    }
+
+    pub fn backend_unavailable(&mut self, message: SharedString, cx: &mut Context<Self>) {
+        if let Some(live) = &self.live { live.update(cx, |live, cx| live.backend_unavailable(message, cx)); }
+        if let Some((dialog, _)) = &self.compose {
+            dialog.update(cx, |dialog, cx| dialog.set_contact_client(None, cx));
+        }
+        cx.notify();
     }
 
     fn build(mailbox: Mailbox, calendar_data: calendar::model::CalendarData, renderer: Entity<HtmlRenderer>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -381,15 +383,19 @@ impl MailWorkspace {
                     context_menus::open(*position, items, window, cx);
                 }
             }
-            calendar::CalendarViewEvent::CreateRequested { .. } if this.live.is_some() => this.refused(cx),
             calendar::CalendarViewEvent::CreateRequested { start, end, all_day } => {
                 this.open_event_compose(event_compose::EventSeed::slot(*start, *end, *all_day), window, cx)
             }
         })
         .detach();
-        cx.subscribe(&schedule, |this, _, event, cx| {
-            if let calendar::model::ScheduleEvent::ReadOnly = event {
-                this.refused(cx);
+        cx.subscribe_in(&schedule, window, |this, _, event, window, cx| {
+            match event {
+                calendar::model::ScheduleEvent::ReadOnly => this.refused(cx),
+                calendar::model::ScheduleEvent::EditReady(event) => {
+                    let me = this.schedule.read(cx).me.clone();
+                    this.open_event_compose(event_compose::EventSeed::edit(event.clone(), &me), window, cx);
+                }
+                _ => {}
             }
         })
         .detach();
@@ -411,7 +417,8 @@ impl MailWorkspace {
                 }
             }
             MailboxEvent::ReadOnly => this.refused(cx),
-            MailboxEvent::QueryChanged | MailboxEvent::MoreWanted => {}
+            MailboxEvent::WriteProblem(message) => this.show_toast(message.clone(), ToastAction::None, cx),
+            MailboxEvent::QueryChanged | MailboxEvent::MoreWanted | MailboxEvent::WriteRequested(_) | MailboxEvent::DraftSaved(_) | MailboxEvent::DraftDeleted(_) | MailboxEvent::SendFinished { .. } => {}
         })
         .detach();
         trace::note(&format!("appearance at start: {:?} → dark theme: {}", cx.window_appearance(), cx.theme().is_dark()));
@@ -464,6 +471,8 @@ impl MailWorkspace {
             thread,
             compose: None,
             event_compose: None,
+            confirm_delete: None,
+            confirm_focus: cx.focus_handle(),
             context_menu: None,
             help: None,
             drafts,
@@ -477,6 +486,7 @@ impl MailWorkspace {
             toast: None,
             _toast_timer: None,
             live: None,
+            calendar_writes: None,
             _subscriptions: vec![thread_subscription, sidebar_subscription, drafts_subscription, list_subscription],
             mailbox,
             focus_handle,
@@ -554,7 +564,14 @@ impl MailWorkspace {
     }
 
     fn open_compose(&mut self, seed: ComposeSeed, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(writes) = &self.calendar_writes { writes.update(cx, |writes, _| writes.cancel_edit()); }
+        if self.compose.is_some() || self.event_compose.is_some() {
+            self.show_toast("Finish or close the current editor before opening another.".into(), ToastAction::None, cx);
+            return;
+        }
         let dialog = cx.new(|cx| ComposeDialog::new(self.mailbox.clone(), seed, window, cx));
+        let client = self.live.as_ref().map(|live| live.read(cx).client());
+        dialog.update(cx, |dialog, cx| dialog.set_contact_client(client, cx));
         let subscription = cx.subscribe_in(&dialog, window, |this, _, event, window, cx| match event {
             ComposeEvent::Close => {
                 this.compose = None;
@@ -562,6 +579,9 @@ impl MailWorkspace {
                 cx.notify();
             }
             ComposeEvent::DraftSaved(id) => this.show_toast("Draft saved".into(), ToastAction::OpenDraft(*id), cx),
+            ComposeEvent::UndoSend(id) => {
+                if let Some(live) = &this.live { live.update(cx, |live, cx| live.undo_send(*id, cx)); }
+            }
         });
         self.compose = Some((dialog, subscription));
         cx.notify();
@@ -569,13 +589,18 @@ impl MailWorkspace {
 
     /// New event, prefilled with a slot (dragged out in the grid, or the next full hour).
     fn open_event_compose(&mut self, seed: event_compose::EventSeed, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(writes) = &self.calendar_writes { writes.update(cx, |writes, _| writes.cancel_edit()); }
+        if self.event_compose.is_some() || self.compose.is_some() {
+            self.show_toast("Finish or close the current editor before opening another.".into(), ToastAction::None, cx);
+            return;
+        }
         let dialog = cx.new(|cx| event_compose::EventComposer::new(self.mailbox.clone(), self.schedule.clone(), seed, window, cx));
         let subscription = cx.subscribe_in(&dialog, window, |this, _, event, window, cx| {
             this.event_compose = None;
             if let event_compose::EventComposeEvent::Saved(id) = event
                 && this.mode != Mode::Calendar
             {
-                this.show_toast("Event created".into(), ToastAction::ShowEvent(id.clone()), cx);
+                this.show_toast("Event saved locally".into(), ToastAction::ShowEvent(id.clone()), cx);
             }
             this.focus_area(window, cx);
             cx.notify();
@@ -584,7 +609,16 @@ impl MailWorkspace {
         cx.notify();
     }
 
-    /// Delete / cancel / remove events, with Undo in the toast.
+    fn request_delete(&mut self, ids: Vec<SharedString>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.live.is_none() {
+            return self.remove_events(ids, "Event deleted", cx);
+        }
+        self.confirm_delete = Some(ids);
+        self.confirm_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Delete / cancel / remove events. Only demo-local deletion offers Undo.
     fn remove_events(&mut self, ids: Vec<SharedString>, message: &str, cx: &mut Context<Self>) {
         let removed = self.schedule.update(cx, |s, cx| s.remove_events(&ids, cx));
         if !removed.is_empty() {
@@ -756,24 +790,6 @@ impl MailWorkspace {
         self.show_toast("Read-only: changes aren't sent to durian yet".into(), ToastAction::None, cx);
     }
 
-    /// Live (read-only): actions that would change mail or events stop here, before any
-    /// handler, composer or picker runs. The models refuse changes too – this only makes sure
-    /// nothing opens that can't be finished.
-    fn guard_writes<E: InteractiveElement>(root: E, cx: &Context<Self>) -> E {
-        macro_rules! refuse {
-            ($($action:ty),* $(,)?) => {
-                root $(.capture_action(cx.listener(|this, _: &$action, _, cx| {
-                    cx.stop_propagation();
-                    this.refused(cx);
-                })))*
-            };
-        }
-        refuse!(
-            Archive, ToggleStar, ToggleRead, OpenTagPicker, Reply, ReplyAll, NewMessage, Forward, ComposeHere,
-            NewEvent, EventFromThread, calendar::EditEvent, calendar::DeleteEvent, calendar::DuplicateEvent,
-        )
-    }
-
     fn show_toast(&mut self, message: SharedString, action: ToastAction, cx: &mut Context<Self>) {
         self.toast = Some((message, action));
         self._toast_timer = Some(cx.spawn(async move |this, cx| {
@@ -784,6 +800,31 @@ impl MailWorkspace {
             });
         }));
         cx.notify();
+    }
+
+    fn show_queued(&mut self, draft_id: usize, send_after: i64, cx: &mut Context<Self>) {
+        let remaining = send_after - chrono::Utc::now().timestamp();
+        if remaining <= 0 {
+            self.show_toast("The original delivery deadline has passed; status must be verified".into(), ToastAction::OpenDraft(draft_id), cx);
+            return;
+        }
+        self.show_toast(format!("Queued for delivery in {remaining}s — not yet sent").into(), ToastAction::UndoSend(draft_id), cx);
+        self._toast_timer = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+            let keep = this.update(cx, |this, cx| {
+                if !matches!(this.toast, Some((_, ToastAction::UndoSend(id))) if id == draft_id) { return false }
+                let remaining = send_after - chrono::Utc::now().timestamp();
+                if remaining <= 0 {
+                    this.toast = Some(("Delivery deadline passed — status unconfirmed".into(), ToastAction::OpenDraft(draft_id)));
+                    if let Some(live) = &this.live { live.update(cx, |live, cx| live.reconcile_outbox(cx)); }
+                } else {
+                    this.toast = Some((format!("Queued for delivery in {remaining}s — not yet sent").into(), ToastAction::UndoSend(draft_id)));
+                }
+                cx.notify();
+                remaining > 0
+            }).unwrap_or(false);
+            if !keep { break }
+        }));
     }
 
     fn forward_seed(&self, cx: &App) -> Option<ComposeSeed> {
@@ -839,7 +880,7 @@ impl Render for MailWorkspace {
         #[cfg(target_os = "macos")]
         webview::frame(
             window,
-            self.picker.is_some() || self.compose.is_some() || self.event_compose.is_some() || self.context_menu.is_some() || self.help.is_some() || self.toast.is_some(),
+            self.picker.is_some() || self.compose.is_some() || self.event_compose.is_some() || self.confirm_delete.is_some() || self.context_menu.is_some() || self.help.is_some() || self.toast.is_some(),
             self.mode == Mode::Inbox && self.thread_visible(),
         );
         // what the panes actually get: the remembered widths, squeezed so the thread keeps
@@ -860,7 +901,6 @@ impl Render for MailWorkspace {
             // calendar view adds its own "Calendar" context below
             .key_context(if self.mode == Mode::Calendar { "Workspace" } else { "Workspace Mail" })
             .track_focus(&self.focus_handle)
-            .when(self.live.is_some(), |root| Self::guard_writes(root, cx))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // digits build a count for the next motion (`12j`); 0 only continues a count.
                 // Only when the mail view itself has focus – never while typing in a field.
@@ -924,7 +964,8 @@ impl Render for MailWorkspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &Forward, window, cx| {
-                if let Some(seed) = this.forward_seed(cx) {
+                if let Some(live) = &this.live { live.update(cx, |live, cx| live.forward_selected(cx)); }
+                else if let Some(seed) = this.forward_seed(cx) {
                     this.open_compose(seed, window, cx);
                 }
             }))
@@ -1055,19 +1096,18 @@ impl Render for MailWorkspace {
             // the selected event: edit (yours), delete / cancel / remove, duplicate
             .on_action(cx.listener(|this, _: &calendar::EditEvent, window, cx| {
                 let s = this.schedule.read(cx);
-                let Some(event) = s.selected_event().filter(|e| s.is_own(e)).cloned() else { return };
+                let Some(event) = s.selected_event().cloned() else { return };
+                if this.live.is_some() {
+                    return this.schedule.update(cx, |_, cx| cx.emit(calendar::model::ScheduleEvent::EditRequested(event.id)));
+                }
+                if !s.is_own(&event) { return; }
                 let me = s.me.clone();
                 this.open_event_compose(event_compose::EventSeed::edit(event, &me), window, cx);
             }))
-            .on_action(cx.listener(|this, _: &calendar::DeleteEvent, _, cx| {
+            .on_action(cx.listener(|this, _: &calendar::DeleteEvent, window, cx| {
                 let s = this.schedule.read(cx);
                 let Some(event) = s.selected_event().cloned() else { return };
-                let message = match (s.is_own(&event), event.attendees.len() > 1) {
-                    (false, _) => "Removed from calendar",
-                    (true, true) => "Event cancelled",
-                    (true, false) => "Event deleted",
-                };
-                this.remove_events(vec![event.id], message, cx);
+                this.request_delete(vec![event.id], window, cx);
             }))
             .on_action(cx.listener(|this, _: &calendar::DuplicateEvent, _, cx| {
                 let Some(id) = this.schedule.read(cx).selected.clone() else { return };
@@ -1212,6 +1252,9 @@ impl Render for MailWorkspace {
                         this.toast = None;
                         this.open_draft(id, window, cx);
                     })),
+                    ToastAction::UndoSend(id) => toast.action("Undo", cx.listener(move |this, _, _, cx| {
+                        if let Some(live) = &this.live { live.update(cx, |live, cx| live.undo_send(id, cx)); }
+                    })),
                     ToastAction::Reveal(path) => toast.action("Show in Finder", cx.listener(move |this, _, _, cx| {
                         this.toast = None;
                         attachments::reveal_in_finder(&path);
@@ -1260,6 +1303,33 @@ impl Render for MailWorkspace {
                     .pt(px(106.))
                     .child(dialog.clone())
                     .with_animation("event-compose-in", ui::entrance(160), |s, t| s.opacity(t).pt(px(106. + 8. * (1. - t))))
+            }))
+            .children(self.confirm_delete.as_ref().map(|ids| {
+                let series = ids.iter().any(|id| self.schedule.read(cx).event(id).is_some_and(|event| event.series.is_some()));
+                ui::ConfirmDialog::new(
+                    if series { "Delete the entire series?" } else { "Delete this event?" },
+                    "This deletes the stored event and syncs the change to its account. A recurring event is deleted for all dates; guests may be notified. This cannot be undone here.",
+                    "Delete",
+                    cx.listener(|this, _, window, cx| {
+                        if let Some(ids) = this.confirm_delete.take() { this.remove_events(ids, "Event deleted", cx); }
+                        this.focus_area(window, cx);
+                        cx.notify();
+                    }),
+                    cx.listener(|this, _, window, cx| {
+                        this.confirm_delete = None;
+                        this.focus_area(window, cx);
+                        cx.notify();
+                    }),
+                ).track_focus(&self.confirm_focus)
+            }))
+            .children(self.calendar_writes.as_ref().filter(|writes| writes.read(cx).recovery_count() > 0).map(|writes| {
+                let writes = writes.clone();
+                div().absolute().bottom(px(16.)).left(px(16.)).child(
+                    ui::PrimaryButton::new("recover-calendar", "Recover calendar changes").on_click(cx.listener(move |this, _, window, cx| {
+                        writes.update(cx, |writes, cx| writes.recover(cx));
+                        this.focus_area(window, cx);
+                    }))
+                )
             }))
             // picker overlay: transparent backdrop (no dimming), click outside closes
             .children(self.picker.as_ref().map(|(view, _)| {

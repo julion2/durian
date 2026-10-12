@@ -97,6 +97,12 @@ impl ThreadCache {
         Some(entry.thread.clone())
     }
 
+    /// SSE is only a hint, and timestamps/tags cannot detect every content change.
+    /// A freshness refresh must discard even entries whose stamp still matches.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -119,6 +125,19 @@ mod tests {
     fn a_new_message_makes_the_thread_stale() {
         assert_eq!(fit(&stamp(5, "inbox"), &stamp(5, "inbox")), Fit::Same);
         assert_eq!(fit(&stamp(5, "inbox"), &stamp(9, "inbox,unread")), Fit::Stale);
+    }
+
+    #[test]
+    fn freshness_invalidates_full_content_even_when_the_row_stamp_is_unchanged() {
+        let thread: Thread = serde_json::from_str(r#"{"id":"t","subject":"old content","tags":[],"items":[]}"#).unwrap();
+        let row = stamp(5, "inbox");
+        let mut cache = ThreadCache::new(300);
+        cache.insert(row.clone(), thread.clone());
+        assert_eq!(cache.get("t", &row).unwrap().subject, "old content");
+        cache.clear();
+        assert!(cache.get("t", &row).is_none());
+        cache.insert(row.clone(), Thread { subject: "refetched content".into(), ..thread });
+        assert_eq!(cache.get("t", &row).unwrap().subject, "refetched content");
     }
 
     #[test]

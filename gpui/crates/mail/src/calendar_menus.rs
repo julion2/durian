@@ -94,6 +94,7 @@ fn plan(e: &Event, schedule: &Schedule, has_invitation: bool) -> Vec<Entry> {
         entries.extend([Entry::Copy, Entry::Separator]);
         // with guests it's a cancellation – they'll hear about it
         match (e.series.is_some(), others > 0) {
+            (true, _) if schedule.loaded.is_some() => entries.push(Entry::DeleteSeries),
             (true, guests) => entries.extend([Entry::Delete(if guests { "Cancel this event" } else { "Delete this event" }), Entry::DeleteSeries]),
             (false, guests) => entries.push(Entry::Delete(if guests { "Cancel event" } else { "Delete" })),
         }
@@ -107,14 +108,19 @@ fn plan(e: &Event, schedule: &Schedule, has_invitation: bool) -> Vec<Entry> {
     if let Some(organizer) = e.attendees.iter().find(|a| a.organizer) {
         entries.push(Entry::EmailOrganizer(organizer.name.split_whitespace().next().unwrap_or("organizer").to_string()));
     }
-    entries.extend([Entry::Copy, Entry::Separator, Entry::Remove]);
+    entries.extend([Entry::Copy, Entry::Separator]);
+    if e.series.is_some() && schedule.loaded.is_some() {
+        entries.push(Entry::DeleteSeries);
+    } else {
+        entries.push(Entry::Remove);
+    }
     entries
 }
 
 fn event(e: Event, schedule: &Entity<Schedule>, workspace: WeakEntity<MailWorkspace>, cx: &App) -> Vec<MenuItem> {
     let has_invitation = workspace.upgrade().is_some_and(|ws| ws.read(cx).invitation_thread(&e.id, cx).is_some());
     let me = schedule.read(cx).me.clone();
-    let others: Vec<SharedString> = e.attendees.iter().filter(|a| !me.iter().any(|m| m.eq_ignore_ascii_case(&a.email))).map(|a| a.name.clone()).collect();
+    let others: Vec<SharedString> = e.attendees.iter().filter(|a| !me.iter().any(|m| m.eq_ignore_ascii_case(&a.email))).map(|a| a.email.clone()).collect();
     plan(&e, schedule.read(cx), has_invitation)
         .into_iter()
         .map(|entry| match entry {
@@ -134,8 +140,8 @@ fn event(e: Event, schedule: &Entity<Schedule>, workspace: WeakEntity<MailWorksp
             Entry::Delete(label) => cmd(label, IconName::MailTrash, Box::new(calendar::DeleteEvent)).destructive(),
             Entry::DeleteSeries => {
                 let (w, ids) = (workspace.clone(), schedule.read(cx).series_ids(&e.id));
-                MenuItem::handler("Delete all in series", IconName::MailTrash, move |_, cx| {
-                    let _ = w.update(cx, |this, cx| this.remove_events(ids.clone(), "Series deleted", cx));
+                MenuItem::handler("Delete entire series…", IconName::MailTrash, move |window, cx| {
+                    let _ = w.update(cx, |this, cx| this.request_delete(ids.clone(), window, cx));
                 })
                 .destructive()
             }
@@ -150,7 +156,7 @@ fn event(e: Event, schedule: &Entity<Schedule>, workspace: WeakEntity<MailWorksp
                 })
             }
             Entry::EmailOrganizer(first) => {
-                let organizer = e.attendees.iter().find(|a| a.organizer).map(|a| a.name.clone()).unwrap_or_default();
+                let organizer = e.attendees.iter().find(|a| a.organizer).map(|a| a.email.clone()).unwrap_or_default();
                 let (w, subject) = (workspace.clone(), e.title.clone());
                 MenuItem::handler(format!("Email {first}…"), IconName::MailReply, move |window, cx| {
                     let _ = w.update(cx, |this, cx| this.email_people(vec![organizer.clone()], subject.clone(), window, cx));

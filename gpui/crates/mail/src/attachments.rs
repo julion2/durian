@@ -5,6 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::{fs, io};
+use std::os::unix::fs::OpenOptionsExt;
 
 use gpui::{App, Global};
 
@@ -43,7 +45,17 @@ pub fn quick_look(attachment: &Attachment, cx: &mut App) {
 
 /// Quick Look any file – also .eml, which renders the HTML part like a mail client would.
 pub fn quick_look_path(path: &Path) {
-    let _ = Command::new("qlmanage").arg("-p").arg(path).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    let Ok(path) = path.canonicalize() else { return };
+    #[cfg(target_os = "macos")]
+    launch(Command::new("qlmanage").arg("-p").arg(path));
+    #[cfg(not(target_os = "macos"))]
+    launch(Command::new("xdg-open").arg(path));
+}
+
+fn launch(command: &mut Command) {
+    if let Ok(mut child) = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        std::thread::spawn(move || { let _ = child.wait(); });
+    }
 }
 
 /// Copies into ~/Downloads and returns the new path; one that's still on the server is fetched
@@ -69,27 +81,51 @@ pub fn safe_name(name: &str) -> String {
 
 /// Into ~/Downloads without overwriting ("name (1).pdf" …); returns the new path.
 pub fn copy_to_downloads(src: &Path, name: &str) -> Option<PathBuf> {
+    let downloads = std::env::var_os("HOME").map(PathBuf::from)?.join("Downloads");
+    copy_to_directory(src, name, &downloads).ok()
+}
+
+fn copy_to_directory(src: &Path, name: &str, downloads: &Path) -> io::Result<PathBuf> {
     let name = safe_name(name);
     let name = name.as_str();
-    let downloads = std::env::var_os("HOME").map(PathBuf::from)?.join("Downloads");
     let (stem, ext) = match name.rsplit_once('.') {
         Some((stem, ext)) => (stem.to_string(), format!(".{ext}")),
         None => (name.to_string(), String::new()),
     };
-    let target = (0..)
-        .map(|n| downloads.join(if n == 0 { format!("{stem}{ext}") } else { format!("{stem} ({n}){ext}") }))
-        .find(|p| !p.exists())?;
-    std::fs::copy(src, &target).ok()?;
-    Some(target)
+    let mut source = fs::File::open(src)?;
+    fs::create_dir_all(downloads)?;
+    for n in 0..10_000 {
+        let target = downloads.join(if n == 0 { format!("{stem}{ext}") } else { format!("{stem} ({n}){ext}") });
+        // O_EXCL also rejects dangling symlinks; exists-then-copy could overwrite their target.
+        match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&target) {
+            Ok(mut output) => {
+                if let Err(error) = io::copy(&mut source, &mut output) {
+                    let _ = fs::remove_file(&target);
+                    return Err(error);
+                }
+                return Ok(target);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "too many attachments with the same name"))
 }
 
 pub fn reveal_in_finder(path: &Path) {
-    let _ = Command::new("open").arg("-R").arg(path).spawn();
+    let Ok(path) = path.canonicalize() else { return };
+    #[cfg(target_os = "macos")]
+    launch(Command::new("open").arg("-R").arg(path));
+    #[cfg(not(target_os = "macos"))]
+    if let Some(parent) = path.parent() {
+        launch(Command::new("xdg-open").arg(parent));
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::safe_name;
+    use super::*;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn header_names_cant_escape_or_hide() {
@@ -99,5 +135,23 @@ mod tests {
         assert_eq!(safe_name("a\nb:c.pdf"), "abc.pdf");
         assert_eq!(safe_name("  "), "attachment");
         assert_eq!(safe_name("Rechnung 2026.pdf"), "Rechnung 2026.pdf");
+    }
+
+    #[test]
+    fn downloads_do_not_overwrite_files_or_follow_dangling_symlinks() {
+        let root = std::env::temp_dir().join(format!("durian-download-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source");
+        fs::write(&source, b"invoice").unwrap();
+        let downloads = root.join("Downloads");
+        let first = copy_to_directory(&source, "../../invoice.pdf", &downloads).unwrap();
+        assert_eq!(first, downloads.join("invoice.pdf"));
+        symlink(root.join("victim"), downloads.join("invoice (1).pdf")).unwrap();
+        let second = copy_to_directory(&source, "invoice.pdf", &downloads).unwrap();
+        assert_eq!(second, downloads.join("invoice (2).pdf"));
+        assert_eq!(fs::read(first).unwrap(), b"invoice");
+        assert_eq!(fs::read(second).unwrap(), b"invoice");
+        assert!(!root.join("victim").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -56,6 +56,7 @@ pub fn translate(query: &Query, me: &[SharedString]) -> Translated {
         let part: Option<String> = match &clause.term {
             Term::Tag(t) => Some(format!("tag:{}", value(t))),
             Term::From(w) => Some(any_of("from", &who(w))),
+            Term::Subject(s) => Some(format!("subject:{}", value(s))),
             // the UI's to: covers cc as well
             Term::To(w) => {
                 let w = who(w);
@@ -125,6 +126,9 @@ mod tests {
         assert_eq!(t("is:unread is:starred").server, "tag:unread tag:flagged");
         assert_eq!(t("is:read").server, "NOT tag:unread");
         assert_eq!(t("has:attachment").server, "has:attachment");
+        assert_eq!(t("subject:Other").server, "subject:other");
+        assert_eq!(t("-subject:\"Other Thread\"").server, "NOT subject:\"other thread\"");
+        assert!(t("subject:Other").refine.is_empty());
     }
 
     #[test]

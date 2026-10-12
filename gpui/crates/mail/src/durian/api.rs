@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Go encodes an empty slice or map as `null`: read that as empty, like a missing field.
 fn nullable<'de, D: Deserializer<'de>, T: Default + Deserialize<'de>>(d: D) -> Result<T, D::Error> {
@@ -25,6 +25,14 @@ pub struct Version {
     pub version: String,
     #[serde(default, deserialize_with = "nullable")]
     pub commit: String,
+}
+
+/// `GET /contacts/search`: ordered by usage on the server, not thread proximity.
+#[derive(Deserialize, Debug)]
+pub struct Contact {
+    pub email: String,
+    #[serde(default)]
+    pub name: String,
 }
 
 /// `GET /search`: one row per thread; `threads` holds full content for the first `enrich`.
@@ -86,6 +94,10 @@ pub struct ThreadMessage {
     /// RFC 5322 Message-ID – metadata only, not unique
     #[serde(default)]
     pub message_id: Option<String>,
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub references: Option<String>,
     #[serde(default)]
     pub account: Option<String>,
     #[serde(default)]
@@ -286,6 +298,97 @@ pub struct CalendarAttendee {
     /// accepted | declined | tentativelyAccepted | none | notResponded …
     #[serde(default)]
     pub response: Option<String>,
+}
+
+/// Opaque local-draft JSON uses Swift's EmailDraft/EmailAttachment field names.
+/// The server encrypts it at rest; GPUI never writes a plaintext snapshot.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftContent {
+    pub id: String,
+    #[serde(default)] pub from: String,
+    #[serde(default)] pub to: Vec<String>,
+    #[serde(default)] pub cc: Vec<String>,
+    #[serde(default)] pub bcc: Vec<String>,
+    #[serde(default)] pub subject: String,
+    #[serde(default)] pub body: String,
+    #[serde(default, rename = "isHTML")] pub is_html: bool,
+    #[serde(default)] pub in_reply_to: Option<String>,
+    #[serde(default)] pub references: Option<String>,
+    #[serde(default)] pub account_id: Option<String>,
+    #[serde(default)] pub reply_thread_id: Option<String>,
+    #[serde(default)] pub created_at: String,
+    #[serde(default)] pub modified_at: String,
+    #[serde(default)] pub attachments: Vec<DraftAttachment>,
+    // Preserve Swift rich/quoted content when reopening a shared draft.
+    #[serde(default)] pub html_body: Option<String>,
+    #[serde(default)] pub html_signature: Option<String>,
+    #[serde(default)] pub quoted_content: Option<String>,
+    #[serde(default, rename = "quotedIsHTML")] pub quoted_is_html: bool,
+    #[serde(flatten)] pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftAttachment {
+    pub id: String,
+    pub filename: String,
+    pub mime_type: String,
+    /// Swift Data JSON encoding is base64.
+    pub data: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LocalDraft {
+    pub id: String,
+    pub draft_json: serde_json::Value,
+    pub created_at: i64,
+    pub modified_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct OutboxAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct OutboxDraft {
+    pub idempotency_key: String,
+    pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub is_html: bool,
+    pub in_reply_to: String,
+    pub references: String,
+    pub attachments: Vec<OutboxAttachment>,
+    pub delay_seconds: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Enqueued {
+    pub id: i64,
+    pub send_after: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct OutboxUpdate {
+    pub item_id: i64,
+    pub status: String,
+    #[serde(default)] pub error: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct OutboxEntry {
+    pub id: i64,
+    pub message_id: String,
+    #[serde(default)] pub last_error: String,
+    pub in_flight: bool,
+    pub delivery_confirmed: bool,
 }
 
 #[cfg(test)]

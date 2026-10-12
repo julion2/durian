@@ -31,6 +31,7 @@ pub struct Command {
 
 pub const COMMANDS: &[Command] = &[
     Command { scope: Scope::Mail, label: "Search", icon: IconName::Search, keys: &["/"], action: || Box::new(FocusSearch), in_menu: true, group: "Navigation" },
+    Command { scope: Scope::Any, label: "Refresh from server", icon: IconName::MailInbox, keys: &["cmd-r", "ctrl-r"], action: || Box::new(Retry), in_menu: true, group: "Navigation" },
     Command { scope: Scope::Mail, label: "Reply all", icon: IconName::MailReply, keys: &["a"], action: || Box::new(ReplyAll), in_menu: true, group: "Writing" },
     Command { scope: Scope::Mail, label: "Reply", icon: IconName::MailReply, keys: &["r"], action: || Box::new(Reply), in_menu: true, group: "Writing" },
     Command { scope: Scope::Mail, label: "Forward…", icon: IconName::MailForward, keys: &[], action: || Box::new(Forward), in_menu: true, group: "Writing" },
@@ -105,6 +106,11 @@ pub fn bind_keys(cx: &mut App) {
         })
         .collect::<Vec<_>>();
     cx.bind_keys(bindings);
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([
+        KeyBinding::new("ctrl-c", CopySelection, Some(&context(Scope::Any))),
+        KeyBinding::new("ctrl-a", SelectAllText, Some(&context(Scope::Any))),
+    ]);
 }
 
 /// Keycaps of the binding for `action`, from the same table that binds the keys.

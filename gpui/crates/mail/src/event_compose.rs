@@ -2,7 +2,7 @@
 //! takes the same natural language as ⌘K ("tomorrow 3pm for 1h") and shows what it understood;
 //! guests come from the mail contacts.
 
-use calendar::model::{Attendee, Event, Rsvp, Schedule};
+use calendar::model::{Attendee, Event, Rsvp, Schedule, ScheduleEvent};
 use calendar::parse::{self, Parsed};
 use chrono::{NaiveDateTime, Timelike};
 use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, Render, SharedString, Subscription, Window, div, prelude::*, px};
@@ -36,7 +36,7 @@ impl EventSeed {
 
     /// Edit an existing event: its time, title, guests (not you), place and notes.
     pub fn edit(event: Event, me: &[SharedString]) -> Self {
-        let guests = event.attendees.iter().filter(|a| !me.iter().any(|m| m.eq_ignore_ascii_case(&a.email))).map(|a| a.name.clone()).collect();
+        let guests = event.attendees.iter().filter(|a| !a.organizer && !me.iter().any(|m| m.eq_ignore_ascii_case(&a.email))).map(|a| a.email.clone()).collect();
         Self { start: event.start, end: event.end, all_day: event.all_day, title: Some(event.title.clone()), guests, editing: Some(event) }
     }
 }
@@ -73,6 +73,9 @@ pub struct EventComposer {
     location: Entity<TextInput>,
     notes: Entity<TextArea>,
     editing: Option<Event>,
+    id: SharedString,
+    submitting: bool,
+    error: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -84,13 +87,15 @@ impl Focusable for EventComposer {
     }
 }
 
-/// "Sat, Oct 10 12:30 – 13:30": readable, and the parser reads it back.
+/// Explicit years keep editing a past series master from moving it to next year.
+/// All-day ends are exclusive; timed midnight belongs to the actual end date.
 fn when_text(seed: &EventSeed) -> String {
-    let day = |t: NaiveDateTime| t.format("%a, %b %-d").to_string();
+    let day = |t: NaiveDateTime| t.format("%d.%m.%Y").to_string();
     let last = (seed.end - chrono::Duration::minutes(1)).date();
-    match (seed.all_day, last > seed.start.date()) {
+    let spans_days = if seed.all_day { last > seed.start.date() } else { seed.end.date() > seed.start.date() };
+    match (seed.all_day, spans_days) {
         (true, false) => format!("{} all day", day(seed.start)),
-        (true, true) => format!("{} – {} all day", day(seed.start), last.format("%a, %b %-d")),
+        (true, true) => format!("{} – {} all day", day(seed.start), last.format("%d.%m.%Y")),
         (false, false) => format!("{} {} – {}", day(seed.start), seed.start.format("%H:%M"), seed.end.format("%H:%M")),
         (false, true) => format!("{} {} – {} {}", day(seed.start), seed.start.format("%H:%M"), day(seed.end), seed.end.format("%H:%M")),
     }
@@ -145,30 +150,63 @@ impl EventComposer {
                 TextAreaEvent::Cancel => this.close(&Close, window, cx),
                 TextAreaEvent::Changed => {}
             }),
+            cx.subscribe(&schedule, |this, _, event, cx| {
+                if let ScheduleEvent::WriteFinished { id, result } = event {
+                    if this.submitting && *id == this.id {
+                        this.submitting = false;
+                        match result {
+                            Ok(saved) => cx.emit(EventComposeEvent::Saved(saved.clone())),
+                            Err(error) => this.error = Some(error.clone()),
+                        }
+                        cx.notify();
+                    }
+                }
+            }),
         ];
         title.read(cx).focus_handle(cx).focus(window, cx);
-        Self { mailbox, schedule, focus: cx.focus_handle(), calendar, title, when, parsed, guests, location, notes, editing: seed.editing, _subscriptions: subscriptions }
+        let id = seed.editing.as_ref().map(|e| e.id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string().into());
+        Self { mailbox, schedule, focus: cx.focus_handle(), calendar, title, when, parsed, guests, location, notes, editing: seed.editing,
+            id, submitting: false, error: None, _subscriptions: subscriptions }
     }
 
-    fn save(&mut self, _: &Send, _window: &mut Window, cx: &mut Context<Self>) {
+    fn save(&mut self, _: &Send, window: &mut Window, cx: &mut Context<Self>) {
+        if self.submitting { return; }
+        if self.schedule.read(cx).read_only {
+            self.error = Some("Calendar changes are unavailable. Your editor was kept.".into());
+            cx.notify();
+            return;
+        }
         let Some(when) = self.parsed.clone() else { return };
+        if !self.guests.update(cx, |guests, cx| guests.commit_pending(cx)) {
+            self.error = Some("Complete each guest with an email address before saving.".into());
+            cx.notify();
+            return;
+        }
         let mailbox = self.mailbox.read(cx);
         let contacts = mailbox.contacts();
-        let me = mailbox.me.clone();
+        let owner = self.schedule.read(cx).calendar(&self.calendar).and_then(|c| mailbox.account(&c.account));
+        let owner_email = owner.map(|a| a.email.clone()).unwrap_or_else(|| mailbox.me.email.clone());
+        let owner_name = owner.map(|a| a.name.clone()).unwrap_or_else(|| mailbox.me.name.clone());
         let guests = self.guests.read(cx).recipients();
         let mut attendees: Vec<Attendee> = Vec::new();
         if !guests.is_empty() {
-            attendees.push(Attendee { name: me.name.clone(), email: me.email.clone(), rsvp: Rsvp::Accepted, organizer: true, avatar: me.avatar.as_ref().map(|a| a.path.clone()) });
+            attendees.push(Attendee { name: owner_name, email: owner_email, rsvp: Rsvp::Accepted, organizer: true, avatar: None });
             for guest in guests {
+                let parsed = crate::durian::parse_address(&guest);
+                if !parsed.email.contains('@') {
+                    self.error = Some("Each guest needs an email address, not just a display name.".into());
+                    cx.notify();
+                    return;
+                }
                 // a guest who was already invited keeps their answer
-                if let Some(known) = self.editing.as_ref().and_then(|e| e.attendees.iter().find(|a| a.name == guest && !a.organizer)) {
+                if let Some(known) = self.editing.as_ref().and_then(|e| e.attendees.iter().find(|a| a.email.eq_ignore_ascii_case(&parsed.email) && !a.organizer)) {
                     attendees.push(known.clone());
                     continue;
                 }
-                let contact = contacts.iter().find(|c| c.name == guest);
+                let contact = contacts.iter().find(|c| c.email.eq_ignore_ascii_case(&parsed.email));
                 attendees.push(Attendee {
-                    name: guest.clone(),
-                    email: contact.map(|c| c.email.clone()).unwrap_or(guest),
+                    name: contact.map(|c| c.name.clone()).unwrap_or(parsed.name),
+                    email: parsed.email,
                     rsvp: Rsvp::NeedsAction,
                     organizer: false,
                     avatar: contact.and_then(|c| c.avatar.as_ref().map(|a| a.path.clone())),
@@ -180,7 +218,7 @@ impl EventComposer {
         let notes = self.notes.read(cx).text().trim().to_string();
         let editing = self.editing.clone();
         let event = Event {
-            id: editing.as_ref().map(|e| e.id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string().into()),
+            id: self.id.clone(),
             calendar: self.calendar.clone(),
             title: if title.is_empty() { "New event".into() } else { title.into() },
             start: when.start,
@@ -196,12 +234,19 @@ impl EventComposer {
             series: editing.as_ref().and_then(|e| e.series.clone()),
         };
         let id = event.id.clone();
+        let remote = self.schedule.read(cx).loaded.is_some();
+        if remote {
+            self.submitting = true;
+            self.error = None;
+            self.focus.focus(window, cx);
+            cx.notify();
+        }
         self.schedule.update(cx, |s, cx| if editing.is_some() { s.replace_event(event, cx) } else { s.add_event(event, cx) });
-        cx.emit(EventComposeEvent::Saved(id));
+        if !remote { cx.emit(EventComposeEvent::Saved(id)); }
     }
 
     fn close(&mut self, _: &Close, _window: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(EventComposeEvent::Close);
+        if !self.submitting { cx.emit(EventComposeEvent::Close); }
     }
 
     /// Tab order: title → when → guests → location → notes.
@@ -225,7 +270,7 @@ impl EventComposer {
             let start = p.start.date().and_hms_opt(9, 0, 0).unwrap_or(p.start);
             when_text(&EventSeed::slot(start, start + chrono::Duration::hours(1), false))
         } else {
-            format!("{} all day", p.start.format("%a, %b %-d"))
+            format!("{} all day", p.start.format("%d.%m.%Y"))
         };
         self.when.update(cx, |input, cx| {
             input.set_text(SharedString::from(text.clone()));
@@ -240,11 +285,15 @@ impl EventComposer {
     /// Your other events in that slot (not declined, not all-day).
     fn conflicts(&self, cx: &App) -> Vec<Event> {
         let Some(p) = self.parsed.as_ref().filter(|p| !p.all_day) else { return Vec::new() };
+        // Refresh can discover our create after its ACK was lost. Compare the
+        // scoped wire identity as well as the editor id, not title or times.
+        let uid = crate::durian::EventRef::from_occurrence(&self.id).map(|at| at.uid).unwrap_or_else(|| self.id.to_string());
         // every day the slot touches, not just the first
         self.schedule
             .read(cx)
             .events
             .iter()
+            .filter(|e| e.id != self.id && !(e.calendar == self.calendar && crate::durian::EventRef::from_occurrence(&e.id).is_some_and(|at| at.uid == uid)))
             .filter(|e| !e.all_day && e.rsvp != Rsvp::Declined && e.start < p.end && e.end > p.start)
             .cloned()
             .collect()
@@ -288,6 +337,14 @@ fn length(p: &Parsed) -> String {
 impl Render for EventComposer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        if self.submitting {
+            // Keep the editor's entities and text alive, but do not permit more
+            // edits that could be lost when this already-submitted save succeeds.
+            return div().key_context("Compose").track_focus(&self.focus)
+                .w(px(640.)).p(px(24.)).bg(theme.bg_card).rounded(theme.radius.dialog)
+                .shadow(theme.overlay_shadow()).text_color(theme.text_primary)
+                .child("Saving event… Your editor will return if saving fails.").into_any_element();
+        }
         let calendar = self.schedule.read(cx).calendar(&self.calendar).cloned();
         let today = chrono::Local::now().date_naive();
         let red = ui::theme::lch(55., 70., 30.);
@@ -364,6 +421,7 @@ impl Render for EventComposer {
                             // click: the next calendar
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let calendars = &this.schedule.read(cx).calendars;
+                                if calendars.is_empty() || this.editing.is_some() { return; }
                                 let next = calendars.iter().position(|c| c.id == this.calendar).map_or(0, |i| (i + 1) % calendars.len());
                                 this.calendar = calendars[next].id.clone();
                                 cx.notify();
@@ -389,6 +447,7 @@ impl Render for EventComposer {
                     .children(conflict_line)
                     .child(self.guests.clone())
                     .child(property(IconName::MapPin, self.location.clone(), &theme))
+                    .when_some(self.error.clone(), |s, error| s.child(div().py(px(8.)).text_size(px(SIZE_SMALL)).text_color(red).child(error)))
                     // description in the mail body's style
                     .child(
                         div()
@@ -438,5 +497,35 @@ impl Render for EventComposer {
                         PrimaryButton::new("event-save", "Save").on_click(cx.listener(|this, _, window, cx| this.save(&Send, window, cx))),
                     )),
             )
+            .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editing_event_time_preserves_year_and_midnight_end() {
+        let time = |s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap();
+        let now = time("2026-10-11 12:00");
+        for (start, end, all_day) in [
+            ("2026-10-09 14:00", "2026-10-09 15:45", false),
+            ("2029-10-09 14:00", "2029-10-09 15:45", false),
+            ("2026-10-12 21:00", "2026-10-13 00:00", false),
+            ("2025-12-31 00:00", "2026-01-03 00:00", true),
+            ("2026-10-09 00:00", "2026-10-10 00:00", true),
+        ] {
+            let seed = EventSeed::slot(time(start), time(end), all_day);
+            let input = when_text(&seed);
+            let parsed = parse::parse(&input, now, &[]).unwrap();
+            assert_eq!((parsed.start, parsed.end, parsed.all_day), (time(start), time(end), all_day), "{input}");
+            if !all_day {
+                let edited = input.replacen(&seed.start.format("%H:%M").to_string(), "13:30", 1);
+                let parsed = parse::parse(&edited, now, &[]).unwrap();
+                assert_eq!(parsed.start, seed.start.date().and_hms_opt(13, 30, 0).unwrap());
+                assert_eq!(parsed.end, time(end));
+            }
+        }
     }
 }

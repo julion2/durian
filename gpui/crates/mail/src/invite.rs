@@ -38,7 +38,20 @@ pub fn resolve(schedule: &Schedule, message: &crate::model::Message) -> Option<(
         return Some((schedule.event(id)?.clone(), Kind::Request, false));
     }
     let carried = message.invitation.as_ref()?;
-    let event = match schedule.event(&carried.event.id) {
+    let listed = schedule.event(&carried.event.id).or_else(|| {
+        let source = crate::durian::EventRef::from_occurrence(&carried.event.id)?;
+        if !source.calendar.is_empty() { return None }
+        // A mail invitation often has no calendar yet. Match only its account, UID
+        // and occurrence, and leave the mail's copy alone if two calendars contain it.
+        let mut matches = schedule.events.iter().filter(|event| {
+            event.start == carried.event.start
+                && crate::durian::EventRef::from_occurrence(&event.id)
+                    .is_some_and(|candidate| candidate.account == source.account && candidate.uid == source.uid)
+        });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    });
+    let event = match listed {
         Some(listed) => {
             let mut event = listed.clone();
             if event.attendees.is_empty() {

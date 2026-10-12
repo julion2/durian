@@ -1,0 +1,74 @@
+load("@gpui_crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+cargo_build_script(
+    name = "mail_build_script",
+    srcs = ["build.rs"],
+    crate_root = "build.rs",
+    data = glob(["helpers/**"]),
+    edition = "2024",
+    pkg_name = "mail",
+)
+
+filegroup(
+    name = "mailrender_output",
+    srcs = [":mail_build_script"],
+    output_group = "out_dir",
+    visibility = ["//gpui:__subpackages__"],
+)
+
+rust_library(
+    name = "mail",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    compile_data = glob([
+        "src/**/*.pkl",
+        "src/**/*.js",
+    ]),
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//gpui:__subpackages__"],
+    deps = [
+        ":mail_build_script",
+        "//gpui/crates/calendar",
+        "//gpui/crates/ui",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "mail_test",
+    size = "small",
+    crate = ":mail",
+    data = [":mailrender_output"],
+)
+
+rust_binary(
+    name = "prepare_html",
+    srcs = ["examples/prepare_html.rs"],
+    aliases = aliases(),
+    crate_root = "examples/prepare_html.rs",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [":mail"] + all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_binary(
+    name = "backend_contract",
+    srcs = ["examples/backend_contract.rs"],
+    aliases = aliases(),
+    crate_root = "examples/backend_contract.rs",
+    data = [":mailrender_output"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+    deps = [
+        ":mail",
+        "//gpui/crates/calendar",
+        "//gpui/crates/ui",
+    ] + all_crate_deps(normal = True),
+)

@@ -2,13 +2,17 @@
 //! with 21px radius over a dimmed backdrop, breadcrumb header, big title field (here: subject),
 //! body editor, and a footer with a filled primary action.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
-    Render, SharedString, Subscription, Window, actions, deferred, div, prelude::*, px,
+    Render, SharedString, Subscription, Task, Window, actions, deferred, div, prelude::*, px,
 };
 
 use crate::contact_avatar;
-use crate::model::{Contact, DraftKind, Mailbox};
+use crate::model::{Contact, DraftKind, Mailbox, MailboxEvent};
+use crate::durian::api::{DraftContent, DraftAttachment};
 use ui::theme::{ActiveTheme, typography::*};
 use ui::{ConfirmDialog, IconButton, IconName, PrimaryButton, StyledExt, TextArea, TextAreaEvent, TextInput, TextInputEvent, fuzzy_score};
 
@@ -51,6 +55,7 @@ enum Format {
 pub enum ComposeEvent {
     Close,
     DraftSaved(usize),
+    UndoSend(usize),
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -76,16 +81,23 @@ pub struct RecipientField {
     contacts: Vec<Contact>,
     suggestions: Vec<Contact>,
     selected: usize,
+    contact_client: Option<Arc<crate::durian::Client>>,
+    contact_generation: u64,
+    contact_debounce: Option<Task<()>>,
+    contact_task: Option<Task<()>>,
+    contact_status: Option<&'static str>,
     _subscription: Subscription,
 }
 
 impl RecipientField {
     pub(crate) fn new(label: &'static str, closable: bool, recipients: Vec<SharedString>, contacts: Vec<Contact>, cx: &mut Context<Self>) -> Self {
+        let recipients = recipients.into_iter().map(|raw| canonical_recipient(&raw, &contacts)).collect();
         let input = cx.new(|cx| TextInput::new("", cx));
         let subscription = cx.subscribe(&input, |this, _, event, cx| match event {
             TextInputEvent::Changed(query) => this.update_suggestions(query, cx),
         });
-        Self { label, label_width: 36., icon: None, closable, recipients, input, contacts, suggestions: Vec::new(), selected: 0, _subscription: subscription }
+        Self { label, label_width: 36., icon: None, closable, recipients, input, contacts, suggestions: Vec::new(), selected: 0,
+            contact_client: None, contact_generation: 0, contact_debounce: None, contact_task: None, contact_status: None, _subscription: subscription }
     }
 
     pub(crate) fn as_property(mut self, icon: IconName, placeholder: &'static str, cx: &mut Context<Self>) -> Self {
@@ -97,13 +109,16 @@ impl RecipientField {
 
     fn update_suggestions(&mut self, query: &str, cx: &mut Context<Self>) {
         let query = query.trim();
-        self.suggestions = if query.is_empty() {
+        self.contact_generation += 1;
+        self.contact_debounce = None;
+        self.contact_status = None;
+        self.suggestions = if query.is_empty() || self.contact_client.is_some() {
             Vec::new()
         } else {
             let mut scored: Vec<(i32, Contact)> = self
                 .contacts
                 .iter()
-                .filter(|c| !self.recipients.contains(&c.name))
+                .filter(|c| !self.recipients.iter().any(|r| crate::durian::parse_address(r).email.eq_ignore_ascii_case(&c.email)))
                 .filter_map(|c| {
                     let score = fuzzy_score(query, &c.name).max(fuzzy_score(query, &c.email))?;
                     Some((score, c.clone()))
@@ -113,20 +128,88 @@ impl RecipientField {
             scored.into_iter().take(5).map(|(_, c)| c).collect()
         };
         self.selected = 0;
+        if !query.is_empty() && self.contact_client.is_some() {
+            self.contact_status = Some("Searching contacts…");
+            self.schedule_contacts(cx);
+        }
         cx.notify();
+    }
+
+    fn set_contact_client(&mut self, client: Option<Arc<crate::durian::Client>>, cx: &mut Context<Self>) {
+        self.contact_client = client;
+        let query = self.input.read(cx).text().to_string();
+        self.update_suggestions(&query, cx);
+    }
+
+    fn schedule_contacts(&mut self, cx: &mut Context<Self>) {
+        // One blocking lookup per field, plus only the newest pending text. A
+        // dropped GPUI task cannot cancel ureq IO, so never replace an active one.
+        if self.contact_task.is_some() || self.contact_client.is_none() || self.input.read(cx).text().trim().is_empty() {
+            return;
+        }
+        let executor = cx.background_executor().clone();
+        self.contact_debounce = Some(cx.spawn(async move |this, cx| {
+            executor.timer(Duration::from_millis(150)).await;
+            this.update(cx, |this, cx| this.lookup_contacts(cx)).ok();
+        }));
+    }
+
+    fn lookup_contacts(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.contact_client.clone() else { return };
+        if self.contact_task.is_some() { return; }
+        let query = self.input.read(cx).text().trim().to_string();
+        if query.is_empty() { return; }
+        let generation = self.contact_generation;
+        let executor = cx.background_executor().clone();
+        self.contact_task = Some(cx.spawn(async move |this, cx| {
+            let result = executor.spawn(async move { client.contacts(&query) }).await;
+            this.update(cx, |this, cx| {
+                this.contact_task = None;
+                if generation != this.contact_generation {
+                    this.schedule_contacts(cx);
+                    return;
+                }
+                this.contact_status = None;
+                match result {
+                    Ok(contacts) => {
+                        let mut seen: std::collections::HashSet<String> = this.recipients.iter().map(|r| crate::durian::parse_address(r).email.to_lowercase()).collect();
+                        this.suggestions = contacts.into_iter()
+                            .filter(|c| c.email.contains('@') && seen.insert(c.email.to_lowercase()))
+                            .take(5)
+                            .map(|c| Contact { name: c.name.into(), email: c.email.into(), avatar: None })
+                            .collect();
+                    }
+                    Err(_) => this.contact_status = Some("Contacts unavailable — type an email address"),
+                }
+                this.selected = 0;
+                cx.notify();
+            }).ok();
+        }));
     }
 
     /// Enter / Tab / comma: take the highlighted suggestion, or the typed address as-is.
     fn commit(&mut self, cx: &mut Context<Self>) -> bool {
         let typed = self.input.read(cx).text().trim().trim_end_matches(',').to_string();
-        let name: Option<SharedString> = match self.suggestions.get(self.selected) {
-            Some(contact) => Some(contact.name.clone()),
-            None if typed.contains('@') => Some(typed.into()),
-            None => None,
-        };
+        let name = self.suggestions.get(self.selected).map(contact_identity).or_else(|| typed.contains('@').then(|| typed.into()));
         let Some(name) = name else { return false };
         if !self.recipients.contains(&name) {
             self.recipients.push(name);
+        }
+        self.input.update(cx, |input, cx| input.clear(cx));
+        self.suggestions.clear();
+        cx.notify();
+        true
+    }
+
+    /// Commit any uncommitted recipient text before saving/sending. An invalid
+    /// nonempty field returns false and keeps its text for correction.
+    pub fn commit_pending(&mut self, cx: &mut Context<Self>) -> bool {
+        let typed: SharedString = self.input.read(cx).text().trim().trim_end_matches(',').to_string().into();
+        if typed.is_empty() { return true }
+        let address = canonical_recipient(&typed, &self.contacts);
+        if !address.contains('@') { return false }
+        if !self.recipients.iter().any(|r| crate::durian::parse_address(r).email.eq_ignore_ascii_case(&crate::durian::parse_address(&address).email)) {
+            self.recipients.push(address);
         }
         self.input.update(cx, |input, cx| input.clear(cx));
         self.suggestions.clear();
@@ -142,6 +225,13 @@ impl RecipientField {
         self.recipients.clone()
     }
 
+    fn draft_recipients(&self, cx: &App) -> Vec<SharedString> {
+        let mut recipients = self.recipients.clone();
+        let pending = self.input.read(cx).text().trim();
+        if !pending.is_empty() { recipients.push(pending.to_string().into()); }
+        recipients
+    }
+
     fn clear(&mut self, cx: &mut Context<Self>) {
         self.recipients.clear();
         self.suggestions.clear();
@@ -150,11 +240,43 @@ impl RecipientField {
     }
 }
 
+fn contact_identity(contact: &Contact) -> SharedString {
+    if contact.name.is_empty() { contact.email.clone() } else { format!("{} <{}>", contact.name, contact.email).into() }
+}
+
+fn canonical_recipient(raw: &SharedString, contacts: &[Contact]) -> SharedString {
+    if raw.contains('@') { return raw.clone() }
+    let mut matching = contacts.iter().filter(|c| c.name == *raw);
+    match (matching.next(), matching.next()) {
+        (Some(contact), None) => contact_identity(contact),
+        _ => raw.clone(), // ambiguous names cannot silently select someone else's address
+    }
+}
+
+fn read_attachments(paths: Vec<std::path::PathBuf>) -> Result<Vec<DraftAttachment>, String> {
+    use std::io::Read;
+    use base64::Engine;
+    let mut total = 0;
+    paths.into_iter().map(|path| {
+        let file = std::fs::File::open(&path).map_err(|_| "Could not read an attachment".to_string())?;
+        let mut data = Vec::new();
+        file.take((1 << 20) + 1).read_to_end(&mut data).map_err(|_| "Could not read an attachment".to_string())?;
+        total += data.len();
+        if total > 1 << 20 { return Err("Attachments exceed the 1 MiB encrypted draft limit".into()) }
+        let mime_type = match path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+            "txt" => "text/plain", "pdf" => "application/pdf", "png" => "image/png", "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif", "csv" => "text/csv", "ics" => "text/calendar", _ => "application/octet-stream",
+        };
+        Ok(DraftAttachment { id: uuid::Uuid::new_v4().to_string(), filename: path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            mime_type: mime_type.into(), data: base64::engine::general_purpose::STANDARD.encode(data) })
+    }).collect()
+}
+
 impl Render for RecipientField {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let chips = self.recipients.iter().enumerate().map(|(ix, name)| {
-            let contact = self.contacts.iter().find(|c| c.name == *name).cloned().unwrap_or(Contact {
+            let contact = self.contacts.iter().find(|c| c.email.eq_ignore_ascii_case(&crate::durian::parse_address(name).email)).cloned().unwrap_or(Contact {
                 name: name.clone(),
                 email: name.clone(),
                 avatar: None,
@@ -202,7 +324,7 @@ impl Render for RecipientField {
         });
 
         // deferred: painted after the rest of the dialog, so subject/body never draw over it
-        let suggestions = (!self.suggestions.is_empty()).then(|| {
+        let suggestions = (self.input_focus(cx).is_focused(window) && (!self.suggestions.is_empty() || self.contact_status.is_some())).then(|| {
             deferred(div()
                 .absolute()
                 .top(px(38.))
@@ -214,6 +336,7 @@ impl Render for RecipientField {
                 .border_color(theme.border_card)
                 .rounded(theme.radius.lg)
                 .shadow(theme.overlay_shadow())
+                .when_some(self.contact_status, |s, status| s.child(div().p(px(8.)).text_size(px(SIZE_SMALL)).text_color(theme.text_tertiary).child(status)))
                 .children(self.suggestions.iter().enumerate().map(|(ix, contact)| {
                     let active = ix == self.selected;
                     div()
@@ -326,6 +449,11 @@ pub struct ComposeDialog {
     account: SharedString,
     /// sending address (the account's primary or an alias)
     from: SharedString,
+    wire: DraftContent,
+    waiting: bool,
+    close_on_saved: bool,
+    autosave: Option<Task<()>>,
+    attachment_task: Option<Task<()>>,
     /// "Save to drafts?" is up
     confirm_close: bool,
     confirm_focus: FocusHandle,
@@ -341,17 +469,31 @@ impl Focusable for ComposeDialog {
 }
 
 impl ComposeDialog {
+    pub(crate) fn set_contact_client(&self, client: Option<Arc<crate::durian::Client>>, cx: &mut Context<Self>) {
+        for field in [&self.to, &self.cc, &self.bcc] {
+            field.update(cx, |field, cx| field.set_contact_client(client.clone(), cx));
+        }
+    }
+
     pub fn new(mailbox: Entity<Mailbox>, seed: ComposeSeed, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let wire = seed.draft_id.and_then(|id| mailbox.read(cx).drafts.iter().find(|d| d.id == id)).map(|d| d.wire.clone()).unwrap_or_else(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            DraftContent { id: uuid::Uuid::new_v4().to_string(), created_at: now.clone(), modified_at: now, ..Default::default() }
+        });
         let contacts = mailbox.read(cx).contacts();
-        let account = seed.account.clone().or_else(|| mailbox.read(cx).sending_account(None).map(|a| a.id.clone())).unwrap_or_default();
-        let from = seed.from.clone().or_else(|| mailbox.read(cx).account(&account).map(|a| a.email.clone())).unwrap_or_default();
-        let show_cc = !seed.cc.is_empty();
-        let to = cx.new(|cx| RecipientField::new("To", false, seed.to.clone(), contacts.clone(), cx));
-        let cc = cx.new(|cx| RecipientField::new("Cc", true, seed.cc.clone(), contacts.clone(), cx));
-        let bcc = cx.new(|cx| RecipientField::new("Bcc", true, Vec::new(), contacts, cx));
+        let captured = wire.reply_thread_id.is_some();
+        let account = captured.then(|| wire.account_id.clone()).flatten().map(Into::into).or_else(|| seed.account.clone()).or_else(|| mailbox.read(cx).sending_account(None).map(|a| a.id.clone())).unwrap_or_default();
+        let from = captured.then(|| wire.from.clone().into()).or_else(|| seed.from.clone()).or_else(|| mailbox.read(cx).account(&account).map(|a| a.email.clone())).unwrap_or_default();
+        let recipients: Vec<SharedString> = if captured { wire.to.iter().cloned().map(Into::into).collect() } else { seed.to.clone() };
+        let copies: Vec<SharedString> = if captured { wire.cc.iter().cloned().map(Into::into).collect() } else { seed.cc.clone() };
+        let show_cc = !copies.is_empty();
+        let to = cx.new(|cx| RecipientField::new("To", false, recipients, contacts.clone(), cx));
+        let cc = cx.new(|cx| RecipientField::new("Cc", true, copies, contacts.clone(), cx));
+        let show_bcc = !wire.bcc.is_empty();
+        let bcc = cx.new(|cx| RecipientField::new("Bcc", true, wire.bcc.iter().cloned().map(Into::into).collect(), contacts, cx));
         let subject = cx.new(|cx| {
             let mut input = TextInput::new("Subject", cx);
-            input.set_text(seed.subject.clone());
+            input.set_text(if captured { wire.subject.clone().into() } else { seed.subject.clone() });
             input
         });
         let body = cx.new(|cx| {
@@ -359,11 +501,11 @@ impl ComposeDialog {
             area.set_text(seed.body.clone(), cx);
             area
         });
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe_in(&body, window, |this, _, event, window, cx| match event {
                 TextAreaEvent::Submit => this.send(&Send, window, cx),
                 TextAreaEvent::Cancel => this.close(&Close, window, cx),
-                TextAreaEvent::Changed => cx.notify(),
+                TextAreaEvent::Changed => { this.wire.html_body = None; this.wire.is_html = false; this.schedule_autosave(cx); cx.notify(); }
             }),
             // closing a Cc/Bcc row drops its recipients and moves on to the subject
             cx.subscribe_in(&cc, window, |this, field, RecipientFieldEvent::Close, window, cx| {
@@ -378,7 +520,26 @@ impl ComposeDialog {
                 this.subject.read(cx).focus_handle(cx).focus(window, cx);
                 cx.notify();
             }),
+            cx.subscribe(&mailbox, |this, _, event, cx| match event {
+                MailboxEvent::DraftSaved(id) if this.draft_id == Some(*id) && this.close_on_saved => {
+                    this.waiting = false;
+                    cx.emit(ComposeEvent::DraftSaved(*id));
+                    cx.emit(ComposeEvent::Close);
+                }
+                MailboxEvent::DraftDeleted(id) if this.draft_id == Some(*id) => cx.emit(ComposeEvent::Close),
+                MailboxEvent::SendFinished { draft_id, result } if this.draft_id == Some(*draft_id) => {
+                    this.waiting = false;
+                    if result.is_ok() { cx.emit(ComposeEvent::Close); }
+                    cx.notify();
+                }
+                MailboxEvent::WriteProblem(_) => { this.waiting = false; this.close_on_saved = false; cx.notify(); }
+                _ => {}
+            }),
         ];
+        subscriptions.push(cx.subscribe(&subject, |this, _, _, cx| this.schedule_autosave(cx)));
+        for field in [&to, &cc, &bcc] {
+            subscriptions.push(cx.observe(field, |this, _, cx| this.schedule_autosave(cx)));
+        }
 
         // start where the user has to type next
         if seed.to.is_empty() {
@@ -396,12 +557,17 @@ impl ComposeDialog {
             cc,
             bcc,
             show_cc,
-            show_bcc: false,
+            show_bcc,
             subject,
             body,
             draft_id: seed.draft_id,
             account,
             from,
+            wire,
+            waiting: false,
+            close_on_saved: false,
+            autosave: None,
+            attachment_task: None,
             confirm_close: false,
             confirm_focus: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -409,8 +575,14 @@ impl ComposeDialog {
     }
 
     fn send(&mut self, _: &Send, _: &mut Window, cx: &mut Context<Self>) {
-        // pending text in the To field counts as a recipient
-        self.to.update(cx, |field, cx| field.commit(cx));
+        if self.waiting || self.attachment_task.is_some() { return }
+        if let Some(id) = self.draft_id.filter(|id| self.mailbox.read(cx).drafts.iter().any(|d| d.id == *id && d.wire.extra.contains_key(crate::durian::writes::PENDING_SEND))) {
+            self.autosave = None;
+            self.waiting = self.mailbox.update(cx, |m, cx| m.submit_draft(id, None, cx));
+            cx.notify();
+            return;
+        }
+        if !self.commit_recipients(cx) { return }
         let to = self.to.read(cx).recipients();
         let body = self.body.read(cx).text().trim().to_string();
         if to.is_empty() || body.is_empty() {
@@ -420,6 +592,15 @@ impl ComposeDialog {
         let bcc = self.bcc.read(cx).recipients();
         let subject = self.subject.read(cx).text().clone();
         let subject = if subject.trim().is_empty() { "(no subject)".into() } else { subject };
+        if self.mailbox.read(cx).remote.is_some() {
+            self.autosave = None;
+            self.subject.update(cx, |input, _| input.set_text(subject));
+            if let Some(id) = self.persist(cx) {
+                self.waiting = self.mailbox.update(cx, |m, cx| m.submit_draft(id, None, cx));
+            }
+            cx.notify();
+            return;
+        }
         self.mailbox.update(cx, |m, cx| m.send_new(self.account.clone(), self.from.clone(), subject, to, cc, bcc, body.into(), cx));
         if let Some(id) = self.draft_id {
             self.mailbox.update(cx, |m, cx| m.discard_draft(id, cx));
@@ -428,34 +609,100 @@ impl ComposeDialog {
     }
 
     fn has_content(&self, cx: &App) -> bool {
-        !self.to.read(cx).recipients.is_empty()
-            || !self.cc.read(cx).recipients.is_empty()
-            || !self.bcc.read(cx).recipients.is_empty()
+        !self.to.read(cx).draft_recipients(cx).is_empty()
+            || !self.cc.read(cx).draft_recipients(cx).is_empty()
+            || !self.bcc.read(cx).draft_recipients(cx).is_empty()
             || !self.subject.read(cx).text().trim().is_empty()
             || !self.body.read(cx).is_empty()
+            || !self.wire.attachments.is_empty()
     }
 
     fn save_draft(&mut self, cx: &mut Context<Self>) {
+        if self.waiting || self.attachment_task.is_some() || !self.commit_recipients(cx) { return }
+        self.autosave = None;
+        self.close_on_saved = self.mailbox.read(cx).remote.is_some();
+        if let Some(id) = self.persist(cx) {
+            if self.close_on_saved { self.waiting = true; self.confirm_close = false; cx.notify(); }
+            else { cx.emit(ComposeEvent::DraftSaved(id)); cx.emit(ComposeEvent::Close); }
+        } else { self.close_on_saved = false; }
+    }
+
+    fn commit_recipients(&self, cx: &mut Context<Self>) -> bool {
+        let to = self.to.update(cx, |f, cx| f.commit_pending(cx));
+        let cc = self.cc.update(cx, |f, cx| f.commit_pending(cx));
+        let bcc = self.bcc.update(cx, |f, cx| f.commit_pending(cx));
+        if !(to && cc && bcc) {
+            self.mailbox.update(cx, |_, cx| cx.emit(MailboxEvent::WriteProblem("Complete each recipient with an email address before saving or sending.".into())));
+        }
+        to && cc && bcc
+    }
+
+    fn persist(&mut self, cx: &mut Context<Self>) -> Option<usize> {
         let kind = DraftKind::New {
             account: self.account.clone(),
             from: self.from.clone(),
-            to: self.to.read(cx).recipients(),
-            cc: self.cc.read(cx).recipients(),
-            bcc: self.bcc.read(cx).recipients(),
+            to: self.to.read(cx).draft_recipients(cx),
+            cc: self.cc.read(cx).draft_recipients(cx),
+            bcc: self.bcc.read(cx).draft_recipients(cx),
             subject: self.subject.read(cx).text().clone(),
         };
         let body = self.body.read(cx).text().clone();
-        if let Some(id) = self.mailbox.update(cx, |m, cx| m.save_new_draft(self.draft_id, kind, body, cx)) {
-            cx.emit(ComposeEvent::DraftSaved(id));
+        // GPUI's editor is Markdown; preserve a Swift rich draft until edited.
+        if self.wire.html_body.is_none() { self.wire.html_body = Some(ui::markdown::to_html(&body)); }
+        let id = self.mailbox.update(cx, |m, cx| m.save_draft_content(self.draft_id, kind, body, self.wire.clone(), cx))?;
+        self.draft_id = Some(id);
+        self.wire = self.mailbox.read(cx).drafts.iter().find(|d| d.id == id)?.wire.clone();
+        Some(id)
+    }
+
+    fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
+        if self.mailbox.read(cx).remote.is_none() || self.waiting { return }
+        if self.draft_id.is_some_and(|id| self.mailbox.read(cx).drafts.iter().any(|d| d.id == id && (d.queued.is_some() || d.sending || d.wire.extra.contains_key(crate::durian::writes::PENDING_SEND)))) { return }
+        self.autosave = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(750)).await;
+            this.update(cx, |this, cx| { this.autosave = None; if !this.waiting { this.persist(cx); } }).ok();
+        }));
+    }
+
+    fn discard(&mut self, cx: &mut Context<Self>) {
+        if self.waiting { return }
+        self.autosave = None;
+        if let Some(id) = self.draft_id {
+            self.mailbox.update(cx, |m, cx| m.discard_draft(id, cx));
+            if self.mailbox.read(cx).remote.is_some() {
+                self.waiting = self.mailbox.read(cx).drafts.iter().any(|d| d.id == id && d.deleting);
+                self.confirm_close = false;
+                cx.notify();
+                return;
+            }
         }
         cx.emit(ComposeEvent::Close);
     }
 
-    fn discard(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.draft_id {
-            self.mailbox.update(cx, |m, cx| m.discard_draft(id, cx));
-        }
-        cx.emit(ComposeEvent::Close);
+    fn attach(&mut self, cx: &mut Context<Self>) {
+        if self.waiting || self.attachment_task.is_some() { return }
+        let choose = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach files (encrypted recovery drafts are limited to 1 MiB)".into()) });
+        let executor = cx.background_executor().clone();
+        self.attachment_task = Some(cx.spawn(async move |this, cx| {
+            let result = match choose.await {
+                Ok(Ok(Some(paths))) => executor.spawn(async move { read_attachments(paths) }).await,
+                Ok(Ok(None)) => Ok(Vec::new()),
+                _ => Err("Could not open the attachment picker".to_string()),
+            };
+            this.update(cx, |this, cx| {
+                this.attachment_task = None;
+                match result {
+                    Ok(attachments) => {
+                        let mut next = this.wire.clone(); next.attachments.extend(attachments);
+                        if crate::durian::writes::draft_fits(&next) { this.wire = next; this.schedule_autosave(cx); }
+                        else { this.mailbox.update(cx, |_, cx| cx.emit(MailboxEvent::WriteProblem("Attachments exceed the 1 MiB encrypted recovery draft limit; they were not added.".into()))); }
+                    }
+                    Err(error) => this.mailbox.update(cx, |_, cx| cx.emit(MailboxEvent::WriteProblem(error.into()))),
+                }
+                cx.notify();
+            }).ok();
+        }));
+        cx.notify();
     }
 
     fn format_button(&self, id: &'static str, label: &'static str, format: Format, theme: &ui::theme::Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -510,6 +757,7 @@ impl ComposeDialog {
 
     /// Esc / ×: an empty composer just closes; with content it asks "Save to drafts?".
     fn close(&mut self, _: &Close, window: &mut Window, cx: &mut Context<Self>) {
+        if self.waiting || self.attachment_task.is_some() { return }
         if !self.has_content(cx) {
             cx.emit(ComposeEvent::Close);
             return;
@@ -521,13 +769,44 @@ impl ComposeDialog {
 }
 
 impl Render for ComposeDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let mailbox = self.mailbox.read(cx);
+        if let Some(draft) = self.draft_id.and_then(|id| mailbox.drafts.iter().find(|d| d.id == id)).filter(|d| d.sending || d.queued.is_some() || d.wire.extra.contains_key(crate::durian::writes::PENDING_SEND)).cloned() {
+            // Detached inputs must not retain keyboard focus while the payload
+            // is frozen. Display the actual frozen body, never unaccepted edits.
+            self.focus_handle.focus(window, cx);
+            let pending = draft.sending;
+            let queued = draft.queued.is_some();
+            return div().key_context("Compose").track_focus(&self.focus_handle)
+                .on_action(cx.listener(|_, _: &Close, _, cx| cx.emit(ComposeEvent::Close)))
+                .w(px(750.)).p(px(24.)).flex().flex_col().gap(px(14.)).bg(theme.bg_card).rounded(theme.radius.dialog)
+                .text_color(theme.text_body)
+                .child(if pending { "Queuing message… your content is retained" } else if queued { "Outbox receipt retained — verify delivery status" } else { "Enqueue outcome is unknown; retry preserves the original message" })
+                .child(div().text_size(px(SIZE_SMALL)).child(format!("From: {} · To: {}", draft.wire.from, draft.wire.to.join(", "))))
+                .child(div().text_size(px(18.)).child(draft.wire.subject.clone()))
+                .child(div().max_h(px(420.)).child(draft.wire.body.clone()))
+                .child(div().text_size(px(SIZE_MINI)).child("Editing is locked until cancellation is confirmed. Closing retains this draft in memory; server recovery may be unavailable after a failed save."))
+                .child(div().flex().gap(px(12.))
+                    .when(!pending && !queued, |s| s.child(PrimaryButton::new("retry-original-send", "Retry original send").on_click(cx.listener(|this, _, window, cx| this.send(&Send, window, cx)))))
+                    .when(queued, |s| s.child(PrimaryButton::new("undo-queued-send", "Request cancellation").on_click(cx.listener(move |_, _, _, cx| cx.emit(ComposeEvent::UndoSend(draft.id))))))
+                    .child(PrimaryButton::new("close-frozen-send", "Close").on_click(cx.listener(|_, _, _, cx| cx.emit(ComposeEvent::Close)))))
+                .into_any_element();
+        }
+        if self.waiting {
+            // A save ACK closes this editor. Do not accept later keystrokes that
+            // were not part of that save and would be discarded by its ACK.
+            self.focus_handle.focus(window, cx);
+            return div().key_context("Compose").track_focus(&self.focus_handle)
+                .w(px(750.)).p(px(24.)).bg(theme.bg_card).rounded(theme.radius.dialog)
+                .text_color(theme.text_body)
+                .child(if self.close_on_saved { "Saving draft… Your editor will return if saving fails." } else { "Deleting draft… Your editor will return if deletion fails." })
+                .into_any_element();
+        }
         let account = mailbox.account(&self.account).cloned();
         let sender_count = mailbox.sender_options().len();
         let from = self.from.clone();
-        let can_send = !self.to.read(cx).recipients.is_empty() || !self.to.read(cx).input.read(cx).text().is_empty();
+        let can_send = !self.waiting && self.attachment_task.is_none() && (!self.to.read(cx).recipients.is_empty() || !self.to.read(cx).input.read(cx).text().is_empty());
 
         div()
             .key_context("Compose")
@@ -582,6 +861,7 @@ impl Render for ComposeDialog {
                                     let options = this.mailbox.read(cx).sender_options();
                                     let next = options.iter().position(|(_, e)| *e == this.from).map_or(0, |i| (i + 1) % options.len());
                                     (this.account, this.from) = options[next].clone();
+                                    this.schedule_autosave(cx);
                                     cx.notify();
                                 }))
                             }),
@@ -682,11 +962,18 @@ impl Render for ComposeDialog {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.))
                     .px(px(12.))
                     .pb(px(12.))
-                    .child(IconButton::new("compose-attach", IconName::MailAttach).style(ui::ButtonStyle::Raised))
+                    .child(IconButton::new("compose-attach", IconName::MailAttach).style(ui::ButtonStyle::Raised).on_click(cx.listener(|this, _, _, cx| this.attach(cx))))
+                    .children(self.wire.attachments.iter().enumerate().map(|(ix, attachment)| {
+                        div().id(("compose-attachment", ix)).text_size(px(SIZE_MINI)).child(attachment.filename.clone())
+                            .child(IconButton::new(("remove-attachment", ix), IconName::CloseSmall).size(18.).on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.waiting && ix < this.wire.attachments.len() { this.wire.attachments.remove(ix); this.schedule_autosave(cx); cx.notify(); }
+                            })))
+                    }))
                     .child(div().w(px(4.)))
                     // formatting: Markdown under the hood, styled live in the body
                     .child(self.format_button("fmt-bold", "B", Format::Wrap("**"), &theme, cx).font_weight(WEIGHT_SEMIBOLD))
@@ -725,5 +1012,20 @@ impl Render for ComposeDialog {
                     .with_priority(2),
                 )
             })
+            .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_named_contacts_keep_canonical_identity_and_ambiguous_text_unresolved() {
+        let contacts = ["one", "two"].map(|s| Contact { name: "Alex".into(), email: format!("alex.{s}@test.invalid").into(), avatar: None });
+        assert_eq!(canonical_recipient(&"Alex".into(), &contacts), "Alex");
+        assert_eq!(canonical_recipient(&"Alex <alex.two@test.invalid>".into(), &contacts), "Alex <alex.two@test.invalid>");
+        assert_eq!(contact_identity(&contacts[1]), "Alex <alex.two@test.invalid>");
+        assert_eq!(canonical_recipient(&"Alex".into(), &contacts[1..]), "Alex <alex.two@test.invalid>");
     }
 }

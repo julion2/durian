@@ -41,9 +41,7 @@ use objc2_foundation::{MainThreadMarker, NSError};
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{NewWindowResponse, PermissionResponse, Rect, WebView, WebViewBuilder, WebViewBuilderExtDarwin as _, WebViewExtMacOS as _};
 
-const DARK_MODE: &str = include_str!("webview/dark_mode.js");
-
-const SELECT_ALL: &str = "const r=document.createRange();r.selectNodeContents(document.body);const s=getSelection();s.removeAllRanges();s.addRange(r);window.ipc.postMessage('selection:'+s.toString());";
+use crate::html_doc::host::SELECT_ALL;
 
 /// Height before the document reports its own (a short mail's; avoids a big jump).
 const INITIAL_HEIGHT: f32 = 120.;
@@ -322,7 +320,7 @@ impl MailWebView {
             .with_html(html.to_string())
             .with_initialization_script(&host)
             // the document we load, and in-page anchors – nothing else
-            .with_navigation_handler(|url| url == "about:blank" || url.starts_with("about:blank#"))
+            .with_navigation_handler(|url| crate::html_doc::allows_navigation(&url))
             .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
             .with_download_started_handler(|_, _| false)
             .with_permission_handler(|_| PermissionResponse::Deny)
@@ -476,61 +474,11 @@ impl MailWebView {
     }
 }
 
-/// The page's side: report the height, hand link clicks to the app, track the selection, and
-/// in dark mode transform the mail's colors onto the card's.
+/// Adapt GPUI's theme color to the renderer-independent trusted page script.
 fn host_script(dark: bool, background: Hsla) -> String {
     let rgb = background.to_rgb();
     let (r, g, b) = ((rgb.r * 255.).round() as u8, (rgb.g * 255.).round() as u8, (rgb.b * 255.).round() as u8);
-    let dark_mode = if dark {
-        format!(
-            "{}\ndocument.documentElement.style.setProperty('background','rgb({r},{g},{b})','important');\
-             document.body.style.setProperty('background-color','rgb({r},{g},{b})','important');\
-             document.documentElement.style.colorScheme='dark';",
-            DARK_MODE.replace("const DARK_BG = [42, 42, 44];", &format!("const DARK_BG = [{r}, {g}, {b}];"))
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        r#"addEventListener('DOMContentLoaded', () => {{
-            {dark_mode}
-            const height = () => window.ipc.postMessage('height:' + Math.max(document.documentElement.scrollHeight, document.body.scrollHeight));
-            new ResizeObserver(height).observe(document.body);
-            height();
-        }}, {{once: true}});
-        addEventListener('click', event => {{
-            const link = event.target.closest('a');
-            if (link && !(link.getAttribute('href') || '').startsWith('#')) {{
-                event.preventDefault();
-                window.ipc.postMessage('link:' + (link.getAttribute('href') || ''));
-            }}
-        }}, true);
-        addEventListener('selectionchange', () => window.ipc.postMessage('selection:' + getSelection().toString()));
-        // what's under the pointer: the app draws the cursor and names the link
-        let cursor = '', hover = '';
-        addEventListener('mousemove', event => {{
-            const link = event.target.closest ? event.target.closest('a[href]') : null;
-            let kind = 'default';
-            if (link) {{
-                kind = 'pointer';
-            }} else {{
-                const range = document.caretRangeFromPoint(event.clientX, event.clientY);
-                if (range && range.startContainer.nodeType === 3 && /\S/.test(range.startContainer.textContent)) kind = 'text';
-            }}
-            if (kind !== cursor) {{ cursor = kind; window.ipc.postMessage('cursor:' + kind); }}
-            const url = link ? link.href : '';
-            if (url !== hover) {{ hover = url; window.ipc.postMessage('hover:' + url); }}
-        }}, {{passive: true}});
-        document.addEventListener('mouseleave', () => {{
-            if (hover) {{ hover = ''; window.ipc.postMessage('hover:'); }}
-        }});
-        // the app's menu, not WebKit's
-        addEventListener('contextmenu', event => {{
-            event.preventDefault();
-            const link = event.target.closest ? event.target.closest('a[href]') : null;
-            window.ipc.postMessage('menu:' + JSON.stringify({{x: event.clientX, y: event.clientY, link: link ? link.href : '', selection: getSelection().toString()}}));
-        }}, true);"#
-    )
+    crate::html_doc::host::script(dark, [r, g, b])
 }
 
 impl Render for MailWebView {
@@ -579,23 +527,6 @@ impl Render for MailWebView {
 /// Whether live mail views can be used here (the snapshot renderer otherwise).
 pub fn available() -> bool {
     std::env::var("MAIL_HTML").as_deref() != Ok("snapshot")
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn dark_mode_takes_the_cards_color() {
-        let script = super::host_script(true, gpui::rgb(0x1e1e20).into());
-        assert!(script.contains("const DARK_BG = [30, 30, 32];"), "the transform's background is the card's");
-        assert!(script.contains("MIN_CONTRAST = 4.5"));
-        assert!(script.contains(r"/rgba?\((\d+),\s*(\d+),\s*(\d+)/"), "the regex survived extraction");
-        let light = super::host_script(false, gpui::rgb(0xffffff).into());
-        assert!(!light.contains("DARK_BG"));
-        // the page reports cursor, hovered link and right-clicks; WebKit's own menu is suppressed
-        for part in ["'cursor:'", "'hover:'", "'menu:'", "event.preventDefault()", r"/\S/.test"] {
-            assert!(light.contains(part), "missing {part}");
-        }
-    }
 }
 
 #[cfg(test)]

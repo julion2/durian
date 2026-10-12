@@ -38,6 +38,15 @@ pub fn bind_text_input_keys(cx: &mut App) {
         KeyBinding::new("end", End, Some(CONTEXT)),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some(CONTEXT)),
     ]);
+    // Command is Super on Linux, not Control. Keep the macOS bindings, but
+    // expose the platform's normal editing shortcuts in both input and textarea.
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([
+        KeyBinding::new("ctrl-a", SelectAll, Some(CONTEXT)),
+        KeyBinding::new("ctrl-v", Paste, Some(CONTEXT)),
+        KeyBinding::new("ctrl-c", Copy, Some(CONTEXT)),
+        KeyBinding::new("ctrl-x", Cut, Some(CONTEXT)),
+    ]);
 }
 
 pub struct TextInput {
@@ -667,4 +676,3 @@ impl Focusable for TextInput {
         self.focus_handle.clone()
     }
 }
-

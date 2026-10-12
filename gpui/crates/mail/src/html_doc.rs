@@ -14,6 +14,9 @@
 //!
 //! Based on durian's GPUI experiment (PR #427, `document.rs`).
 
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod host;
+
 use std::collections::HashMap;
 
 use html5ever::tendril::TendrilSink as _;
@@ -34,6 +37,12 @@ pub struct Policy {
 #[derive(Debug, PartialEq)]
 pub enum Refused {
     TooLarge,
+}
+
+/// A live renderer may navigate only within the prepared in-memory document. External link
+/// clicks go to the host's link policy; no redirects, local files or replacement documents.
+pub fn allows_navigation(url: &str) -> bool {
+    url == "about:blank" || url.starts_with("about:blank#")
 }
 
 const DROP: &[&str] = &[
@@ -245,5 +254,22 @@ mod tests {
         let out = doc("<style>p{color:red}</style><p>x</p>");
         assert!(out.contains("<style>p{color:red}</style>"));
         assert_eq!(prepare(&"x".repeat(MAX_HTML + 1), &HashMap::new(), Policy::default()), Err(Refused::TooLarge));
+    }
+
+    #[test]
+    fn navigation_cannot_replace_the_mail_document() {
+        assert!(allows_navigation("about:blank"));
+        assert!(allows_navigation("about:blank#invoice"));
+        for url in [
+            "https://example.org",
+            "http://example.org",
+            "file:///etc/passwd",
+            "data:text/html,hello",
+            "javascript:alert(1)",
+            "about:blank?redirect",
+            "about:blank.evil",
+        ] {
+            assert!(!allows_navigation(url), "allowed {url}");
+        }
     }
 }

@@ -1,10 +1,13 @@
-//! A read-only client for durian's HTTP API: GET endpoints only, so pointing the UI at a real
-//! mailbox can never change it. Blocking (ureq) – call it from GPUI's background executor.
+//! Authenticated durian HTTP API. Blocking (ureq): call it off the UI thread.
 
 use std::fmt;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
+use serde::Serialize;
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::{Connector, DefaultConnector};
 
 use super::api::*;
 
@@ -63,13 +66,16 @@ fn segment(s: &str) -> String {
 impl Client {
     /// `server` is "http://127.0.0.1:9723" (the `/api/v1` prefix is added).
     pub fn new(server: &str, token: Option<String>) -> Self {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
+        let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(20)))
             .timeout_connect(Some(Duration::from_secs(3)))
             // statuses are ours to interpret: the body carries the server's message
             .http_status_as_error(false)
-            .build()
-            .into();
+            .build();
+        // Keep ureq's normal proxy/TLS setup. Resume only interrupted response
+        // reads after connecting; a POST/PUT is never sent a second time.
+        let connector = DefaultConnector::default().chain(super::transport::InterruptedConnector);
+        let agent = ureq::Agent::with_parts(config, connector, DefaultResolver::default());
         Self { base: format!("{}/api/v1", server.trim_end_matches('/')), token, agent }
     }
 
@@ -98,6 +104,28 @@ impl Client {
 
     fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T> {
         let mut response = self.call(path, query)?;
+        Self::decode(path, &mut response)
+    }
+
+    /// Shared authenticated JSON transport for mail and calendar writes. Never retries
+    /// a mutation implicitly: the caller owns its logical identity and reconciliation.
+    pub(super) fn request_json<T: DeserializeOwned>(&self, method: &str, path: &str, query: &[(&str, &str)], body: &impl Serialize) -> Result<T> {
+        let mut url = format!("{}{path}", self.base);
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query.iter().map(|(k, v)| format!("{}={}", segment(k), segment(v))).collect::<Vec<_>>().join("&"));
+        }
+        let bytes = serde_json::to_vec(body).map_err(|e| Error::Decode(e.to_string()))?;
+        let mut request = ureq::http::Request::builder().method(method).uri(url).header("Content-Type", "application/json");
+        if let Some(token) = &self.token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let request = request.body(bytes).map_err(|e| Error::Decode(e.to_string()))?;
+        let mut response = self.agent.run(request).map_err(|_| Error::Unreachable(format!("{method} {path} failed; outcome may be unknown")))?;
+        Self::decode(path, &mut response)
+    }
+
+    fn decode<T: DeserializeOwned>(path: &str, response: &mut ureq::http::Response<ureq::Body>) -> Result<T> {
         let status = response.status().as_u16();
         let text = response.body_mut().read_to_string().map_err(|e| Error::Unreachable(format!("{path}: {e}")))?;
         if !(200..300).contains(&status) {
@@ -109,6 +137,28 @@ impl Client {
             return Err(Error::Server { status, message: envelope.error.unwrap_or_default() });
         }
         serde_json::from_str(&text).map_err(|e| Error::Decode(format!("{path}: {e}")))
+    }
+
+    /// A cancellable streaming GET. Its agent has no whole-response deadline:
+    /// the events worker polls the socket underneath HTTP/TLS and owns its lifetime.
+    pub(super) fn event_stream(&self, stop: Arc<AtomicBool>) -> Result<ureq::BodyReader<'static>> {
+        let agent = super::events::agent(stop);
+        let mut request = agent.get(format!("{}/events", self.base))
+            .header("Accept", "text/event-stream");
+        if let Some(token) = &self.token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let response = request.call().map_err(|_| Error::Unreachable("SSE connection failed".into()))?;
+        let status = response.status().as_u16();
+        // Only 200 is a stream (not 204, redirects or a JSON error envelope).
+        if status != 200 {
+            return Err(Self::failure("/events", status, "event stream unavailable"));
+        }
+        let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if !content_type.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("text/event-stream") {
+            return Err(Error::Decode("/events: expected text/event-stream".into()));
+        }
+        Ok(response.into_body().into_reader())
     }
 
     /// Raw bytes (attachments), up to `limit`.
@@ -135,6 +185,10 @@ impl Client {
         Ok(self.get::<SearchCount>("/search/count", &[("query", query)])?.count)
     }
 
+    pub fn contacts(&self, query: &str) -> Result<Vec<Contact>> {
+        self.get("/contacts/search", &[("query", query), ("limit", "10")])
+    }
+
     pub fn thread(&self, thread_id: &str) -> Result<ThreadContent> {
         let path = format!("/threads/{}", segment(thread_id));
         self.get::<ThreadResponse>(&path, &[])?.thread.ok_or_else(|| Error::Decode(format!("{path}: no thread in the answer")))
@@ -143,6 +197,10 @@ impl Client {
     /// One MIME part's bytes (`message`: a message's opaque id).
     pub fn attachment(&self, message: &str, part: i64) -> Result<Vec<u8>> {
         self.get_bytes(&format!("/messages/{}/attachments/{part}", segment(message)), ATTACHMENT_LIMIT)
+    }
+
+    pub(super) fn draft_attachment(&self, message: &str, part: i64) -> Result<Vec<u8>> {
+        self.get_bytes(&format!("/messages/{}/attachments/{part}", segment(message)), 1 << 20)
     }
 
     /// Profiles with their accounts (servers before durian#… answer NotFound).
@@ -159,6 +217,35 @@ impl Client {
         Ok(self.get::<TagsResponse>("/tags", &[])?.tags)
     }
 
+    pub fn tag_thread(&self, id: &str, tags: &str) -> Result<()> {
+        let _: Envelope = self.request_json("POST", &format!("/threads/{}/tags", segment(id)), &[], &serde_json::json!({"tags": tags}))?;
+        Ok(())
+    }
+
+    pub fn drafts(&self) -> Result<Vec<LocalDraft>> { self.get("/local-drafts", &[]) }
+
+    pub fn save_draft(&self, draft: &DraftContent) -> Result<()> {
+        if !super::writes::draft_fits(draft) { return Err(Error::Decode("Draft exceeds the server's 1 MiB recovery limit".into())); }
+        let _: Envelope = self.request_json("PUT", &format!("/local-drafts/{}", segment(&draft.id)), &[], &serde_json::json!({"draft_json": draft}))?;
+        Ok(())
+    }
+
+    pub fn delete_draft(&self, id: &str) -> Result<()> {
+        let _: Envelope = self.request_json("DELETE", &format!("/local-drafts/{}", segment(id)), &[], &())?;
+        Ok(())
+    }
+
+    pub fn enqueue(&self, draft: &OutboxDraft) -> Result<Enqueued> {
+        self.request_json("POST", "/outbox/send", &[], draft)
+    }
+
+    pub fn outbox(&self) -> Result<Vec<OutboxEntry>> { self.get("/outbox", &[]) }
+
+    pub fn cancel_send(&self, id: i64) -> Result<()> {
+        let _: Envelope = self.request_json("DELETE", &format!("/outbox/{id}"), &[], &())?;
+        Ok(())
+    }
+
     pub fn calendars(&self, account: &str) -> Result<Vec<Calendar>> {
         Ok(self.get::<CalendarsResponse>("/calendars", &[("account", account)])?.calendars)
     }
@@ -168,9 +255,9 @@ impl Client {
         Ok(self.get::<CalendarEventsResponse>("/calendars/events", &[("account", account), ("from", from), ("to", to)])?.events)
     }
 
-    /// One event with organizer, attendees and description (`reference`: its iCalUID).
-    pub fn event(&self, account: &str, calendar: &str, reference: &str) -> Result<CalendarEvent> {
-        Ok(self.get::<CalendarEventResponse>("/calendars/event", &[("account", account), ("calendar", calendar), ("ref", reference)])?.event)
+    /// One event by exact iCalUID; a removed event must not resolve to a prefix match.
+    pub fn event(&self, account: &str, calendar: &str, uid: &str) -> Result<CalendarEvent> {
+        Ok(self.get::<CalendarEventResponse>("/calendars/event", &[("account", account), ("calendar", calendar), ("uid", uid)])?.event)
     }
 }
 
@@ -200,7 +287,7 @@ mod tests {
             }
             let reply = format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
             stream.write_all(reply.as_bytes()).unwrap();
-            tx.send(request).unwrap();
+            let _ = tx.send(request);
         });
         (address, rx)
     }
@@ -235,6 +322,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_attachment_is_success_not_a_missing_part() {
+        let (address, request) = serve_once(200, "");
+        assert_eq!(Client::new(&address, Some("token".into())).attachment("a/b", 2).unwrap(), Vec::<u8>::new());
+        let request = request.recv().unwrap();
+        assert!(request.starts_with("GET /api/v1/messages/a%2Fb/attachments/2 "));
+        assert!(request.to_lowercase().contains("authorization: bearer token"));
+    }
+
+    #[test]
     fn statuses_become_errors_the_ui_can_tell_apart() {
         let (address, _) = serve_once(401, r#"{"ok":false,"error":"missing token"}"#);
         assert_eq!(Client::new(&address, None).tags().unwrap_err(), Error::Unauthorized);
@@ -255,6 +351,93 @@ mod tests {
         // nothing listening
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         assert!(matches!(Client::new(&format!("http://127.0.0.1:{port}"), None).version().unwrap_err(), Error::Unreachable(_)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signals_preserve_responses_without_replay_or_deadline_extension() {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+
+        // Signal dispositions are process-wide. Keep the real timed-socket
+        // regression isolated from every other test, as with renderer fixtures.
+        if std::env::var_os("DURIAN_SIGNAL_TEST").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap(), "--nocapture"])
+                .env("DURIAN_SIGNAL_TEST", "1").output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(40));
+            std::process::exit(2);
+        });
+        static SIGNALS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn signal(_: libc::c_int) { SIGNALS.fetch_add(1, Ordering::Relaxed); }
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = signal as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            assert_eq!(libc::sigemptyset(&mut action.sa_mask), 0);
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()), 0);
+        }
+        let reader_thread = unsafe { libc::pthread_self() };
+        for case in ["headers", "partial headers", "body", "write acknowledgment", "deadline"] {
+            SIGNALS.store(0, Ordering::Relaxed);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = Client::new(&format!("http://{}", listener.local_addr().unwrap()), Some("signal-token".into()));
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" { break }
+                    request.push_str(&line);
+                }
+                if case == "write acknowledgment" {
+                    assert!(request.starts_with("POST /api/v1/threads/one/tags HTTP/1.1\r\n"));
+                    let length: usize = request.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|n| n.trim().parse().unwrap())).unwrap();
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({"tags": "+flagged"}));
+                } else {
+                    assert!(request.starts_with("GET /api/v1/version HTTP/1.1\r\n"));
+                }
+                let body = if case == "write acknowledgment" { r#"{"ok":true}"# } else { r#"{"ok":true,"version":"signal-safe"}"# };
+                let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let response = format!("{headers}{body}");
+                let split = match case { "partial headers" => 28, "body" => headers.len() + 5, _ => 0 };
+                stream.write_all(&response.as_bytes()[..split]).unwrap();
+                // The request has arrived once. Interrupt that same reader, never
+                // replay it on a second connection or restart the global budget.
+                let until = Instant::now() + if case == "deadline" { Duration::from_secs(21) } else { Duration::from_millis(200) };
+                while Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(25));
+                    assert_eq!(unsafe { libc::pthread_kill(reader_thread, libc::SIGUSR1) }, 0);
+                }
+                let _ = stream.write_all(&response.as_bytes()[split..]);
+                // Dropping the sole listener also makes a whole-request replay fail.
+            });
+            let started = Instant::now();
+            let result = if case == "write acknowledgment" {
+                client.tag_thread("one", "+flagged").map(|_| "signal-safe".to_string())
+            } else {
+                client.version().map(|version| version.version)
+            };
+            let took = started.elapsed();
+            server.join().unwrap();
+            assert!(SIGNALS.load(Ordering::Relaxed) >= 4, "the requesting thread must receive signals");
+            if case == "deadline" {
+                assert!(result.is_err(), "a silent peer must hit the original global deadline");
+                assert!(took >= Duration::from_secs(19) && took < Duration::from_secs(21), "deadline changed: {took:?}");
+            } else {
+                assert_eq!(result, Ok("signal-safe".to_string()), "{case}");
+            }
+        }
     }
 }
 

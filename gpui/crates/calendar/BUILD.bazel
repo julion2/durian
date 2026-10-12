@@ -1,0 +1,21 @@
+load("@gpui_crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "calendar",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//gpui:__subpackages__"],
+    deps = ["//gpui/crates/ui"] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "calendar_test",
+    size = "small",
+    crate = ":calendar",
+)

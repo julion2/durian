@@ -110,6 +110,11 @@ pub struct Message {
     /// The data source's id for it (opaque); empty for mail written here.
     #[serde(default)]
     pub id: SharedString,
+    /// RFC threading metadata; never substitute the opaque row id above.
+    #[serde(default)] pub message_id: Option<SharedString>,
+    #[serde(default)] pub in_reply_to: Option<SharedString>,
+    #[serde(default)] pub references: Option<SharedString>,
+    #[serde(default)] pub account: Option<SharedString>,
     pub from: Contact,
     pub to: Vec<SharedString>,
     #[serde(default)]
@@ -202,11 +207,11 @@ impl Message {
 }
 
 /// Identity of a message's rendered HTML: its id from the data source (stable when messages
-/// arrive or the thread is refetched; the item index for local data), plus the HTML's length
+/// arrive or the thread is refetched; the item index for local data), plus the HTML's digest
 /// so a replaced body renders again.
 pub fn message_key(thread: &Thread, item_ix: usize) -> SharedString {
     match thread.items.get(item_ix) {
-        Some(ThreadItem::Message(m)) if !m.id.is_empty() => format!("{}#{}#{}", thread.id, m.id, m.html.as_ref().map_or(0, |h| h.len())).into(),
+        Some(ThreadItem::Message(m)) if !m.id.is_empty() => format!("{}#{}#{:x}", thread.id, m.id, md5::compute(m.html.as_deref().unwrap_or("").as_bytes())).into(),
         _ => format!("{}#{item_ix}", thread.id).into(),
     }
 }
@@ -292,6 +297,10 @@ pub struct Draft {
     pub kind: DraftKind,
     pub body: SharedString,
     pub saved_at: std::time::Instant,
+    pub wire: crate::durian::api::DraftContent,
+    pub sending: bool,
+    pub deleting: bool,
+    pub queued: Option<crate::durian::api::Enqueued>,
 }
 
 impl Draft {
@@ -353,6 +362,14 @@ pub struct Mailbox {
     pub profiles: Vec<Profile>,
     pub profile: Option<usize>,
     pub folder: Option<usize>,
+    /// Authoritative unread thread counts, keyed by the exact scoped API query.
+    /// Missing means unknown, not zero. Search pages never populate this cache.
+    pub server_counts: std::collections::HashMap<String, u64>,
+    /// Last desired operations remain overlaid on periodic reads until writes drain.
+    pub pending_tags: std::collections::HashMap<SharedString, String>,
+    pub confirmed_tags: std::collections::HashMap<SharedString, Thread>,
+    pub writes_available: bool,
+    pub unread_by_user: Option<SharedString>,
     next_draft_id: usize,
 }
 
@@ -366,6 +383,11 @@ pub enum MailboxEvent {
     MoreWanted,
     /// A change was asked for, but the data is only read from a server (nothing changed).
     ReadOnly,
+    WriteRequested(crate::durian::writes::Intent),
+    DraftSaved(usize),
+    DraftDeleted(usize),
+    WriteProblem(SharedString),
+    SendFinished { draft_id: usize, result: crate::durian::client::Result<crate::durian::api::Enqueued> },
 }
 
 impl EventEmitter<MailboxEvent> for Mailbox {}
@@ -374,7 +396,7 @@ impl Mailbox {
     pub fn new(data: MailData) -> Self {
         let MailData { me, accounts, tags, views, threads } = data;
         let selected = (!threads.is_empty()).then_some(0);
-        Self { me, accounts, account_filter: None, query_text: SharedString::default(), query: Default::default(), view_title: "Inbox".into(), tags, views, threads, selected, drafts: Vec::new(), unread_on_open: None, remote: None, profiles: Vec::new(), profile: None, folder: None, next_draft_id: 1 }
+        Self { me, accounts, account_filter: None, query_text: SharedString::default(), query: Default::default(), view_title: "Inbox".into(), tags, views, threads, selected, drafts: Vec::new(), unread_on_open: None, remote: None, profiles: Vec::new(), profile: None, folder: None, server_counts: std::collections::HashMap::new(), pending_tags: Default::default(), confirmed_tags: Default::default(), writes_available: false, unread_by_user: None, next_draft_id: 1 }
     }
 
     /// An empty mailbox whose threads a server provides.
@@ -399,8 +421,11 @@ impl Mailbox {
 
     /// The server's answer replaces the list. The selection follows its thread (by id), so a
     /// refresh or a page more doesn't move you; if it's gone, the first visible thread.
-    pub fn replace_threads(&mut self, threads: Vec<Thread>, cx: &mut Context<Self>) {
+    pub fn replace_threads(&mut self, mut threads: Vec<Thread>, cx: &mut Context<Self>) {
         let selected = self.selected_thread().map(|t| t.id.clone());
+        for thread in &mut threads {
+            if let Some(ops) = self.pending_tags.get(&thread.id) { crate::durian::writes::apply_tags(thread, ops); }
+        }
         self.threads = threads;
         self.selected = selected.and_then(|id| self.threads.iter().position(|t| t.id == id));
         if let Some(remote) = self.remote.as_mut() {
@@ -413,7 +438,8 @@ impl Mailbox {
     }
 
     /// A full thread arrived for a list row.
-    pub fn fill_thread(&mut self, thread: Thread, cx: &mut Context<Self>) {
+    pub fn fill_thread(&mut self, mut thread: Thread, cx: &mut Context<Self>) {
+        if let Some(ops) = self.pending_tags.get(&thread.id) { crate::durian::writes::apply_tags(&mut thread, ops); }
         if let Some(remote) = self.remote.as_mut() {
             remote.threads.remove(&thread.id);
         }
@@ -432,10 +458,9 @@ impl Mailbox {
         }
     }
 
-    /// Threads come from a server that this client only reads (for now): no change may be
-    /// made, not even locally – the list would show a state the server doesn't have.
+    /// Mail writes are routed to the live controller when remote is set.
     pub fn read_only(&self) -> bool {
-        self.remote.is_some()
+        false
     }
 
     /// Guard for every change: true (and an explanation for the user) when it's refused.
@@ -524,6 +549,42 @@ impl Mailbox {
 
     pub fn tag(&self, name: &str) -> Option<&Tag> {
         self.tags.iter().find(|t| t.name == name)
+    }
+
+    /// Sidebar scopes don't include the open folder or typed search. Each badge
+    /// counts its own base query, independently of the list's page and refinement.
+    pub fn sidebar_count_query(&self, base: &str) -> String {
+        let scope = match (self.active_profile(), self.account_filter.as_deref()) {
+            (Some(profile), _) => crate::durian::profiles::scope(profile),
+            (None, Some(account)) => Some(crate::durian::translate::account_scope(account)),
+            (None, None) => None,
+        };
+        unread_query(scope.as_deref(), base)
+    }
+
+    pub fn count_for(&self, query: &str) -> Option<u64> {
+        self.server_counts.get(query).copied()
+    }
+
+    /// Every configured profile's folders, account inboxes, and the visible tags.
+    /// Deduplication uses the query itself, not folder names that repeat in profiles.
+    pub fn count_queries(&self) -> Vec<String> {
+        if self.remote.is_none() {
+            return Vec::new(); // Demo counts still come from its complete local data.
+        }
+        let mut queries = vec![account_inbox_query(None), self.sidebar_count_query("tag:inbox")];
+        queries.extend(self.accounts.iter().map(|a| account_inbox_query(Some(&a.id))));
+        queries.extend(self.profiles.iter().flat_map(|p| p.folders.iter().map(move |f| folder_unread_query(p, f))));
+        queries.extend(self.tags.iter().map(|t| self.sidebar_count_query(&format!("tag:{}", crate::durian::translate::quoted(&t.name)))));
+        queries.sort();
+        queries.dedup();
+        queries
+    }
+
+    /// A failed request leaves the last known count alone. A successful zero is
+    /// known zero; a failed first request stays absent/unknown.
+    pub fn update_counts(&mut self, counts: impl IntoIterator<Item = (String, Option<u64>)>) {
+        self.server_counts.extend(counts.into_iter().filter_map(|(query, count)| Some((query, count?))));
     }
 
     /// Unread visible threads, in total and per tag – one pass for the whole sidebar.
@@ -665,7 +726,13 @@ impl Mailbox {
 
     /// Opening a thread reads it.
     pub fn mark_selected_read(&mut self, cx: &mut Context<Self>) {
-        let read_only = self.read_only();
+        // Filtering can temporarily remove selection. That isn't viewing a
+        // different thread and must not undo an explicit mark-unread intent.
+        let Some(selected_id) = self.selected_thread().map(|t| t.id.clone()) else { return };
+        let remote = self.remote.is_some();
+        if remote && (!self.writes_available || self.unread_by_user.as_ref() == Some(&selected_id)) { return }
+        self.unread_by_user = None;
+        let mut mark = None;
         if let Some(thread) = self.selected.and_then(|ix| self.threads.get_mut(ix)) {
             let mut unread = Vec::new();
             for (ix, item) in thread.items.iter_mut().enumerate() {
@@ -673,8 +740,8 @@ impl Mailbox {
                     if !m.read {
                         unread.push(ix);
                     }
-                    // read-only: the unread ones still open expanded, they just stay unread
-                    m.read |= !read_only;
+                    if remote && !m.read { mark = Some(thread.id.clone()); }
+                    m.read |= !remote;
                 }
             }
             // keep the first snapshot of this thread; a second call (right-click) finds nothing new
@@ -683,10 +750,15 @@ impl Mailbox {
             }
             cx.notify();
         }
+        if let Some(id) = mark { self.request_tags(id, "-unread".into(), cx); }
     }
 
     /// "Archive" = drop the thread from the inbox view (in the real app: remove `tag:inbox`).
     pub fn archive_selected(&mut self, cx: &mut Context<Self>) {
+        if self.remote.is_some() {
+            if let Some(id) = self.selected_thread().map(|t| t.id.clone()) { self.request_tags(id, "+archive -inbox -trash".into(), cx); }
+            return;
+        }
         if self.refuse(cx) {
             return;
         }
@@ -701,6 +773,17 @@ impl Mailbox {
     }
 
     pub fn toggle_tag_selected(&mut self, name: &SharedString, cx: &mut Context<Self>) {
+        if self.remote.is_some() {
+            if name.is_empty() || name.chars().any(char::is_whitespace) || name.starts_with(['+', '-']) {
+                cx.emit(MailboxEvent::WriteProblem("Tag names cannot contain spaces or start with + or -".into()));
+                return;
+            }
+            if let Some(thread) = self.selected_thread() {
+                let ops = format!("{}{name}", if thread.tags.contains(name) { '-' } else { '+' });
+                self.request_tags(thread.id.clone(), ops, cx);
+            }
+            return;
+        }
         if self.refuse(cx) {
             return;
         }
@@ -745,6 +828,8 @@ impl Mailbox {
         }
         Message {
             id: SharedString::default(),
+            message_id: None, in_reply_to: None, references: None,
+            account: None,
             plain: false,
             from,
             to,
@@ -777,6 +862,7 @@ impl Mailbox {
 
     /// Builds the multipart/alternative message and drops it in the outbox (the "send").
     fn write_outbox(&self, message: &mut Message, subject: &str) {
+        assert!(self.remote.is_none(), "live sending must use the encrypted HTTP outbox");
         let addresses = |names: &[SharedString]| names.iter().map(|n| self.address(n)).collect::<Vec<_>>();
         let raw = crate::mime::build(&crate::mime::Outgoing {
             from: crate::mime::Address { name: message.from.name.to_string(), email: Some(message.from.email.to_string()) },
@@ -796,6 +882,13 @@ impl Mailbox {
     }
 
     pub fn send_reply(&mut self, to: Vec<SharedString>, cc: Vec<SharedString>, body: SharedString, cx: &mut Context<Self>) {
+        if self.remote.is_some() {
+            let Some(thread_id) = self.selected_thread().map(|t| t.id.clone()) else { return };
+            let all = self.reply_draft(&thread_id).is_none_or(|d| matches!(d.kind, DraftKind::Reply { all: true, .. }));
+            self.save_reply_draft(thread_id.clone(), all, body, cx);
+            if let Some(id) = self.reply_draft(&thread_id).map(|d| d.id) { self.submit_draft(id, Some(all), cx); }
+            return;
+        }
         if self.refuse(cx) {
             return;
         }
@@ -824,6 +917,11 @@ impl Mailbox {
         body: SharedString,
         cx: &mut Context<Self>,
     ) {
+        if self.remote.is_some() {
+            let kind = DraftKind::New { account, from: from_email, to, cc, bcc, subject };
+            if let Some(id) = self.save_new_draft(None, kind, body, cx) { self.submit_draft(id, None, cx); }
+            return;
+        }
         if self.refuse(cx) {
             return;
         }
@@ -841,64 +939,182 @@ impl Mailbox {
         self.drafts.iter().find(|d| matches!(&d.kind, DraftKind::Reply { thread_id: t, .. } if t == thread_id))
     }
 
-    /// Autosave for inline replies: empty text deletes the draft.
+    /// Capture the full original reply target before the editor is shown. Profile
+    /// changes, new mail and autosaves never choose another sender or Message-ID.
+    pub fn begin_reply(&mut self, thread_id: SharedString, all: bool, cx: &mut Context<Self>) -> Option<usize> {
+        if let Some(draft) = self.reply_draft(&thread_id).cloned() {
+            if draft.sending || draft.deleting || draft.queued.is_some() || draft.wire.extra.contains_key(crate::durian::writes::PENDING_SEND) { return Some(draft.id) }
+            if matches!(draft.kind, DraftKind::Reply { all: previous, .. } if previous == all) { return Some(draft.id) }
+            let mut wire = draft.wire;
+            let captured = crate::durian::api::ThreadContent { thread_id: thread_id.to_string(), subject: wire.subject.clone(), messages: Vec::new() };
+            if self.remote.is_some() {
+                if let Err(error) = crate::durian::writes::prepare_reply(&mut wire, &captured, all) {
+                    cx.emit(MailboxEvent::WriteProblem(error.to_string().into())); return None;
+                }
+            }
+            return self.save_draft_content(Some(draft.id), DraftKind::Reply { thread_id, all }, draft.body, wire, cx);
+        }
+        let thread = self.threads.iter().find(|t| t.id == thread_id)?;
+        if self.remote.is_some() && thread.partial {
+            cx.emit(MailboxEvent::WriteProblem("Wait for the full thread before starting a reply.".into()));
+            return None;
+        }
+        let target = thread.latest();
+        let account = target.account.as_ref().and_then(|id| self.account(id)).or_else(|| self.sending_account(Some(thread)))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut wire = crate::durian::api::DraftContent { id: uuid::Uuid::new_v4().to_string(), from: account.email.to_string(),
+            account_id: Some(account.id.to_string()), reply_thread_id: Some(thread_id.to_string()), created_at: now.clone(), modified_at: now, ..Default::default() };
+        let own: Vec<String> = self.accounts.iter().flat_map(|a| std::iter::once(&a.email).chain(&a.aliases)).map(ToString::to_string).collect();
+        wire.extra.insert(crate::durian::writes::OWN_ADDRESSES.into(), serde_json::json!(own));
+        let content = crate::durian::api::ThreadContent { thread_id: thread_id.to_string(), subject: thread.subject.to_string(), messages: vec![serde_json::from_value(serde_json::json!({
+            "id": target.id, "account": target.account, "from": format!("{} <{}>", target.from.name, target.from.email),
+            "to": target.to.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "), "cc": target.cc.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+            "message_id": target.message_id, "references": target.references, "timestamp": 0
+        })).ok()?] };
+        if let Err(e) = crate::durian::writes::prepare_reply(&mut wire, &content, all) {
+            cx.emit(MailboxEvent::WriteProblem(e.to_string().into())); return None;
+        }
+        self.save_draft_content(None, DraftKind::Reply { thread_id, all }, SharedString::default(), wire, cx)
+    }
+
+    /// Autosave keeps the original target even when live reply text is emptied.
     pub fn save_reply_draft(&mut self, thread_id: SharedString, all: bool, body: SharedString, cx: &mut Context<Self>) {
         if self.refuse(cx) {
             return;
         }
         let existing = self.drafts.iter().position(|d| matches!(&d.kind, DraftKind::Reply { thread_id: t, .. } if *t == thread_id));
-        if body.trim().is_empty() {
+        if existing.is_some_and(|ix| self.drafts[ix].sending || self.drafts[ix].deleting || self.drafts[ix].queued.is_some() || self.drafts[ix].wire.extra.contains_key(crate::durian::writes::PENDING_SEND)) { return; }
+        if self.remote.is_none() && body.trim().is_empty() {
             if let Some(ix) = existing {
-                self.drafts.remove(ix);
-                cx.notify();
+                let id = self.drafts[ix].id;
+                self.discard_draft(id, cx);
             }
             return;
         }
-        crate::trace::note(&format!("reply draft on {thread_id}: {body:?}"));
-        let kind = DraftKind::Reply { thread_id, all };
-        match existing {
-            Some(ix) => {
-                let draft = &mut self.drafts[ix];
-                (draft.kind, draft.body, draft.saved_at) = (kind, body, std::time::Instant::now());
-            }
-            None => {
-                let id = self.next_draft_id;
-                self.next_draft_id += 1;
-                self.drafts.push(Draft { id, kind, body, saved_at: std::time::Instant::now() });
+        if self.remote.is_some() && existing.is_none() && self.begin_reply(thread_id.clone(), all, cx).is_none() { return }
+        let existing = self.reply_draft(&thread_id).map(|d| d.id);
+        if let Some(draft) = self.drafts.iter_mut().find(|d| Some(d.id) == existing) {
+            if draft.wire.extra.contains_key(crate::durian::writes::REPLY_TARGET) {
+                let captured = crate::durian::api::ThreadContent { thread_id: thread_id.to_string(), subject: draft.wire.subject.clone(), messages: Vec::new() };
+                if let Err(e) = crate::durian::writes::prepare_reply(&mut draft.wire, &captured, all) {
+                    cx.emit(MailboxEvent::WriteProblem(e.to_string().into())); return;
+                }
             }
         }
-        cx.notify();
+        let kind = DraftKind::Reply { thread_id, all };
+        self.save_new_draft(existing, kind, body, cx);
     }
 
     /// Saves (or updates, when `id` is given) a new-message draft and returns its id (None:
     /// refused, read-only).
     pub fn save_new_draft(&mut self, id: Option<usize>, kind: DraftKind, body: SharedString, cx: &mut Context<Self>) -> Option<usize> {
-        if self.refuse(cx) {
+        let wire = id.and_then(|id| self.drafts.iter().find(|d| d.id == id)).map(|d| d.wire.clone()).unwrap_or_else(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            crate::durian::api::DraftContent { id: uuid::Uuid::new_v4().to_string(), created_at: now.clone(), modified_at: now, ..Default::default() }
+        });
+        self.save_draft_content(id, kind, body, wire, cx)
+    }
+
+    pub fn save_draft_content(&mut self, id: Option<usize>, kind: DraftKind, body: SharedString, mut wire: crate::durian::api::DraftContent, cx: &mut Context<Self>) -> Option<usize> {
+        if let Some(draft) = id.and_then(|id| self.drafts.iter().find(|d| d.id == id)) {
+            if draft.sending || draft.deleting || draft.queued.is_some() || draft.wire.extra.contains_key(crate::durian::writes::PENDING_SEND) {
+                cx.emit(MailboxEvent::WriteProblem("This send may already be queued. Retry its original request or Undo before editing.".into()));
+                return None;
+            }
+        }
+        match &kind {
+            DraftKind::New { account, from, to, cc, bcc, subject } => {
+                wire.account_id = Some(account.to_string()); wire.from = from.to_string();
+                wire.to = to.iter().map(ToString::to_string).collect(); wire.cc = cc.iter().map(ToString::to_string).collect();
+                wire.bcc = bcc.iter().map(ToString::to_string).collect(); wire.subject = subject.to_string();
+            }
+            DraftKind::Reply { thread_id, .. } => {
+                wire.reply_thread_id = Some(thread_id.to_string());
+                // begin_reply captured the sending identity, recipients and RFC
+                // headers; autosave only updates the editable body and timestamp.
+                if wire.body != body.as_ref() { wire.html_body = None; wire.is_html = false; }
+            }
+        }
+        wire.body = body.to_string(); wire.modified_at = chrono::Utc::now().to_rfc3339();
+        if self.remote.is_some() && !crate::durian::writes::draft_fits(&wire) {
+            cx.emit(MailboxEvent::WriteProblem("Draft exceeds the server's 1 MiB recovery limit. Remove attachments; nothing was saved or sent.".into()));
             return None;
         }
-        let id = match id.and_then(|id| self.drafts.iter_mut().find(|d| d.id == id)) {
-            Some(draft) => {
-                (draft.kind, draft.body, draft.saved_at) = (kind, body, std::time::Instant::now());
-                draft.id
-            }
-            None => {
-                let id = self.next_draft_id;
-                self.next_draft_id += 1;
-                self.drafts.push(Draft { id, kind, body, saved_at: std::time::Instant::now() });
-                id
-            }
-        };
-        crate::trace::note(&format!("draft {id} saved ({} drafts)", self.drafts.len()));
+        let id = id.unwrap_or_else(|| { let id = self.next_draft_id; self.next_draft_id += 1; id });
+        let updated = Draft { id, kind, body, saved_at: std::time::Instant::now(), wire: wire.clone(), sending: false, deleting: false, queued: None };
+        if let Some(draft) = self.drafts.iter_mut().find(|d| d.id == id) { *draft = updated; } else { self.drafts.push(updated); }
+        if self.remote.is_some() { cx.emit(MailboxEvent::WriteRequested(crate::durian::writes::Intent::Save { draft: wire })); }
         cx.notify();
         Some(id)
     }
 
     pub fn discard_draft(&mut self, id: usize, cx: &mut Context<Self>) {
-        if self.refuse(cx) {
+        if self.remote.is_some() {
+            if !self.writes_available { cx.emit(MailboxEvent::WriteProblem("Backend unavailable; draft was not deleted".into())); return }
+            let Some(draft) = self.drafts.iter_mut().find(|d| d.id == id) else { return };
+            if draft.sending || draft.queued.is_some() || draft.wire.extra.contains_key(crate::durian::writes::PENDING_SEND) {
+                cx.emit(MailboxEvent::WriteProblem("Undo the pending send before deleting its recovery draft.".into()));
+                return;
+            }
+            draft.deleting = true;
+            cx.emit(MailboxEvent::WriteRequested(crate::durian::writes::Intent::Delete { id: draft.wire.id.clone(), local_id: id }));
             return;
         }
         self.drafts.retain(|d| d.id != id);
         crate::trace::note(&format!("draft {id} discarded ({} drafts)", self.drafts.len()));
+        cx.notify();
+    }
+
+    pub fn submit_draft(&mut self, id: usize, reply_all: Option<bool>, cx: &mut Context<Self>) -> bool {
+        if !self.writes_available { cx.emit(MailboxEvent::WriteProblem("Backend unavailable; content retained, nothing sent".into())); return false }
+        let accounts = self.accounts.clone();
+        let Some(draft) = self.drafts.iter_mut().find(|d| d.id == id) else { return false };
+        if draft.sending || draft.deleting || draft.queued.is_some() { return false }
+        let from = crate::durian::parse_address(&draft.wire.from).email;
+        if !accounts.iter().any(|a| Some(a.id.as_ref()) == draft.wire.account_id.as_deref() && (a.email.eq_ignore_ascii_case(&from) || a.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(&from)))) {
+            cx.emit(MailboxEvent::WriteProblem("Choose a configured sending account or alias.".into()));
+            return false;
+        }
+        // The original full-thread target was captured before opening a reply.
+        if !draft.wire.extra.contains_key(crate::durian::writes::PENDING_SEND) {
+            match crate::durian::writes::outbox(&draft.wire) {
+                Ok(payload) => {
+                    let mut frozen = draft.wire.clone(); frozen.extra.insert(crate::durian::writes::PENDING_SEND.into(), serde_json::to_value(payload).unwrap());
+                    if !crate::durian::writes::draft_fits(&frozen) {
+                        cx.emit(MailboxEvent::WriteProblem("Draft including send recovery exceeds 1 MiB; remove attachments. Nothing queued.".into())); return false;
+                    }
+                    draft.wire = frozen;
+                }
+                Err(e) => { cx.emit(MailboxEvent::WriteProblem(e.to_string().into())); return false; }
+            }
+        }
+        draft.sending = true;
+        cx.emit(MailboxEvent::WriteRequested(crate::durian::writes::Intent::Send { draft: draft.wire.clone(), local_id: id, reply_all }));
+        cx.notify();
+        true
+    }
+
+    pub fn load_drafts(&mut self, entries: Vec<crate::durian::api::LocalDraft>, cx: &mut Context<Self>) {
+        for entry in entries {
+            // Unknown foreign draft formats stay untouched on the server.
+            let Ok(mut wire) = serde_json::from_value::<crate::durian::api::DraftContent>(entry.draft_json) else { continue };
+            wire.id = entry.id;
+            if self.drafts.iter().any(|d| d.wire.id == wire.id) { continue }
+            let kind = DraftKind::New { account: wire.account_id.clone().unwrap_or_default().into(), from: wire.from.clone().into(), to: wire.to.iter().cloned().map(Into::into).collect(), cc: wire.cc.iter().cloned().map(Into::into).collect(), bcc: wire.bcc.iter().cloned().map(Into::into).collect(), subject: wire.subject.clone().into() };
+            let queued = wire.extra.get(crate::durian::writes::QUEUED_SEND).and_then(|v| serde_json::from_value(v.clone()).ok());
+            let id = self.next_draft_id; self.next_draft_id += 1;
+            self.drafts.push(Draft { id, kind, body: wire.body.clone().into(), saved_at: std::time::Instant::now(), wire, sending: false, deleting: false, queued });
+        }
+        cx.notify();
+    }
+
+    fn request_tags(&mut self, id: SharedString, ops: String, cx: &mut Context<Self>) {
+        if !self.writes_available { cx.emit(MailboxEvent::WriteProblem("Backend unavailable; no tags changed".into())); return }
+        let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) else { return };
+        self.confirmed_tags.entry(id.clone()).or_insert_with(|| thread.clone());
+        self.pending_tags.entry(id.clone()).and_modify(|all| { all.push(' '); all.push_str(&ops); }).or_insert_with(|| ops.clone());
+        crate::durian::writes::apply_tags(thread, &ops);
+        cx.emit(MailboxEvent::WriteRequested(crate::durian::writes::Intent::Tags { thread: id.to_string(), ops }));
         cx.notify();
     }
 
@@ -910,6 +1126,15 @@ impl Mailbox {
 
     /// `u`: unread threads become read; read threads get their latest message marked unread.
     pub fn toggle_read_selected(&mut self, cx: &mut Context<Self>) {
+        if self.remote.is_some() {
+            if let Some(thread) = self.selected_thread() {
+                let ops = if thread.unread() { "-unread" } else { "+unread" };
+                let id = thread.id.clone();
+                self.unread_by_user = (ops == "+unread").then(|| id.clone());
+                self.request_tags(id, ops.into(), cx);
+            }
+            return;
+        }
         if self.refuse(cx) {
             return;
         }
@@ -926,6 +1151,13 @@ impl Mailbox {
     }
 
     pub fn toggle_star_selected(&mut self, cx: &mut Context<Self>) {
+        if self.remote.is_some() {
+            if let Some(thread) = self.selected_thread() {
+                let ops = if thread.starred { "-flagged" } else { "+flagged" };
+                self.request_tags(thread.id.clone(), ops.into(), cx);
+            }
+            return;
+        }
         if self.refuse(cx) {
             return;
         }
@@ -938,4 +1170,112 @@ impl Mailbox {
 
 pub fn first_name(name: &str) -> &str {
     name.split_whitespace().next().unwrap_or(name)
+}
+
+fn unread_query(scope: Option<&str>, base: &str) -> String {
+    format!("({}) AND tag:unread", crate::durian::live::compose(scope, Some(base), ""))
+}
+
+pub fn folder_unread_query(profile: &Profile, folder: &Folder) -> String {
+    unread_query(crate::durian::profiles::scope(profile).as_deref(), &folder.query)
+}
+
+pub fn account_inbox_query(account: Option<&str>) -> String {
+    unread_query(account.map(crate::durian::translate::account_scope).as_deref(), "tag:inbox")
+}
+
+#[cfg(test)]
+mod count_tests {
+    use super::*;
+
+    fn mailbox(live: bool) -> Mailbox {
+        let profiles = crate::durian::profiles::parse(r#"{"profiles":[
+            {"name":"Work","accounts":["work"],"folders":[{"name":"Inbox","query":"tag:inbox AND NOT tag:trash"},{"name":"Waiting","query":"tag:waiting"}]},
+            {"name":"Home","accounts":["home"],"folders":[{"name":"Inbox","query":"tag:inbox AND NOT tag:trash"}]},
+            {"name":"Team","accounts":["work","home"],"folders":[{"name":"Inbox","query":"tag:inbox"}]},
+            {"name":"All","accounts":["*"],"folders":[{"name":"Inbox","query":"tag:inbox"}]}]}"#).unwrap();
+        let accounts = ["work", "home"].map(|id| Account { id: id.into(), name: id.into(), email: format!("me@{id}.test").into(), aliases: Vec::new(), color: gpui::black() });
+        let threads = ["work", "home"].into_iter().map(|id| {
+            let row = serde_json::from_str(&format!(r#"{{"thread_id":"{id}","tags":"inbox,unread,waiting"}}"#)).unwrap();
+            Thread { account: id.into(), ..crate::durian::summary(&row, 0) }
+        }).collect();
+        let data = MailData { me: Contact { name: "Me".into(), email: "me@work.test".into(), avatar: None }, accounts: accounts.to_vec(), tags: vec![Tag { name: "waiting".into(), color: gpui::black() }], views: Vec::new(), threads };
+        let mut mailbox = if live { Mailbox::remote(data, crate::durian::live::initial_remote()) } else { Mailbox::new(data) };
+        mailbox.profiles = profiles;
+        mailbox.profile = Some(0);
+        mailbox.folder = Some(0);
+        mailbox
+    }
+
+    #[test]
+    fn counts_are_scoped_by_query_not_folder_name_search_or_page() {
+        let mut m = mailbox(true);
+        // Independent expected scopes, with unequal counts beyond the first 200 rows.
+        let work = "((path:work/**) (tag:inbox AND NOT tag:trash)) AND tag:unread";
+        let home = "((path:home/**) (tag:inbox AND NOT tag:trash)) AND tag:unread";
+        let team = "(((path:work/** OR path:home/**)) (tag:inbox)) AND tag:unread";
+        let all = "(tag:inbox) AND tag:unread";
+        let queries = m.count_queries();
+        for query in [work, home, team, all, "((path:work/) (tag:inbox)) AND tag:unread", "((path:home/) (tag:inbox)) AND tag:unread"] {
+            assert!(queries.iter().any(|q| q == query), "missing {query}");
+        }
+        assert_eq!(queries.iter().filter(|q| q.as_str() == all).count(), 1, "All/profile/account queries deduplicate exactly");
+        m.update_counts([(work.into(), Some(501)), (home.into(), Some(7)), (team.into(), Some(943)), (all.into(), Some(1026))]);
+        let expected = [501, 7, 943, 1026];
+        for (profile, count) in m.profiles.iter().zip(expected) {
+            assert_eq!(m.count_for(&folder_unread_query(profile, &profile.folders[0])), Some(count));
+        }
+        m.query_text = "from:guest invoice".into();
+        m.query = crate::query::Query::parse(&m.query_text);
+        let remote = m.remote.as_mut().unwrap();
+        remote.server_query = "tag:inbox from:guest invoice".into();
+        remote.refine = crate::query::Query::parse("missing");
+        remote.limit = 400;
+        m.folder = Some(1);
+        m.threads.truncate(1);
+        assert_eq!(m.count_queries(), queries, "no new count queries for typing, local refinement, folder navigation or paging");
+        assert_eq!(m.count_for(work), Some(501), "a narrowed/partial page cannot replace the authoritative badge");
+        m.profile = Some(1);
+        assert_eq!(m.count_for(&folder_unread_query(m.active_profile().unwrap(), m.active_folder().unwrap_or(&m.profiles[1].folders[0]))), Some(7));
+    }
+
+    #[test]
+    fn failed_counts_preserve_known_values_and_unknown_is_not_zero() {
+        let mut m = mailbox(true);
+        let work = folder_unread_query(&m.profiles[0], &m.profiles[0].folders[0]);
+        let home = folder_unread_query(&m.profiles[1], &m.profiles[1].folders[0]);
+        let waiting = folder_unread_query(&m.profiles[0], &m.profiles[0].folders[1]);
+        assert_eq!(m.count_for(&work), None);
+        m.update_counts([(work.clone(), Some(501)), (waiting.clone(), Some(19))]);
+        m.update_counts([(work.clone(), None), (home.clone(), None), (waiting.clone(), Some(0))]);
+        assert_eq!(m.count_for(&work), Some(501));
+        assert_eq!(m.count_for(&home), None, "a first failure must not manufacture a zero");
+        assert_eq!(m.count_for(&waiting), Some(0));
+        m.profiles[0].folders[0].query = "tag:sent".into();
+        assert_eq!(m.count_for(&folder_unread_query(&m.profiles[0], &m.profiles[0].folders[0])), None, "a changed query cannot reuse an index/name-keyed count");
+    }
+
+    #[test]
+    fn demo_counts_still_use_complete_local_threads() {
+        let mut m = mailbox(false);
+        assert!(m.count_queries().is_empty());
+        assert_eq!((m.unread_count(), m.account_unread("work"), m.account_unread("home")), (2, 1, 1));
+        m.update_counts([(account_inbox_query(None), Some(900))]);
+        m.account_filter = Some("home".into());
+        assert_eq!(m.unread_count(), 1);
+        let (total, tags) = m.unread_counts();
+        assert_eq!((total, tags.get("inbox").copied(), tags.get("waiting").copied()), (1, Some(1), Some(1)));
+    }
+
+    #[test]
+    fn replacement_html_with_equal_length_gets_a_new_render_identity() {
+        let a: crate::durian::api::ThreadContent = serde_json::from_str(r#"{"thread_id":"global","subject":"x","messages":[{"id":"local:7","from":"a@test.invalid","html":"<p>first</p>"}]}"#).unwrap();
+        let mut b = a.clone(); b.messages[0].html = Some("<p>other</p>".into());
+        assert_eq!(a.messages[0].html.as_ref().unwrap().len(), b.messages[0].html.as_ref().unwrap().len());
+        let first = crate::durian::thread(&a, 0, Default::default()).unwrap();
+        let other = crate::durian::thread(&b, 0, Default::default()).unwrap();
+        assert_ne!(first.html_jobs()[0].key, other.html_jobs()[0].key);
+        let mut tagged = first.clone(); tagged.tags.push("flagged".into());
+        assert_eq!(first.html_jobs()[0].key, tagged.html_jobs()[0].key);
+    }
 }

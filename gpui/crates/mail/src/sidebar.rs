@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use gpui::{AnyElement, Context, Entity, IntoElement, Render, SharedString, Window, deferred, div, prelude::*, px};
 
 use crate::contact_avatar;
-use crate::model::{Account, Mailbox};
+use crate::model::{Account, Mailbox, account_inbox_query, folder_unread_query};
 use ui::theme::{ActiveTheme, typography::*};
 use ui::{ButtonStyle, Icon, IconButton, IconName, Kbd, NavItem, SectionHeader, StyledExt, color_dot};
 
@@ -50,11 +50,11 @@ impl MailSidebar {
         Self { mailbox, menu_open: false, active: "inbox".into(), collapsed: HashSet::default() }
     }
 
-    fn item(&self, key: &'static str, label: &'static str, icon: IconName, count: Option<usize>, cx: &mut Context<Self>) -> NavItem {
+    fn item(&self, key: &'static str, label: &'static str, icon: IconName, count: Option<SharedString>, cx: &mut Context<Self>) -> NavItem {
         NavItem::new(key, label)
             .icon(icon)
             .active(self.active == key)
-            .when_some(count.filter(|c| *c > 0), |item, c| item.trailing(c.to_string()))
+            .when_some(count, |item, c| item.trailing(c))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.active = key.into();
                 cx.emit(SidebarEvent::Navigate(key.into()));
@@ -84,13 +84,25 @@ impl MailSidebar {
 impl Render for MailSidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mailbox = self.mailbox.read(cx);
+        let live = mailbox.remote.is_some();
         let (unread, per_tag) = mailbox.unread_counts();
         let drafts = mailbox.drafts.len();
-        let tags: Vec<_> = mailbox.tags.iter().map(|t| (t.name.clone(), t.color, per_tag.get(&t.name).copied().unwrap_or(0))).collect();
+        let tags: Vec<_> = mailbox.tags.iter().map(|t| {
+            let count = if live {
+                mailbox.count_for(&mailbox.sidebar_count_query(&format!("tag:{}", crate::durian::translate::quoted(&t.name))))
+            } else {
+                Some(per_tag.get(&t.name).copied().unwrap_or(0) as u64)
+            };
+            (t.name.clone(), t.color, count)
+        }).collect();
         let views = mailbox.views.clone();
         let me = mailbox.me.clone();
-        let accounts: Vec<(Account, usize)> = mailbox.accounts.iter().map(|a| (a.clone(), mailbox.account_unread(&a.id))).collect();
-        let all_unread = mailbox.threads.iter().filter(|t| t.unread()).count();
+        let accounts: Vec<(Account, Option<u64>)> = mailbox.accounts.iter().map(|a| {
+            let count = if live { mailbox.count_for(&account_inbox_query(Some(&a.id))) } else { Some(mailbox.account_unread(&a.id) as u64) };
+            (a.clone(), count)
+        }).collect();
+        let all_unread = if live { mailbox.count_for(&account_inbox_query(None)) } else { Some(mailbox.threads.iter().filter(|t| t.unread()).count() as u64) };
+        let inbox_unread = if live { mailbox.count_for(&mailbox.sidebar_count_query("tag:inbox")) } else { Some(unread as u64) };
         let active = mailbox.account_filter.as_ref().and_then(|id| mailbox.account(id)).cloned();
         // durian's profiles, when the data source has them, replace accounts in the switcher
         // and their folders replace the fixed system views
@@ -100,6 +112,13 @@ impl Render for MailSidebar {
         let open_folder = mailbox.folder;
         // the sidebar starts on "inbox": with profiles, that's the open folder
         let on_folder = |ix: usize, active: &SharedString| *active == format!("folder:{ix}") || (active.as_ref() == "inbox" && open_folder == Some(ix));
+        let folder_counts: Vec<_> = profile.as_ref().map(|p| p.folders.iter().enumerate().map(|(ix, folder)| {
+            if live {
+                count_label(mailbox.count_for(&folder_unread_query(p, folder)))
+            } else {
+                count_label(Some(if on_folder(ix, &self.active) { unread as u64 } else { 0 }))
+            }
+        }).collect()).unwrap_or_default();
         let (switcher_label, switcher_color): (SharedString, Option<gpui::Hsla>) = match &profile {
             Some(p) => (p.name.clone(), p.color),
             None => (active.as_ref().map_or(SharedString::from("All accounts"), |a| a.name.clone()), active.as_ref().map(|a| a.color)),
@@ -181,8 +200,7 @@ impl Render for MailSidebar {
                     NavItem::new(SharedString::from(format!("folder-{ix}")), folder.name.clone())
                         .icon(crate::durian::profiles::ui_icon(&folder.icon))
                         .active(active)
-                        // a server-backed list only knows the open folder's count
-                        .when(active && unread > 0, |item| item.trailing(unread.to_string()))
+                        .when_some(folder_counts[ix].clone(), |item, count| item.trailing(count))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.active = key.clone();
                             cx.emit(SidebarEvent::Navigate(key.clone()));
@@ -196,12 +214,12 @@ impl Render for MailSidebar {
         });
         let system = div()
             .pb(px(8.))
-            .child(self.item("inbox", "Inbox", IconName::MailInbox, Some(unread), cx))
+            .child(self.item("inbox", "Inbox", IconName::MailInbox, count_label(inbox_unread), cx))
             .child(self.item("starred", "Starred", IconName::MailStarred, None, cx))
             .child(self.item("snoozed", "Snoozed", IconName::MailClock, None, cx))
             .child(self.item("sent", "Sent", IconName::MailSend, None, cx))
             // Drafts only shows up while there are drafts
-            .when(drafts > 0, |s| s.child(self.item("drafts", "Drafts", IconName::MailDraft, Some(drafts), cx)))
+            .when(drafts > 0, |s| s.child(self.item("drafts", "Drafts", IconName::MailDraft, Some(drafts.to_string().into()), cx)))
             .child(self.item("all", "All mail", IconName::MailEmail, None, cx))
             .child(self.item("calendar", "Calendar", IconName::Calendar, None, cx));
 
@@ -223,7 +241,7 @@ impl Render for MailSidebar {
                         .child(
                             NavItem::new(SharedString::from(format!("tag-{name}")), name)
                                 .leading(color_dot(color))
-                                .when(count > 0, |item| item.trailing(count.to_string()))
+                                .when_some(count_label(count), |item, count| item.trailing(count))
                                 .active(active)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.active = key.clone();
@@ -265,7 +283,7 @@ impl Render for MailSidebar {
             .bg(bg)
             .child(mail_titlebar(true, cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ToggleSidebar))))
             .when(self.menu_open, |s| {
-                let row = |id: SharedString, leading: AnyElement, label: SharedString, detail: Option<SharedString>, count: usize, key: Option<&'static str>, selected: bool| {
+                let row = |id: SharedString, leading: AnyElement, label: SharedString, detail: Option<SharedString>, count: Option<SharedString>, key: Option<&'static str>, selected: bool| {
                     div()
                         .id(id)
                         .flex()
@@ -279,7 +297,7 @@ impl Render for MailSidebar {
                         .child(div().flex().flex_none().items_center().justify_center().w(px(16.)).child(leading))
                         .child(div().flex_none().text_size(px(SIZE_SMALL)).font_weight(WEIGHT_MEDIUM).text_color(theme.text_primary).child(label))
                         .child(div().flex_1().min_w_0().truncate().text_size(px(SIZE_MINI)).text_color(theme.text_tertiary).children(detail))
-                        .when(count > 0, |s| s.child(div().text_size(px(SIZE_MINI)).text_color(theme.text_quaternary).child(count.to_string())))
+                        .children(count.map(|count| div().text_size(px(SIZE_MINI)).text_color(theme.text_quaternary).child(count)))
                         .children(key.map(|k| Kbd::new(k)))
                 };
                 let current = active.as_ref().map(|a| a.id.clone());
@@ -294,7 +312,7 @@ impl Render for MailSidebar {
                 let menu = if profiles.is_empty() {
                     let mut menu = menu
                         .child(
-                            row("acct-all".into(), Icon::new(IconName::MailInbox).color(theme.text_tertiary).into_any_element(), "All accounts".into(), None, all_unread, Some("⌘0"), current.is_none())
+                            row("acct-all".into(), Icon::new(IconName::MailInbox).color(theme.text_tertiary).into_any_element(), "All accounts".into(), None, count_label(all_unread), Some("⌘0"), current.is_none())
                                 .on_click(cx.listener(|this, _, _, cx| this.pick(None, cx))),
                         )
                         .child(div().h(px(1.)).my(px(4.)).bg(theme.border_card));
@@ -303,12 +321,12 @@ impl Render for MailSidebar {
                         let selected = current.as_ref() == Some(&account.id);
                         let key = ["⌘1", "⌘2", "⌘3"].get(n).copied();
                         menu = menu.child(
-                            row(format!("acct-{}", account.id).into(), div().size(px(8.)).rounded_full().bg(account.color).into_any_element(), account.name.clone(), Some(account.email.clone()), *unread, key, selected)
+                            row(format!("acct-{}", account.id).into(), div().size(px(8.)).rounded_full().bg(account.color).into_any_element(), account.name.clone(), Some(account.email.clone()), count_label(*unread), key, selected)
                                 .on_click(cx.listener(move |this, _, _, cx| this.pick(Some(id.clone()), cx))),
                         );
                     }
                     menu.child(div().h(px(1.)).my(px(4.)).bg(theme.border_card))
-                        .child(row("acct-add".into(), Icon::new(IconName::Plus).color(theme.text_tertiary).into_any_element(), "Add account…".into(), None, 0, None, false))
+                        .child(row("acct-add".into(), Icon::new(IconName::Plus).color(theme.text_tertiary).into_any_element(), "Add account…".into(), None, None, None, false))
                 } else {
                     // profiles as configured in durian (profiles.pkl): name, accounts, ⌘1…
                     menu.children(profiles.iter().enumerate().map(|(n, p)| {
@@ -318,7 +336,7 @@ impl Render for MailSidebar {
                             None => Icon::new(IconName::MailInbox).color(theme.text_tertiary).into_any_element(),
                         };
                         let key = ["⌘1", "⌘2", "⌘3"].get(n).copied();
-                        row(format!("profile-{n}").into(), leading, p.name.clone(), Some(accounts), 0, key, profile_ix == Some(n))
+                        row(format!("profile-{n}").into(), leading, p.name.clone(), Some(accounts), None, key, profile_ix == Some(n))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.menu_open = false;
                                 this.active = "folder:0".into();
@@ -359,5 +377,24 @@ impl Render for MailSidebar {
                     .child(tag_section)
                     .child(view_section),
             )
+    }
+}
+
+/// Zero gets no badge; an unknown live count is visibly distinct from zero.
+fn count_label(count: Option<u64>) -> Option<SharedString> {
+    match count {
+        None => Some("—".into()),
+        Some(0) => None,
+        Some(n) => Some(n.to_string().into()),
+    }
+}
+
+#[cfg(test)]
+mod count_tests {
+    #[test]
+    fn unknown_zero_and_large_counts_are_distinct_badges() {
+        assert_eq!(super::count_label(None).as_deref(), Some("—"));
+        assert_eq!(super::count_label(Some(0)), None);
+        assert_eq!(super::count_label(Some(501)).as_deref(), Some("501"));
     }
 }

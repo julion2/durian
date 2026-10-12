@@ -1,5 +1,5 @@
 [package]
-name = "linear-gpui"
+name = "durian-gpui"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -18,7 +18,8 @@ mail = { path = "crates/mail" }
 calendar = { path = "crates/calendar" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 gpui.workspace = true
-gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = ["font-kit", "runtime_shaders"] }
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = ["font-kit", "runtime_shaders", "x11", "wayland"] }
+zlog = { package = "gpui-pre-zlog", version = "=0.3.8" }
 anyhow = "1"
 rust-embed.workspace = true
 serde = { version = "1", features = ["derive"] }

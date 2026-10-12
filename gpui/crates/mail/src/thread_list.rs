@@ -451,9 +451,9 @@ fn people(thread: &Thread, mailbox: &Mailbox) -> SharedString {
     let senders = thread.senders();
     let count = thread.messages().count();
     let joined = if senders.len() > 3 {
-        let mut recent: Vec<String> = Vec::new();
+        let mut recent: Vec<&SharedString> = Vec::new();
         for m in thread.messages().rev() {
-            let name = short(&m.from.name);
+            let name = &m.from.name;
             if !recent.contains(&name) {
                 recent.push(name);
             }
@@ -461,7 +461,9 @@ fn people(thread: &Thread, mailbox: &Mailbox) -> SharedString {
                 break;
             }
         }
-        format!("{} … {}, {}", short(&senders[0]), recent[1], recent[0])
+        // Match senders()' identity before shortening labels. Several distinct
+        // people can share a first name, which must not collapse this pair.
+        format!("{} … {}, {}", short(&senders[0]), short(recent[1]), short(recent[0]))
     } else {
         senders.iter().map(short).collect::<Vec<_>>().join(", ")
     };

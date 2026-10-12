@@ -42,6 +42,8 @@ pub struct ThreadView {
     /// message indices the user expanded/collapsed explicitly (toggles the default)
     toggled: HashSet<usize>,
     show_quoted: HashSet<usize>,
+    /// Snapshots are pictures; the original text part remains selectable on demand.
+    show_plain: HashSet<usize>,
     show_all: bool,
     /// URL under the pointer inside an HTML message, shown like a browser status bar.
     hovered_link: Option<SharedString>,
@@ -67,6 +69,8 @@ fn webview_key(thread: &Thread, ix: usize, dark: bool) -> SharedString {
 }
 
 struct ReplyDraft {
+    thread_id: SharedString,
+    submitting: Option<usize>,
     all: bool,
     editor: Entity<TextArea>,
     _subscription: Subscription,
@@ -100,15 +104,25 @@ impl ThreadView {
                 this.selection.clear();
                 this.toggled.clear();
                 this.show_quoted.clear();
+                this.show_plain.clear();
                 this.show_all = false;
                 this.hovered_link = None;
                 this.restore_reply(cx);
                 cx.notify();
             }
+            MailboxEvent::SendFinished { draft_id, result } if this.reply.as_ref().is_some_and(|draft| draft.submitting == Some(*draft_id)) => {
+                if result.is_ok() {
+                    this.reply = None;
+                    cx.emit(ThreadViewEvent::ReleaseFocus);
+                } else if let Some(draft) = &mut this.reply {
+                    draft.submitting = None;
+                }
+                cx.notify();
+            }
             _ => {}
         })
         .detach();
-        Self { mailbox, renderer, schedule, selection: ui::Selection::new(), reply: None, hovered_attachment: None, scroll: gpui::ScrollHandle::new(), toggled: HashSet::default(), show_quoted: HashSet::default(), show_all: false, hovered_link: None, #[cfg(target_os = "macos")] webviews: Default::default(), #[cfg(target_os = "macos")] webviews_wanted: Default::default() }
+        Self { mailbox, renderer, schedule, selection: ui::Selection::new(), reply: None, hovered_attachment: None, scroll: gpui::ScrollHandle::new(), toggled: HashSet::default(), show_quoted: HashSet::default(), show_plain: HashSet::default(), show_all: false, hovered_link: None, #[cfg(target_os = "macos")] webviews: Default::default(), #[cfg(target_os = "macos")] webviews_wanted: Default::default() }
     }
 
     /// What Space previews: the hovered attachment, else the latest message's first one.
@@ -367,7 +381,19 @@ impl ThreadView {
                 )
                 .children(live.map(|view| div().rounded(theme.radius.md).overflow_hidden().child(view)))
                 .into_any_element(),
-            Some(Some(RenderState::Ready(snapshot))) => self.render_html(ix, &snapshot, blocked, theme, cx).into_any_element(),
+            Some(Some(RenderState::Ready(snapshot))) => {
+                let show_plain = self.show_plain.contains(&ix);
+                let content = if show_plain { plain().into_any_element() } else { self.render_html(ix, &snapshot, blocked, theme, cx).into_any_element() };
+                div().flex().flex_col().gap(px(8.))
+                    .child(div().flex().child(ui::SecondaryButton::new(("mail-layout", ix), if show_plain { "Show original layout" } else { "Show plain text" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.show_plain.remove(&ix) { this.show_plain.insert(ix); }
+                            this.selection.clear();
+                            this.hovered_link = None;
+                            cx.notify();
+                        }))))
+                    .child(content).into_any_element()
+            }
             // couldn't render (too large, timed out, crashed): the text part is the message
             Some(Some(RenderState::Failed(_))) => plain().into_any_element(),
             // not rendered yet: the text/plain part is readable right away, never a spinner
@@ -640,12 +666,25 @@ impl ThreadView {
 
     /// Creates the inline editor (optionally with restored draft text) without focusing it.
     fn ensure_reply(&mut self, all: bool, text: Option<SharedString>, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.mailbox.read(cx).selected_thread().map(|t| t.id.clone()) else { return };
+        let live = self.mailbox.read(cx).remote.is_some();
+        if live && self.mailbox.update(cx, |m, cx| m.begin_reply(thread_id.clone(), all, cx)).is_none() { return }
+        let all = if live {
+            self.mailbox.read(cx).reply_draft(&thread_id).and_then(|d| match d.kind { DraftKind::Reply { all, .. } => Some(all), _ => None }).unwrap_or(all)
+        } else { all };
         if self.reply.is_some() {
             if let Some(draft) = self.reply.as_mut() {
                 draft.all = all;
             }
             return;
         }
+        let Some(thread) = self.mailbox.read(cx).selected_thread() else { return };
+        if thread.partial && self.mailbox.read(cx).remote.is_some() && self.mailbox.read(cx).reply_draft(&thread.id).is_none() {
+            self.mailbox.update(cx, |_, cx| cx.emit(MailboxEvent::WriteProblem("Wait for the complete thread before replying.".into())));
+            return;
+        }
+        let thread_id = thread.id.clone();
+        let submitting = self.mailbox.read(cx).reply_draft(&thread_id).filter(|draft| draft.sending).map(|draft| draft.id);
         let text = text.or_else(|| {
             let mailbox = self.mailbox.read(cx);
             let thread = mailbox.selected_thread()?;
@@ -672,13 +711,18 @@ impl ThreadView {
             TextAreaEvent::Changed => {
                 let body = editor.read(cx).text().clone();
                 let all = this.reply.as_ref().is_none_or(|d| d.all);
-                if let Some(thread_id) = this.mailbox.read(cx).selected_thread().map(|t| t.id.clone()) {
+                if let Some(thread_id) = this.reply.as_ref().map(|draft| draft.thread_id.clone()) {
+                    if let Some(frozen) = this.mailbox.read(cx).reply_draft(&thread_id).filter(|d| d.sending || d.queued.is_some() || d.wire.extra.contains_key(crate::durian::writes::PENDING_SEND)) {
+                        let original = frozen.body.clone();
+                        if body != original { editor.update(cx, |editor, cx| editor.set_text(original, cx)); }
+                        return;
+                    }
                     this.mailbox.update(cx, |m, cx| m.save_reply_draft(thread_id, all, body, cx));
                 }
                 cx.notify();
             }
         });
-        self.reply = Some(ReplyDraft { all, editor, _subscription: subscription });
+        self.reply = Some(ReplyDraft { thread_id, submitting, all, editor, _subscription: subscription });
     }
 
     /// Restore the saved reply draft of the newly selected thread, if any.
@@ -686,7 +730,7 @@ impl ThreadView {
         self.reply = None;
         let mailbox = self.mailbox.read(cx);
         let Some(thread) = mailbox.selected_thread() else { return };
-        if let Some(Draft { kind: DraftKind::Reply { all, .. }, body, .. }) = mailbox.reply_draft(&thread.id).cloned() {
+        if let Some(Draft { kind: DraftKind::Reply { all, .. }, body, .. }) = mailbox.reply_draft(&thread.id).filter(|draft| draft.queued.is_none()).cloned() {
             self.ensure_reply(all, Some(body), cx);
         }
     }
@@ -698,7 +742,9 @@ impl ThreadView {
         }
         self.ensure_reply(all, None, cx);
         if let Some(draft) = &self.reply {
-            draft.editor.read(cx).focus_handle(cx).focus(window, cx);
+            let frozen = self.mailbox.read(cx).reply_draft(&draft.thread_id).is_some_and(|d| d.sending || d.queued.is_some() || d.wire.extra.contains_key(crate::durian::writes::PENDING_SEND));
+            if frozen { cx.emit(ThreadViewEvent::ReleaseFocus); }
+            else { draft.editor.read(cx).focus_handle(cx).focus(window, cx); }
         }
         // the composer sits under the thread – bring it into view
         self.scroll.scroll_to_bottom();
@@ -707,7 +753,28 @@ impl ThreadView {
 
     fn recipients(&self, all: bool, cx: &App) -> Option<Recipients> {
         let mailbox = self.mailbox.read(cx);
-        let latest = mailbox.selected_thread()?.latest();
+        let thread = mailbox.selected_thread()?;
+        if mailbox.remote.is_some() {
+            if let Some(draft) = mailbox.reply_draft(&thread.id).filter(|draft| !draft.wire.to.is_empty()) {
+                return Some(Recipients { to: draft.wire.to.iter().cloned().map(Into::into).collect(), cc: draft.wire.cc.iter().cloned().map(Into::into).collect() });
+            }
+            let latest = thread.latest();
+            let own = |raw: &str| {
+                let contact = crate::durian::parse_address(raw);
+                mailbox.is_me(&contact) || mailbox.accounts.iter().any(|a| a.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(&contact.email)))
+            };
+            let mut seen = HashSet::new();
+            let mut collect = |raw: &[SharedString]| raw.iter().filter(|address| {
+                !own(address) && seen.insert(crate::durian::parse_address(address).email.to_lowercase())
+            }).cloned().collect::<Vec<_>>();
+            let sender: SharedString = format!("{} <{}>", latest.from.name, latest.from.email).into();
+            let mine = own(&sender);
+            let mut to = if mine { collect(&latest.to) } else { collect(&[sender]) };
+            if all && !mine { to.extend(collect(&latest.to)); }
+            let cc = if all { collect(&latest.cc) } else { Vec::new() };
+            return Some(Recipients { to, cc });
+        }
+        let latest = thread.latest();
         let me = &mailbox.me.name;
         let mut to: Vec<SharedString> = Vec::new();
         let push = |list: &mut Vec<SharedString>, name: &SharedString| {
@@ -733,12 +800,26 @@ impl ThreadView {
 
     fn send_reply(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = &self.reply else { return };
+        if draft.submitting.is_some() { return; }
         let body = draft.editor.read(cx).text().trim().to_string();
         if body.is_empty() {
             return;
         }
         let Some(Recipients { to, cc }) = self.recipients(draft.all, cx) else { return };
         let all = draft.all;
+        if self.mailbox.read(cx).remote.is_some() {
+            let thread_id = draft.thread_id.clone();
+            let submitting = self.mailbox.update(cx, |m, cx| {
+                m.save_reply_draft(thread_id.clone(), all, body.into(), cx);
+                let id = m.reply_draft(&thread_id)?.id;
+                m.submit_draft(id, Some(all), cx).then_some(id)
+            });
+            if let Some(draft) = &mut self.reply { draft.submitting = submitting; }
+            // The editor and encrypted recovery draft remain until enqueue is acknowledged.
+            if submitting.is_some() { cx.emit(ThreadViewEvent::ReleaseFocus); }
+            cx.notify();
+            return;
+        }
         let thread_id = self.mailbox.read(cx).selected_thread().map(|t| t.id.clone());
         self.mailbox.update(cx, |m, cx| {
             m.send_reply(to, cc, body.into(), cx);
@@ -753,16 +834,23 @@ impl ThreadView {
 
     /// Hand the draft to the full composer (more recipients, subject, formatting).
     fn pop_out(&mut self, cx: &mut Context<Self>) {
-        let Some(draft) = self.reply.take() else { return };
+        let Some(draft) = &self.reply else { return };
+        if draft.submitting.is_some() { return; }
         let Some(Recipients { to, cc }) = self.recipients(draft.all, cx) else { return };
         let Some(thread) = self.mailbox.read(cx).selected_thread() else { return };
         let subject = if thread.subject.starts_with("Re:") { thread.subject.to_string() } else { format!("Re: {}", thread.subject) };
         let thread_id = thread.id.clone();
         let account = Some(thread.account.clone());
         let body = draft.editor.read(cx).text().clone();
-        // the text moves to the full composer; its inline draft goes away
-        self.mailbox.update(cx, |m, cx| m.save_reply_draft(thread_id, draft.all, SharedString::default(), cx));
-        cx.emit(ThreadViewEvent::PopOut(ComposeSeed { draft_id: None, account, from: None, to, cc, subject: subject.into(), body }));
+        let all = draft.all;
+        let existing = self.mailbox.read(cx).reply_draft(&thread_id).map(|draft| draft.id);
+        let draft_id = self.mailbox.update(cx, |m, cx| {
+            m.save_new_draft(existing, DraftKind::Reply { thread_id, all }, body.clone(), cx)
+        });
+        if draft_id.is_none() { return; }
+        // Both editors address the same draft. Never delete before the recipient accepts it.
+        cx.emit(ThreadViewEvent::PopOut(ComposeSeed { draft_id, account, from: None, to, cc, subject: subject.into(), body }));
+        self.reply = None;
         cx.notify();
     }
 
@@ -791,6 +879,15 @@ impl ThreadView {
                 .on_click(cx.listener(|this, _, window, cx| this.open_reply(true, window, cx)))
                 .into_any_element();
         };
+
+        if let Some(saved) = self.mailbox.read(cx).reply_draft(&draft.thread_id).filter(|saved| saved.sending || saved.wire.extra.contains_key(crate::durian::writes::PENDING_SEND)) {
+            let pending = saved.sending;
+            return card(theme).p(px(16.)).flex().flex_col().gap(px(12.))
+                .child(if pending { "Queuing reply… Your draft is kept." } else { "Delivery is unconfirmed. Retry sends the original message, not a new copy." })
+                .child(div().text_color(theme.text_body).child(draft.editor.read(cx).text().clone()))
+                .when(!pending && saved.queued.is_none(), |s| s.child(PrimaryButton::new("reply-retry", "Retry original send").on_click(cx.listener(|this, _, _, cx| this.send_reply(cx)))))
+                .into_any_element();
+        }
 
         let all = draft.all;
         let recipients = self.recipients(all, cx).unwrap_or(Recipients { to: Vec::new(), cc: Vec::new() });
@@ -826,10 +923,8 @@ impl ThreadView {
                             .hover(|s| s.underline())
                             .child(if all { "Reply all" } else { "Reply" })
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(draft) = this.reply.as_mut() {
-                                    draft.all = !draft.all;
-                                    cx.notify();
-                                }
+                                if let Some(all) = this.reply.as_ref().map(|d| !d.all) { this.ensure_reply(all, None, cx); }
+                                cx.notify();
                             })),
                     )
                     .child(div().min_w_0().truncate().text_color(theme.text_tertiary).child(line))

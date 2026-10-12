@@ -1,7 +1,5 @@
-//! durian as a data source: the HTTP API's read side mapped onto the UI's model.
-//!
-//! Read-only for now – [`client::Client`] only has GET endpoints. Writes (tags, send, drafts,
-//! calendar) come later as intents. Set `MAIL_BACKEND=http://127.0.0.1:9723` (and
+//! durian HTTP data and encrypted drafts/outbox mapped onto the UI's model.
+//! Set `MAIL_BACKEND=http://127.0.0.1:9723` (and
 //! `MAIL_TOKEN` unless the server runs with `--no-auth`) to use it.
 //!
 //! - [`client`]: blocking HTTP, typed errors
@@ -13,10 +11,14 @@
 
 pub mod api;
 pub mod cache;
+pub mod calendar_write;
 pub mod client;
+pub mod events;
 pub mod live;
 pub mod profiles;
 pub mod translate;
+mod transport;
+pub mod writes;
 
 use calendar::model::{Attendee, Event as CalEvent, Rsvp};
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
@@ -195,13 +197,17 @@ fn text_body(body: &str) -> String {
 /// One message. A message whose HTML embeds images gets its HTML once they're fetched
 /// (`inline_images`); until then its text shows, as for any HTML still rendering.
 fn message(m: &api::ThreadMessage, now: i64, policy: crate::html_doc::Policy) -> Message {
-    let names = |list: &str| split_addresses(list).into_iter().map(|c| c.name).collect();
+    let names = |list: &str| split_addresses(list).into_iter().map(|c| format!("{} <{}>", c.name, c.email).into()).collect();
     let html = m.html.as_deref().filter(|h| !h.trim().is_empty());
     // what was written, apart from the history that came along (durian strips most of it
     // already; this catches what's left, e.g. Outlook's "From:/Sent:" blocks)
     let (body, quoted) = crate::quote::split(&text_body(&m.body));
     Message {
         id: m.id.clone().into(),
+        message_id: m.message_id.clone().map(Into::into),
+        in_reply_to: m.in_reply_to.clone().map(Into::into),
+        references: m.references.clone().map(Into::into),
+        account: m.account.clone().map(Into::into),
         from: parse_address(&m.from),
         to: names(&m.to),
         cc: names(&m.cc),
@@ -275,6 +281,8 @@ pub fn summary(r: &api::SearchResult, now: i64) -> Thread {
     let tags: Vec<SharedString> = r.tags.split(',').map(str::trim).filter(|t| !t.is_empty()).map(|t| t.to_string().into()).collect();
     let stand_in = Message {
         id: SharedString::default(),
+        message_id: None, in_reply_to: None, references: None,
+        account: None,
         plain: true,
         from: parse_address(&r.from),
         to: Vec::new(),
@@ -322,11 +330,20 @@ fn answer(response: &str) -> Rsvp {
 }
 
 /// Where an event lives on the server: what `/calendars/event` needs to find it again.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EventRef {
     pub account: SharedString,
     pub calendar: String,
     pub uid: String,
+}
+
+impl EventRef {
+    /// Decode only ids produced by `calendar_event`; fixture ids remain opaque.
+    pub(crate) fn from_occurrence(id: &str) -> Option<Self> {
+        let (series, _) = id.rsplit_once('@')?;
+        let (account, calendar, uid): (String, String, String) = serde_json::from_str(series).ok()?;
+        Some(Self { account: account.into(), calendar, uid })
+    }
 }
 
 /// A calendar's id in the UI: account and name (names repeat across accounts).
@@ -338,14 +355,20 @@ pub fn calendar_id(account: &str, name: &str) -> SharedString {
 /// with the detail; until then, "none" is taken as nothing to answer – most events without
 /// an answer are your own.
 pub fn calendar_event(account: &SharedString, e: &api::CalendarEvent) -> Option<(CalEvent, EventRef)> {
-    let (start, end) = (parse_time(&e.start)?, parse_time(&e.end)?);
+    let time = |s: &str| if e.all_day {
+        NaiveDate::parse_from_str(s.get(..10)?, "%Y-%m-%d").ok()?.and_hms_opt(0, 0, 0)
+    } else { parse_time(s) };
+    let (start, end) = (time(&e.start)?, time(&e.end)?);
     let rsvp = match e.my_response.as_deref() {
         None | Some("none") | Some("") => Rsvp::Accepted,
         Some(r) => answer(r),
     };
+    // A UID can occur in several accounts/calendars at the same start time.
+    // Encode the tuple unambiguously, including opaque ids that contain separators.
+    let series = serde_json::to_string(&(account.as_ref(), &e.calendar, &e.uid)).ok()?;
     let event = CalEvent {
         // occurrences of a series share the uid
-        id: format!("{}@{}", e.uid, e.start).into(),
+        id: format!("{series}@{}", e.start).into(),
         calendar: calendar_id(account, &e.calendar),
         title: e.subject.clone().into(),
         start,
@@ -357,7 +380,7 @@ pub fn calendar_event(account: &SharedString, e: &api::CalendarEvent) -> Option<
         attendees: Vec::new(),
         rsvp,
         recurrence: e.recurring.then(|| "Repeats".into()),
-        series: e.recurring.then(|| e.uid.clone().into()),
+        series: e.recurring.then(|| series.into()),
     };
     Some((event, EventRef { account: account.clone(), calendar: e.calendar.clone(), uid: e.uid.clone() }))
 }
@@ -459,11 +482,28 @@ mod tests {
         assert_eq!((event.rsvp, event.attendees.len(), kind, occurrence), (Rsvp::NeedsAction, 3, crate::invite::Kind::Request, true));
 
         // loaded, answered since, guests not fetched yet: the calendar's, with the mail's guests
-        let (mut listed, _) = calendar_event(&"work".into(), &m.invitation.as_ref().unwrap().event).unwrap();
-        listed.calendar = "work/Work".into();
+        let mut api_event = m.invitation.as_ref().unwrap().event.clone();
+        api_event.calendar = "Work".into();
+        let (mut listed, _) = calendar_event(&"work".into(), &api_event).unwrap();
         listed.rsvp = Rsvp::Tentative;
         let (event, ..) = crate::invite::resolve(&schedule(vec![listed.clone()]), message).unwrap();
         assert_eq!((event.calendar.as_ref(), event.rsvp, event.attendees.len()), ("work/Work", Rsvp::Tentative, 3));
+
+        // Same UID/time in another account must not supply the answer, nor make our
+        // one matching account ambiguous. Multiple calendars within our account must.
+        let (other_account, _) = calendar_event(&"personal".into(), &api_event).unwrap();
+        let (event, ..) = crate::invite::resolve(&schedule(vec![other_account.clone()]), message).unwrap();
+        assert_eq!(event.rsvp, Rsvp::NeedsAction);
+        let (event, ..) = crate::invite::resolve(&schedule(vec![other_account, listed.clone()]), message).unwrap();
+        assert_eq!(event.rsvp, Rsvp::Tentative);
+        api_event.calendar = "Other".into();
+        let (other_calendar, _) = calendar_event(&"work".into(), &api_event).unwrap();
+        let (event, ..) = crate::invite::resolve(&schedule(vec![other_calendar.clone(), listed.clone()]), message).unwrap();
+        assert_eq!(event.rsvp, Rsvp::NeedsAction);
+        let mut known = message.clone();
+        known.invitation.as_mut().unwrap().event = listed.clone();
+        let (event, ..) = crate::invite::resolve(&schedule(vec![other_calendar]), &known).unwrap();
+        assert_eq!(event.calendar.as_ref(), "work/Work", "a known calendar must not match a different one");
 
         // the calendar's own guests win once it has them
         listed.attendees = vec![Attendee { name: "Mara".into(), email: "mara@x.dev".into(), rsvp: Rsvp::Accepted, organizer: true, avatar: None }];
@@ -594,10 +634,29 @@ mod tests {
         let e = event(r#"{"calendar":"Work","uid":"abc@google.com","subject":"Standup","start":"2026-10-12T09:00:00+02:00","end":"2026-10-12T09:15:00+02:00","recurring":true,"my_response":"none"}"#);
         let (ev, at) = calendar_event(&"work".into(), &e).unwrap();
         assert_eq!(ev.calendar.as_ref(), "work/Work");
-        assert_eq!(ev.series.as_deref(), Some("abc@google.com"));
+        assert!(ev.series.is_some());
         assert_eq!(ev.rsvp, Rsvp::Accepted, "no answer in a summary: likely your own");
         assert_eq!(at, EventRef { account: "work".into(), calendar: "Work".into(), uid: "abc@google.com".into() });
+        let (other_account, _) = calendar_event(&"home".into(), &e).unwrap();
+        let mut other = e.clone();
+        other.calendar = "Shared".into();
+        let (other_calendar, _) = calendar_event(&"work".into(), &other).unwrap();
+        assert_ne!(ev.id, other_account.id, "equal UID/start must not collide across accounts");
+        assert_ne!(ev.id, other_calendar.id, "equal UID/start must not collide across calendars");
+        assert_ne!(ev.series, other_account.series);
+        assert_ne!(ev.series, other_calendar.series);
         assert!(calendar_event(&"work".into(), &event(r#"{"calendar":"W","uid":"x","start":"garbage","end":"x"}"#)).is_none());
+    }
+
+    #[test]
+    fn all_day_keeps_civil_dates_and_exclusive_end() {
+        let e = event(r#"{"calendar":"W","uid":"day","all_day":true,"start":"2026-10-12T00:00:00+13:00","end":"2026-10-14T00:00:00+13:00"}"#);
+        let (mapped, _) = calendar_event(&"work".into(), &e).unwrap();
+        assert_eq!(mapped.start, NaiveDate::from_ymd_opt(2026, 10, 12).unwrap().and_hms_opt(0, 0, 0).unwrap());
+        assert_eq!(mapped.end, NaiveDate::from_ymd_opt(2026, 10, 14).unwrap().and_hms_opt(0, 0, 0).unwrap());
+        assert_eq!((mapped.end - mapped.start).num_days(), 2);
+        let timed = api::CalendarEvent { all_day: false, ..e };
+        assert_eq!(calendar_event(&"work".into(), &timed).unwrap().0.start, parse_time(&timed.start).unwrap());
     }
 
     #[test]

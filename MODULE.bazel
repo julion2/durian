@@ -4,6 +4,67 @@ bazel_dep(name = "apple_support", version = "2.2.0")
 bazel_dep(name = "googletest", version = "1.17.0")
 bazel_dep(name = "rules_swift", version = "3.6.1")
 bazel_dep(name = "rules_apple", version = "4.5.3")
+bazel_dep(name = "rules_rust", version = "0.74.0")
+bazel_dep(name = "platforms", version = "1.1.0")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.99.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+rust_host = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
+rust_host.host_tools(
+    name = "gpui_rust_host",
+    version = "1.99.0",
+)
+use_repo(rust_host, "gpui_rust_host")
+
+gpui_crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+gpui_crate.from_cargo(
+    name = "gpui_crates",
+    cargo_lockfile = "//gpui:Cargo.lock",
+    host_tools = "@gpui_rust_host",
+    manifests = ["//gpui:Cargo.toml"],
+    skip_cargo_lockfile_overwrite = True,
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+    ],
+)
+
+# GPUI uses this macro in debug builds, but Bazel compiles host proc macros
+# with optimizations even in fastbuild. Keep the debug-gated export available.
+gpui_crate.annotation(
+    crate = "gpui-pre-macros",
+    repositories = ["gpui_crates"],
+    rustc_flags = ["-Cdebug-assertions=yes"],
+    version = "0.3.8",
+)
+
+# Bazel executables and tests must not read assets from a vanished compile
+# sandbox. Embed them in fastbuild/debug as well as optimized builds.
+gpui_crate.annotation(
+    crate = "rust-embed",
+    crate_features = ["debug-embed"],
+    repositories = ["gpui_crates"],
+)
+gpui_crate.annotation(
+    crate = "rust-embed-impl",
+    crate_features = ["debug-embed"],
+    repositories = ["gpui_crates"],
+)
+gpui_crate.annotation(
+    crate = "rust-embed-utils",
+    crate_features = ["debug-embed"],
+    repositories = ["gpui_crates"],
+)
+use_repo(gpui_crate, "gpui_crates")
 
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
 

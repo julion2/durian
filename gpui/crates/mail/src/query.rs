@@ -16,6 +16,7 @@ pub enum Term {
     Tag(String),
     From(String),
     To(String),
+    Subject(String),
     Account(String),
     Is(String),
     Has(String),
@@ -105,6 +106,7 @@ impl Query {
                             "tag" | "label" => Term::Tag(value),
                             "from" => Term::From(value),
                             "to" => Term::To(value),
+                            "subject" => Term::Subject(value),
                             "account" | "in" => Term::Account(value),
                             "is" => Term::Is(value),
                             "has" => Term::Has(value),
@@ -187,6 +189,7 @@ fn term_matches(term: &Term, prefix: bool, thread: &Thread, mailbox: &Mailbox, e
                 name_matches(n, email, who, mailbox) || (who == "me" && *n == mailbox.me.name)
             })
         }),
+        Term::Subject(needle) => contains_folded(&thread.subject, needle),
         Term::Account(id) => eq(&thread.account.to_lowercase(), id)
             || mailbox.account(&thread.account).is_some_and(|a| eq(&a.name.to_lowercase(), id)),
         // while typing, `is:st` means "any state starting with st"; no such state matches nothing
@@ -218,7 +221,7 @@ pub fn completions(input: &str, mailbox: &Mailbox) -> Vec<(SharedString, SharedS
     let (negate, last) = last.strip_prefix('-').map_or(("", last), |l| ("-", l));
     let Some((key, partial)) = last.split_once(':') else {
         // no key yet: offer the keys themselves
-        return ["tag:", "from:", "to:", "is:", "has:", "account:", "newer:", "older:"]
+        return ["tag:", "from:", "to:", "subject:", "is:", "has:", "account:", "newer:", "older:"]
             .iter()
             .filter(|k| !last.is_empty() && k.starts_with(&last.to_lowercase()))
             .map(|k| (SharedString::from(format!("{negate}{k}")), SharedString::from("filter")))

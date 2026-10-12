@@ -1,0 +1,26 @@
+load("@gpui_crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "ui",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    compile_data = glob(["assets/**"]),
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//gpui:__subpackages__"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "ui_test",
+    size = "small",
+    crate = ":ui",
+    data = glob(["assets/**"]),
+    # The icon inventory test checks source files, not the embedded copy.
+    # Use the same relative path in the compile execroot and test runfiles.
+    rustc_env = {"CARGO_MANIFEST_DIR": "gpui/crates/ui"},
+)

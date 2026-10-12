@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Linux Orb prerequisites; all builds/tests remain explicit Bazel commands.
+set -euo pipefail
+
+packages=(build-essential pkg-config clang lld cmake curl ca-certificates unzip
+  libfontconfig1-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev
+  libxcb-xinput-dev libxcb-shape0-dev libxcb-randr0-dev libxcb-xfixes0-dev
+  libxcb-sync-dev libxcb-render0-dev libxcursor-dev libxrandr-dev libxi-dev
+  libasound2-dev libssl-dev libvulkan1 mesa-vulkan-drivers libsecret-tools
+  libwebkit2gtk-4.1-dev
+  xvfb xauth xdotool x11-apps x11-utils openbox imagemagick tesseract-ocr python3-pil)
+missing=()
+for package in "${packages[@]}"; do
+  if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
+    missing+=("$package")
+  fi
+done
+if ((${#missing[@]})); then
+  sudo apt-get update -qq
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}"
+fi
+
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+if ! command -v bazel >/dev/null; then
+  curl -fsSL https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o "$scratch/bazel"
+  sudo install -m 755 "$scratch/bazel" /usr/local/bin/bazel
+fi
+if ! pkl --version 2>/dev/null | grep -q '^Pkl 0.31.1 '; then
+  curl -fsSL https://github.com/apple/pkl/releases/download/0.31.1/pkl-linux-amd64 -o "$scratch/pkl"
+  sudo install -m 755 "$scratch/pkl" /usr/local/bin/pkl
+fi
+if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+  curl -fsSL https://sh.rustup.rs -o "$scratch/rustup-init.sh"
+  sh "$scratch/rustup-init.sh" -y --profile minimal --default-toolchain 1.99.0
+fi
+"$HOME/.cargo/bin/rustup" toolchain install 1.99.0 --profile minimal --component rustfmt,clippy
+printf 'Orb toolchains ready: '
+bazel --version
+"$HOME/.cargo/bin/rustc" +1.99.0 --version
+pkl --version

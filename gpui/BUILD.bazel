@@ -1,0 +1,62 @@
+load("@gpui_crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load(":mailrender.bzl", "mailrender")
+load(":package_binary.bzl", "package_binary")
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+])
+
+package_binary(
+    name = "durian-cli",
+    src = "//cli/cmd/durian",
+)
+
+mailrender(
+    name = "mailrender",
+    out_dir = "//gpui/crates/mail:mailrender_output",
+    linux = select({
+        "@platforms//os:linux": True,
+        "//conditions:default": False,
+    }),
+    target_compatible_with = select({
+        "@platforms//os:macos": [],
+        "@platforms//os:linux": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+rust_binary(
+    name = "durian",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    compile_data = glob([
+        "assets/**",
+        "data/**",
+    ]),
+    crate_name = "durian_gpui",
+    crate_root = "src/main.rs",
+    # html_render finds a packaged helper beside current_exe. Do not depend on
+    # build.rs's compile-sandbox absolute path surviving at runtime.
+    data = [":durian-cli"] + select({
+        "@platforms//os:macos": [":mailrender"],
+        "@platforms//os:linux": [":mailrender"],
+        "//conditions:default": [],
+    }),
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+    deps = [
+        "//gpui/crates/calendar",
+        "//gpui/crates/mail",
+        "//gpui/crates/ui",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "durian_test",
+    size = "small",
+    crate = ":durian",
+)
