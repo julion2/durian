@@ -10,8 +10,8 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = ["//gpui:__subpackages__"],
-    deps = ["//gpui/crates/ui"] + all_crate_deps(normal = True),
+    visibility = ["//app:__subpackages__"],
+    deps = ["//app/crates/ui"] + all_crate_deps(normal = True),
 )
 
 rust_test(

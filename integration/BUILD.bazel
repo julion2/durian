@@ -21,9 +21,20 @@ sh_test(
     name = "mailrender_test",
     size = "medium",
     srcs = ["mailrender_test.sh"],
-    args = ["$(location //gpui:durian)", "$(location //gpui/crates/mail:prepare_html)"],
-    data = ["testdata/mailrender_contract.py", "//gpui:durian", "//gpui/crates/mail:prepare_html"],
-    tags = ["integration", "local", "manual"],
+    args = [
+        "$(location //app:durian)",
+        "$(location //app/crates/mail:prepare_html)",
+    ],
+    data = [
+        "testdata/mailrender_contract.py",
+        "//app:durian",
+        "//app/crates/mail:prepare_html",
+    ],
+    tags = [
+        "integration",
+        "local",
+        "manual",
+    ],
     target_compatible_with = ["@platforms//os:linux"],
 )
 
@@ -31,15 +42,23 @@ sh_test(
     name = "gpui_html_ui_test",
     size = "medium",
     srcs = ["gpui_html_ui_test.sh"],
-    args = ["$(location //gpui:durian)", "$(location //cli/cmd/testseeder)", "$(location testdata/config.pkl)"],
+    args = [
+        "$(location //app:durian)",
+        "$(location //cli/cmd/testseeder)",
+        "$(location testdata/config.pkl)",
+    ],
     data = [
-        "testdata/render-mail.html",
         "testdata/config.pkl",
         "testdata/profiles.pkl",
+        "testdata/render-mail.html",
+        "//app:durian",
         "//cli/cmd/testseeder",
-        "//gpui:durian",
     ],
-    tags = ["integration", "local", "manual"],
+    tags = [
+        "integration",
+        "local",
+        "manual",
+    ],
     target_compatible_with = ["@platforms//os:linux"],
 )
 
@@ -50,15 +69,15 @@ sh_test(
     size = "medium",
     srcs = ["gpui_ui_test.sh"],
     args = [
-        "$(location //gpui:durian)",
+        "$(location //app:durian)",
         "$(location //cli/cmd/testseeder)",
         "$(location testdata/config.pkl)",
     ],
     data = [
         "testdata/config.pkl",
         "testdata/profiles.pkl",
+        "//app:durian",
         "//cli/cmd/testseeder",
-        "//gpui:durian",
     ],
     tags = [
         "integration",
@@ -72,15 +91,23 @@ sh_test(
     name = "gpui_startup_ui_test",
     size = "medium",
     srcs = ["gpui_startup_ui_test.sh"],
-    args = ["$(location //gpui:durian)", "$(location //cli/cmd/testseeder)", "$(location testdata/config.pkl)"],
+    args = [
+        "$(location //app:durian)",
+        "$(location //cli/cmd/testseeder)",
+        "$(location testdata/config.pkl)",
+    ],
     data = [
         "testdata/config.pkl",
-        "testdata/profiles.pkl",
         "testdata/fault_proxy.py",
+        "testdata/profiles.pkl",
+        "//app:durian",
         "//cli/cmd/testseeder",
-        "//gpui:durian",
     ],
-    tags = ["integration", "local", "manual"],
+    tags = [
+        "integration",
+        "local",
+        "manual",
+    ],
     target_compatible_with = ["@platforms//os:linux"],
 )
 
@@ -88,14 +115,22 @@ sh_test(
     name = "gpui_keymaps_ui_test",
     size = "medium",
     srcs = ["gpui_keymaps_ui_test.sh"],
-    args = ["$(location //gpui:durian)", "$(location //cli/cmd/testseeder)", "$(location testdata/config.pkl)"],
+    args = [
+        "$(location //app:durian)",
+        "$(location //cli/cmd/testseeder)",
+        "$(location testdata/config.pkl)",
+    ],
     data = [
         "testdata/config.pkl",
         "testdata/profiles.pkl",
+        "//app:durian",
         "//cli/cmd/testseeder",
-        "//gpui:durian",
     ],
-    tags = ["integration", "local", "manual"],
+    tags = [
+        "integration",
+        "local",
+        "manual",
+    ],
     target_compatible_with = ["@platforms//os:linux"],
 )
 
@@ -104,18 +139,22 @@ sh_test(
     size = "medium",
     srcs = ["gpui_calendar_ui_test.sh"],
     args = [
-        "$(location //gpui:durian)",
+        "$(location //app:durian)",
         "$(location //cli/cmd/testseeder)",
         "$(location testdata/config.pkl)",
     ],
     data = [
         "testdata/config.pkl",
-        "testdata/profiles.pkl",
         "testdata/fault_proxy.py",
+        "testdata/profiles.pkl",
+        "//app:durian",
         "//cli/cmd/testseeder",
-        "//gpui:durian",
     ],
-    tags = ["integration", "local", "manual"],
+    tags = [
+        "integration",
+        "local",
+        "manual",
+    ],
     target_compatible_with = ["@platforms//os:linux"],
 )
 
@@ -124,7 +163,7 @@ sh_test(
     size = "medium",
     srcs = ["gpui_test.sh"],
     args = [
-        "$(location //gpui/crates/mail:backend_contract)",
+        "$(location //app/crates/mail:backend_contract)",
         "$(location //cli/cmd/testseeder)",
         "$(location //cli/cmd/durian)",
         "$(location testdata/config.pkl)",
@@ -132,9 +171,9 @@ sh_test(
     data = [
         "testdata/config.pkl",
         "testdata/profiles.pkl",
+        "//app/crates/mail:backend_contract",
         "//cli/cmd/durian",
         "//cli/cmd/testseeder",
-        "//gpui/crates/mail:backend_contract",
     ],
     tags = ["integration"],
 )

@@ -16,11 +16,11 @@ package_binary(
 
 mailrender(
     name = "mailrender",
-    out_dir = "//gpui/crates/mail:mailrender_output",
     linux = select({
         "@platforms//os:linux": True,
         "//conditions:default": False,
     }),
+    out_dir = "//app/crates/mail:mailrender_output",
     target_compatible_with = select({
         "@platforms//os:macos": [],
         "@platforms//os:linux": [],
@@ -49,9 +49,9 @@ rust_binary(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = ["//visibility:public"],
     deps = [
-        "//gpui/crates/calendar",
-        "//gpui/crates/mail",
-        "//gpui/crates/ui",
+        "//app/crates/calendar",
+        "//app/crates/mail",
+        "//app/crates/ui",
     ] + all_crate_deps(normal = True),
 )
 

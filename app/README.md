@@ -13,15 +13,19 @@ Do not use these calendar write paths with real calendars yet.
 ## Build and run
 
 ```sh
-bazel build //gpui:durian
-bazel run //gpui:durian           # real Durian configuration and encrypted store
-bazel run //gpui:durian -- --demo # explicit bundled fixtures, never a connection-error fallback
+bazel build //app:durian
+bazel run //app:durian           # real Durian configuration and encrypted store
+bazel run //app:durian -- --demo # explicit bundled fixtures, never a connection-error fallback
 ```
+
+The application lives in `app/`; `crates/ui` remains its widget library. GPUI dependency,
+crate and integration-test names stay unchanged; this is a source-directory move, not a
+runtime identity or configuration migration.
 
 Bazel pins Rust 1.99 and resolves the Cargo lockfile through rules_rust/crate_universe; this is
 not a shell wrapper around Cargo. The GPUI family remains locked to gpui-pre 0.3.8 and macOS
 wry to 0.57.0. Assets are embedded in debug and optimized Bazel builds. The packaged Go
-executable is `bazel-bin/gpui/durian-cli`, beside the GUI `bazel-bin/gpui/durian`; copy both
+executable is `bazel-bin/app/durian-cli`, beside the GUI `bazel-bin/app/durian`; copy both
 together when moving the build. Also keep `mailrender` beside them; Linux additionally needs
 the sibling `mailrender-extensions/` directory, containing the request-filter library.
 Copy actual files, not symlinks back into a build sandbox. Linux builds require GTK3 and
@@ -249,13 +253,13 @@ In this Orb's Mesa software stack Vulkan painted black; disabling its ICD select
 OpenGL path. This is a test-environment setting, not a forced production renderer:
 
 ```sh
-VK_ICD_FILENAMES=/dev/null bazel run //gpui:durian -- --demo
+VK_ICD_FILENAMES=/dev/null bazel run //app:durian -- --demo
 ```
 
 ## Verification
 
 ```sh
-bazel test //gpui/... //integration:gpui_test
+bazel test //app/... //integration:gpui_test
 bazel test //cli/... //integration:integration_test
 bazel test //integration:gpui_ui_test --nocache_test_results
 bazel test //integration:gpui_startup_ui_test --nocache_test_results
@@ -350,17 +354,15 @@ are separate from the earlier matrices, not a replacement for their observations
    pagination and a compact list-ready API remain work; even a bounded conversation batch
    can exceed the unchanged response byte cap for exceptionally large threads.
 2. Design compose modal editing without locking selection/actions to Vim's operator-first
-   grammar. Multi-selection and message navigation work; remaining Swift calendar modes
-   are deliberately not a parity target. macOS keyboard-layout acceptance and automatic
-   keymap reload remain.
-3. Rename the client directory separately from behavioral changes. Prefer `app/` over `ui/`:
-   it contains application/backend lifecycle as well as views; `crates/ui` is the widget layer.
-4. Agree durable calendar recovery across app exit and finish provider/macOS write
+   grammar. The key-independent editing core, multi-selection and message navigation work;
+   remaining Swift calendar modes are deliberately not a parity target. macOS keyboard-layout
+   acceptance and automatic keymap reload remain.
+3. Agree durable calendar recovery across app exit and finish provider/macOS write
    acceptance. Larger durable attachments require extending the Go draft storage contract,
    rather than using temporary paths or pretending an oversized draft was saved.
-5. Add settings reload, notifications, account/auth management and complete message-header inspection.
+4. Add settings reload, notifications, account/auth management and complete message-header inspection.
    Existing Swift managers and tests are the reference for behavior, not a second backend.
-6. Finish Linux distribution installation packaging and Wayland acceptance. Exercise macOS
+5. Finish Linux distribution installation packaging and Wayland acceptance. Exercise macOS
    packaging/WebKit on macOS separately; Linux tests cannot establish native macOS behavior.
 
 The imported prototype's historical design/API notes live under `docs/`; this README describes

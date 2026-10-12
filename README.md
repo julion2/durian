@@ -51,7 +51,7 @@ brew install durian
 
 > An experimental Linux GUI is available — see [linux/README.md](linux/README.md).
 > The existing GPUI mail/calendar UI is also integrated as an experimental client with live mail writes —
-> see [gpui/README.md](gpui/README.md) for Bazel builds, backend ownership and native Linux tests.
+> see [app/README.md](app/README.md) for Bazel builds, backend ownership and native Linux tests.
 
 Or download pre-built binaries from [GitHub Releases](https://github.com/julion2/durian/releases). Or build from source (see below).
 
@@ -68,7 +68,7 @@ Or download pre-built binaries from [GitHub Releases](https://github.com/julion2
 bazel build //cli/cmd/durian    # CLI (macOS & Linux)
 bazel build //macos:Durian        # GUI (macOS only, debug)
 bazel build -c opt //macos:Durian # GUI (macOS only, release)
-bazel build //gpui:durian        # experimental GPUI + packaged CLI
+bazel build //app:durian         # experimental GPUI + packaged CLI
 
 ./cli/install.sh                # build & install CLI to /usr/local/bin
 ./macos/install.sh              # build & install GUI to /Applications
@@ -81,8 +81,8 @@ bazel build //gpui:durian        # experimental GPUI + packaged CLI
 bazel test //cli/...                       # CLI unit tests
 bazel test //macos/...                     # GUI tests (requires Xcode 26)
 bazel test //integration:integration_test  # API contract tests (real server)
-bazel test //gpui/... //integration:gpui_test # Rust + real-backend contract
-bazel test //integration:gpui_ui_test      # opt-in native Linux E2E; see gpui/README.md
+bazel test //app/... //integration:gpui_test # Rust + real-backend contract
+bazel test //integration:gpui_ui_test      # opt-in native Linux E2E; see app/README.md
 ```
 
 ## CLI

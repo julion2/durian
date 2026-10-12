@@ -26,9 +26,9 @@ use_repo(rust_host, "gpui_rust_host")
 gpui_crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 gpui_crate.from_cargo(
     name = "gpui_crates",
-    cargo_lockfile = "//gpui:Cargo.lock",
+    cargo_lockfile = "//app:Cargo.lock",
     host_tools = "@gpui_rust_host",
-    manifests = ["//gpui:Cargo.toml"],
+    manifests = ["//app:Cargo.toml"],
     skip_cargo_lockfile_overwrite = True,
     supported_platform_triples = [
         "aarch64-apple-darwin",

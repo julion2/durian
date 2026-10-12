@@ -11,7 +11,7 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = ["//gpui:__subpackages__"],
+    visibility = ["//app:__subpackages__"],
     deps = all_crate_deps(normal = True),
 )
 
@@ -22,5 +22,5 @@ rust_test(
     data = glob(["assets/**"]),
     # The icon inventory test checks source files, not the embedded copy.
     # Use the same relative path in the compile execroot and test runfiles.
-    rustc_env = {"CARGO_MANIFEST_DIR": "gpui/crates/ui"},
+    rustc_env = {"CARGO_MANIFEST_DIR": "app/crates/ui"},
 )

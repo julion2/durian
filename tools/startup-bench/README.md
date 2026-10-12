@@ -24,7 +24,7 @@ Separate store profiling (`benchseeder --profile`) measures real encrypted Searc
 Evidence is in `.amp/in/artifacts/startup-optimized/`: per-run raw bounds/residency/cleanup, binary hashes, traces, inspected captures, profiles and resource logs. The historical matrix below remains untouched.
 
 ```sh
-bazel build -c opt //gpui:durian //cli/cmd/benchseeder
+bazel build -c opt //app:durian //cli/cmd/benchseeder
 # Use the same synthetic-only environment and native run.py command below,
 # with separate before/after packaged binaries and fresh output directories.
 bazel-bin/cli/cmd/benchseeder/benchseeder_/benchseeder --profile \
@@ -305,7 +305,7 @@ Invalid preflights (wrong OCR region, wrong first-frame patch, original crash) w
 Requires existing Bazel native build dependencies, Pkl, Xvfb/Openbox, xdotool, tesseract, `/usr/bin/python3` and python3-pil. Start Xvfb/Openbox using the orb's supervised services (or an existing display); do not use real provider configuration.
 
 ```sh
-bazel build //gpui:durian //cli/cmd/benchseeder
+bazel build //app:durian //cli/cmd/benchseeder
 # Public fixture key, NOT a real mailbox key.
 export DURIAN_MASTER_KEY_HEX_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 SEEDER=bazel-bin/cli/cmd/benchseeder/benchseeder_/benchseeder
@@ -315,7 +315,7 @@ mkdir -p /tmp/startup-corpora
 "$SEEDER" --verify /tmp/startup-corpora/100k 100000
 for corpus in 10k 100k; do
   DISPLAY=:99 /usr/bin/python3 tools/startup-bench/run.py \
-    --app bazel-bin/gpui/durian --corpus /tmp/startup-corpora/$corpus \
+    --app bazel-bin/app/durian --corpus /tmp/startup-corpora/$corpus \
     --work /tmp/startup-runtime/$corpus \
     --output .amp/in/artifacts/startup-benchmark/$corpus --runs 5
 done
@@ -329,7 +329,7 @@ from pathlib import Path
 import subprocess
 from run import environment
 env = environment(Path('/tmp/startup-runtime/cli'), Path('/tmp/startup-corpora/100k'))
-cli = str(Path('bazel-bin/gpui/durian-cli').resolve())
+cli = str(Path('bazel-bin/app/durian-cli').resolve())
 for args in [('count', 'BenchBody'), ('search', 'BenchBody', '--limit', '7', '--json')]:
     result = subprocess.run([cli, *args], env=env)
     print('command:', args, 'exit:', result.returncode)
@@ -337,7 +337,7 @@ PY
 # Equivalent full HTTP public-interface checks; launches a diagnostic owned CLI,
 # consumes READY/token only in memory, and performs GET requests only.
 /usr/bin/python3 tools/startup-bench/api-diagnostic.py \
-  --cli bazel-bin/gpui/durian-cli --corpus /tmp/startup-corpora/100k \
+  --cli bazel-bin/app/durian-cli --corpus /tmp/startup-corpora/100k \
   --work /tmp/startup-runtime/api --output /tmp/api.json
 ```
 
