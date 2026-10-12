@@ -46,6 +46,7 @@ go_test(
         "cache_test.go",
         "config_test.go",
         "groups_test.go",
+        "keymaps_test.go",
         "validate_test.go",
     ],
     data = glob(["testdata/**"]),

@@ -135,6 +135,35 @@ paths:
           description: profiles.pkl could not be evaluated
         '503':
           description: config.pkl is not loaded
+  /keymaps:
+    get:
+      summary: The user's keymaps.pkl, read-only
+      description: >-
+        keymaps.pkl from the directory of the config file serve runs with,
+        evaluated against the embedded schema (modulepath:/Keymaps.pkl), so
+        clients need neither the pkl CLI nor the schema. Both typed and untyped
+        files are accepted. The bindings are the user's own, as written: they
+        are not merged with any client's built-in defaults, and entries with
+        enabled = false are kept (they disable a default binding). Fields the
+        file leaves out carry the schema defaults. If keymaps.pkl doesn't
+        exist, config is null and clients use their built-in keymaps. The
+        file is read per request, so an edit applies without a restart. This
+        endpoint never writes the file and never includes account settings.
+      responses:
+        '200':
+          description: The keymaps, or null when keymaps.pkl doesn't exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeymapsResponse'
+        '422':
+          description: >-
+            keymaps.pkl evaluates but has errors `durian validate keymaps`
+            reports (e.g. an unknown modifier or context in an untyped file).
+            Details are in serve.log, not the response. Unknown actions and
+            duplicate bindings are only warnings and do not fail the request.
+        '500':
+          description: keymaps.pkl could not be evaluated (details in serve.log)
   /settings:
     get:
       summary: App settings from config.pkl
@@ -924,6 +953,76 @@ components:
         query:
           type: string
           description: A search query, as for /search
+    KeymapsResponse:
+      type: object
+      required: [ok, config]
+      properties:
+        ok:
+          type: boolean
+        config:
+          nullable: true
+          description: Null when keymaps.pkl doesn't exist
+          allOf:
+            - $ref: '#/components/schemas/KeymapConfig'
+    KeymapConfig:
+      type: object
+      required: [keymaps, global_settings]
+      properties:
+        keymaps:
+          type: array
+          description: The user's bindings in file order, not merged with defaults
+          items:
+            $ref: '#/components/schemas/KeymapEntry'
+        global_settings:
+          $ref: '#/components/schemas/KeymapGlobalSettings'
+    KeymapEntry:
+      type: object
+      required: [action, key, modifiers, enabled, sequence, supports_count, context]
+      properties:
+        action:
+          type: string
+          description: >-
+            Action name (e.g. next_email, calendar_today). Not restricted:
+            clients ignore actions they don't know.
+        key:
+          type: string
+          description: A key, a named key ("Escape") or a sequence ("gg")
+        modifiers:
+          type: array
+          description: Empty when omitted
+          items:
+            type: string
+            enum: [cmd, ctrl, shift, alt]
+        enabled:
+          type: boolean
+          description: True when omitted; false disables the matching default binding
+        sequence:
+          type: boolean
+          description: False when omitted
+        supports_count:
+          type: boolean
+          description: False when omitted
+        context:
+          type: string
+          enum: [list, search, tag_picker, thread, compose_normal, calendar]
+          description: '"list" when omitted'
+        tags:
+          type: string
+          description: Tag operation for tag_op ("+todo -inbox"); omitted when unset
+    KeymapGlobalSettings:
+      type: object
+      required: [keymaps_enabled, show_keymap_hints, sequence_timeout]
+      properties:
+        keymaps_enabled:
+          type: boolean
+          description: True when omitted
+        show_keymap_hints:
+          type: boolean
+          description: False when omitted (not part of the Pkl schema)
+        sequence_timeout:
+          type: number
+          format: double
+          description: Seconds to wait for the next key of a sequence; 1.0 when omitted
     SettingsResponse:
       type: object
       properties:

@@ -2,6 +2,8 @@ package config
 
 import (
 	"errors"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -765,17 +767,79 @@ func TestValidateKeymaps_UnknownAction(t *testing.T) {
 func TestValidateKeymaps_InvalidModifier(t *testing.T) {
 	km := &KeymapConfig{
 		GlobalSettings: KeymapGlobalSettings{SequenceTimeout: 1.0},
-		Keymaps:        []KeymapEntry{{Action: "next_email", Key: "j", Modifiers: []string{"alt"}}},
+		// "option" is what the macOS GUI calls Alt internally, but the
+		// schema only accepts "alt".
+		Keymaps: []KeymapEntry{{Action: "next_email", Key: "j", Modifiers: []string{"option"}}},
 	}
 	errs := ValidateKeymaps(km)
 	found := false
 	for _, e := range errs {
-		if strings.Contains(e.Message, "alt") {
+		if strings.Contains(e.Message, `"option"`) && e.Severity == "error" {
 			found = true
 		}
 	}
 	if !found {
 		t.Error("expected error for invalid modifier")
+	}
+}
+
+// The validator accepts exactly what schema/Keymaps.pkl accepts: the alt
+// modifier and the calendar context, with the calendar actions the GUI binds.
+func TestValidateKeymaps_AltAndCalendar(t *testing.T) {
+	km := &KeymapConfig{
+		GlobalSettings: KeymapGlobalSettings{KeymapsEnabled: true, SequenceTimeout: 1.0},
+		Keymaps: []KeymapEntry{
+			{Action: "go_calendar", Key: "gc", Sequence: true, Context: "list"},
+			{Action: "calendar_next_period", Key: "]", Modifiers: []string{"alt", "cmd"}, Context: "calendar"},
+		},
+	}
+	for _, action := range []string{
+		"calendar_today", "calendar_prev_period", "calendar_edit", "calendar_new",
+		"calendar_delete", "calendar_toggle_sidebar", "calendar_toggle_declined",
+		"calendar_prev_day", "calendar_next_day", "calendar_detail", "calendar_command",
+		"confirm_selection", "close_popup",
+	} {
+		km.Keymaps = append(km.Keymaps, KeymapEntry{Action: action, Key: action, Context: "calendar"})
+	}
+	if errs := ValidateKeymaps(km); len(errs) != 0 {
+		t.Errorf("unexpected issues: %v", errs)
+	}
+
+	// Unknown actions stay warnings, never errors.
+	km.Keymaps = []KeymapEntry{{Action: "calendar_teleport", Key: "x", Context: "calendar"}}
+	errs := ValidateKeymaps(km)
+	if len(errs) != 1 || errs[0].Severity != "warning" {
+		t.Errorf("unknown action: %v, want one warning", errs)
+	}
+}
+
+// The validator's modifier and context sets must match the unions in the
+// authoritative Pkl schema.
+func TestValidateKeymaps_MatchesSchema(t *testing.T) {
+	data, err := schemaFS.ReadFile("schema/Keymaps.pkl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(data)
+	union := func(field string) map[string]bool {
+		t.Helper()
+		i := strings.Index(src, field+":")
+		if i < 0 {
+			t.Fatalf("field %s not in schema", field)
+		}
+		line := src[i:]
+		line = line[:strings.Index(line, "\n")]
+		got := map[string]bool{}
+		for _, m := range regexp.MustCompile(`"([a-z_]+)"`).FindAllStringSubmatch(line, -1) {
+			got[m[1]] = true
+		}
+		return got
+	}
+	if got := union("modifiers"); !reflect.DeepEqual(got, validKeymapModifiers) {
+		t.Errorf("schema modifiers %v != validator %v", got, validKeymapModifiers)
+	}
+	if ctx := union("context"); !reflect.DeepEqual(ctx, validKeymapContexts) {
+		t.Errorf("schema contexts %v != validator %v", ctx, validKeymapContexts)
 	}
 }
 

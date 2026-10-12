@@ -59,6 +59,9 @@ type Handler struct {
 	// profilesPath is profiles.pkl next to the config serve runs with (empty:
 	// the default config directory).
 	profilesPath string
+	// keymapsPath is keymaps.pkl next to the config serve runs with (empty:
+	// the default config directory).
+	keymapsPath string
 }
 
 // New creates a Handler that reads from the SQLite store.

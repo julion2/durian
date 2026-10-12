@@ -186,6 +186,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	r.HandleFunc("/api/v1/messages/{message_id}/attachments/{part_id}", h.DownloadAttachmentHandler).Methods("GET")
 	r.HandleFunc("/api/v1/groups", h.ListGroupsHandler).Methods("GET")
 	r.HandleFunc("/api/v1/profiles", h.ProfilesHandler).Methods("GET")
+	r.HandleFunc("/api/v1/keymaps", h.KeymapsHandler).Methods("GET")
 	r.HandleFunc("/api/v1/contacts/search", h.SearchContactsHandler).Methods("GET")
 	r.HandleFunc("/api/v1/contacts/usage", h.IncrementContactUsageHandler).Methods("POST")
 	r.HandleFunc("/api/v1/contacts", h.ListContactsHandler).Methods("GET")
@@ -235,6 +236,11 @@ func runServe(cmd *cobra.Command, args []string) {
 	}
 
 	h.SetConfigPath(cfgFile)
+	// keymaps.pkl lives beside the config file in use (-c), like profiles.pkl;
+	// it does not depend on config.pkl loading.
+	if cfgFile != "" {
+		h.SetKeymapsPath(filepath.Join(filepath.Dir(config.ExpandPath(cfgFile)), "keymaps.pkl"))
+	}
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		slog.Warn("Could not load config", "module", "SERVE", "err", err)

@@ -9,10 +9,10 @@
 // supports_count   : accepts count prefix (e.g. "5j" = move down 5)
 // enabled = false  : disable a default binding
 // modifiers        : { "cmd" }, { "ctrl" }, { "shift" }, or omit for none
-// context          : "list" (default), "search", "tag_picker", "thread", "compose_normal"
+// context          : "list" (default), "search", "tag_picker", "thread", "compose_normal", "calendar"
 //
 // Examples:
-//   Override:  new { action = "archive"; key = "e" }          // rebind archive from "a" to "e"
+//   Add key:   new { action = "archive"; key = "e" }          // "a" remains; disable it separately
 //   Disable:   new { action = "delete"; key = "dd"; sequence = true; enabled = false }
 //   Add new:   new { action = "tag_op"; key = "T"; tags = "+todo -inbox" }
 

@@ -382,10 +382,34 @@ var (
 		"open_in_browser": "Open in browser", "copy_link": "Copy link",
 		"go_folder": "Go to folder by position", "next_folder": "Next folder",
 		"prev_folder": "Previous folder", "folder_picker": "Open folder picker",
+		"confirm_selection": "Confirm popup selection", "close_popup": "Close popup",
+		// Calendar (KeymapAction in macos/durian/Keymaps/KeymapTypes.swift)
+		"go_calendar": "Open calendar", "calendar_today": "Jump to today",
+		"calendar_prev_period": "Previous period", "calendar_next_period": "Next period",
+		"calendar_prev_day": "Previous day", "calendar_next_day": "Next day",
+		"calendar_edit": "Edit event", "calendar_new": "New event",
+		"calendar_delete": "Delete event", "calendar_detail": "Show event details",
+		"calendar_command":         "Open command line",
+		"calendar_toggle_sidebar":  "Toggle calendar sidebar",
+		"calendar_toggle_declined": "Toggle declined events",
+		// GPUI extensions use the same user format, not a second config file.
+		"toggle_focus_mode": "Toggle focus mode", "toggle_expand_all": "Expand/collapse messages",
+		"toggle_list_layout": "Toggle list layout", "toggle_sidebar": "Toggle sidebar",
+		"shortcut_help": "Keyboard shortcuts", "command_menu": "Command menu",
+		"preview_attachment": "Preview attachment", "event_from_thread": "Create event from thread",
+		"show_all_accounts": "All accounts", "show_account_1": "Account 1",
+		"show_account_2": "Account 2", "show_account_3": "Account 3",
+		"toggle_dark_mode": "Toggle dark mode", "system_appearance": "System appearance",
+		"calendar_view_day": "Day view", "calendar_view_week": "Week view",
+		"calendar_view_month": "Month view", "calendar_view_agenda": "Agenda view",
+		"calendar_duplicate": "Duplicate event",
 	}
-	validKeymapModifiers = map[string]bool{"cmd": true, "ctrl": true, "shift": true}
+	// validKeymapModifiers and validKeymapContexts mirror the KeymapEntry
+	// types in schema/Keymaps.pkl, which is authoritative.
+	validKeymapModifiers = map[string]bool{"cmd": true, "ctrl": true, "shift": true, "alt": true}
 	validKeymapContexts  = map[string]bool{
 		"list": true, "search": true, "tag_picker": true, "thread": true, "compose_normal": true,
+		"calendar": true,
 	}
 )
 
@@ -419,7 +443,7 @@ func ValidateKeymaps(keymaps *KeymapConfig) []ValidationError {
 
 		for _, mod := range entry.Modifiers {
 			if !validKeymapModifiers[mod] {
-				add(prefix+".modifiers", fmt.Sprintf("unknown modifier %q (valid: cmd, ctrl, shift)", mod))
+				add(prefix+".modifiers", fmt.Sprintf("unknown modifier %q (valid: cmd, ctrl, shift, alt)", mod))
 			}
 		}
 

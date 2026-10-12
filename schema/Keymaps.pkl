@@ -14,6 +14,6 @@ class KeymapEntry {
   enabled: Boolean = true
   sequence: Boolean = false
   supports_count: Boolean = false
-  context: "list"|"search"|"tag_picker"|"thread"|"compose_normal" = "list"
+  context: "list"|"search"|"tag_picker"|"thread"|"compose_normal"|"calendar" = "list"
   tags: String?
 }
