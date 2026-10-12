@@ -1,10 +1,11 @@
 // testseeder creates SQLite databases with test data for integration tests.
-// Usage: testseeder <email-db-path> <contacts-db-path> [reply-html-fixture]
+// Usage: testseeder [-list-rows N] [-list-body-bytes N] <email-db-path> <contacts-db-path> [reply-html-fixture]
 package main
 
 import (
 	"bytes"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -47,26 +48,30 @@ func testKeyring() *dbcrypto.Keyring {
 }
 
 func main() {
-	if len(os.Args) != 3 && len(os.Args) != 4 {
-		fmt.Fprintln(os.Stderr, "usage: testseeder <email-db-path> <contacts-db-path> [reply-html-fixture]")
+	listRows := flag.Int("list-rows", 0, "additional inbox threads for native preview/paging tests")
+	listBodyBytes := flag.Int("list-body-bytes", 0, "minimum body bytes in each additional preview thread")
+	flag.Parse()
+	args := flag.Args()
+	if (len(args) != 2 && len(args) != 3) || *listRows < 0 || *listBodyBytes < 0 {
+		fmt.Fprintln(os.Stderr, "usage: testseeder [-list-rows N] [-list-body-bytes N] <email-db-path> <contacts-db-path> [reply-html-fixture]")
 		os.Exit(1)
 	}
 
 	var replyHTML string
-	if len(os.Args) == 4 {
-		data, err := os.ReadFile(os.Args[3])
+	if len(args) == 3 {
+		data, err := os.ReadFile(args[2])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "html fixture: %v\n", err)
 			os.Exit(1)
 		}
 		replyHTML = string(data)
 	}
-	if err := seedEmailDB(os.Args[1], replyHTML); err != nil {
+	if err := seedEmailDB(args[0], replyHTML, *listRows, *listBodyBytes); err != nil {
 		fmt.Fprintf(os.Stderr, "email db: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := seedContactsDB(os.Args[2]); err != nil {
+	if err := seedContactsDB(args[1]); err != nil {
 		fmt.Fprintf(os.Stderr, "contacts db: %v\n", err)
 		os.Exit(1)
 	}
@@ -74,7 +79,7 @@ func main() {
 	fmt.Println("Seeded test databases successfully")
 }
 
-func seedEmailDB(path, replyHTML string) error {
+func seedEmailDB(path, replyHTML string, listRows, listBodyBytes int) error {
 	db, err := store.Open(path, testKeyring())
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
@@ -155,7 +160,26 @@ func seedEmailDB(path, replyHTML string) error {
 		}
 	}
 
-	fmt.Printf("  email.db: %d messages at %s\n", len(msgs), path) // encgrep:allow filename, not PII
+	for i := 1; i <= listRows; i++ {
+		msg := &store.Message{
+			MessageID: fmt.Sprintf("preview-%03d@test", i), Subject: fmt.Sprintf("Preview row %03d", i),
+			FromAddr: "sender@example.com", ToAddrs: "alice@example.com", Account: "test",
+			Date: now - int64(i+1000)*60, CreatedAt: now, Mailbox: "INBOX", FetchedBody: true,
+			BodyText: fmt.Sprintf("Snippetnumber %03d is visible without opening this message.", i),
+		}
+		if padding := listBodyBytes - len(msg.BodyText); padding > 0 {
+			const filler = "Long message content. "
+			msg.BodyText += "\n" + strings.Repeat(filler, (padding+len(filler)-2)/len(filler))
+		}
+		if err := db.InsertMessage(msg); err != nil {
+			return fmt.Errorf("insert preview row: %w", err)
+		}
+		if err := db.AddTag(msg.ID, "inbox"); err != nil {
+			return fmt.Errorf("tag preview row: %w", err)
+		}
+	}
+
+	fmt.Printf("  email.db: %d messages at %s\n", len(msgs)+listRows, path) // encgrep:allow filename, not PII
 	return nil
 }
 

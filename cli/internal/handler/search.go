@@ -5,7 +5,6 @@ import (
 
 	"github.com/julion2/durian/cli/internal/mail"
 	"github.com/julion2/durian/cli/internal/protocol"
-	"github.com/julion2/durian/cli/internal/store"
 )
 
 // Search handles the "search" command.
@@ -43,39 +42,28 @@ func (h *Handler) Search(query string, limit int, enrichLimit int) protocol.Resp
 		return protocol.SuccessWithResults(mails)
 	}
 
-	// Enrich threads from store — collect all messages first, then batch-fetch
-	// tags and attachments to avoid per-message N+1 queries.
-	type threadMsgs struct {
-		threadID string
-		msgs     []*store.Message
+	// Batch the light conversations as well as their metadata. A corrupt body
+	// is a failed search, not a successful page with silently missing previews.
+	threadIDs := make([]string, min(len(results), enrichLimit))
+	for i := range threadIDs {
+		threadIDs[i] = results[i].Thread
 	}
-	var enriched []threadMsgs
+	enriched, err := h.store.GetThreadPreviews(threadIDs)
+	if err != nil {
+		return protocol.Fail(protocol.ErrBackendError, err)
+	}
 	var allMsgIDs []int64
-	for i, r := range results {
-		if i >= enrichLimit {
-			break
-		}
-		msgs, err := h.store.GetByThread(r.Thread)
-		if err != nil || len(msgs) == 0 {
-			continue
-		}
-		enriched = append(enriched, threadMsgs{r.Thread, msgs})
-		for _, m := range msgs {
-			allMsgIDs = append(allMsgIDs, m.ID)
-		}
+	for _, msgs := range enriched {
+		allMsgIDs = append(allMsgIDs, threadMessageRowIDs(msgs)...)
 	}
 
 	tagMap, _ := h.store.GetMessageTagsBatch(allMsgIDs)
 	attMap, _ := h.store.GetAttachmentsByMessages(allMsgIDs)
-	var allMessageRowIDs []int64
-	for _, e := range enriched {
-		allMessageRowIDs = append(allMessageRowIDs, threadMessageRowIDs(e.msgs)...)
-	}
-	headerMap, _ := h.store.HeadersByMessageDBIDs(allMessageRowIDs)
+	headerMap, _ := h.store.HeadersByMessageDBIDs(allMsgIDs)
 
 	threads := make(map[string]*mail.ThreadContent, len(enriched))
-	for _, e := range enriched {
-		threads[e.threadID] = h.convertThreadWithHeaders(e.threadID, e.msgs, true, tagMap, attMap, headerMap)
+	for id, msgs := range enriched {
+		threads[id] = h.convertThreadWithHeaders(id, msgs, true, tagMap, attMap, headerMap)
 	}
 
 	return protocol.SuccessWithResultsAndThreads(mails, threads)

@@ -707,6 +707,41 @@ func (d *DB) GetByThread(threadID string) ([]*Message, error) {
 		return nil, err
 	}
 
+	return deduplicateThreadMessages(all), nil
+}
+
+// GetThreadPreviews reads a search page's conversations together. HTML and Bcc
+// are not part of the light search response: do not read/decrypt their blobs
+// only to discard them. All other fields and thread identity rules match
+// GetByThread; full message content still comes from that method on open.
+func (d *DB) GetThreadPreviews(threadIDs []string) (map[string][]*Message, error) {
+	threads := make(map[string][]*Message, len(threadIDs))
+	if len(threadIDs) == 0 {
+		return threads, nil
+	}
+	columns := strings.NewReplacer("m.body_html_ct", "NULL", "m.bcc_ct", "NULL").Replace(messageSelectColumns)
+	rows, err := d.db.Query(`SELECT `+columns+`
+		`+messageSelectFrom+`
+		WHERE m.thread_id IN (SELECT value FROM json_each(?))
+		ORDER BY m.thread_id, m.date ASC`, sqlIDArray(threadIDs))
+	if err != nil {
+		return nil, fmt.Errorf("get thread previews: %w", err)
+	}
+	defer rows.Close()
+	all, err := d.scanMessages(rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, msg := range all {
+		threads[msg.ThreadID] = append(threads[msg.ThreadID], msg)
+	}
+	for id, msgs := range threads {
+		threads[id] = deduplicateThreadMessages(msgs)
+	}
+	return threads, nil
+}
+
+func deduplicateThreadMessages(all []*Message) []*Message {
 	seenAccount := make(map[string]string, len(all))
 	deduped := make([]*Message, 0, len(all))
 	for _, msg := range all {
@@ -720,7 +755,7 @@ func (d *DB) GetByThread(threadID string) ([]*Message, error) {
 		seenAccount[msg.MessageID] = msg.Account
 		deduped = append(deduped, msg)
 	}
-	return deduped, nil
+	return deduped
 }
 
 // GetAllByThread retrieves all messages in a thread without deduplication.

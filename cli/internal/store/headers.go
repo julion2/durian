@@ -3,7 +3,6 @@ package store
 import (
 	"fmt"
 	"net/textproto"
-	"strings"
 )
 
 // InsertHeader stores a message header. Overwrites if it already exists.
@@ -166,15 +165,9 @@ func (d *DB) HeadersByMessageDBIDs(ids []int64) (map[int64]map[string][]string, 
 	if len(ids) == 0 {
 		return map[int64]map[string][]string{}, nil
 	}
-	placeholders := make([]string, len(ids))
-	params := make([]any, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		params[i] = id
-	}
-	q := "SELECT message_id, name, value_ct FROM message_headers WHERE message_id IN (" +
-		strings.Join(placeholders, ",") + ")"
-	rows, err := d.db.Query(q, params...)
+	q := `SELECT message_id, name, value_ct FROM message_headers
+		WHERE message_id IN (SELECT value FROM json_each(?))`
+	rows, err := d.db.Query(q, sqlIDArray(ids))
 	if err != nil {
 		return nil, fmt.Errorf("query headers: %w", err)
 	}

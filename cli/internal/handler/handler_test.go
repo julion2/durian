@@ -344,17 +344,75 @@ func TestStoreSearchWithEnrichment(t *testing.T) {
 	db := newTestStore(t)
 	seedStoreData(t, db)
 
+	// Several pages, with different bodies so a mixed-up batch cannot pass.
+	for i := 0; i < 210; i++ {
+		label := strconv.Itoa(i)
+		msg := &store.Message{
+			MessageID: "page-" + label + "@test", Subject: "Page " + label,
+			FromAddr: "page@example.com", ToAddrs: "reader@example.com",
+			BCCAddrs: "blind@example.com", Date: int64(i + 1), CreatedAt: int64(i + 1),
+			BodyText: "Body " + label, BodyHTML: "<p>HTML " + label + "</p>",
+			Account: "work", Mailbox: "INBOX", FetchedBody: true,
+		}
+		if err := db.InsertMessage(msg); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.AddTag(msg.ID, "inbox"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := db.GetByMessageID("msg1@test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertAttachment(&store.Attachment{MessageDBID: root.ID, PartID: 2, Filename: "notes.txt", ContentType: "text/plain", Size: 17}); err != nil {
+		t.Fatal(err)
+	}
 	h := New(db, nil)
-	resp := h.Search("tag:inbox", 10, 5)
-
-	if !resp.OK {
-		t.Fatalf("Search failed: %s", resp.Error)
+	for _, limit := range []int{1, 50, 100, 200, 250} {
+		for _, enrich := range []int{0, 1, limit} {
+			resp := h.Search("tag:inbox", limit, enrich)
+			if !resp.OK || len(resp.Results) != min(212, limit) || len(resp.Threads) != min(212, enrich) {
+				t.Fatalf("limit=%d enrich=%d: results=%d threads=%d error=%s", limit, enrich, len(resp.Results), len(resp.Threads), resp.Error)
+			}
+			for _, row := range resp.Results[:min(len(resp.Results), enrich)] {
+				thread := resp.Threads[row.ThreadID]
+				if thread == nil || len(thread.Messages) == 0 {
+					t.Fatalf("missing preview for %s", row.Subject)
+				}
+				want := "Body " + strings.TrimPrefix(row.Subject, "Page ")
+				switch row.Subject {
+				case "Hello World", "Re: Hello World":
+					want = "Reply body"
+					if len(thread.Messages) != 2 || thread.Messages[1].Body != "First message body" ||
+						!slices.Contains(thread.Messages[1].Tags, "unread") || len(thread.Messages[1].Attachments) != 1 ||
+						thread.Messages[1].Attachments[0].Filename != "notes.txt" {
+						t.Fatalf("incomplete conversation: %+v", thread)
+					}
+				case "Other Thread":
+					want = "Different thread"
+				}
+				if thread.Messages[0].Body != want {
+					t.Fatalf("%s body=%q, want %q", row.Subject, thread.Messages[0].Body, want)
+				}
+				for _, msg := range thread.Messages {
+					if msg.HTML != "" || msg.BCC != "" || msg.InReplyTo != "" || msg.References != "" {
+						t.Fatalf("light response leaked full-only fields: %+v", msg)
+					}
+					if !slices.Contains(msg.Tags, "inbox") {
+						t.Fatalf("message lost tags: %+v", msg)
+					}
+				}
+			}
+		}
 	}
-	if len(resp.Results) == 0 {
-		t.Fatal("expected results")
+	full, err := db.GetByMessageID("page-209@test")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(resp.Threads) == 0 {
-		t.Error("expected enriched threads")
+	opened := h.ShowThread(full.ThreadID)
+	if !opened.OK || opened.Thread.Messages[0].HTML != "<p>HTML 209</p>" || opened.Thread.Messages[0].BCC != "blind@example.com" {
+		t.Fatalf("opening after preview lost full content: %+v", opened)
 	}
 }
 

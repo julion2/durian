@@ -39,6 +39,46 @@ func TestAddAndGetTags(t *testing.T) {
 	}
 }
 
+// Enriched prefixes can contain more message IDs than SQLite's variable limit.
+// Neither tags nor reaction headers may disappear as the user pages further.
+func TestPreviewMetadataLargeBatch(t *testing.T) {
+	db := newTestDB(t)
+	first := insertTestMessage(t, db, "preview-first@x")
+	second := insertTestMessage(t, db, "preview-second@x")
+	other := insertTestMessage(t, db, "preview-outside@x")
+	for _, item := range []struct {
+		id  int64
+		tag string
+	}{{first, "inbox"}, {second, "sent"}, {other, "outside"}} {
+		if err := db.AddTag(item.id, item.tag); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.InsertHeader(item.id, "reply-to", item.tag+"@example.com"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := make([]int64, 33000)
+	for i := range ids {
+		ids[i] = int64(100 + i)
+	}
+	ids[0], ids[1] = first, second
+	for _, input := range [][]int64{ids[:2], ids, nil} {
+		want := min(len(input), 2)
+		tags, err := db.GetMessageTagsBatch(input)
+		if err != nil {
+			t.Errorf("%d tag IDs: %v", len(input), err)
+		} else if len(tags) != want || (want > 0 && (!slices.Equal(tags[first], []string{"inbox"}) || !slices.Equal(tags[second], []string{"sent"}))) {
+			t.Errorf("%d tag IDs: incorrect scoped tags %v", len(input), tags)
+		}
+		headers, err := db.HeadersByMessageDBIDs(input)
+		if err != nil {
+			t.Errorf("%d header IDs: %v", len(input), err)
+		} else if len(headers) != want || (want > 0 && (!slices.Equal(headers[first]["Reply-To"], []string{"inbox@example.com"}) || !slices.Equal(headers[second]["Reply-To"], []string{"sent@example.com"}))) {
+			t.Errorf("%d header IDs: incorrect scoped headers %v", len(input), headers)
+		}
+	}
+}
+
 func TestAddTag_Duplicate(t *testing.T) {
 	db := newTestDB(t)
 	id := insertTestMessage(t, db, "dup-tag@x")

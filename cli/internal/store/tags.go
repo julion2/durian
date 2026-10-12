@@ -358,17 +358,10 @@ func (d *DB) GetMessageTagsBatch(ids []int64) (map[int64][]string, error) {
 		return make(map[int64][]string), nil
 	}
 
-	placeholders := make([]string, len(ids))
-	params := make([]interface{}, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		params[i] = id
-	}
+	q := `SELECT message_id, tag FROM tags
+		WHERE message_id IN (SELECT value FROM json_each(?)) ORDER BY message_id, tag`
 
-	q := "SELECT message_id, tag FROM tags WHERE message_id IN (" +
-		strings.Join(placeholders, ",") + ") ORDER BY message_id, tag"
-
-	rows, err := d.db.Query(q, params...)
+	rows, err := d.db.Query(q, sqlIDArray(ids))
 	if err != nil {
 		return nil, fmt.Errorf("get tags batch: %w", err)
 	}
