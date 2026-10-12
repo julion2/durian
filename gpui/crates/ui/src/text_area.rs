@@ -8,17 +8,38 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Style, TextRun, UTF16Selection, Window,
-    WrappedLine, actions, div, fill, point, prelude::*, px, relative, size,
+    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Style, TextRun,
+    UTF16Selection, Window, WrappedLine, actions, div, fill, point, prelude::*, px, relative, size,
 };
-use unicode_segmentation::*;
 
+use crate::editing::{Direction, Editor, Selection};
 use crate::theme::ActiveTheme;
 use crate::{Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft, SelectRight};
 
-actions!(text_area, [Up, Down, SelectUp, SelectDown, Newline, Submit, Cancel, Bold, Italic, InlineCode]);
+actions!(
+    text_area,
+    [
+        Up,
+        Down,
+        SelectUp,
+        SelectDown,
+        Newline,
+        Submit,
+        Cancel,
+        Bold,
+        Italic,
+        InlineCode,
+        Undo,
+        Redo,
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        DeleteWordLeft,
+        DeleteWordRight
+    ]
+);
 
 const CONTEXT: &str = "TextArea";
 
@@ -35,6 +56,26 @@ pub fn bind_text_area_keys(cx: &mut App) {
         KeyBinding::new("cmd-b", Bold, Some(CONTEXT)),
         KeyBinding::new("cmd-i", Italic, Some(CONTEXT)),
         KeyBinding::new("cmd-e", InlineCode, Some(CONTEXT)),
+        KeyBinding::new("cmd-z", Undo, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-z", Redo, Some(CONTEXT)),
+    ]);
+    #[cfg(target_os = "macos")]
+    let word = "alt";
+    #[cfg(not(target_os = "macos"))]
+    let word = "ctrl";
+    cx.bind_keys([
+        KeyBinding::new(&format!("{word}-left"), WordLeft, Some(CONTEXT)),
+        KeyBinding::new(&format!("{word}-right"), WordRight, Some(CONTEXT)),
+        KeyBinding::new(&format!("{word}-shift-left"), SelectWordLeft, Some(CONTEXT)),
+        KeyBinding::new(&format!("{word}-shift-right"), SelectWordRight, Some(CONTEXT)),
+        KeyBinding::new(&format!("{word}-backspace"), DeleteWordLeft, Some(CONTEXT)),
+        KeyBinding::new(&format!("{word}-delete"), DeleteWordRight, Some(CONTEXT)),
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([
+        KeyBinding::new("ctrl-z", Undo, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-z", Redo, Some(CONTEXT)),
+        KeyBinding::new("ctrl-y", Redo, Some(CONTEXT)),
     ]);
 }
 
@@ -73,11 +114,8 @@ impl Layout {
 
 pub struct TextArea {
     focus_handle: FocusHandle,
-    content: SharedString,
+    editor: Editor,
     placeholder: SharedString,
-    selected_range: Range<usize>,
-    selection_reversed: bool,
-    marked_range: Option<Range<usize>>,
     min_lines: usize,
     layout: Rc<RefCell<Layout>>,
     is_selecting: bool,
@@ -93,11 +131,8 @@ impl TextArea {
     pub fn new(placeholder: impl Into<SharedString>, min_lines: usize, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            content: SharedString::default(),
+            editor: Editor::default(),
             placeholder: placeholder.into(),
-            selected_range: 0..0,
-            selection_reversed: false,
-            marked_range: None,
             min_lines,
             layout: Rc::default(),
             is_selecting: false,
@@ -114,8 +149,9 @@ impl TextArea {
     /// Cmd-B / Cmd-I / Cmd-E: wrap the selection in `marker`, or unwrap if it's already wrapped.
     /// With no selection, insert a pair and put the cursor between.
     pub fn toggle_wrap(&mut self, marker: &str, cx: &mut Context<Self>) {
-        let range = self.selected_range.clone();
-        let (m, text) = (marker.len(), self.content.to_string());
+        let range = self.editor.selection().range();
+        let reversed = self.editor.selection().head < self.editor.selection().anchor;
+        let (m, text) = (marker.len(), self.editor.text().to_string());
         let wrapped = range.start >= m && text[range.end..].starts_with(marker) && text[..range.start].ends_with(marker);
         let (new, selection) = if wrapped {
             let new = format!("{}{}{}", &text[..range.start - m], &text[range.clone()], &text[range.end + m..]);
@@ -124,73 +160,63 @@ impl TextArea {
             let new = format!("{}{marker}{}{marker}{}", &text[..range.start], &text[range.clone()], &text[range.end..]);
             (new, range.start + m..range.end + m)
         };
-        self.content = new.into();
-        self.selected_range = selection;
-        cx.emit(TextAreaEvent::Changed);
-        cx.notify();
+        let changed = self.editor.replace(0..text.len(), &new);
+        let (anchor, head) = if reversed { (selection.end, selection.start) } else { (selection.start, selection.end) };
+        self.editor.select(Selection { anchor, head });
+        self.edited(changed, cx);
     }
 
     /// Toolbar: toggle a block prefix ("- ", "> ", "1. ") on the cursor's line.
     pub fn toggle_line_prefix(&mut self, prefix: &str, cx: &mut Context<Self>) {
         let cursor = self.cursor_offset();
-        let start = self.content[..cursor].rfind('\n').map_or(0, |i| i + 1);
-        let text = self.content.to_string();
+        let start = self.editor.text()[..cursor].rfind('\n').map_or(0, |i| i + 1);
+        let text = self.editor.text().to_string();
         let (new, delta): (String, isize) = if text[start..].starts_with(prefix) {
             (format!("{}{}", &text[..start], &text[start + prefix.len()..]), -(prefix.len() as isize))
         } else {
             (format!("{}{prefix}{}", &text[..start], &text[start..]), prefix.len() as isize)
         };
-        self.content = new.into();
+        let changed = self.editor.replace(0..text.len(), &new);
         let at = (cursor as isize + delta).max(start as isize) as usize;
-        self.selected_range = at..at;
-        cx.emit(TextAreaEvent::Changed);
-        cx.notify();
+        self.editor.move_to(at, false);
+        self.edited(changed, cx);
     }
 
     pub fn text(&self) -> &SharedString {
-        &self.content
+        self.editor.committed_text()
     }
 
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.content = text.into();
-        self.selected_range = self.content.len()..self.content.len();
+        self.editor.reset(text.into());
+        self.goal_x = None;
         cx.emit(TextAreaEvent::Changed);
         cx.notify();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.content.trim().is_empty()
+        self.text().trim().is_empty()
     }
 
     fn cursor_offset(&self) -> usize {
-        if self.selection_reversed { self.selected_range.start } else { self.selected_range.end }
+        self.editor.selection().head
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        self.selected_range = offset..offset;
-        self.selection_reversed = false;
+        self.editor.move_to(offset, false);
         cx.notify();
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        if self.selection_reversed {
-            self.selected_range.start = offset
-        } else {
-            self.selected_range.end = offset
-        }
-        if self.selected_range.end < self.selected_range.start {
-            self.selection_reversed = !self.selection_reversed;
-            self.selected_range = self.selected_range.end..self.selected_range.start;
-        }
+        self.editor.move_to(offset, true);
         cx.notify();
     }
 
-    fn previous_boundary(&self, offset: usize) -> usize {
-        self.content.grapheme_indices(true).rev().find_map(|(ix, _)| (ix < offset).then_some(ix)).unwrap_or(0)
-    }
-
-    fn next_boundary(&self, offset: usize) -> usize {
-        self.content.grapheme_indices(true).find_map(|(ix, _)| (ix > offset).then_some(ix)).unwrap_or(self.content.len())
+    fn edited(&mut self, changed: bool, cx: &mut Context<Self>) {
+        self.goal_x = None;
+        if changed {
+            cx.emit(TextAreaEvent::Changed);
+        }
+        cx.notify();
     }
 
     /// Position of a byte offset relative to the text origin.
@@ -210,7 +236,7 @@ impl TextArea {
         };
         let local = point(position.x, (position.y - para.top).max(px(0.)));
         let ix = para.line.closest_index_for_position(local, layout.line_height).unwrap_or_else(|ix| ix);
-        layout.source(para.start + ix).min(self.content.len())
+        layout.source(para.start + ix).min(self.editor.text().len())
     }
 
     fn vertical(&mut self, lines: f32, select: bool, cx: &mut Context<Self>) {
@@ -218,13 +244,13 @@ impl TextArea {
         let Some(pos) = self.position_for(self.cursor_offset()) else { return };
         let x = *self.goal_x.get_or_insert(pos.x);
         let target = point(x, pos.y + line_height * lines + line_height / 2.);
-        let offset = if target.y < px(0.) {
-            0
-        } else {
-            self.offset_for(target)
-        };
+        let offset = if target.y < px(0.) { 0 } else { self.offset_for(target) };
         let goal = self.goal_x;
-        if select { self.select_to(offset, cx) } else { self.move_to(offset, cx) }
+        if select {
+            self.select_to(offset, cx)
+        } else {
+            self.move_to(offset, cx)
+        }
         self.goal_x = goal;
     }
 
@@ -243,58 +269,88 @@ impl TextArea {
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         self.goal_x = None;
-        if self.selected_range.is_empty() {
-            self.move_to(self.previous_boundary(self.cursor_offset()), cx);
+        let range = self.editor.selection().range();
+        if range.is_empty() {
+            self.move_to(self.editor.boundary(Direction::Backward, false), cx);
         } else {
-            self.move_to(self.selected_range.start, cx)
+            self.move_to(range.start, cx)
         }
     }
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
         self.goal_x = None;
-        if self.selected_range.is_empty() {
-            self.move_to(self.next_boundary(self.selected_range.end), cx);
+        let range = self.editor.selection().range();
+        if range.is_empty() {
+            self.move_to(self.editor.boundary(Direction::Forward, false), cx);
         } else {
-            self.move_to(self.selected_range.end, cx)
+            self.move_to(range.end, cx)
         }
     }
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.previous_boundary(self.cursor_offset()), cx);
+        self.select_to(self.editor.boundary(Direction::Backward, false), cx);
     }
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.next_boundary(self.cursor_offset()), cx);
+        self.select_to(self.editor.boundary(Direction::Forward, false), cx);
     }
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(0, cx);
-        self.select_to(self.content.len(), cx)
+        self.select_to(self.editor.text().len(), cx)
     }
     /// Home/End work on the current paragraph.
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        let start = self.content[..self.cursor_offset()].rfind('\n').map_or(0, |i| i + 1);
+        let start = self.editor.text()[..self.cursor_offset()].rfind('\n').map_or(0, |i| i + 1);
         self.move_to(start, cx);
     }
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
         let cursor = self.cursor_offset();
-        let end = self.content[cursor..].find('\n').map_or(self.content.len(), |i| cursor + i);
+        let end = self.editor.text()[cursor..].find('\n').map_or(self.editor.text().len(), |i| cursor + i);
         self.move_to(end, cx);
     }
-    fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            self.select_to(self.previous_boundary(self.cursor_offset()), cx)
-        }
-        self.replace_text_in_range(None, "", window, cx)
+    fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        let changed = self.editor.delete(Direction::Backward, false);
+        self.edited(changed, cx);
     }
-    fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            self.select_to(self.next_boundary(self.cursor_offset()), cx)
-        }
-        self.replace_text_in_range(None, "", window, cx)
+    fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        let changed = self.editor.delete(Direction::Forward, false);
+        self.edited(changed, cx);
+    }
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        let changed = self.editor.undo();
+        self.edited(changed, cx);
+    }
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        let changed = self.editor.redo();
+        self.edited(changed, cx);
+    }
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.goal_x = None;
+        self.move_to(self.editor.boundary(Direction::Backward, true), cx);
+    }
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.goal_x = None;
+        self.move_to(self.editor.boundary(Direction::Forward, true), cx);
+    }
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.goal_x = None;
+        self.select_to(self.editor.boundary(Direction::Backward, true), cx);
+    }
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.goal_x = None;
+        self.select_to(self.editor.boundary(Direction::Forward, true), cx);
+    }
+    fn delete_word_left(&mut self, _: &DeleteWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let changed = self.editor.delete(Direction::Backward, true);
+        self.edited(changed, cx);
+    }
+    fn delete_word_right(&mut self, _: &DeleteWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let changed = self.editor.delete(Direction::Forward, true);
+        self.edited(changed, cx);
     }
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
-        if self.markdown && self.selected_range.is_empty() {
+        if self.markdown && self.editor.selection().range().is_empty() {
             // lists and quotes continue; Enter on an empty item ends the list
             let cursor = self.cursor_offset();
-            let start = self.content[..cursor].rfind('\n').map_or(0, |i| i + 1);
-            let line = self.content[start..cursor].to_string();
+            let start = self.editor.text()[..cursor].rfind('\n').map_or(0, |i| i + 1);
+            let line = self.editor.text()[start..cursor].to_string();
             let digits = line.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
             let prefix = if let Some(p) = ["- ", "* ", "> "].into_iter().find(|p| line.starts_with(p)) {
                 Some((p.to_string(), p.to_string()))
@@ -306,8 +362,8 @@ impl TextArea {
             };
             if let Some((current, next)) = prefix {
                 if line == current {
-                    self.selected_range = start..cursor;
-                    return self.replace_text_in_range(None, "", window, cx);
+                    let changed = self.editor.replace(start..cursor, "");
+                    return self.edited(changed, cx);
                 }
                 return self.replace_text_in_range(None, &format!("\n{next}"), window, cx);
             }
@@ -330,6 +386,8 @@ impl TextArea {
         }
     }
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
+        let changed = self.editor.finish_composition();
+        self.edited(changed, cx);
         cx.emit(TextAreaEvent::Submit);
     }
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
@@ -341,13 +399,15 @@ impl TextArea {
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.content[self.selected_range.clone()].to_string()));
+        let range = self.editor.selection().range();
+        if !range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(self.editor.text()[range].to_string()));
         }
     }
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.content[self.selected_range.clone()].to_string()));
+        let range = self.editor.selection().range();
+        if !range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(self.editor.text()[range].to_string()));
             self.replace_text_in_range(None, "", window, cx)
         }
     }
@@ -374,70 +434,33 @@ impl TextArea {
             self.select_to(self.offset_for(event.position - origin), cx);
         }
     }
-
-    // UTF-16 <-> UTF-8 conversions for the platform input handler (IME)
-    fn offset_from_utf16(&self, offset: usize) -> usize {
-        let (mut utf8, mut utf16) = (0, 0);
-        for ch in self.content.chars() {
-            if utf16 >= offset {
-                break;
-            }
-            utf16 += ch.len_utf16();
-            utf8 += ch.len_utf8();
-        }
-        utf8
-    }
-    fn offset_to_utf16(&self, offset: usize) -> usize {
-        let (mut utf16, mut utf8) = (0, 0);
-        for ch in self.content.chars() {
-            if utf8 >= offset {
-                break;
-            }
-            utf8 += ch.len_utf8();
-            utf16 += ch.len_utf16();
-        }
-        utf16
-    }
-    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
-    }
-    fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
-    }
 }
 
 impl EntityInputHandler for TextArea {
     fn text_for_range(&mut self, range_utf16: Range<usize>, actual: &mut Option<Range<usize>>, _: &mut Window, _: &mut Context<Self>) -> Option<String> {
-        let range = self.range_from_utf16(&range_utf16);
-        actual.replace(self.range_to_utf16(&range));
-        Some(self.content[range].to_string())
+        let range = self.editor.range_from_utf16(range_utf16);
+        let text = self.editor.text().get(range.clone())?.to_string();
+        actual.replace(self.editor.range_to_utf16(range));
+        Some(text)
     }
 
     fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
-        Some(UTF16Selection { range: self.range_to_utf16(&self.selected_range), reversed: self.selection_reversed })
+        let selection = self.editor.selection();
+        Some(UTF16Selection { range: self.editor.range_to_utf16(selection.range()), reversed: selection.head < selection.anchor })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked_range.as_ref().map(|r| self.range_to_utf16(r))
+        self.editor.marked().map(|r| self.editor.range_to_utf16(r))
     }
 
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
-        self.marked_range = None;
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let changed = self.editor.finish_composition();
+        self.edited(changed, cx);
     }
 
     fn replace_text_in_range(&mut self, range_utf16: Option<Range<usize>>, new_text: &str, _: &mut Window, cx: &mut Context<Self>) {
-        let range = range_utf16
-            .as_ref()
-            .map(|r| self.range_from_utf16(r))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
-        self.content = (self.content[..range.start].to_owned() + new_text + &self.content[range.end..]).into();
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
-        self.selection_reversed = false;
-        self.marked_range = None;
-        self.goal_x = None;
-        cx.emit(TextAreaEvent::Changed);
-        cx.notify();
+        let changed = self.editor.input(range_utf16, new_text);
+        self.edited(changed, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -448,23 +471,13 @@ impl EntityInputHandler for TextArea {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|r| self.range_from_utf16(r))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
-        self.content = (self.content[..range.start].to_owned() + new_text + &self.content[range.end..]).into();
-        self.marked_range = (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|r| self.range_from_utf16(r))
-            .map(|r| r.start + range.start..r.end + range.start)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.editor.preedit(range_utf16, new_text, new_selected_range_utf16);
+        self.goal_x = None;
         cx.notify();
     }
 
     fn bounds_for_range(&mut self, range_utf16: Range<usize>, bounds: Bounds<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<Bounds<Pixels>> {
-        let range = self.range_from_utf16(&range_utf16);
+        let range = self.editor.range_from_utf16(range_utf16);
         let line_height = self.layout.borrow().line_height;
         let start = self.position_for(range.start)?;
         let end = self.position_for(range.end)?;
@@ -473,7 +486,8 @@ impl EntityInputHandler for TextArea {
 
     fn character_index_for_point(&mut self, point: Point<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
         let origin = self.text_origin()?;
-        Some(self.offset_to_utf16(self.offset_for(point - origin)))
+        let at = self.offset_for(point - origin);
+        self.editor.text().is_char_boundary(at).then(|| self.editor.range_to_utf16(at..at).start)
     }
 }
 
@@ -482,9 +496,8 @@ fn shape(text: &SharedString, width: Pixels, window: &Window, color: gpui::Hsla,
     let style = window.text_style();
     let font_size = style.font_size.to_pixels(window.rem_size());
     let line_height = window.line_height();
-    let runs = runs.unwrap_or_else(|| {
-        vec![TextRun { len: text.len(), font: style.font(), color, background_color: None, underline: None, strikethrough: None }]
-    });
+    let runs =
+        runs.unwrap_or_else(|| vec![TextRun { len: text.len(), font: style.font(), color, background_color: None, underline: None, strikethrough: None }]);
     let lines = window.text_system().shape_text(text.clone(), font_size, &runs, Some(width), None).unwrap_or_default();
     let (mut start, mut top) = (0, px(0.));
     let paragraphs = lines
@@ -524,13 +537,13 @@ impl Element for TextAreaElement {
 
     fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&gpui::InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
         let input = self.input.read(cx);
-        let text = if input.content.is_empty() {
+        let text = if input.editor.text().is_empty() {
             input.placeholder.clone()
         } else if input.markdown {
             let family = window.text_style().font_family.clone();
-            crate::markdown::live(&input.content, Some(input.cursor_offset()), &family, cx.theme()).display
+            crate::markdown::live(input.editor.text(), Some(input.cursor_offset()), &family, cx.theme()).display
         } else {
-            input.content.clone()
+            input.editor.text().clone()
         };
         let min_height = window.line_height() * input.min_lines as f32;
         let mut style = Style::default();
@@ -547,13 +560,21 @@ impl Element for TextAreaElement {
         (layout_id, ())
     }
 
-    fn prepaint(&mut self, _: Option<&GlobalElementId>, _: Option<&gpui::InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), window: &mut Window, cx: &mut App) -> Self::PrepaintState {
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
         let theme = cx.theme().clone();
         let input = self.input.read(cx);
-        let empty = input.content.is_empty();
-        let text = if empty { input.placeholder.clone() } else { input.content.clone() };
+        let empty = input.editor.text().is_empty();
+        let text = if empty { input.placeholder.clone() } else { input.editor.text().clone() };
         let color = if empty { theme.text_placeholder } else { window.text_style().color };
-        let selected = input.selected_range.clone();
+        let selected = input.editor.selection().range();
         let cursor = input.cursor_offset();
         // live Markdown: shape what the user sees, keep maps back to the source
         let (text, runs, to_display, to_source) = if input.markdown && !empty {
@@ -589,7 +610,16 @@ impl Element for TextAreaElement {
         (rects, None)
     }
 
-    fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&gpui::InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), prepaint: &mut Self::PrepaintState, window: &mut Window, cx: &mut App) {
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let focus_handle = self.input.read(cx).focus_handle.clone();
         window.handle_input(&focus_handle, ElementInputHandler::new(bounds, self.input.clone()), cx);
         let layout = self.input.read(cx).layout.clone();
@@ -641,6 +671,14 @@ impl Render for TextArea {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

@@ -159,10 +159,21 @@ mechanism. They cannot shadow a Swift key or sequence prefix. Native macOS key-e
 acceptance remains separate from the Linux tests below.
 
 Compose modal editing is deliberately not tied to a Vim engine yet. Key-sequence dispatch
-and selection/actions remain separate; a later editor design must allow selection-first
-editing (Kakoune-style) as well as Vim's operator-first grammar. No modal-editor dependency
-or new configuration format has been added. Remaining Swift calendar cursor/detail/command
-modes are not scheduled for a parity port; their interaction needs a separate design.
+and selection/actions remain separate. `ui::editing::Editor` owns text, anchor/head selection,
+Unicode movement, replacement and undo/redo without keys, focus or window state. Selecting a
+word then deleting it and directly deleting toward a word boundary use the same edit path;
+there is no Vim/Kakoune grammar or new dependency/config format. Normal typing stays default.
+
+The existing multiline editor (compose, inline reply and event notes) now supports Cmd-Z /
+Cmd-Shift-Z, plus Ctrl-Z / Ctrl-Shift-Z / Ctrl-Y on Linux. Word movement/selection/deletion
+uses Option on macOS and Ctrl on Linux with arrows, Shift-arrows, Backspace/Delete. Unicode
+word segments include punctuation; movement skips whitespace before the approached segment.
+Each input commit, paste, cut or formatting action is an undo step; no timed typing grouping
+yet. History is memory-only, capped at 128 steps / 8 MiB of retained text per editor, and
+reset when loading another draft. IME preedit remains visible but excluded from draft text
+until committed, and the whole composition is one undo step. Native macOS IME acceptance
+remains outstanding. Remaining Swift calendar cursor/detail/command modes are not scheduled
+for a parity port; their interaction needs a separate design.
 
 ## Write behavior and limits
 

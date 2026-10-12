@@ -12,6 +12,7 @@ mod chip;
 mod context_menu;
 mod dialog;
 mod empty_state;
+pub mod editing;
 mod icon;
 mod kbd;
 pub mod link;

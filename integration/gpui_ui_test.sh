@@ -99,13 +99,28 @@ screen() {
       tesseract "$ROOT/list-ocr.png" stdout --psm 11 2>/dev/null >> "$ROOT/screen.txt"
       ;;
   esac
+  if [[ "$1" == inline-word-delete ]]; then
+    # The empty editor's placeholder is intentionally dim; normalize its own
+    # region rather than the white HTML pane when checking that it survived.
+    convert "$OUT/$1.png" -crop 300x40+682+576 -resize 300% -colorspace Gray -normalize -negate "$ROOT/placeholder.png"
+    tesseract "$ROOT/placeholder.png" stdout --psm 7 2>/dev/null >> "$ROOT/screen.txt"
+  fi
 }
 
 expect_screen() {
-  local name="$1" expected="$2" absent="${3:-}" attempts="${4:-40}"
+  local name="$1" expected="$2" absent="${3:-}" attempts="${4:-40}" occurrences="${5:-}"
   for ((i = 0; i < attempts; i++)); do
     screen "$name"
-    if grep -Eqi -- "$expected" "$ROOT/screen.txt" && { [[ -z "$absent" ]] || ! grep -Eqi -- "$absent" "$ROOT/screen.txt"; }; then
+    if grep -Eqi -- "$expected" "$ROOT/screen.txt" &&
+       { [[ -z "$absent" ]] || ! grep -Eqi -- "$absent" "$ROOT/screen.txt"; } &&
+       { [[ -z "$occurrences" ]] || [[ $(grep -Eci -- "$expected" "$ROOT/screen.txt") == "$occurrences" ]]; }; then
+      if [[ "$name" == compose-edit-selected ]]; then
+        # Text is unchanged by selection. Wait for the accent highlight in the
+        # word's region, not just glyphs that were already present before the key.
+        local highlight
+        highlight=$(convert "$OUT/$name.png" -crop 40x26+476+247 -fx 'b-r>0.04 ? 1 : 0' -format '%[fx:mean]' info:)
+        if ! awk -v value="$highlight" 'BEGIN { exit !(value > 0.3) }'; then sleep 0.1; continue; fi
+      fi
       echo "PASS native rendered $name"
       return
     fi
@@ -429,6 +444,36 @@ expect_screen draft-contact-canonical 'Server Only <server@example.invalid>' 'Se
 xdotool type --clearmodifiers --delay 15 'NativeRecovery'
 xdotool key Tab
 xdotool type --clearmodifiers --delay 15 'Durable compose body'
+# Selection-first and direct word edits share the same undoable operation.
+expect_screen compose-edit-default 'Durable compose body'
+xdotool key --clearmodifiers ctrl+shift+Left
+expect_screen compose-edit-selected 'Durable compose body'
+xdotool key --clearmodifiers BackSpace
+expect_screen compose-edit-selection-delete 'Durable compose' 'Durable compose body'
+xdotool key --clearmodifiers ctrl+z
+expect_screen compose-edit-selection-undo 'Durable compose body'
+xdotool key --clearmodifiers Right ctrl+BackSpace
+expect_screen compose-edit-word-delete 'Durable compose' 'Durable compose body'
+xdotool key --clearmodifiers ctrl+z
+expect_screen compose-edit-word-undo 'Durable compose body'
+xdotool key --clearmodifiers ctrl+shift+z
+expect_screen compose-edit-word-redo 'Durable compose' 'Durable compose body'
+xdotool key --clearmodifiers ctrl+z
+# Clipboard replacement is a single undo step; it must not leak list shortcuts.
+xdotool key --clearmodifiers ctrl+a ctrl+c End Return ctrl+v
+expect_screen compose-edit-pasted 'Durable compose body' '' 40 2
+xdotool key --clearmodifiers ctrl+z ctrl+z
+expect_screen compose-edit-paste-undo 'Durable compose body' '' 40 1
+xdotool key --clearmodifiers ctrl+shift+Left ctrl+x
+expect_screen compose-edit-cut 'Durable compose' 'Durable compose body'
+xdotool key --clearmodifiers ctrl+z
+expect_screen compose-edit-cut-undo 'Durable compose body'
+# Formatting also participates in history. Typing replaces the restored word
+# selection after undo rather than appending outside the Markdown markers.
+xdotool key --clearmodifiers super+b ctrl+z
+xdotool type --clearmodifiers --delay 15 'body'
+expect_screen compose-edit-format-undo 'Durable compose body'
+echo 'PASS native text core: word selection/delete, undo/redo, clipboard and formatting history'
 click_word Bcc
 xdotool type --clearmodifiers --delay 15 'hidden@example.invalid'
 expect_screen compose-bcc 'hidden@example.invalid'
@@ -496,9 +541,14 @@ expect_screen inline-ready 'Reply body'
 xdotool key --clearmodifiers r
 xdotool type --clearmodifiers --delay 15 'InlineFirst'
 expect_screen inline-edited 'InlineFirst'
+xdotool key --clearmodifiers ctrl+BackSpace
+expect_screen inline-word-delete 'Write a reply' 'InlineFirst'
+xdotool key --clearmodifiers ctrl+z
+expect_screen inline-word-undo 'InlineFirst'
 kill -STOP "$BACKEND_PID"
 click_word Send
 expect_screen inline-pending 'Queuing reply'
+xdotool key --clearmodifiers ctrl+z ctrl+BackSpace
 xdotool type --clearmodifiers --delay 15 'UNACCEPTED-LATE-TEXT'
 expect_screen inline-locked 'InlineFirst' 'UNACCEPTED-LATE-TEXT'
 kill -CONT "$BACKEND_PID"
