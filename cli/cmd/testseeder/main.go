@@ -1,5 +1,5 @@
 // testseeder creates SQLite databases with test data for integration tests.
-// Usage: testseeder <email-db-path> <contacts-db-path>
+// Usage: testseeder <email-db-path> <contacts-db-path> [reply-html-fixture]
 package main
 
 import (
@@ -47,12 +47,21 @@ func testKeyring() *dbcrypto.Keyring {
 }
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "usage: testseeder <email-db-path> <contacts-db-path>")
+	if len(os.Args) != 3 && len(os.Args) != 4 {
+		fmt.Fprintln(os.Stderr, "usage: testseeder <email-db-path> <contacts-db-path> [reply-html-fixture]")
 		os.Exit(1)
 	}
 
-	if err := seedEmailDB(os.Args[1]); err != nil {
+	var replyHTML string
+	if len(os.Args) == 4 {
+		data, err := os.ReadFile(os.Args[3])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "html fixture: %v\n", err)
+			os.Exit(1)
+		}
+		replyHTML = string(data)
+	}
+	if err := seedEmailDB(os.Args[1], replyHTML); err != nil {
 		fmt.Fprintf(os.Stderr, "email db: %v\n", err)
 		os.Exit(1)
 	}
@@ -65,7 +74,7 @@ func main() {
 	fmt.Println("Seeded test databases successfully")
 }
 
-func seedEmailDB(path string) error {
+func seedEmailDB(path, replyHTML string) error {
 	db, err := store.Open(path, testKeyring())
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
@@ -112,6 +121,9 @@ func seedEmailDB(path string) error {
 		},
 	}
 
+	if replyHTML != "" {
+		msgs[2].BodyHTML = replyHTML
+	}
 	for _, msg := range msgs {
 		if err := db.InsertMessage(msg); err != nil {
 			return fmt.Errorf("insert %s: %w", msg.MessageID, err)

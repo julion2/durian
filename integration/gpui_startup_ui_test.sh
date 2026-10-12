@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Hold real Go search responses while driving the packaged native client's input.
+set -euo pipefail
+if [[ "${DURIAN_UI_DISPLAY:-}" != 1 ]]; then
+  exec xvfb-run -a -s '-screen 0 1600x1000x24 -nolisten tcp' env DURIAN_UI_DISPLAY=1 bash "$0" "$@"
+fi
+APP=$(realpath "$1")
+SEEDER=$(realpath "$2")
+CONFIG=$(realpath "$3")
+CLI="$(dirname "$APP")/durian-cli"
+BASE=$(mktemp -d /tmp/durian-startup-ui-XXXXXX)
+OUT="${DURIAN_UI_ARTIFACT_DIR:-${TEST_UNDECLARED_OUTPUTS_DIR:-$BASE/evidence}}"
+mkdir -p "$OUT"
+PIDS=()
+stop_case() {
+  for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+  for pid in "${PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+  PIDS=()
+}
+cleanup() { stop_case; rm -rf "$BASE"; }
+trap cleanup EXIT
+
+wait_file() {
+  for _ in {1..200}; do [[ -e "$1" ]] && return; sleep 0.025; done
+  echo "FAIL missing barrier $1" >&2; return 1
+}
+search_count() {
+  local n
+  n=$(jq -s '[.[] | select(.path == "/api/v1/search")] | length' "$CASE_OUT/requests.jsonl")
+  [[ "$n" == "$1" ]] || { echo "FAIL expected $1 completed searches, got $n"; cat "$CASE_OUT/requests.jsonl"; return 1; }
+}
+screen() {
+  import -window "$WINDOW" "$CASE_OUT/$1.png"
+  # Only the actual list, never a search field or reading-pane header.
+  convert "$CASE_OUT/$1.png" -crop 390x660+252+105 -resize 300% -colorspace Gray -negate "$ROOT/ocr.png"
+  tesseract "$ROOT/ocr.png" stdout --psm 11 2>/dev/null > "$ROOT/list.txt"
+}
+expect_list() {
+  for _ in {1..20}; do
+    screen "$1"
+    if grep -Eqi "$2" "$ROOT/list.txt" && { [[ -z "${3:-}" ]] || ! grep -Eqi "$3" "$ROOT/list.txt"; }; then
+      echo "PASS native startup $CASE/$1"; return
+    fi
+    kill -0 "$APP_PID"; sleep 0.05
+  done
+  cat "$ROOT/list.txt"; echo "FAIL $CASE/$1" >&2; return 1
+}
+search_charlie() {
+  xdotool key --clearmodifiers slash
+  xdotool type --clearmodifiers --delay 15 'from:charlie '
+  xdotool key Return
+  expect_list searched 'Other Thread' 'Hello World'
+  search_count 1
+}
+
+for CASE in ${DURIAN_STARTUP_CASES:-initial headers navigation return return-pending refresh failure empty}; do
+  ROOT="$BASE/$CASE"; CASE_OUT="$OUT/$CASE"
+  mkdir -p "$ROOT" "$CASE_OUT"
+  export HOME="$ROOT/home" XDG_DATA_HOME="$ROOT/data" XDG_STATE_HOME="$ROOT/state"
+  export XDG_CONFIG_HOME="$ROOT/config" XDG_CACHE_HOME="$ROOT/cache" XDG_RUNTIME_DIR="$ROOT/runtime"
+  export TMPDIR="$ROOT/tmp" MAIL_APPEARANCE=dark MAIL_AVATARS=0 MAIL_TRACE=1 VK_ICD_FILENAMES=/dev/null
+  unset MAIL_BACKEND MAIL_TOKEN DURIAN_BIN MAIL_FOLDER MAIL_BACKGROUND
+  # HTML engine startup is unrelated to request ownership; use the supported text fallback.
+  export MAILRENDER_BIN="$ROOT/no-renderer"
+  export DURIAN_MASTER_KEY_HEX_SECRET="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  mkdir -p "$HOME" "$XDG_CONFIG_HOME/durian" "$XDG_DATA_HOME/durian" "$TMPDIR" "$XDG_RUNTIME_DIR"
+  chmod 700 "$TMPDIR" "$XDG_RUNTIME_DIR"
+  sed -e '/    smtp {/d' -e '/    imap {/d' -e '/    auth {/d' "$CONFIG" > "$XDG_CONFIG_HOME/durian/config.pkl"
+  cp "$(dirname "$CONFIG")/profiles.pkl" "$XDG_CONFIG_HOME/durian/profiles.pkl"
+  "$SEEDER" "$XDG_DATA_HOME/durian/email.db" "$XDG_DATA_HOME/durian/contacts.db"
+  # Opening unread mail legitimately writes tags and refreshes. Isolate startup
+  # reads here; the full native mail suite covers mark-read freshness separately.
+  "$CLI" tag --all '*' -unread > "$CASE_OUT/read-fixture.log"
+  if [[ "$CASE" == empty ]]; then
+    "$CLI" tag --all '*' -inbox > "$CASE_OUT/empty-fixture.log"
+  fi
+  # Separate from the backend/calendar contracts' 19724/19725 ports.
+  PORT=19726
+  "$CLI" serve --port "$PORT" --exit-when-orphaned > "$ROOT/ready.log" 2> "$CASE_OUT/server.log" &
+  SERVER_PID=$!; PIDS+=("$SERVER_PID")
+  for _ in {1..200}; do
+    grep -q '^READY ' "$ROOT/ready.log" && break
+    kill -0 "$SERVER_PID"; sleep 0.025
+  done
+  export MAIL_TOKEN
+  MAIL_TOKEN=$(sed -n 's/^READY .*token=\([^ ]*\).*/\1/p' "$ROOT/ready.log")
+  PORT=$(sed -n 's/^READY .*addr=127\.0\.0\.1:\([0-9]*\).*/\1/p' "$ROOT/ready.log")
+  [[ -n "$MAIL_TOKEN" && -n "$PORT" ]]
+  MODE=hold; [[ "$CASE" == failure ]] && MODE=hold-reject
+  [[ "$CASE" == headers ]] && MODE=hold-headers
+  echo "GET /api/v1/search $MODE" > "$ROOT/fault"
+  : > "$CASE_OUT/requests.jsonl"
+  python3 "$(dirname "$CONFIG")/fault_proxy.py" "$PORT" "$ROOT/fault" "$CASE_OUT/requests.jsonl" "$ROOT/proxy.port" > "$CASE_OUT/proxy.log" 2>&1 &
+  PIDS+=("$!")
+  wait_file "$ROOT/proxy.port"
+  export MAIL_BACKEND="http://127.0.0.1:$(cat "$ROOT/proxy.port")"
+  openbox --sm-disable > "$ROOT/wm.log" 2>&1 &
+  PIDS+=("$!")
+  "$APP" > "$CASE_OUT/app.log" 2>&1 &
+  APP_PID=$!; PIDS+=("$APP_PID")
+  WINDOW=$(timeout 20 xdotool search --sync --onlyvisible --name '^Durian$' | head -1)
+  xdotool windowactivate --sync "$WINDOW"
+  wait_file "$ROOT/fault.held"
+  for _ in {1..100}; do
+    grep -q 'accounts, .*addresses, .*tags' "$CASE_OUT/app.log" && break
+    sleep 0.025
+  done
+  grep -q 'accounts, .*addresses, .*tags' "$CASE_OUT/app.log"
+  sleep 0.5
+  # Identity/profile completion must not dispatch another copy of the held request.
+  search_count 0
+  case "$CASE" in
+    initial|headers)
+      touch "$ROOT/fault.release"
+      expect_list ready 'Hello World'
+      search_count 1
+      ;;
+    navigation)
+      search_charlie
+      touch "$ROOT/fault.release"
+      sleep 0.4
+      expect_list late-inbox 'Other Thread' 'Hello World'
+      search_count 2
+      ;;
+    return)
+      search_charlie
+      xdotool key --clearmodifiers slash ctrl+a BackSpace Return
+      sleep 0.4
+      search_count 1
+      touch "$ROOT/fault.release"
+      expect_list returned 'Hello World'
+      search_count 2
+      ;;
+    return-pending)
+      # Keep both answers pending, then return to Inbox. The other query's
+      # in-flight response must not replace the reused startup page.
+      rm "$ROOT/fault.held"
+      echo 'GET /api/v1/search hold' > "$ROOT/fault"
+      xdotool key --clearmodifiers slash
+      xdotool type --clearmodifiers --delay 15 'from:charlie '
+      xdotool key Return
+      wait_file "$ROOT/fault.held"
+      xdotool key --clearmodifiers slash ctrl+a BackSpace Return
+      sleep 0.4
+      search_count 0
+      touch "$ROOT/fault.release"
+      sleep 0.4
+      expect_list returned-pending 'Hello World'
+      search_count 2
+      ;;
+    refresh)
+      # The held page contains Other Thread. Change real SQLite state, then
+      # refresh: its late response must not resurrect the removed inbox row.
+      "$CLI" tag 'from:charlie' -inbox > "$CASE_OUT/tag.log"
+      xdotool key --clearmodifiers ctrl+r
+      expect_list refreshed 'Hello World' 'Other Thread'
+      search_count 1
+      touch "$ROOT/fault.release"
+      sleep 0.4
+      expect_list late-refresh 'Hello World' 'Other Thread'
+      search_count 2
+      ;;
+    failure)
+      touch "$ROOT/fault.release"
+      expect_list failed 'Try again'
+      search_count 1
+      xdotool key --clearmodifiers ctrl+r
+      expect_list retried 'Hello World'
+      search_count 2
+      ;;
+    empty)
+      touch "$ROOT/fault.release"
+      expect_list empty 'Inbox zero' 'Hello World|Other Thread|Loading'
+      search_count 1
+      # Empty success still releases the queued sidebar count batch.
+      jq -se 'any(.[]; .path == "/api/v1/search/count" and .status == 200)' "$CASE_OUT/requests.jsonl" > /dev/null
+      ;;
+  esac
+  xdotool key --clearmodifiers ctrl+q
+  wait "$APP_PID"
+  stop_case
+done
+echo 'PASS GPUI native startup ownership, navigation, refresh and retry'
