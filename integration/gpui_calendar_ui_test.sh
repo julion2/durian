@@ -145,7 +145,12 @@ xdotool key --clearmodifiers d d
 expect_screen unsubmitted-confirm 'Delete this event'
 xdotool key Return
 expect_screen unsubmitted-uncertain 'Recover calendar changes'
-printf 'GET /api/v1/calendars reject\n' > "$ROOT/fault"
+# Recover the captured identity without a selected event. Periodic/SSE refresh
+# still reads /calendars, but cannot consume this exact-detail failure or replace
+# its notice with a background list failure.
+xdotool key --clearmodifiers Escape
+expect_screen recovery-deselected 'Recover calendar changes' 'Edit'
+printf 'GET /api/v1/calendars/event reject\n' > "$ROOT/fault"
 click_word Recover
 expect_screen recovery-failed 'Calendar recovery failed'
 expect_screen recovery-retained 'Recover calendar changes'
