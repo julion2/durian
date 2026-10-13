@@ -806,7 +806,8 @@ impl Render for ComposeDialog {
         let account = mailbox.account(&self.account).cloned();
         let sender_count = mailbox.sender_options().len();
         let from = self.from.clone();
-        let can_send = !self.waiting && self.attachment_task.is_none() && (!self.to.read(cx).recipients.is_empty() || !self.to.read(cx).input.read(cx).text().is_empty());
+        let can_send = !self.waiting && self.attachment_task.is_none() && !self.body.read(cx).text().trim().is_empty()
+            && (!self.to.read(cx).recipients.is_empty() || !self.to.read(cx).input.read(cx).text().trim().is_empty());
 
         div()
             .key_context("Compose")
@@ -886,7 +887,7 @@ impl Render for ComposeDialog {
                                 .on_click(cx.listener(|this, _, _, cx| this.save_draft(cx))),
                         )
                     })
-                    .child(IconButton::new("compose-close", IconName::CloseSmall).on_click(cx.listener(|this, _, window, cx| this.close(&Close, window, cx)))),
+                    .child(IconButton::new("compose-close", IconName::CloseSmall).tooltip("Close composer").on_click(cx.listener(|this, _, window, cx| this.close(&Close, window, cx)))),
             )
             .child(
                 div()
@@ -967,26 +968,24 @@ impl Render for ComposeDialog {
                     .gap(px(8.))
                     .px(px(12.))
                     .pb(px(12.))
-                    .child(IconButton::new("compose-attach", IconName::MailAttach).style(ui::ButtonStyle::Raised).on_click(cx.listener(|this, _, _, cx| this.attach(cx))))
+                    .child(IconButton::new("compose-attach", IconName::MailAttach).style(ui::ButtonStyle::Raised).tooltip("Add attachments").on_click(cx.listener(|this, _, _, cx| this.attach(cx))))
                     .children(self.wire.attachments.iter().enumerate().map(|(ix, attachment)| {
                         div().id(("compose-attachment", ix)).text_size(px(SIZE_MINI)).child(attachment.filename.clone())
-                            .child(IconButton::new(("remove-attachment", ix), IconName::CloseSmall).size(18.).on_click(cx.listener(move |this, _, _, cx| {
+                            .child(IconButton::new(("remove-attachment", ix), IconName::CloseSmall).size(18.).tooltip("Remove attachment").on_click(cx.listener(move |this, _, _, cx| {
                                 if !this.waiting && ix < this.wire.attachments.len() { this.wire.attachments.remove(ix); this.schedule_autosave(cx); cx.notify(); }
                             })))
                     }))
                     .child(div().w(px(4.)))
                     // formatting: Markdown under the hood, styled live in the body
-                    .child(self.format_button("fmt-bold", "B", Format::Wrap("**"), &theme, cx).font_weight(WEIGHT_SEMIBOLD))
-                    .child(self.format_button("fmt-italic", "I", Format::Wrap("_"), &theme, cx).italic())
-                    .child(self.format_button("fmt-code", "</>", Format::Wrap("`"), &theme, cx).font_family(theme.font_mono).text_size(px(11.)))
-                    .child(self.format_button("fmt-list", "•", Format::Prefix("- "), &theme, cx))
-                    .child(self.format_button("fmt-ordered", "1.", Format::Prefix("1. "), &theme, cx))
-                    .child(self.format_button("fmt-quote", "❝", Format::Prefix("> "), &theme, cx))
+                    .child(self.format_button("fmt-bold", "B", Format::Wrap("**"), &theme, cx).font_weight(WEIGHT_SEMIBOLD).tooltip(ui::tooltip("Bold")))
+                    .child(self.format_button("fmt-italic", "I", Format::Wrap("_"), &theme, cx).italic().tooltip(ui::tooltip("Italic")))
+                    .child(self.format_button("fmt-code", "</>", Format::Wrap("`"), &theme, cx).font_family(theme.font_mono).text_size(px(11.)).tooltip(ui::tooltip("Code")))
+                    .child(self.format_button("fmt-list", "•", Format::Prefix("- "), &theme, cx).tooltip(ui::tooltip("Bullet list")))
+                    .child(self.format_button("fmt-ordered", "1.", Format::Prefix("1. "), &theme, cx).tooltip(ui::tooltip("Numbered list")))
+                    .child(self.format_button("fmt-quote", "❝", Format::Prefix("> "), &theme, cx).tooltip(ui::tooltip("Quote")))
                     .child(div().flex_1())
                     .child(div().text_size(px(SIZE_MINI)).text_color(theme.text_quaternary).child("⌘↵ to send"))
-                    .child(div().when(!can_send, |s| s.opacity(0.5)).child(
-                        PrimaryButton::new("compose-send", "Send").on_click(cx.listener(|this, _, window, cx| this.send(&Send, window, cx))),
-                    )),
+                    .child(PrimaryButton::new("compose-send", "Send").disabled(!can_send).on_click(cx.listener(|this, _, window, cx| this.send(&Send, window, cx)))),
             )
             .when(self.confirm_close, |s| {
                 let this = cx.entity();

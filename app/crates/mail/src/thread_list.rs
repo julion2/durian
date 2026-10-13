@@ -375,7 +375,7 @@ impl ThreadList {
                     .child(Icon::new(IconName::Search).size(13.).color(theme.text_tertiary))
                     .child(div().flex_1().min_w_0().text_size(px(SIZE_SMALL)).text_color(theme.text_primary).child(self.search.clone()))
                     .when(has_query, |s| {
-                        s.child(IconButton::new("clear-search", IconName::CloseSmall).size(20.).on_click(cx.listener(|this, _, _, cx| {
+                        s.child(IconButton::new("clear-search", IconName::CloseSmall).size(20.).tooltip("Clear search").on_click(cx.listener(|this, _, _, cx| {
                             this.set_search(SharedString::default(), None, cx);
                         })))
                     })
@@ -396,6 +396,8 @@ impl ThreadList {
                         .font_weight(WEIGHT_MEDIUM)
                         .text_color(theme.text_secondary)
                         .hover(|s| s.bg(theme.bg_raised_hover))
+                        .cursor_pointer()
+                        .tooltip(ui::tooltip("Save this search for this session"))
                         .child("Save view")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let name: SharedString = if title.as_ref() == "Search" { text.trim().to_string().into() } else { title.clone() };
@@ -432,10 +434,15 @@ impl ThreadList {
                             .text_color(theme.text_secondary)
                             .child(title),
                     )
-                    .child(IconButton::new("inbox-options", IconName::More))
+                    .child(IconButton::new("inbox-options", IconName::More).tooltip("List actions").on_click(|_, window, cx| {
+                        let items = crate::commands::COMMANDS.iter().filter(|c| ["toggle_list_layout", "toggle_focus_mode", "reload_inbox"]
+                            .contains(&crate::commands::pkl_name((c.action)().as_ref(), c.scope).unwrap_or_default()))
+                            .map(|c| ui::MenuItem::action(c.label, c.icon, crate::commands::keys_for((c.action)().as_ref(), &[crate::keymaps::Context::List], cx), (c.action)())).collect();
+                        crate::context_menus::open(window.mouse_position(), items, window, cx);
+                    }))
                     .child(div().flex_1())
                     .children(selection.map(|label| div().text_size(px(SIZE_MINI)).text_color(theme.accent).child(label)))
-                    .child(IconButton::new("unread-only", IconName::MailUnreadOnly).on_click(cx.listener(|this, _, _, cx| {
+                    .child(IconButton::new("unread-only", IconName::MailUnreadOnly).tooltip("Toggle unread filter").on_click(cx.listener(|this, _, _, cx| {
                         // Toggle the same unread tag that read/unread actions write.
                         let text = this.search.read(cx).text().to_string();
                         let next = if text.split_whitespace().any(|t| t == "tag:unread") {
@@ -445,8 +452,8 @@ impl ThreadList {
                         };
                         this.apply_query(next.into(), None, cx);
                     })))
-                    .child(IconButton::new("inbox-filter", IconName::Filter).on_click(cx.listener(|this, _, window, cx| this.focus_search(window, cx))))
-                    .child(IconButton::new("inbox-display", IconName::Display).on_click(|_, window, cx| {
+                    .child(IconButton::new("inbox-filter", IconName::Filter).tooltip("Search and filter").on_click(cx.listener(|this, _, window, cx| this.focus_search(window, cx))))
+                    .child(IconButton::new("inbox-display", IconName::Display).tooltip("Toggle list layout").on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(crate::ToggleListLayout), cx)
                     })),
             )

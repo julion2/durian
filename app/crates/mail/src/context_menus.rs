@@ -27,10 +27,7 @@ fn copy(label: &str, icon: IconName, text: impl Into<String>) -> MenuItem {
 
 /// Thread row in the list (right-click also selects it, so commands act on it).
 pub fn thread(thread: &Thread, cx: &App) -> Vec<MenuItem> {
-    let cmd = |label: &str, icon, action: Box<dyn gpui::Action>| {
-        let keys = keys_for(action.as_ref(), &[keymaps::Context::List], cx);
-        MenuItem::action(label.to_string(), icon, keys, action)
-    };
+    let cmd = |label: &str, icon, action: Box<dyn gpui::Action>| cmd(label, icon, action, cx);
     vec![
         cmd("Reply", IconName::MailReply, Box::new(Reply)),
         cmd("Reply all", IconName::MailReply, Box::new(ReplyAll)),
@@ -51,17 +48,21 @@ pub fn thread(thread: &Thread, cx: &App) -> Vec<MenuItem> {
     ]
 }
 
-/// A message card in the thread.
-pub fn message(body: SharedString, sender: SharedString, email: SharedString, cx: &App) -> Vec<MenuItem> {
+/// Reply/forward currently target the latest message, never an arbitrary older card.
+pub fn message(body: SharedString, sender: SharedString, email: SharedString, latest: bool, cx: &App) -> Vec<MenuItem> {
     let cmd = |label: &str, icon, action: Box<dyn gpui::Action>| cmd(label, icon, action, cx);
-    vec![
+    let mut items = Vec::new();
+    if latest { items.extend([
         cmd("Reply", IconName::MailReply, Box::new(Reply)),
         cmd("Reply all", IconName::MailReply, Box::new(ReplyAll)),
         cmd("Forward…", IconName::MailForward, Box::new(Forward)),
         MenuItem::Separator,
+    ]); }
+    items.extend([
         copy("Copy text", IconName::MailEmail, body.to_string()),
         copy(&format!("Copy {}'s address", crate::model::first_name(&sender)), IconName::MailUsers, email.to_string()),
-    ]
+    ]);
+    items
 }
 
 pub fn attachment(attachment: Attachment) -> Vec<MenuItem> {
@@ -90,7 +91,7 @@ pub fn attachment(attachment: Attachment) -> Vec<MenuItem> {
 
 /// Right-click in an HTML message: the selection, the link under the pointer (if it may be
 /// opened), then what the message itself offers.
-pub fn html_body(selection: String, link: Option<SharedString>, body: SharedString, sender: SharedString, email: SharedString, cx: &App) -> Vec<MenuItem> {
+pub fn html_body(selection: String, link: Option<SharedString>, body: SharedString, sender: SharedString, email: SharedString, latest: bool, cx: &App) -> Vec<MenuItem> {
     let mut items = Vec::new();
     if !selection.trim().is_empty() {
         items.push(copy("Copy", IconName::MailEmail, selection));
@@ -100,7 +101,7 @@ pub fn html_body(selection: String, link: Option<SharedString>, body: SharedStri
         items.extend(self::link(url));
         items.push(MenuItem::Separator);
     }
-    items.extend(message(body, sender, email, cx));
+    items.extend(message(body, sender, email, latest, cx));
     items
 }
 

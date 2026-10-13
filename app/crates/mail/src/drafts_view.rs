@@ -78,6 +78,7 @@ impl DraftsView {
                     .child(
                         div().invisible().group_hover("draft-card", |s| s.visible()).child(
                             IconButton::new(("discard-draft", id), IconName::MailTrash)
+                                .tooltip("Discard draft")
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.confirm_discard = Some(id);

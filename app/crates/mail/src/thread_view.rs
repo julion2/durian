@@ -19,7 +19,7 @@ use crate::contact_avatar;
 use crate::{attachments, context_menus};
 use ui::markdown;
 use crate::compose::ComposeSeed;
-use ui::{ButtonStyle, Icon, IconButton, IconName, Kbd, PrimaryButton, StyledExt, TextArea, TextAreaEvent};
+use ui::{Icon, IconButton, IconName, Kbd, PrimaryButton, StyledExt, TextArea, TextAreaEvent};
 
 const CONTENT_MAX_WIDTH: f32 = 760.;
 /// Own messages are nudged right – enough to scan "who said what", not a chat layout.
@@ -277,16 +277,22 @@ impl ThreadView {
             )
             .child(
                 IconButton::new("star", if thread.starred { IconName::MailStarred } else { IconName::MailStar })
+                    .tooltip(if thread.starred { "Unstar thread" } else { "Star thread" })
                     .on_click(move |_, _, cx| mailbox.update(cx, |m, cx| m.toggle_star_selected(cx))),
             )
-            .child(IconButton::new("thread-options", IconName::More))
+            .child(IconButton::new("thread-options", IconName::More).tooltip("Thread actions").on_click(cx.listener(|this, _, window, cx| {
+                if let Some(thread) = this.mailbox.read(cx).selected_thread() {
+                    let items = context_menus::thread(thread, cx);
+                    context_menus::open(window.mouse_position(), items, window, cx);
+                }
+            })))
             .child(div().flex_1())
             .children(thread.messages().position(|m| Some(&m.id) == self.focused_message.as_ref()).map(|ix| {
                 div().text_size(px(SIZE_MINI)).text_color(theme.text_tertiary).child(format!("Message {} of {}", ix + 1, thread.messages().count()))
             }))
-            .child(IconButton::new("reply", IconName::MailReply))
-            .child(IconButton::new("snooze", IconName::MailSnooze))
-            .child(IconButton::new("archive", IconName::MailDone).on_click({
+            .child(IconButton::new("reply", IconName::MailReply).tooltip("Reply to latest message").on_click(cx.listener(|this, _, window, cx| this.open_reply(false, window, cx))))
+            .child(IconButton::new("snooze", IconName::MailSnooze).tooltip("Snooze is not available yet"))
+            .child(IconButton::new("archive", IconName::MailDone).tooltip("Mark done").on_click({
                 let mailbox = self.mailbox.clone();
                 move |_, _, cx| mailbox.update(cx, |m, cx| m.archive_selected(cx))
             }))
@@ -300,15 +306,20 @@ impl ThreadView {
             .filter_map(|t| mailbox.tag(t))
             .map(|tag| {
                 property_chip(SharedString::from(format!("tag-chip-{}", tag.name)), theme)
+                    .cursor_pointer().hover(|s| s.bg(theme.bg_raised_hover))
+                    .tooltip(ui::tooltip("Add or remove tags"))
                     .child(div().size(px(8.)).rounded_full().bg(tag.color))
                     .child(div().text_color(theme.text_secondary).child(tag.name.clone()))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenTagPicker), cx))
                     .into_any_element()
             })
             .collect();
         chips.push(
             property_chip("add-tag-chip", theme)
+                .cursor_pointer().hover(|s| s.bg(theme.bg_raised_hover))
                 .child(Icon::new(IconName::MailTagAdd).size(14.).color(theme.text_tertiary))
                 .child("Tag")
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenTagPicker), cx))
                 .into_any_element(),
         );
         chips.push(
@@ -322,6 +333,7 @@ impl ThreadView {
 
     fn render_card(&self, thread: &Thread, ix: usize, message: &Message, mine: bool, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let quoted_open = self.show_quoted.contains(&ix);
+        let latest = thread.latest().id == message.id;
         let me = self.mailbox.read(cx).me.name.clone();
         let short = |names: &[SharedString]| {
             names.iter().map(|n| if *n == me { "me".to_string() } else { first_name(n).to_string() }).collect::<Vec<_>>()
@@ -373,9 +385,19 @@ impl ThreadView {
                     .gap(px(2.))
                     .invisible()
                     .group_hover("message-card", |s| s.visible())
-                    .child(IconButton::new(("msg-reply", ix), IconName::MailReply).size(24.))
-                    .child(IconButton::new(("msg-forward", ix), IconName::MailForward).size(24.))
-                    .child(IconButton::new(("msg-options", ix), IconName::MailOptions).size(24.)),
+                    .child(IconButton::new(("msg-reply", ix), IconName::MailReply).size(24.)
+                        .tooltip(if latest { "Reply" } else { "Reply to an older message is not available yet" })
+                        .when(latest, |b| b.on_click(cx.listener(|this, _, window, cx| this.open_reply(false, window, cx)))))
+                    .child(IconButton::new(("msg-forward", ix), IconName::MailForward).size(24.)
+                        .tooltip(if latest { "Forward" } else { "Forward an older message is not available yet" })
+                        .when(latest, |b| b.on_click(|_, window, cx| window.dispatch_action(Box::new(crate::Forward), cx))))
+                    .child(IconButton::new(("msg-options", ix), IconName::MailOptions).size(24.).tooltip("Message actions").on_click({
+                        let (body, sender, email) = (message.body.clone(), message.from.name.clone(), message.from.email.clone());
+                        move |_, window, cx| {
+                            let items = context_menus::message(body.clone(), sender.clone(), email.clone(), latest, cx);
+                            context_menus::open(window.mouse_position(), items, window, cx);
+                        }
+                    })),
             )
             .child(
                 div()
@@ -491,6 +513,7 @@ impl ThreadView {
                         .text_size(px(SIZE_MICRO))
                         .line_height(px(10.))
                         .text_color(theme.text_meta)
+                        .tooltip(ui::tooltip(if quoted_open { "Hide quoted text" } else { "Show quoted text" }))
                         .child("•••")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if !this.show_quoted.remove(&ix) {
@@ -523,6 +546,8 @@ impl ThreadView {
                 let (chip, preview, download) = (a.clone(), a.clone(), a.clone());
                 property_chip(group.clone(), theme)
                     .group(group.clone())
+                    .cursor_pointer().hover(|s| s.bg(theme.bg_raised_hover))
+                    .tooltip(ui::tooltip("Preview attachment"))
                     .pr(px(4.))
                     .child(Icon::new(IconName::MailAttach).size(14.).color(theme.text_tertiary))
                     .child(div().text_color(theme.text_secondary).child(a.name.clone()))
@@ -539,6 +564,7 @@ impl ThreadView {
                             .invisible()
                             .group_hover(group, |s| s.visible())
                             .hover(|s| s.bg(theme.bg_nav_hover))
+                            .tooltip(ui::tooltip("Download attachment"))
                             .child(Icon::new(IconName::MailDownload).size(12.).color(theme.text_tertiary))
                             .on_click(cx.listener(move |_, _, _, cx| {
                                 cx.stop_propagation();
@@ -582,7 +608,7 @@ impl ThreadView {
         card(theme)
             .id(("card", ix))
             .on_mouse_down(gpui::MouseButton::Right, move |event, window, cx| {
-                context_menus::open(event.position, context_menus::message(menu_body.clone(), menu_sender.clone(), menu_email.clone(), cx), window, cx);
+                context_menus::open(event.position, context_menus::message(menu_body.clone(), menu_sender.clone(), menu_email.clone(), latest, cx), window, cx);
             })
             .group("message-card")
             .flex()
@@ -926,8 +952,8 @@ impl ThreadView {
                         .items_center()
                         .gap(px(6.))
                         .child(div().flex_1())
-                        .child(IconButton::new("attach", IconName::MailAttach).size(24.))
-                        .child(IconButton::new("send", IconName::MailSubmit).size(24.).style(ButtonStyle::Raised)),
+                        .child(IconButton::new("start-reply", IconName::MailReply).size(24.).tooltip("Reply all")
+                            .on_click(cx.listener(|this, _, window, cx| this.open_reply(true, window, cx)))),
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.open_reply(true, window, cx)))
                 .into_any_element();
@@ -950,7 +976,7 @@ impl ThreadView {
             let cc = short(&recipients.cc);
             line += &format!(" · cc {}{}", cc.iter().take(2).cloned().collect::<Vec<_>>().join(", "), if cc.len() > 2 { format!(" +{}", cc.len() - 2) } else { String::new() });
         }
-        let can_send = !draft.editor.read(cx).is_empty();
+        let can_send = !draft.editor.read(cx).text().trim().is_empty();
 
         card(theme)
             .flex()
@@ -985,6 +1011,7 @@ impl ThreadView {
                     .child(
                         IconButton::new("reply-pop-out", IconName::PanelRight)
                             .size(24.)
+                            .tooltip("Open full composer")
                             .on_click(cx.listener(|this, _, _, cx| this.pop_out(cx))),
                     ),
             )
@@ -1001,13 +1028,12 @@ impl ThreadView {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(IconButton::new("reply-attach", IconName::MailAttach).size(24.))
+                    .child(IconButton::new("reply-attach", IconName::MailAttach).size(24.).tooltip("Open full composer to add attachments")
+                        .on_click(cx.listener(|this, _, _, cx| this.pop_out(cx))))
                     .child(div().flex_1())
                     .child(div().text_size(px(SIZE_MINI)).text_color(theme.text_quaternary).child("⌘↵ to send"))
                     .child(
-                        div().when(!can_send, |s| s.opacity(0.5)).child(
-                            PrimaryButton::new("reply-send", "Send").on_click(cx.listener(|this, _, _, cx| this.send_reply(cx))),
-                        ),
+                        PrimaryButton::new("reply-send", "Send").disabled(!can_send).on_click(cx.listener(|this, _, _, cx| this.send_reply(cx))),
                     ),
             )
             .into_any_element()
@@ -1057,7 +1083,6 @@ fn property_chip(id: impl Into<gpui::ElementId>, theme: &Theme) -> gpui::Statefu
         .text_size(px(SIZE_MINI))
         .font_weight(WEIGHT_NORMAL)
         .text_color(theme.text_tertiary)
-        .hover(|s| s.bg(theme.bg_raised_hover))
 }
 
 /// History-entry row: 36px icon column, 12px tertiary text.
@@ -1145,7 +1170,7 @@ impl ThreadView {
                 let (html, key, this) = (html.clone(), key.clone(), cx.entity().downgrade());
                 // for the right-click menu: what the message offers besides the page
                 let ThreadItem::Message(m) = &thread.items[*ix] else { continue };
-                let (body, sender, email) = (m.body.clone(), m.from.name.clone(), m.from.email.clone());
+                let (body, sender, email, message_id) = (m.body.clone(), m.from.name.clone(), m.from.email.clone(), m.id.clone());
                 window.on_next_frame(move |window, cx| {
                     let _ = this.update(cx, |this, cx| {
                         // still shown? (the thread may have changed meanwhile)
@@ -1159,7 +1184,8 @@ impl ThreadView {
                                     }
                                 }
                                 crate::webview::MailWebViewEvent::ContextMenu { position, link, selection } => {
-                                    let items = context_menus::html_body(selection.clone(), link.clone(), body.clone(), sender.clone(), email.clone(), cx);
+                                    let latest = this.mailbox.read(cx).selected_thread().is_some_and(|t| t.latest().id == message_id);
+                                    let items = context_menus::html_body(selection.clone(), link.clone(), body.clone(), sender.clone(), email.clone(), latest, cx);
                                     context_menus::open(*position, items, window, cx);
                                 }
                             })

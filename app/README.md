@@ -179,6 +179,18 @@ defaults). `keymaps_enabled = false` suspends configurable bindings, not text ed
 clipboard, Quit or Reload. `?`, command hints and context-menu hints use effective bindings;
 shared menus omit shortcuts that differ between contexts.
 
+Cmd-1…Cmd-9 select profiles 1–9 in menu order; Cmd-0 selects profile 10. Without profiles,
+the same keys select accounts. Missing slots do nothing. `show_account_1`…`show_account_10`
+can be rebound or disabled in Pkl. `show_all_accounts` remains in the command menu but has
+no default digit binding; bind it explicitly to Cmd-0 if you prefer the previous behavior.
+
+Icon-only controls expose hover hints; unavailable controls are dim and do not advertise an
+active hover. List/thread action menus, tag chips and the header Reply button share the
+keyboard actions. Reply/forward on an older message are deliberately unavailable until the
+composer can target that exact message; they must not silently act on the latest message.
+Inline attachments open the full composer. Snooze and direct sidebar tag/view creation are
+not implemented. Save view is session-only; persistent search folders belong in `profiles.pkl`.
+
 Swift defaults replace the prototype's conflicting keys: `a` archives, `R` replies to all,
 `f` forwards, `t` opens tags, `l` enters thread mode, `h` returns. `gg`/`G` select the first/last
 **loaded** list thread, or focus the first/last message in a thread; repeated `G` scrolls to

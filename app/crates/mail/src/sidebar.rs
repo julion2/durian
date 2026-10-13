@@ -32,7 +32,8 @@ pub fn mail_titlebar(open: bool, on_toggle: impl Fn(&gpui::ClickEvent, &mut Wind
         .pl(px(89.))
         .pr(px(8.))
         .window_control_area(gpui::WindowControlArea::Drag)
-        .child(IconButton::new(if open { "sidebar-collapse" } else { "sidebar-expand" }, IconName::SidebarToggle).on_click(on_toggle))
+        .child(IconButton::new(if open { "sidebar-collapse" } else { "sidebar-expand" }, IconName::SidebarToggle)
+            .tooltip(if open { "Hide sidebar" } else { "Show sidebar" }).on_click(on_toggle))
 }
 
 impl gpui::EventEmitter<SidebarEvent> for MailSidebar {}
@@ -182,11 +183,13 @@ impl Render for MailSidebar {
                     // same actions as the shortcuts (⌘K, c), so menus, keys and buttons stay in sync
                     .child(
                         IconButton::new("search", IconName::Search)
+                            .tooltip("Command menu")
                             .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenCommandMenu), cx)),
                     )
                     .child(
                         IconButton::new("compose", IconName::Compose)
                             .style(ButtonStyle::Raised)
+                            .tooltip(if self.active == "calendar" { "New event" } else { "New message" })
                             .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::ComposeHere), cx)),
                     ),
             );
@@ -226,7 +229,7 @@ impl Render for MailSidebar {
         let tag_section = div()
             .child(
                 SectionHeader::new("tags", "Tags", tags_open)
-                    .action("add-tag", IconName::Plus)
+                    .action(IconButton::new("add-tag", IconName::Plus).tooltip("Create tags by adding them to a thread"))
                     .on_toggle(cx.listener(|this, _, _, cx| this.toggle(Section::Tags, cx))),
             )
             .when(tags_open, |this| {
@@ -255,7 +258,7 @@ impl Render for MailSidebar {
         let view_section = div()
             .child(
                 SectionHeader::new("views", "Views", views_open)
-                    .action("add-view", IconName::Plus)
+                    .action(IconButton::new("add-view", IconName::Plus).tooltip("Use Save view for this session; configure persistent folders in profiles.pkl"))
                     .on_toggle(cx.listener(|this, _, _, cx| this.toggle(Section::Views, cx))),
             )
             .when(views_open, |this| {
@@ -331,7 +334,7 @@ impl Render for MailSidebar {
                         );
                     }
                     menu.child(div().h(px(1.)).my(px(4.)).bg(theme.border_card))
-                        .child(row("acct-add".into(), Icon::new(IconName::Plus).color(theme.text_tertiary).into_any_element(), "Add account…".into(), None, None, Vec::new(), false))
+                        .child(div().px(px(8.)).py(px(6.)).text_size(px(SIZE_MINI)).text_color(theme.text_tertiary).child("Manage accounts in config.pkl"))
                 } else {
                     // profiles as configured in durian (profiles.pkl): name, accounts, ⌘1…
                     menu.children(profiles.iter().enumerate().map(|(n, p)| {

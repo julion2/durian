@@ -134,6 +134,7 @@ pub fn render(
     let s = schedule.read(cx);
     let calendar = s.calendar(&event.calendar).cloned();
     let cancelled = kind == Kind::Cancel;
+    let can_respond = s.event(&event.id).is_some();
     // the day's other events only when they're all here – else it would look free
     let known = s.knows(event.start.date()) && !cancelled;
     let clashing: Vec<Event> = if known { conflicts(s, &event).into_iter().cloned().collect() } else { Vec::new() };
@@ -232,7 +233,8 @@ pub fn render(
                 .flex()
                 .items_center()
                 .gap(px(12.))
-                .when(kind == Kind::Request, |r| r.child(rsvp_buttons(schedule, &event, theme).w(px(300.))))
+                .when(kind == Kind::Request && can_respond, |r| r.child(rsvp_buttons(schedule, &event, theme).w(px(300.))))
+                .when(kind == Kind::Request && !can_respond, |r| r.child(div().text_size(px(SIZE_MINI)).text_color(theme.text_tertiary).child("Load this event in Calendar to respond")))
                 .child(div().flex_1())
                 .child(
                     div()

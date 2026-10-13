@@ -430,7 +430,7 @@ impl Render for EventComposer {
                     .child(div().text_size(px(SIZE_SMALL)).text_color(theme.text_meta).child("›"))
                     .child(div().text_size(px(SIZE_SMALL)).child(if self.editing.is_some() { "Edit event" } else { "New event" }))
                     .child(div().flex_1())
-                    .child(IconButton::new("event-close", IconName::CloseSmall).on_click(cx.listener(|this, _, window, cx| this.close(&Close, window, cx)))),
+                    .child(IconButton::new("event-close", IconName::CloseSmall).tooltip("Close event editor").on_click(cx.listener(|this, _, window, cx| this.close(&Close, window, cx)))),
             )
             .child(
                 div()
@@ -493,9 +493,7 @@ impl Render for EventComposer {
                     )
                     .child(div().flex_1())
                     .child(div().text_size(px(SIZE_MINI)).text_color(theme.text_quaternary).child("⌘↵ to save"))
-                    .child(div().when(self.parsed.is_none(), |s| s.opacity(0.5)).child(
-                        PrimaryButton::new("event-save", "Save").on_click(cx.listener(|this, _, window, cx| this.save(&Send, window, cx))),
-                    )),
+                    .child(PrimaryButton::new("event-save", "Save").disabled(self.parsed.is_none()).on_click(cx.listener(|this, _, window, cx| this.save(&Send, window, cx)))),
             )
             .into_any_element()
     }

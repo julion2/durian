@@ -79,7 +79,8 @@ impl RenderOnce for NavItem {
         let theme = cx.theme();
         // the active item recedes while the window is in the background
         let active_bg = if window.is_window_active() { theme.bg_nav_active } else { theme.bg_nav_active.opacity(0.5) };
-        let fg = if self.active { theme.text_nav_active } else { theme.text_muted };
+        let enabled = self.on_click.is_some();
+        let fg = if !enabled { theme.text_quaternary } else if self.active { theme.text_nav_active } else { theme.text_muted };
         let leading = self.leading.or_else(|| self.icon.map(|i| Icon::new(i).color(fg).into_any_element()));
         div()
             .id(self.id)
@@ -95,7 +96,7 @@ impl RenderOnce for NavItem {
             .text_size(px(SIZE_SMALL))
             .font_weight(WEIGHT_MEDIUM)
             .text_color(fg)
-            .map(|s| if self.active { s.bg(active_bg) } else { s.hover(|s| s.bg(theme.bg_nav_hover)) })
+            .when(enabled, |s| s.cursor_pointer().map(|s| if self.active { s.bg(active_bg) } else { s.hover(|s| s.bg(theme.bg_nav_hover)) }))
             .children(leading.map(|el| div().flex().flex_none().items_center().justify_center().size(px(14.)).child(el)))
             .child(div().flex_1().min_w_0().truncate().child(self.label))
             // counts: one step smaller, tabular digits so 1/2/3 share a right edge, quaternary ink
@@ -118,7 +119,7 @@ pub struct SectionHeader {
     id: ElementId,
     label: SharedString,
     open: bool,
-    action: Option<(ElementId, IconSource)>,
+    action: Option<IconButton>,
     on_toggle: Option<ClickHandler>,
 }
 
@@ -127,8 +128,8 @@ impl SectionHeader {
         Self { id: id.into(), label: label.into(), open, action: None, on_toggle: None }
     }
 
-    pub fn action(mut self, id: impl Into<ElementId>, icon: impl Into<IconSource>) -> Self {
-        self.action = Some((id.into(), icon.into()));
+    pub fn action(mut self, button: IconButton) -> Self {
+        self.action = Some(button);
         self
     }
 
@@ -175,8 +176,8 @@ impl RenderOnce for SectionHeader {
                     )
                     .when_some(self.on_toggle, |s, f| s.on_click(f)),
             )
-            .children(self.action.map(|(id, icon)| {
-                div().mr(px(2.)).invisible().group_hover(group, |s| s.visible()).child(IconButton::new(id, icon).size(24.))
+            .children(self.action.map(|button| {
+                div().mr(px(2.)).invisible().group_hover(group, |s| s.visible()).child(button.size(24.))
             }))
     }
 }

@@ -218,6 +218,18 @@ BACKEND_PID=$(pgrep -P "$APP_PID" -x durian-cli)
 expect_inbox_count live 0
 echo 'PASS packaged sibling backend and opening a thread marks it read'
 
+# Toolbar buttons must expose real actions, not just hover chrome.
+xdotool mousemove --window "$WINDOW" 315 64 click 1
+expect_screen list-actions 'Toggle list layout'
+xdotool key --clearmodifiers Escape
+xdotool mousemove --window "$WINDOW" 788 64 click 1
+expect_screen thread-actions 'Reply all'
+xdotool key --clearmodifiers Escape
+xdotool mousemove --window "$WINDOW" 700 169 click 1
+expect_screen tag-chip-picker 'Add tags'
+xdotool key --clearmodifiers Escape
+expect_screen toolbar-restored 'Reply body'
+
 xdotool key --clearmodifiers a
 expect_screen archived 'Different thread' 'Reply body'
 [[ "$("$CLI" count 'tag:inbox')" == 1 ]]
@@ -555,7 +567,7 @@ echo 'PASS native composer save/restart/Bcc/enqueue/confirmed Undo against encry
 # A sent inline reply keeps its recovery receipt, not ownership of the next editor.
 xdotool key --clearmodifiers g i
 expect_screen inline-ready 'Reply body'
-xdotool key --clearmodifiers r
+xdotool mousemove --window "$WINDOW" 1325 64 click 1
 xdotool type --clearmodifiers --delay 15 'InlineFirst'
 expect_screen inline-edited 'InlineFirst'
 xdotool key --clearmodifiers ctrl+BackSpace

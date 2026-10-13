@@ -175,7 +175,7 @@ impl Render for ShortcutHelp {
                     .font_weight(WEIGHT_MEDIUM)
                     .text_color(theme.text_primary)
                     .child(div().flex_1().child("Keyboard shortcuts"))
-                    .child(IconButton::new("close-help", IconName::CloseSmall).on_click(cx.listener(|_, _, _, cx| cx.emit(ShortcutHelpEvent::Close)))),
+                    .child(IconButton::new("close-help", IconName::CloseSmall).tooltip("Close shortcuts").on_click(cx.listener(|_, _, _, cx| cx.emit(ShortcutHelpEvent::Close)))),
             )
             .child(
                 div().px(px(12.)).pb(px(10.)).child(

@@ -184,8 +184,8 @@ impl CalendarView {
                     .child("Today")
                     .on_click(cx.listener(|this, _, _, cx| this.schedule.update(cx, |s, cx| s.go_to_today(cx)))),
             )
-            .child(IconButton::new("prev-period", IconName::ArrowLeft).on_click(cx.listener(|this, _, _, cx| this.schedule.update(cx, |s, cx| s.shift(-1, cx)))))
-            .child(IconButton::new("next-period", IconName::ArrowRight).on_click(cx.listener(|this, _, _, cx| this.schedule.update(cx, |s, cx| s.shift(1, cx)))))
+            .child(IconButton::new("prev-period", IconName::ArrowLeft).tooltip("Previous period").on_click(cx.listener(|this, _, _, cx| this.schedule.update(cx, |s, cx| s.shift(-1, cx)))))
+            .child(IconButton::new("next-period", IconName::ArrowRight).tooltip("Next period").on_click(cx.listener(|this, _, _, cx| this.schedule.update(cx, |s, cx| s.shift(1, cx)))))
     }
 }
 
