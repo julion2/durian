@@ -1,4 +1,4 @@
-use gpui::{App, ImageSource, IntoElement, RenderOnce, SharedString, Window, div, img, prelude::*, px};
+use gpui::{App, ImageSource, IntoElement, ObjectFit, RenderOnce, SharedString, Window, div, img, prelude::*, px};
 
 use crate::theme::{ActiveTheme, lch, typography::*};
 
@@ -22,7 +22,7 @@ impl Avatar {
         self
     }
 
-    /// A company mark: drawn inset on a white disc so square favicons read as avatars.
+    /// A company mark filling the same circle, with a light backing for transparency.
     pub fn logo(mut self, path: impl Into<ImageSource>) -> Self {
         self.image = Some(path.into());
         self.logo = true;
@@ -60,10 +60,10 @@ impl RenderOnce for Avatar {
                     .rounded_full()
                     .bg(theme.bg_logo)
                     .shadow(theme.raised_shadow(false))
-                    .child(img(image).size(px((self.size * 0.62).round())))
+                    .child(img(image).size(size).object_fit(ObjectFit::Cover).rounded_full())
                     .into_any_element();
             }
-            Some(image) => return img(image).size(size).flex_none().rounded_full().into_any_element(),
+            Some(image) => return img(image).size(size).flex_none().object_fit(ObjectFit::Cover).rounded_full().into_any_element(),
             None => {}
         }
         div()

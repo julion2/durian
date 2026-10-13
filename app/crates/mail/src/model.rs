@@ -260,15 +260,25 @@ impl Thread {
         out
     }
 
-    /// Everyone on the thread: senders, recipients and cc.
+    /// Visible participants, deduplicated by address across senders, To and Cc.
+    /// Display names can change between messages; Bcc is not public membership.
     pub fn people_count(&self) -> usize {
-        let mut all: Vec<&SharedString> = Vec::new();
-        for m in self.messages() {
-            for name in std::iter::once(&m.from.name).chain(&m.to).chain(&m.cc) {
-                if !all.contains(&name) {
-                    all.push(name);
+        let senders: HashSet<_> = self.messages()
+            .map(|m| (m.from.name.trim(), m.from.email.trim().to_ascii_lowercase()))
+            .filter(|(_, email)| !email.is_empty())
+            .collect();
+        let mut all: HashSet<_> = senders.iter().map(|(_, email)| email.clone()).collect();
+        for raw in self.messages().flat_map(|m| m.to.iter().chain(&m.cc)) {
+            let mut email = crate::durian::parse_address(raw).email.trim().to_ascii_lowercase();
+            if !email.contains('@') {
+                // Older demo recipients have names only. Resolve an exact name
+                // only when one sender address owns it; never merge real addresses.
+                let mut matches = senders.iter().filter(|(name, _)| *name == raw.trim());
+                if let (Some((_, address)), None) = (matches.next(), matches.next()) {
+                    email = address.clone();
                 }
             }
+            if !email.is_empty() { all.insert(email); }
         }
         all.len()
     }

@@ -74,7 +74,7 @@ const MAX_DECODE_ALLOC: u64 = 32 << 20;
 type Picture = Option<(Arc<RenderImage>, bool)>;
 type ResultMessage = (String, Picture);
 
-/// Where a sender's picture comes from, and whether it's a logo (drawn inset on a disc).
+/// Where a sender's picture comes from, and whether it needs a logo's light backing.
 #[derive(Debug, PartialEq)]
 pub enum Source {
     Gravatar(String),

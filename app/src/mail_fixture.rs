@@ -81,6 +81,14 @@ mod tests {
     }
 
     #[test]
+    fn demo_participants_count_name_only_recipients_once() {
+        let mailbox = mailbox();
+        let thread = mailbox.threads.iter().find(|t| t.id == "rfc-tags").unwrap();
+        // Mara, Tobias and Julian alternate sender/recipient roles over five messages.
+        assert_eq!(thread.people_count(), 3);
+    }
+
+    #[test]
     fn matches_fixture_threads() {
         assert_eq!(ids("tag:incident"), ["incident", "invite-postmortem"]);
         assert!(ids("tag:oss -tag:alerts").contains(&"gpui-pr".to_string()));

@@ -563,9 +563,25 @@ mod tests {
         assert!(!full.partial && full.account == "me@x");
         assert_eq!(full.messages().map(|m| m.body.to_string()).collect::<Vec<_>>(), ["first", "later"], "oldest first");
         assert!(full.unread());
+        assert_eq!(full.people_count(), 2, "each address counts once across sender and recipient roles");
         assert_eq!(full.messages().next().unwrap().attachments[0].size.as_ref(), "2 KB");
         let row = summary(&search.results[1], 200);
         assert!(row.partial && row.starred && !row.unread());
+    }
+
+    #[test]
+    fn thread_participants_use_addresses_not_display_names() {
+        let content: api::ThreadContent = serde_json::from_value(serde_json::json!({
+            "thread_id": "participants", "subject": "Hello", "messages": [
+                {"id": "1", "from": "\"Doe, Jane\" < JANE@example.test >", "to": "Pat <pat@example.test>, Alex <alex@example.test>",
+                 "cc": "Jane D. <jane@example.test>, Pat <PAT@example.test>, Pat <pat+team@example.test>", "bcc": "hidden@example.test"},
+                {"id": "2", "from": "pat@example.test", "to": "JANE@EXAMPLE.TEST", "cc": "Alex Renamed <alex@example.test>"},
+                {"id": "3", "from": "Jane Changed <jane@example.test>", "to": "Pat Renamed <pat@example.test>", "cc": "Pat <pat+team@example.test>"},
+                {"id": "4", "from": "", "to": "", "cc": ""}
+            ]
+        })).unwrap();
+        let full = thread(&content, 0, Default::default()).unwrap();
+        assert_eq!(full.people_count(), 4, "ignore names, casing, duplicates, empty addresses and Bcc; do not guess that different addresses are aliases");
     }
 
     fn event(json: &str) -> api::CalendarEvent {

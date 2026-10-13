@@ -71,6 +71,12 @@ screen() {
   import -window "$WINDOW" "$OUT/$1.png"
   OCR_SCALE=2
   case "$1" in
+    participants)
+      # The low-contrast chip is lost in whole-page OCR beside white HTML.
+      # Read the thread heading and metadata independently, as for Inbox badges.
+      OCR_SCALE=3
+      convert "$OUT/$1.png" -crop 730x105+665+105 -resize 300% -colorspace Gray -normalize -negate "$ROOT/ocr.png"
+      ;;
     reconnecting)
       # The short-lived status pill is behind the dimmed composer. Isolate it
       # before OCR so white HTML and the modal do not hide its lower contrast.
@@ -205,6 +211,7 @@ assert_gone() {
 }
 
 expect_screen live 'Reply body'
+expect_screen participants '2 people' '4 people'
 BACKEND_PID=$(pgrep -P "$APP_PID" -x durian-cli)
 [[ "$("$CLI" count 'tag:inbox')" == 2 ]]
 [[ "$("$CLI" count 'tag:unread')" == 0 ]]
