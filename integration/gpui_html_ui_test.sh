@@ -57,8 +57,10 @@ expect() {
   cat "$ROOT/screen.txt"; return 1
 }
 point() {
+  # Drain all OCR output: exiting at the first match can SIGPIPE Tesseract
+  # under pipefail, even though the expected control is visibly present.
   tesseract "$ROOT/ocr.png" stdout --psm 11 tsv 2>/dev/null |
-    awk -F '\t' -v word="$1" '$12 == word { print 650+int(($7+$9/2)/2), int(($8+$10/2)/2); exit }'
+    awk -F '\t' -v word="$1" '!found && $12 == word { print 650+int(($7+$9/2)/2), int(($8+$10/2)/2); found=1 }'
 }
 click() {
   local p; p=$(point "$1"); [[ -n "$p" ]]
@@ -121,7 +123,8 @@ for theme in dark light; do
   sleep .3
   screen "$theme-copy"
   convert "$OUT/$theme-copy.png" -crop 385x35+250+90 -resize 300% -colorspace Gray -negate "$ROOT/search.png"
-  tesseract "$ROOT/search.png" stdout --psm 7 2>/dev/null | grep -qi 'Reply body'
+  tesseract "$ROOT/search.png" stdout --psm 7 2>/dev/null > "$ROOT/search.txt"
+  grep -qi 'Reply body' "$ROOT/search.txt"
   xdotool key --clearmodifiers Escape Escape
   expect "$theme-text" 'Show original layout'
   click Show
