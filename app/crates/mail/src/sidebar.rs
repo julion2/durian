@@ -284,10 +284,8 @@ impl Render for MailSidebar {
             .child(mail_titlebar(true, cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ToggleSidebar))))
             .when(self.menu_open, |s| {
                 let account_keys = |n: usize| -> Vec<SharedString> {
-                    let action: Box<dyn gpui::Action> = match n {
-                        0 => Box::new(crate::ShowAllAccounts), 1 => Box::new(crate::ShowAccount1),
-                        2 => Box::new(crate::ShowAccount2), 3 => Box::new(crate::ShowAccount3), _ => return Vec::new(),
-                    };
+                    let name = if n == 0 { "show_all_accounts".to_string() } else { format!("show_account_{n}") };
+                    let Some(action) = crate::commands::action_for(&name) else { return Vec::new() };
                     crate::commands::keys_for(action.as_ref(), &[crate::keymaps::Context::List, crate::keymaps::Context::Thread, crate::keymaps::Context::Calendar], cx)
                 };
                 let row = |id: SharedString, leading: AnyElement, label: SharedString, detail: Option<SharedString>, count: Option<SharedString>, keys: Vec<SharedString>, selected: bool| {
@@ -363,7 +361,12 @@ impl Render for MailSidebar {
                                 this.menu_open = false;
                                 cx.notify();
                             }))
-                            .child(div().absolute().left(px(12.)).top(px(84.)).on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(menu)),
+                            .child(div().absolute().left(px(12.)).top(px(84.))
+                                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                    this.menu_open = false;
+                                    cx.notify();
+                                }))
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(menu)),
                     )
                     .with_priority(3),
                 )

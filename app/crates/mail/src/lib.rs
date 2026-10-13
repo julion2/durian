@@ -49,7 +49,7 @@ use thread_list::{LIST_WIDTH, Layout, ThreadList, ThreadListEvent};
 use compose::{ComposeDialog, ComposeEvent, ComposeSeed};
 use thread_view::{ThreadView, ThreadViewEvent};
 
-actions!(mail, [SelectNext, SelectPrev, Archive, ToggleStar, ToggleFocusMode, ExitFocusMode, ToggleExpandAll, OpenCommandMenu, OpenTagPicker, Reply, ReplyAll, NewMessage, Forward, GoToDrafts, GoToInbox, PreviewAttachment, ToggleSidebar, ShowAllAccounts, ShowAccount1, ShowAccount2, ShowAccount3, ToggleDarkMode, UseSystemAppearance, ShowContextMenu, ToggleRead, FocusSearch, ToggleShortcutHelp, ToggleListLayout, OpenThread, GoToCalendar, NewEvent, ComposeHere, EventFromThread, CopySelection, SelectAllText, Retry]);
+actions!(mail, [SelectNext, SelectPrev, Archive, ToggleStar, ToggleFocusMode, ExitFocusMode, ToggleExpandAll, OpenCommandMenu, OpenTagPicker, Reply, ReplyAll, NewMessage, Forward, GoToDrafts, GoToInbox, PreviewAttachment, ToggleSidebar, ShowAllAccounts, ShowAccount1, ShowAccount2, ShowAccount3, ShowAccount4, ShowAccount5, ShowAccount6, ShowAccount7, ShowAccount8, ShowAccount9, ShowAccount10, ToggleDarkMode, UseSystemAppearance, ShowContextMenu, ToggleRead, FocusSearch, ToggleShortcutHelp, ToggleListLayout, OpenThread, GoToCalendar, NewEvent, ComposeHere, EventFromThread, CopySelection, SelectAllText, Retry]);
 actions!(keymaps, [ReloadKeymaps]);
 
 /// Menu requested by a view (see `context_menus::open`), picked up by the workspace.
@@ -880,8 +880,9 @@ impl MailWorkspace {
         })
     }
 
-    fn show_account(&mut self, ix: Option<usize>, cx: &mut Context<Self>) {
-        // with profiles, ⌘1… pick profiles and ⌘0 the one spanning all accounts
+    fn show_account(&mut self, ix: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        // With profiles, digit shortcuts pick the same ordered slots as the menu.
+        // ShowAllAccounts remains a separate command, not the tenth slot.
         let profiles = &self.mailbox.read(cx).profiles;
         if !profiles.is_empty() {
             let target = match ix {
@@ -890,6 +891,7 @@ impl MailWorkspace {
             };
             if let Some(ix) = target {
                 self.switch_profile(ix, cx);
+                self.focus_area(window, cx);
             }
             return;
         }
@@ -1073,10 +1075,17 @@ impl Render for MailWorkspace {
                 cx.set_global(Appearance::System);
                 ui::theme::apply_appearance(cx);
             }))
-            .on_action(cx.listener(|this, _: &ShowAllAccounts, _, cx| this.show_account(None, cx)))
-            .on_action(cx.listener(|this, _: &ShowAccount1, _, cx| this.show_account(Some(0), cx)))
-            .on_action(cx.listener(|this, _: &ShowAccount2, _, cx| this.show_account(Some(1), cx)))
-            .on_action(cx.listener(|this, _: &ShowAccount3, _, cx| this.show_account(Some(2), cx)))
+            .on_action(cx.listener(|this, _: &ShowAllAccounts, window, cx| this.show_account(None, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAccount1, window, cx| this.show_account(Some(0), window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAccount2, window, cx| this.show_account(Some(1), window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAccount3, window, cx| this.show_account(Some(2), window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAccount4, window, cx| this.show_account(Some(3), window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAccount5, window, cx| this.show_account(Some(4), window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAccount6, window, cx| this.show_account(Some(5), window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAccount7, window, cx| this.show_account(Some(6), window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAccount8, window, cx| this.show_account(Some(7), window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAccount9, window, cx| this.show_account(Some(8), window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAccount10, window, cx| this.show_account(Some(9), window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();

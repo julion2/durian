@@ -29,7 +29,16 @@ chmod 700 "$TMPDIR" "$XDG_RUNTIME_DIR"
 # card and its focus marker instead of only unindented incoming messages.
 sed -e '/    smtp {/d' -e '/    imap {/d' -e '/    auth {/d' \
   -e 's/email = "test@example.com"/email = "bob@example.com"/' "$CONFIG" > "$XDG_CONFIG_HOME/durian/config.pkl"
-cp "$(dirname "$CONFIG")/profiles.pkl" "$XDG_CONFIG_HOME/durian/profiles.pkl"
+cat > "$XDG_CONFIG_HOME/durian/profiles.pkl" <<'PKL'
+import "modulepath:/Profiles.pkl" as P
+profiles: Listing<P.ProfileConfig> = new {
+  new { name = "All"; accounts = new { "*" }; folders = P.standardFolders }
+  new { name = "Test"; accounts = new { "test" }; default = true; folders = new { new { name = "Inbox"; query = "tag:inbox" } } }
+PKL
+for name in Third Fourth Fifth Sixth Seventh Eighth Ninth Tenth; do
+  printf '  new { name = "%s"; accounts = new { "test" }; folders = new { new { name = "Inbox"; query = "tag:inbox" } } }\n' "$name" >> "$XDG_CONFIG_HOME/durian/profiles.pkl"
+done
+printf '}\n' >> "$XDG_CONFIG_HOME/durian/profiles.pkl"
 # Public fixture key. Provider transports are absent; this cannot send mail.
 export DURIAN_MASTER_KEY_HEX_SECRET="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 "$SEEDER" -list-rows 20 "$XDG_DATA_HOME/durian/email.db" "$XDG_DATA_HOME/durian/contacts.db"
@@ -63,6 +72,11 @@ screen() {
   [[ "$1" == picker-* ]] && crop=700x600+350+70
   [[ "$1" == sent-* ]] && crop=390x660+252+105
   [[ "$1" == sent-wide ]] && crop=1168x660+244+105
+  if [[ "$1" == profile-* ]]; then
+    convert "$OUT/$1.png" -crop 130x24+42+52 -resize 400% -colorspace Gray -negate -normalize -bordercolor white -border 12 "$ROOT/ocr.png"
+    tesseract "$ROOT/ocr.png" stdout --psm 11 2>/dev/null > "$ROOT/screen.txt"
+    return
+  fi
   convert "$OUT/$1.png" -crop "$crop" -resize 200% -colorspace Gray -normalize "$ROOT/ocr.png"
   tesseract "$ROOT/ocr.png" stdout --psm 11 2>/dev/null > "$ROOT/screen.txt"
 }
@@ -117,6 +131,25 @@ count() {
 expect initial 'Reply body'
 for _ in {1..80}; do grep -q 'keymaps loaded;' "$ROOT/app.log" && break; sleep 0.1; done
 grep -q 'keymaps loaded;' "$ROOT/app.log"
+# The ordered profile menu and its shortcuts cover all ten digit slots.
+xdotool mousemove --window "$WINDOW" 60 64 click 1
+expect selection-profile-menu 'Tenth'
+xdotool mousemove --window "$WINDOW" 1000 100 click 1
+expect selection-profile-dismissed 'Reply body' 'Tenth'
+for pair in 1:All 2:Test 3:Third 4:Fourth 5:Fifth 6:Sixth 7:Seventh 8:Eighth 9:Ninth 0:Tenth; do
+  keys "super+${pair%%:*}"
+  expect "profile-${pair%%:*}" "${pair#*:}"
+done
+keys super+2
+expect profile-restored 'Test'
+keys l super+9
+expect profile-thread-context 'Ninth'
+keys h g c super+0
+expect profile-calendar-context 'Tenth'
+keys super+2
+expect profile-restored-again 'Test'
+keys g g
+expect initial-restored 'Reply body'
 keys j a
 expect disabled-defaults 'Reply body'
 count 'tag:inbox' 22

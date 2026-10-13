@@ -465,6 +465,28 @@ mod tests {
     }
 
     #[test]
+    fn ten_profile_shortcuts_use_the_effective_keymap() {
+        let defaults = Keymaps::default();
+        let now = Instant::now();
+        for context in [Context::List, Context::Thread, Context::Calendar] {
+            for n in 1..=10 {
+                assert_eq!(feed(&mut Engine::default(), &defaults, context, &format!("cmd-{}", n % 10), now),
+                    Some((format!("show_account_{n}"), 1)));
+            }
+        }
+        let customized = maps(r#"{"keymaps":[
+            {"action":"show_account_9","key":"9","modifiers":["cmd"],"enabled":false},
+            {"action":"show_all_accounts","key":"0","modifiers":["cmd"]}
+        ]}"#);
+        assert_eq!(feed(&mut Engine::default(), &customized, Context::List, "cmd-9", now), None);
+        assert_eq!(feed(&mut Engine::default(), &customized, Context::List, "cmd-0", now), Some(("show_all_accounts".into(), 1)));
+        assert_eq!(feed(&mut Engine::default(), &customized, Context::Thread, "cmd-0", now), Some(("show_account_10".into(), 1)));
+        for context in [Context::Search, Context::TagPicker, Context::ComposeNormal] {
+            assert_eq!(feed(&mut Engine::default(), &defaults, context, "cmd-4", now), None);
+        }
+    }
+
+    #[test]
     fn user_slots_disable_override_and_restore_without_changing_other_contexts() {
         let maps = maps(
             r#"{"keymaps":[
