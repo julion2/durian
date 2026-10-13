@@ -453,7 +453,6 @@ mod tests {
             let (limited_tx, limited_rx) = mpsc::channel();
             let server = std::thread::spawn(move || {
                 let mut not_before = Instant::now();
-                let mut previous_read = None;
                 // Initial count 429, unrelated version, non-replayed write 429,
                 // foreground search, then the retried count and three other counts.
                 for index in 0..8 {
@@ -495,10 +494,9 @@ mod tests {
                     };
                     if index >= 3 {
                         assert!(arrived >= not_before, "a different reader ignored the shared Retry-After");
-                        if let Some(previous) = previous_read {
-                            assert!(arrived.duration_since(previous) >= Duration::from_millis(100), "background reads still burst after cooldown");
-                        }
-                        previous_read = Some(arrived);
+                        // A descheduled server can accept two already queued sockets
+                        // together. Check the cumulative wire budget, not accept gaps.
+                        assert!(arrived.duration_since(not_before) >= Duration::from_millis(100 * (index - 3)), "background reads still burst after cooldown");
                     }
                     let header = if index == 0 && date_header {
                         let at = chrono::Utc::now() + chrono::Duration::seconds(3);
@@ -513,6 +511,8 @@ mod tests {
                     } else { String::new() };
                     write!(stream, "HTTP/1.1 {status} X\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                     if index == 0 { limited_tx.send(()).unwrap(); }
+                    // Deliberately let paced clients queue while the observer sleeps.
+                    if index == 3 { std::thread::sleep(Duration::from_millis(200)); }
                 }
             });
             std::thread::scope(|scope| {
