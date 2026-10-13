@@ -538,7 +538,7 @@ impl MailWorkspace {
         self.clear_key_sequence();
         if on && !self.focus_mode {
             self.mailbox.update(cx, |m, cx| m.clear_selection(cx));
-            self.thread.update(cx, |t, cx| t.message_edge(false, cx));
+            self.thread.update(cx, |t, cx| t.open_latest(cx));
         }
         self.focus_mode = on;
         if self.thread_visible() {

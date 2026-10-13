@@ -25,11 +25,15 @@ export MAILRENDER_BIN="$ROOT/no-renderer"
 unset MAIL_BACKEND MAIL_TOKEN DURIAN_BIN MAIL_FOLDER MAIL_BACKGROUND
 mkdir -p "$HOME" "$XDG_CONFIG_HOME/durian" "$XDG_DATA_HOME/durian" "$TMPDIR" "$XDG_RUNTIME_DIR"
 chmod 700 "$TMPDIR" "$XDG_RUNTIME_DIR"
-sed -e '/    smtp {/d' -e '/    imap {/d' -e '/    auth {/d' "$CONFIG" > "$XDG_CONFIG_HOME/durian/config.pkl"
+# The latest reply is ours, so message navigation also exercises the indented
+# card and its focus marker instead of only unindented incoming messages.
+sed -e '/    smtp {/d' -e '/    imap {/d' -e '/    auth {/d' \
+  -e 's/email = "test@example.com"/email = "bob@example.com"/' "$CONFIG" > "$XDG_CONFIG_HOME/durian/config.pkl"
 cp "$(dirname "$CONFIG")/profiles.pkl" "$XDG_CONFIG_HOME/durian/profiles.pkl"
 # Public fixture key. Provider transports are absent; this cannot send mail.
 export DURIAN_MASTER_KEY_HEX_SECRET="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 "$SEEDER" -list-rows 20 "$XDG_DATA_HOME/durian/email.db" "$XDG_DATA_HOME/durian/contacts.db"
+"$CLI" tag 'from:bob' +sent
 KEYMAPS="$XDG_CONFIG_HOME/durian/keymaps.pkl"
 cat > "$KEYMAPS" <<'PKL'
 global_settings { sequence_timeout = 0.35 }
@@ -40,6 +44,7 @@ keymaps {
   new { action = "tag_op"; key = "zz"; tags = "+keymap-proof" }
   new { action = "confirm_selection"; key = "y"; modifiers { "ctrl" }; context = "tag_picker" }
   new { action = "calendar_today"; key = "b"; context = "calendar" }
+  new { action = "toggle_list_layout"; key = "z"; modifiers { "ctrl" } }
 }
 PKL
 openbox --sm-disable > "$ROOT/wm.log" 2>&1 & WM_PID=$!
@@ -56,6 +61,8 @@ screen() {
   [[ "$1" == message-* ]] && crop=1168x760+244+45
   [[ "$1" == selection-* ]] && crop=1440x850+0+0
   [[ "$1" == picker-* ]] && crop=700x600+350+70
+  [[ "$1" == sent-* ]] && crop=390x660+252+105
+  [[ "$1" == sent-wide ]] && crop=1168x660+244+105
   convert "$OUT/$1.png" -crop "$crop" -resize 200% -colorspace Gray -normalize "$ROOT/ocr.png"
   tesseract "$ROOT/ocr.png" stdout --psm 11 2>/dev/null > "$ROOT/screen.txt"
 }
@@ -113,6 +120,13 @@ grep -q 'keymaps loaded;' "$ROOT/app.log"
 keys j a
 expect disabled-defaults 'Reply body'
 count 'tag:inbox' 22
+# The reply's author is our account, but Sent identifies its recipient in both layouts.
+keys g s
+expect sent-split 'To alice' 'Other Thread'
+keys ctrl+z
+expect sent-wide 'To alice' 'Other Thread'
+keys ctrl+z g i
+expect sent-back-inbox 'Other Thread'
 keys 3 x
 expect counted-custom 'Snippetnumber 002'
 keys g g
@@ -184,6 +198,9 @@ reload
 # A short viewport exercises scrolling as the message cards expand.
 xdotool windowsize --sync "$WINDOW" 1420 500
 keys g g l
+expect message-open-latest 'Message[[:space:]]*3[[:space:]]*[o0]f[[:space:]]*3'
+grep -qi 'Reply body' "$ROOT/screen.txt"
+keys g g
 expect message-first 'Message[[:space:]]*[1lI][[:space:]]*[o0]f[[:space:]]*3'
 [[ "$(identify -format '%h' "$OUT/message-first.png")" == 500 ]]
 grep -qi 'First message body' "$ROOT/screen.txt"
@@ -200,6 +217,9 @@ expect message-edge-last 'Message[[:space:]]*3[[:space:]]*[o0]f[[:space:]]*3'
 keys g g
 expect message-edge-first 'Message[[:space:]]*[1lI][[:space:]]*[o0]f[[:space:]]*3'
 grep -qi 'First message body' "$ROOT/screen.txt"
+keys h l
+expect message-reopen-latest 'Message[[:space:]]*3[[:space:]]*[o0]f[[:space:]]*3'
+grep -qi 'Reply body' "$ROOT/screen.txt"
 xdotool windowsize --sync "$WINDOW" 1420 816
 keys h
 
@@ -249,7 +269,8 @@ keys Escape
 # Toggle marks are noncontiguous; Space advances without selecting its new cursor.
 keys g g shift+v 2 j space space 2 k space j
 # The count already equals two before the final j; observe its new cursor too.
-expect selection-toggle 'Toggle.*2' '' 'Snippetnumber 003'
+# OCR can render the leading zeros as capital O; the distinguishing row digit is exact.
+expect selection-toggle 'Toggle.*2' '' 'Snippetnumber [0O][0O]3'
 keys s
 count 'tag:flagged' 2
 count 'tag:flagged AND tag:range-proof' 1

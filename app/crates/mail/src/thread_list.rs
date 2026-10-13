@@ -482,6 +482,14 @@ fn people(thread: &Thread, mailbox: &Mailbox) -> SharedString {
 
 fn render_row(ix: usize, thread: &Thread, mailbox: &Mailbox, selected: bool, theme: &Theme) -> Stateful<Div> {
     let latest = thread.latest();
+    let contact = mailbox.list_contact(thread);
+    let label = if mailbox.is_me(&latest.from) && !mailbox.is_me(&contact) {
+        let count = thread.messages().count();
+        let name = first_name(&contact.name);
+        if count > 1 { format!("To {name} ({count})").into() } else { format!("To {name}").into() }
+    } else {
+        people(thread, mailbox)
+    };
     let unread = thread.unread();
     let fg = if unread { theme.text_primary } else { theme.text_tertiary };
     let opacity = if unread { 1. } else { 0.8 };
@@ -509,7 +517,7 @@ fn render_row(ix: usize, thread: &Thread, mailbox: &Mailbox, selected: bool, the
                 div().pt(px(12.)).flex_none().child(
                     div()
                         .relative()
-                        .child(contact_avatar(&latest.from).size(AVATAR))
+                        .child(contact_avatar(&contact).size(AVATAR))
                         // unread badge: centered on the avatar's rim at 10:30, ringed in the row color
                         .when(unread, |s| {
                             let rim = AVATAR / 2. * (1. - std::f32::consts::FRAC_1_SQRT_2);
@@ -573,7 +581,7 @@ fn render_row(ix: usize, thread: &Thread, mailbox: &Mailbox, selected: bool, the
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .child(format!("{} · {}", people(thread, mailbox), snippet)),
+                                    .child(format!("{label} · {snippet}")),
                             )
                             .child(div().flex_none().child(latest.ago.clone())),
                     ),
@@ -621,9 +629,10 @@ fn render_group(group: Bucket, count: usize, collapsed: bool, theme: &Theme) -> 
 /// tag pills · attachment / star · date.
 fn render_wide_row(ix: usize, thread: &Thread, mailbox: &Mailbox, selected: bool, theme: &Theme) -> Stateful<Div> {
     let latest = thread.latest();
+    let contact = mailbox.list_contact(thread);
     let unread = thread.unread();
     let (subject_fg, sender_fg) = if unread { (theme.text_primary, theme.text_primary) } else { (theme.text_secondary, theme.text_tertiary) };
-    let sender = if latest.from.name == mailbox.me.name { "me".into() } else { latest.from.name.clone() };
+    let sender = if mailbox.is_me(&contact) { "me".into() } else if mailbox.is_me(&latest.from) { format!("To {}", contact.name).into() } else { contact.name.clone() };
     let count = thread.messages().count();
     let attachment = thread.messages().any(|m| !m.attachments.is_empty());
     let tags: Vec<_> = thread.tags.iter().filter_map(|t| mailbox.tag(t)).take(3).cloned().collect();
@@ -643,7 +652,7 @@ fn render_wide_row(ix: usize, thread: &Thread, mailbox: &Mailbox, selected: bool
             .gap(px(10.))
             .text_size(px(SIZE_SMALL))
             .child(div().w(px(UNREAD_DOT)).flex_none().when(unread, |s| s.size(px(UNREAD_DOT)).rounded_full().bg(theme.accent)))
-            .child(contact_avatar(&latest.from).size(20.))
+            .child(contact_avatar(&contact).size(20.))
             .child(
                 div()
                     .flex()

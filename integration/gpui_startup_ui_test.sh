@@ -31,8 +31,10 @@ search_count() {
 }
 screen() {
   import -window "$WINDOW" "$CASE_OUT/$1.png"
-  # Only the actual list, never a search field or reading-pane header.
-  convert "$CASE_OUT/$1.png" -crop 390x660+252+105 -resize 300% -colorspace Gray -negate "$ROOT/ocr.png"
+  # Only actual list glyphs, except the explicit full-width thread-opening case.
+  local crop=390x660+252+105
+  [[ "$1" == thread-* ]] && crop=1168x760+244+45
+  convert "$CASE_OUT/$1.png" -crop "$crop" -resize 300% -colorspace Gray -negate "$ROOT/ocr.png"
   tesseract "$ROOT/ocr.png" stdout --psm 11 2>/dev/null > "$ROOT/list.txt"
 }
 expect_list() {
@@ -76,7 +78,7 @@ scroll_preview() {
   echo "FAIL did not scroll to preview row $target" >&2; return 1
 }
 
-for CASE in ${DURIAN_STARTUP_CASES:-initial headers navigation return return-pending refresh failure empty rate-limit previews previews-page previews-cancel}; do
+for CASE in ${DURIAN_STARTUP_CASES:-initial headers navigation return return-pending refresh failure empty rate-limit previews previews-page previews-cancel thread-open}; do
   ROOT="$BASE/$CASE"; CASE_OUT="$OUT/$CASE"
   mkdir -p "$ROOT" "$CASE_OUT"
   export HOME="$ROOT/home" XDG_DATA_HOME="$ROOT/data" XDG_STATE_HOME="$ROOT/state"
@@ -135,6 +137,10 @@ EOF
   MODE=hold; [[ "$CASE" == failure ]] && MODE=hold-reject
   [[ "$CASE" == headers ]] && MODE=hold-headers
   echo "GET /api/v1/search $MODE" > "$ROOT/fault"
+  if [[ "$CASE" == thread-open ]]; then
+    thread=$("$CLI" search from:bob --json | jq -er '.[0].thread_id')
+    echo "GET /api/v1/threads/$thread hold" > "$ROOT/fault"
+  fi
   : > "$CASE_OUT/requests.jsonl"
   python3 "$(dirname "$CONFIG")/fault_proxy.py" "$PORT" "$ROOT/fault" "$CASE_OUT/requests.jsonl" "$ROOT/proxy.port" > "$CASE_OUT/proxy.log" 2>&1 &
   PIDS+=("$!")
@@ -154,9 +160,30 @@ EOF
   grep -q 'accounts, .*addresses, .*tags' "$CASE_OUT/app.log"
   sleep 0.5
   # Identity/profile completion must not dispatch another copy of the held request.
-  search_count 0
+  if [[ "$CASE" == thread-open ]]; then search_count 1; else search_count 0; fi
   jq -se '[.[] | select(.path == "/api/v1/profiles")] | length == 1' "$CASE_OUT/requests.jsonl" > /dev/null
   case "$CASE" in
+    thread-open)
+      expect_list ready 'Hello World'
+      xdotool windowsize --sync "$WINDOW" 1420 500
+      xdotool key --clearmodifiers l
+      expect_list thread-pending 'Loading conversation'
+      touch "$ROOT/fault.release"
+      expect_list thread-latest 'Message[[:space:]]*3[[:space:]]*[o0]f[[:space:]]*3'
+      grep -qi 'Reply body' "$ROOT/list.txt"
+      # A later refresh must not jump back to newest after explicit navigation.
+      xdotool key --clearmodifiers g g
+      expect_list thread-first 'Message[[:space:]]*[1lI][[:space:]]*[o0]f[[:space:]]*3'
+      completed=$(grep -c "durian: thread $thread in" "$CASE_OUT/app.log")
+      xdotool key --clearmodifiers ctrl+r
+      for _ in {1..400}; do
+        [[ $(grep -c "durian: thread $thread in" "$CASE_OUT/app.log") -gt "$completed" ]] && break
+        kill -0 "$APP_PID"; sleep 0.025
+      done
+      [[ $(grep -c "durian: thread $thread in" "$CASE_OUT/app.log") -gt "$completed" ]]
+      expect_list thread-refreshed 'First message body'
+      grep -Eqi 'Message[[:space:]]*[1lI][[:space:]]*[o0]f[[:space:]]*3' "$ROOT/list.txt"
+      ;;
     initial|headers)
       touch "$ROOT/fault.release"
       expect_list ready 'Hello World'

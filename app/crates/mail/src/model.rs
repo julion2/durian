@@ -716,7 +716,26 @@ impl Mailbox {
     }
 
     pub fn is_me(&self, contact: &Contact) -> bool {
-        contact.email == self.me.email || self.accounts.iter().any(|a| a.email == contact.email)
+        contact.email.eq_ignore_ascii_case(&self.me.email) || self.accounts.iter().any(|a| {
+            a.email.eq_ignore_ascii_case(&contact.email) || a.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(&contact.email))
+        })
+    }
+
+    /// The list's avatar and label identify the other person, not ourselves when
+    /// the latest message is outgoing. To precedes Cc; Bcc stays out of previews.
+    /// Self-mail or a summary without recipients keeps the actual sender.
+    pub fn list_contact(&self, thread: &Thread) -> Contact {
+        let latest = thread.latest();
+        if self.is_me(&latest.from) {
+            for raw in latest.to.iter().chain(&latest.cc) {
+                // Message recipients are already split; a display name may contain a comma.
+                let contact = crate::durian::parse_address(raw);
+                if !contact.email.is_empty() && !self.is_me(&contact) {
+                    return contact;
+                }
+            }
+        }
+        latest.from.clone()
     }
 
     pub fn selected_thread(&self) -> Option<&Thread> {
@@ -1388,5 +1407,32 @@ mod count_tests {
         assert_ne!(first.html_jobs()[0].key, other.html_jobs()[0].key);
         let mut tagged = first.clone(); tagged.tags.push("flagged".into());
         assert_eq!(first.html_jobs()[0].key, tagged.html_jobs()[0].key);
+    }
+
+    #[test]
+    fn outgoing_list_contact_uses_recipients_not_own_primary_or_alias() {
+        let mut m = mailbox(true);
+        m.accounts[0].aliases.push("alias@work.test".into());
+        let cases = [
+            ("ME@WORK.TEST", "Me <me@home.test>, \"Doe, Jane\" <jane@example.test>", "cc@example.test", "jane@example.test", "Doe, Jane"),
+            ("Alias <ALIAS@WORK.TEST>", "Me <me@work.test>", "Other <other@example.test>", "other@example.test", "Other"),
+            ("Self <me@work.test>", "me@home.test", "ALIAS@WORK.TEST", "me@work.test", "Self"),
+            // A matching display name is not proof of identity; incoming stays incoming.
+            ("Me <stranger@example.test>", "me@work.test", "other@example.test", "stranger@example.test", "Me"),
+            ("Self <me@work.test>", "", "", "me@work.test", "Self"),
+        ];
+        for (from, to, cc, email, name) in cases {
+            let content: crate::durian::api::ThreadContent = serde_json::from_value(serde_json::json!({
+                "thread_id": "outgoing", "subject": "Hello", "messages": [{
+                    "id": "latest", "from": from, "to": to, "cc": cc, "bcc": "hidden@example.test"
+                }]
+            })).unwrap();
+            let thread = crate::durian::thread(&content, 0, Default::default()).unwrap();
+            let contact = m.list_contact(&thread);
+            assert_eq!((&*contact.email, &*contact.name), (email, name), "{from} to {to}, cc {cc}");
+            assert_eq!(thread.latest().from.email, crate::durian::parse_address(from).email);
+            let summary = serde_json::from_value(serde_json::json!({"thread_id": "outgoing", "from": from})).unwrap();
+            assert_eq!(m.list_contact(&crate::durian::summary(&summary, 0)).email, thread.latest().from.email);
+        }
     }
 }

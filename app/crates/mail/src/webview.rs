@@ -184,6 +184,7 @@ enum Message {
     Selection(String),
     Copy,
     Scroll { x: f32, y: f32, precise: bool, at: (f32, f32) },
+    PageScroll(ScrollRequest),
     Move { at: (f32, f32) },
     Cursor(CursorStyle),
     Hover(String),
@@ -199,6 +200,19 @@ struct MenuRequest {
     link: String,
     #[serde(default)]
     selection: String,
+}
+
+/// Fallback for wheels that reached WebKit rather than the AppKit monitor.
+#[derive(serde::Deserialize)]
+struct ScrollRequest {
+    x: f32,
+    y: f32,
+    dx: f32,
+    dy: f32,
+    control: bool,
+    alt: bool,
+    shift: bool,
+    command: bool,
 }
 
 pub enum MailWebViewEvent {
@@ -340,6 +354,8 @@ impl MailWebView {
                     }))
                 } else if let Some(url) = body.strip_prefix("hover:") {
                     Some(Message::Hover(url.to_string()))
+                } else if let Some(json) = body.strip_prefix("scroll:") {
+                    serde_json::from_str(json).ok().map(Message::PageScroll)
                 } else {
                     body.strip_prefix("menu:").and_then(|json| serde_json::from_str(json).ok()).map(Message::Menu)
                 };
@@ -399,6 +415,22 @@ impl MailWebView {
                         Message::Scroll { x, y, precise, at } => {
                             let delta = if precise { ScrollDelta::Pixels(point(px(x), px(y))) } else { ScrollDelta::Lines(point(x, y)) };
                             window.dispatch_event(PlatformInput::ScrollWheel(ScrollWheelEvent { position: point(px(at.0), px(at.1)), delta, ..Default::default() }), cx);
+                        }
+                        Message::PageScroll(request) => {
+                            if let Some(native) = observed.upgrade() {
+                                let native = native.borrow();
+                                if native.in_view && !native.overlay_shown && SHOWN.get()
+                                    && [request.x, request.y, request.dx, request.dy].iter().all(|v| v.is_finite()) {
+                                    let event = ScrollWheelEvent {
+                                        position: native.visible.origin + point(px(request.x), px(request.y)),
+                                        delta: ScrollDelta::Pixels(point(px(request.dx), px(request.dy))),
+                                        modifiers: Modifiers { control: request.control, alt: request.alt, shift: request.shift, platform: request.command, ..Default::default() },
+                                        ..Default::default()
+                                    };
+                                    drop(native);
+                                    window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+                                }
+                            }
                         }
                         Message::Move { at } => {
                             window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position: point(px(at.0), px(at.1)), pressed_button: None, modifiers: Modifiers::default() }), cx);

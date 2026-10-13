@@ -56,6 +56,8 @@ pub struct ThreadView {
     focused_message: Option<SharedString>,
     message_anchor: gpui::ScrollAnchor,
     reveal_message: bool,
+    /// Opening a summary must wait for the full conversation before choosing its newest message.
+    open_latest: bool,
     /// live views of the open thread's expanded HTML messages, by message and theme
     #[cfg(target_os = "macos")]
     webviews: std::collections::HashMap<SharedString, Entity<crate::webview::MailWebView>>,
@@ -113,6 +115,7 @@ impl ThreadView {
                 this.hovered_link = None;
                 this.focused_message = None;
                 this.reveal_message = false;
+                this.open_latest = false;
                 this.restore_reply(cx);
                 cx.notify();
             }
@@ -130,10 +133,17 @@ impl ThreadView {
         .detach();
         let scroll = gpui::ScrollHandle::new();
         let message_anchor = gpui::ScrollAnchor::for_handle(scroll.clone());
-        Self { mailbox, renderer, schedule, selection: ui::Selection::new(), reply: None, hovered_attachment: None, scroll, focused_message: None, message_anchor, reveal_message: false, toggled: HashSet::default(), show_quoted: HashSet::default(), show_plain: HashSet::default(), show_all: false, hovered_link: None, #[cfg(target_os = "macos")] webviews: Default::default(), #[cfg(target_os = "macos")] webviews_wanted: Default::default() }
+        Self { mailbox, renderer, schedule, selection: ui::Selection::new(), reply: None, hovered_attachment: None, scroll, focused_message: None, message_anchor, reveal_message: false, open_latest: false, toggled: HashSet::default(), show_quoted: HashSet::default(), show_plain: HashSet::default(), show_all: false, hovered_link: None, #[cfg(target_os = "macos")] webviews: Default::default(), #[cfg(target_os = "macos")] webviews_wanted: Default::default() }
+    }
+
+    /// Explicitly entering a thread starts at the newest message, not the reply box.
+    pub fn open_latest(&mut self, cx: &mut Context<Self>) {
+        self.open_latest = true;
+        cx.notify();
     }
 
     pub fn scroll_by(&mut self, count: isize, page: bool, cx: &mut Context<Self>) {
+        self.open_latest = false;
         let step = if page { f32::from(self.scroll.bounds().size.height) / 2. } else { 40. };
         let mut offset = self.scroll.offset();
         offset.y -= px(step * count as f32);
@@ -142,6 +152,7 @@ impl ThreadView {
     }
 
     pub fn message_edge(&mut self, last: bool, cx: &mut Context<Self>) {
+        self.open_latest = false;
         let Some(thread) = self.mailbox.read(cx).selected_thread().filter(|t| !t.partial) else { return };
         let id = if last { thread.messages().next_back() } else { thread.messages().next() }.map(|m| m.id.clone());
         if last && id.is_some() && self.focused_message == id {
@@ -155,6 +166,7 @@ impl ThreadView {
     }
 
     pub fn navigate_message(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.open_latest = false;
         let Some(thread) = self.mailbox.read(cx).selected_thread().filter(|t| !t.partial) else { return };
         let messages: Vec<_> = thread.messages().collect();
         if messages.is_empty() { return }
@@ -573,7 +585,6 @@ impl ThreadView {
                 context_menus::open(event.position, context_menus::message(menu_body.clone(), menu_sender.clone(), menu_email.clone(), cx), window, cx);
             })
             .group("message-card")
-            .when(mine, |s| s.ml(px(OWN_INDENT)))
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -657,7 +668,6 @@ impl ThreadView {
         let snippet = message.preview();
         card(theme)
             .id(("collapsed", ix))
-            .when(mine, |s| s.ml(px(OWN_INDENT)))
             .flex()
             .items_center()
             .gap(px(8.))
@@ -804,7 +814,7 @@ impl ThreadView {
             let latest = thread.latest();
             let own = |raw: &str| {
                 let contact = crate::durian::parse_address(raw);
-                mailbox.is_me(&contact) || mailbox.accounts.iter().any(|a| a.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(&contact.email)))
+                mailbox.is_me(&contact)
             };
             let mut seen = HashSet::new();
             let mut collect = |raw: &[SharedString]| raw.iter().filter(|address| {
@@ -1180,6 +1190,11 @@ impl ThreadView {
                     .child("Select a thread from the list"))
                 .into_any_element();
         };
+        if self.open_latest && !thread.partial {
+            self.open_latest = false;
+            self.focused_message = thread.messages().next_back().map(|m| m.id.clone());
+            self.reveal_message = self.focused_message.is_some();
+        }
         if !thread.partial && self.focused_message.is_some() {
             if let Some(ix) = thread.items.iter().position(|item| matches!(item, ThreadItem::Message(m) if Some(&m.id) == self.focused_message.as_ref())) {
                 // Reveal on navigation, not on every repaint: clicking a card or
@@ -1225,6 +1240,7 @@ impl ThreadView {
                     };
                     let focused = self.focused_message.as_ref() == Some(&m.id);
                     div().id(SharedString::from(format!("message-focus:{}", m.id))).anchor_scroll(focused.then(|| self.message_anchor.clone()))
+                        .when(mine, |s| s.ml(px(OWN_INDENT)))
                         .rounded(theme.radius.md).border_l_2().border_color(if focused { theme.accent } else { gpui::transparent_black() })
                         .child(content).into_any_element()
                 }

@@ -24,10 +24,27 @@ pub(crate) fn script(dark: bool, background: [u8; 3]) -> String {
     format!(
         r#"addEventListener('DOMContentLoaded', () => {{
             {dark_mode}
+            // Like Swift's NonScrollingWebView: only the host scrolls the document
+            // to mirror clipping. `clip` would also disable that programmatic scroll.
+            for (const element of [document.documentElement, document.body]) {{
+                element.style.setProperty('overflow', 'hidden', 'important');
+                element.style.setProperty('overscroll-behavior', 'none', 'important');
+            }}
             const height = () => window.ipc.postMessage('height:' + Math.max(document.documentElement.scrollHeight, document.body.scrollHeight));
             new ResizeObserver(height).observe(document.body);
             height();
         }}, {{once: true}});
+        // The AppKit monitor normally consumes wheels before they reach WebKit.
+        // Tracking loops can bypass local monitors: stop even nested HTML scrollers
+        // here and forward only those otherwise-unhandled events to the host.
+        addEventListener('wheel', event => {{
+            event.preventDefault();
+            const unit = event.deltaMode === 1 ? (parseFloat(getComputedStyle(document.body).lineHeight) || 20) : event.deltaMode === 2 ? innerHeight : 1;
+            window.ipc.postMessage('scroll:' + JSON.stringify({{
+                x: event.clientX, y: event.clientY, dx: -event.deltaX * unit, dy: -event.deltaY * unit,
+                control: event.ctrlKey, alt: event.altKey, shift: event.shiftKey, command: event.metaKey
+            }}));
+        }}, {{capture: true, passive: false}});
         addEventListener('click', event => {{
             const link = event.target.closest('a');
             if (link && !(link.getAttribute('href') || '').startsWith('#')) {{
