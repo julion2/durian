@@ -258,8 +258,19 @@ impl Backend {
             if self.0.cancelled.load(Ordering::Acquire) {
                 return Err((Error::Cancelled, false));
             }
-            let mut child = Command::new(binary)
-                .args(["serve", "--port", &port.to_string(), "--exit-when-orphaned"])
+            let mut command = Command::new(binary);
+            // Finder's PATH omits Homebrew and ~/.local/bin. Like Swift's backend
+            // launcher, supply those to the owned CLI so it can evaluate Pkl.
+            // Preserve explicitly supplied paths first; do not mutate the GUI environment.
+            #[cfg(target_os = "macos")]
+            {
+                let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+                let mut paths: Vec<_> = std::env::split_paths(&path).collect();
+                paths.extend([PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")]);
+                if let Some(home) = std::env::var_os("HOME") { paths.push(PathBuf::from(home).join(".local/bin")); }
+                if let Ok(path) = std::env::join_paths(paths) { command.env("PATH", path); }
+            }
+            let mut child = command.args(["serve", "--port", &port.to_string(), "--exit-when-orphaned"])
                 .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
                 .spawn().map_err(|error| {
                     eprintln!("[BACKEND] could not spawn durian (kind {:?}, OS code {:?})", error.kind(), error.raw_os_error());

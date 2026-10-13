@@ -1,6 +1,9 @@
 load("@rules_apple//apple:macos.bzl", "macos_application")
 load("@rules_swift//swift:swift.bzl", "swift_library", "swift_test")
 
+# Reuse the existing brand asset for the separately named Rust preview bundle.
+exports_files(["durian/CompiledIcons/release/AppIcon.icns"])
+
 config_setting(
     name = "release",
     values = {"compilation_mode": "opt"},

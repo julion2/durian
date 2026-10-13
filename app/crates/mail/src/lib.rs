@@ -3,6 +3,7 @@
 //! HTML rendering) lives here. Call [`bind_keys`] once at startup, after `ui::init`.
 
 pub mod attachments;
+pub mod app_menu;
 pub mod avatars;
 pub mod commands;
 mod calendar_menus;
@@ -927,11 +928,12 @@ impl Render for MailWorkspace {
         self.shown = PaneWidths { sidebar: sidebar_w, list: list_w };
         // built before the theme is borrowed below
         let (sidebar_handle, list_handle) = (self.resize_handle(Pane::Sidebar, cx), self.resize_handle(Pane::List, cx));
+        let view = self.app_menu_handlers(div(), window, cx);
         let theme = cx.theme();
         let (bg, panel, border, shadow, font, fg) =
             (theme.bg_app, theme.bg_panel, theme.border_panel, theme.panel_shadow(), theme.font_family, theme.text_primary);
 
-        div()
+        view
             // "Workspace" carries the shortcuts that work everywhere, "Mail" the mail area's; the
             // calendar view adds its own "Calendar" context below
             .key_context(if self.mode == Mode::Calendar { "Workspace" } else if self.focus_mode { "Workspace Mail ThreadKeys" } else { "Workspace Mail" })
@@ -1115,6 +1117,10 @@ impl Render for MailWorkspace {
             }))
             // ⌘C / ⌘A on read-only text: the open thread, or the event details in the calendar
             // (text fields handle their own – their bindings are deeper in the key context)
+            // The native Edit menu uses the editor's action types. Focused fields consume
+            // them first; only unhandled actions reach this read-only fallback.
+            .on_action(cx.listener(|_, _: &ui::Copy, window, cx| window.dispatch_action(Box::new(CopySelection), cx)))
+            .on_action(cx.listener(|_, _: &ui::SelectAll, window, cx| window.dispatch_action(Box::new(SelectAllText), cx)))
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
                 let selection = if this.mode == Mode::Calendar { this.calendar.read(cx).selection.clone() } else { this.thread.read(cx).selection.clone() };
                 if let Some(text) = selection.selected_text() {

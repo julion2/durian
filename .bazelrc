@@ -2,6 +2,14 @@
 build --workspace_status_command=tools/stamp.sh
 build --stamp
 
+# Keep the deployment minimum independent of the installed Xcode SDK. This
+# matches the Swift app's macOS 26 baseline; SDK 27 must not imply minos 27.
+build --enable_platform_specific_config
+build:macos --macos_minimum_os=26.0
+build:macos --action_env=MACOSX_DEPLOYMENT_TARGET=26.0
+build:macos --host_macos_minimum_os=26.0
+build:macos --host_action_env=MACOSX_DEPLOYMENT_TARGET=26.0
+
 # --- Caching ---
 build --disk_cache=~/.cache/bazel-disk
 

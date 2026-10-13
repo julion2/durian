@@ -14,9 +14,20 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
+    // Swift does not use MACOSX_DEPLOYMENT_TARGET as its default target. Pass
+    // the same minimum explicitly, preserving the artifact's (not host's) arch.
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    let minimum = std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "26.0".into());
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").expect("target architecture");
+    let arch = match arch.as_str() {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        other => panic!("unsupported macOS renderer architecture: {other}"),
+    };
+    let target = format!("{arch}-apple-macosx{minimum}");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("mailrender");
     let status = Command::new("xcrun")
-        .args(["swiftc", "-O", "-framework", "AppKit", "-framework", "WebKit", src, "-o"])
+        .args(["swiftc", "-target", &target, "-O", "-framework", "AppKit", "-framework", "WebKit", src, "-o"])
         .arg(&out)
         .status()
         .expect("failed to run swiftc (Xcode command line tools required)");

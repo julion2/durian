@@ -2,6 +2,7 @@ mod assets;
 mod backend;
 mod calendar_fixture;
 mod mail_fixture;
+mod menus;
 
 use std::sync::mpsc;
 
@@ -25,6 +26,7 @@ fn bind_keys(cx: &mut App) {
         gpui::KeyBinding::new("cmd-q", Quit, None),
         gpui::KeyBinding::new("ctrl-q", Quit, None),
     ]);
+    menus::bind_keys(cx);
 }
 
 enum Startup {
@@ -217,6 +219,7 @@ fn main() {
         }
         ui::theme::apply_appearance(cx);
         cx.set_global(mail::keymaps::Keymaps::default());
+        menus::init(cx);
         bind_keys(cx);
         cx.observe_global::<mail::keymaps::Keymaps>(bind_keys).detach();
         cx.on_action(|_: &Quit, cx| cx.quit());

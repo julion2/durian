@@ -1,5 +1,6 @@
 load("@gpui_crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load(":macos_bundle.bzl", "macos_bundle")
 load(":mailrender.bzl", "mailrender")
 load(":package_binary.bzl", "package_binary")
 
@@ -12,6 +13,51 @@ exports_files([
 package_binary(
     name = "durian-cli",
     src = "//cli/cmd/durian",
+)
+
+genrule(
+    name = "app_version",
+    outs = ["app-version.env"],
+    cmd = """
+        awk '
+            $$1 == "STABLE_VERSION" { print "DURIAN_VERSION=" $$2 }
+            $$1 == "STABLE_BUILD_NUMBER" { print "DURIAN_BUILD_NUMBER=" $$2 }
+            $$1 == "STABLE_GIT_COMMIT" { revision = $$2 }
+            $$1 == "STABLE_GIT_DIRTY" && $$2 == "true" { dirty = "-dirty" }
+            END { print "DURIAN_REVISION=" revision dirty }
+        ' bazel-out/stable-status.txt > $@
+    """,
+    stamp = True,
+)
+
+macos_bundle(
+    name = "DurianPreview",
+    cli = ":durian-cli",
+    gui = ":durian",
+    icon = "//macos:durian/CompiledIcons/release/AppIcon.icns",
+    license = "//:LICENSE",
+    plist = "Info.plist",
+    renderer = ":mailrender",
+    target_compatible_with = ["@platforms//os:macos"],
+    version = ":app_version",
+)
+
+sh_test(
+    name = "package_macos_test",
+    size = "small",
+    srcs = ["package_macos_test.sh"],
+    args = [
+        "$(location package_macos.sh)",
+        "$(location Info.plist)",
+        "$(location //macos:durian/CompiledIcons/release/AppIcon.icns)",
+        "$(location //:LICENSE)",
+    ],
+    data = [
+        "Info.plist",
+        "package_macos.sh",
+        "//:LICENSE",
+        "//macos:durian/CompiledIcons/release/AppIcon.icns",
+    ],
 )
 
 mailrender(
@@ -47,6 +93,7 @@ rust_binary(
     }),
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env_files = [":app_version"],
     visibility = ["//visibility:public"],
     deps = [
         "//app/crates/calendar",

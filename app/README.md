@@ -55,6 +55,51 @@ bearer token through your environment. External servers are never spawned, resta
 by the GUI. Tokens are not logged. After an external server rotates its token, restart the GUI
 with the new token; same-session SSE disconnects reconnect automatically.
 
+### macOS application bundle
+
+On a Mac with Xcode, build and open the separate preview application:
+
+```sh
+bazel build -c opt //app:DurianPreview
+open "bazel-bin/app/Durian Preview.app"
+```
+
+Mac builds target macOS **26.0**, matching the Swift app, independently of the installed
+Xcode SDK. The automatic `macos` Bazel configuration sets both target and host-tool minima
+and `MACOSX_DEPLOYMENT_TARGET`. The Swift renderer receives an explicit, architecture-matched
+`-target`; Swift does not use that environment variable as its default target. The bundle's
+`LSMinimumSystemVersion` comes from the configured minimum, and packaging rejects any of its
+three executables whose Mach-O minimum exceeds it. An SDK 27 build may say `sdk 27.0`, but the
+GUI and renderer must still say `minos 26.0`. Do not patch a signed binary or lower only the
+plist value to bypass a compatibility error. For a direct Cargo build, set
+`MACOSX_DEPLOYMENT_TARGET=26.0` as well.
+
+This is live mail, not the demo. The bundle is named **Durian Preview**, with identifier
+`org.js-lab.durian.preview`, and reuses the existing Durian icon. It does not install anything
+or replace Swift's Durian/DurianNightly applications. Configuration and the Go mail store are
+still shared with Durian; a separate bundle identifier is not a separate mailbox. Quit the
+other client before trying it. Calendar provider-write restrictions above still apply.
+
+The bundle contains real copies of `durian`, `durian-cli` and `mailrender`, so Finder does not
+depend on Bazel runfiles or a globally installed CLI version. Pkl must still be installed;
+the owned CLI inherits PATH with Homebrew and `~/.local/bin` appended for Finder launches.
+The native menus expose About, Services, Hide/Quit, new message/event, clipboard/history,
+mail/calendar, refresh, window controls and keymap help. Workspace menu entries disable while
+an editor, search field or popup owns focus. They add no alternative hardcoded mail shortcuts;
+user Pkl bindings remain authoritative. OS shortcuts for Hide/Minimize/Close/Quit and standard
+editor shortcuts remain. Closing the last window still quits and cleans up the owned
+backend/helper; it does not leave a menu-only process or status-bar item.
+
+Version/build metadata comes from the same Bazel workspace stamp as the Go CLI. The rule signs
+copied helpers first and then the application ad-hoc, and runs `codesign --verify --deep --strict`.
+This is for local testing, not a notarized distribution or a universal binary. Copy the complete
+bundle with `ditto` if moving it; never copy just its main executable. The existing Swift
+install/run scripts still build Swift, not this client.
+
+Linux checks cover the portable bundle layout, copied executables/icon, metadata and overwrite
+refusal. Finder launch, Dock/application identity, native menu availability, clipboard/Undo,
+keymap reload and signing still require Mac acceptance; Linux does not verify those surfaces.
+
 ## Read-side behavior
 
 - Profiles, identity, folder queries and remote-image policy come from the existing API.
