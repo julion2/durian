@@ -64,6 +64,9 @@ with the new token; same-session SSE disconnects reconnect automatically.
   the startup answer. A failed startup search shows an explicit retry, not a duplicate request.
   Old servers can fall back to cached/evaluated profile configuration.
 - Search runs on the server, with local refinement only for terms the API cannot express.
+  Status uses ordinary tags: `tag:unread`, `-tag:unread`, `tag:flagged`. The old `is:` namespace
+  is removed, not retained as an alias. The unread-only button and tag completions use the same
+  tags that read/unread actions write; read means absence of `unread`, not a separate `read` tag.
   Generations reject obsolete answers. The first page has 50 rows, all with previews. Paging
   fetches the lightweight row prefix and batches only missing/changed previews; already-visible
   content stays in memory. Batches respect the server's 1024-byte query cap and the client's

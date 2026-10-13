@@ -7,7 +7,6 @@
 //! - negation is `NOT x`, not `-x`
 //! - dates are whole days and `m` means *months* (`date:3m..`), so `newer:30m` (minutes) or
 //!   `newer:5h` become "since N days" on the server and are cut exactly here
-//! - unread / starred are tags (`tag:unread`, `tag:flagged`); there is no `is:`
 //! - accounts are folder paths there (`path:work/`)
 //! - "has:html" isn't a field; a token still being typed (`tag:o`) can't go out either – the
 //!   server matches whole words (its text index is blind: HMAC tokens), so prefixes match here
@@ -62,12 +61,6 @@ pub fn translate(query: &Query, me: &[SharedString]) -> Translated {
                 let w = who(w);
                 Some(format!("({} OR {})", any_of("to", &w), any_of("cc", &w)))
             }
-            Term::Is(state) => match state.as_str() {
-                "unread" => Some("tag:unread".into()),
-                "read" => Some("NOT tag:unread".into()),
-                "starred" => Some("tag:flagged".into()),
-                _ => None,
-            },
             Term::Has(what) if matches!(what.as_str(), "attachment" | "attachments" | "file") => Some("has:attachment".into()),
             Term::Account(a) => Some(format!("path:{}/", value(a))),
             Term::Has(_) => None,
@@ -123,8 +116,9 @@ mod tests {
     #[test]
     fn tags_states_and_negation() {
         assert_eq!(t("tag:review -tag:done").server, "tag:review NOT tag:done");
-        assert_eq!(t("is:unread is:starred").server, "tag:unread tag:flagged");
-        assert_eq!(t("is:read").server, "NOT tag:unread");
+        assert_eq!(t("tag:unread tag:flagged").server, "tag:unread tag:flagged");
+        assert_eq!(t("-tag:unread").server, "NOT tag:unread");
+        assert_eq!(t("is:unread").server, "\"is:unread\"", "removed syntax is literal text, not a status alias");
         assert_eq!(t("has:attachment").server, "has:attachment");
         assert_eq!(t("subject:Other").server, "subject:other");
         assert_eq!(t("-subject:\"Other Thread\"").server, "NOT subject:\"other thread\"");

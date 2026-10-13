@@ -160,7 +160,7 @@ impl ThreadList {
             _ => {}
         })
         .detach();
-        let search = cx.new(|cx| TextInput::new("Search or filter…  tag:  from:  is:unread", cx));
+        let search = cx.new(|cx| TextInput::new("Search…  tag:unread  from:", cx));
         // live: every keystroke re-filters the list and refreshes completions
         let subscription = cx.subscribe(&search, |this, _, event, cx| match event {
             TextInputEvent::Changed(text) => {
@@ -436,12 +436,12 @@ impl ThreadList {
                     .child(div().flex_1())
                     .children(selection.map(|label| div().text_size(px(SIZE_MINI)).text_color(theme.accent).child(label)))
                     .child(IconButton::new("unread-only", IconName::MailUnreadOnly).on_click(cx.listener(|this, _, _, cx| {
-                        // toggles `is:unread` in the current query
+                        // Toggle the same unread tag that read/unread actions write.
                         let text = this.search.read(cx).text().to_string();
-                        let next = if text.split_whitespace().any(|t| t == "is:unread") {
-                            text.split_whitespace().filter(|t| *t != "is:unread").collect::<Vec<_>>().join(" ")
+                        let next = if text.split_whitespace().any(|t| t == "tag:unread") {
+                            text.split_whitespace().filter(|t| *t != "tag:unread").collect::<Vec<_>>().join(" ")
                         } else {
-                            format!("{} is:unread", text.trim()).trim().to_string()
+                            format!("{} tag:unread", text.trim()).trim().to_string()
                         };
                         this.apply_query(next.into(), None, cx);
                     })))
@@ -837,7 +837,7 @@ mod tests {
     /// A clicked view or tag searches as it is: nothing in it counts as still being typed.
     #[test]
     fn clicked_queries_are_finished() {
-        for q in ["tag:newsletter", "from:mara is:unread", "tag:inbox "] {
+        for q in ["tag:newsletter", "from:mara tag:unread", "tag:inbox "] {
             assert!(Query::parse(&finished(q)).clauses.iter().all(|c| !c.prefix), "{q}");
         }
         assert_eq!(finished(""), "");

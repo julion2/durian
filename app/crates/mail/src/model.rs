@@ -850,6 +850,7 @@ impl Mailbox {
                     m.read |= !remote;
                 }
             }
+            if !remote { thread.tags.retain(|tag| tag != "unread"); }
             // keep the first snapshot of this thread; a second call (right-click) finds nothing new
             if self.unread_on_open.as_ref().is_none_or(|(id, _)| *id != thread.id) || !unread.is_empty() {
                 self.unread_on_open = Some((thread.id.clone(), unread));
@@ -1249,7 +1250,7 @@ impl Mailbox {
         }
     }
 
-    /// `u`: unread threads become read; read threads get their latest message marked unread.
+    /// `u`: unread threads become read; read threads get the unread tag.
     pub fn toggle_read_selected(&mut self, cx: &mut Context<Self>) {
         if self.remote.is_some() || self.selection_mode().is_some() {
             if self.selection_mode().is_some() {
@@ -1271,12 +1272,7 @@ impl Mailbox {
         }
         let Some(thread) = self.selected.and_then(|ix| self.threads.get_mut(ix)) else { return };
         let unread = thread.unread();
-        let last = thread.items.iter().rposition(|i| matches!(i, ThreadItem::Message(_)));
-        for (ix, item) in thread.items.iter_mut().enumerate() {
-            if let ThreadItem::Message(m) = item {
-                m.read = if unread { true } else { Some(ix) != last };
-            }
-        }
+        crate::durian::writes::apply_tags(thread, if unread { "-unread" } else { "+unread" });
         crate::trace::note(&format!("{} is now {}", thread.id, if unread { "read" } else { "unread" }));
         cx.notify();
     }
@@ -1292,7 +1288,7 @@ impl Mailbox {
             return;
         }
         if let Some(thread) = self.selected.and_then(|ix| self.threads.get_mut(ix)) {
-            thread.starred = !thread.starred;
+            crate::durian::writes::apply_tags(thread, if thread.starred { "-flagged" } else { "+flagged" });
             cx.notify();
         }
     }

@@ -1515,7 +1515,7 @@ pub fn complete_known_tags(query: &Query, tags: &[Tag]) -> Query {
     let mut query = query.clone();
     if let Some(last) = query.clauses.last_mut().filter(|c| c.prefix)
         && let Term::Tag(name) = &last.term
-        && tags.iter().any(|t| t.name.eq_ignore_ascii_case(name))
+        && (tags.iter().any(|t| t.name.eq_ignore_ascii_case(name)) || super::SYSTEM_TAGS.iter().any(|t| t.eq_ignore_ascii_case(name)))
     {
         last.prefix = false;
     }
@@ -1645,7 +1645,7 @@ mod tests {
     fn the_last_clause_settles_whatever_it_is() {
         // a field typed without a trailing space must reach the server too, not only narrow
         // what's listed
-        for q in ["invoi", "tag:newsletter", "from:mara", "to:jo", "is:unread"] {
+        for q in ["invoi", "tag:newsletter", "from:mara", "to:jo", "tag:unread"] {
             let settled = settle(&Query::parse(q));
             assert!(!settled.clauses[0].prefix, "{q}");
             assert!(!translate(&settled, &[]).server.is_empty(), "{q} goes to the server");
@@ -1659,6 +1659,7 @@ mod tests {
         let q = complete_known_tags(&Query::parse("tag:newsletter"), &tags);
         assert!(!q.clauses[0].prefix);
         assert_eq!(translate(&q, &[]).server, "tag:newsletter");
+        assert!(!complete_known_tags(&Query::parse("tag:unread"), &[]).clauses[0].prefix);
         // still being typed: narrows locally until the pause
         assert!(complete_known_tags(&Query::parse("tag:news"), &tags).clauses[0].prefix);
     }

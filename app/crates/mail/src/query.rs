@@ -1,8 +1,8 @@
-//! The query language shared with the CLI: what `mailcli list '<query>'` accepts, the search bar
-//! accepts. A view is just a saved query, a tag click is `tag:name`.
+//! The search bar's query parser. A view is a saved query, a tag click is `tag:name`.
+//! The durian adapter translates negation and date syntax for the Go backend.
 //!
 //! ```text
-//! tag:review -tag:done from:mara to:me account:work is:unread is:starred has:attachment
+//! tag:review -tag:done from:mara to:me account:work tag:unread tag:flagged has:attachment
 //! newer:24h older:7d "exact phrase" free text
 //! ```
 //! Terms are AND-ed; `-` negates any term.
@@ -18,7 +18,6 @@ pub enum Term {
     To(String),
     Subject(String),
     Account(String),
-    Is(String),
     Has(String),
     /// age bounds in hours, against the latest message
     Newer(f32),
@@ -108,7 +107,6 @@ impl Query {
                             "to" => Term::To(value),
                             "subject" => Term::Subject(value),
                             "account" | "in" => Term::Account(value),
-                            "is" => Term::Is(value),
                             "has" => Term::Has(value),
                             "newer" | "after" => Term::Newer(duration_hours(&value)?),
                             "older" | "before" => Term::Older(duration_hours(&value)?),
@@ -192,12 +190,6 @@ fn term_matches(term: &Term, prefix: bool, thread: &Thread, mailbox: &Mailbox, e
         Term::Subject(needle) => contains_folded(&thread.subject, needle),
         Term::Account(id) => eq(&thread.account.to_lowercase(), id)
             || mailbox.account(&thread.account).is_some_and(|a| eq(&a.name.to_lowercase(), id)),
-        // while typing, `is:st` means "any state starting with st"; no such state matches nothing
-        Term::Is(state) => ["unread", "read", "starred"].iter().filter(|s| eq(s, state)).any(|s| match *s {
-            "unread" => thread.unread(),
-            "read" => !thread.unread(),
-            _ => thread.starred,
-        }),
         Term::Has(what) => match what.as_str() {
             "attachment" | "attachments" | "file" => messages().any(|m| !m.attachments.is_empty()),
             "html" => messages().any(|m| m.html.is_some()),
@@ -221,7 +213,7 @@ pub fn completions(input: &str, mailbox: &Mailbox) -> Vec<(SharedString, SharedS
     let (negate, last) = last.strip_prefix('-').map_or(("", last), |l| ("-", l));
     let Some((key, partial)) = last.split_once(':') else {
         // no key yet: offer the keys themselves
-        return ["tag:", "from:", "to:", "subject:", "is:", "has:", "account:", "newer:", "older:"]
+        return ["tag:", "from:", "to:", "subject:", "has:", "account:", "newer:", "older:"]
             .iter()
             .filter(|k| !last.is_empty() && k.starts_with(&last.to_lowercase()))
             .map(|k| (SharedString::from(format!("{negate}{k}")), SharedString::from("filter")))
@@ -236,11 +228,12 @@ pub fn completions(input: &str, mailbox: &Mailbox) -> Vec<(SharedString, SharedS
                 let n = mailbox.threads.iter().filter(|th| th.tags.contains(&t.name)).count();
                 (t.name.to_string(), format!("{n} thread{}", if n == 1 { "" } else { "s" }))
             })
+            // System tags are hidden from the sidebar, not from tag search.
+            .chain(crate::durian::SYSTEM_TAGS.iter().map(|tag| (tag.to_string(), "system tag".into())))
             .collect(),
         "from" | "to" => std::iter::once(("me".to_string(), "you".to_string()))
             .chain(mailbox.contacts().into_iter().map(|c| (first_name(&c.name).to_lowercase(), c.email.to_string())))
             .collect(),
-        "is" => ["unread", "read", "starred"].iter().map(|s| (s.to_string(), String::new())).collect(),
         "has" => ["attachment", "html"].iter().map(|s| (s.to_string(), String::new())).collect(),
         "account" => mailbox.accounts.iter().map(|a| (a.id.to_string(), a.email.to_string())).collect(),
         "newer" | "older" => ["1h", "24h", "7d", "30d"].iter().map(|s| (s.to_string(), String::new())).collect(),

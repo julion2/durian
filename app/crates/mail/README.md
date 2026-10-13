@@ -24,7 +24,7 @@ views never fetch anything themselves.
 | Module | What |
 |---|---|
 | `model` | `MailData`, `Mailbox` (selection, filters, drafts, read/star/tag state) |
-| `query` | the search language shared with the CLI: `tag:` `from:` `is:` `has:` `newer:` … |
+| `query` | tag-based search: `tag:` `from:` `has:` `newer:` …; the adapter translates to the CLI |
 | `commands` | one table for key bindings, the command menu and the shortcut sheet |
 | `html_render` | WebKit snapshot pool for HTML mail (Swift helper, built by `build.rs`) |
 | `mime` | RFC 5322 multipart/alternative for sending (Markdown → text + HTML) |

@@ -757,8 +757,8 @@ impl MailWorkspace {
         }
         let (query, title): (String, String) = match key.as_ref() {
             "inbox" => (String::new(), "Inbox".into()),
-            "starred" => ("is:starred".into(), "Starred".into()),
-            "snoozed" => ("is:snoozed".into(), "Snoozed".into()),
+            "starred" => ("tag:flagged".into(), "Starred".into()),
+            "snoozed" => ("tag:snoozed".into(), "Snoozed".into()),
             "sent" => ("from:me".into(), "Sent".into()),
             "all" => (String::new(), "All mail".into()),
             other => match other.split_once(':') {

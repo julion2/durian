@@ -52,7 +52,7 @@
   "views": [
     {
       "name": "Needs reply",
-      "query": "is:unread -from:me tag:waiting"
+      "query": "tag:unread -from:me tag:waiting"
     },
     {
       "name": "GitHub",

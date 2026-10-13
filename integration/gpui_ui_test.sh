@@ -227,6 +227,16 @@ echo 'PASS archive key writes global thread tags and refresh reads the restored 
 xdotool key --clearmodifiers u
 expect_inbox_count marked-unread 1
 [[ "$("$CLI" count 'tag:unread')" == 1 ]]
+# The unread filter is the ordinary durable tag, not a second query namespace.
+xdotool mousemove --window "$WINDOW" 558 64 click 1
+expect_screen unread-tag-filter 'tag:unread' 'Other Thread'
+expect_inbox_count unread-tag-filter 1
+xdotool mousemove --window "$WINDOW" 558 64 click 1
+expect_screen unread-filter-cleared 'Other Thread'
+search 'tag:unread'
+expect_screen unread-tag-search 'Reply body' 'Other Thread'
+expect_inbox_count unread-tag-search 1
+clear_search
 search 'subject:Other'
 expect_screen search 'Different thread' 'Hello World'
 expect_inbox_count search 1

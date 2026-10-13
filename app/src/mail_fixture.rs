@@ -16,6 +16,10 @@ pub fn load() -> anyhow::Result<MailData> {
     let mut data: MailData = serde_json::from_slice(include_bytes!("../data/mail.json"))?;
     let attachments = mail::cache_dir("attachments");
     for thread in &mut data.threads {
+        // Older fixture data has state booleans; expose the same tags as live mail.
+        for (tag, present) in [("unread", thread.unread()), ("flagged", thread.starred)] {
+            if present && !thread.tags.iter().any(|t| t == tag) { thread.tags.push(tag.into()); }
+        }
         for item in &mut thread.items {
             let ThreadItem::Message(m) = item else { continue };
             if let Some(source) = &m.html_source {
@@ -87,7 +91,9 @@ mod tests {
         assert!(ids("newer:3h").iter().all(|id| id != "lunch"));
         assert!(ids("tag:o").contains(&"gpui-pr".to_string()), "typing a tag narrows by prefix");
         assert!(ids("tag:o ").is_empty(), "a finished token is exact");
-        assert_eq!(ids("is:st"), ids("is:starred "), "a state prefix narrows to that state");
+        assert_eq!(ids("tag:flagged "), ["rfc-tags"]);
+        assert!(ids("tag:unread ").contains(&"rfc-tags".to_string()));
+        assert!(!ids("-tag:unread ").contains(&"rfc-tags".to_string()));
     }
 
     #[test]
@@ -97,6 +103,8 @@ mod tests {
         assert!(tags.contains(&"tag:infra".to_string()) && tags.contains(&"tag:incident".to_string()));
         assert_eq!(apply_completion("from:me tag:in", "tag:infra"), "from:me tag:infra ");
         assert!(completions("ta", &mailbox).iter().any(|(c, _)| c == "tag:"));
+        assert!(completions("tag:un", &mailbox).iter().any(|(c, _)| c == "tag:unread"));
+        assert!(completions("is:", &mailbox).is_empty());
     }
 
     #[test]
