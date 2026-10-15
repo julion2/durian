@@ -90,9 +90,9 @@ func NewWithClient(account *config.AccountConfig, client *imap.Client) *Backend 
 // FetchFolders returns the syncable mailboxes with resolved special-use roles.
 // Role detection delegates to imap.Client.FindMailboxByRole (SPECIAL-USE
 // attribute with common-name fallback); INBOX is matched by name per RFC 3501.
-func (b *Backend) FetchFolders(_ context.Context) ([]backend.Folder, error) {
+func (b *Backend) FetchFolders(ctx context.Context) ([]backend.Folder, error) {
 	var folders []backend.Folder
-	err := b.withReconnect(func() error {
+	err := b.withReconnect(ctx, func() error {
 		f, e := b.fetchFoldersOnce()
 		if e != nil {
 			return e
@@ -148,11 +148,11 @@ func (b *Backend) fetchFoldersOnce() ([]backend.Folder, error) {
 // new. A UIDVALIDITY change starts an authoritative replacement snapshot so
 // stale local refs are removed after all pages succeed. New UIDs are fetched
 // newest-first, capped at limit (limit <= 0 means no cap).
-func (b *Backend) FetchMessages(_ context.Context, folder string, cursor backend.Cursor, limit int) (backend.FetchResult, error) {
+func (b *Backend) FetchMessages(ctx context.Context, folder string, cursor backend.Cursor, limit int) (backend.FetchResult, error) {
 	var result backend.FetchResult
 	// Retry-safe: fetchMessagesOnce re-decodes the cursor and re-selects the
 	// folder on every call, so a reconnect-and-retry restarts from clean state.
-	err := b.withReconnect(func() error {
+	err := b.withReconnect(ctx, func() error {
 		r, e := b.fetchMessagesOnce(folder, cursor, limit)
 		if e != nil {
 			return e
@@ -307,20 +307,21 @@ func (b *Backend) fetchMessagesOnce(folder string, cursor backend.Cursor, limit 
 
 // FetchBody streams the full RFC822 message for ref to w. Uses BODY.PEEK[]
 // (empty section path = entire message) so \Seen is not set.
-func (b *Backend) FetchBody(_ context.Context, ref backend.RemoteRef, w io.Writer) error {
+func (b *Backend) FetchBody(ctx context.Context, ref backend.RemoteRef, w io.Writer) error {
 	uid, err := parseUID(ref)
 	if err != nil {
 		return err
 	}
 
-	if _, err := b.client.SelectMailbox(ref.Folder); err != nil {
-		return fmt.Errorf("failed to select %s: %w", ref.Folder, err)
-	}
-
-	if err := b.client.FetchBodySection(uid, nil, w); err != nil {
-		return fmt.Errorf("failed to fetch body for UID %d in %s: %w", uid, ref.Folder, err)
-	}
-	return nil
+	return b.client.WithContext(ctx, func() error {
+		if _, err := b.client.SelectMailbox(ref.Folder); err != nil {
+			return fmt.Errorf("failed to select %s: %w", ref.Folder, err)
+		}
+		if err := b.client.FetchBodySection(uid, nil, w); err != nil {
+			return fmt.Errorf("failed to fetch body for UID %d in %s: %w", uid, ref.Folder, err)
+		}
+		return nil
+	})
 }
 
 // MARK: - Flags / Move / Append
@@ -328,14 +329,14 @@ func (b *Backend) FetchBody(_ context.Context, ref backend.RemoteRef, w io.Write
 // ApplyFlags adds and removes flags on ref. Flags are translated via
 // imap.FlagState.ToIMAPFlags, which (matching existing sync behavior) never
 // uploads the server-only $Completed keyword.
-func (b *Backend) ApplyFlags(_ context.Context, ref backend.RemoteRef, add, remove backend.Flags) error {
+func (b *Backend) ApplyFlags(ctx context.Context, ref backend.RemoteRef, add, remove backend.Flags) error {
 	uid, err := parseUID(ref)
 	if err != nil {
 		return err
 	}
 
 	// Retry-safe: adding/removing the same flags twice is idempotent.
-	return b.withReconnect(func() error {
+	return b.withReconnect(ctx, func() error {
 		if _, err := b.client.SelectMailbox(ref.Folder); err != nil {
 			return fmt.Errorf("failed to select %s: %w", ref.Folder, err)
 		}
@@ -358,7 +359,7 @@ func (b *Backend) ApplyFlags(_ context.Context, ref backend.RemoteRef, add, remo
 // valid UID, and UIDs the server no longer holds, are simply absent from the
 // result. The three-way merge against the last-synced baseline lives in the
 // sync engine; this method only reports server state.
-func (b *Backend) FetchFlags(_ context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
+func (b *Backend) FetchFlags(ctx context.Context, folder string, refs []backend.RemoteRef) (map[string]backend.Flags, error) {
 	uids := make([]uint32, 0, len(refs))
 	refIDByUID := make(map[uint32]string, len(refs))
 	for _, ref := range refs {
@@ -375,7 +376,7 @@ func (b *Backend) FetchFlags(_ context.Context, folder string, refs []backend.Re
 
 	var result map[string]backend.Flags
 	// Retry-safe: read-only, re-selects the folder on every attempt.
-	err := b.withReconnect(func() error {
+	err := b.withReconnect(ctx, func() error {
 		if _, err := b.client.SelectMailbox(folder); err != nil {
 			return fmt.Errorf("failed to select %s: %w", folder, err)
 		}
@@ -405,7 +406,7 @@ func (b *Backend) FetchFlags(_ context.Context, folder string, refs []backend.Re
 // Move relocates ref into destFolder with UID MOVE. go-imap v1 does not expose
 // the destination UID, so the returned ref has an empty ID; the next sync of
 // destFolder re-establishes the mapping via Message-ID.
-func (b *Backend) Move(_ context.Context, ref backend.RemoteRef, destFolder string) (backend.RemoteRef, error) {
+func (b *Backend) Move(ctx context.Context, ref backend.RemoteRef, destFolder string) (backend.RemoteRef, error) {
 	uid, err := parseUID(ref)
 	if err != nil {
 		return backend.RemoteRef{}, err
@@ -414,11 +415,17 @@ func (b *Backend) Move(_ context.Context, ref backend.RemoteRef, destFolder stri
 		return backend.RemoteRef{}, fmt.Errorf("ref has no Message-ID identity")
 	}
 
-	if _, err := b.client.SelectMailbox(ref.Folder); err != nil {
-		return backend.RemoteRef{}, fmt.Errorf("failed to select %s: %w", ref.Folder, err)
-	}
-	if err := b.client.MoveMessageToMailbox(uid, ref.MessageID, destFolder); err != nil {
-		return backend.RemoteRef{}, fmt.Errorf("failed to move UID %d to %s: %w", uid, destFolder, err)
+	err = b.client.WithContext(ctx, func() error {
+		if _, err := b.client.SelectMailbox(ref.Folder); err != nil {
+			return fmt.Errorf("failed to select %s: %w", ref.Folder, err)
+		}
+		if err := b.client.MoveMessageToMailbox(uid, ref.MessageID, destFolder); err != nil {
+			return fmt.Errorf("failed to move UID %d to %s: %w", uid, destFolder, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return backend.RemoteRef{}, err
 	}
 
 	return backend.RemoteRef{Folder: destFolder, ID: "", MessageID: ref.MessageID}, nil
@@ -428,8 +435,12 @@ func (b *Backend) Move(_ context.Context, ref backend.RemoteRef, destFolder stri
 // APPENDUID, so the returned ref has an empty ID (like Move, the next sync
 // resolves it via Message-ID). The append date is time.Now(), matching how
 // the existing draft/sent-copy code stamps appended messages.
-func (b *Backend) Append(_ context.Context, folder string, flags backend.Flags, msg []byte) (backend.RemoteRef, error) {
-	if _, err := b.client.Append(folder, toFlagState(flags).ToIMAPFlags(), time.Now(), msg); err != nil {
+func (b *Backend) Append(ctx context.Context, folder string, flags backend.Flags, msg []byte) (backend.RemoteRef, error) {
+	err := b.client.WithContext(ctx, func() error {
+		_, err := b.client.Append(folder, toFlagState(flags).ToIMAPFlags(), time.Now(), msg)
+		return err
+	})
+	if err != nil {
 		return backend.RemoteRef{}, fmt.Errorf("failed to append to %s: %w", folder, err)
 	}
 	return backend.RemoteRef{Folder: folder, ID: ""}, nil
@@ -522,18 +533,21 @@ func (b *Backend) Close() error {
 // must re-establish its own mailbox selection, since a reconnect resets the
 // server-side selected state — only wrap read/flag operations, never Append or
 // Move (which would duplicate on retry) or streaming FetchBody.
-func (b *Backend) withReconnect(op func() error) error {
-	err := op()
-	if err == nil || !b.ownsClient || !isConnectionError(err) {
+func (b *Backend) withReconnect(ctx context.Context, op func() error) error {
+	err := b.client.WithContext(ctx, op)
+	if err == nil || ctx.Err() != nil || !b.ownsClient || !isConnectionError(err) {
 		return err
 	}
 
 	slog.Warn("Connection lost, reconnecting", "module", "IMAPBACKEND", "err", err)
-	if rerr := b.client.Reconnect(); rerr != nil {
+	if rerr := b.client.ReconnectContext(ctx); rerr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return reconnectFailure(err, rerr)
 	}
 	slog.Debug("Reconnected, retrying operation", "module", "IMAPBACKEND")
-	return op()
+	return b.client.WithContext(ctx, op)
 }
 
 func reconnectFailure(operationErr, reconnectErr error) error {
