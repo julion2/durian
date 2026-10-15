@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Linux orb toolchain; match the repository and CI pins without requiring Nix.
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "$(uname -sm)" != "Linux x86_64" ]]; then
+    echo "This setup supports Linux x86_64 orbs only." >&2
+    exit 1
+fi
+
+missing=()
+for package in build-essential ca-certificates curl jq unzip zip; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
+        missing+=("$package")
+    fi
+done
+if ((${#missing[@]})); then
+    sudo apt-get update -qq
+    sudo apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+go_version="$(awk '$1 == "go" { print $2 }' "$repo_root/cli/go.mod")"
+bazel_version="$(tr -d '\n' < "$repo_root/.bazelversion")"
+pkl_version=0.31.1
+
+if ! command -v go >/dev/null || [[ "$(go version)" != "go version go${go_version} linux/amd64" ]]; then
+    echo "Installing Go $go_version"
+    archive="go${go_version}.linux-amd64.tar.gz"
+    checksum="$(curl --fail --silent --show-error --location 'https://go.dev/dl/?mode=json&include=all' |
+        jq -er --arg name "$archive" '.[] | .files[] | select(.filename == $name) | .sha256')"
+    curl --fail --silent --show-error --location "https://go.dev/dl/$archive" -o "$tmp/$archive"
+    printf '%s  %s\n' "$checksum" "$tmp/$archive" | sha256sum --check
+    destination="/usr/local/lib/durian-go/$go_version"
+    sudo mkdir -p "$destination"
+    sudo tar -xzf "$tmp/$archive" -C "$destination"
+    sudo ln -sfn "$destination/go/bin/go" /usr/local/bin/go
+    sudo ln -sfn "$destination/go/bin/gofmt" /usr/local/bin/gofmt
+fi
+
+if ! command -v bazel >/dev/null || [[ "$(bazel --version)" != "bazel $bazel_version" ]]; then
+    echo "Installing Bazel $bazel_version"
+    binary="bazel-${bazel_version}-linux-x86_64"
+    release="https://github.com/bazelbuild/bazel/releases/download/$bazel_version"
+    curl --fail --silent --show-error --location "$release/$binary" -o "$tmp/$binary"
+    checksum="$(curl --fail --silent --show-error --location "$release/$binary.sha256" | awk '{print $1}')"
+    printf '%s  %s\n' "$checksum" "$tmp/$binary" | sha256sum --check
+    sudo install -m 0755 "$tmp/$binary" /usr/local/bin/bazel
+fi
+
+if ! command -v pkl >/dev/null || [[ "$(pkl --version)" != "Pkl $pkl_version"* ]]; then
+    echo "Installing Pkl $pkl_version"
+    curl --fail --silent --show-error --location \
+        "https://github.com/apple/pkl/releases/download/$pkl_version/pkl-linux-amd64" -o "$tmp/pkl"
+    printf '%s  %s\n' '618f13955d755cafbfe8c9cba1d27635848cd49dbc6abffd398d2751db1231bf' "$tmp/pkl" | sha256sum --check
+    sudo install -m 0755 "$tmp/pkl" /usr/local/bin/pkl
+fi
+
+# Bazel stages these through copy_schemas; direct Go race/fuzz runs need the
+# same ignored copies for the config package's go:embed directive.
+mkdir -p "$repo_root/cli/internal/config/schema"
+cp "$repo_root"/schema/*.pkl "$repo_root/cli/internal/config/schema/"
+
+go version
+bazel --version
+pkl --version

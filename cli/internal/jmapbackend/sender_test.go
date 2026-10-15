@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/julion2/durian/cli/internal/mailsend"
@@ -280,7 +281,7 @@ func TestSenderTreatsProviderUploadLimitAsPermanent(t *testing.T) {
 
 func TestSenderStopsAfterAmbiguousEmailCreation(t *testing.T) {
 	s := newTestJMAPServer(t)
-	var created bool
+	var created atomic.Bool
 	s.handler = func(method string, _ map[string]interface{}) interface{} {
 		switch method {
 		case "Mailbox/get":
@@ -288,7 +289,7 @@ func TestSenderStopsAfterAmbiguousEmailCreation(t *testing.T) {
 		case "Identity/get":
 			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
 		case "Email/set":
-			created = true
+			created.Store(true)
 			s.dropAPIResponse = true
 			return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
 		}
@@ -298,8 +299,8 @@ func TestSenderStopsAfterAmbiguousEmailCreation(t *testing.T) {
 	err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
 		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
 	})
-	if !created || err == nil || !errors.Is(err, errEmailCreationOutcomeUnknown) || mailsend.Classify(err) != mailsend.KindAmbiguous {
-		t.Fatalf("created=%v Send() error=%#v, want ambiguous unknown creation", created, err)
+	if !created.Load() || err == nil || !errors.Is(err, errEmailCreationOutcomeUnknown) || mailsend.Classify(err) != mailsend.KindAmbiguous {
+		t.Fatalf("created=%v Send() error=%#v, want ambiguous unknown creation", created.Load(), err)
 	}
 }
 
@@ -359,7 +360,7 @@ func TestValidateCreatedEmailRequiresAllServerProperties(t *testing.T) {
 
 func TestRawSenderStopsAfterAmbiguousEmailImport(t *testing.T) {
 	s := newTestJMAPServer(t)
-	var imported bool
+	var imported atomic.Bool
 	s.handler = func(method string, args map[string]interface{}) interface{} {
 		switch method {
 		case "Mailbox/get":
@@ -367,7 +368,7 @@ func TestRawSenderStopsAfterAmbiguousEmailImport(t *testing.T) {
 		case "Identity/get":
 			return map[string]interface{}{"accountId": "a1", "state": "i1", "list": []interface{}{map[string]string{"id": "identity-1", "email": "me@example.test"}}}
 		case "Email/import":
-			imported = true
+			imported.Store(true)
 			email := args["emails"].(map[string]interface{})["0"].(map[string]interface{})
 			if email["keywords"].(map[string]interface{})["$draft"] != true {
 				t.Fatal("temporary raw Email was not marked $draft")
@@ -379,8 +380,8 @@ func TestRawSenderStopsAfterAmbiguousEmailImport(t *testing.T) {
 		return nil
 	}
 	err := s.backend(t).Send(t.Context(), []byte(testRaw))
-	if !imported || err == nil || !errors.Is(err, errEmailCreationOutcomeUnknown) {
-		t.Fatalf("imported=%v Send() error=%#v, want unknown creation", imported, err)
+	if !imported.Load() || err == nil || !errors.Is(err, errEmailCreationOutcomeUnknown) {
+		t.Fatalf("imported=%v Send() error=%#v, want unknown creation", imported.Load(), err)
 	}
 }
 
@@ -493,7 +494,7 @@ func TestSenderPreservesDraftWhenSubmissionResponseIsLost(t *testing.T) {
 		{"id": "inbox-id", "name": "Inbox", "role": "inbox", "isSubscribed": true},
 		{"id": "sent-id", "name": "Sent", "role": "sent", "isSubscribed": true},
 	}
-	var accepted, destroyed bool
+	var accepted, destroyed atomic.Bool
 	s.handler = func(method string, args map[string]interface{}) interface{} {
 		switch method {
 		case "Mailbox/get":
@@ -508,10 +509,10 @@ func TestSenderPreservesDraftWhenSubmissionResponseIsLost(t *testing.T) {
 				}
 				return map[string]interface{}{"accountId": "a1", "oldState": "s1", "newState": "s2", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
 			}
-			destroyed = true
+			destroyed.Store(true)
 			return map[string]interface{}{"accountId": "a1", "destroyed": []string{"draft-1"}, "notDestroyed": map[string]interface{}{}}
 		case "EmailSubmission/set":
-			accepted = true
+			accepted.Store(true)
 			s.dropAPIResponse = true
 			return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"s0": map[string]string{"id": "submission-1"}}, "notCreated": map[string]interface{}{}}
 		}
@@ -521,10 +522,10 @@ func TestSenderPreservesDraftWhenSubmissionResponseIsLost(t *testing.T) {
 	err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
 		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
 	})
-	if !accepted || err == nil || !errors.Is(err, errSubmissionOutcomeUnknown) || mailsend.Classify(err) != mailsend.KindAmbiguous {
-		t.Fatalf("accepted=%v Send() error=%#v, want ambiguous unknown outcome", accepted, err)
+	if !accepted.Load() || err == nil || !errors.Is(err, errSubmissionOutcomeUnknown) || mailsend.Classify(err) != mailsend.KindAmbiguous {
+		t.Fatalf("accepted=%v Send() error=%#v, want ambiguous unknown outcome", accepted.Load(), err)
 	}
-	if destroyed {
+	if destroyed.Load() {
 		t.Fatal("source Email was destroyed after an ambiguous accepted submission")
 	}
 }
@@ -563,7 +564,7 @@ func TestSenderTreatsServerPartialFailAsUnknownOutcome(t *testing.T) {
 
 func TestSenderTreatsContradictorySubmissionResponsesAsUnknown(t *testing.T) {
 	s := newTestJMAPServer(t)
-	var accepted, destroyed bool
+	var accepted, destroyed atomic.Bool
 	s.handler = func(method string, args map[string]interface{}) interface{} {
 		switch method {
 		case "Mailbox/get":
@@ -574,10 +575,10 @@ func TestSenderTreatsContradictorySubmissionResponsesAsUnknown(t *testing.T) {
 			if _, creating := args["create"]; creating {
 				return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"e0": map[string]string{"id": "draft-1"}}, "notCreated": map[string]interface{}{}}
 			}
-			destroyed = true
+			destroyed.Store(true)
 			return map[string]interface{}{"accountId": "a1", "destroyed": []string{"draft-1"}, "notDestroyed": map[string]interface{}{}}
 		case "EmailSubmission/set":
-			accepted = true
+			accepted.Store(true)
 			s.before = []interface{}{[]interface{}{"error", map[string]interface{}{"type": "serverFail"}, "0"}}
 			return map[string]interface{}{"accountId": "a1", "created": map[string]interface{}{"s0": map[string]string{"id": "submission-1"}}, "notCreated": map[string]interface{}{}}
 		}
@@ -587,10 +588,10 @@ func TestSenderTreatsContradictorySubmissionResponsesAsUnknown(t *testing.T) {
 	err := (&Sender{b: s.backend(t)}).Send(t.Context(), &mailsend.Message{
 		From: "me@example.test", To: []string{"you@example.test"}, Subject: "x", Body: "y",
 	})
-	if !accepted || err == nil || !errors.Is(err, errSubmissionOutcomeUnknown) || mailsend.Classify(err) != mailsend.KindAmbiguous {
-		t.Fatalf("accepted=%v Send() error=%#v, want ambiguous unknown outcome", accepted, err)
+	if !accepted.Load() || err == nil || !errors.Is(err, errSubmissionOutcomeUnknown) || mailsend.Classify(err) != mailsend.KindAmbiguous {
+		t.Fatalf("accepted=%v Send() error=%#v, want ambiguous unknown outcome", accepted.Load(), err)
 	}
-	if destroyed {
+	if destroyed.Load() {
 		t.Fatal("source Email was destroyed after contradictory submission responses")
 	}
 }

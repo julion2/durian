@@ -790,16 +790,22 @@ func TestEngineReplacementFlagDeadlineMakesBoundedProgress(t *testing.T) {
 			Messages: []backend.Message{message}, Present: []backend.RemoteRef{message.Ref},
 		}
 	}
-	delayed := &delayedFlagsBackend{Backend: fake, delay: 100 * time.Millisecond}
+	// Leave enough time for the real SQLite snapshot work under -race, then
+	// keep the fake flag request blocked until the engine's actual phase
+	// deadline. This tests deadline recovery, not database throughput.
+	delayed := &delayedFlagsBackend{Backend: fake, delay: time.Hour}
 	engine := New(Options{
 		Store: db, Cursors: cursors, Account: testAccount,
-		Timeout: 5 * time.Millisecond, RecoveryTimeout: 20 * time.Millisecond,
+		Timeout: 250 * time.Millisecond, RecoveryTimeout: 500 * time.Millisecond,
 		Ingest: IngestOptions{Account: testAccount},
 	})
 
 	for pass := 0; pass < 2; pass++ {
 		result, err := engine.Sync(t.Context(), delayed)
-		if !errors.Is(err, context.DeadlineExceeded) || len(result.Errors) == 0 {
+		recordedFlagDeadline := slices.ContainsFunc(result.Errors, func(err error) bool {
+			return errors.Is(err, context.DeadlineExceeded)
+		})
+		if !errors.Is(err, context.DeadlineExceeded) || !recordedFlagDeadline {
 			t.Fatalf("pass %d result=%+v err=%v, want recorded flag deadline", pass, result, err)
 		}
 	}
