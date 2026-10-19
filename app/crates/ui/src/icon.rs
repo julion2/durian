@@ -13,6 +13,12 @@ macro_rules! icons {
         impl IconName {
             pub const ALL: &[IconName] = &[$(IconName::$variant,)*];
 
+            /// Exact canonical name: the bundled SVG's filename stem (e.g. `mail_inbox`).
+            /// No extension, path, case folding or aliases; the catalog above is authoritative.
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name { $($file => Some(IconName::$variant),)* _ => None }
+            }
+
             pub fn file(self) -> &'static str {
                 match self { $(IconName::$variant => $file,)* }
             }
@@ -141,6 +147,17 @@ impl RenderOnce for Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_names_round_trip() {
+        for &icon in IconName::ALL {
+            assert_eq!(IconName::from_name(icon.file()), Some(icon));
+        }
+        assert_eq!(IconName::from_name("mail_inbox"), Some(IconName::MailInbox));
+        for name in ["", "MailInbox", "MAIL_INBOX", "mail-inbox", "mail_inbox.svg", "icons/lucide/mail_inbox.svg", "tray", "unknown"] {
+            assert_eq!(IconName::from_name(name), None, "{name}");
+        }
+    }
 
     /// Every name must have its SVG – a missing one would render as nothing.
     #[test]

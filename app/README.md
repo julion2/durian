@@ -159,6 +159,22 @@ keymap reload and signing still require Mac acceptance; Linux does not verify th
   across workspace replacements. Old-session results are rejected; already-running HTTP
   requests retain their 8 s timeout. Decoding rejects dimensions above 2048×2048.
 
+## Configured sidebar icons
+
+`profiles.pkl` still owns folders and their `icon` strings. Prefer canonical bundled icon
+names such as `mail_inbox`, `mail_users`, `mail_terminal`, `mail_star`, `calendar` and `folder`.
+The complete inventory is `IconName` in `crates/ui/src/icon.rs`; lookup and paths are generated
+from the same catalog, so adding a bundled icon does not require another resolver branch.
+
+Existing SF Symbol names use the explicit `ICON_ALIASES` table in
+`crates/mail/src/durian/profiles.rs`: for example `tray.fill`, `person.badge.plus`, `checklist`,
+`list.bullet` and `chevron.left.forwardslash.chevron.right`. These are semantic mappings to
+bundled Lucide glyphs, not SF Symbols rendering; fill variants can share an outline icon.
+Names are trimmed and ASCII case-insensitive. Unknown names use a neutral folder, never
+substring guesses (`starfish` is not a star, `person.badge.plus` is not unread). Arbitrary
+asset paths/URLs are not accepted. `scalemass`/`building.columns` do not yet have bundled
+equivalents and use that fallback. New compatibility aliases belong in the one tested table.
+
 ## User keymaps
 
 The client reads the same `keymaps.pkl` as Swift through authenticated `GET /api/v1/keymaps`.

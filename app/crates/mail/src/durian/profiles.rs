@@ -144,36 +144,42 @@ pub fn evaluate(config: &Path, cache: &Path) -> Result<Option<Vec<Profile>>, Str
     Ok(Some(profiles))
 }
 
-/// The UI icon for a folder's SF Symbols name.
+/// Finite compatibility aliases for configured folder icons, grouped by bundled target.
+/// These are semantic approximations, not SF Symbols rendering. Fill/decorated variants
+/// must be listed explicitly: never infer meaning from a substring or strip suffixes.
+/// Includes the old plain nicknames (`inbox`, `unread`, `send`, `draft`, `people`).
+/// Extend this table for aliases; canonical SVG stems come only from `IconName`'s catalog.
+pub const ICON_ALIASES: &[(&[&str], ui::IconName)] = &[
+    (&["tray", "tray.fill", "tray.full", "tray.full.fill", "tray.and.arrow.down", "tray.and.arrow.down.fill", "inbox"], ui::IconName::MailInbox),
+    (&["envelope.badge", "envelope.badge.fill", "unread"], ui::IconName::MailUnreadOnly),
+    (&["paperplane", "paperplane.fill", "send"], ui::IconName::MailSend),
+    (&["doc", "doc.fill", "doc.text", "doc.text.fill", "doc.plaintext", "doc.plaintext.fill", "doc.richtext", "doc.richtext.fill", "square.and.pencil", "pencil", "pencil.line", "draft"], ui::IconName::MailDraft),
+    (&["trash", "trash.fill", "trash.circle", "trash.circle.fill", "xmark.bin", "xmark.bin.fill"], ui::IconName::MailTrash),
+    (&["archivebox", "archivebox.fill", "checkmark", "checkmark.circle", "checkmark.circle.fill", "checkmark.square", "checkmark.square.fill", "checklist"], ui::IconName::MailDone),
+    // The available list glyph is Lucide list-filter; tasks use circle-check above.
+    (&["list.bullet", "list.bullet.circle", "list.bullet.circle.fill", "list.bullet.rectangle", "list.bullet.rectangle.fill", "list.number", "line.3.horizontal.decrease", "line.3.horizontal.decrease.circle", "line.3.horizontal.decrease.circle.fill"], ui::IconName::Filter),
+    // Terminal is the available code glyph; don't mistake chevrons for mail navigation.
+    (&["terminal", "terminal.fill", "chevron.left.forwardslash.chevron.right", "curlybraces", "curlybraces.square", "curlybraces.square.fill"], ui::IconName::MailTerminal),
+    (&["star", "star.fill", "star.circle", "star.circle.fill", "flag", "flag.fill", "flag.circle", "flag.circle.fill"], ui::IconName::MailStarred),
+    (&["clock", "clock.fill", "clock.circle", "clock.circle.fill"], ui::IconName::MailClock),
+    (&["alarm", "alarm.fill", "zzz"], ui::IconName::MailSnooze),
+    (&["person", "person.fill", "person.circle", "person.circle.fill", "person.badge.plus", "person.fill.badge.plus", "person.badge.minus", "person.fill.badge.minus", "person.2", "person.2.fill", "person.3", "person.3.fill", "person.crop.circle", "person.crop.circle.fill", "person.crop.circle.badge.plus", "person.crop.circle.fill.badge.plus", "people"], ui::IconName::MailUsers),
+    (&["calendar", "calendar.circle", "calendar.circle.fill", "calendar.badge.clock", "calendar.badge.plus", "calendar.badge.minus", "calendar.badge.exclamationmark"], ui::IconName::Calendar),
+    (&["envelope", "envelope.fill", "envelope.open", "envelope.open.fill", "envelope.circle", "envelope.circle.fill"], ui::IconName::MailEmail),
+    (&["tag", "tag.fill", "tag.circle", "tag.circle.fill"], ui::IconName::MailLabel),
+    (&["folder", "folder.fill", "folder.circle", "folder.circle.fill"], ui::IconName::Folder),
+    (&["paperclip", "paperclip.circle", "paperclip.circle.fill"], ui::IconName::MailAttach),
+];
+
+/// Resolve a configured icon: canonical SVG stem first, then an exact compatibility alias.
+/// Names are trimmed and ASCII case-insensitive. Unknown/empty names get a
+/// neutral folder, not a guessed mail action. In particular, Legal's `building.columns`
+/// and `scalemass` have no bundled equivalent and deliberately use this fallback.
 pub fn ui_icon(symbol: &str) -> ui::IconName {
-    use ui::IconName as I;
-    let s = symbol.to_ascii_lowercase();
-    let has = |part: &str| s.contains(part);
-    if has("tray") || has("inbox") {
-        I::MailInbox
-    } else if has("badge") || has("unread") {
-        I::MailUnreadOnly
-    } else if has("paperplane") || has("send") {
-        I::MailSend
-    } else if has("doc") || has("pencil") || has("draft") {
-        I::MailDraft
-    } else if has("trash") || has("xmark") {
-        I::MailTrash
-    } else if has("archivebox") || has("checkmark") {
-        I::MailDone
-    } else if has("star") || has("flag") {
-        I::MailStarred
-    } else if has("clock") || has("alarm") {
-        I::MailClock
-    } else if has("person") || has("people") {
-        I::MailUsers
-    } else if has("calendar") {
-        I::Calendar
-    } else if has("envelope") {
-        I::MailEmail
-    } else {
-        I::MailLabel
-    }
+    let name = symbol.trim().to_ascii_lowercase();
+    ui::IconName::from_name(&name)
+        .or_else(|| ICON_ALIASES.iter().find_map(|(aliases, icon)| aliases.contains(&name.as_str()).then_some(*icon)))
+        .unwrap_or(ui::IconName::Folder)
 }
 
 #[cfg(test)]
@@ -202,6 +208,63 @@ mod tests {
         assert_eq!(profiles[1].folders.iter().map(|f| f.name.as_ref()).collect::<Vec<_>>(), ["Inbox", "Sent"]);
         assert_eq!(profiles[1].home().unwrap().query.as_ref(), "tag:inbox");
         assert_eq!(ui_icon("paperplane.fill"), ui::IconName::MailSend);
+    }
+
+    #[test]
+    fn configured_icons_support_standard_symbols_and_variants() {
+        use ui::IconName as I;
+        for (name, expected) in [
+            ("tray", I::MailInbox), ("tray.fill", I::MailInbox),
+            ("envelope.badge", I::MailUnreadOnly), ("envelope.badge.fill", I::MailUnreadOnly),
+            ("paperplane", I::MailSend), ("paperplane.fill", I::MailSend),
+            ("doc.text", I::MailDraft), ("doc.text.fill", I::MailDraft),
+            ("xmark.bin", I::MailTrash), ("xmark.bin.fill", I::MailTrash),
+            ("trash", I::MailTrash), ("trash.fill", I::MailTrash),
+            ("archivebox", I::MailDone), ("archivebox.fill", I::MailDone),
+            ("checklist", I::MailDone), ("checkmark.circle.fill", I::MailDone),
+            ("list.bullet", I::Filter), ("list.bullet.rectangle.fill", I::Filter),
+            ("terminal.fill", I::MailTerminal), ("chevron.left.forwardslash.chevron.right", I::MailTerminal),
+            ("person.badge.plus", I::MailUsers), ("person.fill.badge.plus", I::MailUsers),
+            ("person.2.fill", I::MailUsers), ("person.crop.circle.fill", I::MailUsers),
+            ("calendar", I::Calendar), ("calendar.circle.fill", I::Calendar), ("calendar.badge.clock", I::Calendar),
+            ("envelope.fill", I::MailEmail), ("envelope.open.fill", I::MailEmail),
+            ("star", I::MailStarred), ("star.fill", I::MailStarred),
+            ("clock", I::MailClock), ("clock.fill", I::MailClock), ("alarm.fill", I::MailSnooze),
+            ("paperclip", I::MailAttach), ("tag.fill", I::MailLabel),
+        ] {
+            assert_eq!(ui_icon(name), expected, "{name}");
+        }
+        assert_eq!(ui_icon("  PERSON.BADGE.PLUS  "), I::MailUsers);
+    }
+
+    #[test]
+    fn canonical_icons_and_aliases_are_unambiguous() {
+        for &icon in ui::IconName::ALL {
+            assert_eq!(ui_icon(icon.file()), icon, "canonical {}", icon.file());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for &(aliases, expected) in ICON_ALIASES {
+            for &alias in aliases {
+                assert!(seen.insert(alias), "duplicate alias: {alias}");
+                assert_eq!(alias, alias.trim().to_ascii_lowercase(), "normalized alias: {alias}");
+                assert_eq!(ui_icon(alias), expected, "alias: {alias}");
+            }
+        }
+        // Canonical names distinguish assets that SF compatibility deliberately collapses.
+        assert_eq!(ui_icon("mail_star"), ui::IconName::MailStar);
+        assert_eq!(ui_icon("mail_starred"), ui::IconName::MailStarred);
+    }
+
+    #[test]
+    fn unknown_icons_do_not_guess_from_substrings_or_suffixes() {
+        for name in [
+            "", "   ", "unknown", "starfish", "restart", "doctor", "badge", "xmark",
+            "person.badge.unsupported", "doc.unrecognized.fill", "star.fill.fill", "mail_inbox.fill",
+            "building.columns", "building.columns.fill", "scalemass", "scalemass.fill",
+            "mail_inbox.svg", "icons/lucide/mail_inbox.svg",
+        ] {
+            assert_eq!(ui_icon(name), ui::IconName::Folder, "{name}");
+        }
     }
 
     #[test]
