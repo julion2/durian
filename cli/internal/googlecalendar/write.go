@@ -66,7 +66,9 @@ func classifyWriteError(err error) error {
 // eventFromGoogle. All-day events use start/end date boundaries (exclusive
 // end, as the model stores); because Google rejects an all-day event whose
 // end is not after its start, such an end date is snapped to start + 1 day.
-// Timed events retain their IANA zones and RFC3339 offsets. The
+// Timed events retain their IANA zones and RFC3339 offsets, except single
+// appointments with a fold endpoint: Google reinterprets those wall clocks,
+// so both endpoints use UTC and private metadata retains the original zones. The
 // recurrence key is always present — the RRULE line of a series, or an empty
 // list so a PATCH clears the recurrence when the local file dropped its
 // RRULE.
@@ -83,6 +85,7 @@ func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
 	if validateWriteEvent(ev) != nil {
 		return nil
 	}
+	fold := googleFoldEvent(ev)
 	var start, end map[string]string
 	if ev.AllDay {
 		startDay := calendar.DateOnly(ev.Start)
@@ -93,12 +96,10 @@ func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
 		start = map[string]string{"date": startDay.Format(calendar.GraphDateFormat)}
 		end = map[string]string{"date": endDay.Format(calendar.GraphDateFormat)}
 	} else {
-		startZone, _ := googleZone(ev.TimeZone)
-		endZone := ev.EndTimeZone
-		if endZone == "" {
-			endZone = startZone
+		startZone, endZone := googleWriteZones(ev)
+		if fold {
+			startZone, endZone = "UTC", "UTC"
 		}
-		endZone, _ = googleZone(endZone)
 		startLoc, _ := time.LoadLocation(startZone)
 		endLoc, _ := time.LoadLocation(endZone)
 		start = map[string]string{
@@ -117,6 +118,13 @@ func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
 		"description": ev.Description,
 		"start":       start,
 		"end":         end,
+	}
+	if fold {
+		startZone, endZone := googleWriteZones(ev)
+		body["extendedProperties"] = map[string]any{"private": map[string]any{
+			foldStartZoneKey: startZone,
+			foldEndZoneKey:   endZone,
+		}}
 	}
 	// An opaque recurrence is one durian read but could not express. Sending
 	// the key at all would clear it — an empty list REPLACES the rule — so the
@@ -339,20 +347,52 @@ func (c *Client) UpdateEvent(ctx context.Context, calendarID, eventID string, sp
 	if err := validateWriteEvent(spec.Event); err != nil {
 		return fmt.Errorf("failed to update event %s: %w", eventID, err)
 	}
+	eventURL := c.baseURL + "/calendars/" + url.PathEscape(calendarID) +
+		"/events/" + url.PathEscape(eventID)
+	etag := spec.ETag
 	var body map[string]any
 	if spec.AttendeesOnly {
 		body = map[string]any{"attendees": attendeesToGoogle(spec.Event.Attendees)}
 	} else {
+		// Null-deleting a missing private property returns 400 at Google.
+		// Read the provider state rather than caching metadata in the neutral
+		// model, and bind the PATCH to that version so the decision cannot race
+		// another edit. A caller's older ETag must still fail, not be refreshed.
+		var current googleEvent
+		if err := c.doJSON(ctx, eventURL, nil, &current); err != nil {
+			return fmt.Errorf("failed to read event before update %s: %w", eventID, classifyWriteError(err))
+		}
+		if current.ETag == "" {
+			return fmt.Errorf("cannot safely update event %s without a remote ETag", eventID)
+		}
+		if etag == "" {
+			etag = current.ETag
+		}
+		if googleFoldEvent(spec.Event) && current.RecurringEventID != "" {
+			return fmt.Errorf("ambiguous recurring calendar endpoints cannot be represented safely by Google Calendar")
+		}
 		body = eventToGoogle(spec.Event, spec.IncludeAttendees)
+		if _, hasFold := body["extendedProperties"]; !hasFold {
+			clear := map[string]any{}
+			for _, key := range []string{foldStartZoneKey, foldEndZoneKey} {
+				if _, present := current.ExtendedProperties.Private[key]; present {
+					clear[key] = nil
+				}
+			}
+			if len(clear) != 0 {
+				// PATCH merges per-key: preserve every unrelated private/shared
+				// property, including when converting to a date or a series.
+				body["extendedProperties"] = map[string]any{"private": clear}
+			}
+		}
 	}
 
 	q := url.Values{}
 	q.Set("sendUpdates", sendUpdatesParam(spec.NotifyAttendees))
-	reqURL := c.baseURL + "/calendars/" + url.PathEscape(calendarID) +
-		"/events/" + url.PathEscape(eventID) + "?" + q.Encode()
+	reqURL := eventURL + "?" + q.Encode()
 	var headers map[string]string
-	if spec.ETag != "" {
-		headers = map[string]string{"If-Match": spec.ETag}
+	if etag != "" {
+		headers = map[string]string{"If-Match": etag}
 	}
 
 	var g googleEvent

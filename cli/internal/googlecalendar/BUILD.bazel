@@ -26,14 +26,31 @@ go_test(
     srcs = [
         "delta_test.go",
         "googlecalendar_test.go",
+        "provider_contract_test.go",
         "series_exceptions_test.go",
         "throttle_test.go",
         "timezone_test.go",
         "write_test.go",
     ],
+    data = ["testdata/google-timezones.json"],
     embed = [":googlecalendar"],
     deps = [
         "//cli/internal/calendar",
         "//cli/internal/calendarsync",
+        "//cli/internal/calendartest",
+    ],
+)
+
+go_test(
+    name = "googlecalendar_live_integration_test",
+    size = "large",
+    srcs = ["live_integration_test.go", "provider_contract_test.go"],
+    embed = [":googlecalendar"],
+    gotags = ["calendarintegration"],
+    tags = ["manual"],
+    deps = [
+        "//cli/internal/calendar",
+        "//cli/internal/calendarsync",
+        "//cli/internal/calendartest",
     ],
 )

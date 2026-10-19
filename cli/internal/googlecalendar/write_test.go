@@ -271,7 +271,7 @@ func TestCreateEventID(t *testing.T) {
 // MARK: - UpdateEvent
 
 func TestUpdateEventFull(t *testing.T) {
-	srv, captured := captureServer(t, []int{http.StatusOK}, []string{`{"etag": "\"etag-2\""}`})
+	srv, captured := captureServer(t, []int{http.StatusOK, http.StatusOK}, []string{`{"etag": "\"etag-1\""}`, `{"etag": "\"etag-2\""}`})
 	defer srv.Close()
 
 	err := testClient(srv).UpdateEvent(context.Background(), "cal-primary", "evt-1", calendarsync.UpdateSpec{
@@ -281,7 +281,7 @@ func TestUpdateEventFull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateEvent: %v", err)
 	}
-	req := (*captured)[0]
+	req := (*captured)[len(*captured)-1]
 	if req.method != http.MethodPatch || req.path != "/calendars/cal-primary/events/evt-1" {
 		t.Errorf("request = %s %s", req.method, req.path)
 	}
@@ -328,6 +328,122 @@ func TestUpdateEventAttendeesOnly(t *testing.T) {
 	}
 	if _, ok := req.body["attendees"]; !ok {
 		t.Errorf("attendees-only body misses attendees: %v", req.body)
+	}
+}
+
+func TestUpdateEventFoldMetadataLifecycle(t *testing.T) {
+	// Model Google's nested, per-key PATCH semantics. Unrelated private AND
+	// shared properties must survive every write, including metadata removal.
+	private := map[string]any{"other-app": "private-value"}
+	shared := map[string]any{"other-app": "shared-value"}
+	stored := map[string]any{"id": "event", "etag": `"version"`, "extendedProperties": map[string]any{"private": private, "shared": shared}}
+	attendeesOnly := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			var patch map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+				t.Error(err)
+			}
+			if attendeesOnly {
+				if len(patch) != 1 || patch["attendees"] == nil {
+					t.Errorf("attendee-only edit must not touch fold metadata: %v", patch)
+				}
+			} else {
+				ext, ok := patch["extendedProperties"].(map[string]any)
+				if ok {
+					props := ext["private"].(map[string]any)
+					if len(ext) != 1 || len(props) != 2 {
+						t.Errorf("PATCH must touch only our two private keys: %v", ext)
+					}
+					for key, value := range props {
+						if value == nil {
+							if _, exists := private[key]; !exists {
+								http.Error(w, "missing property", http.StatusBadRequest)
+								return
+							}
+							delete(private, key)
+						} else {
+							private[key] = value
+						}
+					}
+				}
+			}
+			for key, value := range patch {
+				if key != "extendedProperties" {
+					stored[key] = value
+				}
+			}
+		}
+		_ = json.NewEncoder(w).Encode(stored)
+	}))
+	defer srv.Close()
+	c := testClient(srv)
+	ctx := context.Background()
+	fold := calendar.Event{
+		Start: time.Date(2026, 10, 25, 1, 15, 0, 0, time.UTC),
+		End:   time.Date(2026, 10, 25, 1, 45, 0, 0, time.UTC), TimeZone: "Europe/Berlin",
+	}
+	ordinary := fold
+	ordinary.Start, ordinary.End = fold.Start.AddDate(0, 0, 1), fold.End.AddDate(0, 0, 1)
+	utc := fold
+	utc.TimeZone, utc.EndTimeZone = "UTC", "Asia/Tokyo"
+	allDay := calendar.Event{Start: fold.Start, End: fold.End.AddDate(0, 0, 1), AllDay: true}
+	series := ordinary
+	series.RecurrenceRule = "FREQ=WEEKLY;BYDAY=MO"
+	opaque := ordinary
+	opaque.OpaqueRecurrence = true
+	fromSeries := fold
+	fromSeries.Type = "seriesMaster" // The removed rule, not stale read-only Type, determines conversion.
+	newZones := fold
+	newZones.Start = time.Date(2026, 11, 1, 6, 15, 0, 0, time.UTC)
+	newZones.End = time.Date(2026, 11, 1, 6, 45, 0, 0, time.UTC)
+	newZones.TimeZone, newZones.EndTimeZone = "America/New_York", "America/Los_Angeles"
+	for _, step := range []struct {
+		name                string
+		ev                  calendar.Event
+		fold, attendeesOnly bool
+	}{
+		{"ordinary without metadata", ordinary, false, false},
+		{"ordinary to fold", fold, true, false},
+		{"attendee only", fold, true, true},
+		{"zone removes fold", utc, false, false},
+		{"back to fold", fold, true, false},
+		{"fold to all day", allDay, false, false},
+		{"all day to fold", fold, true, false},
+		{"fold to series", series, false, false},
+		{"series to fold", fromSeries, true, false},
+		{"change both original zones", newZones, true, false},
+		{"fold to ordinary", ordinary, false, false},
+		{"ordinary to fold again", fold, true, false},
+		{"fold to opaque series", opaque, false, false},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			attendeesOnly = step.attendeesOnly
+			if err := c.UpdateEvent(ctx, "cal", "event", calendarsync.UpdateSpec{Event: step.ev, AttendeesOnly: attendeesOnly}); err != nil {
+				t.Fatal(err)
+			}
+			got, err := c.GetEvent(ctx, "cal", "event")
+			startZone, endZone := step.ev.TimeZone, step.ev.EndTimeZone
+			if endZone == "" {
+				endZone = startZone
+			}
+			if err != nil || got.TimeZone != startZone || got.EndTimeZone != endZone || got.AllDay != step.ev.AllDay {
+				t.Fatalf("read after edit = %+v / %v", got, err)
+			}
+			if !step.ev.AllDay && (!got.Start.Equal(step.ev.Start) || !got.End.Equal(step.ev.End)) {
+				t.Errorf("edit lost instants: %+v", got)
+			}
+			if step.fold {
+				if private["durian.fold.v1.startZone"] != startZone || private["durian.fold.v1.endZone"] != endZone {
+					t.Errorf("stale original zones: %v", private)
+				}
+			} else if len(private) != 1 {
+				t.Errorf("stale fold metadata: %v", private)
+			}
+			if private["other-app"] != "private-value" || shared["other-app"] != "shared-value" {
+				t.Errorf("unrelated properties changed: %v / %v", private, shared)
+			}
+		})
 	}
 }
 
@@ -412,7 +528,7 @@ func TestUpdateEventNotifiesWithoutAttendeeChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateEvent: %v", err)
 	}
-	if got := (*captured)[0].query.Get("sendUpdates"); got != "all" {
+	if got := (*captured)[len(*captured)-1].query.Get("sendUpdates"); got != "all" {
 		t.Errorf("sendUpdates = %q, want \"all\" for a reschedule that changes no attendee", got)
 	}
 }

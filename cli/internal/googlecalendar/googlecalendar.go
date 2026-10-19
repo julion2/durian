@@ -538,9 +538,12 @@ type googleEvent struct {
 	// rule, which stays its identity within the series even after it was
 	// moved — the RECURRENCE-ID equivalent. Only set on instances. Cancelled
 	// instances carry it while carrying no start/end at all.
-	OriginalStartTime googleDateTime   `json:"originalStartTime"`
-	Attendees         []googleAttendee `json:"attendees"`
-	Organizer         *googlePerson    `json:"organizer"`
+	OriginalStartTime  googleDateTime   `json:"originalStartTime"`
+	Attendees          []googleAttendee `json:"attendees"`
+	Organizer          *googlePerson    `json:"organizer"`
+	ExtendedProperties struct {
+		Private map[string]string `json:"private"`
+	} `json:"extendedProperties"`
 	// HangoutLink is the legacy join-link field, used as fallback when
 	// conferenceData carries no video entry point.
 	HangoutLink    string `json:"hangoutLink"`
@@ -628,6 +631,12 @@ func (c *Client) eventFromGoogle(g googleEvent) (calendar.Event, bool) {
 		endZone, _ = googleZone(g.End.TimeZone)
 		if g.End.TimeZone == "" {
 			endZone = startZone
+		}
+		// Metadata restores zone identities only; explicit Google offsets remain
+		// authoritative for the instants (including either side of a fold).
+		if original, ok := g.ExtendedProperties.Private[foldStartZoneKey]; ok {
+			startZone = original
+			endZone = g.ExtendedProperties.Private[foldEndZoneKey]
 		}
 		loc, _ := time.LoadLocation(startZone)
 		recurrenceStart = start.In(loc)
