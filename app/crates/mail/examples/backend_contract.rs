@@ -11,6 +11,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!client.version()?.version.is_empty());
     println!("PASS authenticated real Go server, wrong token rejected");
 
+    assert!(matches!(Client::new(&server, Some("invalid".into())).compose_settings(), Err(Error::Unauthorized)));
+    let compose = client.compose_settings()?;
+    assert!(compose.signatures.is_empty() && compose.account_defaults.is_empty());
+    println!("PASS authenticated compose settings from real Pkl; empty maps are not unavailable");
+
     assert!(matches!(Client::new(&server, Some("invalid".into())).contacts("alice"), Err(Error::Unauthorized)));
     let contacts = client.contacts("alice@")?;
     assert_eq!(contacts.len(), 1);
@@ -36,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(client.count("tag:inbox")?, 2);
     assert_eq!(client.count("tag:unread")?, 1);
     assert!(client.search("subject:absent-contract-message", 25, 0)?.results.is_empty());
-    let subject_query = |text| durian::translate::translate(&mail::query::Query::parse(text), &[]).server;
+    let subject_query = |text| durian::translate::translate(&mail::query::Query::parse(text), &[]).unwrap().server;
     let subjects = client.search(&subject_query("subject:Other "), 25, 0)?;
     assert_eq!(subjects.results.len(), 1);
     assert_eq!(subjects.results[0].subject, "Other Thread");
@@ -123,6 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         account: "test".into(), calendar: "Work".into(), uid: format!("{}-neighbor", at.uid),
         subject: "Keep this invitation unchanged".into(), start: "2026-08-01T15:00:00Z".into(), end: "2026-08-01T16:00:00Z".into(),
         all_day: false, location: String::new(), description: String::new(), attendees: vec!["test@example.com".into()], replace_attendees: true,
+        time_zone: String::new(), end_time_zone: String::new(), floating: false,
     };
     client.put_event(&neighbor)?;
     let before = client.event("test", "Work", &neighbor.uid)?;
@@ -145,6 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         account: "local".into(), calendar: "Scratch".into(), uid: "stable-create-contract".into(),
         subject: "All-day saved locally".into(), start: "2026-08-03T00:00:00Z".into(), end: "2026-08-05T00:00:00Z".into(),
         all_day: true, location: "Room 2".into(), description: "Keep the full description".into(), attendees: Vec::new(), replace_attendees: true,
+        time_zone: String::new(), end_time_zone: String::new(), floating: false,
     };
     let created = client.put_event(&write)?;
     assert_eq!(created.uid, write.uid);

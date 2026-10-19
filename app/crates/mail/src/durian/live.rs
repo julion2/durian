@@ -21,7 +21,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
 use calendar::model::{Attendee, CalendarInfo, Rsvp, Schedule, ScheduleEvent};
-use chrono::{Local, NaiveDate};
+use chrono::{Local, NaiveDate, TimeZone};
 use gpui::{Context, Entity, EventEmitter, SharedString, Subscription, Task};
 
 use super::cache::{Stamp, ThreadCache};
@@ -260,8 +260,10 @@ impl Live {
             // the shown period moved (or anything else changed): load its events if needed
             cx.observe(&schedule, |this, _, cx| this.ensure_calendar(cx)),
             cx.subscribe(&schedule, |this, _, event, cx| {
-                if let ScheduleEvent::SelectionChanged = event {
-                    this.event_selected(cx);
+                match event {
+                    ScheduleEvent::SelectionChanged => this.event_selected(cx),
+                    ScheduleEvent::TimeZoneChanged => this.refresh_calendar(cx),
+                    _ => {}
                 }
             }),
             cx.subscribe(&mailbox, Self::mailbox_event),
@@ -1436,7 +1438,16 @@ fn counts(client: &Client, queries: &[String], cancel: &AtomicBool) -> Vec<(Stri
 /// Every account's calendars and events in [from, to). An account without calendars (or one
 /// whose calendar isn't synced yet: 404 / 409) is skipped, any other failure fails the load.
 fn calendars(client: &Client, accounts: &[SharedString], from: NaiveDate, to: NaiveDate) -> client::Result<Vec<AccountCalendars>> {
-    let (from, to) = (from.to_string(), to.to_string());
+    // Date-only bounds mean UTC to Go. Each local midnight needs its own offset:
+    // a window crossing DST is not a fixed multiple of 24 elapsed hours.
+    let boundary = |day: NaiveDate| {
+        let midnight = day.and_time(chrono::NaiveTime::MIN);
+        // Some zones skip midnight, or an entire civil day. Use the first actual
+        // instant at/after that boundary; repeated midnights use the earlier one.
+        (0..=172800).find_map(|seconds| Local.from_local_datetime(&(midnight + chrono::Duration::seconds(seconds))).earliest())
+            .map(|time| time.to_rfc3339()).ok_or_else(|| client::Error::Decode("Could not resolve the calendar's local-day boundary.".into()))
+    };
+    let (from, to) = (boundary(from)?, boundary(to)?);
     let one = |account: &SharedString| -> client::Result<Option<AccountCalendars>> {
         let list = match client.calendars(account) {
             Ok(list) => list,

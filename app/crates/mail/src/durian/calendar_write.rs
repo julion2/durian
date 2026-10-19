@@ -3,8 +3,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use calendar::model::{CalendarInfo, Event, Rsvp, Schedule, ScheduleEvent, WriteIntent};
-use chrono::{Local, NaiveDateTime, TimeZone};
+use calendar::model::{CalendarInfo, Event, EventInstants, Rsvp, Schedule, ScheduleEvent, WriteIntent};
+use chrono::NaiveDateTime;
 use gpui::{Context, Entity, EventEmitter, SharedString, Subscription, Task};
 use serde::Serialize;
 use serde_json::json;
@@ -22,6 +22,11 @@ pub struct EventWrite {
     pub start: String,
     pub end: String,
     pub all_day: bool,
+    /// Explicit metadata also permits transitions out of floating/zoned semantics.
+    /// Empty end zone inherits the start zone; empty start zone means UTC.
+    pub time_zone: String,
+    pub end_time_zone: String,
+    pub floating: bool,
     pub location: String,
     pub description: String,
     pub attendees: Vec<String>,
@@ -71,14 +76,16 @@ fn validate_event(account: &str, calendar: &str, uid: &str, wire: api::CalendarE
     Ok(wire)
 }
 
-fn timestamp(time: NaiveDateTime, all_day: bool) -> Result<String> {
+fn timestamp(time: NaiveDateTime, all_day: bool, floating: bool) -> Result<String> {
     if all_day {
         return Ok(time.date().and_hms_opt(0, 0, 0).unwrap().and_utc().to_rfc3339());
     }
+    if floating {
+        return Ok(time.and_utc().to_rfc3339());
+    }
     // Never silently move a time in a daylight-saving gap or choose one side of
     // an ambiguous clock hour. The user can choose an unambiguous time instead.
-    Local.from_local_datetime(&time).single().map(|t| t.to_rfc3339())
-        .ok_or_else(|| invalid("That local time is ambiguous or does not exist because of daylight saving time."))
+    EventInstants::resolve_local(time).map(|t| t.to_rfc3339()).map_err(invalid)
 }
 
 fn reference(event: &Event) -> Result<EventRef> {
@@ -95,16 +102,22 @@ pub fn event_write(event: &Event, new: bool, calendars: &[CalendarInfo]) -> Resu
         }
         at.uid
     };
-    if event.end <= event.start {
+    if event.duration() <= chrono::Duration::zero() {
         return Err(invalid("The event must end after it starts."));
     }
     let attendees = event.attendees.iter().filter(|a| !a.organizer).map(|a| a.email.to_string()).collect::<Vec<_>>();
     if target.account == "local" && !attendees.is_empty() {
         return Err(invalid("Local calendars cannot send invitations. Choose an account calendar or remove the guests."));
     }
+    let instants = event.instants.filter(|_| !event.all_day && !event.floating);
     Ok(EventWrite {
         account: target.account.to_string(), calendar: target.name.to_string(), uid,
-        subject: event.title.to_string(), start: timestamp(event.start, event.all_day)?, end: timestamp(event.end, event.all_day)?,
+        subject: event.title.to_string(),
+        start: match instants { Some(t) => t.start.to_rfc3339(), None => timestamp(event.start, event.all_day, event.floating)? },
+        end: match instants { Some(t) => t.end.to_rfc3339(), None => timestamp(event.end, event.all_day, event.floating)? },
+        time_zone: if event.all_day { String::new() } else { event.time_zone.as_ref().map(ToString::to_string).unwrap_or_default() },
+        end_time_zone: if event.all_day { String::new() } else { event.end_time_zone.as_ref().map(ToString::to_string).unwrap_or_default() },
+        floating: !event.all_day && event.floating,
         all_day: event.all_day, location: event.location.as_ref().or(event.conference.as_ref()).map(ToString::to_string).unwrap_or_default(),
         description: event.description.as_ref().map(ToString::to_string).unwrap_or_default(), attendees, replace_attendees: true,
     })

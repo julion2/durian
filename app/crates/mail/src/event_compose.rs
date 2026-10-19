@@ -2,9 +2,9 @@
 //! takes the same natural language as ⌘K ("tomorrow 3pm for 1h") and shows what it understood;
 //! guests come from the mail contacts.
 
-use calendar::model::{Attendee, Event, Rsvp, Schedule, ScheduleEvent};
+use calendar::model::{Attendee, Event, EventInstants, Rsvp, Schedule, ScheduleEvent};
 use calendar::parse::{self, Parsed};
-use chrono::{NaiveDateTime, Timelike};
+use chrono::{Local, NaiveDateTime, Timelike};
 use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, Render, ScrollHandle, SharedString, Subscription, Window, div, prelude::*, px};
 use ui::theme::{ActiveTheme, typography::*};
 use ui::{Icon, IconButton, IconName, PrimaryButton, StyledExt, TextArea, TextAreaEvent, TextInput, TextInputEvent};
@@ -69,6 +69,10 @@ pub struct EventComposer {
     when: Entity<TextInput>,
     /// what "When" currently reads as (None: can't tell)
     parsed: Option<Parsed>,
+    /// Resolve when the input is entered, not when a delayed write runs. Changing
+    /// the machine's zone must never reinterpret an untouched editor.
+    instants: Result<Option<EventInstants>, &'static str>,
+    temporal: TemporalMetadata,
     guests: Entity<RecipientField>,
     location: Entity<TextInput>,
     notes: Entity<TextArea>,
@@ -102,6 +106,54 @@ fn when_text(seed: &EventSeed) -> String {
     }
 }
 
+/// Existing semantics survive ordinary edits; new drafts remain definite instants.
+#[derive(Default)]
+struct TemporalMetadata {
+    time_zone: Option<SharedString>,
+    end_time_zone: Option<SharedString>,
+    floating: bool,
+}
+
+impl TemporalMetadata {
+    fn from_event(event: Option<&Event>) -> Self {
+        match event.filter(|e| !e.all_day) {
+            Some(e) => Self { time_zone: e.time_zone.clone(), end_time_zone: e.end_time_zone.clone(), floating: e.floating },
+            None => Self::default(),
+        }
+    }
+
+    fn resolve(&mut self, parsed: &Parsed, previous: Option<(&Parsed, EventInstants)>) -> Result<Option<EventInstants>, &'static str> {
+        if parsed.all_day {
+            // Switching back to timed after this starts with definite-instant semantics.
+            *self = Self::default();
+            return Ok(None);
+        }
+        if self.floating { return Ok(None); }
+        resolve_when(parsed, previous)
+    }
+}
+
+fn resolve_when(parsed: &Parsed, previous: Option<(&Parsed, EventInstants)>) -> Result<Option<EventInstants>, &'static str> {
+    if parsed.all_day { return Ok(None); }
+    if let Some((old, instants)) = previous {
+        if (parsed.start, parsed.end) == (old.start, old.end) && !old.all_day {
+            return Ok(Some(instants));
+        }
+    }
+    let resolve = |time, prior: Option<chrono::DateTime<chrono::FixedOffset>>| {
+        // An unchanged endpoint keeps which occurrence of 02:30 it meant. If
+        // the zone changed, explicitly entered times use the new local zone.
+        if let Some(prior) = prior.filter(|prior| prior.with_timezone(&Local).naive_local() == time) {
+            return Ok(prior.with_timezone(&Local).fixed_offset());
+        }
+        EventInstants::resolve_local(time)
+    };
+    Ok(Some(EventInstants {
+        start: resolve(parsed.start, previous.map(|(_, t)| t.start))?,
+        end: resolve(parsed.end, previous.map(|(_, t)| t.end))?,
+    }))
+}
+
 impl EventComposer {
     pub fn new(mailbox: Entity<Mailbox>, schedule: Entity<Schedule>, seed: EventSeed, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let contacts = mailbox.read(cx).contacts();
@@ -121,7 +173,13 @@ impl EventComposer {
             input.set_text(SharedString::from(when_text(&seed)));
             input
         });
-        let parsed = Some(Parsed { title: String::new(), start: seed.start, end: seed.end, all_day: seed.all_day, people: Vec::new() });
+        let parsed = Parsed { title: String::new(), start: seed.start, end: seed.end, all_day: seed.all_day, people: Vec::new() };
+        let original = seed.editing.as_ref().and_then(|e| e.instants).map(|t| EventInstants {
+            start: t.start.with_timezone(&Local).fixed_offset(), end: t.end.with_timezone(&Local).fixed_offset(),
+        });
+        let mut temporal = TemporalMetadata::from_event(seed.editing.as_ref());
+        let instants = temporal.resolve(&parsed, original.map(|t| (&parsed, t)));
+        let parsed = Some(parsed);
         let guests = cx.new(|cx| RecipientField::new("Guests", false, seed.guests.clone(), contacts, cx).as_property(IconName::MailUsers, "Add guests…", cx));
         let place = seed.editing.as_ref().and_then(|e| e.location.clone().or(e.conference.clone()));
         let description = seed.editing.as_ref().and_then(|e| e.description.clone());
@@ -144,7 +202,7 @@ impl EventComposer {
             cx.subscribe(&when, |this, _, TextInputEvent::Changed(text), cx| {
                 let names: Vec<SharedString> = this.mailbox.read(cx).contacts().into_iter().map(|c| c.name).collect();
                 let names: Vec<&str> = names.iter().map(|n| n.as_ref()).collect();
-                this.parsed = parse::parse(text, chrono::Local::now().naive_local(), &names);
+                this.set_when(parse::parse(text, chrono::Local::now().naive_local(), &names));
                 cx.notify();
             }),
             cx.subscribe_in(&notes, window, |this, _, event, window, cx| match event {
@@ -167,7 +225,7 @@ impl EventComposer {
         ];
         title.read(cx).focus_handle(cx).focus(window, cx);
         let id = seed.editing.as_ref().map(|e| e.id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string().into());
-        Self { mailbox, schedule, focus: cx.focus_handle(), calendar, title, when, parsed, guests, location, notes, scroll, editing: seed.editing,
+        Self { mailbox, schedule, focus: cx.focus_handle(), calendar, title, when, parsed, instants, temporal, guests, location, notes, scroll, editing: seed.editing,
             id, submitting: false, error: None, _subscriptions: subscriptions }
     }
 
@@ -179,6 +237,10 @@ impl EventComposer {
             return;
         }
         let Some(when) = self.parsed.clone() else { return };
+        let instants = match self.instants {
+            Ok(instants) => instants,
+            Err(message) => { self.error = Some(message.into()); cx.notify(); return; }
+        };
         if !self.guests.update(cx, |guests, cx| guests.commit_pending(cx)) {
             self.error = Some("Complete each guest with an email address before saving.".into());
             cx.notify();
@@ -226,6 +288,10 @@ impl EventComposer {
             start: when.start,
             end: when.end,
             all_day: when.all_day,
+            instants,
+            time_zone: self.temporal.time_zone.clone(),
+            end_time_zone: self.temporal.end_time_zone.clone(),
+            floating: self.temporal.floating,
             // a link goes to the call field, anything else is a place
             conference: (location.starts_with("http") || location.contains("meet.")).then(|| location.clone().into()),
             location: (!location.is_empty() && !location.starts_with("http") && !location.contains("meet.")).then(|| location.into()),
@@ -249,6 +315,15 @@ impl EventComposer {
 
     fn close(&mut self, _: &Close, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.submitting { cx.emit(EventComposeEvent::Close); }
+    }
+
+    fn set_when(&mut self, parsed: Option<Parsed>) {
+        if let Some(parsed) = &parsed {
+            let previous = self.parsed.as_ref().zip(self.instants.ok().flatten());
+            self.instants = self.temporal.resolve(parsed, previous);
+        }
+        self.parsed = parsed;
+        self.error = None;
     }
 
     /// Tab order: title → when → guests → location → notes.
@@ -282,7 +357,7 @@ impl EventComposer {
         });
         let names: Vec<SharedString> = self.mailbox.read(cx).contacts().into_iter().map(|c| c.name).collect();
         let names: Vec<&str> = names.iter().map(|n| n.as_ref()).collect();
-        self.parsed = parse::parse(&text, chrono::Local::now().naive_local(), &names);
+        self.set_when(parse::parse(&text, chrono::Local::now().naive_local(), &names));
         cx.notify();
     }
 
@@ -329,13 +404,22 @@ fn chip(label: impl Into<SharedString>, theme: &ui::theme::Theme) -> gpui::Div {
         .child(label.into())
 }
 
-fn length(p: &Parsed) -> String {
-    let minutes = (p.end - p.start).num_minutes();
+fn length(p: &Parsed, instants: Option<EventInstants>) -> String {
+    let minutes = instants.map_or(p.end - p.start, |t| t.end - t.start).num_minutes();
     match (minutes / 60, minutes % 60) {
         (0, m) => format!("{m}m"),
         (h, 0) => format!("{h}h"),
         (h, m) => format!("{h}h {m}m"),
     }
+}
+
+fn zone_label(floating: bool, instants: Option<EventInstants>) -> Option<String> {
+    if floating { return Some("Local time".into()); }
+    instants.map(|t| if t.start.offset() == t.end.offset() {
+        format!("Times shown in UTC{}", t.start.offset())
+    } else {
+        format!("Start in UTC{} · end in UTC{}", t.start.offset(), t.end.offset())
+    })
 }
 
 impl Render for EventComposer {
@@ -354,6 +438,8 @@ impl Render for EventComposer {
         let red = ui::theme::lch(55., 70., 30.);
         let conflicts = self.conflicts(cx);
         let all_day = self.parsed.as_ref().is_some_and(|p| p.all_day);
+        let instants = self.instants.ok().flatten();
+        let zone = zone_label(self.temporal.floating, instants);
 
         let understood = match &self.parsed {
             Some(p) => {
@@ -370,8 +456,8 @@ impl Render for EventComposer {
                     .flex_none()
                     .gap(px(6.))
                     .map(|d| match (p.all_day, days > 1) {
-                        (false, false) => d.child(chip(day, &theme)).child(chip(format!("{} – {}", p.start.format("%H:%M"), p.end.format("%H:%M")), &theme)).child(chip(length(p), &theme)),
-                        (false, true) => d.child(chip(short(p.start), &theme)).child(chip(format!("→ {}", short(p.end)), &theme)).child(chip(length(p), &theme)),
+                        (false, false) => d.child(chip(day, &theme)).child(chip(format!("{} – {}", p.start.format("%H:%M"), p.end.format("%H:%M")), &theme)).child(chip(length(p, instants), &theme)),
+                        (false, true) => d.child(chip(short(p.start), &theme)).child(chip(format!("→ {}", short(p.end)), &theme)).child(chip(length(p, instants), &theme)),
                         (true, false) => d.child(chip(day, &theme)).child(chip("All day", &theme)),
                         (true, true) => d.child(chip(format!("{} – {}", p.start.format("%b %-d"), last.format("%b %-d")), &theme)).child(chip(format!("{days} days"), &theme)),
                     })
@@ -454,6 +540,7 @@ impl Render for EventComposer {
                         div().flex().items_center().gap(px(12.)).child(div().flex_1().min_w_0().child(self.when.clone())).child(understood),
                         &theme,
                     )).children(conflict_line))
+                    .when_some(zone, |s, zone| s.child(div().pl(px(28.)).pb(px(4.)).text_size(px(SIZE_MINI)).text_color(theme.text_tertiary).child(zone)))
                     .child(self.guests.clone())
                     .child(property(IconName::MapPin, self.location.clone(), &theme))
                     .when_some(self.error.clone(), |s, error| s.child(div().py(px(8.)).text_size(px(SIZE_SMALL)).text_color(red).child(error)))
@@ -513,6 +600,85 @@ impl Render for EventComposer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floating_editor_keeps_civil_clocks_on_edit_and_clears_semantics_for_all_day() {
+        let wire = serde_json::from_str(r#"{"calendar":"W","uid":"civil","subject":"Civil",
+            "start":"2026-10-12T09:00:00Z","end":"2026-10-12T10:17:00Z","floating":true}"#).unwrap();
+        let event = crate::durian::calendar_event(&"local".into(), &wire).unwrap().0;
+        let seed = EventSeed::edit(event, &[]);
+        let input = when_text(&seed);
+        assert_eq!(input, "12.10.2026 09:00 – 10:17");
+        let mut temporal = TemporalMetadata::from_event(seed.editing.as_ref());
+        let parsed = parse::parse(&input, seed.start, &[]).unwrap();
+        assert_eq!(temporal.resolve(&parsed, None), Ok(None));
+        assert_eq!(zone_label(temporal.floating, None).as_deref(), Some("Local time"));
+        assert_eq!(length(&parsed, None), "1h 17m");
+        // Inputs in a DST gap/fold are valid civil clocks. No hidden instant is
+        // introduced by opening the editor, editing its clocks, or saving later.
+        for text in ["29.03.2026 02:30 – 03:45", "25.10.2026 02:30 – 03:45", "12.10.2026 09:15 – 10:17"] {
+            let parsed = parse::parse(text, seed.start, &[]).unwrap();
+            assert_eq!(temporal.resolve(&parsed, None), Ok(None));
+            assert!(temporal.floating);
+        }
+        let all_day = parse::parse("12.10.2026 all day", seed.start, &[]).unwrap();
+        assert_eq!(temporal.resolve(&all_day, None), Ok(None));
+        assert!(!temporal.floating && temporal.time_zone.is_none() && temporal.end_time_zone.is_none());
+        assert_eq!(zone_label(temporal.floating, None), None);
+        // Toggling back does not restore the discarded floating semantics.
+        assert!(temporal.resolve(&parsed, None).unwrap().is_some());
+    }
+
+    #[test]
+    fn named_zone_editor_preserves_names_folds_elapsed_length_and_frozen_times() {
+        for (start, end, minutes) in [
+            ("2026-10-25T02:30:00+02:00", "2026-10-25T02:30:00+01:00", 60),
+            ("2026-10-25T02:45:00+02:00", "2026-10-25T02:15:00+01:00", 30),
+            ("2026-10-25T02:30:00+02:00", "2026-10-25T02:45:00+02:00", 15),
+            ("2026-10-25T02:30:00+01:00", "2026-10-25T02:45:00+01:00", 15),
+        ] {
+            let wire = serde_json::from_value(serde_json::json!({"calendar":"W","uid":"series","recurring":true,
+                "start":start,"end":end,"time_zone":"Europe/Berlin","end_time_zone":"America/New_York"})).unwrap();
+            let event = crate::durian::calendar_event(&"local".into(), &wire).unwrap().0;
+            let seed = EventSeed::edit(event.clone(), &[]);
+            // Opening and title-only saving do not roundtrip the textual preview:
+            // the original Parsed/instants pair identifies both sides of a fold.
+            let parsed = Parsed { title: String::new(), start: seed.start, end: seed.end, all_day: false, people: vec![] };
+            let instants = event.instants.unwrap();
+            let mut temporal = TemporalMetadata::from_event(seed.editing.as_ref());
+            assert_eq!(temporal.resolve(&parsed, Some((&parsed, instants))), Ok(Some(instants)));
+            let mut live = event.clone();
+            live.project(&chrono::FixedOffset::west_opt(7 * 3600).unwrap());
+            assert_eq!(temporal.resolve(&parsed, Some((&parsed, instants))), Ok(Some(instants)));
+            assert_eq!(instants.end.signed_duration_since(instants.start).num_minutes(), minutes);
+            assert_ne!(zone_label(false, Some(instants)).as_deref(), Some("Local time"));
+            // Editing the date/time does not silently reassign a named series to
+            // the machine's zone. New clock input still resolves as local input.
+            let changed = parse::parse("26.10.2026 09:00 – 10:17", seed.start, &[]).unwrap();
+            assert!(temporal.resolve(&changed, Some((&parsed, instants))).unwrap().is_some());
+            assert_eq!(temporal.time_zone.as_deref(), Some("Europe/Berlin"));
+            assert_eq!(temporal.end_time_zone.as_deref(), Some("America/New_York"));
+            assert!(!temporal.floating);
+            let all_day = parse::parse("26.10.2026 all day", seed.start, &[]).unwrap();
+            assert_eq!(temporal.resolve(&all_day, Some((&parsed, instants))), Ok(None));
+            assert!(temporal.time_zone.is_none() && temporal.end_time_zone.is_none() && !temporal.floating);
+        }
+    }
+
+    #[test]
+    fn new_drafts_stay_definite_and_reject_new_ambiguous_or_missing_local_times() {
+        use chrono::TimeZone;
+        let now = Local::now().naive_local();
+        let mut temporal = TemporalMetadata::from_event(None);
+        let parsed = parse::parse("12.10.2026 09:00 – 10:17", now, &[]).unwrap();
+        assert!(temporal.resolve(&parsed, None).unwrap().is_some());
+        assert!(!temporal.floating && temporal.time_zone.is_none() && temporal.end_time_zone.is_none());
+        for text in ["29.03.2026 02:30 – 03:45", "25.10.2026 02:30 – 03:45", "08.03.2026 02:30 – 03:45", "01.11.2026 01:30 – 02:45"] {
+            let parsed = parse::parse(text, now, &[]).unwrap();
+            let resolved = temporal.resolve(&parsed, None);
+            assert_eq!(resolved.is_ok(), Local.from_local_datetime(&parsed.start).single().is_some());
+        }
+    }
 
     #[test]
     fn editing_event_time_preserves_year_and_midnight_end() {

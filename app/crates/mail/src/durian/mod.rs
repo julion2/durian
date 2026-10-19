@@ -357,8 +357,15 @@ pub fn calendar_id(account: &str, name: &str) -> SharedString {
 pub fn calendar_event(account: &SharedString, e: &api::CalendarEvent) -> Option<(CalEvent, EventRef)> {
     let time = |s: &str| if e.all_day {
         NaiveDate::parse_from_str(s.get(..10)?, "%Y-%m-%d").ok()?.and_hms_opt(0, 0, 0)
+    } else if e.floating {
+        // A floating value is a UTC-shaped civil container, never a local instant.
+        Some(DateTime::parse_from_rfc3339(s).ok()?.naive_utc())
     } else { parse_time(s) };
     let (start, end) = (time(&e.start)?, time(&e.end)?);
+    let instants = if e.all_day || e.floating { None } else { Some(calendar::model::EventInstants {
+        start: DateTime::parse_from_rfc3339(&e.start).ok()?,
+        end: DateTime::parse_from_rfc3339(&e.end).ok()?,
+    }) };
     let rsvp = match e.my_response.as_deref() {
         None | Some("none") | Some("") => Rsvp::Accepted,
         Some(r) => answer(r),
@@ -372,8 +379,12 @@ pub fn calendar_event(account: &SharedString, e: &api::CalendarEvent) -> Option<
         calendar: calendar_id(account, &e.calendar),
         title: e.subject.clone().into(),
         start,
-        end: end.max(start),
+        end,
         all_day: e.all_day,
+        instants,
+        time_zone: e.time_zone.clone().filter(|z| !e.all_day && !z.is_empty()).map(Into::into),
+        end_time_zone: e.end_time_zone.clone().filter(|z| !e.all_day && !z.is_empty()).map(Into::into),
+        floating: !e.all_day && e.floating,
         location: e.location.clone().filter(|l| !l.is_empty()).map(Into::into),
         conference: e.online_meeting_url.clone().filter(|u| !u.is_empty()).map(Into::into),
         description: None,
@@ -665,12 +676,131 @@ mod tests {
     }
 
     #[test]
+    fn timed_calendar_edits_keep_instants_across_dst_and_travel() {
+        let calendars: Vec<calendar::model::CalendarInfo> = serde_json::from_str(r##"[{"id":"local/W","name":"W","account":"local","color":"#123456"}]"##).unwrap();
+        for (start, end, minutes) in [
+            ("2026-03-29T01:30:00+01:00", "2026-03-29T03:30:00+02:00", 60),
+            ("2026-10-25T02:30:00+02:00", "2026-10-25T02:30:00+01:00", 60),
+            ("2026-10-25T02:45:00+02:00", "2026-10-25T02:15:00+01:00", 30),
+            ("2026-10-25T02:30:00+02:00", "2026-10-25T02:45:00+02:00", 15),
+            ("2026-10-25T02:30:00+01:00", "2026-10-25T02:45:00+01:00", 15),
+        ] {
+            let wire = event(&serde_json::json!({"calendar":"W","uid":"fold","start":start,"end":end}).to_string());
+            let (mut mapped, _) = calendar_event(&"local".into(), &wire).unwrap();
+            let (start, end) = (DateTime::parse_from_rfc3339(start).unwrap(), DateTime::parse_from_rfc3339(end).unwrap());
+            assert!(!mapped.floating);
+            assert!(mapped.time_zone.is_none() && mapped.end_time_zone.is_none());
+            // Display in the source's Berlin clocks, independent of the test host's zone.
+            (mapped.start, mapped.end) = (start.naive_local(), end.naive_local());
+            assert_eq!(mapped.duration().num_minutes(), minutes);
+            let mut editor = mapped.clone();
+            // The live calendar follows travel; the already-open editor does not.
+            let old = (editor.start, editor.end);
+            mapped.project(&chrono::FixedOffset::west_opt(4 * 3600).unwrap());
+            editor.title = "Only the title changed".into();
+            let write = calendar_write::event_write(&editor, false, &calendars).unwrap();
+            assert_eq!(DateTime::parse_from_rfc3339(&write.start).unwrap(), start);
+            assert_eq!(DateTime::parse_from_rfc3339(&write.end).unwrap(), end);
+            assert!(!write.floating);
+            assert!(write.time_zone.is_empty() && write.end_time_zone.is_empty());
+            assert_eq!((editor.start, editor.end), old);
+            assert_eq!(mapped.duration().num_minutes(), minutes);
+        }
+    }
+
+    #[test]
+    fn floating_clocks_roundtrip_without_instant_resolution_or_travel_projection() {
+        use calendar::model::{CalendarData, Schedule};
+        let calendars: Vec<calendar::model::CalendarInfo> = serde_json::from_str(r##"[{"id":"local/W","name":"W","account":"local","color":"#123456"}]"##).unwrap();
+        for (start, end) in [
+            ("2026-10-12T09:00:00Z", "2026-10-12T10:17:00Z"),
+            ("2026-03-29T02:30:00Z", "2026-03-29T03:45:00Z"),
+            ("2026-10-25T02:30:00Z", "2026-10-25T03:45:00Z"),
+        ] {
+            let wire = event(&serde_json::json!({"calendar":"W","uid":"civil","start":start,"end":end,"floating":true}).to_string());
+            let (mut mapped, _) = calendar_event(&"local".into(), &wire).unwrap();
+            let clocks = (DateTime::parse_from_rfc3339(start).unwrap().naive_utc(), DateTime::parse_from_rfc3339(end).unwrap().naive_utc());
+            assert_eq!((mapped.start, mapped.end), clocks);
+            assert!(mapped.floating && mapped.instants.is_none());
+            let mut timed_wire = wire.clone();
+            timed_wire.uid = "timed".into();
+            timed_wire.floating = false;
+            let timed = calendar_event(&"local".into(), &timed_wire).unwrap().0;
+            let mut schedule = Schedule::new(CalendarData { calendars: calendars.clone(), events: vec![mapped.clone(), timed], me: vec![] }, mapped.start.date());
+            for offset in [2, -4] { // Berlin and New York on the asymmetric October date.
+                let zone = chrono::FixedOffset::east_opt(offset * 3600).unwrap();
+                assert!(!mapped.project(&zone));
+                schedule.refresh_clock(DateTime::parse_from_rfc3339("2026-10-12T12:00:00Z").unwrap().with_timezone(&zone));
+                let live = schedule.event(&mapped.id).unwrap();
+                assert_eq!((live.start, live.end), clocks);
+                let timed = schedule.events.iter().find(|e| !e.floating).unwrap();
+                assert_eq!(timed.start, (clocks.0.and_utc() + chrono::Duration::hours(offset.into())).naive_utc());
+            }
+            mapped.title = "Title changed after travel".into();
+            let write = calendar_write::event_write(&mapped, false, &calendars).unwrap();
+            let json = serde_json::to_value(&write).unwrap();
+            assert_eq!(json["floating"], true);
+            for (field, clock) in [("start", clocks.0), ("end", clocks.1)] {
+                let timestamp = DateTime::parse_from_rfc3339(json[field].as_str().unwrap()).unwrap();
+                assert_eq!(timestamp.offset().local_minus_utc(), 0);
+                assert_eq!(timestamp.naive_utc(), clock);
+            }
+            let roundtrip: api::CalendarEvent = serde_json::from_value(json).unwrap();
+            let roundtrip = calendar_event(&"local".into(), &roundtrip).unwrap().0;
+            assert_eq!((roundtrip.start, roundtrip.end), clocks);
+            assert!(roundtrip.floating && roundtrip.instants.is_none());
+        }
+    }
+
+    #[test]
+    fn named_zones_survive_title_edits_and_roundtrip_without_becoming_display_zones() {
+        let calendars: Vec<calendar::model::CalendarInfo> = serde_json::from_str(r##"[{"id":"local/W","name":"W","account":"local","color":"#123456"}]"##).unwrap();
+        for end_zone in [None, Some(""), Some("America/New_York")] {
+            let wire = event(&serde_json::json!({"calendar":"W","uid":"series","recurring":true,
+                "start":"2026-10-12T09:00:00+02:00","end":"2026-10-12T04:17:00-04:00",
+                "time_zone":"Europe/Berlin","end_time_zone":end_zone}).to_string());
+            let (mut mapped, _) = calendar_event(&"local".into(), &wire).unwrap();
+            let instants = mapped.instants.unwrap();
+            assert_eq!(mapped.time_zone.as_deref(), Some("Europe/Berlin"));
+            assert_eq!(mapped.end_time_zone.as_deref(), end_zone.filter(|s| !s.is_empty()));
+            mapped.project(&chrono::FixedOffset::west_opt(4 * 3600).unwrap());
+            assert_eq!(mapped.start.format("%H:%M").to_string(), "03:00");
+            assert_eq!(mapped.end.format("%H:%M").to_string(), "04:17");
+            mapped.title = "Only title".into();
+            let write = calendar_write::event_write(&mapped, false, &calendars).unwrap();
+            assert_eq!(write.time_zone, "Europe/Berlin");
+            assert_eq!(write.end_time_zone, end_zone.unwrap_or_default());
+            assert!(!write.floating);
+            let roundtrip: api::CalendarEvent = serde_json::from_value(serde_json::to_value(write).unwrap()).unwrap();
+            let roundtrip = calendar_event(&"local".into(), &roundtrip).unwrap().0;
+            assert_eq!(roundtrip.instants, Some(instants));
+            assert_eq!((roundtrip.time_zone, roundtrip.end_time_zone), (mapped.time_zone, mapped.end_time_zone));
+        }
+    }
+
+    #[test]
     fn all_day_keeps_civil_dates_and_exclusive_end() {
         let e = event(r#"{"calendar":"W","uid":"day","all_day":true,"start":"2026-10-12T00:00:00+13:00","end":"2026-10-14T00:00:00+13:00"}"#);
-        let (mapped, _) = calendar_event(&"work".into(), &e).unwrap();
+        let (mut mapped, _) = calendar_event(&"work".into(), &e).unwrap();
+        assert!(!mapped.project(&chrono::FixedOffset::west_opt(11 * 3600).unwrap()));
         assert_eq!(mapped.start, NaiveDate::from_ymd_opt(2026, 10, 12).unwrap().and_hms_opt(0, 0, 0).unwrap());
         assert_eq!(mapped.end, NaiveDate::from_ymd_opt(2026, 10, 14).unwrap().and_hms_opt(0, 0, 0).unwrap());
         assert_eq!((mapped.end - mapped.start).num_days(), 2);
+        // Conversion must explicitly clear old semantics, even with stale metadata.
+        let calendars: Vec<calendar::model::CalendarInfo> = serde_json::from_str(r##"[{"id":"work/W","name":"W","account":"work","color":"#123456"}]"##).unwrap();
+        mapped.time_zone = Some("Europe/Berlin".into());
+        mapped.end_time_zone = Some("America/New_York".into());
+        mapped.floating = true;
+        let write = calendar_write::event_write(&mapped, false, &calendars).unwrap();
+        assert!(write.all_day && !write.floating);
+        assert!(write.time_zone.is_empty() && write.end_time_zone.is_empty());
+        assert_eq!(write.start, "2026-10-12T00:00:00+00:00");
+        assert_eq!(write.end, "2026-10-14T00:00:00+00:00");
+        let roundtrip: api::CalendarEvent = serde_json::from_value(serde_json::to_value(write).unwrap()).unwrap();
+        let roundtrip = calendar_event(&"work".into(), &roundtrip).unwrap().0;
+        assert!(roundtrip.instants.is_none() && !roundtrip.floating);
+        assert!(roundtrip.time_zone.is_none() && roundtrip.end_time_zone.is_none());
+        assert_eq!((roundtrip.start, roundtrip.end), (mapped.start, mapped.end));
         let timed = api::CalendarEvent { all_day: false, ..e };
         assert_eq!(calendar_event(&"work".into(), &timed).unwrap().0.start, parse_time(&timed.start).unwrap());
     }

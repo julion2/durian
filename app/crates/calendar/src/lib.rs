@@ -12,7 +12,7 @@ pub mod parse;
 
 use chrono::{Datelike, NaiveDateTime};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Render, ScrollHandle, Subscription, Window, actions, div, point,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Render, ScrollHandle, Subscription, Task, Window, actions, div, point,
     prelude::*, px,
 };
 use ui::theme::{ActiveTheme, typography::*};
@@ -51,6 +51,7 @@ pub struct CalendarView {
     /// text selection in the details panel (⌘C copies it)
     pub selection: ui::Selection,
     _observe: Subscription,
+    _clock: Task<()>,
 }
 
 impl EventEmitter<CalendarViewEvent> for CalendarView {}
@@ -74,7 +75,15 @@ impl CalendarView {
             }
         })
         .detach();
-        Self { schedule, focus: cx.focus_handle(), scroll, drag: None, columns: Default::default(), selection: ui::Selection::new(), _observe: observe }
+        // Also runs while mail is in front. Wake/sleep and timezone changes must
+        // not leave Today or cached wall times at their launch values.
+        let clock_schedule = schedule.downgrade();
+        let executor = cx.background_executor().clone();
+        let clock = cx.spawn(async move |_, cx| loop {
+            if clock_schedule.update(cx, |s, cx| s.tick(cx)).is_err() { break; }
+            executor.timer(std::time::Duration::from_secs(1)).await;
+        });
+        Self { schedule, focus: cx.focus_handle(), scroll, drag: None, columns: Default::default(), selection: ui::Selection::new(), _observe: observe, _clock: clock }
     }
 
     /// Right-click: an event gets selected first, so menu commands act on it.

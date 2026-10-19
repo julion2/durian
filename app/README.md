@@ -290,7 +290,8 @@ for a parity port; their interaction needs a separate design.
   reconciliation-required and delivered-with-warning states; provider reconciliation remains
   a Go CLI operation, not an automatic retry.
 - Calendar creates allocate a stable UID before submission; edits fetch master details, preserve
-  all-day civil dates and reject ambiguous/nonexistent local times. Local saves and scoped provider
+  all-day civil dates and existing definite instants, and reject newly entered ambiguous/nonexistent
+  local times. Local saves and scoped provider
   sync are separate acknowledgements. Local-only calendars skip provider sync; remote deletion
   does not offer a fake in-memory Undo. A lost DELETE response retains account/calendar/UID,
   blocks further changes to that identity, and exposes **Recover calendar changes**. Recovery
@@ -299,6 +300,28 @@ for a parity port; their interaction needs a separate design.
   retain recovery; failed sync stays retryable. No PUT/DELETE/RSVP is replayed automatically.
   This queue survives an owned-backend replacement, not a full app restart. Durable recovery
   needs a separately agreed backend storage contract; no plaintext intent journal is written.
+
+### Calendar time semantics
+
+Timed events retain their instants and optional IANA start/end zones. The calendar projects
+them into the current system zone and updates Today after travel/date rollover; an open
+editor keeps the instants captured when its time was entered. Floating events instead keep
+their wall clock and show **Local time** in the editor. All-day dates never shift with travel.
+The optional API fields are `time_zone`, `end_time_zone` and `floating`; omitted write metadata
+preserves the stored kind for older clients. Bare-date API window bounds still mean UTC;
+the app sends explicit local-midnight offsets, separately resolved at each end of the window.
+
+Go retains TZID, exact RRULE, EXDATE and moved-occurrence identities through iCalendar and
+expands series in their original zone. Nonexistent generated times do not consume COUNT;
+repeated generated times use the first occurrence. Existing definite second-fold instants
+survive local edits. Legacy sync baselines recover metadata without discarding pending local
+edits; Google performs one full refresh to refill metadata discarded by older readers.
+
+Floating writes to Google/Graph and unknown/custom zones are refused, not silently converted.
+Graph writes use its documented zone-less dateTime plus timeZone; uploads with ambiguous
+fold endpoints are refused until provider-side disambiguation is verified. Google/Graph
+payloads have loopback contract tests, not live-provider write acceptance. Linux native
+travel/save checks do not replace macOS automatic-timezone and sleep/wake acceptance.
 
 ### Configured signatures
 

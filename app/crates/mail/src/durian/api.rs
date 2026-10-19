@@ -274,6 +274,13 @@ pub struct CalendarEvent {
     #[serde(default)]
     pub all_day: bool,
     #[serde(default)]
+    pub time_zone: Option<String>,
+    #[serde(default)]
+    pub end_time_zone: Option<String>,
+    /// UTC-shaped start/end carry civil clocks, not instants.
+    #[serde(default)]
+    pub floating: bool,
+    #[serde(default)]
     pub location: Option<String>,
     /// accepted | declined | tentative | organizer | none
     #[serde(default)]

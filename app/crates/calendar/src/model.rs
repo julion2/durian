@@ -1,7 +1,7 @@
 //! Calendar data as the data source hands it over ([`CalendarData`]), and the [`Schedule`] entity
 //! the views share: which period is shown, in which view, and which event is selected.
 
-use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Timelike};
 use gpui::{Context, EventEmitter, Hsla, SharedString};
 use serde::{Deserialize, Deserializer};
 use ui::theme::parse_css_color;
@@ -44,6 +44,29 @@ pub struct Attendee {
     pub avatar: Option<SharedString>,
 }
 
+/// Authoritative instants of a timed event. Local wall clocks are a display projection,
+/// not enough to identify either occurrence of a repeated daylight-saving hour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventInstants {
+    pub start: DateTime<FixedOffset>,
+    pub end: DateTime<FixedOffset>,
+}
+
+impl EventInstants {
+    pub fn local(start: NaiveDateTime, end: NaiveDateTime) -> Result<Self, &'static str> {
+        Ok(Self { start: Self::resolve_local(start)?, end: Self::resolve_local(end)? })
+    }
+
+    pub fn resolve_local(time: NaiveDateTime) -> Result<DateTime<FixedOffset>, &'static str> {
+        Local.from_local_datetime(&time).single().map(|t| t.fixed_offset())
+            .ok_or("That local time is ambiguous or does not exist because of daylight saving time.")
+    }
+
+    pub fn project<Tz: TimeZone>(&self, zone: &Tz) -> (NaiveDateTime, NaiveDateTime) {
+        (self.start.with_timezone(zone).naive_local(), self.end.with_timezone(zone).naive_local())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Event {
     pub id: SharedString,
@@ -53,6 +76,16 @@ pub struct Event {
     /// exclusive; all-day events end at midnight after their last day
     pub end: NaiveDateTime,
     pub all_day: bool,
+    /// Timed events keep their source instants; start/end above are the cached local
+    /// projection. None for floating clocks, all-day dates and unresolved new inputs.
+    pub instants: Option<EventInstants>,
+    /// Retained IANA identities, not display zones. None means UTC for the start;
+    /// an absent end zone inherits the start zone. The backend resolves these.
+    pub time_zone: Option<SharedString>,
+    pub end_time_zone: Option<SharedString>,
+    /// start/end are civil clocks, unchanged by travel, rather than instants.
+    /// All-day events have neither floating nor zone metadata.
+    pub floating: bool,
     pub location: Option<SharedString>,
     pub conference: Option<SharedString>,
     pub description: Option<SharedString>,
@@ -67,7 +100,17 @@ pub struct Event {
 
 impl Event {
     pub fn duration(&self) -> Duration {
-        self.end - self.start
+        if self.all_day || self.floating { return self.end - self.start; }
+        self.instants.map_or(self.end - self.start, |t| t.end - t.start)
+    }
+
+    pub fn project<Tz: TimeZone>(&mut self, zone: &Tz) -> bool {
+        if self.all_day || self.floating { return false; }
+        let Some(instants) = self.instants else { return false };
+        let times = instants.project(zone);
+        let changed = (self.start, self.end) != times;
+        (self.start, self.end) = times;
+        changed
     }
 
     /// Does the event touch this day? (timed events only count the days they actually cover)
@@ -114,6 +157,8 @@ pub enum WriteIntent {
 
 pub enum ScheduleEvent {
     SelectionChanged,
+    /// Local-day request bounds changed; cached instants have already been reprojected.
+    TimeZoneChanged,
     /// A change was asked for, but the calendar is only read from a server (nothing changed).
     ReadOnly,
     WriteRequested(WriteIntent),
@@ -137,6 +182,7 @@ pub struct Schedule {
     /// The periods whose events are here [from, to), when they come in windows from a
     /// server; None: all of them are (fixtures).
     pub loaded: Option<Vec<(NaiveDate, NaiveDate)>>,
+    clock: Option<(NaiveDateTime, FixedOffset)>,
 }
 
 impl EventEmitter<ScheduleEvent> for Schedule {}
@@ -145,7 +191,39 @@ impl Schedule {
     pub fn new(data: CalendarData, today: NaiveDate) -> Self {
         let mut events = data.events;
         events.sort_by_key(|e| (e.start, std::cmp::Reverse(e.end)));
-        Self { me: data.me, calendars: data.calendars, events, view: View::Week, anchor: today, selected: None, today, read_only: false, loaded: None }
+        Self { me: data.me, calendars: data.calendars, events, view: View::Week, anchor: today, selected: None, today, read_only: false, loaded: None, clock: None }
+    }
+
+    /// Recompute from the current clock after sleep/travel, never by adding 24 hours.
+    /// Follow today only while viewing today; browsing another date stays put.
+    pub fn refresh_clock<Tz: TimeZone>(&mut self, now: DateTime<Tz>) -> (bool, bool) {
+        let today = now.date_naive();
+        if self.anchor == self.today {
+            self.anchor = today;
+        }
+        let day_changed = self.today != today;
+        self.today = today;
+        let clock = (now.naive_local().with_second(0).unwrap().with_nanosecond(0).unwrap(), now.offset().fix());
+        let mut zone_changed = self.clock.is_some_and(|previous| previous.1 != clock.1);
+        for event in &mut self.events {
+            zone_changed |= event.project(&now.timezone());
+        }
+        if zone_changed {
+            self.events.sort_by_key(|e| (e.start, std::cmp::Reverse(e.end)));
+        }
+        let changed = day_changed || zone_changed || self.clock != Some(clock);
+        self.clock = Some(clock);
+        (changed, zone_changed)
+    }
+
+    pub fn tick(&mut self, cx: &mut Context<Self>) {
+        let (changed, zone_changed) = self.refresh_clock(Local::now());
+        if zone_changed {
+            cx.emit(ScheduleEvent::TimeZoneChanged);
+        }
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Whether every event of that day is here – only then can a day look free.
@@ -215,6 +293,7 @@ impl Schedule {
     }
 
     pub fn go_to_today(&mut self, cx: &mut Context<Self>) {
+        self.tick(cx);
         self.anchor = self.today;
         cx.notify();
     }
@@ -347,10 +426,12 @@ impl Schedule {
     /// A copy right after the original (same length), selected. Guests are not re-invited.
     pub fn duplicate(&mut self, id: &str, new_id: SharedString, cx: &mut Context<Self>) {
         let Some(mut copy) = self.event(id).cloned() else { return };
-        let length = copy.end - copy.start;
+        let length = copy.duration();
         copy.id = new_id;
         copy.start = copy.end;
         copy.end = copy.start + length;
+        copy.instants = copy.instants.map(|t| EventInstants { start: t.end, end: t.end + length });
+        copy.project(&Local);
         copy.series = None;
         copy.recurrence = None;
         copy.rsvp = Rsvp::Accepted;
@@ -414,6 +495,24 @@ impl Schedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_rollover_follows_today_but_not_a_browsed_date() {
+        let instant = |s| DateTime::parse_from_rfc3339(s).unwrap();
+        let initial = instant("2026-10-24T23:59:00+02:00");
+        let mut schedule = Schedule::new(CalendarData { calendars: Vec::new(), events: Vec::new(), me: Vec::new() }, initial.date_naive());
+        schedule.refresh_clock(initial);
+        schedule.refresh_clock(instant("2026-10-25T00:01:00+02:00"));
+        assert_eq!((schedule.today, schedule.anchor), (initial.date_naive().succ_opt().unwrap(), initial.date_naive().succ_opt().unwrap()));
+        // Same instant on the other side of the date line, including travel backwards.
+        schedule.refresh_clock(instant("2026-10-24T11:01:00-11:00"));
+        assert_eq!((schedule.today, schedule.anchor), (initial.date_naive(), initial.date_naive()));
+        schedule.anchor = NaiveDate::from_ymd_opt(2025, 6, 3).unwrap();
+        // Waking after more than one midnight must not increment just once.
+        schedule.refresh_clock(instant("2026-10-28T09:00:00+01:00"));
+        assert_eq!(schedule.today, NaiveDate::from_ymd_opt(2026, 10, 28).unwrap());
+        assert_eq!(schedule.anchor, NaiveDate::from_ymd_opt(2025, 6, 3).unwrap());
+    }
 
     #[test]
     fn a_day_is_known_only_inside_a_loaded_window() {
