@@ -706,23 +706,39 @@ impl Mailbox {
         cx.notify();
     }
 
+    /// Use the same scope as mail search. A profile takes precedence over a stale
+    /// account filter, and its configured order decides the default new-mail sender.
+    fn sending_accounts(&self) -> Vec<&Account> {
+        if let Some(profile) = self.active_profile() {
+            if profile.accounts.is_empty() || profile.accounts.iter().any(|name| name == "*") {
+                return self.accounts.iter().collect();
+            }
+            let mut seen = HashSet::new();
+            return profile.accounts.iter().filter_map(|name| {
+                self.accounts.iter().find(|a| a.id.eq_ignore_ascii_case(name) || a.name.eq_ignore_ascii_case(name))
+                    .or_else(|| self.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(name) || a.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(name))))
+            }).filter(|a| seen.insert(a.id.as_ref())).collect();
+        }
+        self.accounts
+            .iter()
+            .filter(|a| self.account_filter.as_ref().is_none_or(|f| a.id.eq_ignore_ascii_case(f)))
+            .collect()
+    }
+
     /// Addresses the composer may send from: the active profile's own addresses (primary +
     /// aliases), or every account's in All accounts.
     pub fn sender_options(&self) -> Vec<(SharedString, SharedString)> {
-        self.accounts
-            .iter()
-            .filter(|a| self.account_filter.as_ref().is_none_or(|f| a.id == *f))
+        self.sending_accounts().into_iter()
             .flat_map(|a| std::iter::once(a.email.clone()).chain(a.aliases.iter().cloned()).map(move |e| (a.id.clone(), e)))
             .collect()
     }
 
-    /// The identity to send from: the thread's account for replies, else the filtered account,
-    /// else the first (work) account.
+    /// Replies keep the thread's account; new mail uses the first account in scope.
+    /// An unresolved scoped account must never fall back to an unrelated identity.
     pub fn sending_account(&self, thread: Option<&Thread>) -> Option<&Account> {
         thread
             .and_then(|t| self.account(&t.account))
-            .or_else(|| self.account_filter.as_ref().and_then(|id| self.account(id)))
-            .or_else(|| self.accounts.first())
+            .or_else(|| self.sending_accounts().into_iter().next())
     }
 
     pub fn is_me(&self, contact: &Contact) -> bool {
@@ -1341,6 +1357,39 @@ mod count_tests {
         mailbox.profile = Some(0);
         mailbox.folder = Some(0);
         mailbox
+    }
+
+    #[test]
+    fn compose_senders_follow_profile_order_not_global_accounts_or_stale_filters() {
+        let mut m = mailbox(true);
+        m.accounts[0].aliases.push("alias@work.test".into());
+        m.accounts.reverse(); // Private account is first globally, Work first in the profile.
+        m.account_filter = Some("home".into());
+        m.profiles[0].accounts = vec!["WORK".into()];
+        let work = vec![("work".into(), "me@work.test".into()), ("work".into(), "alias@work.test".into())];
+        assert_eq!(m.sending_account(None).unwrap().id.as_ref(), "work");
+        assert_eq!(m.sender_options(), work);
+        assert_eq!(m.sending_account(Some(&m.threads[1])).unwrap().id.as_ref(), "home", "a reply keeps its actual account");
+
+        m.profile = Some(2); // Team is ordered Work, Home, unlike the global account list.
+        m.profiles[2].accounts.push("WORK".into());
+        assert_eq!(m.sending_account(None).unwrap().id.as_ref(), "work");
+        let mut team = work;
+        team.push(("home".into(), "me@home.test".into()));
+        assert_eq!(m.sender_options(), team, "profile order, with duplicate references removed");
+
+        m.profile = Some(3); // All ignores the stale account filter, as search already does.
+        assert_eq!(m.sending_account(None).unwrap().id.as_ref(), "home");
+        assert_eq!(m.sender_options().len(), 3);
+        m.profile = None;
+        assert_eq!(m.sender_options(), vec![("home".into(), "me@home.test".into())]);
+        m.account_filter = None;
+        assert_eq!(m.sender_options().len(), 3);
+
+        m.profile = Some(0);
+        m.profiles[0].accounts = vec!["unconfigured-work".into()];
+        assert!(m.sending_account(None).is_none(), "an unknown Work account must not fall back to private mail");
+        assert!(m.sender_options().is_empty());
     }
 
     #[test]

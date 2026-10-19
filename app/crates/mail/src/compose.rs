@@ -804,7 +804,7 @@ impl Render for ComposeDialog {
                 .into_any_element();
         }
         let account = mailbox.account(&self.account).cloned();
-        let sender_count = mailbox.sender_options().len();
+        let can_change_sender = mailbox.sender_options().iter().any(|(id, email)| *id != self.account || *email != self.from);
         let from = self.from.clone();
         let can_send = !self.waiting && self.attachment_task.is_none() && !self.body.read(cx).text().trim().is_empty()
             && (!self.to.read(cx).recipients.is_empty() || !self.to.read(cx).input.read(cx).text().trim().is_empty());
@@ -857,10 +857,11 @@ impl Render for ComposeDialog {
                                     .child(div().text_color(theme.text_tertiary).child(from.clone()))
                             })
                             // cycles through the active profile's addresses (all accounts in All accounts)
-                            .when(sender_count > 1, |s| {
+                            .when(can_change_sender, |s| {
                                 s.on_click(cx.listener(|this, _, _, cx| {
                                     let options = this.mailbox.read(cx).sender_options();
-                                    let next = options.iter().position(|(_, e)| *e == this.from).map_or(0, |i| (i + 1) % options.len());
+                                    if options.is_empty() { return; }
+                                    let next = options.iter().position(|(id, email)| *id == this.account && *email == this.from).map_or(0, |i| (i + 1) % options.len());
                                     (this.account, this.from) = options[next].clone();
                                     this.schedule_autosave(cx);
                                     cx.notify();
