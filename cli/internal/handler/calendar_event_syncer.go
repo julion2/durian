@@ -1,4 +1,4 @@
-package main
+package handler
 
 import (
 	"context"
@@ -6,38 +6,48 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
-	"github.com/julion2/durian/cli/internal/handler"
 )
+
+// CalendarProviderFactory supplies the remote boundary explicitly. Production
+// serve uses its normal credential factory; test-only roots can supply guards.
+type CalendarProviderFactory func(*config.AccountConfig) (calendarsync.CalendarProvider, error)
+
+// NewCalendarEventSyncer constructs the shared production event-scoped runner.
+func NewCalendarEventSyncer(cfg *config.Config, factory CalendarProviderFactory) CalendarEventSyncer {
+	return guiCalendarSyncer{cfg: cfg, factory: factory}
+}
 
 // guiCalendarSyncer turns an explicit GUI action into one event-scoped sync.
 // It intentionally discards the newly fetched remote mirror: the filtered run
 // applies no other event, so advancing the account cursor would skip those
 // unapplied remote changes. The next autosync fetches them again normally.
 type guiCalendarSyncer struct {
-	cfg *config.Config
+	cfg     *config.Config
+	factory CalendarProviderFactory
 }
 
 func (s guiCalendarSyncer) SyncCalendarEvent(ctx context.Context, identifier, calendarName, uid, operation string) (bool, error) {
-	if s.cfg == nil {
+	if s.cfg == nil || s.factory == nil {
 		return false, errors.New("config not loaded")
 	}
-	if err := rejectLocalCalendarAccount(identifier); err != nil {
-		return false, fmt.Errorf("%w: %v", handler.ErrCalendarSyncBadRequest, err)
+	if strings.EqualFold(identifier, config.LocalCalendarAccount) {
+		return false, fmt.Errorf("%w: %q holds local-only calendars — they have no provider to sync or export from", ErrCalendarSyncBadRequest, config.LocalCalendarAccount)
 	}
 	account, err := s.cfg.GetAccountByIdentifier(identifier)
 	if err != nil {
-		return false, fmt.Errorf("%w: %v", handler.ErrCalendarSyncNotFound, err)
+		return false, fmt.Errorf("%w: %v", ErrCalendarSyncNotFound, err)
 	}
 	if !account.CalendarEnabled() {
-		return false, handler.ErrCalendarSyncDisabled
+		return false, ErrCalendarSyncDisabled
 	}
-	provider, err := newCalendarProvider(account)
+	provider, err := s.factory(account)
 	if err != nil {
-		return false, fmt.Errorf("%w: %v", handler.ErrCalendarSyncBadRequest, err)
+		return false, fmt.Errorf("%w: %v", ErrCalendarSyncBadRequest, err)
 	}
 	accountDir := filepath.Join(config.CalendarBaseDir(s.cfg, ""), account.CalendarDir())
 	release, ok, err := calendarsync.AcquireRunLock(accountDir)
@@ -45,7 +55,7 @@ func (s guiCalendarSyncer) SyncCalendarEvent(ctx context.Context, identifier, ca
 		return false, fmt.Errorf("failed to acquire calendar sync run lock: %w", err)
 	}
 	if !ok {
-		return false, handler.ErrCalendarSyncBusy
+		return false, ErrCalendarSyncBusy
 	}
 	defer release()
 
@@ -79,7 +89,7 @@ func (s guiCalendarSyncer) SyncCalendarEvent(ctx context.Context, identifier, ca
 	for _, plan := range filtered {
 		for _, action := range plan.Actions {
 			if !guiOperationAllows(operation, action) {
-				return false, handler.ErrCalendarSyncConflict
+				return false, ErrCalendarSyncConflict
 			}
 			applied = applied || action.RemoteMutation()
 		}

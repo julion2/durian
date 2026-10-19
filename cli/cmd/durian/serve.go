@@ -182,7 +182,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		if cfgFile != "" {
 			h.SetProfilesPath(filepath.Join(filepath.Dir(config.ExpandPath(cfgFile)), "profiles.pkl"))
 		}
-		h.SetCalendarEventSyncer(guiCalendarSyncer{cfg: cfg})
+		h.SetCalendarEventSyncer(handler.NewCalendarEventSyncer(cfg, newCalendarProvider))
 
 		// Optional: set up remote tag sync client
 		if cfg.Sync.TagSync != nil && cfg.Sync.TagSync.URL != "" && cfg.Sync.TagSync.APIKey != "" {
