@@ -16,6 +16,56 @@ import (
 const graphBatch = "https://graph.microsoft.com/v1.0/$batch"
 const flagRead = `{"id":"0","method":"GET","url":"/me/messages/m1?$select=id,isRead,flag"}`
 
+func TestGraphOpaqueDeltaCursorRemainsReadable(t *testing.T) {
+	fake := &fakeMail{t: t}
+	cursor := graphBase + "mailFolders('folder1')/messages/delta?$deltatoken=opaque"
+	reads := 0
+	transport := transportFunc(func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "userinfo") {
+			return fake.RoundTrip(r)
+		}
+		reads++
+		if r.Method != "GET" || (reads == 2 && r.URL.String() != cursor) {
+			t.Fatal("cursor changed or mutation reached read transport")
+		}
+		return response(r, 200, fmt.Sprintf(`{"value":[],"@odata.deltaLink":%q}`, cursor)), nil
+	})
+	m, err := demotest.New(context.Background(), options(transport))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := m.BackendFor(account(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	first, err := b.FetchMessages(context.Background(), "folder1", nil, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.FetchMessages(context.Background(), "folder1", first.Cursor, 20); err != nil {
+		t.Fatal(err)
+	}
+	if reads != 2 {
+		t.Fatal("opaque delta did not reach the guarded provider")
+	}
+	c, _ := m.HTTPClient(account(false))
+	for _, endpoint := range []string{
+		graphBase + "mailFolders('folder1')/messages/send",
+		graphBase + "mailFolders('folder1')/messages/delta?$expand=messages",
+		graphBase + "mailFolders('folder1')/messages/delta/extra",
+		graphBase + "mailFolders('../users/other')/messages/delta",
+		"https://graph.microsoft.com/v1.0/users/other/mailFolders('folder1')/messages/delta",
+	} {
+		if request(t, c, "GET", endpoint, "", "") == nil || reads != 2 {
+			t.Fatal("unsafe OData path reached transport")
+		}
+	}
+	if request(t, c, "POST", cursor, "application/json", `{}`) == nil || reads != 2 {
+		t.Fatal("OData mutation reached transport")
+	}
+}
+
 func TestGraphFetchFlagsUsesGuardedReadOnlyBatch(t *testing.T) {
 	fake := &fakeMail{t: t}
 	batches := 0

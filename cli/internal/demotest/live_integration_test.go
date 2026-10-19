@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -47,8 +48,24 @@ const liveAttachmentSHA256 = "d60a3987e9d99b784cab1225fc9b79d60776a33db312f429e0
 // existing mail, and never enqueues a replacement after a timeout/error.
 // Run only after the Microsoft credential refresh worker has finished.
 func TestLiveMailPublicFlow(t *testing.T) {
+	exerciseLiveMail(t, []int{0, 1}, false)
+}
+
+// One additional, distinct Gmail→Graph message, not a retry of the unresolved
+// Graph→Gmail delivery. Covers HTML, Unicode filenames, empty attachments and
+// a nontrivial binary attachment through the same public outbox/sync path.
+func TestLiveHTMLPublicFlow(t *testing.T) {
+	exerciseLiveMail(t, []int{0}, true)
+}
+
+func exerciseLiveMail(t *testing.T, directions []int, html bool) {
+	t.Helper()
 	if os.Getenv("DURIAN_MAIL_LIVE_TEST") != "1" {
 		t.Skip("requires explicit mail live-test opt-in")
+	}
+	resume := os.Getenv("DURIAN_MAIL_READBACK_MARKER")
+	if resume != "" && (!regexp.MustCompile(`^durianlive[0-9a-f]{33}$`).MatchString(resume) || len(directions) != 1) {
+		t.Fatal("readback requires one exact earlier run marker and one direction")
 	}
 	// Production logging includes provider/local IDs and may log mailbox
 	// content on failures. This process runs only this test: discard it entirely,
@@ -132,16 +149,19 @@ func TestLiveMailPublicFlow(t *testing.T) {
 	if _, err := rand.Read(nonce[:]); err != nil {
 		t.Fatal("generate unique run marker")
 	}
-	for direction := 0; direction < 2; direction++ {
+	for _, direction := range directions {
 		from, to := &cfg.Accounts[direction], &cfg.Accounts[1-direction]
 		marker := "durianlive" + hex.EncodeToString(nonce[:]) + fmt.Sprint(direction)
+		if resume != "" {
+			marker = resume
+		}
 		// No subtest: a failure aborts the entire run instead of sending the
 		// other direction after an uncertain outcome.
-		exerciseLiveDirection(t, ctx, client, server.URL, db, mailDemo, from, to, marker)
-		if !attempted[from.AccountIdentifier()].Load() {
+		exerciseLiveDirection(t, ctx, client, server.URL, db, mailDemo, from, to, marker, html, resume != "")
+		if attempted[from.AccountIdentifier()].Load() != (resume == "") {
 			t.Fatal("public outbox did not invoke the guarded sender")
 		}
-		t.Logf("direction %d passed: HTTP enqueue/worker/provider/sync/search/thread/body/attachment SHA-256 and account ownership", direction+1)
+		t.Logf("direction %d passed (readback-only=%v): provider/sync/search/thread/body/attachment bytes and account ownership", direction+1, resume != "")
 	}
 }
 
@@ -169,21 +189,49 @@ func (s *singleLiveSend) SendAfterPersist(ctx context.Context, msg *mailsend.Mes
 	return s.sender.SendAfterPersist(ctx, msg, persist)
 }
 
-func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Client, base string, db *store.DB, m *demotest.Mail, from, to *config.AccountConfig, marker string) {
+func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Client, base string, db *store.DB, m *demotest.Mail, from, to *config.AccountConfig, marker string, html, readback bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
 	defer cancel()
 	subject := "Durian Test LIVE café 日本語 🥭 " + marker
 	body := "Bonjour café — 日本語 — 🥭\nBounded two-party mail demo.\n" + marker
+	type attachment struct {
+		name, mime string
+		data       []byte
+	}
+	attachments := []attachment{{"durian-live.txt", "text/plain", []byte(liveAttachment)}}
+	if html {
+		body = "<p>Bonjour café — 日本語 — 🥭</p><p><strong>Bounded HTML demo.</strong></p><p>" + marker + "</p>"
+		attachments[0].name = "résumé 日本語 🥭.txt"
+		pattern := make([]byte, 256)
+		for i := range pattern {
+			pattern[i] = byte(i)
+		}
+		attachments = append(attachments,
+			attachment{"empty.txt", "text/plain", []byte{}},
+			attachment{"binary-768k.bin", "application/octet-stream", bytes.Repeat(pattern, 3072)})
+	}
 	draft := handler.OutboxDraft{IdempotencyKey: marker, From: from.Email, To: []string{to.Email}, Subject: subject, Body: body,
-		Attachments: []handler.OutboxAttachment{{Filename: "durian-live.txt", MIMEType: "text/plain", DataBase64: base64.StdEncoding.EncodeToString([]byte(liveAttachment))}}}
+		IsHTML: html}
+	for _, a := range attachments {
+		draft.Attachments = append(draft.Attachments, handler.OutboxAttachment{Filename: a.name, MIMEType: a.mime, DataBase64: base64.StdEncoding.EncodeToString(a.data)})
+	}
+	received := attachments
+	if html {
+		// Real Gmail Sent retains all three, but Outlook's received MIME and
+		// attachment API omit empty.txt. Characterize that delivery behavior,
+		// not a Durian parser exception: nonempty filenames/bytes must survive.
+		received = []attachment{attachments[0], attachments[2]}
+	}
 	var enqueued struct {
 		OK bool  `json:"ok"`
 		ID int64 `json:"id"`
 	}
-	liveJSON(t, ctx, client, base, "POST", "/api/v1/outbox/send", draft, &enqueued)
-	if !enqueued.OK || enqueued.ID <= 0 {
-		t.Fatal("HTTP enqueue did not acknowledge one outbox action")
+	if !readback {
+		liveJSON(t, ctx, client, base, "POST", "/api/v1/outbox/send", draft, &enqueued)
+		if !enqueued.OK || enqueued.ID <= 0 {
+			t.Fatal("HTTP enqueue did not acknowledge one outbox action")
+		}
 	}
 	// Only the recipient account is synced. A local Sent projection made by
 	// the worker can therefore never satisfy the received-message assertion.
@@ -192,14 +240,14 @@ func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Cl
 		t.Fatal("construct guarded receiving backend")
 	}
 	defer b.Close()
-	folder, suffix := "INBOX", "-demo-graph"
+	folders, suffix := []string{"INBOX", "junk"}, "-demo-graph"
 	if to.OAuth.Provider == "google" {
-		folder, suffix = "ALL", "-demo-gmail"
+		folders, suffix = []string{"ALL"}, "-demo-gmail"
 	}
 	engine := syncengine.New(syncengine.Options{Store: db,
 		Cursors: syncengine.NewFileCursorStoreWithSuffix(to.AccountIdentifier(), suffix),
 		Account: to.AccountIdentifier(), Ingest: syncengine.IngestOptions{Account: to.AccountIdentifier()},
-		Mode: syncengine.DownloadOnly, Folders: []string{folder}, BatchLimit: 20, MaxPerFolder: 20,
+		Mode: syncengine.DownloadOnly, Folders: folders, BatchLimit: 20, MaxPerFolder: 20,
 		Timeout: 30 * time.Second, RecoveryTimeout: 30 * time.Second})
 	for {
 		if ctx.Err() != nil {
@@ -246,18 +294,47 @@ func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Cl
 					}
 					fromAddr, fromErr := mail.ParseAddress(msg.From)
 					toAddrs, toErr := mail.ParseAddressList(msg.To)
-					if fromErr != nil || toErr != nil || fromAddr.Address != from.Email || len(toAddrs) != 1 || toAddrs[0].Address != to.Email || normalizeLiveBody(msg.Body) != body {
+					if fromErr != nil || toErr != nil || fromAddr.Address != from.Email || len(toAddrs) != 1 || toAddrs[0].Address != to.Email {
 						t.Fatal("received envelope or unicode body mismatch")
 					}
 					var quoted protocol.Response
 					liveJSON(t, ctx, client, base, "GET", "/api/v1/message/body?id="+url.QueryEscape(msg.ID), nil, &quoted)
-					if !quoted.OK || quoted.MessageBody == nil || normalizeLiveBody(quoted.MessageBody.Body) != body || len(msg.Attachments) != 1 || msg.Attachments[0].Filename != "durian-live.txt" {
+					if !quoted.OK || quoted.MessageBody == nil || len(msg.Attachments) != len(received) {
 						t.Fatal("HTTP body or attachment metadata mismatch")
 					}
-					data := liveHTTP(t, ctx, client, base, "GET", fmt.Sprintf("/api/v1/messages/%s/attachments/%d", url.PathEscape(msg.ID), msg.Attachments[0].PartID), nil)
-					sum := sha256.Sum256(data)
-					if hex.EncodeToString(sum[:]) != liveAttachmentSHA256 {
-						t.Fatal("HTTP attachment hash differs from independent input fixture")
+					if html {
+						for _, text := range []string{"Bonjour café — 日本語 — 🥭", "Bounded HTML demo.", marker} {
+							if !strings.Contains(msg.HTML, text) || !strings.Contains(msg.Body, text) || !strings.Contains(quoted.MessageBody.Body, text) {
+								t.Fatal("HTML or its plain-text reading projection lost content")
+							}
+						}
+						if !strings.Contains(msg.HTML, "<strong>") {
+							t.Fatal("HTML markup disappeared")
+						}
+					} else if normalizeLiveBody(msg.Body) != body || normalizeLiveBody(quoted.MessageBody.Body) != body {
+						t.Fatal("plain-text body changed")
+					}
+					for _, expected := range received {
+						found := 0
+						for _, actual := range msg.Attachments {
+							if actual.Filename != expected.name {
+								continue
+							}
+							found++
+							data := liveHTTP(t, ctx, client, base, "GET", fmt.Sprintf("/api/v1/messages/%s/attachments/%d", url.PathEscape(msg.ID), actual.PartID), nil)
+							if !bytes.Equal(data, expected.data) {
+								t.Fatal("HTTP attachment bytes differ from independently constructed input")
+							}
+							if expected.mime == "text/plain" && len(expected.data) > 0 {
+								sum := sha256.Sum256(data)
+								if hex.EncodeToString(sum[:]) != liveAttachmentSHA256 {
+									t.Fatal("HTTP attachment hash differs from independent input fixture")
+								}
+							}
+						}
+						if found != 1 {
+							t.Fatal("attachment filename lost or duplicated")
+						}
 					}
 				}
 				if matches != 1 {

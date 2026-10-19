@@ -16,6 +16,7 @@ import (
 )
 
 var messageID = regexp.MustCompile(`^[A-Za-z0-9_+=-]{1,1000}$`)
+var graphFolderCursor = regexp.MustCompile(`^mailFolders\('[A-Za-z0-9_+=-]{1,1000}'\)/messages/delta$`)
 
 type mailGuard struct {
 	mu        sync.Mutex
@@ -48,8 +49,14 @@ func (g *mailGuard) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Body != nil {
 		defer req.Body.Close()
 	}
+	// net/url retains the unescaped apostrophes in Graph's canonical OData
+	// cursor as RawPath. Exempt exactly that GET shape, not percent-encoded
+	// paths, arbitrary predicates, alternate mailboxes or mutation endpoints.
+	cursorRead := req.URL != nil && !g.google && req.Method == http.MethodGet &&
+		req.URL.RawPath == req.URL.Path && strings.HasPrefix(req.URL.Path, "/v1.0/me/") &&
+		graphFolderCursor.MatchString(strings.TrimPrefix(req.URL.Path, "/v1.0/me/"))
 	if req.URL == nil || req.URL.Scheme != "https" || req.URL.User != nil || req.URL.Fragment != "" ||
-		req.URL.Opaque != "" || req.URL.RawPath != "" || (req.Host != "" && req.Host != req.URL.Host) ||
+		req.URL.Opaque != "" || req.URL.RawPath != "" && !cursorRead || (req.Host != "" && req.Host != req.URL.Host) ||
 		req.Header.Get("X-HTTP-Method-Override") != "" || req.Header.Get("Content-Encoding") != "" {
 		return nil, blocked()
 	}
@@ -211,6 +218,12 @@ func flagBatch(data []byte) bool {
 }
 
 func readable(path string, google bool) bool {
+	// Graph emits this canonical OData spelling in opaque delta/next links.
+	// Allow only the exact /me folder-delta resource, never general predicates,
+	// other collection functions or a mutation through this read-only branch.
+	if !google && graphFolderCursor.MatchString(path) {
+		return true
+	}
 	p := strings.Split(path, "/")
 	id := func(i int) bool { return i < len(p) && messageID.MatchString(p[i]) }
 	if google {

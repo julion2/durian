@@ -15,6 +15,15 @@ draft and no matching non-delivery notice in the inspected Graph folders.
 No resend was attempted. This is NOT a passing bidirectional delivery test;
 the cause is still unknown. Evidence is under `.amp/in/artifacts/mail-live/`.
 
+One subsequent, distinct Gmail → Outlook HTML message passed the real sync and
+HTTP readback, including Unicode filename, HTML/plain projection and exact bytes
+of a 51-byte text file and a 768 KiB binary file. Outlook delivered it to Junk,
+not Inbox. Gmail Sent retained a third, zero-byte attachment, but Outlook's raw
+received MIME and attachment API both omitted it; this is an observed provider
+delivery difference, not a Durian parser exception. The first readback exposed a
+test-guard bug rejecting Graph's OData folder-delta cursor. After fixing that
+narrow GET path, readback of the **same** message passed without another send.
+
 ## Preconditions and commands
 
 Use only the two dedicated, quiescent demo mailboxes. Disable mailbox forwarding
@@ -56,6 +65,12 @@ passing credential values through Bazel test action arguments/cache. Do not use
 test repetition or automatic reruns. A failed/timeout run requires private
 provider inspection before deciding whether a new run is appropriate.
 
+`TestLiveHTMLPublicFlow` sends one additional Gmail → Outlook message. To inspect
+an already-sent HTML case without enqueueing or sending, set
+`DURIAN_MAIL_READBACK_MARKER` to its exact `durianlive…` run marker and run only
+that test. The marker is not a credential; it must match the original test case.
+Readback mode refuses a bidirectional run and asserts zero sender invocations.
+
 ## Exercised path and bounds
 
 One modest Unicode subject/body message with a deterministic 51-byte UTF-8
@@ -72,7 +87,7 @@ delivery/readback deadline; the second direction never runs after a failure.
 4. Real `syncengine.Sync` in download-only mode into a temporary encrypted
    `store.DB` with a random, memory-only master key. Both returned errors and
    `Result.Errors` must be empty. Cursors use isolated `XDG_CACHE_HOME` and
-   provider-specific demo suffixes; Graph sync selects Inbox, Gmail selects ALL.
+   provider-specific demo suffixes; Graph sync selects Inbox and Junk, Gmail ALL.
    Ordinary sync passes are capped at 20 messages (Graph page size is a provider
    soft-limit exception), with 30-second pass deadlines and a five-minute run
    context. No engine watcher or production server is involved.
@@ -97,6 +112,10 @@ is 1–20 unique numbered subrequests, all exact `GET
 dependencies or extra fields. Exact HTTPS host checks still apply. Offline tests
 exercise real `graphbackend.FetchFlags` chunking and reject mutations, `/users`,
 foreign recipients, mixed unsafe batches, expanded reads and host bypasses.
+
+Opaque Graph cursor reads also permit the provider's exact
+`/me/mailFolders('safe-id')/messages/delta` spelling. This does not allow arbitrary
+OData predicates, alternate users, percent-encoded paths or mutations.
 
 **Mail capture/replay is deferred.** The existing `calendartest.Recorder` is
 calendar-JSON-specific: it cannot preserve MIME faithfully, retains subjects/IDs,
