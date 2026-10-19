@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
-    Render, SharedString, Subscription, Task, Window, actions, deferred, div, prelude::*, px,
+    Render, ScrollHandle, SharedString, Subscription, Task, Window, actions, deferred, div, prelude::*, px,
 };
 
 use crate::contact_avatar;
@@ -287,6 +287,7 @@ impl Render for RecipientField {
                 .group(group.clone())
                 .flex()
                 .flex_none()
+                .max_w(px(320.))
                 .items_center()
                 .gap(px(6.))
                 .h(px(24.))
@@ -298,13 +299,15 @@ impl Render for RecipientField {
                 .text_size(px(SIZE_MINI))
                 .font_weight(WEIGHT_NORMAL)
                 .text_color(theme.text_secondary)
-                .child(contact_avatar(&contact).size(18.))
-                .child(name.clone())
+                .tooltip(ui::tooltip(name.clone()))
+                .child(div().flex_none().child(contact_avatar(&contact).size(18.)))
+                .child(div().min_w_0().truncate().child(name.clone()))
                 // × on hover removes; keeps the chip's width so nothing jumps
                 .child(
                     div()
                         .id(SharedString::from(format!("{group}-remove")))
                         .flex()
+                        .flex_none()
                         .items_center()
                         .justify_center()
                         .size(px(16.))
@@ -445,6 +448,7 @@ pub struct ComposeDialog {
     show_bcc: bool,
     subject: Entity<TextInput>,
     body: Entity<TextArea>,
+    scroll: ScrollHandle,
     draft_id: Option<usize>,
     account: SharedString,
     /// sending address (the account's primary or an alias)
@@ -496,8 +500,9 @@ impl ComposeDialog {
             input.set_text(if captured { wire.subject.clone().into() } else { seed.subject.clone() });
             input
         });
+        let scroll = ScrollHandle::new();
         let body = cx.new(|cx| {
-            let mut area = TextArea::new("Write your message…", 6, cx).markdown(true);
+            let mut area = TextArea::new("Write your message…", 6, cx).markdown(true).scroll_in(scroll.clone());
             area.set_text(seed.body.clone(), cx);
             area
         });
@@ -560,6 +565,7 @@ impl ComposeDialog {
             show_bcc,
             subject,
             body,
+            scroll,
             draft_id: seed.draft_id,
             account,
             from,
@@ -744,7 +750,9 @@ impl ComposeDialog {
         let fields = self.fields(cx);
         let current = fields.iter().position(|f| f.is_focused(window)).unwrap_or(0) as isize;
         let next = (current + delta).rem_euclid(fields.len() as isize) as usize;
+        if next + 1 < fields.len() { self.scroll.scroll_to_item(next); }
         fields[next].focus(window, cx);
+        cx.notify();
     }
 
     fn next_field(&mut self, _: &NextField, window: &mut Window, cx: &mut Context<Self>) {
@@ -771,6 +779,8 @@ impl ComposeDialog {
 impl Render for ComposeDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // The workspace places this card 106px below the top; leave room below it too.
+        let max_height = (window.viewport_size().height - px(130.)).max(px(200.));
         let mailbox = self.mailbox.read(cx);
         if let Some(draft) = self.draft_id.and_then(|id| mailbox.drafts.iter().find(|d| d.id == id)).filter(|d| d.sending || d.queued.is_some() || d.wire.extra.contains_key(crate::durian::writes::PENDING_SEND)).cloned() {
             // Detached inputs must not retain keyboard focus while the payload
@@ -780,14 +790,15 @@ impl Render for ComposeDialog {
             let queued = draft.queued.is_some();
             return div().key_context("Compose").track_focus(&self.focus_handle)
                 .on_action(cx.listener(|_, _: &Close, _, cx| cx.emit(ComposeEvent::Close)))
-                .w(px(750.)).p(px(24.)).flex().flex_col().gap(px(14.)).bg(theme.bg_card).rounded(theme.radius.dialog)
+                .w(px(750.)).max_h(max_height).p(px(24.)).flex().flex_col().gap(px(14.)).bg(theme.bg_card).rounded(theme.radius.dialog)
                 .text_color(theme.text_body)
-                .child(if pending { "Queuing message… your content is retained" } else if queued { "Outbox receipt retained — verify delivery status" } else { "Enqueue outcome is unknown; retry preserves the original message" })
-                .child(div().text_size(px(SIZE_SMALL)).child(format!("From: {} · To: {}", draft.wire.from, draft.wire.to.join(", "))))
-                .child(div().text_size(px(18.)).child(draft.wire.subject.clone()))
-                .child(div().max_h(px(420.)).child(draft.wire.body.clone()))
-                .child(div().text_size(px(SIZE_MINI)).child("Editing is locked until cancellation is confirmed. Closing retains this draft in memory; server recovery may be unavailable after a failed save."))
-                .child(div().flex().gap(px(12.))
+                .child(div().flex_none().child(if pending { "Queuing message… your content is retained" } else if queued { "Outbox receipt retained — verify delivery status" } else { "Enqueue outcome is unknown; retry preserves the original message" }))
+                .child(div().id("frozen-body-scroll").min_h_0().overflow_y_scroll()
+                    .child(div().text_size(px(SIZE_SMALL)).child(format!("From: {} · To: {}", draft.wire.from, draft.wire.to.join(", "))))
+                    .child(div().py(px(14.)).text_size(px(18.)).child(draft.wire.subject.clone()))
+                    .child(draft.wire.body.clone()))
+                .child(div().flex_none().text_size(px(SIZE_MINI)).child("Editing is locked until cancellation is confirmed. Closing retains this draft in memory; server recovery may be unavailable after a failed save."))
+                .child(div().flex().flex_none().gap(px(12.))
                     .when(!pending && !queued, |s| s.child(PrimaryButton::new("retry-original-send", "Retry original send").on_click(cx.listener(|this, _, window, cx| this.send(&Send, window, cx)))))
                     .when(queued, |s| s.child(PrimaryButton::new("undo-queued-send", "Request cancellation").on_click(cx.listener(move |_, _, _, cx| cx.emit(ComposeEvent::UndoSend(draft.id))))))
                     .child(PrimaryButton::new("close-frozen-send", "Close").on_click(cx.listener(|_, _, _, cx| cx.emit(ComposeEvent::Close)))))
@@ -819,6 +830,7 @@ impl Render for ComposeDialog {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .relative()
             .w(px(750.))
+            .max_h(max_height)
             .flex()
             .flex_col()
             .bg(theme.bg_card)
@@ -831,6 +843,7 @@ impl Render for ComposeDialog {
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
                     .gap(px(6.))
                     .h(px(52.))
@@ -841,6 +854,8 @@ impl Render for ComposeDialog {
                         div()
                             .id("compose-from")
                             .flex()
+                            .min_w_0()
+                            .max_w(px(340.))
                             .items_center()
                             .gap(px(6.))
                             .h(px(24.))
@@ -854,7 +869,7 @@ impl Render for ComposeDialog {
                             .when_some(account.clone(), |s, a| {
                                 s.child(div().size(px(8.)).rounded_full().bg(a.color))
                                     .child(a.name.clone())
-                                    .child(div().text_color(theme.text_tertiary).child(from.clone()))
+                                    .child(div().min_w_0().truncate().text_color(theme.text_tertiary).child(from.clone()))
                             })
                             // cycles through the active profile's addresses (all accounts in All accounts)
                             .when(can_change_sender, |s| {
@@ -892,12 +907,17 @@ impl Render for ComposeDialog {
             )
             .child(
                 div()
+                    .id("compose-content-scroll")
+                    .track_scroll(&self.scroll)
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .px(px(18.))
                     .flex()
                     .flex_col()
                     .child(
                         div()
                             .relative()
+                            .when(!self.show_cc || !self.show_bcc, |s| s.pr(px(if !self.show_cc && !self.show_bcc { 66. } else { 36. })))
                             .child(self.to.clone())
                             // "Cc  Bcc" reveal links, like most mail clients
                             .child(
@@ -954,28 +974,32 @@ impl Render for ComposeDialog {
                         div()
                             .pt(px(6.))
                             .pb(px(12.))
-                            .max_h(px(420.))
                             .text_size(px(SIZE_REGULAR))
                             .line_height(px(22.5))
                             .font_weight(WEIGHT_NORMAL)
                             .child(self.body.clone()),
-                    ),
+                    )
+                    .when(!self.wire.attachments.is_empty(), |s| s.child(
+                        div().flex().flex_wrap().gap(px(6.)).pb(px(12.)).children(self.wire.attachments.iter().enumerate().map(|(ix, attachment)| {
+                            div().id(("compose-attachment", ix)).flex().items_center().gap(px(6.)).max_w(px(320.))
+                                .px(px(8.)).py(px(4.)).rounded(theme.radius.md).bg(theme.bg_raised)
+                                .text_size(px(SIZE_MINI)).tooltip(ui::tooltip(attachment.filename.clone()))
+                                .child(div().min_w_0().truncate().child(attachment.filename.clone()))
+                                .child(IconButton::new(("remove-attachment", ix), IconName::CloseSmall).size(18.).tooltip("Remove attachment").on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.waiting && ix < this.wire.attachments.len() { this.wire.attachments.remove(ix); this.schedule_autosave(cx); cx.notify(); }
+                                })))
+                        }))
+                    )),
             )
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
+                    .flex_none()
                     .items_center()
                     .gap(px(8.))
                     .px(px(12.))
                     .pb(px(12.))
                     .child(IconButton::new("compose-attach", IconName::MailAttach).style(ui::ButtonStyle::Raised).tooltip("Add attachments").on_click(cx.listener(|this, _, _, cx| this.attach(cx))))
-                    .children(self.wire.attachments.iter().enumerate().map(|(ix, attachment)| {
-                        div().id(("compose-attachment", ix)).text_size(px(SIZE_MINI)).child(attachment.filename.clone())
-                            .child(IconButton::new(("remove-attachment", ix), IconName::CloseSmall).size(18.).tooltip("Remove attachment").on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.waiting && ix < this.wire.attachments.len() { this.wire.attachments.remove(ix); this.schedule_autosave(cx); cx.notify(); }
-                            })))
-                    }))
                     .child(div().w(px(4.)))
                     // formatting: Markdown under the hood, styled live in the body
                     .child(self.format_button("fmt-bold", "B", Format::Wrap("**"), &theme, cx).font_weight(WEIGHT_SEMIBOLD).tooltip(ui::tooltip("Bold")))

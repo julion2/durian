@@ -262,6 +262,11 @@ for a parity port; their interaction needs a separate design.
 
 ## Write behavior and limits
 
+- Composer content scrolls within the available window height; header and Send/formatting
+  controls stay outside that scroll region. Attachment chips have their own content row,
+  and long recipient/attachment labels truncate with full-text hints. Editing, selecting or
+  focusing the body reveals the caret, while wheel scrolling does not force it back into view.
+  Event descriptions use the same bounded content/caret behavior.
 - Thread tags intentionally use global thread identity, without an account qualifier. Optimistic
   changes survive periodic reads until the ordered request completes; failure restores confirmed
   state and refreshes it. Account filtering does not redefine a thread's identity.

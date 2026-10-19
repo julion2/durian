@@ -535,6 +535,27 @@ xdotool key --clearmodifiers super+b ctrl+z
 xdotool type --clearmodifiers --delay 15 'body'
 expect_screen compose-edit-format-undo 'Durable compose body'
 echo 'PASS native text core: word selection/delete, undo/redo, clipboard and formatting history'
+# A real pasted, multi-paragraph body must stay in the card, reveal the caret,
+# and permit looking elsewhere with the wheel without snapping back to it.
+for _ in {1..6}; do
+  xdotool key --clearmodifiers ctrl+a ctrl+c Right Return ctrl+v
+  sleep 0.15
+done
+xdotool key --clearmodifiers Right Return
+# Keep the caret separated from the last glyph so OCR does not read t + caret as d.
+xdotool type --clearmodifiers --delay 15 'Visible end of long draft '
+expect_screen compose-long-end 'Visible end of long draft'
+xdotool mousemove --window "$WINDOW" 800 400 click --repeat 70 --delay 12 4
+expect_screen compose-long-top 'NativeRecovery' 'Visible end of long draft'
+xdotool key --clearmodifiers Right
+xdotool type --clearmodifiers --delay 15 ' caret-visible '
+expect_screen compose-long-caret 'caret-visible'
+# Restore the exact original draft so subsequent recovery/write checks still
+# exercise their unchanged public contract.
+xdotool key --clearmodifiers ctrl+a
+xdotool type --clearmodifiers --delay 15 'Durable compose body'
+expect_screen compose-long-restored 'Durable compose body' 'caret-visible'
+echo 'PASS native long composer wheel scrolling and caret reveal'
 click_word Bcc
 xdotool type --clearmodifiers --delay 15 'hidden@example.invalid'
 expect_screen compose-bcc 'hidden@example.invalid'

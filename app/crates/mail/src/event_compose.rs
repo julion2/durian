@@ -5,7 +5,7 @@
 use calendar::model::{Attendee, Event, Rsvp, Schedule, ScheduleEvent};
 use calendar::parse::{self, Parsed};
 use chrono::{NaiveDateTime, Timelike};
-use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, Render, SharedString, Subscription, Window, div, prelude::*, px};
+use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, Render, ScrollHandle, SharedString, Subscription, Window, div, prelude::*, px};
 use ui::theme::{ActiveTheme, typography::*};
 use ui::{Icon, IconButton, IconName, PrimaryButton, StyledExt, TextArea, TextAreaEvent, TextInput, TextInputEvent};
 
@@ -72,6 +72,7 @@ pub struct EventComposer {
     guests: Entity<RecipientField>,
     location: Entity<TextInput>,
     notes: Entity<TextArea>,
+    scroll: ScrollHandle,
     editing: Option<Event>,
     id: SharedString,
     submitting: bool,
@@ -131,8 +132,9 @@ impl EventComposer {
             }
             input
         });
+        let scroll = ScrollHandle::new();
         let notes = cx.new(|cx| {
-            let mut area = TextArea::new("Add a description…", 4, cx).markdown(true);
+            let mut area = TextArea::new("Add a description…", 4, cx).markdown(true).scroll_in(scroll.clone());
             if let Some(d) = description {
                 area.set_text(d, cx);
             }
@@ -148,7 +150,7 @@ impl EventComposer {
             cx.subscribe_in(&notes, window, |this, _, event, window, cx| match event {
                 TextAreaEvent::Submit => this.save(&Send, window, cx),
                 TextAreaEvent::Cancel => this.close(&Close, window, cx),
-                TextAreaEvent::Changed => {}
+                TextAreaEvent::Changed => cx.notify(),
             }),
             cx.subscribe(&schedule, |this, _, event, cx| {
                 if let ScheduleEvent::WriteFinished { id, result } = event {
@@ -165,7 +167,7 @@ impl EventComposer {
         ];
         title.read(cx).focus_handle(cx).focus(window, cx);
         let id = seed.editing.as_ref().map(|e| e.id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string().into());
-        Self { mailbox, schedule, focus: cx.focus_handle(), calendar, title, when, parsed, guests, location, notes, editing: seed.editing,
+        Self { mailbox, schedule, focus: cx.focus_handle(), calendar, title, when, parsed, guests, location, notes, scroll, editing: seed.editing,
             id, submitting: false, error: None, _subscriptions: subscriptions }
     }
 
@@ -260,7 +262,9 @@ impl EventComposer {
         ];
         let current = order.iter().position(|f| f.is_focused(window)).unwrap_or(0) as isize;
         let next = (current + delta).rem_euclid(order.len() as isize) as usize;
+        if next + 1 < order.len() { self.scroll.scroll_to_item(next); }
         order[next].focus(window, cx);
+        cx.notify();
     }
 
     /// All day on/off rewrites "When" – the text stays the single source of truth.
@@ -335,7 +339,7 @@ fn length(p: &Parsed) -> String {
 }
 
 impl Render for EventComposer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         if self.submitting {
             // Keep the editor's entities and text alive, but do not permit more
@@ -388,6 +392,7 @@ impl Render for EventComposer {
             .on_action(cx.listener(|this, _: &PrevField, window, cx| this.move_focus(-1, window, cx)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .w(px(640.))
+            .max_h((window.viewport_size().height - px(130.)).max(px(200.)))
             .flex()
             .flex_col()
             .bg(theme.bg_card)
@@ -400,6 +405,7 @@ impl Render for EventComposer {
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
                     .gap(px(6.))
                     .h(px(52.))
@@ -434,23 +440,27 @@ impl Render for EventComposer {
             )
             .child(
                 div()
+                    .id("event-content-scroll")
+                    .track_scroll(&self.scroll)
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .px(px(18.))
                     .flex()
                     .flex_col()
                     // title in the subject's style
                     .child(div().pt(px(2.)).pb(px(10.)).text_size(px(18.)).line_height(px(26.)).font_weight(WEIGHT_SEMIBOLD).text_color(theme.text_primary).child(self.title.clone()))
-                    .child(property(
+                    .child(div().child(property(
                         IconName::MailClock,
                         div().flex().items_center().gap(px(12.)).child(div().flex_1().min_w_0().child(self.when.clone())).child(understood),
                         &theme,
-                    ))
-                    .children(conflict_line)
+                    )).children(conflict_line))
                     .child(self.guests.clone())
                     .child(property(IconName::MapPin, self.location.clone(), &theme))
                     .when_some(self.error.clone(), |s, error| s.child(div().py(px(8.)).text_size(px(SIZE_SMALL)).text_color(red).child(error)))
                     // description in the mail body's style
                     .child(
                         div()
+                            .flex_none()
                             .mt(px(10.))
                             .pt(px(12.))
                             .pb(px(12.))
@@ -465,6 +475,7 @@ impl Render for EventComposer {
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
                     .gap(px(8.))
                     .px(px(12.))

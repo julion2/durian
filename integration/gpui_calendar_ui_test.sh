@@ -175,6 +175,20 @@ xdotool key Tab Tab
 xdotool type --clearmodifiers --delay 15 'RoomNine'
 xdotool key Tab
 xdotool type --clearmodifiers --delay 15 'Preserve calendar notes'
+for _ in {1..5}; do
+  xdotool key --clearmodifiers ctrl+a ctrl+c Right Return ctrl+v
+  sleep 0.15
+done
+xdotool key --clearmodifiers Right Return
+xdotool type --clearmodifiers --delay 15 'End of event description '
+expect_screen create-long-notes 'End of event description'
+xdotool mousemove --window "$WINDOW" 800 400 click --repeat 70 --delay 12 4
+expect_screen create-notes-scrolled 'NativeCreated' 'End of event description'
+xdotool key --clearmodifiers Right
+expect_screen create-notes-caret 'End of event description'
+xdotool key --clearmodifiers ctrl+a
+xdotool type --clearmodifiers --delay 15 'Preserve calendar notes'
+expect_screen create-notes-restored 'Preserve calendar notes' 'End of event description'
 printf 'PUT /api/v1/calendars/event after\n' > "$ROOT/fault"
 click_word Save
 expect_screen create-ack-lost 'Calendar request failed'

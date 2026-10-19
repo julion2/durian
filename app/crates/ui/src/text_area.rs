@@ -3,13 +3,13 @@
 //! vertical movement, newlines and a submit action. Height follows the wrapped content, so the
 //! composer grows as you type.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Style, TextRun,
+    GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollHandle, SharedString, Style, TextRun,
     UTF16Selection, Window, WrappedLine, actions, div, fill, point, prelude::*, px, relative, size,
 };
 
@@ -123,6 +123,10 @@ pub struct TextArea {
     goal_x: Option<Pixels>,
     /// Live Markdown styling + formatting shortcuts.
     markdown: bool,
+    /// Optional enclosing scroll region; reveal edits/navigation, never ordinary wheel scrolls.
+    scroll: Option<ScrollHandle>,
+    reveal_caret: Cell<bool>,
+    was_focused: Cell<bool>,
 }
 
 impl EventEmitter<TextAreaEvent> for TextArea {}
@@ -138,7 +142,15 @@ impl TextArea {
             is_selecting: false,
             goal_x: None,
             markdown: false,
+            scroll: None,
+            reveal_caret: Cell::new(true),
+            was_focused: Cell::new(false),
         }
+    }
+
+    pub fn scroll_in(mut self, scroll: ScrollHandle) -> Self {
+        self.scroll = Some(scroll);
+        self
     }
 
     pub fn markdown(mut self, enabled: bool) -> Self {
@@ -189,6 +201,7 @@ impl TextArea {
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.editor.reset(text.into());
         self.goal_x = None;
+        self.reveal_caret.set(true);
         cx.emit(TextAreaEvent::Changed);
         cx.notify();
     }
@@ -203,16 +216,19 @@ impl TextArea {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.editor.move_to(offset, false);
+        self.reveal_caret.set(true);
         cx.notify();
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.editor.move_to(offset, true);
+        self.reveal_caret.set(true);
         cx.notify();
     }
 
     fn edited(&mut self, changed: bool, cx: &mut Context<Self>) {
         self.goal_x = None;
+        self.reveal_caret.set(true);
         if changed {
             cx.emit(TextAreaEvent::Changed);
         }
@@ -473,6 +489,7 @@ impl EntityInputHandler for TextArea {
     ) {
         self.editor.preedit(range_utf16, new_text, new_selected_range_utf16);
         self.goal_x = None;
+        self.reveal_caret.set(true);
         cx.notify();
     }
 
@@ -492,10 +509,8 @@ impl EntityInputHandler for TextArea {
 }
 
 /// `runs: None` = one run in `color`; otherwise the given styled runs (live Markdown).
-fn shape(text: &SharedString, width: Pixels, window: &Window, color: gpui::Hsla, runs: Option<Vec<TextRun>>) -> (Vec<Paragraph>, Pixels) {
-    let style = window.text_style();
+fn shape(text: &SharedString, width: Pixels, window: &Window, style: &gpui::TextStyle, line_height: Pixels, color: gpui::Hsla, runs: Option<Vec<TextRun>>) -> (Vec<Paragraph>, Pixels) {
     let font_size = style.font_size.to_pixels(window.rem_size());
-    let line_height = window.line_height();
     let runs =
         runs.unwrap_or_else(|| vec![TextRun { len: text.len(), font: style.font(), color, background_color: None, underline: None, strikethrough: None }]);
     let lines = window.text_system().shape_text(text.clone(), font_size, &runs, Some(width), None).unwrap_or_default();
@@ -545,7 +560,11 @@ impl Element for TextAreaElement {
         } else {
             input.editor.text().clone()
         };
-        let min_height = window.line_height() * input.min_lines as f32;
+        // Measured-layout callbacks run outside the element's inherited text-style scope.
+        // Capture it now, or the measured height differs from what prepaint actually draws.
+        let text_style = window.text_style();
+        let line_height = window.line_height();
+        let min_height = line_height * input.min_lines as f32;
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         // height follows the wrapped text at whatever width we get
@@ -554,7 +573,7 @@ impl Element for TextAreaElement {
                 gpui::AvailableSpace::Definite(w) => Some(w),
                 _ => None,
             });
-            let height = width.map_or(min_height, |w| shape(&text, w, window, gpui::black(), None).1.max(min_height));
+            let height = width.map_or(min_height, |w| shape(&text, w, window, &text_style, line_height, gpui::black(), None).1.max(min_height));
             size(width.unwrap_or(px(0.)), height)
         });
         (layout_id, ())
@@ -584,13 +603,37 @@ impl Element for TextAreaElement {
         } else {
             (text, None, Vec::new(), Vec::new())
         };
-        let (paragraphs, _) = shape(&text, bounds.size.width, window, color, runs);
         let line_height = window.line_height();
+        let (paragraphs, _) = shape(&text, bounds.size.width, window, &window.text_style(), line_height, color, runs);
         let layout = input.layout.clone();
         *layout.borrow_mut() = Layout { paragraphs, line_height, bounds: Some(bounds), to_display, to_source };
 
         let input = self.input.read(cx);
         let pos = |offset: usize| input.position_for(offset).unwrap_or_default();
+        let focused = input.focus_handle.is_focused(window);
+        let was_focused = input.was_focused.replace(focused);
+        if focused && (input.reveal_caret.replace(false) || !was_focused)
+            && let Some(scroll) = &input.scroll
+        {
+            let caret = Bounds::new(bounds.origin + pos(cursor), size(px(1.5), line_height));
+            let viewport = scroll.bounds();
+            let mut offset = scroll.offset();
+            if caret.top() < viewport.top() {
+                offset.y += viewport.top() - caret.top();
+            } else if caret.bottom() > viewport.bottom() {
+                offset.y += viewport.bottom() - caret.bottom();
+            }
+            offset.y = offset.y.clamp(-scroll.max_offset().y, px(0.));
+            if offset != scroll.offset() {
+                // Div has already prepainted its translation this frame. Refresh once with
+                // the new offset; plain scrolling Divs do not consume request_autoscroll.
+                let scroll = scroll.clone();
+                window.on_next_frame(move |window, _| {
+                    scroll.set_offset(offset);
+                    window.refresh();
+                });
+            }
+        }
         if selected.is_empty() || empty {
             let at = if empty { point(px(0.), px(0.)) } else { pos(cursor) };
             let caret = fill(Bounds::new(bounds.origin + at, size(px(1.5), line_height)), theme.accent);
