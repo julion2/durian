@@ -58,6 +58,7 @@ struct Worker {
     bool expecting_load = true;
     bool busy = false;
     std::string id, out, links;
+    int width = WIDTH;
     int height = 1;
     bool clipped = false;
     gint64 started = 0;
@@ -128,14 +129,14 @@ static void snapshot_done(GObject* object, GAsyncResult* result, gpointer data) 
     strips << '[';
     for (int y = 0, index = 0; y < worker->height; y += STRIP_HEIGHT, ++index) {
         int height = std::min(STRIP_HEIGHT, worker->height - y);
-        auto* tile = cairo_image_surface_create(CAIRO_FORMAT_RGB24, WIDTH, height);
+        auto* tile = cairo_image_surface_create(CAIRO_FORMAT_RGB24, worker->width, height);
         auto* cr = cairo_create(tile);
         cairo_set_source_rgb(cr, 1, 1, 1);
         cairo_paint(cr);
         cairo_set_source_surface(cr, surface, 0, -y);
         cairo_paint(cr);
         cairo_destroy(cr);
-        g_autoptr(GdkPixbuf) pixels = gdk_pixbuf_get_from_surface(tile, 0, 0, WIDTH, height);
+        g_autoptr(GdkPixbuf) pixels = gdk_pixbuf_get_from_surface(tile, 0, 0, worker->width, height);
         cairo_surface_destroy(tile);
         std::string path = worker->out.substr(0, worker->out.rfind('.')) + "." + std::to_string(index) + ".jpg";
         if (!pixels || !save_strip(pixels, path)) fail("snapshot write failed");
@@ -145,7 +146,7 @@ static void snapshot_done(GObject* object, GAsyncResult* result, gpointer data) 
     cairo_surface_destroy(surface);
     strips << ']';
     // Integer milliseconds keep the JSON locale-independent after GTK's setlocale.
-    reply("{\"id\":" + quoted(worker->id) + ",\"ok\":true,\"width\":664,\"height\":" + std::to_string(worker->height)
+    reply("{\"id\":" + quoted(worker->id) + ",\"ok\":true,\"width\":" + std::to_string(worker->width) + ",\"height\":" + std::to_string(worker->height)
         + ",\"clipped\":" + (worker->clipped ? "true" : "false") + ",\"strips\":" + strips.str()
         + ",\"links\":" + worker->links + ",\"ms\":" + std::to_string((g_get_monotonic_time() - worker->started) / 1000) + "}");
     worker->busy = false;
@@ -155,7 +156,7 @@ static void snapshot_done(GObject* object, GAsyncResult* result, gpointer data) 
 
 static gboolean snapshot(gpointer data) {
     auto* worker = static_cast<Worker*>(data);
-    if (gtk_widget_get_allocated_width(GTK_WIDGET(worker->web)) != WIDTH ||
+    if (gtk_widget_get_allocated_width(GTK_WIDGET(worker->web)) != worker->width ||
         gtk_widget_get_allocated_height(GTK_WIDGET(worker->web)) != worker->height) return G_SOURCE_CONTINUE;
     webkit_web_view_get_snapshot(worker->web, WEBKIT_SNAPSHOT_REGION_VISIBLE, WEBKIT_SNAPSHOT_OPTIONS_NONE, nullptr, snapshot_done, data);
     return G_SOURCE_REMOVE;
@@ -174,8 +175,8 @@ static void measured(GObject* object, GAsyncResult* result, gpointer data) {
     g_autofree char* links_json = jsc_value_to_json(links, 0);
     if (!links_json || strlen(links_json) > (8 << 20) - 4096) fail("too much link metadata");
     worker->links = links_json;
-    gtk_widget_set_size_request(GTK_WIDGET(worker->web), WIDTH, worker->height);
-    gtk_window_resize(GTK_WINDOW(worker->window), WIDTH, worker->height);
+    gtk_widget_set_size_request(GTK_WIDGET(worker->web), worker->width, worker->height);
+    gtk_window_resize(GTK_WINDOW(worker->window), worker->width, worker->height);
     // An idle callback can run before GTK's next frame allocation, yielding only
     // the previous one-pixel viewport. Wait for the actual bounded allocation.
     g_timeout_add(16, snapshot, worker);
@@ -188,6 +189,16 @@ static void loaded(WebKitWebView* web, WebKitLoadEvent event, gpointer data) {
     if (!worker->busy) {
         worker->loaded = true;
         check_ready();
+        return;
+    }
+    // A narrow preview may reuse a worker that last laid out a full-width mail.
+    // Measure only after GTK applies the requested width and resets the viewport.
+    if (gtk_widget_get_allocated_width(GTK_WIDGET(web)) != worker->width || gtk_widget_get_allocated_height(GTK_WIDGET(web)) != 1) {
+        g_timeout_add(16, +[](gpointer data) -> gboolean {
+            auto* worker = static_cast<Worker*>(data);
+            loaded(worker->web, WEBKIT_LOAD_FINISHED, data);
+            return G_SOURCE_REMOVE;
+        }, worker);
         return;
     }
     // Privileged, isolated host code. Markup JS is disabled separately; no input
@@ -250,7 +261,9 @@ static void submit(const std::string& line) {
     g_autoptr(JSCValue) request = jsc_value_new_from_json(json_context, line.c_str());
     if (!request || !jsc_value_is_object(request) || jsc_context_get_exception(json_context)) fail("invalid request JSON");
     g_autoptr(JSCValue) width = jsc_value_object_get_property(request, "width");
-    if (!jsc_value_is_number(width) || jsc_value_to_double(width) != WIDTH) fail("unsupported render width");
+    double requested_width = jsc_value_is_number(width) ? jsc_value_to_double(width) : 0;
+    // Support compact previews without increasing the existing maximum allocation.
+    if (!std::isfinite(requested_width) || requested_width < 128 || requested_width > WIDTH || std::floor(requested_width) != requested_width) fail("unsupported render width");
     auto worker = std::find_if(workers.begin(), workers.end(), [](const Worker& w) { return !w.busy; });
     if (worker == workers.end()) fail("renderer queue full");
     worker->id = string_property(request, "id");
@@ -260,8 +273,9 @@ static void submit(const std::string& line) {
     worker->busy = true;
     worker->started = g_get_monotonic_time();
     worker->expecting_load = true;
-    gtk_widget_set_size_request(GTK_WIDGET(worker->web), WIDTH, 1);
-    gtk_window_resize(GTK_WINDOW(worker->window), WIDTH, 1);
+    worker->width = static_cast<int>(requested_width);
+    gtk_widget_set_size_request(GTK_WIDGET(worker->web), worker->width, 1);
+    gtk_window_resize(GTK_WINDOW(worker->window), worker->width, 1);
     webkit_web_view_load_html(worker->web, html.c_str(), "about:blank");
 }
 

@@ -213,11 +213,16 @@ pub fn outbox(draft: &api::DraftContent) -> Result<api::OutboxDraft> {
     // Rich/quoted shared Swift drafts must not silently lose their content.
     let mut body = draft.html_body.clone().filter(|b| !b.is_empty()).unwrap_or_else(|| draft.body.clone());
     let mut is_html = draft.is_html || draft.html_body.as_ref().is_some_and(|b| !b.is_empty());
-    if draft.html_signature.as_ref().is_some_and(|s| !s.is_empty()) || draft.quoted_is_html {
+    let signature = draft.html_signature.as_deref().filter(|s| !s.trim().is_empty());
+    if signature.is_some() || draft.quoted_is_html {
         if !is_html { body = escape_html(&body).replace('\n', "<br>"); }
         is_html = true;
     }
-    if let Some(signature) = &draft.html_signature { body.push_str(&format!("<br><br>{signature}")); }
+    if let Some(signature) = signature {
+        // Block margins collapse with the Markdown paragraph's existing 12px gap;
+        // line breaks added on top of that made the signature look two paragraphs away.
+        body.push_str(&format!("<div style=\"margin-top:12px\">{signature}</div>"));
+    }
     if let Some(quote) = &draft.quoted_content {
         body.push_str(if is_html { "<br><br>" } else { "\n\n" });
         body.push_str(&if is_html && !draft.quoted_is_html { escape_html(quote).replace('\n', "<br>") } else { quote.clone() });

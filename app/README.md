@@ -300,6 +300,42 @@ for a parity port; their interaction needs a separate design.
   This queue survives an owned-backend replacement, not a full app restart. Durable recovery
   needs a separately agreed backend storage contract; no plaintext intent journal is written.
 
+### Configured signatures
+
+Pkl remains authoritative. Authenticated `GET /api/v1/compose-settings` returns only named
+signature content and account-to-default-signature names, never the full config or credentials.
+Account IDs match `/profiles` (lowercased names, not CLI aliases). The app fetches this once
+after connection and on explicit reload/retry; there is no extra disk cache or config editor.
+An old/unavailable server leaves composition usable; the picker shows a warning, Retry and None.
+
+New mail, replies and forwards start with the sending account's default. Full compose has a
+small toolbar button with the selected name. Its anchored popover combines a searchable,
+scrollable list with HTML preview; arrow keys only preview, Enter selects and Escape cancels.
+Tab reaches the toolbar button after the body. No signature panel changes the composer height.
+Inline replies have no signature controls: pop out to full compose to change the selection.
+This hides only the controls, not the signature in the outgoing message or recovered draft.
+Plain text is escaped to HTML; previews use the existing sanitizer/CSP and remote-image policy.
+Opening the popover starts one separate snapshot helper with one active job, including on macOS,
+so it cannot replace the thread render queue or put a native WebView above the composer. Closing
+the popover drops that helper. Compact previews render at their own width, not as scaled-down
+desktop screenshots. Snapshot files
+remain in the private process session and are removed with it; nothing starts at launch just
+for previewing signatures. Links in this preview are not interactive.
+
+The selected content is a snapshot in the encrypted draft's existing `htmlSignature` field;
+selection intent is opaque `gpuiSignature` metadata. Reopening keeps the snapshot even if Pkl
+changed. Switching accounts updates only Automatic; explicit signatures, None and foreign
+saved snapshots stay explicit. Switching aliases within an account does not reapply defaults.
+Reload signatures updates available options, not existing snapshots: choose Account default
+or a named signature again to deliberately apply its new content. Body text and quotes stay
+separate; send assembly appends exactly one signature before the quote. Frozen sends retain
+their original payload and cannot accept signature changes.
+When the saved version differs from the current definition, the picker lists it separately;
+previewing the saved row must never silently select the changed configuration instead.
+
+The encrypted recovery envelope still has its 1 MiB limit (including signature/attachments).
+Preview is not a guarantee of how another mail client will render the outgoing HTML.
+
 ## Rendering and Linux
 
 The UI is the existing `crates/ui`, `crates/mail` and `crates/calendar` implementation, not a

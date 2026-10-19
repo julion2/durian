@@ -79,6 +79,8 @@ struct ReplyDraft {
     submitting: Option<usize>,
     all: bool,
     editor: Entity<TextArea>,
+    _signature: Entity<crate::signature_editor::SignatureEditor>,
+    _signature_subscription: Subscription,
     _subscription: Subscription,
 }
 
@@ -776,6 +778,17 @@ impl ThreadView {
             }
             area
         });
+        let wire = self.mailbox.read(cx).reply_draft(&thread_id).map(|draft| draft.wire.clone()).unwrap_or_default();
+        let signature = cx.new(|cx| crate::signature_editor::SignatureEditor::new(self.mailbox.clone(), &wire, cx));
+        let signature_subscription = cx.subscribe(&signature, |this, signature, _, cx| {
+            let Some(reply) = &this.reply else { return };
+            let Some(saved) = this.mailbox.read(cx).reply_draft(&reply.thread_id).cloned() else { return };
+            if saved.sending || saved.queued.is_some() || saved.wire.extra.contains_key(crate::durian::writes::PENDING_SEND) { return }
+            let mut wire = saved.wire;
+            signature.read(cx).apply(&mut wire);
+            let body = reply.editor.read(cx).text().clone();
+            this.mailbox.update(cx, |m, cx| m.save_draft_content(Some(saved.id), saved.kind, body, wire, cx));
+        });
         let subscription = cx.subscribe(&editor, |this, editor, event, cx| match event {
             TextAreaEvent::Submit => this.send_reply(cx),
             TextAreaEvent::Cancel => {
@@ -801,7 +814,7 @@ impl ThreadView {
                 cx.notify();
             }
         });
-        self.reply = Some(ReplyDraft { thread_id, submitting, all, editor, _subscription: subscription });
+        self.reply = Some(ReplyDraft { thread_id, submitting, all, editor, _signature: signature, _signature_subscription: signature_subscription, _subscription: subscription });
     }
 
     /// Restore the saved reply draft of the newly selected thread, if any.

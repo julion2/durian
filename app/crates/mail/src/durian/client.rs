@@ -302,6 +302,10 @@ impl Client {
         Ok(self.get::<SettingsResponse>("/settings", &[])?.settings)
     }
 
+    pub fn compose_settings(&self) -> Result<ComposeSettings> {
+        self.get("/compose-settings", &[])
+    }
+
     pub fn tags(&self) -> Result<Vec<String>> {
         Ok(self.get::<TagsResponse>("/tags", &[])?.tags)
     }
@@ -408,6 +412,20 @@ mod tests {
         // durian before /settings: gorilla/mux's plain-text 404
         let (address, _) = serve_once(404, "404 page not found\n");
         assert!(matches!(Client::new(&address, None).settings().unwrap_err(), Error::NotFound(_)));
+    }
+
+    #[test]
+    fn compose_settings_distinguish_empty_config_from_unavailable() {
+        let (address, _) = serve_once(200, r#"{"ok":true,"signatures":{"Plain":"A & B\n<me@example.com>"},"account_defaults":{"work":"Plain"}}"#);
+        let settings = Client::new(&address, None).compose_settings().unwrap();
+        assert_eq!(settings.signatures["Plain"], "A & B\n<me@example.com>");
+        assert_eq!(settings.account_defaults["work"], "Plain");
+        let (address, _) = serve_once(200, r#"{"ok":true,"signatures":{},"account_defaults":{}}"#);
+        assert_eq!(Client::new(&address, None).compose_settings().unwrap(), ComposeSettings::default());
+        for (status, body) in [(404, "404 page not found"), (500, "failed to load compose settings"), (200, r#"{"ok":true}"#)] {
+            let (address, _) = serve_once(status, body);
+            assert!(Client::new(&address, None).compose_settings().is_err(), "{status}: {body}");
+        }
     }
 
     #[test]

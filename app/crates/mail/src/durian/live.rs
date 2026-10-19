@@ -150,6 +150,7 @@ pub struct Live {
     write_queue: writes::Queue,
     write_tasks: HashMap<String, Task<()>>,
     draft_task: Option<Task<()>>,
+    compose_settings_task: Option<Task<()>>,
     outbox_task: Option<Task<()>>,
     delivery: HashMap<i64, writes::Delivery>,
     forward_task: Option<Task<()>>,
@@ -289,6 +290,7 @@ impl Live {
             write_queue: Default::default(),
             write_tasks: HashMap::new(),
             draft_task: None,
+            compose_settings_task: None,
             outbox_task: None,
             delivery: HashMap::new(),
             forward_task: None,
@@ -330,6 +332,7 @@ impl Live {
                 self.queue_write(intent.clone(), cx);
                 self.start_writes(cx);
             }
+            MailboxEvent::ReloadComposeSettings => self.refresh_compose_settings(cx),
             MailboxEvent::ThreadLoaded(_) | MailboxEvent::ReadOnly | MailboxEvent::DraftSaved(_) | MailboxEvent::DraftDeleted(_) | MailboxEvent::WriteProblem(_) | MailboxEvent::SendFinished { .. } => {}
         }
     }
@@ -369,6 +372,7 @@ impl Live {
         self.count_pending = false;
         if let Some(cancel) = &self.count_cancel { cancel.store(true, Ordering::Relaxed); }
         self.draft_task = None;
+        self.compose_settings_task = None;
         self.outbox_task = None;
         self.update_remote(cx, |remote| remote.loading = Some(Loading::Failed(message)));
         self.mailbox.update(cx, |m, cx| { m.writes_available = false; cx.notify(); });
@@ -499,7 +503,8 @@ impl Live {
             this.update(cx, |this, cx| {
                 this.forward_task = None;
                 match result {
-                    Ok(wire) => {
+                    Ok(mut wire) => {
+                        this.mailbox.read(cx).initialize_signature(&mut wire);
                         let kind = crate::model::DraftKind::New { account: wire.account_id.clone().unwrap_or_default().into(), from: wire.from.clone().into(),
                             to: Vec::new(), cc: Vec::new(), bcc: Vec::new(), subject: wire.subject.clone().into() };
                         if let Some(id) = this.mailbox.update(cx, |m, cx| m.save_draft_content(None, kind, wire.body.clone().into(), wire, cx)) {
@@ -508,6 +513,26 @@ impl Live {
                     }
                     Err(e) => cx.emit(LiveEvent::Problem(format!("Forward not created: {e}").into())),
                 }
+            }).ok();
+        }));
+    }
+
+    fn refresh_compose_settings(&mut self, cx: &mut Context<Self>) {
+        if self.compose_settings_task.is_some() || !self.backend_available() { return }
+        let client = self.client.clone();
+        let executor = cx.background_executor().clone();
+        self.compose_settings_task = Some(cx.spawn(async move |this, cx| {
+            let settings = executor.spawn(async move { client.compose_settings() }).await;
+            this.update(cx, |this, cx| {
+                this.compose_settings_task = None;
+                this.mailbox.update(cx, |mailbox, cx| {
+                    mailbox.compose_settings = match settings {
+                        Ok(settings) => crate::signatures::Settings::Ready(settings),
+                        Err(client::Error::NotFound(_)) => crate::signatures::Settings::Unavailable("Signature settings unavailable. Update the Durian CLI or choose None.".into()),
+                        Err(_) => crate::signatures::Settings::Unavailable("Couldn't load signatures. Retry or choose None; saved signatures are retained.".into()),
+                    };
+                    cx.notify();
+                });
             }).ok();
         }));
     }
@@ -751,6 +776,7 @@ impl Live {
         }
         self.ensure_calendar(cx);
         self.start_events(cx);
+        self.refresh_compose_settings(cx);
         self.load_drafts(cx);
         self.start_writes(cx);
         cx.notify();
@@ -922,6 +948,7 @@ impl Live {
     /// differ, the cache is dropped and those threads are fetched again.
     fn apply_settings(&mut self, settings: &api::Settings, cx: &mut Context<Self>) {
         let policy = super::html_policy(settings);
+        self.mailbox.update(cx, |m, cx| { m.signature_policy = policy; cx.notify(); });
         if policy == self.policy {
             return;
         }
@@ -939,7 +966,7 @@ impl Live {
         match self.status {
             Status::Failed(_) => self.connect(cx),
             Status::Connecting => {}
-            Status::Connected { .. } => self.reconcile(cx),
+            Status::Connected { .. } => { self.refresh_compose_settings(cx); self.reconcile(cx); }
         }
     }
 

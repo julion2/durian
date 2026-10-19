@@ -62,8 +62,8 @@ pub struct HtmlSnapshot {
 }
 
 impl HtmlSnapshot {
-    fn valid_output(&self, out: &std::path::Path) -> bool {
-        protocol::valid_snapshot(self.width, RENDER_WIDTH, self.height, &self.strips, out)
+    fn valid_output(&self, out: &std::path::Path, width: f32) -> bool {
+        protocol::valid_snapshot(self.width, width, self.height, &self.strips, out)
             && self.links.len() <= protocol::MAX_LINKS
             && self.links.iter().all(|link| protocol::valid_link(link.x, link.y, link.w, link.h))
             && self.strips.iter().all(|strip| strip.path.symlink_metadata().is_ok_and(|metadata| metadata.is_file()))
@@ -90,6 +90,8 @@ pub struct HtmlRenderer {
     helper: Option<Helper>,
     replies: Option<Task<()>>,
     helper_ready: bool,
+    workers: usize,
+    width: f32,
     cache_dir: PathBuf,
     states: HashMap<SharedString, RenderState>,
     queue: VecDeque<HtmlJob>,
@@ -116,6 +118,17 @@ impl HtmlRenderer {
 
     /// Snapshots in `cache_dir` – e.g. a folder that goes away with the session.
     pub fn in_dir(cache_dir: PathBuf, cx: &mut Context<Self>) -> Self {
+        Self::with_workers(cache_dir, crate::uses_snapshots().then_some(MAX_IN_FLIGHT), RENDER_WIDTH, cx)
+    }
+
+    /// Composer previews also use snapshots on macOS: no native view above a modal,
+    /// and no changes to the open thread's render queue. Created only on demand.
+    pub(crate) fn signature_preview(width: f32, cx: &mut Context<Self>) -> Self {
+        // Two open editors must never encode the same snapshot file concurrently.
+        Self::with_workers(crate::session_dir(&format!("signature-preview/{}", uuid::Uuid::new_v4())), Some(1), width.round(), cx)
+    }
+
+    fn with_workers(cache_dir: PathBuf, workers: Option<usize>, width: f32, cx: &mut Context<Self>) -> Self {
         let _ = std::fs::create_dir_all(&cache_dir);
         let cache_dir = std::fs::canonicalize(&cache_dir).unwrap_or(cache_dir);
 
@@ -123,22 +136,21 @@ impl HtmlRenderer {
             helper: None,
             replies: None,
             helper_ready: false,
+            workers: workers.unwrap_or(MAX_IN_FLIGHT),
+            width,
             cache_dir,
             states: HashMap::default(),
             queue: VecDeque::default(),
             in_flight: HashMap::default(),
             urgent: HashSet::default(),
         };
-        this.spawn_helper(cx);
+        if let Some(workers) = workers { this.spawn_helper(workers, cx); }
         this
     }
 
-    fn spawn_helper(&mut self, cx: &mut Context<Self>) {
+    fn spawn_helper(&mut self, workers: usize, cx: &mut Context<Self>) {
         // the one started before the window, if there is one (its WebViews are warm by now)
-        if !crate::uses_snapshots() {
-            return;
-        }
-        let Some((helper, mut rx)) = Helper::start(MAX_IN_FLIGHT) else { return };
+        let Some((helper, mut rx)) = Helper::start(workers) else { return };
         self.helper = Some(helper);
         let started = Instant::now();
         self.replies = Some(cx.spawn(async move |this, cx| {
@@ -252,7 +264,7 @@ impl HtmlRenderer {
         if !self.helper_ready {
             return false;
         }
-        while self.in_flight.len() < MAX_IN_FLIGHT {
+        while self.in_flight.len() < self.workers {
             let urgent_queued = self.queue.iter().position(|j| self.urgent.contains(&j.key));
             let urgent_rendering = self.in_flight.keys().any(|k| self.urgent.contains(k));
             let next = match (urgent_queued, urgent_rendering) {
@@ -263,7 +275,7 @@ impl HtmlRenderer {
             };
             let Some(job) = self.queue.remove(next) else { break };
             let out = self.cache_path(&job.html, "jpg");
-            let request = Request { id: job.key.as_ref(), html: job.html.as_ref(), width: RENDER_WIDTH, out: &out };
+            let request = Request { id: job.key.as_ref(), html: job.html.as_ref(), width: self.width, out: &out };
             let Some(helper) = self.helper.as_mut() else { return false };
             if helper.send(&request).is_err() {
                 self.unavailable();
@@ -296,12 +308,12 @@ impl HtmlRenderer {
         let state = if reply.ok == Some(true) {
             let snapshot = HtmlSnapshot {
                 strips: reply.strips,
-                width: reply.width.unwrap_or(RENDER_WIDTH),
+                width: reply.width.unwrap_or(self.width),
                 height: reply.height.unwrap_or_default(),
                 clipped: reply.clipped,
                 links: reply.links.into_iter().map(|link| HtmlLink { x: link.x, y: link.y, w: link.w, h: link.h, href: link.href.into() }).collect(),
             };
-            if snapshot.valid_output(&self.cache_path(&job.html, "jpg")) {
+            if snapshot.valid_output(&self.cache_path(&job.html, "jpg"), self.width) {
                 if let Ok(json) = serde_json::to_vec(&snapshot) {
                     let _ = std::fs::write(self.cache_path(&job.html, "json"), json);
                 }
@@ -317,14 +329,14 @@ impl HtmlRenderer {
         self.pump();
     }
 
-    fn cache_key(html: &str) -> u64 {
+    fn cache_key(&self, html: &str) -> u64 {
         let mut hasher = DefaultHasher::new();
-        (CACHE_VERSION, RENDER_WIDTH.to_bits(), html).hash(&mut hasher);
+        (CACHE_VERSION, self.width.to_bits(), html).hash(&mut hasher);
         hasher.finish()
     }
 
     fn cache_path(&self, html: &str, ext: &str) -> PathBuf {
-        self.cache_dir.join(format!("{:016x}.{ext}", Self::cache_key(html)))
+        self.cache_dir.join(format!("{:016x}.{ext}", self.cache_key(html)))
     }
 
     fn load_cached(&self, html: &str) -> Option<HtmlSnapshot> {
@@ -334,7 +346,7 @@ impl HtmlRenderer {
             return None;
         }
         let snapshot: HtmlSnapshot = serde_json::from_slice(&json).ok()?;
-        snapshot.valid_output(&self.cache_path(html, "jpg")).then_some(snapshot)
+        snapshot.valid_output(&self.cache_path(html, "jpg"), self.width).then_some(snapshot)
     }
 }
 
@@ -376,6 +388,8 @@ mod tests {
             helper: Some(helper),
             replies: None,
             helper_ready: false,
+            workers: MAX_IN_FLIGHT,
+            width: RENDER_WIDTH,
             cache_dir: dir.0.clone(),
             states: jobs.iter().map(|job| (job.key.clone(), RenderState::Pending)).collect(),
             queue: jobs.into(),

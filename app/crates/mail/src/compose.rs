@@ -448,6 +448,7 @@ pub struct ComposeDialog {
     show_bcc: bool,
     subject: Entity<TextInput>,
     body: Entity<TextArea>,
+    signature: Entity<crate::signature_editor::SignatureEditor>,
     scroll: ScrollHandle,
     draft_id: Option<usize>,
     account: SharedString,
@@ -480,7 +481,9 @@ impl ComposeDialog {
     }
 
     pub fn new(mailbox: Entity<Mailbox>, seed: ComposeSeed, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let wire = seed.draft_id.and_then(|id| mailbox.read(cx).drafts.iter().find(|d| d.id == id)).map(|d| d.wire.clone()).unwrap_or_else(|| {
+        let recovered = seed.draft_id.and_then(|id| mailbox.read(cx).drafts.iter().find(|d| d.id == id)).map(|d| d.wire.clone());
+        let new_draft = recovered.is_none();
+        let mut wire = recovered.unwrap_or_else(|| {
             let now = chrono::Utc::now().to_rfc3339();
             DraftContent { id: uuid::Uuid::new_v4().to_string(), created_at: now.clone(), modified_at: now, ..Default::default() }
         });
@@ -488,6 +491,11 @@ impl ComposeDialog {
         let captured = wire.reply_thread_id.is_some();
         let account = captured.then(|| wire.account_id.clone()).flatten().map(Into::into).or_else(|| seed.account.clone()).or_else(|| mailbox.read(cx).sending_account(None).map(|a| a.id.clone())).unwrap_or_default();
         let from = captured.then(|| wire.from.clone().into()).or_else(|| seed.from.clone()).or_else(|| mailbox.read(cx).account(&account).map(|a| a.email.clone())).unwrap_or_default();
+        if new_draft {
+            wire.account_id = Some(account.to_string());
+            mailbox.read(cx).initialize_signature(&mut wire);
+        }
+        let signature = cx.new(|cx| crate::signature_editor::SignatureEditor::new(mailbox.clone(), &wire, cx));
         let recipients: Vec<SharedString> = if captured { wire.to.iter().cloned().map(Into::into).collect() } else { seed.to.clone() };
         let copies: Vec<SharedString> = if captured { wire.cc.iter().cloned().map(Into::into).collect() } else { seed.cc.clone() };
         let show_cc = !copies.is_empty();
@@ -542,6 +550,7 @@ impl ComposeDialog {
             }),
         ];
         subscriptions.push(cx.subscribe(&subject, |this, _, _, cx| this.schedule_autosave(cx)));
+        subscriptions.push(cx.subscribe(&signature, |this, _, _, cx| this.schedule_autosave(cx)));
         for field in [&to, &cc, &bcc] {
             subscriptions.push(cx.observe(field, |this, _, cx| this.schedule_autosave(cx)));
         }
@@ -565,6 +574,7 @@ impl ComposeDialog {
             show_bcc,
             subject,
             body,
+            signature,
             scroll,
             draft_id: seed.draft_id,
             account,
@@ -655,6 +665,7 @@ impl ComposeDialog {
         let body = self.body.read(cx).text().clone();
         // GPUI's editor is Markdown; preserve a Swift rich draft until edited.
         if self.wire.html_body.is_none() { self.wire.html_body = Some(ui::markdown::to_html(&body)); }
+        self.signature.read(cx).apply(&mut self.wire);
         let id = self.mailbox.update(cx, |m, cx| m.save_draft_content(self.draft_id, kind, body, self.wire.clone(), cx))?;
         self.draft_id = Some(id);
         self.wire = self.mailbox.read(cx).drafts.iter().find(|d| d.id == id)?.wire.clone();
@@ -663,6 +674,8 @@ impl ComposeDialog {
 
     fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
         if self.mailbox.read(cx).remote.is_none() || self.waiting { return }
+        // A signature/default or contact-client notification alone is not a draft.
+        if self.draft_id.is_none() && !self.has_content(cx) { self.autosave = None; return }
         if self.draft_id.is_some_and(|id| self.mailbox.read(cx).drafts.iter().any(|d| d.id == id && (d.queued.is_some() || d.sending || d.wire.extra.contains_key(crate::durian::writes::PENDING_SEND)))) { return }
         self.autosave = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(std::time::Duration::from_millis(750)).await;
@@ -732,7 +745,7 @@ impl ComposeDialog {
             }))
     }
 
-    /// Tab order: To → Cc (when shown) → Subject → Body.
+    /// Tab order: recipients → Subject → Body → signature toolbar button.
     fn fields(&self, cx: &App) -> Vec<FocusHandle> {
         let mut fields = vec![self.to.read(cx).input_focus(cx)];
         if self.show_cc {
@@ -743,6 +756,7 @@ impl ComposeDialog {
         }
         fields.push(self.subject.read(cx).focus_handle(cx));
         fields.push(self.body.read(cx).focus_handle(cx));
+        fields.push(self.signature.read(cx).focus_handle(cx));
         fields
     }
 
@@ -878,6 +892,7 @@ impl Render for ComposeDialog {
                                     if options.is_empty() { return; }
                                     let next = options.iter().position(|(id, email)| *id == this.account && *email == this.from).map_or(0, |i| (i + 1) % options.len());
                                     (this.account, this.from) = options[next].clone();
+                                    this.signature.update(cx, |signature, cx| signature.change_account(&this.account, cx));
                                     this.schedule_autosave(cx);
                                     cx.notify();
                                 }))
@@ -1008,6 +1023,7 @@ impl Render for ComposeDialog {
                     .child(self.format_button("fmt-list", "•", Format::Prefix("- "), &theme, cx).tooltip(ui::tooltip("Bullet list")))
                     .child(self.format_button("fmt-ordered", "1.", Format::Prefix("1. "), &theme, cx).tooltip(ui::tooltip("Numbered list")))
                     .child(self.format_button("fmt-quote", "❝", Format::Prefix("> "), &theme, cx).tooltip(ui::tooltip("Quote")))
+                    .child(self.signature.clone())
                     .child(div().flex_1())
                     .child(div().text_size(px(SIZE_MINI)).text_color(theme.text_quaternary).child("⌘↵ to send"))
                     .child(PrimaryButton::new("compose-send", "Send").disabled(!can_send).on_click(cx.listener(|this, _, window, cx| this.send(&Send, window, cx)))),

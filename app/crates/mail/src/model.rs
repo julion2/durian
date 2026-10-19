@@ -392,6 +392,8 @@ pub struct Mailbox {
     pub pending_tags: std::collections::HashMap<SharedString, String>,
     pub confirmed_tags: std::collections::HashMap<SharedString, Thread>,
     pub writes_available: bool,
+    pub compose_settings: crate::signatures::Settings,
+    pub signature_policy: crate::html_doc::Policy,
     pub unread_by_user: Option<SharedString>,
     next_draft_id: usize,
 }
@@ -411,6 +413,7 @@ pub enum MailboxEvent {
     DraftDeleted(usize),
     WriteProblem(SharedString),
     SendFinished { draft_id: usize, result: crate::durian::client::Result<crate::durian::api::Enqueued> },
+    ReloadComposeSettings,
 }
 
 impl EventEmitter<MailboxEvent> for Mailbox {}
@@ -419,12 +422,12 @@ impl Mailbox {
     pub fn new(data: MailData) -> Self {
         let MailData { me, accounts, tags, views, threads } = data;
         let selected = (!threads.is_empty()).then_some(0);
-        Self { me, accounts, account_filter: None, query_text: SharedString::default(), query: Default::default(), view_title: "Inbox".into(), tags, views, threads, selected, selection: ListSelection::Single, drafts: Vec::new(), unread_on_open: None, remote: None, profiles: Vec::new(), profile: None, folder: None, server_counts: std::collections::HashMap::new(), pending_tags: Default::default(), confirmed_tags: Default::default(), writes_available: false, unread_by_user: None, next_draft_id: 1 }
+        Self { me, accounts, account_filter: None, query_text: SharedString::default(), query: Default::default(), view_title: "Inbox".into(), tags, views, threads, selected, selection: ListSelection::Single, drafts: Vec::new(), unread_on_open: None, remote: None, profiles: Vec::new(), profile: None, folder: None, server_counts: std::collections::HashMap::new(), pending_tags: Default::default(), confirmed_tags: Default::default(), writes_available: false, compose_settings: crate::signatures::Settings::Ready(Default::default()), signature_policy: Default::default(), unread_by_user: None, next_draft_id: 1 }
     }
 
     /// An empty mailbox whose threads a server provides.
     pub fn remote(data: MailData, remote: Remote) -> Self {
-        Self { remote: Some(remote), ..Self::new(data) }
+        Self { remote: Some(remote), compose_settings: Default::default(), ..Self::new(data) }
     }
 
     /// The clauses `visible()` applies: everything locally, or what the server couldn't.
@@ -1126,7 +1129,12 @@ impl Mailbox {
         if let Err(e) = crate::durian::writes::prepare_reply(&mut wire, &content, all) {
             cx.emit(MailboxEvent::WriteProblem(e.to_string().into())); return None;
         }
+        self.initialize_signature(&mut wire);
         self.save_draft_content(None, DraftKind::Reply { thread_id, all }, SharedString::default(), wire, cx)
+    }
+
+    pub fn initialize_signature(&self, wire: &mut crate::durian::api::DraftContent) {
+        crate::signatures::Signature::new(wire.account_id.as_deref().unwrap_or(""), &self.compose_settings).apply(wire);
     }
 
     /// Autosave keeps the original target even when live reply text is emptied.
@@ -1252,6 +1260,10 @@ impl Mailbox {
             let Ok(mut wire) = serde_json::from_value::<crate::durian::api::DraftContent>(entry.draft_json) else { continue };
             wire.id = entry.id;
             if self.drafts.iter().any(|d| d.wire.id == wire.id) { continue }
+            // A lookup that was pending at shutdown must not rewrite a recovered draft.
+            if !wire.extra.contains_key(crate::durian::writes::PENDING_SEND) {
+                crate::signatures::Signature::retain_recovered_snapshot(&mut wire);
+            }
             let kind = DraftKind::New { account: wire.account_id.clone().unwrap_or_default().into(), from: wire.from.clone().into(), to: wire.to.iter().cloned().map(Into::into).collect(), cc: wire.cc.iter().cloned().map(Into::into).collect(), bcc: wire.bcc.iter().cloned().map(Into::into).collect(), subject: wire.subject.clone().into() };
             let queued = wire.extra.get(crate::durian::writes::QUEUED_SEND).and_then(|v| serde_json::from_value(v.clone()).ok());
             let id = self.next_draft_id; self.next_draft_id += 1;

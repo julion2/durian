@@ -74,6 +74,8 @@ pub trait PickerDelegate: 'static {
     }
     /// Items for `query`, already filtered and ordered.
     fn items(&self, query: &str, cx: &App) -> Vec<PickerItem>;
+    /// Preview navigation without committing a choice. Initial selection is silent.
+    fn selected(&mut self, _item: Option<&PickerItem>, _cx: &mut App) {}
     fn confirm(&mut self, item: &PickerItem, query: &str, window: &mut Window, cx: &mut App) -> AfterConfirm;
 }
 
@@ -88,6 +90,8 @@ pub struct Picker<D: PickerDelegate> {
     selected: usize,
     scroll: ScrollHandle,
     width: f32,
+    list_height: f32,
+    embedded: bool,
     _input_subscription: Subscription,
 }
 
@@ -107,10 +111,35 @@ impl<D: PickerDelegate> Picker<D> {
             selected: 0,
             scroll: ScrollHandle::new(),
             width,
+            list_height: 370.,
+            embedded: false,
             _input_subscription: subscription,
         };
-        this.refilter(cx);
+        this.items = this.delegate.items("", cx);
         this
+    }
+
+    /// Use the host popover's surface instead of nesting another card inside it.
+    pub fn embedded(mut self, list_height: f32) -> Self {
+        self.embedded = true;
+        self.list_height = list_height;
+        self
+    }
+
+    pub fn select_id(&mut self, id: &str) {
+        self.selected = self.items.iter().position(|item| item.id.as_ref() == id).unwrap_or(0);
+        self.scroll.scroll_to_item(self.child_index(self.selected));
+    }
+
+    /// Refresh options without resetting an in-progress keyboard selection.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        let id = self.items.get(self.selected).map(|item| item.id.clone());
+        self.items = self.delegate.items(self.input.read(cx).text(), cx);
+        self.select_id(id.as_deref().unwrap_or_default());
+        if self.items.get(self.selected).map(|item| &item.id) != id.as_ref() {
+            self.delegate.selected(self.items.get(self.selected), cx);
+        }
+        cx.notify();
     }
 
     fn refilter(&mut self, cx: &mut Context<Self>) {
@@ -118,6 +147,7 @@ impl<D: PickerDelegate> Picker<D> {
         self.items = self.delegate.items(&query, cx);
         self.selected = 0;
         self.scroll.scroll_to_item(0);
+        self.delegate.selected(self.items.first(), cx);
         cx.notify();
     }
 
@@ -126,6 +156,7 @@ impl<D: PickerDelegate> Picker<D> {
             self.selected = ix;
             // children of the list include section headers, so map item → child index
             self.scroll.scroll_to_item(self.child_index(ix));
+            self.delegate.selected(self.items.get(ix), cx);
             cx.notify();
         }
     }
@@ -282,6 +313,7 @@ impl<D: PickerDelegate> Render for Picker<D> {
                     .on_mouse_move(cx.listener(move |this, _, _, cx| {
                         if this.selected != ix {
                             this.selected = ix;
+                            this.delegate.selected(this.items.get(ix), cx);
                             cx.notify();
                         }
                     }))
@@ -305,11 +337,8 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .w(px(self.width))
             .flex()
             .flex_col()
-            .bg(theme.bg_card)
-            .border_hairline()
-            .border_color(theme.border_card)
-            .rounded(theme.radius.xl)
-            .shadow(theme.overlay_shadow())
+            .when(!self.embedded, |s| s.bg(theme.bg_card).border_hairline().border_color(theme.border_card)
+                .rounded(theme.radius.xl).shadow(theme.overlay_shadow()))
             .text_color(theme.text_body)
             .when_some(context, |s, (prefix, title)| {
                 s.child(
@@ -340,7 +369,7 @@ impl<D: PickerDelegate> Render for Picker<D> {
                 div()
                     .id("picker-list")
                     .track_scroll(&self.scroll)
-                    .max_h(px(370.))
+                    .max_h(px(self.list_height))
                     .overflow_y_scroll()
                     .px(px(6.))
                     .py(px(6.))

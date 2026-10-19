@@ -43,7 +43,10 @@ mkdir -p "$HOME" "$XDG_CONFIG_HOME/durian" "$XDG_DATA_HOME/durian" "$TMPDIR" "$X
 chmod 700 "$TMPDIR" "$XDG_RUNTIME_DIR"
 # Keep the fixture's configured sending identity, but remove all provider
 # transports. An accidental expired Undo window cannot deliver a real message.
-sed -e '/    smtp {/d' -e '/    imap {/d' -e '/    auth {/d' "$CONFIG" > "$XDG_CONFIG_HOME/durian/config.pkl"
+sed -e '/    smtp {/d' -e '/    imap {/d' -e '/    auth {/d' \
+  -e 's|signatures: Mapping<String, String> = new {}|signatures: Mapping<String, String> = new { ["Office"] = "<b>OfficeSignature</b>"; ["Personal"] = "OriginalSignature" }|' \
+  -e '/    default = true/a\    default_signature = "Office"' \
+  "$CONFIG" > "$XDG_CONFIG_HOME/durian/config.pkl"
 cp "$(dirname "$CONFIG")/profiles.pkl" "$XDG_CONFIG_HOME/durian/profiles.pkl"
 cat > "$XDG_CONFIG_HOME/durian/groups.pkl" <<'GROUPS'
 import "modulepath:/Groups.pkl" as G
@@ -102,6 +105,12 @@ screen() {
     *) convert "$OUT/$1.png" -resize 200% -colorspace Gray -negate "$ROOT/ocr.png" ;;
   esac
   tesseract "$ROOT/ocr.png" stdout --psm 11 2>/dev/null > "$ROOT/screen.txt"
+  if [[ "$1" == *signature* ]]; then
+    # The popover combines a dark picker with a white HTML preview. The dialog's
+    # 40% threshold erases its dark-gray HTML text; read that region separately.
+    convert "$OUT/$1.png" -crop 640x380+610+20 -resize 300% -colorspace Gray -threshold 70% "$ROOT/signature-ocr.png"
+    tesseract "$ROOT/signature-ocr.png" stdout --psm 11 2>/dev/null >> "$ROOT/screen.txt"
+  fi
   case "$1" in
     compose-*|draft-*|drafts-*|control|reconnecting) ;;
     *)
@@ -485,6 +494,26 @@ BACKEND_PID=$(pgrep -P "$APP_PID" -x durian-cli)
 # Keep an edited composer open across the owned-server replacement.
 xdotool key --clearmodifiers c
 expect_screen compose-empty 'New message'
+expect_screen compose-signature-default 'Office' 'Account default|HTML preview'
+# The toolbar is reachable without a mouse. Previewing a candidate is not selection.
+xdotool key --clearmodifiers shift+Tab Return
+expect_screen compose-signature-keyboard 'Account default'
+xdotool type --clearmodifiers 'Personal'
+expect_screen compose-signature-candidate 'OriginalSignature'
+xdotool key --clearmodifiers Escape
+expect_screen compose-signature-cancelled 'Office' 'Personal|HTML preview'
+xdotool key --clearmodifiers Tab
+click_word Office
+expect_screen compose-signature-menu 'Account default'
+click_word None
+# OCR may append the dropdown chevron; assert the selected label and closed menu.
+expect_screen compose-signature-none '(^|[[:space:]])None([[:space:]]|$)' 'Office|Account default|HTML preview'
+click_word None
+expect_screen compose-signature-options 'Personal'
+click_word Personal
+expect_screen compose-signature-personal 'Personal' 'Account default'
+# The accessible toolbar chip keeps focus after selection; Tab returns to To.
+xdotool key --clearmodifiers Tab
 kill -STOP "$BACKEND_PID"
 xdotool type --clearmodifiers --delay 15 'alice'
 expect_screen compose-contacts-loading 'Searching contacts'
@@ -597,6 +626,8 @@ BACKEND_PID=""
 echo 'PASS normal quit reaps the live owned backend and removes session files'
 
 # A completely new app process must recover the same encrypted server draft.
+# Changing Pkl must not replace the signature content saved with that draft.
+sed -i 's/OriginalSignature/ChangedSignature/g' "$XDG_CONFIG_HOME/durian/config.pkl"
 "$APP" >> "$ROOT/app.log" 2>&1 &
 APP_PID=$!
 WINDOW=$(timeout 20 xdotool search --sync --onlyvisible --name '^Durian$' | head -1)
@@ -609,13 +640,17 @@ click_word NativeRecovery
 expect_screen draft-reopened 'Durable compose body' 'UNACCEPTED-LATE-TEXT'
 expect_screen draft-bcc-restored 'hidden@example.invalid'
 expect_screen draft-contact-restored 'server@example.invalid'
+expect_screen draft-signature-restored 'Personal'
+click_word Personal
+expect_screen draft-signature-snapshot 'OriginalSignature' 'ChangedSignature'
+xdotool key --clearmodifiers Escape
 click_word Send
 expect_screen compose-queued 'Queued for delivery'
 [[ "$("$CLI" outbox list --json | jq length)" == 1 ]]
 click_word Undo
 expect_screen compose-undone 'Delivery cancelled'
 [[ "$("$CLI" outbox list --json | jq length)" == 0 ]]
-echo 'PASS native composer save/restart/Bcc/enqueue/confirmed Undo against encrypted Go state'
+echo 'PASS native composer signature picker/snapshot/restart/Bcc/enqueue/confirmed Undo against encrypted Go state'
 
 # A sent inline reply keeps its recovery receipt, not ownership of the next editor.
 xdotool key --clearmodifiers g i

@@ -43,8 +43,8 @@ def line(process, timeout=20):
     return json.loads(data)
 
 
-def send(process, root, id, html, output=None):
-    request = dict(id=id, html=html, width=664, out=str(root / (output or id + ".jpg")))
+def send(process, root, id, html, output=None, width=664):
+    request = dict(id=id, html=html, width=width, out=str(root / (output or id + ".jpg")))
     process.stdin.write((json.dumps(request) + "\n").encode())
     process.stdin.flush()
 
@@ -153,6 +153,25 @@ with tempfile.TemporaryDirectory(prefix="durian-render-") as tmp:
             shutil.copy(image, out / "table-cid.jpg")
             print("PASS real table/CSS/CID pixels, link geometry, three concurrent atomic outputs", flush=True)
 
+            # A signature preview must lay out at its actual width, not shrink a
+            # desktop screenshot into unreadable text. Reuse the worker at both sizes.
+            signature = prepare('<body style="padding:0"><div style="height:35px;background:#47abcd"></div>'
+                                '<div style="height:45px;background:#e49c42"></div>'
+                                '<p style="font:16px/20px monospace">Alex Morgan leads product design and research '
+                                'for the entire Durian team. Contact the studio for a review.</p></body>')
+            heights = []
+            for i, width in enumerate((310, 664, 128, 310)):
+                send(process, root, f"signature-{i}", signature, width=width)
+                answer = line(process)
+                assert answer["ok"] and answer["width"] == width, answer
+                path = answer["strips"][0]["path"]
+                assert Image.open(path).size == (width, answer["height"])
+                color(path, (width - 4, 20), (71, 171, 205))
+                color(path, (width - 4, 60), (228, 156, 66))
+                heights.append(answer["height"])
+            assert heights[2] > heights[0] > heights[1] and heights[0] == heights[3], heights
+            print("PASS compact/full-width reflow, exact output dimensions and pixels after worker reuse", flush=True)
+
             send(process, root, "long", prepare('<body style="padding:0"><div style="height:19000px;background:#47abcd">Long</div></body>'))
             long = line(process)
             assert long["height"] == 16000 and long["clipped"] and len(long["strips"]) == 4
@@ -194,6 +213,14 @@ with tempfile.TemporaryDirectory(prefix="durian-render-") as tmp:
             assert 14 <= time.monotonic() - start < 20
             assert ("https", "/stall") in hits
             print("PASS TLS hostname rejection and real stalled-image 15s deadline", flush=True)
+
+        for width in (127, 665, 150.5):
+            with helper(root, ca) as process:
+                assert line(process)["ready"] is True
+                send(process, root, "invalid-width", signature, width=width)
+                assert line(process)["ready"] is False
+                assert process.wait(timeout=5) != 0
+        print("PASS out-of-range and fractional widths rejected", flush=True)
 
         # Existing extension must be present, and sandbox disabling is a refusal.
         isolated = root / "missing" / "mailrender"

@@ -23,6 +23,8 @@ pub mod query;
 mod quote;
 pub mod model;
 mod sidebar;
+mod signatures;
+mod signature_editor;
 mod storage;
 mod thread_list;
 mod thread_view;
@@ -431,7 +433,7 @@ impl MailWorkspace {
             }
             MailboxEvent::ReadOnly => this.refused(cx),
             MailboxEvent::WriteProblem(message) => this.show_toast(message.clone(), ToastAction::None, cx),
-            MailboxEvent::QueryChanged | MailboxEvent::MoreWanted | MailboxEvent::WriteRequested(_) | MailboxEvent::DraftSaved(_) | MailboxEvent::DraftDeleted(_) | MailboxEvent::SendFinished { .. } => {}
+            MailboxEvent::QueryChanged | MailboxEvent::MoreWanted | MailboxEvent::ReloadComposeSettings | MailboxEvent::WriteRequested(_) | MailboxEvent::DraftSaved(_) | MailboxEvent::DraftDeleted(_) | MailboxEvent::SendFinished { .. } => {}
         })
         .detach();
         trace::note(&format!("appearance at start: {:?} → dark theme: {}", cx.window_appearance(), cx.theme().is_dark()));

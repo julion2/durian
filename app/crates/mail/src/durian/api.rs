@@ -156,6 +156,14 @@ pub struct Settings {
     pub load_remote_images: bool,
 }
 
+/// Safe composition configuration, never the complete account/transport config.
+#[derive(Deserialize, Debug, Default, Clone, PartialEq)]
+pub struct ComposeSettings {
+    pub signatures: std::collections::BTreeMap<String, String>,
+    /// Lowercased configured account names, as used by /profiles and drafts.
+    pub account_defaults: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct AttachmentInfo {
     pub part_id: i64,
