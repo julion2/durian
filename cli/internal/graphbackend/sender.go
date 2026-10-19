@@ -170,7 +170,7 @@ func (s *Sender) sendRawMIME(ctx context.Context, raw []byte) error {
 	req.Header.Set("Content-Type", "text/plain")
 	resp, err := s.b.httpClient.Do(req)
 	if err != nil {
-		return classifyGraphSendError(fmt.Errorf("graph MIME send: %w", err))
+		return classifyGraphFinalSendError(fmt.Errorf("graph MIME send: %w", err))
 	}
 	defer drainClose(resp)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

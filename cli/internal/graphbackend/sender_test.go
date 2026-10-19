@@ -98,6 +98,29 @@ func TestSenderSendsCanonicalRawMIME(t *testing.T) {
 	}
 }
 
+func TestSenderRawMIMECancellationAfterReceiptIsAmbiguous(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/me/sendMail", func(w http.ResponseWriter, r *http.Request) {
+		// The delivery request reached the provider; losing its acknowledgement
+		// must never put it back in the outbox's automatic retry queue.
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Error(err)
+		}
+		cancel()
+		<-r.Context().Done()
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	err := (&Sender{b: newTestBackend(t, server)}).Send(ctx, &mailsend.Message{
+		RawMIME: []byte("From: me@example.test\r\nTo: peer@example.test\r\n\r\nHello\r\n"),
+	})
+	if !errors.Is(err, context.Canceled) || mailsend.Classify(err) != mailsend.KindAmbiguous {
+		t.Fatalf("cancelled MIME send = %v, kind %v; want ambiguous", err, mailsend.Classify(err))
+	}
+}
+
 func TestSenderUploadsLargeAttachment(t *testing.T) {
 	// A file ≥ uploadThreshold must go through an upload session in chunks,
 	// never inline in the draft.
