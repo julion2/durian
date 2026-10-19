@@ -38,39 +38,9 @@ func accountRow(t *testing.T, db *store.DB, messageID, account string) *store.Me
 	return nil
 }
 
-// newTestRouter sets up a mux.Router with all routes, mirroring serve.go.
+// newTestRouter exercises production route registration without authentication.
 func newTestRouter(h *Handler, hub *EventHub) *mux.Router {
-	r := mux.NewRouter()
-	r.UseEncodedPath()
-	r.HandleFunc("/api/v1/search", h.SearchHandler).Methods("GET")
-	r.HandleFunc("/api/v1/search/count", h.SearchCountHandler).Methods("GET")
-	r.HandleFunc("/api/v1/tags", h.ListTagsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/settings", h.SettingsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/compose-settings", h.ComposeSettingsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/threads/{thread_id}", h.ShowThreadHandler).Methods("GET")
-	r.HandleFunc("/api/v1/threads/{thread_id}/tags", h.TagThreadHandler).Methods("POST")
-	r.HandleFunc("/api/v1/message/body", h.ShowMessageBodyHandler).Methods("GET")
-	r.HandleFunc("/api/v1/messages/{message_id}/attachments/{part_id}", h.DownloadAttachmentHandler).Methods("GET")
-	r.HandleFunc("/api/v1/contacts/search", h.SearchContactsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/contacts/usage", h.IncrementContactUsageHandler).Methods("POST")
-	r.HandleFunc("/api/v1/contacts", h.ListContactsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/profiles", h.ProfilesHandler).Methods("GET")
-	r.HandleFunc("/api/v1/keymaps", h.KeymapsHandler).Methods("GET")
-	if hub != nil {
-		r.Handle("/api/v1/events", hub).Methods("GET")
-	}
-	r.HandleFunc("/api/v1/calendars/events", h.CalendarEventsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/calendars/event", h.CalendarEventHandler).Methods("GET")
-	r.HandleFunc("/api/v1/calendars/event", h.CalendarPutEventHandler).Methods("PUT")
-	r.HandleFunc("/api/v1/calendars/event", h.CalendarDeleteEventHandler).Methods("DELETE")
-	r.HandleFunc("/api/v1/calendars/rsvp", h.CalendarRsvpHandler).Methods("POST")
-	r.HandleFunc("/api/v1/calendars/sync/event", h.CalendarSyncEventHandler).Methods("POST")
-	r.HandleFunc("/api/v1/calendars", h.CalendarsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/outbox/send", h.EnqueueOutboxHandler).Methods("POST")
-	r.HandleFunc("/api/v1/messages/{message_id}/reactions", h.EnqueueReactionHandler).Methods("POST")
-	r.HandleFunc("/api/v1/outbox", h.ListOutboxHandler).Methods("GET")
-	r.HandleFunc("/api/v1/outbox/{id}", h.DeleteOutboxHandler).Methods("DELETE")
-	return r
+	return NewRouter(h, hub, "test-version", "test-commit")
 }
 
 func newTestContactsDB(t *testing.T) *contacts.DB {

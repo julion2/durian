@@ -1,0 +1,39 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+go_library(
+    name = "demo_session_lib",
+    testonly = True,
+    srcs = ["main.go"],
+    importpath = "github.com/julion2/durian/cli/cmd/demo-session",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//cli/internal/backend",
+        "//cli/internal/config",
+        "//cli/internal/contacts",
+        "//cli/internal/dbcrypto",
+        "//cli/internal/demotest",
+        "//cli/internal/handler",
+        "//cli/internal/store",
+        "//cli/internal/syncengine",
+    ],
+)
+
+go_binary(
+    name = "demo-session",
+    testonly = True,
+    embed = [":demo_session_lib"],
+    tags = ["manual"],
+    visibility = ["//visibility:public"],
+    x_defs = {
+        "main.version": "{STABLE_VERSION}",
+        "main.gitCommit": "{STABLE_GIT_COMMIT}",
+    },
+)
+
+go_test(
+    name = "demo_session_test",
+    size = "small",
+    srcs = ["main_test.go"],
+    embed = [":demo_session_lib"],
+    deps = ["//cli/internal/demotest"],
+)

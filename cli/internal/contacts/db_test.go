@@ -23,6 +23,38 @@ func newTestDB(t *testing.T) *DB {
 	return db
 }
 
+func TestOpenMemoryIsIsolatedAndNeverFileBacked(t *testing.T) {
+	first, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	for _, db := range []*DB{first, second} {
+		if err := db.Init(); err != nil {
+			t.Fatal(err)
+		}
+		var seq int
+		var name, file string
+		if err := db.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &file); err != nil || file != "" {
+			t.Fatal("memory contacts database is file-backed")
+		}
+	}
+	if err := first.Add("demo@example.test", "Demo", "demo"); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := first.Count(); err != nil || count != 1 {
+		t.Fatal("memory contacts unavailable")
+	}
+	if count, err := second.Count(); err != nil || count != 0 {
+		t.Fatal("memory contacts leaked across sessions")
+	}
+}
+
 // TestOpen_SecureDeleteEnabled mirrors the store-side smoke test:
 // ADR-0001 step 8 requires PRAGMA secure_delete = ON on every fresh
 // contacts.db connection so deleted email / name bytes don't stay

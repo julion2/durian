@@ -461,14 +461,14 @@ func (w *OutboxWorker) Start(ctx context.Context) {
 			slog.Info("Outbox worker stopped", "module", "OUTBOX")
 			return
 		case <-ticker.C:
-			w.processQueue()
+			w.processQueue(ctx)
 		}
 	}
 }
 
 // processQueue atomically claims and sends items until the queue is empty.
-func (w *OutboxWorker) processQueue() {
-	for {
+func (w *OutboxWorker) processQueue(ctx context.Context) {
+	for ctx.Err() == nil {
 		item, err := w.store.ClaimNextOutboxItem()
 		if err != nil {
 			slog.Error("Failed to claim outbox item", "module", "OUTBOX", "err", err)
@@ -478,7 +478,7 @@ func (w *OutboxWorker) processQueue() {
 			return // queue empty
 		}
 
-		if !w.sendItem(item) {
+		if !w.sendItemContext(ctx, item) {
 			return
 		}
 	}
@@ -487,6 +487,10 @@ func (w *OutboxWorker) processQueue() {
 // sendItem returns false when queue processing must stop because a failed send
 // could not be moved out of the ready queue safely.
 func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
+	return w.sendItemContext(context.Background(), item)
+}
+
+func (w *OutboxWorker) sendItemContext(parent context.Context, item *store.OutboxItem) bool {
 	var draft OutboxDraft
 	if err := json.Unmarshal([]byte(item.DraftJSON), &draft); err != nil {
 		slog.Error("Failed to unmarshal draft", "module", "OUTBOX", "id", item.ID, "err", err) // encgrep:allow word "draft" in message text, no draft value logged
@@ -603,7 +607,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 		return true
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 120*time.Second)
 	defer cancel()
 
 	slog.Info("Sending outbox item", "module", "OUTBOX", "id", item.ID)

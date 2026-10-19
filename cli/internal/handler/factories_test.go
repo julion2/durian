@@ -119,3 +119,56 @@ func TestOutboxSenderFactorySetterPreservesDurableProtocol(t *testing.T) {
 		t.Fatal("provider Message-ID was not durable before uncertain send")
 	}
 }
+
+type cancellationSender struct{ entered chan struct{} }
+
+func (s *cancellationSender) SavesSentCopy() bool { return true }
+func (s *cancellationSender) Send(ctx context.Context, _ *mailsend.Message) error {
+	close(s.entered)
+	<-ctx.Done()
+	return &mailsend.Error{Kind: mailsend.KindAmbiguous, Err: ctx.Err()}
+}
+
+func TestOutboxCancellationStopsInFlightSendAndFurtherClaims(t *testing.T) {
+	db := newTestStore(t)
+	draft, err := json.Marshal(OutboxDraft{From: "demo@example.test", To: []string{"peer@example.test"}, Body: "test", MessageID: "<cancel@example.test>"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := db.Enqueue(string(draft), time.Now().Unix()-1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	worker := NewOutboxWorker(db, &config.Config{Accounts: []config.AccountConfig{{Name: "Demo", Email: "demo@example.test"}}}, nil)
+	s := &cancellationSender{entered: make(chan struct{})}
+	worker.SetSenderFactory(func(*config.AccountConfig) (mailsend.Sender, error) { return s, nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); worker.Start(ctx) }()
+	select {
+	case <-s.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("worker did not start send")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight send did not inherit cancellation")
+	}
+	items, err := db.ListOutbox()
+	if err != nil || len(items) != 2 {
+		t.Fatal("cancellation lost queued items")
+	}
+	claimed := 0
+	for _, item := range items {
+		if item.InFlight {
+			claimed++
+		}
+	}
+	if claimed != 1 {
+		t.Fatal("cancellation lost ambiguous claim or claimed another item")
+	}
+}

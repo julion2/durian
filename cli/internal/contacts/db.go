@@ -54,9 +54,23 @@ func Open(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("chmod db directory: %w", err)
 	}
 
+	return openDB(dbPath)
+}
+
+// OpenMemory opens an isolated, RAM-only contacts store. Contacts intentionally
+// have no at-rest encryption API; ephemeral sessions must not persist them.
+func OpenMemory() (*DB, error) {
+	return openDB(":memory:")
+}
+
+func openDB(dbPath string) (*DB, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
+	}
+	if dbPath == ":memory:" {
+		// SQLite in-memory databases belong to one connection.
+		db.SetMaxOpenConns(1)
 	}
 
 	// Use DELETE journal mode for simpler file handling

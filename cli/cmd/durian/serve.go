@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -16,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/spf13/cobra"
 
 	"github.com/julion2/durian/cli/internal/config"
@@ -132,7 +129,6 @@ func runServe(cmd *cobra.Command, args []string) {
 
 	// Generate auth token for this session (unless --no-auth)
 	var authToken string
-	var expectedHeader []byte
 	if !serveNoAuth {
 		tokenBytes := make([]byte, 32)
 		if _, err := rand.Read(tokenBytes); err != nil {
@@ -140,80 +136,14 @@ func runServe(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 		authToken = hex.EncodeToString(tokenBytes)
-		expectedHeader = []byte("Bearer " + authToken)
 	} else {
 		slog.Warn("Auth disabled via --no-auth (loopback-only access still enforced)", "module", "SERVE")
 		fmt.Fprintln(os.Stderr, "Warning: --no-auth disables bearer-token authentication. Loopback-only access is still enforced, but any local process can hit the API.")
 	}
 
-	r := mux.NewRouter()
-	r.UseEncodedPath()
+	r := handler.NewRouter(h, eventHub, version, gitCommit)
 	addr := fmt.Sprintf("127.0.0.1:%d", servePort)
-	allowedHost := fmt.Sprintf("localhost:%d", servePort)
-	allowedHostIP := fmt.Sprintf("127.0.0.1:%d", servePort)
-	r.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			host := req.Host
-			if host != allowedHost && host != allowedHostIP &&
-				host != "localhost" && host != "127.0.0.1" {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
-			if !serveNoAuth {
-				auth := []byte(req.Header.Get("Authorization"))
-				if subtle.ConstantTimeCompare(auth, expectedHeader) != 1 {
-					http.Error(w, "unauthorized", http.StatusUnauthorized)
-					return
-				}
-			}
-			next.ServeHTTP(w, req)
-		})
-	})
-	r.HandleFunc("/api/v1/version", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"version": version,
-			"commit":  gitCommit,
-		})
-	}).Methods("GET")
-	r.HandleFunc("/api/v1/search", h.SearchHandler).Methods("GET")
-	r.HandleFunc("/api/v1/search/count", h.SearchCountHandler).Methods("GET")
-	r.HandleFunc("/api/v1/tags", h.ListTagsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/settings", h.SettingsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/compose-settings", h.ComposeSettingsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/threads/{thread_id}", h.ShowThreadHandler).Methods("GET")
-	r.HandleFunc("/api/v1/threads/{thread_id}/tags", h.TagThreadHandler).Methods("POST")
-	r.HandleFunc("/api/v1/message/body", h.ShowMessageBodyHandler).Methods("GET")
-	r.HandleFunc("/api/v1/messages/{message_id}/attachments/{part_id}", h.DownloadAttachmentHandler).Methods("GET")
-	r.HandleFunc("/api/v1/groups", h.ListGroupsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/profiles", h.ProfilesHandler).Methods("GET")
-	r.HandleFunc("/api/v1/keymaps", h.KeymapsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/contacts/search", h.SearchContactsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/contacts/usage", h.IncrementContactUsageHandler).Methods("POST")
-	r.HandleFunc("/api/v1/contacts", h.ListContactsHandler).Methods("GET")
-	r.Handle("/api/v1/events", eventHub).Methods("GET")
-
-	// Calendar routes (read-only, served from the local vdir). More specific
-	// paths first so /calendars does not shadow /calendars/events.
-	r.HandleFunc("/api/v1/calendars/events", h.CalendarEventsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/calendars/event", h.CalendarEventHandler).Methods("GET")
-	r.HandleFunc("/api/v1/calendars/event", h.CalendarPutEventHandler).Methods("PUT")
-	r.HandleFunc("/api/v1/calendars/event", h.CalendarDeleteEventHandler).Methods("DELETE")
-	r.HandleFunc("/api/v1/calendars/rsvp", h.CalendarRsvpHandler).Methods("POST")
-	r.HandleFunc("/api/v1/calendars/sync/event", h.CalendarSyncEventHandler).Methods("POST")
-	r.HandleFunc("/api/v1/calendars", h.CalendarsHandler).Methods("GET")
-
-	// Outbox routes
-	r.HandleFunc("/api/v1/outbox/send", h.EnqueueOutboxHandler).Methods("POST")
-	r.HandleFunc("/api/v1/messages/{message_id}/reactions", h.EnqueueReactionHandler).Methods("POST")
-	r.HandleFunc("/api/v1/outbox", h.ListOutboxHandler).Methods("GET")
-	r.HandleFunc("/api/v1/outbox/{id}", h.DeleteOutboxHandler).Methods("DELETE")
-
-	// Local draft routes (crash-recovery, not IMAP)
-	r.HandleFunc("/api/v1/local-drafts", h.ListLocalDraftsHandler).Methods("GET")
-	r.HandleFunc("/api/v1/local-drafts/{id}", h.SaveLocalDraftHandler).Methods("PUT")
-	r.HandleFunc("/api/v1/local-drafts/{id}", h.GetLocalDraftHandler).Methods("GET")
-	r.HandleFunc("/api/v1/local-drafts/{id}", h.DeleteLocalDraftHandler).Methods("DELETE")
+	r.Use(handler.LoopbackAuth(servePort, authToken))
 
 	// Start IMAP IDLE watchers if accounts are configured
 	watcherCtx, watcherCancel := context.WithCancel(context.Background())
