@@ -3,7 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "calendartest",
     testonly = True,
-    srcs = ["google.go", "graph.go", "oauth.go", "record.go", "sync.go"],
+    srcs = ["google.go", "graph.go", "oauth.go", "pinned.go", "record.go", "sync.go"],
     importpath = "github.com/julion2/durian/cli/internal/calendartest",
     visibility = ["//cli:__subpackages__"],
     deps = [
@@ -15,6 +15,6 @@ go_library(
 go_test(
     name = "calendartest_test",
     size = "small",
-    srcs = ["graph_test.go", "oauth_test.go", "safety_test.go"],
+    srcs = ["graph_test.go", "oauth_test.go", "pinned_test.go", "safety_test.go"],
     embed = [":calendartest"],
 )

@@ -166,6 +166,7 @@ type GraphGuard struct {
 	owned     map[string]string // id -> series master (empty for own masters)
 	posts     map[string][32]byte
 	unknown   map[string]bool
+	readable  map[string]bool // observed in pinned collection; NEVER mutation ownership
 }
 
 // NewGraphGuard requires a fresh 128-bit random hex run nonce in prefix:
@@ -175,7 +176,7 @@ func NewGraphGuard(pin *GraphCalendarPin, prefix string) (*GraphGuard, error) {
 		return nil, fmt.Errorf("invalid isolated Graph scope")
 	}
 	return &GraphGuard{pin: pin, prefix: prefix, transport: http.DefaultTransport,
-		owned: map[string]string{}, posts: map[string][32]byte{}, unknown: map[string]bool{}}, nil
+		owned: map[string]string{}, posts: map[string][32]byte{}, unknown: map[string]bool{}, readable: map[string]bool{}}, nil
 }
 
 func (g *GraphGuard) HTTPClient() *http.Client {
@@ -508,7 +509,7 @@ func (g *GraphGuard) RoundTrip(req *http.Request) (*http.Response, error) {
 		if !graphID.MatchString(id) {
 			return deny()
 		}
-		if _, ok := g.owned[id]; !ok {
+		if _, ok := g.owned[id]; !ok && (req.Method != http.MethodGet || !g.readable[id]) {
 			return deny()
 		}
 	}
@@ -562,7 +563,22 @@ func (g *GraphGuard) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	headers := http.Header{}
 	if id != "" {
-		e, err := g.checkEvent(req.Context(), id)
+		var e graphSafeEvent
+		var err error
+		if _, owned := g.owned[id]; owned {
+			e, err = g.checkEvent(req.Context(), id)
+		} else {
+			// Production enriches existing series with mailbox-global reads.
+			// A prior pinned collection read plus FRESH membership permits only
+			// GET; it never enrolls this ID (or its children) for mutation.
+			err = graphJSON(req.Context(), g.pin.source, g.transport, GraphBase+"/me/events/"+url.PathEscape(id)+"?$select="+graphSafetySelect, &e)
+			if err == nil && e.ID != id {
+				err = fmt.Errorf("Graph read identity mismatch")
+			}
+			if err == nil {
+				err = g.membership(req.Context(), e)
+			}
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -654,6 +670,9 @@ func (g *GraphGuard) RoundTrip(req *http.Request) (*http.Response, error) {
 			return deny()
 		}
 		for _, e := range page.Value {
+			if collection && graphID.MatchString(e.ID) {
+				g.readable[e.ID] = true
+			}
 			if e.Master == "" || e.Master == e.ID || !g.safe(e) || (e.Type != "occurrence" && e.Type != "exception") {
 				continue
 			}

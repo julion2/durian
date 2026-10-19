@@ -3,15 +3,20 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 go_library(
     name = "demo_session_lib",
     testonly = True,
-    srcs = ["main.go"],
+    srcs = ["calendars.go", "main.go"],
     importpath = "github.com/julion2/durian/cli/cmd/demo-session",
     visibility = ["//visibility:private"],
     deps = [
         "//cli/internal/backend",
+        "//cli/internal/calendar",
+        "//cli/internal/calendarsync",
+        "//cli/internal/calendartest",
         "//cli/internal/config",
         "//cli/internal/contacts",
         "//cli/internal/dbcrypto",
         "//cli/internal/demotest",
+        "//cli/internal/googlecalendar",
+        "//cli/internal/graphcalendar",
         "//cli/internal/handler",
         "//cli/internal/store",
         "//cli/internal/syncengine",
@@ -33,7 +38,13 @@ go_binary(
 go_test(
     name = "demo_session_test",
     size = "small",
-    srcs = ["main_test.go"],
+    srcs = ["calendars_test.go", "main_test.go"],
     embed = [":demo_session_lib"],
-    deps = ["//cli/internal/demotest"],
+    deps = [
+        "//cli/internal/calendar",
+        "//cli/internal/calendarsync",
+        "//cli/internal/config",
+        "//cli/internal/demotest",
+        "//cli/internal/handler",
+    ],
 )

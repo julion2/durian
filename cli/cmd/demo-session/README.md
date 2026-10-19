@@ -1,4 +1,4 @@
-# Guarded native mail demo session (manual, test-only)
+# Guarded native mail/calendar demo session (manual, test-only)
 
 This executable lets the real GPUI app use the production HTTP routes with
 **only the two already-authorized dedicated Gmail/Outlook demo identities**.
@@ -8,9 +8,10 @@ its composition library `testonly`; the executable is also `manual`.
 ## Safety and limitations
 
 - **Launch only under the parent's explicit live authorization.** Construction
-  calls `demotest.NewFromEnv` exactly once. This verifies both exact identities
-  and uses the existing token sources, including durable Microsoft refresh-token
-  rotation. Do not launch alongside another mail/calendar live test, session,
+  creates each `NewMailTokenSource` exactly once and shares its `Token` method
+  with `demotest.New` and the calendar guards. This verifies both exact identities
+  and retains durable Microsoft refresh-token rotation. Do not launch alongside
+  another mail/calendar live test, session,
   or refresh process. The shared source serializes refreshes **within this
   process**, not across processes; the parent must serialize all live work.
 - Required inherited variables: `DURIAN_MAIL_LIVE_TEST=1`,
@@ -19,6 +20,12 @@ its composition library `testonly`; the executable is also `manual`.
   `DURIAN_MS_TEST_EMAIL`, `DURIAN_MS_TEST_CLIENT_ID`,
   `DURIAN_MS_TEST_REFRESH_TOKEN`, `DURIAN_MS_TEST_TENANT`.
   Never put their values in command arguments, transcripts, or local files.
+- **Calendars are opt-in:** add `--calendars` and inherit
+  `DURIAN_CALENDAR_LIVE_TEST=1`, `DURIAN_GOOGLE_TEST_CALENDAR_ID` and
+  `DURIAN_MS_TEST_CALENDAR_ID`. The parent must supply the **two exact existing
+  authorized Durian Test IDs** privately; they are mandatory pins, never names
+  to discover. Startup performs metadata/ownership reads of those exact IDs,
+  with no calendar creation or replacement fallback. No corpus is seeded.
 - There is no keychain/config credential lookup or unguarded factory fallback.
   HTTP on-demand backend construction uses `BackendFor`; the actual outbox
   worker uses `SenderFor`. Recipient, MIME, draft ownership and operation guards
@@ -32,10 +39,28 @@ its composition library `testonly`; the executable is also `manual`.
 - Graph inferred-recipient reply drafts and large attachment upload sessions
   remain unsupported. Remote mailbox mutations (flags/moves/deletes etc.) stay
   blocked by the guard; local tag edits are not uploaded. No production IDLE,
-  engine watcher, tag-sync or calendar-sync process is started.
-- Calendar integration is **not supported** here. Account calendars are disabled
+  engine watcher, tag-sync or production calendar-autosync process is started.
+- Without `--calendars`, account calendars remain disabled
   (reads return conflict); valid event-sync requests return `503 calendar sync
   unavailable`. There is no fake successful calendar sync.
+- With `--calendars`, native reads expose only the pinned collections. Existing
+  events (including earlier runs' series) are **read-only**: download does not
+  enroll IDs for mutation. New subjects must start with the exact `.prefix`
+  from private `calendar-session.json` (`Durian Test <random 128-bit hex> `,
+  including trailing space). Keep subjects unique within a run: the guards
+  use the full initial subject as the create idempotency key. Editing the suffix
+  after a successful create is supported; never strip the prefix.
+- Only explicit native Save/Delete follow-up sync can write remote events.
+  It uses the same event-scoped production runner as normal serve. Only this
+  run's created IDs can be updated/deleted. Other calendar writes, attendee
+  changes, RSVP, invitations and online meetings fail explicitly (GPUI's empty
+  attendee-list replacement is allowed only for attendee-free appointments);
+  no recipient or production timezone/fold guard is relaxed. Keep both test
+  calendars unshared and both mailboxes quiescent throughout the session.
+- No automatic remote cleanup runs at exit. Delete this run's events through
+  the native UI **before the session expires**, if desired. A new session does
+  not inherit ownership of them. Interrupted/unknown creates require private
+  inspection, never a prefix-based sweep or blind resend.
 
 ## State and bounds
 
@@ -50,7 +75,10 @@ schema with a freshly generated, memory-only keyring. Keys are never persisted;
 metadata and addresses remain plaintext by the production schema's design.
 The production contacts schema has no encryption API, so contacts are instead
 isolated entirely in RAM (seeded with just the two demo identities), never an
-unencrypted contacts file. Sync cursors are also RAM-only. This deliberately
+unencrypted contacts file. Mail cursors are RAM-only. Calendar ICS, sync state,
+remote mirror and occurrence cache use the production plaintext file formats,
+**only under the new private root's `calendars/` vdir**; they are retained on
+exit and must be removed by the parent when finished. This deliberately
 does not claim whole-database or contacts-at-rest encryption.
 
 `config.json` contains only synthetic settings, named signatures, account
@@ -67,6 +95,11 @@ limits are 20. Graph page sizes are provider-controlled soft limits and snapshot
 recovery may exceed the ordinary message cap; time limits remain effective.
 Both initial passes must succeed before readiness. Later failures emit only
 `SYNC_FAILED`; cached data remains available, not silently reported as fresh.
+When opted in, the same initial/30-second cycle also runs sequential calendar
+downloads (90-second bound per account, further bounded by session lifetime).
+They use production plan/apply/state/mirror/occurrence-cache code under the
+account run lock, always `FilterDownloadOnly` regardless of settings. Pending
+local creates, updates and deletes are never opportunistically uploaded.
 
 Total lifetime, including identity verification/startup, defaults to 10 minutes;
 `--duration` accepts 1 second through 30 minutes. SIGTERM/SIGINT cancel the session.
@@ -83,12 +116,17 @@ These commands do not refresh tokens or start a live session:
 bazel build //cli/cmd/demo-session:demo-session //cli/cmd/durian:durian
 bazel test //cli/cmd/demo-session:demo_session_test \
   //cli/internal/handler:handler_test //cli/internal/contacts:contacts_test \
-  //cli/internal/demotest:demotest_test //cli/cmd/durian:durian_test
+  //cli/internal/demotest:demotest_test //cli/cmd/durian:durian_test \
+  //cli/internal/calendartest:calendartest_test \
+  //cli/internal/calendarsync:calendarsync_test
 ```
 
 The session test injects `demotest.New` with fake token callbacks and a strictly
 offline provider transport, but uses the real Gmail/Graph backends, engine,
 SQLite stores, production HTTP router and worker. It never calls NewFromEnv.
+Calendar tests intercept **all** transport (including fake OAuth refresh and
+identity/metadata reads), exercise the real providers, guards and production
+router/event runner, and never invoke real token persistence or live runners.
 
 ## Parent-owned launch and connection
 
@@ -110,6 +148,11 @@ do **not** publish a portal for the mail API:
 amp orb service start demo-mail --command \
   "exec env DURIAN_MAIL_LIVE_TEST=1 bazel-bin/cli/cmd/demo-session/demo-session_/demo-session --output-dir '$DEMO_SESSION_DIR' --duration 10m"
 ```
+
+For the authorized combined session, inherit the calendar opt-in and exact ID
+pins above and append `--calendars` to that executable's arguments. Do not run
+the mail-only and combined sessions simultaneously. Read the run prefix from
+`$DEMO_SESSION_DIR/calendar-session.json` privately before creating UI events.
 
 Wait for the nonsecret `READY` line. Unlike production's owned-server handshake,
 this line intentionally contains **no token**. Only then read

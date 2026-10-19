@@ -1,6 +1,5 @@
 // demo-session is a manual, test-only composition root, never a production
-// credential bypass. It intentionally does not start serve's watchers or calendar
-// syncers. See README.md before an explicitly authorized live launch.
+// credential bypass. See README.md before an explicitly authorized live launch.
 package main
 
 import (
@@ -41,6 +40,7 @@ type options struct {
 	outputDir string
 	duration  time.Duration
 	port      int
+	calendars bool
 }
 
 type connection struct {
@@ -59,6 +59,7 @@ func main() {
 	flag.StringVar(&o.outputDir, "output-dir", "", "required NEW private directory; retained after exit (keys are not)")
 	flag.DurationVar(&o.duration, "duration", 10*time.Minute, "total lifetime including startup (1s to 30m)")
 	flag.IntVar(&o.port, "port", 0, "loopback port (0 chooses a free port)")
+	flag.BoolVar(&o.calendars, "calendars", false, "enable only the two explicitly pinned existing Durian Test calendars")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -66,18 +67,30 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Invalid arguments")
 		os.Exit(1)
 	}
-	if err := run(ctx, o, demotest.NewFromEnv, os.Stdout); err != nil {
+	if err := runSession(ctx, o, newSessionFromEnv, os.Stdout); err != nil {
 		// Deliberately never format err: even setup failures may embed PII.
 		fmt.Fprintln(os.Stderr, "Session failed (details withheld); inspect private state before any retry")
 		os.Exit(1)
 	}
 }
 
-// The constructor seam is private to offline tests. The executable always uses
-// NewFromEnv, once, sharing its serialized token sources across every operation.
+// Mail-only constructor adapter retained for the offline mail contract tests.
 func run(parent context.Context, o options, newMail func(context.Context) (*demotest.Mail, error), status io.Writer) error {
+	return runSession(parent, o, func(ctx context.Context, calendars bool) (*demotest.Mail, *calendarSession, error) {
+		if calendars {
+			return nil, nil, errors.New("mail-only constructor")
+		}
+		m, err := newMail(ctx)
+		return m, nil, err
+	}, status)
+}
+
+func runSession(parent context.Context, o options, setup func(context.Context, bool) (*demotest.Mail, *calendarSession, error), status io.Writer) error {
 	if os.Getenv("DURIAN_MAIL_LIVE_TEST") != "1" {
 		return errors.New("explicit mail live opt-in required")
+	}
+	if o.calendars && os.Getenv("DURIAN_CALENDAR_LIVE_TEST") != "1" {
+		return errors.New("explicit calendar live opt-in required")
 	}
 	if o.outputDir == "" || strings.ContainsAny(o.outputDir, "$~") || o.port < 0 || o.port > 65535 || o.duration < time.Second || o.duration > 30*time.Minute {
 		return errors.New("invalid private directory, port or lifetime")
@@ -93,11 +106,19 @@ func run(parent context.Context, o options, newMail func(context.Context) (*demo
 	}
 	ctx, cancel := context.WithTimeout(parent, o.duration)
 	defer cancel()
-	m, err := newMail(ctx)
+	m, calendars, err := setup(ctx, o.calendars)
 	if err != nil {
 		return errors.New("verify demo identities")
 	}
-	cfg := sessionConfig(root)
+	cfg := sessionConfig(root, o.calendars)
+	if o.calendars {
+		if calendars == nil {
+			return errors.New("guarded calendars unavailable")
+		}
+		if err := writePrivateJSON(filepath.Join(root, "calendar-session.json"), map[string]string{"prefix": calendars.prefix}); err != nil {
+			return err
+		}
+	}
 	if err := writePrivateJSON(filepath.Join(root, "config.json"), cfg); err != nil {
 		return err
 	}
@@ -156,6 +177,9 @@ func run(parent context.Context, o options, newMail func(context.Context) (*demo
 	h.SetProfilesPath(filepath.Join(root, "profiles.json"))
 	h.SetKeymapsPath(filepath.Join(root, "keymaps.json")) // absent = client defaults, never user's file
 	h.SetBackendFactory(m.BackendFor)
+	if calendars != nil {
+		h.SetCalendarEventSyncer(handler.NewCalendarEventSyncer(cfg, calendars.providerFor))
+	}
 	hub := handler.NewEventHub()
 	worker := handler.NewOutboxWorker(db, cfg, hub)
 	worker.SetSenderFactory(m.SenderFor)
@@ -179,6 +203,11 @@ func run(parent context.Context, o options, newMail func(context.Context) (*demo
 		for i, engine := range engines {
 			result = errors.Join(result, syncAccount(ctx, engine, m, &cfg.Accounts[i]))
 		}
+		if calendars != nil {
+			for i := range cfg.Accounts {
+				result = errors.Join(result, calendars.download(ctx, cfg, &cfg.Accounts[i], hub))
+			}
+		}
 		return result
 	}
 	if err := syncAll(); err != nil {
@@ -196,6 +225,9 @@ func run(parent context.Context, o options, newMail func(context.Context) (*demo
 	}
 	router := handler.NewRouter(h, hub, version, gitCommit)
 	router.Use(handler.LoopbackAuth(port, hex.EncodeToString(tokenBytes)))
+	if calendars != nil {
+		router.Use(calendars.policy(cfg))
+	}
 	server := &http.Server{Handler: router, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second,
 		ErrorLog: log.New(io.Discard, "", 0), BaseContext: func(net.Listener) context.Context { return ctx }}
 	var wg sync.WaitGroup
@@ -242,8 +274,12 @@ func run(parent context.Context, o options, newMail func(context.Context) (*demo
 	}
 }
 
-func sessionConfig(root string) *config.Config {
+func sessionConfig(root string, calendars bool) *config.Config {
 	disabled := false
+	var include []string
+	if calendars {
+		include = []string{"Durian Test"}
+	}
 	return &config.Config{
 		Settings:   &config.SettingsConfig{Theme: "system"},
 		Calendar:   config.CalendarConfig{VdirPath: filepath.Join(root, "calendars"), Autosync: &disabled},
@@ -251,10 +287,10 @@ func sessionConfig(root string) *config.Config {
 		Accounts: []config.AccountConfig{
 			{Name: "Gmail", Alias: "gmail-demo", DisplayName: "Gmail Demo", Default: true,
 				Email: os.Getenv("DURIAN_GOOGLE_TEST_EMAIL"), OAuth: &config.OAuthConfig{Provider: "google"},
-				DefaultSignature: "demo", Calendar: &config.AccountCalendarConfig{Enabled: &disabled}},
+				DefaultSignature: "demo", Calendar: &config.AccountCalendarConfig{Enabled: &calendars, Include: include}},
 			{Name: "Outlook", Alias: "outlook-demo", DisplayName: "Outlook Demo",
 				Email: os.Getenv("DURIAN_MS_TEST_EMAIL"), OAuth: &config.OAuthConfig{Provider: "microsoft"},
-				DefaultSignature: "demo", Calendar: &config.AccountCalendarConfig{Enabled: &disabled}},
+				DefaultSignature: "demo", Calendar: &config.AccountCalendarConfig{Enabled: &calendars, Include: include}},
 		},
 	}
 }
