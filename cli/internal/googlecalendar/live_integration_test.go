@@ -60,6 +60,6 @@ func TestGoogleLiveTimezones(t *testing.T) {
 	})
 	// NewWithToken never touches persisted OAuth. The guard injects the
 	// in-memory credential only after validating the actual request boundary.
-	c := NewWithToken("", calendartest.GoogleBase, "guard-supplies-token", httpClient)
+	c := NewWithToken(os.Getenv("DURIAN_GOOGLE_TEST_EMAIL"), calendartest.GoogleBase, "guard-supplies-token", httpClient)
 	exerciseProviderTimezones(t, c, cal, prefix)
 }

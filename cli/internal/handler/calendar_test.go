@@ -1213,3 +1213,82 @@ func TestUnknownCalendarAccountStill404s(t *testing.T) {
 		t.Errorf("status = %d, want 404", code)
 	}
 }
+
+// Only the refresh seam can access this provider; HTTP has no provider/token.
+type cachedOccurrenceProvider struct {
+	calendarsync.CalendarProvider
+	master   calendar.Event
+	instance calendar.Event
+}
+
+func (p cachedOccurrenceProvider) Owner() string { return "me@example.com" }
+func (p cachedOccurrenceProvider) FetchInstances(context.Context, string, time.Time, time.Time) ([]calendar.Event, error) {
+	return []calendar.Event{p.instance}, nil
+}
+func (p cachedOccurrenceProvider) FetchMasterEvents(context.Context, string) ([]calendar.Event, error) {
+	return []calendar.Event{p.master}, nil
+}
+
+func TestCalendarEventsProviderCacheAndLocalFallback(t *testing.T) {
+	r, calDir := newCalendarHandler(t)
+	start := time.Date(2026, 8, 6, 9, 0, 0, 0, time.UTC)
+	master := calendar.Event{ID: "remote-parent", ICalUID: "series", Subject: "Recurring", Start: start, End: start.Add(time.Hour),
+		Recurrence: &calendar.Recurrence{Pattern: calendar.RecurrencePattern{Type: "weekly", Interval: 1, DaysOfWeek: []string{"thursday"}}, Range: calendar.RecurrenceRange{Type: "numbered", StartDate: "2026-08-06", NumberOfOccurrences: 2}}}
+	writeCalendarTestEvent(t, calDir, master)
+	items, _, err := calendar.ScanLocalItems(calDir, "me@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &calendarsync.SyncState{Mailbox: "me@example.com", Calendars: map[string]calendarsync.CalendarStatus{
+		"remote-calendar": {Name: "Calendar", Dir: "Calendar", Items: map[string]calendarsync.ItemStatus{
+			"series": {RemoteID: master.ID, RemoteHash: calendar.EventContentHash(master, "me@example.com"), LocalHash: items["series"].Hash},
+		}},
+	}}
+	accountDir := filepath.Dir(calDir)
+	if err := calendarsync.NewFileStateStore(accountDir).Save(state); err != nil {
+		t.Fatal(err)
+	}
+	read := func() []calendar.CalendarEvent {
+		t.Helper()
+		var resp struct {
+			Events []calendar.CalendarEvent `json:"events"`
+		}
+		if code := getJSON(t, r, "/api/v1/calendars/events?account=work&from=2026-08-01&to=2026-08-20", &resp); code != http.StatusOK {
+			t.Fatalf("GET status %d", code)
+		}
+		return resp.Events
+	}
+	if got := read(); len(got) != 4 || got[2].OccurrenceSource != "local-estimate" {
+		t.Fatalf("HTTP missing-cache fallback: %+v", got)
+	}
+	instance := master
+	instance.ID, instance.ICalUID, instance.SeriesMasterID = "remote-instance", "distinct-graph-uid", master.ID
+	instance.Recurrence = nil
+	instance.Start, instance.End = start.Add(2*time.Hour), start.Add(2*time.Hour) // supported zero-duration occurrence
+	p := cachedOccurrenceProvider{master: master, instance: instance}
+	plans := []calendarsync.CalendarPlan{{Calendar: calendarsync.Calendar{ID: "remote-calendar"}, Dir: calDir}}
+	if _, err := calendarsync.RefreshOccurrences(context.Background(), p, accountDir, state, plans, start); err != nil {
+		t.Fatal(err)
+	}
+	got := read()
+	if len(got) != 3 || got[2].UID != "series" || got[2].OccurrenceSource != "provider" || !got[2].Recurring || !got[2].Start.Equal(instance.Start) {
+		t.Fatalf("HTTP cached occurrence: %+v", got)
+	}
+	var detail struct {
+		Event calendar.CalendarEvent `json:"event"`
+	}
+	if code := getJSON(t, r, "/api/v1/calendars/event?account=work&uid=series", &detail); code != http.StatusOK || !detail.Event.Start.Equal(master.Start) {
+		t.Fatal("cached occurrence broke master detail lookup")
+	}
+	master.Subject = "Pending local edit"
+	writeCalendarTestEvent(t, calDir, master)
+	if got := read(); len(got) != 4 || got[2].OccurrenceSource != "local-estimate" || got[2].Subject != master.Subject {
+		t.Fatalf("HTTP pending edit: %+v", got)
+	}
+	if err := os.Remove(filepath.Join(calDir, "series.ics")); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); len(got) != 2 {
+		t.Fatalf("HTTP resurrected deleted master: %+v", got)
+	}
+}

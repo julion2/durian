@@ -223,9 +223,16 @@ func calendarAutosyncOnce(ctx context.Context, hub *handler.EventHub, account *c
 	stats, applyErr := calendarsync.ApplyAll(runCtx, provider, state, filtered, calendarsync.SyncOptions{})
 	// Save also on partial failure: completed local writes are recorded and
 	// must not be misread as local edits on the next run.
+	cacheChanged := false
 	if saveErr := store.Save(state); saveErr != nil {
 		slog.Warn("Calendar autosync failed to save state", "module", "CALSYNC",
 			"account", account.GetAliasOrName(), "err", saveErr) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
+	} else {
+		var cacheErr error
+		cacheChanged, cacheErr = calendarsync.RefreshOccurrences(runCtx, provider, accountDir, state, filtered, time.Now())
+		if cacheErr != nil {
+			slog.Warn("Calendar occurrence cache refresh failed; keeping offline fallback", "module", "CALSYNC")
+		}
 	}
 	// Recording the mirror is safe even though the deferred actions were never
 	// applied: those are LOCAL changes waiting for the confirmation gate, and
@@ -241,7 +248,7 @@ func calendarAutosyncOnce(ctx context.Context, hub *handler.EventHub, account *c
 	}
 	*authHintLogged = false // a full clean cycle resets the auth-hint damper
 
-	if stats.Downloaded+stats.Pruned+stats.Archived+stats.Uploaded > 0 {
+	if cacheChanged || stats.Downloaded+stats.Pruned+stats.Archived+stats.Uploaded > 0 {
 		slog.Info("Calendar autosync updated calendars", "module", "CALSYNC",
 			"account", account.GetAliasOrName(), "downloaded", stats.Downloaded, "pruned", stats.Pruned, "archived", stats.Archived, "uploaded", stats.Uploaded) // encgrep:allow wrapper-protected slog key per redact.SensitiveSlogKeys
 		hub.BroadcastCalendar(handler.CalendarUpdatedEvent{

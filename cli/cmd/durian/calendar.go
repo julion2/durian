@@ -352,6 +352,10 @@ func runCalendarSyncAccount(cmd *cobra.Command, cfg *config.Config, account *con
 		}
 		return saveErr
 	}
+	if _, err := calendarsync.RefreshOccurrences(cmd.Context(), client, accountDir, state, plans, time.Now()); err != nil {
+		// Do not log provider error bodies or mailbox credentials.
+		slog.Warn("Calendar occurrence cache refresh failed; keeping offline fallback", "module", "CALSYNC")
+	}
 	// The mirror follows the state, and for the same reason: the actions that
 	// did NOT get applied left no baseline behind, so the next run replans
 	// them against this same mirror. A mirror that failed to save is not worth

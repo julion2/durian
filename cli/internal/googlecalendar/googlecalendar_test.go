@@ -2,6 +2,7 @@ package googlecalendar
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -336,8 +337,18 @@ func TestFetchInstances(t *testing.T) {
 	if events[0].ID != "evt-weekly_20260706T090000Z" || events[0].ICalUID != "uid-weekly@google.com" {
 		t.Errorf("instance identity = %+v", events[0])
 	}
-	if events[0].Type != "occurrence" {
-		t.Errorf("instance Type = %q", events[0].Type)
+	if events[0].Type != "occurrence" || events[0].SeriesMasterID != "evt-weekly" {
+		t.Errorf("instance type/parent = %q/%q", events[0].Type, events[0].SeriesMasterID)
+	}
+}
+
+func TestFetchInstancesRejectsIncompleteSnapshot(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"items":[{"id":"bad-instance","recurringEventId":"parent","start":{"dateTime":"bad"},"end":{"dateTime":"bad"}}]}`)
+	}))
+	defer srv.Close()
+	if events, err := testClient(srv).FetchInstances(context.Background(), "cal-primary", time.Now(), time.Now().Add(time.Hour)); err == nil || events != nil {
+		t.Fatal("unparseable occurrence became a successful empty snapshot")
 	}
 }
 

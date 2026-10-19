@@ -10,14 +10,15 @@ import (
 	"time"
 
 	"github.com/julion2/durian/cli/internal/calendar"
+	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/spf13/cobra"
 )
 
 // Local-first calendar read commands (list / search / show). All three read
 // only the on-disk vdir (populated by `durian calendar sync`/`export`) — no
-// Graph call, no token. Recurring masters are expanded into concrete
-// occurrences via calendar.ExpandOccurrences.
+// provider call, no token. Lists use cached provider occurrences when eligible,
+// otherwise RFC expansion with explicit estimate metadata for remote series.
 
 var calendarListCmd = &cobra.Command{
 	Use:   "list [account...]",
@@ -288,10 +289,8 @@ func runCalendarList(cmd *cobra.Command, args []string) error {
 		if calListCalendar != "" && !strings.EqualFold(cal.Name, calListCalendar) {
 			continue
 		}
-		for _, e := range cal.Events {
-			for _, occ := range calendar.ExpandOccurrences(e, from, to) {
-				occs = append(occs, occurrence{cal: cal, event: occ})
-			}
+		for _, occ := range calendarsync.ReadOccurrences(cal, from, to) {
+			occs = append(occs, occurrence{cal: cal, event: occ})
 		}
 	}
 	sort.Slice(occs, func(i, j int) bool { return occs[i].event.Start.Before(occs[j].event.Start) })

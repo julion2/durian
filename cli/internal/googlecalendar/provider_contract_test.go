@@ -34,7 +34,7 @@ func TestGoogleRecordedTimezones(t *testing.T) {
 		}
 		t.Logf("replayed %d of %d exchanges without network", replay.Index, len(replay.Recording.Exchanges))
 	})
-	c := NewWithToken("", calendartest.GoogleBase, "offline", &http.Client{Transport: &replay})
+	c := NewWithToken("demo@example.invalid", calendartest.GoogleBase, "offline", &http.Client{Transport: &replay})
 	exerciseProviderTimezones(t, c, "test-calendar", replay.Recording.Prefix)
 }
 
@@ -143,6 +143,7 @@ func exerciseProviderTimezones(t *testing.T, c *Client, cal, prefix string) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			start := contractTime(t, tc.start)
+			dir := t.TempDir()
 			ev := calendar.Event{Subject: prefix + tc.name, Start: start, End: start.Add(45 * time.Minute), TimeZone: tc.zone, RecurrenceRule: tc.rule}
 			if tc.exdate != "" {
 				ev.ExceptionDates = []time.Time{contractTime(t, tc.exdate)}
@@ -159,6 +160,7 @@ func exerciseProviderTimezones(t *testing.T, c *Client, cal, prefix string) {
 			}
 			checkContractTimes(t, "Google", instances, googleWant)
 			checkContractLocal(t, ctx, c, cal, created.ID, from, to, tc.want)
+			checkContractSynced(t, ctx, c, cal, dir, from, to, googleWant)
 			if tc.moved == "" {
 				return
 			}
@@ -184,6 +186,7 @@ func exerciseProviderTimezones(t *testing.T, c *Client, cal, prefix string) {
 			sort.Strings(want)
 			checkContractTimes(t, "Google after exceptions", contractInstances(t, ctx, c, cal, ev.Subject, from, to), want)
 			checkContractLocal(t, ctx, c, cal, created.ID, from, to, want)
+			checkContractSynced(t, ctx, c, cal, dir, from, to, want)
 		})
 	}
 	t.Run("ambiguous-series-write-rejected", func(t *testing.T) {
@@ -294,4 +297,18 @@ func checkContractLocal(t *testing.T, ctx context.Context, c *Client, cal, id st
 		return
 	}
 	t.Fatal("series master missing")
+}
+
+func checkContractSynced(t *testing.T, ctx context.Context, c *Client, cal, dir string, from, to time.Time, want []string) {
+	t.Helper()
+	events, err := calendartest.SyncOccurrences(ctx, c, cal, dir, from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkContractTimes(t, "synced provider occurrences", events, want)
+	for _, event := range events {
+		if event.OccurrenceSource != "provider" || !calendar.ToCalendarEvent("Durian Test", event, false).Recurring {
+			t.Error("synced recurrence did not retain provider source/series identity")
+		}
+	}
 }

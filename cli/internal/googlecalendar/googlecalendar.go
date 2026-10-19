@@ -656,6 +656,7 @@ func (c *Client) eventFromGoogle(g googleEvent) (calendar.Event, bool) {
 	return calendar.Event{
 		ID:               g.ID,
 		ICalUID:          g.ICalUID,
+		SeriesMasterID:   g.RecurringEventID,
 		Subject:          g.Summary,
 		Location:         g.Location,
 		Description:      g.Description,
@@ -1015,9 +1016,11 @@ func (c *Client) FetchInstances(ctx context.Context, calendarID string, from, to
 			if g.Status == "cancelled" {
 				continue
 			}
-			if ev, ok := c.eventFromGoogle(g); ok {
-				events = append(events, ev)
+			ev, ok := c.eventFromGoogle(g)
+			if !ok {
+				return nil, fmt.Errorf("incomplete provider instance snapshot")
 			}
+			events = append(events, ev)
 		}
 		if page.NextPageToken == "" {
 			break

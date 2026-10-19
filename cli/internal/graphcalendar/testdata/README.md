@@ -3,10 +3,10 @@
 `graph-timezones.json` is the **unchanged output of calendartest.Recorder**
 from a real, consented personal Microsoft demo account, not synthesized Graph
 responses. The fixture is byte-for-byte identical to
-`.amp/in/artifacts/graph-calendar-live/conditional-replan-20261019/recording.json`:
+`.amp/in/artifacts/graph-calendar-live/provider-cache-20261019/recording.json`:
 
 ```
-SHA-256 df3551bc96dea1767a377bda34c45ffc9b77e9ff3666359b79e1f309a755c66d
+SHA-256 9158271a163be272bf6312b4666b2536ab6fa301167f0a8e16e1fc1e07ed2644
 ```
 
 Recorder sanitizes JSON before saving: credentials, addresses, organizer and
@@ -67,12 +67,17 @@ assert zero outbound calls, even if production validation were to regress.
   preferences and augmented selects are not separate recorded exchanges.
   Offline replay verifies the provider request seam, not fresh remote safety.
 
-## Provider contract passes; application occurrence rendering remains open
+## Provider and sync/read contracts pass
 
-Latest live and offline: **16/16 leaf cases pass**, **117/117 exchanges**.
-The fixture contains 16 POST, 75 GET, 11 PATCH and 15 DELETE exchanges;
-statuses: 15×201, 82×200, 4×412, 15×204, 1×400. The live run took 41.27s.
-This is the Go provider + local/ICS contract, not an HTTP/GUI or full-sync proof.
+Latest live and offline: **16/16 leaf cases pass**, **170/170 exchanges**.
+The fixture contains 16 POST, 129 GET, 10 PATCH and 15 DELETE exchanges;
+statuses: 15×201, 136×200, 3×412, 15×204, 1×400. The live run took 56.13s.
+Every series now also exercises the real download plan/apply, ICS, saved state,
+provider occurrence cache and shared CLI/HTTP offline read path. It reuses the
+same isolated vdir after moving and cancelling instances. The read-back helper
+rejects any non-download/prune plan before applying. All returned series
+occurrences must retain recurring identity and `occurrence_source: provider`.
+This is not a native-GUI, upload or invitation workflow proof.
 Provider-specific DST characterization is deliberately separate from RFC5545
 expectations; a passing characterization does not make those models equivalent.
 
@@ -95,7 +100,8 @@ responses were edited. The scenario now reads the current key after POST, and
 on setup-only 412 permits at most two re-planned attempts, each after read-back
 and comparison to the independently expected pre-edit content. A real content
 change aborts; no unconditional PATCH or production retry was introduced. The
-latest stale-delete setup used one such re-plan. The actual stale PATCH/DELETE
+earlier conditional-replan run used one such re-plan; the current cache run
+needed none. The actual stale PATCH/DELETE
 assertions never retry and must preserve the edited remote content.
 
 Graph's gap/fold expectations now reflect the earlier genuine recordings, while
@@ -103,8 +109,13 @@ the original RFC/local expectations remain unchanged and are also asserted.
 Raw fold probes use explicit-offset dateTime strings plus Europe/Berlin only
 in test-only HTTP through guard+recorder. Production ambiguous-time rejection
 remains unchanged because this representation loses zone identity. All events
-have no attendees, conferencing or reminders. The HTTP/UI still expands local
-masters: it does NOT yet substitute provider instances for DST divergences.
+have no attendees, conferencing or reminders. Eligible offline reads now use
+cached provider instances, preserving Graph's zero-duration gap and 105-minute
+fold rather than re-expanding them. Local-only collections remain RFC-native.
+The cache is disposable, UTC month-aligned −12/+18 months and refreshed after
+baseline changes, month rollover or 24 hours. Mailbox, calendar, saved-baseline
+and raw-ICS checks prevent stale snapshots overriding pending local edits.
+Unavailable/uncovered snapshots fall back to explicit `local-estimate` metadata.
 
 `DeleteEvent` now reads the same event with `$select=id,changeKey` and immutable
 ID preference when etag is nonempty. Missing/foreign identity, missing key or
@@ -130,7 +141,7 @@ verification, then all twelve returned IDs were cleaned. The temporary recovery
 entry point was removed; the retained fixture is from a separate fresh nonce.
 At that earlier evidence-capture stage no production provider/timezone/write code
 was changed. The current change preserves the expanded-master exception/cancellation
-fix and adds the DELETE preflight. Still open: provider-faithful HTTP/UI occurrence
-rendering, Graph fold zone identity (writes remain rejected), and the non-atomic
+fix and adds the DELETE preflight. Still open: live native-GUI workflow proof,
+Graph fold zone identity (writes remain rejected), and the non-atomic
 DELETE race. Graph may legitimately return 412 without a user content edit; the
 sync engine keeps such operations pending and re-plans rather than overwriting.

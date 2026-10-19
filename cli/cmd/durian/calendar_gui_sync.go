@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"time"
 
 	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
@@ -94,6 +95,17 @@ func (s guiCalendarSyncer) SyncCalendarEvent(ctx context.Context, identifier, ca
 			return false, errors.Join(applyErr, fmt.Errorf("failed to save calendar sync state: %w", saveErr))
 		}
 		return false, fmt.Errorf("failed to save calendar sync state: %w", saveErr)
+	}
+	// FilterEvent retains no-action plans for unrelated calendars. Refresh
+	// only the selected collection, and never save the newly fetched mirror.
+	var refreshPlans []calendarsync.CalendarPlan
+	for _, plan := range filtered {
+		if len(plan.Actions) > 0 {
+			refreshPlans = append(refreshPlans, plan)
+		}
+	}
+	if _, err := calendarsync.RefreshOccurrences(ctx, provider, accountDir, state, refreshPlans, time.Now()); err != nil {
+		slog.Warn("Calendar occurrence cache refresh failed; keeping offline fallback", "module", "CALSYNC")
 	}
 	if applyErr != nil {
 		return false, fmt.Errorf("failed to apply calendar sync: %w", applyErr)

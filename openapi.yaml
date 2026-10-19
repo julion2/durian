@@ -1520,6 +1520,15 @@ components:
           type: string
         recurring:
           type: boolean
+        occurrence_source:
+          type: string
+          enum: [provider, local-estimate]
+          description: >-
+            Source of a remote calendar's recurring occurrence. Provider means
+            a bounded, locally cached provider expansion matching the synced
+            master and current ICS bytes. Local-estimate means offline RFC
+            expansion (pending edits, missing/invalid cache, or uncovered window).
+            Omitted for ordinary events and local-only calendars.
         organizer:
           $ref: '#/components/schemas/CalendarPerson'
         attendees:

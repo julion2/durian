@@ -24,8 +24,8 @@ import (
 // Event is one calendar event. Two fetch paths fill it:
 //
 //   - FetchEvents (calendarView) returns pre-expanded concrete instances, so
-//     ID is unique per occurrence while ICalUID is shared across a series;
-//     Type, ETag and Recurrence stay empty.
+//     ID is unique per occurrence. Graph's ICalUID is occurrence-specific;
+//     SeriesMasterID, never UID, joins occurrences to their master.
 //   - FetchMasterEvents (/events) returns singleInstance and seriesMaster
 //     events; seriesMaster carries the series definition in Recurrence, and
 //     ETag/Type are populated for the two-way sync engine.
@@ -39,6 +39,11 @@ type Event struct {
 	End          time.Time
 	AllDay       bool
 	LastModified time.Time
+
+	// SeriesMasterID joins provider instances to their remote master. These
+	// read-only fields are never serialized to ICS or included in sync hashes.
+	SeriesMasterID   string `json:",omitempty"`
+	OccurrenceSource string `json:",omitempty"`
 
 	// TimeZone/EndTimeZone retain IANA zone identities independently of the
 	// resolved instants. Empty means UTC; an empty EndTimeZone inherits TimeZone.
@@ -56,7 +61,7 @@ type Event struct {
 	// changes on every remote modification.
 	ETag string
 	// Type is the Graph event type: "singleInstance", "seriesMaster",
-	// "occurrence" or "exception". Empty for calendarView results.
+	// "occurrence" or "exception". Google supplies the equivalent shape.
 	Type string
 	// Recurrence is the series definition of a seriesMaster event; nil for
 	// non-recurring events.

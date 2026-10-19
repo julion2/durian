@@ -195,12 +195,10 @@ func (h *Handler) CalendarEventsHandler(w http.ResponseWriter, r *http.Request) 
 			if calFilter != "" && !strings.EqualFold(cal.Name, calFilter) {
 				continue
 			}
-			for _, e := range cal.Events {
-				for _, occ := range calendar.ExpandOccurrences(e, from, to) {
-					dto := calendar.ToCalendarEvent(cal.Name, occ, false)
-					dto.Account = cal.Account
-					events = append(events, dto)
-				}
+			for _, occ := range calendarsync.ReadOccurrences(cal, from, to) {
+				dto := calendar.ToCalendarEvent(cal.Name, occ, false)
+				dto.Account = cal.Account
+				events = append(events, dto)
 			}
 		}
 	}

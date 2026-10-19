@@ -49,6 +49,7 @@ type CalendarEvent struct {
 	OnlineMeeting    bool      `json:"online_meeting,omitempty"`
 	OnlineMeetingURL string    `json:"online_meeting_url,omitempty"`
 	Recurring        bool      `json:"recurring,omitempty"`
+	OccurrenceSource string    `json:"occurrence_source,omitempty"`
 
 	// Detail-only fields (omitted from list/search responses).
 	Organizer   *PersonDTO    `json:"organizer,omitempty"`
@@ -75,7 +76,8 @@ func ToCalendarEvent(calendarName string, e Event, detail bool) CalendarEvent {
 		MyResponse:       string(e.OwnerResponse),
 		OnlineMeeting:    e.IsOnlineMeeting || e.OnlineMeetingURL != "",
 		OnlineMeetingURL: e.OnlineMeetingURL,
-		Recurring:        e.Recurrence != nil,
+		Recurring:        e.Recurrence != nil || e.OpaqueRecurrence || e.SeriesMasterID != "",
+		OccurrenceSource: e.OccurrenceSource,
 	}
 	if !detail {
 		return dto

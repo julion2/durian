@@ -1,13 +1,37 @@
 # Google Calendar live contract and offline replay
 
-These tests exercise the real Go provider, then the iCalendar round-trip and
-local recurrence expansion. They do not launch the GUI or run a complete sync
-engine round. The production CLI does not read the test credential variables.
+These tests exercise the real Go provider, the iCalendar round-trip and local
+recurrence expansion, then plan/apply, saved sync state and offline occurrence
+reads. They do not launch the GUI. Production does not read test credentials.
 
-## Current result: 14/14 cases pass (previously 8/14)
+## Current sync/read result: 14/14 live and replay
+
+The fixture is byte-for-byte the sanitized live recording from
+`.amp/in/artifacts/google-calendar-live/provider-cache-20261019/recording.json`:
+SHA-256 `49e503c6e8772b9aec616756d032c1ddf565e78531b9d5b82ef92b2ca89ca57d`.
+All **135/135 exchanges** replay without network; the live run took 46.57s.
+Eleven masters were created and cleaned; final instance read-back was empty.
+Methods: 17 POST, 88 GET, 16 PATCH, 14 DELETE. Statuses: 109×200, 6×409
+(idempotency), 6×412 (stale edits), 14×204. Credential/address audits passed.
+
+Each series now goes through the real download plan/apply into isolated ICS,
+saved sync state, provider occurrence cache and the shared CLI/HTTP read path.
+The same vdir is reused after exceptions, testing updates, not only initial
+downloads. Google-specific spring-gap instants survive this entire path;
+local/ICS assertions still independently require RFC expansion. Every returned
+series occurrence must carry `occurrence_source: provider` and recurring identity.
+Only download/prune plans may apply in this read-back step; no implicit uploads.
+
+The disposable cache covers UTC month-aligned −12/+18 months, refreshed after
+baseline changes, window rollover or 24 hours. It never becomes sync input or
+changes ICS. Offline reads require matching mailbox, calendar binding, saved
+baseline and current file bytes. Missing/out-of-window/pending-edit snapshots
+use RFC expansion with `local-estimate`; local-only calendars remain RFC-native.
+
+## Earlier provider-only result: 14/14 cases (previously 8/14)
 
 Captured on 2026-10-19 against a dedicated secondary **Durian Test** calendar.
-The current fixture is copied byte-for-byte from the genuine sanitized live
+The earlier fixture was copied byte-for-byte from the genuine sanitized live
 recording `preflight-fixed-run-20261019.json` in
 `.amp/in/artifacts/google-calendar-live/`. It contains **111 scoped exchanges**
 for **11 created masters**. All eleven were deleted with HTTP 204; the final
@@ -107,8 +131,8 @@ bazel test //cli/internal/googlecalendar:googlecalendar_test \
 All three targets pass with the current fixture. The replay runs the same
 public-method scenario as the live test, including writes and cleanup; it
 compares requests and consumes every recorded response. It has no network
-fallback. This verifies the scoped provider contract, not the GUI or complete
-sync engine, and does not erase the Google/RFC spring-gap discrepancy above.
+fallback. It now also verifies the download/saved-state/offline-read contract,
+not the GUI, uploads or invitation workflows. The Google/RFC discrepancy remains.
 
 ## Live run (requires explicit authorization to write)
 

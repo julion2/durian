@@ -37,17 +37,15 @@ func TestGraphRecordedTimezones(t *testing.T) {
 		t.Logf("replayed %d of %d exchanges without network", replay.Index, len(replay.Recording.Exchanges))
 	})
 	// No fallback transport, token source, or OAuth. Unexpected requests fail.
-	c := NewWithToken("", calendartest.GraphBase, "offline", &http.Client{Transport: &replay})
+	c := NewWithToken("demo@example.invalid", calendartest.GraphBase, "offline", &http.Client{Transport: &replay})
 	exerciseGraphTimezones(t, c, "test-calendar", replay.Recording.Prefix)
 }
 
 // Live and offline run the SAME public-provider contract. The only bypass is
 // the explicitly named raw probes: production's ambiguous-time rejection must
 // remain until real Graph evidence establishes a safe representation.
-// This matrix intentionally remains red: raw folds lose original zone identity,
-// Graph gap/fold series differ from local RFC expansion, and the latest run
-// rejected three edits using POST-returned changeKeys after idempotent retries.
-// Keep these assertions; see testdata/README.md for the genuine recording.
+// Provider-specific gap/fold expectations remain distinct from local RFC
+// expansion. The sync/read path must use provider occurrences, not estimates.
 // The live guard adds false isReminderOn/isOnlineMeeting on POST, forces UTC
 // plus ImmutableId on every request, and augments list $select with safety and
 // series membership fields. Recorder sees provider requests and sanitized
@@ -191,6 +189,7 @@ func exerciseGraphTimezones(t *testing.T, c *Client, cal, prefix string) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			start := graphContractTime(t, tc.start)
+			dir := t.TempDir()
 			ev := calendar.Event{Subject: prefix + tc.name, Start: start, End: start.Add(45 * time.Minute), TimeZone: tc.zone,
 				Recurrence: &calendar.Recurrence{Pattern: calendar.RecurrencePattern{Type: "weekly", Interval: 1, DaysOfWeek: []string{"sunday"}}, Range: calendar.RecurrenceRange{Type: "numbered", StartDate: start.Format("2006-01-02"), TimeZone: tc.zone, NumberOfOccurrences: len(tc.want)}}}
 			created := create(t, ev)
@@ -202,6 +201,11 @@ func exerciseGraphTimezones(t *testing.T, c *Client, cal, prefix string) {
 				checkGraphContractWindow(t, "Graph provider-specific expansion", instances, tc.providerStarts, tc.providerDurations)
 			}
 			checkGraphContractLocal(t, ctx, c, cal, created.ID, from, to, tc.want)
+			providerStarts := tc.providerStarts
+			if providerStarts == nil {
+				providerStarts = tc.want
+			}
+			checkGraphContractSynced(t, ctx, c, cal, dir, from, to, providerStarts, tc.providerDurations)
 			if tc.moved == "" {
 				return
 			}
@@ -222,6 +226,7 @@ func exerciseGraphTimezones(t *testing.T, c *Client, cal, prefix string) {
 			sort.Strings(movedWant)
 			checkGraphContractTimes(t, "Graph after move", graphContractInstances(t, ctx, c, cal, ev.Subject, from, to), movedWant)
 			checkGraphContractLocal(t, ctx, c, cal, created.ID, from, to, movedWant)
+			checkGraphContractSynced(t, ctx, c, cal, dir, from, to, movedWant, nil)
 			removed := read(t, instances[len(instances)-1].ID)
 			if err := c.DeleteEvent(ctx, cal, removed.ID, removed.ETag, false); err != nil {
 				t.Fatal("cancel occurrence failed; inspect sanitized recording")
@@ -229,6 +234,7 @@ func exerciseGraphTimezones(t *testing.T, c *Client, cal, prefix string) {
 			want := append([]string(nil), movedWant[:len(movedWant)-1]...)
 			checkGraphContractTimes(t, "Graph after cancel", graphContractInstances(t, ctx, c, cal, ev.Subject, from, to), want)
 			checkGraphContractLocal(t, ctx, c, cal, created.ID, from, to, want)
+			checkGraphContractSynced(t, ctx, c, cal, dir, from, to, want, nil)
 		})
 	}
 	for _, tc := range []struct{ name, start, end, wantStart, wantEnd string }{
@@ -450,4 +456,22 @@ func checkGraphContractLocal(t *testing.T, ctx context.Context, c *Client, cal, 
 		return
 	}
 	t.Fatal("series master missing")
+}
+
+func checkGraphContractSynced(t *testing.T, ctx context.Context, c *Client, cal, dir string, from, to time.Time, want []string, durations []time.Duration) {
+	t.Helper()
+	events, err := calendartest.SyncOccurrences(ctx, c, cal, dir, from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durations == nil {
+		checkGraphContractTimes(t, "synced provider occurrences", events, want)
+	} else {
+		checkGraphContractWindow(t, "synced provider occurrences", events, want, durations)
+	}
+	for _, event := range events {
+		if event.OccurrenceSource != "provider" || !calendar.ToCalendarEvent("Durian Test", event, false).Recurring {
+			t.Error("synced recurrence did not retain provider source/series identity")
+		}
+	}
 }

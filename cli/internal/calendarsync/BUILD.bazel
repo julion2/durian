@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "calendarsync.go",
         "export.go",
+        "instances.go",
         "mirror.go",
         "notify.go",
         "runlock.go",
@@ -27,6 +28,7 @@ go_test(
         "deltaplan_test.go",
         "downloadonly_test.go",
         "export_test.go",
+        "instances_test.go",
         "mirror_test.go",
         "nonnotifying_test.go",
         "provider_test.go",

@@ -3,9 +3,13 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "calendartest",
     testonly = True,
-    srcs = ["google.go", "graph.go", "oauth.go", "record.go"],
+    srcs = ["google.go", "graph.go", "oauth.go", "record.go", "sync.go"],
     importpath = "github.com/julion2/durian/cli/internal/calendartest",
     visibility = ["//cli:__subpackages__"],
+    deps = [
+        "//cli/internal/calendar",
+        "//cli/internal/calendarsync",
+    ],
 )
 
 go_test(

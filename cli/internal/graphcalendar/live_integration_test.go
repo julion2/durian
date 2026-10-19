@@ -59,6 +59,6 @@ func TestGraphLiveTimezones(t *testing.T) {
 			t.Error("unknown POST outcomes retained; no listing-based cleanup authorized")
 		}
 	})
-	c := NewWithToken("", calendartest.GraphBase, "guard-supplies-token", httpClient)
+	c := NewWithToken(os.Getenv("DURIAN_MS_TEST_EMAIL"), calendartest.GraphBase, "guard-supplies-token", httpClient)
 	exerciseGraphTimezones(t, c, pin.ID(), prefix)
 }

@@ -45,9 +45,10 @@ const (
 	// defaultBaseURL is the Graph API root, without a trailing slash.
 	defaultBaseURL = "https://graph.microsoft.com/v1.0"
 
-	// eventSelect is the field set requested on calendarView queries: just what
-	// the .ics writer needs.
-	eventSelect = "id,iCalUId,subject,start,end,isAllDay,location,bodyPreview,lastModifiedDateTime,originalStartTimeZone,originalEndTimeZone"
+	// eventSelect includes explicit series membership and the summary DTO's
+	// meeting fields, so cached occurrences retain RSVP and join-link display.
+	eventSelect = "id,iCalUId,subject,start,end,isAllDay,location,bodyPreview,lastModifiedDateTime,originalStartTimeZone,originalEndTimeZone,type,seriesMasterId,originalStart," +
+		"responseStatus,isOnlineMeeting,onlineMeeting,onlineMeetingUrl,isCancelled"
 
 	// masterEventSelect is the field set requested on /events queries (master
 	// events for two-way sync): eventSelect plus the full body, the recurrence
@@ -624,20 +625,21 @@ func eventFromGraph(ge graphEvent) (calendar.Event, bool) {
 	}
 
 	return calendar.Event{
-		ID:           ge.ID,
-		ICalUID:      ge.ICalUID,
-		Subject:      ge.Subject,
-		Location:     ge.Location.DisplayName,
-		Description:  description,
-		Start:        start,
-		End:          end,
-		TimeZone:     startZone,
-		EndTimeZone:  endZone,
-		AllDay:       ge.IsAllDay,
-		LastModified: parseGraphTimestamp(ge.LastModifiedDateTime),
-		ETag:         ge.ChangeKey,
-		Type:         ge.Type,
-		Recurrence:   recurrence,
+		ID:             ge.ID,
+		ICalUID:        ge.ICalUID,
+		SeriesMasterID: ge.SeriesMasterID,
+		Subject:        ge.Subject,
+		Location:       ge.Location.DisplayName,
+		Description:    description,
+		Start:          start,
+		End:            end,
+		TimeZone:       startZone,
+		EndTimeZone:    endZone,
+		AllDay:         ge.IsAllDay,
+		LastModified:   parseGraphTimestamp(ge.LastModifiedDateTime),
+		ETag:           ge.ChangeKey,
+		Type:           ge.Type,
+		Recurrence:     recurrence,
 
 		Attendees:        attendees,
 		Organizer:        organizer,
@@ -657,12 +659,11 @@ type eventPage struct {
 
 // FetchEvents returns all event instances of the calendar within [from, to)
 // via the Graph calendarView endpoint, which expands recurring series into
-// concrete occurrences. The Prefer: outlook.timezone="UTC" header is sent on
-// every page (including @odata.nextLink follow-ups) so start/end come back in
-// UTC. For all-day events Graph reports midnight boundaries with an exclusive
-// end date; both are kept as-is.
+// concrete occurrences. Every page requests UTC times and immutable IDs so
+// seriesMasterId matches the sync baseline. For all-day events Graph reports
+// midnight boundaries with an exclusive end date; both are kept as-is.
 func (c *Client) FetchEvents(ctx context.Context, calendarID string, from, to time.Time) ([]calendar.Event, error) {
-	headers := map[string]string{"Prefer": preferUTC}
+	headers := map[string]string{"Prefer": preferMaster}
 
 	var events []calendar.Event
 	pageURL := fmt.Sprintf("%s%s/calendars/%s/calendarView?startDateTime=%s&endDateTime=%s&$select=%s&$top=100",
@@ -679,9 +680,11 @@ func (c *Client) FetchEvents(ctx context.Context, calendarID string, from, to ti
 			if _, _, _, err := graphEventZones(ge); err != nil {
 				return nil, fmt.Errorf("failed to read event %s: %w", ge.ID, err)
 			}
-			if ev, ok := eventFromGraph(ge); ok {
-				events = append(events, ev)
+			ev, ok := eventFromGraph(ge)
+			if !ok {
+				return nil, fmt.Errorf("incomplete provider instance snapshot")
 			}
+			events = append(events, ev)
 		}
 		pageURL = page.NextLink
 	}

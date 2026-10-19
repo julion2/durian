@@ -167,6 +167,13 @@ func TestFetchEvents(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 			t.Errorf("Authorization = %q, want bearer test-token", got)
 		}
+		if r.URL.Query().Get("page") == "" {
+			for _, field := range []string{"type", "seriesMasterId", "originalStart", "responseStatus", "isOnlineMeeting", "onlineMeeting", "onlineMeetingUrl", "isCancelled"} {
+				if !strings.Contains(r.URL.Query().Get("$select"), field) {
+					t.Errorf("calendarView missing %s", field)
+				}
+			}
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Query().Get("page") == "2" {
@@ -189,6 +196,11 @@ func TestFetchEvents(t *testing.T) {
 			"value": [{
 				"id": "ev1",
 				"iCalUId": "ical-1",
+				"type": "occurrence",
+				"seriesMasterId": "immutable-parent",
+				"responseStatus": {"response": "accepted"},
+				"isOnlineMeeting": true,
+				"onlineMeeting": {"joinUrl": "https://meeting.example.test/join"},
 				"subject": "Standup",
 				"start": {"dateTime": "2026-07-23T10:00:00.0000000", "timeZone": "UTC"},
 				"end": {"dateTime": "2026-07-23T10:30:00.0000000", "timeZone": "UTC"},
@@ -216,9 +228,12 @@ func TestFetchEvents(t *testing.T) {
 		t.Fatalf("expected 2 pages fetched, got %d", len(preferHeaders))
 	}
 	for i, h := range preferHeaders {
-		if h != `outlook.timezone="UTC"` {
-			t.Errorf("page %d Prefer header = %q, want outlook.timezone UTC", i+1, h)
+		if h != preferMaster {
+			t.Errorf("page %d Prefer header = %q, want UTC and ImmutableId", i+1, h)
 		}
+	}
+	if len(events) > 0 && events[0].SeriesMasterID != "immutable-parent" {
+		t.Fatal("calendarView lost explicit parent identity")
 	}
 
 	if len(events) != 2 {
@@ -226,6 +241,9 @@ func TestFetchEvents(t *testing.T) {
 	}
 
 	ev1 := events[0]
+	if dto := calendar.ToCalendarEvent("Work", ev1, false); dto.MyResponse != "accepted" || !dto.OnlineMeeting || dto.OnlineMeetingURL != "https://meeting.example.test/join" {
+		t.Fatalf("calendarView lost recurring meeting summary: %+v", dto)
+	}
 	if ev1.ID != "ev1" || ev1.ICalUID != "ical-1" || ev1.Subject != "Standup" ||
 		ev1.Location != "Zoom" || ev1.Description != "daily sync" || ev1.AllDay {
 		t.Errorf("ev1 fields mismatched: %+v", ev1)
@@ -249,6 +267,16 @@ func TestFetchEvents(t *testing.T) {
 	}
 	if want := time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC); !ev2.End.Equal(want) {
 		t.Errorf("ev2.End = %v, want %v", ev2.End, want)
+	}
+}
+
+func TestFetchInstancesRejectsIncompleteSnapshot(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"value":[{"id":"bad-instance","type":"occurrence","seriesMasterId":"parent","start":{"dateTime":"bad","timeZone":"UTC"},"end":{"dateTime":"bad","timeZone":"UTC"}}]}`)
+	}))
+	defer srv.Close()
+	if events, err := testClient(srv).FetchInstances(context.Background(), "cal1", time.Now(), time.Now().Add(time.Hour)); err == nil || events != nil {
+		t.Fatal("unparseable occurrence became a successful empty snapshot")
 	}
 }
 

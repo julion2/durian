@@ -43,6 +43,7 @@ type LocalCalendar struct {
 	// configured local calendar), so a listing spanning several accounts can
 	// tell two identically named calendars apart.
 	Account string
+	Owner   string
 }
 
 // Collection names one calendar collection directory before its events are
@@ -139,6 +140,7 @@ func ReadCollections(cols []Collection) ([]LocalCalendar, error) {
 			Dir:      col.Dir,
 			Events:   events,
 			Account:  col.Account,
+			Owner:    col.Owner,
 		})
 	}
 	sort.Slice(calendars, func(i, j int) bool {
@@ -191,7 +193,7 @@ func ExpandOccurrences(e Event, from, to time.Time) []Event {
 		// all-day dates must not disappear when the caller travels west of UTC.
 		from, to = CivilTime(from), CivilTime(to)
 	}
-	if e.Recurrence == nil {
+	if e.Recurrence == nil || e.SeriesMasterID != "" {
 		if overlaps(e.Start, e.End, from, to) {
 			return []Event{e}
 		}
@@ -334,7 +336,9 @@ func applySeriesExceptions(master Event, raw []Event, from, to time.Time) []Even
 // query window [from, to). Both intervals are half-open: an event whose end
 // equals `from`, or whose start equals `to`, does not overlap.
 func overlaps(start, end, from, to time.Time) bool {
-	return start.Before(to) && end.After(from)
+	// A provider may represent a spring-gap occurrence as a zero-duration
+	// point. Keep it at the inclusive start edge of the query too.
+	return start.Before(to) && (end.After(from) || start.Equal(end) && !start.Before(from))
 }
 
 // ResolveLocalEvent finds exactly one event in the vdir for a short reference
