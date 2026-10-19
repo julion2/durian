@@ -8,6 +8,8 @@
 //! - dates are whole days and `m` means *months* (`date:3m..`), so `newer:30m` (minutes) or
 //!   `newer:5h` become "since N days" on the server and are cut exactly here
 //! - accounts are folder paths there (`path:work/`)
+//! - group membership is resolved only by the server; unfinished terms stay local, but
+//!   malformed completed terms fail rather than silently broadening the search
 //! - "has:html" isn't a field; a token still being typed (`tag:o`) can't go out either – the
 //!   server matches whole words (its text index is blind: HMAC tokens), so prefixes match here
 
@@ -39,8 +41,20 @@ fn any_of(field: &str, values: &[String]) -> String {
     }
 }
 
+/// Match the entire group token, not just a valid prefix of an invalid name or modifier.
+/// Allow only ASCII names and the server's exact /from or /to, never arbitrary query syntax.
+fn group(value: &str) -> Option<String> {
+    let name = match value.split_once('/') {
+        Some((name, "from" | "to")) => name,
+        Some(_) => return None,
+        None => value,
+    };
+    (!name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'))
+        .then(|| format!("group:{value}"))
+}
+
 /// `me`: the user's addresses (`from:me` / `to:me`).
-pub fn translate(query: &Query, me: &[SharedString]) -> Translated {
+pub fn translate(query: &Query, me: &[SharedString]) -> Result<Translated, String> {
     let me: Vec<String> = me.iter().filter(|a| !a.is_empty()).map(|a| a.to_string()).collect();
     let mut server: Vec<String> = Vec::new();
     let mut refine: Vec<Clause> = Vec::new();
@@ -55,6 +69,7 @@ pub fn translate(query: &Query, me: &[SharedString]) -> Translated {
         let part: Option<String> = match &clause.term {
             Term::Tag(t) => Some(format!("tag:{}", value(t))),
             Term::From(w) => Some(any_of("from", &who(w))),
+            Term::Group(g) => Some(group(g).ok_or_else(|| "Invalid group filter: use group:Name, group:Name/from or group:Name/to (letters, digits, _ and -)".to_string())?),
             Term::Subject(s) => Some(format!("subject:{}", value(s))),
             // the UI's to: covers cc as well
             Term::To(w) => {
@@ -88,7 +103,7 @@ pub fn translate(query: &Query, me: &[SharedString]) -> Translated {
             }
         }
     }
-    Translated { server: server.join(" "), refine: Query { clauses: refine } }
+    Ok(Translated { server: server.join(" "), refine: Query { clauses: refine } })
 }
 
 /// Only one account's mail (the account switcher).
@@ -110,7 +125,7 @@ mod tests {
     use super::*;
 
     fn t(q: &str) -> Translated {
-        translate(&Query::parse(&format!("{q} ")), &["me@work.dev".into(), "me@home.dev".into()])
+        translate(&Query::parse(&format!("{q} ")), &["me@work.dev".into(), "me@home.dev".into()]).unwrap()
     }
 
     #[test]
@@ -129,6 +144,48 @@ mod tests {
     fn me_expands_to_every_address() {
         assert_eq!(t("from:me").server, "(from:me@work.dev OR from:me@home.dev)");
         assert_eq!(t("to:mara").server, "(to:mara OR cc:mara)");
+    }
+
+    #[test]
+    fn groups_are_server_terms_with_case_and_direction_preserved() {
+        for (input, expected) in [
+            ("group:team", "group:team"),
+            ("GROUP:Team_2-East/from", "group:Team_2-East/from"),
+            ("-group:Team/to", "NOT group:Team/to"),
+            ("group:Team group:team", "group:Team group:team"),
+            ("tag:inbox group:Team/from -from:mara", "tag:inbox group:Team/from NOT from:mara"),
+            ("-group:Team/to subject:Other group:Clients", "NOT group:Team/to subject:other group:Clients"),
+            ("to:mara -group:Team/from", "(to:mara OR cc:mara) NOT group:Team/from"),
+        ] {
+            let translated = t(input);
+            assert_eq!(translated.server, expected, "{input}");
+            assert!(translated.refine.is_empty(), "membership is resolved only by the server: {input}");
+        }
+    }
+
+    #[test]
+    fn groups_wait_for_completion_without_hiding_other_server_terms() {
+        for input in ["group:Team", "-group:Team", "group:Team/from", "-group:Team/to"] {
+            let typing = translate(&Query::parse(&format!("tag:inbox {input}")), &[]).unwrap();
+            assert_eq!(typing.server, "tag:inbox", "{input}");
+            let settled = translate(&crate::durian::live::settle(&Query::parse(&format!("tag:inbox {input}"))), &[]).unwrap();
+            assert_eq!(settled, t(&format!("tag:inbox {input}")), "settling is equivalent to a trailing space: {input}");
+        }
+        let typing = translate(&Query::parse("group:Team/from subject:oth"), &[]).unwrap();
+        assert_eq!(typing.server, "group:Team/from");
+        assert_eq!(typing.refine.clauses[0].term, Term::Subject("oth".into()));
+    }
+
+    #[test]
+    fn malformed_groups_do_not_pass_through_query_syntax() {
+        for input in ["group:", "group:Team/", "group:Team/f", "group:Team/cc", "group:Team/FROM", "group:Team/to/extra", "group:Team.name", "group:Téam", "group:Team)", "group:\"Team OR tag:inbox\""] {
+            for sign in ["", "-"] {
+                let query = Query::parse(&format!("tag:inbox {sign}{input}"));
+                assert_eq!(translate(&query, &[]).unwrap().server, "tag:inbox", "unfinished: {sign}{input}");
+                assert!(translate(&crate::durian::live::settle(&query), &[]).is_err(), "settled: {sign}{input}");
+                assert!(translate(&Query::parse(&format!("tag:inbox {sign}{input} ")), &[]).is_err(), "complete: {sign}{input}");
+            }
+        }
     }
 
     #[test]
@@ -151,7 +208,7 @@ mod tests {
         assert_eq!(x.refine.clauses.len(), 1);
         assert_eq!(t("\"exact phrase\"").server, "\"exact phrase\"");
         // the token being typed (no trailing space) stays local
-        let typing = translate(&Query::parse("tag:inbox tag:o"), &[]);
+        let typing = translate(&Query::parse("tag:inbox tag:o"), &[]).unwrap();
         assert_eq!(typing.server, "tag:inbox");
         assert_eq!(typing.refine.clauses.len(), 1);
     }

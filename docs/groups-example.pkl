@@ -6,7 +6,7 @@
 //
 //   members {
 //     "alice@work.com"                                        // single address
-//     new { "bob@work.com"; "bob@personal.com" }              // same person, two addresses
+//     new Listing { "bob@work.com"; "bob@personal.com" }      // same person, two addresses
 //     "*@fund-xyz.com"                                        // domain wildcard
 //   }
 //
@@ -15,32 +15,34 @@
 //   group:investor/from         — only mail FROM the group (incoming)
 //   group:investor/to           — only mail TO the group (outgoing/sent)
 
-groups {
-  ["investor"] {
+import "modulepath:/Groups.pkl" as G
+
+groups: Mapping<String, G.GroupEntry> = new {
+  ["investor"] = new {
     description = "Cap Table members"
     members {
-      new { "alice@sequoia.com"; "alice.smith@gmail.com" }
+      new Listing { "alice@sequoia.com"; "alice.smith@gmail.com" }
       "bob@index.vc"
       "*@fund-xyz.com"
     }
   }
 
-  ["advisor"] {
+  ["advisor"] = new {
     members {
-      new { "carol@example.org"; "carol.personal@icloud.com" }
+      new Listing { "carol@example.org"; "carol.personal@icloud.com" }
       "mentor@university.edu"
     }
   }
 
-  ["press"] {
+  ["press"] = new {
     members { "*@spiegel.de"; "*@handelsblatt.com"; "*@techcrunch.com" }
   }
 
-  ["legal"] {
+  ["legal"] = new {
     members { "*@kanzlei-mueller.de"; "notar@xy.de" }
   }
 
-  ["vip"] {
+  ["vip"] = new {
     description = "Always-surface contacts"
     members { "cofounder@firma.de"; "lead@sequoia.com" }
   }

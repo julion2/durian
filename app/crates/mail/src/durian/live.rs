@@ -649,7 +649,7 @@ impl Live {
         }
         self.first_page = FirstPage::Done;
         // the list may have moved on (a search typed, another profile, fresh profiles)
-        if self.planned(false, cx).0 != query {
+        if !self.planned(false, cx).is_ok_and(|(server, _)| server == query) {
             if let Ok(page) = page {
                 self.first_page = FirstPage::Ready(query, page);
             }
@@ -691,16 +691,16 @@ impl Live {
 
     /// The server query and local refinement for the current list. `settled`: the word being
     /// typed counts as complete.
-    fn planned(&self, settled: bool, cx: &Context<Self>) -> (String, Query) {
+    fn planned(&self, settled: bool, cx: &Context<Self>) -> Result<(String, Query), String> {
         let mailbox = self.mailbox.read(cx);
         let query = if settled { settle(&mailbox.query) } else { complete_known_tags(&mailbox.query, &mailbox.tags) };
-        let translated = translate(&query, &self.me);
+        let translated = translate(&query, &self.me)?;
         let scope = match (mailbox.active_profile(), &mailbox.account_filter) {
             (Some(profile), _) => profiles::scope(profile),
             (None, Some(account)) => Some(account_scope(account)),
             (None, None) => None,
         };
-        (compose(scope.as_deref(), mailbox.active_folder().map(|f| f.query.as_ref()), &translated.server), translated.refine)
+        Ok((compose(scope.as_deref(), mailbox.active_folder().map(|f| f.query.as_ref()), &translated.server), translated.refine))
     }
 
     fn connected(&mut self, identity: client::Result<Identity>, took: Duration, cx: &mut Context<Self>) {
@@ -810,6 +810,10 @@ impl Live {
     /// Ask for the current query, even if its string and row stamps haven't changed.
     /// The old list stays visible until a successful answer replaces it.
     fn refresh_mail(&mut self, cx: &mut Context<Self>) {
+        if let Err(message) = self.planned(true, cx) {
+            self.reject_query(message, cx);
+            return;
+        }
         self.mail_refreshing = true;
         self.stamps.clear();
         self.invalidate_threads(cx);
@@ -963,8 +967,11 @@ impl Live {
             // Wait for identity and startup scope, not the startup search result.
             return;
         }
-        let (server, refine) = self.planned(settled, cx);
-        let changed = self.mailbox.read(cx).remote.as_ref().is_some_and(|r| r.server_query != server);
+        let (server, refine) = match self.planned(settled, cx) {
+            Ok(plan) => plan,
+            Err(message) => return self.reject_query(message, cx),
+        };
+        let changed = self.mailbox.read(cx).remote.as_ref().is_some_and(|r| r.server_query != server || matches!(r.loading, Some(Loading::Failed(_))));
         self.mailbox.update(cx, |m, cx| {
             if changed && let Some(remote) = m.remote.as_mut() {
                 remote.server_query = server;
@@ -977,6 +984,16 @@ impl Live {
         if changed {
             self.search(delay, cx);
         }
+    }
+
+    /// Never turn a malformed filter into an unconstrained search, including on retry or SSE.
+    fn reject_query(&mut self, message: String, cx: &mut Context<Self>) {
+        self.first_page = FirstPage::Done;
+        self.generation += 1;
+        self.search = None;
+        if let Some(cancel) = self.search_cancel.take() { cancel.store(true, Ordering::Relaxed); }
+        self.mail_refreshing = false;
+        self.update_remote(cx, |r| r.loading = Some(Loading::Failed(message.into())));
     }
 
     /// Ask for the current server query; the answer replaces the list if nothing newer was
@@ -1648,7 +1665,7 @@ mod tests {
         for q in ["invoi", "tag:newsletter", "from:mara", "to:jo", "tag:unread"] {
             let settled = settle(&Query::parse(q));
             assert!(!settled.clauses[0].prefix, "{q}");
-            assert!(!translate(&settled, &[]).server.is_empty(), "{q} goes to the server");
+            assert!(!translate(&settled, &[]).unwrap().server.is_empty(), "{q} goes to the server");
         }
         assert_eq!(settle(&Query::parse("invoice ")), Query::parse("invoice "));
     }
@@ -1658,7 +1675,7 @@ mod tests {
         let tags = [Tag { name: "Newsletter".into(), color: gpui::black() }];
         let q = complete_known_tags(&Query::parse("tag:newsletter"), &tags);
         assert!(!q.clauses[0].prefix);
-        assert_eq!(translate(&q, &[]).server, "tag:newsletter");
+        assert_eq!(translate(&q, &[]).unwrap().server, "tag:newsletter");
         assert!(!complete_known_tags(&Query::parse("tag:unread"), &[]).clauses[0].prefix);
         // still being typed: narrows locally until the pause
         assert!(complete_known_tags(&Query::parse("tag:news"), &tags).clauses[0].prefix);

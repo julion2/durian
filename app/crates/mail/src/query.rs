@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! tag:review -tag:done from:mara to:me account:work tag:unread tag:flagged has:attachment
-//! newer:24h older:7d "exact phrase" free text
+//! group:Team group:Clients/from -group:Team/to newer:24h older:7d "exact phrase" free text
 //! ```
 //! Terms are AND-ed; `-` negates any term.
 
@@ -16,6 +16,9 @@ pub enum Term {
     Tag(String),
     From(String),
     To(String),
+    /// Case-sensitive name with optional /from or /to. Kept even while unfinished or invalid:
+    /// only the server knows membership, and translation validates before sending it.
+    Group(String),
     Subject(String),
     Account(String),
     Has(String),
@@ -99,6 +102,7 @@ impl Query {
                     _ => (false, token),
                 };
                 let term = match token.split_once(':') {
+                    Some((key, value)) if key.eq_ignore_ascii_case("group") => Term::Group(value.to_string()),
                     Some((key, value)) if !value.is_empty() => {
                         let value = value.to_lowercase();
                         match key.to_lowercase().as_str() {
@@ -169,10 +173,11 @@ fn name_matches(name: &str, email: &str, needle: &str, mailbox: &Mailbox) -> boo
     name.to_lowercase().contains(needle) || email.to_lowercase().contains(needle)
 }
 
-/// What a list row without its messages (`Thread::partial`) can't tell: its attachments and
-/// recipients. Such a clause keeps the row – the server's answer already accounts for it.
+/// Group membership is always unknown locally, even with full messages. Summary rows also
+/// can't tell attachments or recipients. Keep unknown predicates before applying negation:
+/// the server's answer accounts for complete terms; unfinished terms must not hide rows.
 fn unknown(term: &Term, thread: &Thread) -> bool {
-    thread.partial && matches!(term, Term::Has(_) | Term::To(_))
+    matches!(term, Term::Group(_)) || (thread.partial && matches!(term, Term::Has(_) | Term::To(_)))
 }
 
 fn term_matches(term: &Term, prefix: bool, thread: &Thread, mailbox: &Mailbox, emails: Option<&std::collections::HashMap<SharedString, SharedString>>) -> bool {
@@ -187,6 +192,7 @@ fn term_matches(term: &Term, prefix: bool, thread: &Thread, mailbox: &Mailbox, e
                 name_matches(n, email, who, mailbox) || (who == "me" && *n == mailbox.me.name)
             })
         }),
+        Term::Group(_) => true, // unknown() bypasses this, including for negated groups
         Term::Subject(needle) => contains_folded(&thread.subject, needle),
         Term::Account(id) => eq(&thread.account.to_lowercase(), id)
             || mailbox.account(&thread.account).is_some_and(|a| eq(&a.name.to_lowercase(), id)),
@@ -213,7 +219,7 @@ pub fn completions(input: &str, mailbox: &Mailbox) -> Vec<(SharedString, SharedS
     let (negate, last) = last.strip_prefix('-').map_or(("", last), |l| ("-", l));
     let Some((key, partial)) = last.split_once(':') else {
         // no key yet: offer the keys themselves
-        return ["tag:", "from:", "to:", "subject:", "has:", "account:", "newer:", "older:"]
+        return ["tag:", "from:", "to:", "group:", "subject:", "has:", "account:", "newer:", "older:"]
             .iter()
             .filter(|k| !last.is_empty() && k.starts_with(&last.to_lowercase()))
             .map(|k| (SharedString::from(format!("{negate}{k}")), SharedString::from("filter")))
@@ -248,10 +254,12 @@ pub fn completions(input: &str, mailbox: &Mailbox) -> Vec<(SharedString, SharedS
         .collect()
 }
 
-/// Replace the last token of `input` with `completion` (and add a trailing space).
+/// Replace the last token. A key keeps the caret after `:` for its value;
+/// a completed value gets a trailing space for the next term.
 pub fn apply_completion(input: &str, completion: &str) -> String {
     let start = input.rfind(char::is_whitespace).map_or(0, |i| i + 1);
-    format!("{}{completion} ", &input[..start])
+    let end = if completion.ends_with(':') { "" } else { " " };
+    format!("{}{completion}{end}", &input[..start])
 }
 
 #[cfg(test)]
@@ -271,6 +279,24 @@ mod folded {
 mod tests {
     use super::*;
 
+    fn mailbox() -> Mailbox {
+        let data = serde_json::from_str(r#"{
+            "me":{"name":"Me","email":"me@example.test"},
+            "accounts":[],"tags":[],"views":[],
+            "threads":[
+                {"id":"plain","subject":"Ordinary mail","tags":["inbox"],"items":[
+                    {"kind":"message","from":{"name":"Mara","email":"mara@example.test"},
+                     "to":["Me"],"at":"09:00","ago":"now","read":true,"body":"No group reference"}
+                ]},
+                {"id":"literal","subject":"Ordinary mail","tags":[],"items":[
+                    {"kind":"message","from":{"name":"Me","email":"me@example.test"},
+                     "to":["Mara"],"at":"09:00","ago":"now","read":true,"body":"group:Team"}
+                ]}
+            ]
+        }"#).unwrap();
+        Mailbox::new(data)
+    }
+
     #[test]
     fn parses_negation_quotes_and_durations() {
         let q = Query::parse(r#"tag:review -tag:done "exact phrase" newer:24h from:mara"#);
@@ -280,5 +306,58 @@ mod tests {
         assert_eq!(q.clauses[3].term, Term::Newer(24.));
         assert!(Query::parse("tag:").is_empty(), "an unfinished key matches everything");
         assert!(Query::parse("tag:o").clauses[0].prefix && !Query::parse("tag:o ").clauses[0].prefix);
+    }
+
+    #[test]
+    fn groups_preserve_case_and_unfinished_tokens() {
+        let query = Query::parse("GROUP:Team_2-East/from -group:Clients/to group:");
+        assert_eq!(query.clauses, vec![
+            Clause { term: Term::Group("Team_2-East/from".into()), negate: false, prefix: false },
+            Clause { term: Term::Group("Clients/to".into()), negate: true, prefix: false },
+            Clause { term: Term::Group("".into()), negate: false, prefix: true },
+        ]);
+    }
+
+    #[test]
+    fn groups_never_refine_unknown_membership_or_body_text() {
+        let mailbox = mailbox();
+        for input in ["group:Team", "group:Team/from", "group:Team/to", "group:", "group:Team/", "group:Team/t", "group:Team/cc"] {
+            for sign in ["", "-"] {
+                for end in ["", " "] {
+                    let input = format!("{sign}{input}{end}");
+                    let query = Query::parse(&input);
+                    // Completed malformed tokens are rejected before a search is issued.
+                    let Ok(translated) = crate::durian::translate::translate(&query, &[]) else { continue };
+                    for partial in [false, true] {
+                        for row in &mailbox.threads {
+                            let thread = Thread { partial, ..row.clone() };
+                            assert!(query.matches(&thread, &mailbox), "{input}, partial={partial}");
+                            assert!(translated.refine.matches(&thread, &mailbox), "refinement: {input}, partial={partial}");
+                        }
+                    }
+                }
+            }
+        }
+        for input in ["tag:inbox -group:Team/to", "-group:Team/from tag:inbox ", "tag:inbox group:"] {
+            let query = Query::parse(input);
+            assert!(query.matches(&mailbox.threads[0], &mailbox), "{input}");
+            assert!(!query.matches(&mailbox.threads[1], &mailbox), "known predicates still refine: {input}");
+        }
+    }
+
+    #[test]
+    fn group_key_completion_does_not_offer_membership_suggestions() {
+        let mailbox = mailbox();
+        for (input, expected) in [("gr", "group:"), ("tag:inbox -GR", "-group:")] {
+            assert_eq!(completions(input, &mailbox), vec![(expected.into(), "filter".into())]);
+            let completed = apply_completion(input, expected);
+            assert!(completed.ends_with(expected));
+            let query = Query::parse(&format!("{completed}Team/from "));
+            assert_eq!(query.clauses.last().unwrap().term, Term::Group("Team/from".into()));
+        }
+        assert_eq!(apply_completion("tag:inbox fr", "from:"), "tag:inbox from:");
+        assert_eq!(apply_completion("group:Team tag:un", "tag:unread"), "group:Team tag:unread ");
+        assert!(completions("group:", &mailbox).is_empty());
+        assert!(completions("group:Te", &mailbox).is_empty());
     }
 }

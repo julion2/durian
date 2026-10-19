@@ -45,6 +45,12 @@ chmod 700 "$TMPDIR" "$XDG_RUNTIME_DIR"
 # transports. An accidental expired Undo window cannot deliver a real message.
 sed -e '/    smtp {/d' -e '/    imap {/d' -e '/    auth {/d' "$CONFIG" > "$XDG_CONFIG_HOME/durian/config.pkl"
 cp "$(dirname "$CONFIG")/profiles.pkl" "$XDG_CONFIG_HOME/durian/profiles.pkl"
+cat > "$XDG_CONFIG_HOME/durian/groups.pkl" <<'GROUPS'
+import "modulepath:/Groups.pkl" as G
+groups: Mapping<String, G.GroupEntry> = new {
+  ["Team"] = new { members { "alice@example.com" } }
+}
+GROUPS
 cat >> "$XDG_CONFIG_HOME/durian/config.pkl" <<EOF
 
 calendar: C.CalendarConfig = new {
@@ -140,7 +146,7 @@ expect_screen() {
 
 search() {
   xdotool key --clearmodifiers slash
-  xdotool type --clearmodifiers --delay 25 "$1 "
+  xdotool type --clearmodifiers --delay 25 -- "$1 "
   xdotool key Return
 }
 
@@ -217,6 +223,32 @@ BACKEND_PID=$(pgrep -P "$APP_PID" -x durian-cli)
 [[ "$("$CLI" count 'tag:unread')" == 0 ]]
 expect_inbox_count live 0
 echo 'PASS packaged sibling backend and opening a thread marks it read'
+
+# Group membership is resolved by Go, not by matching the loaded message body.
+# Alice sends only in Hello World, but receives in both threads.
+xdotool key --clearmodifiers slash
+xdotool type --clearmodifiers --delay 25 'gr'
+xdotool key Tab
+xdotool type --clearmodifiers --delay 25 'Team/from '
+xdotool key Return
+expect_screen group-from 'Hello World' 'Other Thread'
+clear_search
+# Negation follows backend message semantics: Hello has a message TO Bob,
+# whereas every message in Other is addressed to Alice.
+search '-group:Team/to'
+expect_screen group-negated 'Hello World' 'Other Thread'
+clear_search
+search 'group:Team/to'
+expect_screen group-to 'Other Thread'
+grep -q 'Hello World' "$ROOT/screen.txt"
+clear_search
+search 'group:Team/cc'
+expect_screen group-invalid 'Invalid group filter'
+xdotool key --clearmodifiers ctrl+r
+expect_screen group-invalid-refresh 'Invalid group filter'
+clear_search
+expect_screen group-recovered 'Hello World' 'Invalid group filter'
+echo 'PASS directed/negated group search, invalid-filter rejection and recovery'
 
 # Toolbar buttons must expose real actions, not just hover chrome.
 xdotool mousemove --window "$WINDOW" 315 64 click 1
