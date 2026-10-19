@@ -186,6 +186,11 @@ func readMetaFile(calDir, name, fallback string) string {
 // what actually happened to it. So the raw expansion is only an intermediate
 // result — applySeriesExceptions turns it into the real occurrence list.
 func ExpandOccurrences(e Event, from, to time.Time) []Event {
+	if e.Floating || e.AllDay {
+		// Query offsets identify the caller's civil window. Floating 00:15 and
+		// all-day dates must not disappear when the caller travels west of UTC.
+		from, to = CivilTime(from), CivilTime(to)
+	}
 	if e.Recurrence == nil {
 		if overlaps(e.Start, e.End, from, to) {
 			return []Event{e}
@@ -193,7 +198,7 @@ func ExpandOccurrences(e Event, from, to time.Time) []Event {
 		return nil
 	}
 
-	opt, err := RecurrenceToROption(*e.Recurrence)
+	opt, err := recurrenceOptions(e)
 	if err != nil {
 		slog.Warn("Cannot expand recurrence, showing master only", "module", "GRAPHCAL",
 			"uid", e.ICalUID, "err", err)
@@ -202,7 +207,17 @@ func ExpandOccurrences(e Event, from, to time.Time) []Event {
 		}
 		return nil
 	}
-	opt.Dtstart = e.Start.UTC()
+	loc, err := loadZone(e.TimeZone)
+	if err != nil {
+		return nil
+	}
+	// Generate civil candidates first: rrule-go normalizes nonexistent local
+	// times and consumes COUNT for them. RFC 5545 requires skipping them,
+	// while resolving a repeated clock hour to its first occurrence.
+	count, until := opt.Count, opt.Until
+	opt.Count = 0
+	opt.Dtstart = CivilTime(e.Start.In(loc))
+	opt.Until = CivilTime(to.In(loc)).Add(48 * time.Hour)
 	rule, err := rrule.NewRRule(*opt)
 	if err != nil {
 		slog.Warn("Cannot build recurrence rule, showing master only", "module", "GRAPHCAL",
@@ -215,16 +230,31 @@ func ExpandOccurrences(e Event, from, to time.Time) []Event {
 
 	duration := e.End.Sub(e.Start)
 	var raw []Event
-	// Between matches occurrence STARTS only, so it would miss an occurrence
-	// that begins before `from` yet is still running inside the window. Widen
-	// the lower bound by one occurrence duration to catch it; the overlap test
-	// below filters precisely, so the widening never admits an occurrence that
-	// ends at or before `from`. Between(a, b, true) is inclusive on both ends;
-	// our window is end-exclusive ([from, to)), so an occurrence landing
-	// exactly on `to` is dropped to stay consistent with the single-event case.
-	for _, start := range rule.Between(from.Add(-duration), to, true) {
-		if !start.Before(to) {
+	accepted := 0
+	next := rule.Iterator()
+	for {
+		clock, ok := next()
+		if !ok {
+			break
+		}
+		start, valid := resolveCivil(clock, loc)
+		if clock.Equal(opt.Dtstart) {
+			// An explicit DTSTART can identify the second fold. Only generated
+			// future wall clocks use RFC 5545's first-fold choice.
+			start, valid = e.Start, true
+		}
+		if !valid {
 			continue
+		}
+		if !until.IsZero() && start.After(until) {
+			break
+		}
+		if !start.Before(to) {
+			break
+		}
+		accepted++
+		if count > 0 && accepted > count {
+			break
 		}
 		occ := e
 		// An occurrence is not a series: it carries neither the exception list
@@ -431,7 +461,9 @@ func ParseWhen(s string, now time.Time) (t time.Time, allDay bool, err error) {
 		return DateOnly(now).AddDate(0, 0, 1), true, nil
 	}
 	if t, err = time.Parse(time.RFC3339, s); err == nil {
-		return t.UTC(), false, nil
+		// Keep explicit offsets for civil calendar-window bounds; callers that
+		// need an instant can still use UTC/Equal without losing information.
+		return t, false, nil
 	}
 	if t, err = time.ParseInLocation("2006-01-02 15:04", s, time.UTC); err == nil {
 		return t, false, nil

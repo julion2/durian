@@ -29,10 +29,11 @@ import (
 // Client satisfies the optional incremental seam of the sync engine.
 var _ calendarsync.DeltaCalendarProvider = (*Client)(nil)
 
-// deltaParamFingerprint pins the query shape the sync tokens are bound to.
-// Bump it whenever baseQuery changes: a token minted under the old shape would
-// otherwise be replayed against the new one, which Google rejects with a 400.
-const deltaParamFingerprint = "google/v1;singleEvents=false;showDeleted=true;maxResults=250"
+// deltaParamFingerprint pins the query shape and decoder version. Bump it
+// whenever baseQuery changes (Google rejects mismatched parameters), or a full
+// reread is needed to populate newly retained metadata. v2 refreshes timezone
+// identities and exact RRULEs previously discarded from unchanged events.
+const deltaParamFingerprint = "google/v2;singleEvents=false;showDeleted=true;maxResults=250"
 
 // baseQuery is the parameter set shared by the full and the incremental round.
 // Nothing may be added to it per-call except pageToken and syncToken.
@@ -103,6 +104,9 @@ func (c *Client) fetchDeltaRound(ctx context.Context, calendarID, cursor string)
 		}
 
 		for _, g := range page.Items {
+			if err := validateGoogleZones(g); err != nil {
+				return calendarsync.DeltaResult{}, fmt.Errorf("failed to read event %s: %w", g.ID, err)
+			}
 			switch {
 			case g.RecurringEventID != "":
 				c.classifyInstance(&result, inRound, g)

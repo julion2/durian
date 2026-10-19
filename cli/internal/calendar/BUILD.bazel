@@ -11,6 +11,7 @@ go_library(
         "local_scan.go",
         "read_local.go",
         "rsvp.go",
+        "timezone.go",
     ],
     importpath = "github.com/julion2/durian/cli/internal/calendar",
     visibility = ["//cli:__subpackages__"],
@@ -31,6 +32,7 @@ go_test(
         "read_local_test.go",
         "rsvp_test.go",
         "series_exceptions_test.go",
+        "timezone_test.go",
     ],
     embed = [":calendar"],
 )

@@ -4,6 +4,8 @@ go_library(
     name = "graphcalendar",
     srcs = [
         "graphcalendar.go",
+        "timezone.go",
+        "windows_zones.go",
         "write.go",
     ],
     importpath = "github.com/julion2/durian/cli/internal/graphcalendar",
@@ -25,8 +27,12 @@ go_test(
         "graphcalendar_test.go",
         "series_exceptions_test.go",
         "throttle_test.go",
+        "timezone_test.go",
         "write_test.go",
     ],
     embed = [":graphcalendar"],
-    deps = ["//cli/internal/calendar"],
+    deps = [
+        "//cli/internal/calendar",
+        "//cli/internal/calendarsync",
+    ],
 )

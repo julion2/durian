@@ -47,6 +47,10 @@ type ItemStatus struct {
 	// CoreHash existed): such items keep the historical full-hash conflict
 	// behavior until their next rebaseline records one.
 	CoreHash string `json:"core_hash,omitempty"`
+	// TimeVersion distinguishes timezone-aware hashes from legacy UTC-only
+	// baselines. Upgrading must not manufacture a remote edit and discard a
+	// pending local one under remote-wins conflict resolution.
+	TimeVersion int `json:"time_version,omitempty"`
 	// LocalHash is the SHA-256 hex digest of the local .ics file bytes at last
 	// sync; a differing current hash means the local side changed.
 	LocalHash string `json:"local_hash"`

@@ -1496,6 +1496,19 @@ components:
           format: date-time
         all_day:
           type: boolean
+        time_zone:
+          type: string
+          description: Original IANA start timezone; absent or empty means UTC. Not set for all-day or floating values.
+        end_time_zone:
+          type: string
+          description: Original IANA end timezone; absent or empty inherits time_zone.
+        floating:
+          type: boolean
+          default: false
+          description: >-
+            When true, start/end contain civil clock fields in zero-offset RFC3339
+            containers, NOT UTC instants. Display them without timezone conversion.
+            A floating 09:00 remains 09:00 after travel. Never true for all-day dates.
         location:
           type: string
         my_response:
@@ -1572,6 +1585,20 @@ components:
           format: date-time
         all_day:
           type: boolean
+        time_zone:
+          type: string
+          description: IANA start timezone. Omission preserves stored metadata on update; empty explicitly selects UTC.
+        end_time_zone:
+          type: string
+          description: IANA end timezone. Omission preserves stored metadata; empty inherits time_zone.
+        floating:
+          type: boolean
+          description: >-
+            Omission preserves the stored kind on update; defaults to false on
+            create. When true, start/end must be zero-offset civil clock containers
+            and both timezone names must be empty. All-day dates cannot be floating
+            or zoned. Floating events are local-only: Graph/Google uploads are refused
+            rather than silently converted into fixed instants.
         location:
           type: string
         description:

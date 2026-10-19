@@ -557,6 +557,10 @@ type googleEvent struct {
 // or end timestamp is missing or unparseable — cancelled tombstones, which
 // carry no times at all, are filtered by the callers before mapping.
 func (c *Client) eventFromGoogle(g googleEvent) (calendar.Event, bool) {
+	if err := validateGoogleZones(g); err != nil {
+		slog.Warn("Unsupported event timezone", "module", "GOOGLECAL", "id", g.ID, "err", err)
+		return calendar.Event{}, false
+	}
 	start, allDay, err := parseGoogleTime(g.Start)
 	if err != nil {
 		slog.Warn("Skipping event with unparseable start", "module", "GOOGLECAL",
@@ -617,7 +621,28 @@ func (c *Client) eventFromGoogle(g googleEvent) (calendar.Event, bool) {
 		eventType = "occurrence"
 	}
 
-	recurrence, exDates, opaqueRecurrence := recurrenceFromGoogle(g.Recurrence, start, g.ID)
+	startZone, endZone := "", ""
+	recurrenceStart := start
+	if !allDay {
+		startZone, _ = googleZone(g.Start.TimeZone)
+		endZone, _ = googleZone(g.End.TimeZone)
+		if g.End.TimeZone == "" {
+			endZone = startZone
+		}
+		loc, _ := time.LoadLocation(startZone)
+		recurrenceStart = start.In(loc)
+	}
+	recurrence, exDates, opaqueRecurrence := recurrenceFromGoogle(g.Recurrence, recurrenceStart, g.ID)
+	if recurrence != nil && !allDay && startZone != "UTC" {
+		recurrence.Range.TimeZone = startZone
+	}
+	var bareRule string
+	for _, line := range g.Recurrence {
+		if strings.HasPrefix(line, "RRULE:") {
+			bareRule = strings.TrimPrefix(line, "RRULE:")
+			break
+		}
+	}
 
 	return calendar.Event{
 		ID:               g.ID,
@@ -627,6 +652,9 @@ func (c *Client) eventFromGoogle(g googleEvent) (calendar.Event, bool) {
 		Description:      g.Description,
 		Start:            start,
 		End:              end,
+		TimeZone:         startZone,
+		EndTimeZone:      endZone,
+		RecurrenceRule:   bareRule,
 		AllDay:           allDay,
 		LastModified:     parseGoogleTimestamp(g.Updated),
 		ETag:             g.ETag,
@@ -661,6 +689,18 @@ func parseGoogleTime(dt googleDateTime) (t time.Time, allDay bool, err error) {
 		return time.Time{}, false, errors.New("event boundary has neither date nor dateTime")
 	}
 	t, err = time.Parse(time.RFC3339, dt.DateTime)
+	if err == nil {
+		return t.UTC(), false, nil
+	}
+	if dt.TimeZone == "" {
+		return time.Time{}, false, fmt.Errorf("Google dateTime %q requires an offset or IANA timeZone", dt.DateTime)
+	}
+	zone, err := googleZone(dt.TimeZone)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	loc, _ := time.LoadLocation(zone)
+	t, err = time.ParseInLocation("2006-01-02T15:04:05", dt.DateTime, loc)
 	if err != nil {
 		return time.Time{}, false, fmt.Errorf("failed to parse google dateTime %q: %w", dt.DateTime, err)
 	}
@@ -857,6 +897,9 @@ func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]ca
 			return nil, fmt.Errorf("failed to fetch master events for %s: %w", calendarID, err)
 		}
 		for _, g := range page.Items {
+			if err := validateGoogleZones(g); err != nil {
+				return nil, fmt.Errorf("failed to read event %s: %w", g.ID, err)
+			}
 			if g.RecurringEventID != "" {
 				instances = append(instances, g)
 				continue
@@ -957,6 +1000,9 @@ func (c *Client) FetchInstances(ctx context.Context, calendarID string, from, to
 			return nil, fmt.Errorf("failed to fetch instances for %s: %w", calendarID, err)
 		}
 		for _, g := range page.Items {
+			if err := validateGoogleZones(g); err != nil {
+				return nil, fmt.Errorf("failed to read event %s: %w", g.ID, err)
+			}
 			if g.Status == "cancelled" {
 				continue
 			}

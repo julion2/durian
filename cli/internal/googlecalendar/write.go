@@ -66,7 +66,7 @@ func classifyWriteError(err error) error {
 // eventFromGoogle. All-day events use start/end date boundaries (exclusive
 // end, as the model stores); because Google rejects an all-day event whose
 // end is not after its start, such an end date is snapped to start + 1 day.
-// Timed events are written as RFC3339 UTC dateTimes with timeZone "UTC". The
+// Timed events retain their IANA zones and RFC3339 offsets. The
 // recurrence key is always present — the RRULE line of a series, or an empty
 // list so a PATCH clears the recurrence when the local file dropped its
 // RRULE.
@@ -78,6 +78,11 @@ func classifyWriteError(err error) error {
 // emitted here (RSVPs go through RespondToEvent; Meet conferences are
 // requested by CreateEvent via extra keys when the engine asks for one).
 func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
+	// Preserve the map-only helper API; public write boundaries return the
+	// validation error before authentication or any network request.
+	if validateWriteEvent(ev) != nil {
+		return nil
+	}
 	var start, end map[string]string
 	if ev.AllDay {
 		startDay := calendar.DateOnly(ev.Start)
@@ -88,13 +93,21 @@ func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
 		start = map[string]string{"date": startDay.Format(calendar.GraphDateFormat)}
 		end = map[string]string{"date": endDay.Format(calendar.GraphDateFormat)}
 	} else {
+		startZone, _ := googleZone(ev.TimeZone)
+		endZone := ev.EndTimeZone
+		if endZone == "" {
+			endZone = startZone
+		}
+		endZone, _ = googleZone(endZone)
+		startLoc, _ := time.LoadLocation(startZone)
+		endLoc, _ := time.LoadLocation(endZone)
 		start = map[string]string{
-			"dateTime": ev.Start.UTC().Format(time.RFC3339),
-			"timeZone": "UTC",
+			"dateTime": ev.Start.In(startLoc).Format(time.RFC3339Nano),
+			"timeZone": startZone,
 		}
 		end = map[string]string{
-			"dateTime": ev.End.UTC().Format(time.RFC3339),
-			"timeZone": "UTC",
+			"dateTime": ev.End.In(endLoc).Format(time.RFC3339Nano),
+			"timeZone": endZone,
 		}
 	}
 
@@ -112,7 +125,7 @@ func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
 		slog.Warn("Omitting recurrence from upload: remote rule is not representable",
 			"module", "GOOGLECAL", "id", ev.ID, "uid", ev.ICalUID)
 	} else {
-		body["recurrence"] = recurrenceToGoogle(ev.Recurrence, ev.ExceptionDates, ev.AllDay, ev.ID)
+		body["recurrence"] = recurrenceToGoogleWithRule(ev.Recurrence, ev.ExceptionDates, ev.AllDay, ev.ID, ev.RecurrenceRule)
 	}
 	if includeAttendees {
 		body["attendees"] = attendeesToGoogle(ev.Attendees)
@@ -135,17 +148,23 @@ func eventToGoogle(ev calendar.Event, includeAttendees bool) map[string]any {
 // Callers must not reach here for an event whose remote rule durian failed to
 // parse — see eventToGoogleBody, which omits the field entirely in that case.
 func recurrenceToGoogle(rec *calendar.Recurrence, exDates []time.Time, allDay bool, id string) []string {
-	if rec == nil {
-		return []string{}
-	}
-	opt, err := calendar.RecurrenceToROption(*rec)
-	if err != nil {
-		slog.Warn("Dropping unmappable recurrence from upload", "module", "GOOGLECAL",
-			"id", id, "pattern", rec.Pattern.Type, "err", err)
-		return []string{}
-	}
+	return recurrenceToGoogleWithRule(rec, exDates, allDay, id, "")
+}
 
-	lines := []string{"RRULE:" + opt.RRuleString()}
+func recurrenceToGoogleWithRule(rec *calendar.Recurrence, exDates []time.Time, allDay bool, id, bareRule string) []string {
+	if bareRule == "" {
+		if rec == nil {
+			return []string{}
+		}
+		opt, err := calendar.RecurrenceToROption(*rec)
+		if err != nil {
+			slog.Warn("Dropping unmappable recurrence from upload", "module", "GOOGLECAL",
+				"id", id, "pattern", rec.Pattern.Type, "err", err)
+			return []string{}
+		}
+		bareRule = opt.RRuleString()
+	}
+	lines := []string{"RRULE:" + bareRule}
 	for _, d := range exDates {
 		// An all-day series takes date-valued EXDATEs; a UTC DATE-TIME EXDATE
 		// would not line up with the series' midnight-local occurrences and
@@ -267,6 +286,9 @@ func conferenceRequestID(eventID string) string {
 // answers 409 — folded into fetching the already-created event instead of
 // creating a duplicate (or sending a second invitation wave).
 func (c *Client) CreateEvent(ctx context.Context, calendarID string, ev calendar.Event, opts calendarsync.CreateOptions) (calendar.Event, error) {
+	if err := validateWriteEvent(ev); err != nil {
+		return calendar.Event{}, fmt.Errorf("failed to create event in calendar %s: %w", calendarID, err)
+	}
 	body := eventToGoogle(ev, opts.IncludeAttendees)
 	eventID := ""
 	if opts.IdempotencyKey != "" {
@@ -314,6 +336,9 @@ func (c *Client) CreateEvent(ctx context.Context, calendarID string, ev calendar
 // Google notifies only the added/removed attendees; otherwise the full body
 // is sent (attendees included only when spec.IncludeAttendees).
 func (c *Client) UpdateEvent(ctx context.Context, calendarID, eventID string, spec calendarsync.UpdateSpec) error {
+	if err := validateWriteEvent(spec.Event); err != nil {
+		return fmt.Errorf("failed to update event %s: %w", eventID, err)
+	}
 	var body map[string]any
 	if spec.AttendeesOnly {
 		body = map[string]any{"attendees": attendeesToGoogle(spec.Event.Attendees)}

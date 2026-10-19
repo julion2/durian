@@ -10,6 +10,7 @@
 package calendarsync_test
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -36,6 +37,92 @@ func shiftMeetingHour(m map[string]any) map[string]any {
 func shiftLocalHour(ev *Event) {
 	ev.Start = ev.Start.Add(time.Hour)
 	ev.End = ev.End.Add(time.Hour)
+}
+
+func TestLegacyTimezoneUpgradeKeepsPendingEdits(t *testing.T) {
+	for _, tc := range []struct {
+		name                                  string
+		localEdit, remoteResponse, remoteEdit bool
+		want                                  ActionKind
+		readBackFails                         bool
+	}{
+		{"unchanged", false, false, false, ActionDownloadUpdate, false},
+		{"local edit", true, false, false, ActionUploadUpdate, false},
+		{"local edit and RSVP", true, true, false, ActionUploadUpdate, false},
+		{"real conflict", true, false, true, ActionConflict, false},
+		{"lost read-back", true, false, false, ActionUploadUpdate, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newSyncHarness(t)
+			h.events = []map[string]any{aliceMeeting("old", "Original", "notResponded")}
+			h.sync(SyncOptions{})
+			st := h.status.Items["uid-1"]
+			st.TimeVersion = 0 // Existing UTC-only file and hash, before this upgrade.
+			h.status.Items["uid-1"] = st
+			if tc.localEdit {
+				h.rewriteLocal("uid-1", func(e *Event) { e.Subject = "Local edit" })
+			}
+			response := "notResponded"
+			if tc.remoteResponse {
+				response = "accepted"
+			}
+			remote := aliceMeeting("new-reader", "Original", response)
+			remote["originalStartTimeZone"], remote["originalEndTimeZone"] = "W. Europe Standard Time", "W. Europe Standard Time"
+			if tc.remoteEdit {
+				remote["subject"] = "Remote edit"
+			}
+			h.events = []map[string]any{remote}
+			plan := h.plan()
+			if len(plan.Actions) != 1 || plan.Actions[0].Kind != tc.want {
+				t.Fatalf("plan = %+v, want %s", plan.Actions, tc.want)
+			}
+			if tc.want == ActionConflict {
+				return
+			}
+			if tc.localEdit {
+				if plan.Actions[0].LocalEvent.Subject != "Local edit" || plan.Actions[0].LocalEvent.TimeZone != "Europe/Berlin" {
+					t.Fatalf("lost pending edit/zone: %+v", plan.Actions[0].LocalEvent)
+				}
+				remote["subject"] = "Local edit"
+				h.getResponses = map[string]map[string]any{"g1": remote}
+				h.patchResponses = map[string]map[string]any{"g1": {"id": "g1", "changeKey": "settled"}}
+			}
+			if tc.readBackFails {
+				h.getResponses = nil
+			}
+			// Keep the planned remote content while applying; read-back returns settled.
+			stats, err := Apply(context.Background(), h.client, plan, &h.status, SyncOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.readBackFails {
+				h.events = []map[string]any{remote}
+				h.getResponses = map[string]map[string]any{"g1": remote}
+				stats = h.sync(SyncOptions{})
+				if stats.Downloaded != 1 || stats.Uploaded != 0 {
+					t.Fatalf("lost read-back must recover metadata without another upload: %+v", stats)
+				}
+			}
+			if stats.Conflicts != 0 || h.status.Items["uid-1"].TimeVersion != 1 {
+				t.Fatalf("upgrade = %+v / %+v", stats, h.status.Items["uid-1"])
+			}
+			data, err := os.ReadFile(h.icsPath("uid-1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			e, err := ICalToEvent(data, testOwnerEmail)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if e.TimeZone != "Europe/Berlin" || (tc.localEdit && e.Subject != "Local edit") {
+				t.Fatalf("settled local event = %+v", e)
+			}
+			h.events = []map[string]any{remote}
+			if got := h.sync(SyncOptions{}); got != (SyncStats{}) {
+				t.Fatalf("next sync not a no-op: %+v", got)
+			}
+		})
+	}
 }
 
 // stripCoreHash blanks every CoreHash in the harness status, simulating a

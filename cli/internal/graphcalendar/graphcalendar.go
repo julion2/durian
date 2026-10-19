@@ -47,7 +47,7 @@ const (
 
 	// eventSelect is the field set requested on calendarView queries: just what
 	// the .ics writer needs.
-	eventSelect = "id,iCalUId,subject,start,end,isAllDay,location,bodyPreview,lastModifiedDateTime"
+	eventSelect = "id,iCalUId,subject,start,end,isAllDay,location,bodyPreview,lastModifiedDateTime,originalStartTimeZone,originalEndTimeZone"
 
 	// masterEventSelect is the field set requested on /events queries (master
 	// events for two-way sync): eventSelect plus the full body, the recurrence
@@ -58,10 +58,9 @@ const (
 	// date it replaces.
 	masterEventSelect = "id,iCalUId,subject,body,bodyPreview,start,end,isAllDay,location,recurrence,type,changeKey,lastModifiedDateTime," +
 		"attendees,organizer,responseStatus,isOnlineMeeting,onlineMeeting,onlineMeetingUrl,isCancelled,isOrganizer," +
-		"seriesMasterId,originalStart"
+		"seriesMasterId,originalStart,originalStartTimeZone,originalEndTimeZone"
 
-	// preferUTC asks Graph to return event start/end dateTimes in UTC, so
-	// parsing never has to interpret Windows timezone names.
+	// preferUTC separates resolved instants from original*TimeZone identities.
 	preferUTC = `outlook.timezone="UTC"`
 
 	// preferMaster is the Prefer header for the two-way sync read/write paths:
@@ -539,8 +538,10 @@ type graphEvent struct {
 	// OriginalStart is the start the occurrence was scheduled for before it
 	// was modified — the RECURRENCE-ID equivalent. Unlike start it does not
 	// move with the exception, which is what makes it the stable key.
-	OriginalStart string `json:"originalStart"`
-	Attendees     []struct {
+	OriginalStart         string `json:"originalStart"`
+	OriginalStartTimeZone string `json:"originalStartTimeZone"`
+	OriginalEndTimeZone   string `json:"originalEndTimeZone"`
+	Attendees             []struct {
 		Type         string              `json:"type"`
 		Status       graphResponseStatus `json:"status"`
 		EmailAddress graphEmailAddress   `json:"emailAddress"`
@@ -566,17 +567,30 @@ type graphEvent struct {
 // delivered a plain-text body, falling back to bodyPreview (always the case
 // for calendarView queries, which do not select body).
 func eventFromGraph(ge graphEvent) (calendar.Event, bool) {
-	start, err := parseGraphDateTime(ge.Start.DateTime)
+	startZone, endZone, recurrence, err := graphEventZones(ge)
+	if err != nil {
+		slog.Warn("Unsupported event timezone", "module", "GRAPHCAL", "id", ge.ID, "err", err)
+		return calendar.Event{}, false
+	}
+	start, err := parseGraphBoundary(ge.Start)
 	if err != nil {
 		slog.Warn("Skipping event with unparseable start", "module", "GRAPHCAL",
 			"id", ge.ID, "value", ge.Start.DateTime, "err", err)
 		return calendar.Event{}, false
 	}
-	end, err := parseGraphDateTime(ge.End.DateTime)
+	end, err := parseGraphBoundary(ge.End)
 	if err != nil {
 		slog.Warn("Skipping event with unparseable end", "module", "GRAPHCAL",
 			"id", ge.ID, "value", ge.End.DateTime, "err", err)
 		return calendar.Event{}, false
+	}
+
+	if ge.IsAllDay {
+		startLoc, _ := time.LoadLocation(startZone)
+		endLoc, _ := time.LoadLocation(endZone)
+		start = civilDate(start.In(startLoc))
+		end = civilDate(end.In(endLoc))
+		startZone, endZone = "", ""
 	}
 
 	description := ge.BodyPreview
@@ -610,11 +624,13 @@ func eventFromGraph(ge graphEvent) (calendar.Event, bool) {
 		Description:  description,
 		Start:        start,
 		End:          end,
+		TimeZone:     startZone,
+		EndTimeZone:  endZone,
 		AllDay:       ge.IsAllDay,
 		LastModified: parseGraphTimestamp(ge.LastModifiedDateTime),
 		ETag:         ge.ChangeKey,
 		Type:         ge.Type,
-		Recurrence:   ge.Recurrence,
+		Recurrence:   recurrence,
 
 		Attendees:        attendees,
 		Organizer:        organizer,
@@ -653,6 +669,9 @@ func (c *Client) FetchEvents(ctx context.Context, calendarID string, from, to ti
 			return nil, fmt.Errorf("failed to fetch calendar view for %s: %w", calendarID, err)
 		}
 		for _, ge := range page.Value {
+			if _, _, _, err := graphEventZones(ge); err != nil {
+				return nil, fmt.Errorf("failed to read event %s: %w", ge.ID, err)
+			}
 			if ev, ok := eventFromGraph(ge); ok {
 				events = append(events, ev)
 			}
@@ -716,6 +735,11 @@ func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]ca
 			return nil, fmt.Errorf("failed to fetch master events for %s: %w", calendarID, err)
 		}
 		for _, ge := range page.Value {
+			// Fail the entire snapshot rather than omit an existing event and
+			// let sync mistake an unsupported custom zone for a remote deletion.
+			if _, _, _, err := graphEventZones(ge); err != nil {
+				return nil, fmt.Errorf("failed to read event %s: %w", ge.ID, err)
+			}
 			switch ge.Type {
 			case "singleInstance", "seriesMaster":
 				if ev, ok := eventFromGraph(ge); ok {
@@ -766,6 +790,11 @@ func attachExceptions(events []calendar.Event, byID map[string]int, exceptions [
 		ev, ok := eventFromGraph(ge)
 		if !ok {
 			continue
+		}
+		if events[idx].AllDay {
+			zone, _, _, _ := graphEventZones(ge)
+			loc, _ := time.LoadLocation(zone)
+			original = civilDate(original.In(loc))
 		}
 		ev.RecurrenceID = original
 		// An override is a deviation, never a series of its own.
@@ -837,14 +866,26 @@ func ParseEventJSON(data []byte) (calendar.Event, bool) {
 // time.Parse accepts the fractional seconds of the bare form even though the
 // layout does not mention them.
 func parseGraphDateTime(s string) (time.Time, error) {
+	return parseGraphBoundary(graphDateTime{DateTime: s, TimeZone: "UTC"})
+}
+
+// Offsets define the instant even when the sibling zone disagrees. With the
+// UTC preference the sibling is UTC, NOT the original event's timezone.
+func parseGraphBoundary(dt graphDateTime) (time.Time, error) {
+	s := dt.DateTime
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
 		return t.UTC(), nil
 	}
-	t, err := time.ParseInLocation("2006-01-02T15:04:05", s, time.UTC)
+	zone, err := ianaZone(dt.TimeZone)
+	if err != nil {
+		return time.Time{}, err
+	}
+	loc, _ := time.LoadLocation(zone)
+	t, err := time.ParseInLocation("2006-01-02T15:04:05", s, loc)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to parse graph dateTime %q: %w", s, err)
 	}
-	return t, nil
+	return t.UTC(), nil
 }
 
 // parseGraphTimestamp parses an RFC3339 Graph timestamp (e.g.

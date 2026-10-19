@@ -13,7 +13,7 @@
 //	absoluteYearly   -> FREQ=YEARLY;BYMONTH=<month>;BYMONTHDAY=<dayOfMonth>
 //	relativeYearly   -> FREQ=YEARLY;BYMONTH=<month>;BYDAY=<daysOfWeek>;BYSETPOS=<index> (best effort)
 //
-// with INTERVAL when > 1, and range endDate -> UNTIL (end of day UTC),
+// with INTERVAL when > 1, and range endDate -> UNTIL (end of day in the range zone),
 // numbered -> COUNT, noEnd -> neither. The relative patterns map the Graph
 // index (first..fourth, last) to BYSETPOS 1..4 / -1; an unmappable pattern
 // yields no RRULE plus a warning rather than a wrong rule. The parse
@@ -58,9 +58,9 @@ const GraphDateFormat = "2006-01-02"
 
 // MARK: - Serialize
 
-// EventToICal renders one event as a VCALENDAR with a single VEVENT using
-// go-ical (CRLF output). Timed events are written as UTC date-times, all-day
-// events as VALUE=DATE with Graph's exclusive DTEND kept as-is. A seriesMaster
+// EventToICal renders one event as a VCALENDAR using go-ical (CRLF output).
+// Timed events retain their TZID or floating clock; all-day events use
+// VALUE=DATE with Graph's exclusive DTEND kept as-is. A seriesMaster
 // Recurrence becomes an RRULE per the mapping documented in the file header;
 // an unmappable recurrence is dropped with a warning so the event itself still
 // round-trips.
@@ -75,6 +75,9 @@ const GraphDateFormat = "2006-01-02"
 // reaches the first sync; it is one-shot because the post-create read-back
 // rewrites the file from the settled remote event, which carries no marker.
 func EventToICal(e Event) ([]byte, error) {
+	if err := e.ValidateTimeZones(); err != nil {
+		return nil, err
+	}
 	uid := e.ICalUID
 	if uid == "" {
 		uid = e.ID
@@ -89,13 +92,9 @@ func EventToICal(e Event) ([]byte, error) {
 	// line) keeps the output stable under reordering and is what go-ical's own
 	// rule-set reader expects.
 	for _, d := range sortedTimes(e.ExceptionDates) {
-		exdate := ical.NewProp(ical.PropExceptionDates)
-		if e.AllDay {
-			exdate.SetValueType(ical.ValueDate)
-			exdate.Value = d.UTC().Format("20060102")
-		} else {
-			exdate.SetValueType(ical.ValueDateTime)
-			exdate.Value = d.UTC().Format("20060102T150405Z")
+		exdate, err := timeProp(ical.PropExceptionDates, d, e.AllDay, e.Floating, e.TimeZone)
+		if err != nil {
+			return nil, err
 		}
 		master.Props.Add(exdate)
 	}
@@ -129,13 +128,9 @@ func EventToICal(e Event) ([]byte, error) {
 		// timed occurrence that was turned into an all-day one — the key would
 		// come back as midnight, match no occurrence, and leave the series
 		// rendering both the original and the override.
-		recID := ical.NewProp(ical.PropRecurrenceID)
-		if e.AllDay {
-			recID.SetValueType(ical.ValueDate)
-			recID.Value = o.RecurrenceID.UTC().Format("20060102")
-		} else {
-			recID.SetValueType(ical.ValueDateTime)
-			recID.Value = o.RecurrenceID.UTC().Format("20060102T150405Z")
+		recID, err := timeProp(ical.PropRecurrenceID, o.RecurrenceID, e.AllDay, e.Floating, e.TimeZone)
+		if err != nil {
+			return nil, err
 		}
 		comp.Props.Set(recID)
 		cal.Children = append(cal.Children, comp.Component)
@@ -169,6 +164,9 @@ func sortedOverrides(overrides []Event) []Event {
 // except the series-level EXDATE lines and the override-level RECURRENCE-ID,
 // which EventToICal adds around it.
 func eventComponent(e Event, uid string) (*ical.Event, error) {
+	if err := e.ValidateTimeZones(); err != nil {
+		return nil, err
+	}
 	stamp := e.LastModified
 	if stamp.IsZero() {
 		stamp = time.Now()
@@ -189,12 +187,21 @@ func eventComponent(e Event, uid string) (*ical.Event, error) {
 	if e.Description != "" {
 		ev.Props.SetText(ical.PropDescription, NormalizeText(e.Description))
 	}
-	if e.AllDay {
-		ev.Props.SetDate(ical.PropDateTimeStart, e.Start.UTC())
-		ev.Props.SetDate(ical.PropDateTimeEnd, e.End.UTC())
-	} else {
-		ev.Props.SetDateTime(ical.PropDateTimeStart, e.Start.UTC())
-		ev.Props.SetDateTime(ical.PropDateTimeEnd, e.End.UTC())
+	for _, endpoint := range []struct {
+		name, zone, companion string
+		t                     time.Time
+	}{
+		{ical.PropDateTimeStart, e.TimeZone, "X-DURIAN-START-TZID", e.Start},
+		{ical.PropDateTimeEnd, e.endZone(), "X-DURIAN-END-TZID", e.End},
+	} {
+		prop, err := timeProp(endpoint.name, endpoint.t, e.AllDay, e.Floating, endpoint.zone)
+		if err != nil {
+			return nil, err
+		}
+		ev.Props.Set(prop)
+		if !e.AllDay && !e.Floating && endpoint.zone != "" && endpoint.zone != "UTC" && prop.Params.Get(ical.ParamTimezoneID) == "" {
+			ev.Props.SetText(endpoint.companion, endpoint.zone)
+		}
 	}
 	// A recurrence that cannot be rendered as an RRULE leaves the file without
 	// one, and a file without an RRULE parses back as "not a series" — which
@@ -202,14 +209,28 @@ func eventComponent(e Event, uid string) (*ical.Event, error) {
 	// the write paths know the difference between "no rule" and "a rule this
 	// document could not hold".
 	opaque := e.OpaqueRecurrence
-	if e.Recurrence != nil {
-		opt, err := RecurrenceToROption(*e.Recurrence)
+	if e.RecurrenceRule != "" {
+		prop := ical.NewProp(ical.PropRecurrenceRule)
+		prop.Value = e.RecurrenceRule
+		ev.Props.Set(prop)
+	} else if e.Recurrence != nil {
+		opt, err := recurrenceOptions(e)
 		if err != nil {
 			slog.Warn("Recurrence not representable as RRULE, marking event opaque",
 				"module", "CALENDAR", "id", e.ID, "pattern", e.Recurrence.Pattern.Type, "err", err)
 			opaque = true
 		} else {
-			ev.Props.SetRecurrenceRule(opt)
+			prop := ical.NewProp(ical.PropRecurrenceRule)
+			prop.Value = opt.RRuleString()
+			// RFC 5545 requires UNTIL to match the DTSTART value type.
+			if !opt.Until.IsZero() && (e.Floating || e.AllDay) {
+				layout := "20060102T150405"
+				if e.AllDay {
+					layout = "20060102"
+				}
+				prop.Value = strings.Replace(prop.Value, opt.Until.UTC().Format("20060102T150405Z"), opt.Until.UTC().Format(layout), 1)
+			}
+			ev.Props.Set(prop)
 		}
 	}
 
@@ -322,8 +343,8 @@ func AttendeePartStat(response string) string {
 // MARK: - Parse
 
 // ICalToEvent parses a VCALENDAR (the inverse of EventToICal) into an Event. A
-// VALUE=DATE DTSTART marks the event all-day; all times are interpreted in
-// UTC. An RRULE is mapped back into a Graph Recurrence; an RRULE outside the
+// VALUE=DATE DTSTART marks the event all-day; TZIDs and floating clocks are
+// retained. An RRULE is mapped back into a Graph Recurrence; an RRULE outside the
 // supported mapping leaves Recurrence nil with a warning. ID/ETag/Type are not
 // part of the iCal representation and stay empty.
 //
@@ -378,7 +399,10 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 		return Event{}, err
 	}
 	for _, prop := range master.Props.Values(ical.PropExceptionDates) {
-		loc := propLocation(&prop, event.ICalUID)
+		loc, err := loadZone(prop.Params.Get(ical.ParamTimezoneID))
+		if err != nil {
+			return Event{}, err
+		}
 		for _, instant := range strings.Split(prop.Value, ",") {
 			t, err := parseICalInstantIn(strings.TrimSpace(instant), loc)
 			if err != nil {
@@ -395,7 +419,11 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 			return Event{}, err
 		}
 		prop := comp.Props.Get(ical.PropRecurrenceID)
-		recID, err := parseICalInstantIn(strings.TrimSpace(prop.Value), propLocation(prop, event.ICalUID))
+		loc, err := loadZone(prop.Params.Get(ical.ParamTimezoneID))
+		if err != nil {
+			return Event{}, err
+		}
+		recID, err := parseICalInstantIn(strings.TrimSpace(prop.Value), loc)
 		if err != nil {
 			slog.Warn("Ignoring override with unparseable RECURRENCE-ID", "module", "CALENDAR",
 				"uid", event.ICalUID, "value", prop.Value, "err", err)
@@ -407,30 +435,6 @@ func ICalToEvent(data []byte, accountEmail string) (Event, error) {
 	event.ExceptionDates = sortedTimes(event.ExceptionDates)
 	event.Overrides = sortedOverrides(event.Overrides)
 	return event, nil
-}
-
-// propLocation resolves the TZID parameter of an EXDATE/RECURRENCE-ID property
-// to a location, falling back to UTC when the property names no zone or names
-// one this system does not know.
-//
-// durian writes these properties in UTC, but the vdir is a shared surface: a
-// file written by khal or another CalDAV client states the zone the series
-// lives in and a floating local time next to it. Reading "20260817T090000"
-// as UTC then places the exception a whole offset away from the occurrence it
-// cancels — the cancellation silently misses, and on the next upload the
-// wrong date is cancelled on the server instead.
-func propLocation(prop *ical.Prop, uid string) *time.Location {
-	tzid := prop.Params.Get(ical.ParamTimezoneID)
-	if tzid == "" {
-		return time.UTC
-	}
-	loc, err := time.LoadLocation(tzid)
-	if err != nil {
-		slog.Warn("Unknown TZID, reading the value as UTC", "module", "CALENDAR",
-			"uid", uid, "tzid", tzid, "err", err)
-		return time.UTC
-	}
-	return loc
 }
 
 // parseICalInstant parses an EXDATE/RECURRENCE-ID value in either the DATE
@@ -453,8 +457,9 @@ func parseICalInstantIn(s string, loc *time.Location) (time.Time, error) {
 	if t, err := time.ParseInLocation("20060102T150405Z", s, time.UTC); err == nil {
 		return t.UTC(), nil
 	}
-	if t, err := time.ParseInLocation("20060102T150405", s, loc); err == nil {
-		return t.UTC(), nil
+	if t, err := time.ParseInLocation("20060102T150405", s, time.UTC); err == nil {
+		resolved, _ := resolveCivil(t, loc)
+		return resolved.UTC(), nil
 	}
 	if t, err := time.ParseInLocation("20060102", s, time.UTC); err == nil {
 		return t.UTC(), nil
@@ -471,8 +476,8 @@ func parseICalInstantIn(s string, loc *time.Location) (time.Time, error) {
 // the series' own zone while the rest of durian's model is UTC: reading
 // "20260817T090000" as UTC would place the exception an offset away from the
 // occurrence it is meant to cancel, and the cancellation would silently miss.
-// An unknown zone falls back to UTC with a warning rather than dropping the
-// line — a mistimed exception is recoverable, a lost one is not.
+// Unknown zones return an error: neither dropping the cancellation nor
+// silently moving it to a different instant is safe.
 func ParseExDateLine(line string) ([]time.Time, error) {
 	_, params, value, ok := splitContentLine(line)
 	if !ok {
@@ -481,11 +486,10 @@ func ParseExDateLine(line string) ([]time.Time, error) {
 
 	loc := time.UTC
 	if tzid := params["TZID"]; tzid != "" {
-		if l, err := time.LoadLocation(tzid); err == nil {
+		if l, err := loadZone(tzid); err == nil {
 			loc = l
 		} else {
-			slog.Warn("Unknown EXDATE TZID, reading the value as UTC", "module", "CALENDAR",
-				"tzid", tzid, "err", err)
+			return nil, err
 		}
 	}
 
@@ -568,7 +572,7 @@ func eventFromComponent(ev *ical.Event, accountEmail string) (Event, error) {
 		return Event{}, fmt.Errorf("failed to parse iCal: VEVENT has no DTSTART")
 	}
 	allDay := startProp.ValueType() == ical.ValueDate
-	start, err := startProp.DateTime(time.UTC)
+	start, startZone, floating, err := readTimeProperty(startProp)
 	if err != nil {
 		return Event{}, fmt.Errorf("failed to parse iCal DTSTART: %w", err)
 	}
@@ -577,15 +581,55 @@ func eventFromComponent(ev *ical.Event, accountEmail string) (Event, error) {
 	if err != nil {
 		return Event{}, fmt.Errorf("failed to parse iCal DTEND: %w", err)
 	}
+	endZone := startZone
+	if endProp := ev.Props.Get(ical.PropDateTimeEnd); endProp != nil {
+		var endFloating bool
+		end, endZone, endFloating, err = readTimeProperty(endProp)
+		if err != nil {
+			return Event{}, fmt.Errorf("failed to parse iCal DTEND: %w", err)
+		}
+		if endFloating != floating || (endProp.ValueType() == ical.ValueDate) != allDay {
+			return Event{}, fmt.Errorf("DTSTART and DTEND must use matching date/floating kinds")
+		}
+	} else if original, err := startProp.DateTime(time.UTC); err == nil {
+		end = start.Add(end.Sub(original))
+	}
+	for _, endpoint := range []struct {
+		name string
+		zone *string
+	}{
+		{"X-DURIAN-START-TZID", &startZone}, {"X-DURIAN-END-TZID", &endZone},
+	} {
+		if prop := ev.Props.Get(endpoint.name); prop != nil && !allDay && !floating {
+			if _, err := loadZone(prop.Value); err != nil {
+				return Event{}, err
+			}
+			*endpoint.zone = prop.Value
+		}
+	}
+	loc, err := loadZone(startZone)
+	if err != nil {
+		return Event{}, err
+	}
+	start = start.In(loc)
+	if endZone == startZone {
+		endZone = ""
+	} else if endZone == "" {
+		endZone = "UTC" // Empty would inherit the non-UTC start zone on write.
+	}
 	lastModified, err := ev.Props.DateTime(ical.PropLastModified, time.UTC)
 	if err != nil {
 		return Event{}, fmt.Errorf("failed to parse iCal LAST-MODIFIED: %w", err)
 	}
 
 	var recurrence *Recurrence
-	if opt, err := ev.Props.RecurrenceRule(); err != nil {
-		slog.Warn("Ignoring unparseable RRULE", "module", "GRAPHCAL", "uid", uid, "err", err)
-	} else if opt != nil {
+	rawRule := ""
+	if prop := ev.Props.Get(ical.PropRecurrenceRule); prop != nil {
+		rawRule = prop.Value
+		opt, err := rrule.StrToROptionInLocation(rawRule, loc)
+		if err != nil {
+			return Event{}, fmt.Errorf("failed to parse RRULE: %w", err)
+		}
 		recurrence, err = ROptionToRecurrence(opt, start)
 		if err != nil {
 			slog.Warn("Ignoring unmappable RRULE", "module", "GRAPHCAL", "uid", uid, "err", err)
@@ -664,15 +708,19 @@ func eventFromComponent(ev *ical.Event, accountEmail string) (Event, error) {
 	}
 
 	return Event{
-		ICalUID:      uid,
-		Subject:      subject,
-		Location:     location,
-		Description:  description,
-		Start:        start.UTC(),
-		End:          end.UTC(),
-		AllDay:       allDay,
-		LastModified: lastModified.UTC(),
-		Recurrence:   recurrence,
+		ICalUID:        uid,
+		Subject:        subject,
+		Location:       location,
+		Description:    description,
+		Start:          start.UTC(),
+		End:            end.UTC(),
+		AllDay:         allDay,
+		TimeZone:       startZone,
+		EndTimeZone:    endZone,
+		Floating:       floating,
+		RecurrenceRule: rawRule,
+		LastModified:   lastModified.UTC(),
+		Recurrence:     recurrence,
 
 		OpaqueRecurrence:     opaqueRecurrence,
 		Attendees:            attendees,
@@ -798,13 +846,17 @@ func RecurrenceToROption(rec Recurrence) (*rrule.ROption, error) {
 
 	switch rec.Range.Type {
 	case "endDate":
-		endDate, err := time.ParseInLocation(GraphDateFormat, rec.Range.EndDate, time.UTC)
+		loc, err := loadZone(rec.Range.TimeZone)
+		if err != nil {
+			return nil, err
+		}
+		endDate, err := time.ParseInLocation(GraphDateFormat, rec.Range.EndDate, loc)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse recurrence end date %q: %w", rec.Range.EndDate, err)
 		}
 		// Graph's endDate is the inclusive last day; UNTIL is an inclusive
 		// instant, so use the end of that day to cover timed occurrences.
-		opt.Until = endDate.Add(24*time.Hour - time.Second)
+		opt.Until = endDate.AddDate(0, 0, 1).Add(-time.Second)
 	case "numbered":
 		opt.Count = rec.Range.NumberOfOccurrences
 	case "noEnd", "":
@@ -918,14 +970,17 @@ func ROptionToRecurrence(opt *rrule.ROption, start time.Time) (*Recurrence, erro
 		return nil, fmt.Errorf("unsupported rrule with both UNTIL and COUNT")
 	case !opt.Until.IsZero():
 		rec.Range.Type = "endDate"
-		rec.Range.EndDate = opt.Until.UTC().Format(GraphDateFormat)
+		rec.Range.EndDate = opt.Until.In(start.Location()).Format(GraphDateFormat)
 	case opt.Count > 0:
 		rec.Range.Type = "numbered"
 		rec.Range.NumberOfOccurrences = opt.Count
 	default:
 		rec.Range.Type = "noEnd"
 	}
-	rec.Range.StartDate = start.UTC().Format(GraphDateFormat)
+	rec.Range.StartDate = start.Format(GraphDateFormat)
+	if start.Location() != time.UTC {
+		rec.Range.TimeZone = start.Location().String()
+	}
 
 	return rec, nil
 }

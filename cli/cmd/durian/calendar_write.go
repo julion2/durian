@@ -320,11 +320,15 @@ func applyCalendarModify(event calendar.Event, opts calendarModifyOptions,
 	}
 
 	if event.AllDay {
+		event.TimeZone, event.EndTimeZone, event.Floating = "", "", false
 		event.Start = calendar.DateOnly(event.Start)
 		event.End = calendar.DateOnly(event.End)
 		if !event.End.After(event.Start) {
 			event.End = event.Start.AddDate(0, 0, 1)
 		}
+	}
+	if event.Floating {
+		event.Start, event.End = calendar.CivilTime(event.Start), calendar.CivilTime(event.End)
 	}
 	if !event.End.After(event.Start) {
 		return event, fmt.Errorf("end %s is not after start %s",

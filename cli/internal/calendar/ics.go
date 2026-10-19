@@ -46,6 +46,10 @@ func EventToICS(e Event, prodID string) string {
 		lines = append(lines,
 			"DTSTART;VALUE=DATE:"+e.Start.UTC().Format(icsDate),
 			"DTEND;VALUE=DATE:"+e.End.UTC().Format(icsDate))
+	} else if e.Floating {
+		lines = append(lines,
+			"DTSTART:"+e.Start.UTC().Format("20060102T150405"),
+			"DTEND:"+e.End.UTC().Format("20060102T150405"))
 	} else {
 		lines = append(lines,
 			"DTSTART:"+e.Start.UTC().Format(icsDateTimeUTC),

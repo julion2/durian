@@ -487,6 +487,54 @@ func TestCalendarPutValidation(t *testing.T) {
 	}
 }
 
+func TestCalendarTimezoneMetadataSurvivesLegacyEdit(t *testing.T) {
+	for _, floating := range []bool{false, true} {
+		r, dir := newCalendarHandler(t)
+		body := map[string]any{"account": "work", "calendar": "Calendar", "uid": "time-contract", "subject": "Before", "start": "2026-03-22T09:00:00Z", "end": "2026-03-22T10:17:00Z", "floating": floating}
+		if !floating {
+			body["time_zone"] = "Europe/Berlin"
+			body["end_time_zone"] = "UTC"
+		}
+		put := func(want int) {
+			t.Helper()
+			data, _ := json.Marshal(body)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", bytes.NewReader(data)))
+			if w.Code != want {
+				t.Fatalf("PUT = %d: %s", w.Code, w.Body.String())
+			}
+		}
+		put(http.StatusOK)
+		delete(body, "time_zone")
+		delete(body, "end_time_zone")
+		delete(body, "floating")
+		body["subject"] = "Legacy title edit"
+		put(http.StatusOK)
+		got := readCalendarTestEvent(t, dir, "time-contract")
+		if got.Subject != "Legacy title edit" || got.Floating != floating || (!floating && (got.TimeZone != "Europe/Berlin" || got.EndTimeZone != "UTC")) {
+			t.Fatalf("lost metadata: %+v", got)
+		}
+		var detail struct {
+			Event calendar.CalendarEvent `json:"event"`
+		}
+		if status := getJSON(t, r, "/api/v1/calendars/event?account=work&calendar=Calendar&uid=time-contract", &detail); status != 200 || detail.Event.Floating != floating || detail.Event.Start.Format(time.RFC3339) != "2026-03-22T09:00:00Z" {
+			t.Fatalf("GET = %d: %+v", status, detail)
+		}
+		before, _ := os.ReadFile(filepath.Join(dir, "time-contract.ics"))
+		for _, invalid := range []map[string]any{{"time_zone": "Unknown/Zone"}, {"floating": true, "time_zone": "Europe/Berlin"}, {"floating": true, "start": "2026-03-22T09:00:00+02:00"}} {
+			body["time_zone"], body["end_time_zone"], body["floating"], body["start"] = "", "", false, "2026-03-22T09:00:00Z"
+			for key, value := range invalid {
+				body[key] = value
+			}
+			put(http.StatusBadRequest)
+			after, _ := os.ReadFile(filepath.Join(dir, "time-contract.ics"))
+			if !bytes.Equal(before, after) {
+				t.Fatal("rejected write changed stored event")
+			}
+		}
+	}
+}
+
 func TestCalendarPutAllDaySnap(t *testing.T) {
 	// An all-day event shorter than a full day (Graph would reject it) is
 	// normalized to midnight UTC day boundaries and snapped to one day.

@@ -40,6 +40,18 @@ type Event struct {
 	AllDay       bool
 	LastModified time.Time
 
+	// TimeZone/EndTimeZone retain IANA zone identities independently of the
+	// resolved instants. Empty means UTC; an empty EndTimeZone inherits TimeZone.
+	// Floating carries civil clock values in UTC containers, NOT UTC instants.
+	// All-day events likewise carry dates, without timezone or floating metadata.
+	TimeZone    string `json:",omitempty"`
+	EndTimeZone string `json:",omitempty"`
+	Floating    bool   `json:",omitempty"`
+	// RecurrenceRule preserves the exact iCalendar rule (notably UNTIL) when
+	// one was read. Recurrence remains the provider-compatible pattern; a
+	// provider without an iCalendar rule leaves this empty.
+	RecurrenceRule string `json:",omitempty"`
+
 	// ETag is the remote etag of the event (Graph calls it changeKey); it
 	// changes on every remote modification.
 	ETag string
@@ -216,6 +228,13 @@ func CoreContentHash(e Event, ownerEmail string) string {
 	return contentHash(e, ownerEmail, false)
 }
 
+// LegacyContentHashes reproduces the pre-timezone remote/core baselines for
+// old sync state, including uploads whose metadata migration is still pending.
+func LegacyContentHashes(e Event, owner string) (full, core string) {
+	e = legacyTimeEvent(e)
+	return EventContentHash(e, owner), CoreContentHash(e, owner)
+}
+
 // contentHash is the shared deterministic serialization behind
 // EventContentHash and CoreContentHash; withResponses controls whether an
 // attendee entry carries the response ("email|type|response") or not
@@ -281,6 +300,9 @@ func contentHash(e Event, ownerEmail string, withResponses bool) string {
 	if digest := exceptionsDigest(e, ownerEmail, withResponses); digest != "" {
 		fields = append(fields, digest)
 	}
+	if temporal := temporalContent(e); temporal != "" {
+		fields = append(fields, temporal)
+	}
 
 	h := sha256.New()
 	for _, field := range fields {
@@ -332,6 +354,11 @@ func RecurrenceJSON(rec *Recurrence, id string) string {
 	if rec == nil {
 		return ""
 	}
+	copy := *rec
+	if copy.Range.TimeZone == "UTC" {
+		copy.Range.TimeZone = ""
+	}
+	rec = &copy
 	data, err := json.Marshal(rec)
 	if err != nil {
 		// Keep a deterministic fallback rather than failing the hash.
@@ -413,6 +440,7 @@ type RecurrenceRange struct {
 	StartDate           string `json:"startDate,omitempty"`
 	EndDate             string `json:"endDate,omitempty"`
 	NumberOfOccurrences int    `json:"numberOfOccurrences,omitempty"`
+	TimeZone            string `json:"recurrenceTimeZone,omitempty"`
 }
 
 // SanitizeName makes a calendar name or event id safe as a single filesystem

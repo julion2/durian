@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/julion2/durian/cli/internal/calendar"
 	"github.com/julion2/durian/cli/internal/calendarsync"
@@ -59,8 +60,8 @@ func classifyWriteError(err error) error {
 }
 
 // EventToGraphBody builds the Graph event resource JSON for a create (POST)
-// or update (PATCH) from a parsed local Event. Start/end are written as
-// zone-less UTC dateTimes with timeZone "UTC"; all-day events use the date at
+// or update (PATCH) from a parsed local Event. Start/end retain their zones
+// and instants (ambiguous DST folds are rejected); all-day events use the date at
 // 00:00:00 (Graph requires midnight boundaries together with isAllDay), and —
 // because Graph rejects an all-day event spanning less than one full day —
 // an all-day end date that is not after the start date is snapped to
@@ -76,6 +77,17 @@ func classifyWriteError(err error) error {
 // never emitted here (RSVPs go through RespondToEvent; Teams meetings are
 // requested by CreateEvent via extra keys when the engine asks for one).
 func EventToGraphBody(e calendar.Event, includeAttendees bool) map[string]any {
+	// Keep the existing map-only API. Invalid input has no body; public write
+	// operations return a contextual error before authentication or network I/O.
+	if validateWriteEvent(e) != nil {
+		return nil
+	}
+	startZone, _ := ianaZone(e.TimeZone)
+	endZone := e.EndTimeZone
+	if endZone == "" {
+		endZone = startZone
+	}
+	endZone, _ = ianaZone(endZone)
 	var startDT, endDT string
 	if e.AllDay {
 		// Midnight date boundaries; Graph rejects an all-day event shorter
@@ -89,15 +101,15 @@ func EventToGraphBody(e calendar.Event, includeAttendees bool) map[string]any {
 		startDT = startDay.Format(calendar.GraphDateFormat) + "T00:00:00"
 		endDT = endDay.Format(calendar.GraphDateFormat) + "T00:00:00"
 	} else {
-		startDT = e.Start.UTC().Format(graphWriteDateFormat)
-		endDT = e.End.UTC().Format(graphWriteDateFormat)
+		startDT = graphWriteTime(e.Start, startZone)
+		endDT = graphWriteTime(e.End, endZone)
 	}
 
 	body := map[string]any{
 		"subject":  e.Subject,
 		"body":     map[string]string{"contentType": "text", "content": e.Description},
-		"start":    map[string]string{"dateTime": startDT, "timeZone": "UTC"},
-		"end":      map[string]string{"dateTime": endDT, "timeZone": "UTC"},
+		"start":    map[string]string{"dateTime": startDT, "timeZone": startZone},
+		"end":      map[string]string{"dateTime": endDT, "timeZone": endZone},
 		"isAllDay": e.AllDay,
 		"location": map[string]string{"displayName": e.Location},
 	}
@@ -110,7 +122,13 @@ func EventToGraphBody(e calendar.Event, includeAttendees bool) map[string]any {
 		slog.Warn("Omitting recurrence from upload: remote rule is not representable",
 			"module", "GRAPHCAL", "id", e.ID, "uid", e.ICalUID)
 	case e.Recurrence != nil:
-		body["recurrence"] = e.Recurrence
+		rec := *e.Recurrence
+		zone := rec.Range.TimeZone
+		if zone == "" {
+			zone = startZone
+		}
+		rec.Range.TimeZone, _ = ianaZone(zone)
+		body["recurrence"] = &rec
 	default:
 		body["recurrence"] = nil
 	}
@@ -118,6 +136,11 @@ func EventToGraphBody(e calendar.Event, includeAttendees bool) map[string]any {
 		body["attendees"] = attendeesToGraph(e.Attendees)
 	}
 	return body
+}
+
+func graphWriteTime(t time.Time, zone string) string {
+	loc, _ := time.LoadLocation(zone)
+	return t.In(loc).Format(graphWriteDateFormat + ".999999999")
 }
 
 // attendeesToGraph renders the attendee list as Graph attendee resources:
@@ -142,6 +165,9 @@ func attendeesToGraph(attendees []calendar.Attendee) []map[string]any {
 // opts.IdempotencyKey travels as the Graph transactionId so a retried POST
 // cannot create a duplicate event (or a second invitation wave).
 func (c *Client) CreateEvent(ctx context.Context, calendarID string, ev calendar.Event, opts calendarsync.CreateOptions) (calendar.Event, error) {
+	if err := validateWriteEvent(ev); err != nil {
+		return calendar.Event{}, fmt.Errorf("failed to create event in calendar %s: %w", calendarID, err)
+	}
 	body := EventToGraphBody(ev, opts.IncludeAttendees)
 	if opts.RequestOnlineMeeting {
 		body["isOnlineMeeting"] = true
@@ -174,6 +200,9 @@ func (c *Client) CreateEvent(ctx context.Context, calendarID string, ev calendar
 // unused: Graph event ids are mailbox-global.
 func (c *Client) UpdateEvent(ctx context.Context, calendarID, eventID string, spec calendarsync.UpdateSpec) error {
 	_ = calendarID
+	if err := validateWriteEvent(spec.Event); err != nil {
+		return fmt.Errorf("failed to update event %s: %w", eventID, err)
+	}
 	var body map[string]any
 	if spec.AttendeesOnly {
 		body = map[string]any{"attendees": attendeesToGraph(spec.Event.Attendees)}

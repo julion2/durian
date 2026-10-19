@@ -35,11 +35,43 @@ type calendarEventWrite struct {
 	Start                string    `json:"start"`
 	End                  string    `json:"end"`
 	AllDay               bool      `json:"all_day"`
+	TimeZone             *string   `json:"time_zone"`
+	EndTimeZone          *string   `json:"end_time_zone"`
+	Floating             *bool     `json:"floating"`
 	Location             string    `json:"location"`
 	Description          string    `json:"description"`
 	Attendees            *[]string `json:"attendees"`
 	ReplaceAttendees     bool      `json:"replace_attendees"`
 	RequestOnlineMeeting bool      `json:"request_online_meeting"`
+}
+
+// Missing metadata preserves the stored kind for old clients. RFC3339 values
+// remain instants, except floating=true uses zero-offset civil clock containers.
+func applyCalendarTimeMetadata(e *calendar.Event, req calendarEventWrite, start, end time.Time) error {
+	if e.AllDay {
+		e.TimeZone, e.EndTimeZone, e.Floating = "", "", false
+	}
+	if req.TimeZone != nil {
+		e.TimeZone = *req.TimeZone
+	}
+	if req.EndTimeZone != nil {
+		e.EndTimeZone = *req.EndTimeZone
+	}
+	if req.Floating != nil {
+		e.Floating = *req.Floating
+	}
+	if err := e.ValidateTimeZones(); err != nil {
+		return err
+	}
+	if e.Floating {
+		_, startOffset := start.Zone()
+		_, endOffset := end.Zone()
+		if startOffset != 0 || endOffset != 0 {
+			return fmt.Errorf("floating start/end must use zero-offset civil clock values")
+		}
+		e.Start, e.End = calendar.CivilTime(start), calendar.CivilTime(end)
+	}
+	return nil
 }
 
 // mergeUpdatedAttendees replaces an event's editable invitees while retaining
@@ -246,6 +278,10 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		// by `existing` and deliberately not overwritten here.
 		ev = merged
 
+		if err := applyCalendarTimeMetadata(&ev, req, start, end); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		data, serErr := calendar.EventToICal(ev)
 		if serErr != nil {
 			slog.Error("Failed to serialize updated local event", "module", "API", "err", logSafe(serErr.Error()))
@@ -272,6 +308,10 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if err := applyCalendarTimeMetadata(&ev, req, start, end); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if _, err := calendar.WriteEventIn(cols, req.Calendar, ev); err != nil {
 		slog.Error("Failed to write local event", "module", "API", "err", logSafe(err.Error()))
 		status := http.StatusBadRequest

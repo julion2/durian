@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "delta.go",
         "googlecalendar.go",
+        "timezone.go",
         "write.go",
     ],
     importpath = "github.com/julion2/durian/cli/internal/googlecalendar",
@@ -27,6 +28,7 @@ go_test(
         "googlecalendar_test.go",
         "series_exceptions_test.go",
         "throttle_test.go",
+        "timezone_test.go",
         "write_test.go",
     ],
     embed = [":googlecalendar"],

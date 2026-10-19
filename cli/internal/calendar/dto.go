@@ -41,6 +41,9 @@ type CalendarEvent struct {
 	Start            time.Time `json:"start"`
 	End              time.Time `json:"end"`
 	AllDay           bool      `json:"all_day"`
+	TimeZone         string    `json:"time_zone,omitempty"`
+	EndTimeZone      string    `json:"end_time_zone,omitempty"`
+	Floating         bool      `json:"floating,omitempty"`
 	Location         string    `json:"location,omitempty"`
 	MyResponse       string    `json:"my_response,omitempty"`
 	OnlineMeeting    bool      `json:"online_meeting,omitempty"`
@@ -65,6 +68,9 @@ func ToCalendarEvent(calendarName string, e Event, detail bool) CalendarEvent {
 		Start:            e.Start.UTC(),
 		End:              e.End.UTC(),
 		AllDay:           e.AllDay,
+		TimeZone:         e.TimeZone,
+		EndTimeZone:      e.EndTimeZone,
+		Floating:         e.Floating,
 		Location:         e.Location,
 		MyResponse:       string(e.OwnerResponse),
 		OnlineMeeting:    e.IsOnlineMeeting || e.OnlineMeetingURL != "",

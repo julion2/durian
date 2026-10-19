@@ -908,7 +908,16 @@ func planWithRemote(p CalendarProvider, cal Calendar, calDir string, status Cale
 		li, localHas := local[uid]
 		st, tracked := status.Items[uid]
 
-		remoteChanged := remoteHas && (!tracked || st.RemoteHash != eventContentHash(rev, owner))
+		remoteHash, remoteCore := eventContentHash(rev, owner), coreContentHash(rev, owner)
+		localCore := coreContentHash(li.Event, owner)
+		if st.TimeVersion == 0 {
+			remoteHash, remoteCore = calendar.LegacyContentHashes(rev, owner)
+			_, localCore = calendar.LegacyContentHashes(li.Event, owner)
+			if tracked && remoteHas && localHas {
+				li.Event = calendar.RestoreLegacyTimeMetadata(li.Event, rev)
+			}
+		}
+		remoteChanged := remoteHas && (!tracked || st.RemoteHash != remoteHash)
 		localChanged := localHas && (!tracked || st.LocalHash != li.Hash)
 		// Core-change signals: like remoteChanged/localChanged, but diffed with
 		// CoreContentHash, which drops the attendee RESPONSES. They feed ONLY
@@ -923,9 +932,15 @@ func planWithRemote(p CalendarProvider, cal Calendar, calDir string, status Cale
 		// as core-edited (the local conjunct also shields against the lossy
 		// iCal re-parse of an untouched file).
 		remoteCoreChanged := remoteChanged && st.CoreHash != "" &&
-			st.CoreHash != coreContentHash(rev, owner)
+			st.CoreHash != remoteCore
 		localCoreChanged := localChanged && st.CoreHash != "" &&
-			st.CoreHash != coreContentHash(li.Event, owner)
+			st.CoreHash != localCore
+		// Upgrade an untouched rendering, never overwrite a pending local edit
+		// merely because the new reader recovers previously discarded metadata.
+		if tracked && st.TimeVersion == 0 && remoteHas && localHas && !localChanged &&
+			eventContentHash(rev, owner) != remoteHash {
+			remoteChanged = true
+		}
 		remoteDeleted := tracked && !remoteHas
 		localDeleted := tracked && !localHas
 
@@ -1147,14 +1162,14 @@ func localEventMatchesRemote(local, remote Event, owner string) bool {
 
 // coreContentEqual reports whether the user-editable core (subject, times,
 // all-day flag, location, description, recurrence) of a locally parsed event
-// matches the remote event. The remote recurrence is passed through the lossy
-// RRULE round-trip first, so Graph-only details a local re-parse cannot
-// reproduce (e.g. firstDayOfWeek) do not read as differences.
+// matches the remote event. Timezone identities and exact recurrence boundaries
+// are compared independently of their provider-pattern or RRULE serialization.
 func coreContentEqual(local, remote Event) bool {
 	if local.Subject != remote.Subject ||
 		!local.Start.Equal(remote.Start) ||
 		!local.End.Equal(remote.End) ||
 		local.AllDay != remote.AllDay ||
+		!calendar.SameTimeSemantics(local, remote) ||
 		local.Location != remote.Location ||
 		normalizeText(local.Description) != normalizeText(remote.Description) {
 		return false
@@ -1162,8 +1177,7 @@ func coreContentEqual(local, remote Event) bool {
 	if !seriesExceptionsEqual(local, remote) {
 		return false
 	}
-	return recurrenceJSON(local.Recurrence, "") ==
-		recurrenceJSON(lossyRecurrence(remote.Recurrence, remote.Start), "")
+	return true
 }
 
 // seriesExceptionsEqual reports whether two events cancel and move the same
@@ -1224,25 +1238,6 @@ func sortedByRecurrenceID(overrides []Event) []Event {
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].RecurrenceID.Before(out[j].RecurrenceID)
 	})
-	return out
-}
-
-// lossyRecurrence passes a Graph recurrence through the RRULE round-trip
-// (recurrenceToROption -> roptionToRecurrence), yielding exactly what a
-// faithful local re-parse of the emitted .ics produces. Unmappable
-// recurrences come back unchanged.
-func lossyRecurrence(rec *Recurrence, start time.Time) *Recurrence {
-	if rec == nil {
-		return nil
-	}
-	opt, err := recurrenceToROption(*rec)
-	if err != nil {
-		return rec
-	}
-	out, err := roptionToRecurrence(opt, start)
-	if err != nil {
-		return rec
-	}
 	return out
 }
 
@@ -1418,6 +1413,7 @@ func Apply(ctx context.Context, p CalendarProvider, plan CalendarPlan, status *C
 			slog.Debug("Adopting identical untracked pair", "module", "CALSYNC",
 				"calendar", plan.Calendar.Name, "uid", a.UID)
 			status.Items[a.UID] = ItemStatus{
+				TimeVersion:   1,
 				RemoteID:      a.Remote.ID,
 				RemoteHash:    eventContentHash(a.Remote, p.Owner()),
 				CoreHash:      coreContentHash(a.Remote, p.Owner()),
@@ -1700,6 +1696,7 @@ func writeRemoteEvent(calDir, path, uid string, ev Event, status *CalendarStatus
 		return err
 	}
 	status.Items[uid] = ItemStatus{
+		TimeVersion:   1,
 		RemoteID:      ev.ID,
 		RemoteHash:    eventContentHash(ev, owner),
 		CoreHash:      coreContentHash(ev, owner),
@@ -1828,6 +1825,8 @@ func createFromLocal(ctx context.Context, p CalendarProvider, plan CalendarPlan,
 // see createFromLocal) and LocalHash of the current local bytes. The local
 // file is deliberately left exactly as the user wrote it — no normalization
 // rewrite — so the next sync sees neither side changed and is a clean no-op.
+// Exception: a legacy UTC-only rendering is upgraded from the settled read-back
+// after checking it has not changed since planning.
 // If the read-back fails, the uploaded local event is hashed instead (the
 // update response carries no content) rather than failing the sync.
 //
@@ -1872,16 +1871,31 @@ func patchFromLocal(ctx context.Context, p CalendarProvider, plan CalendarPlan, 
 	coreHash := coreContentHash(a.LocalEvent, p.Owner())
 	ownerResp := a.Prior.OwnerResponse
 	attendeeHash := attendeeSetHash(a.LocalEvent.Attendees)
+	timeVersion := 1
 	if settled, err := p.GetEvent(ctx, plan.Calendar.ID, a.RemoteID); err != nil {
 		slog.Warn("Failed to read back updated event, recording uploaded-content baseline", "module", "CALSYNC",
 			"calendar", plan.Calendar.Name, "id", a.RemoteID, "err", err)
+		if a.Prior.TimeVersion == 0 {
+			// The old local file still lacks zone metadata. Keep its migration
+			// pending so the next successful read upgrades it, without treating
+			// our own successful upload as a new remote conflict.
+			timeVersion = 0
+			remoteHash, coreHash = calendar.LegacyContentHashes(a.LocalEvent, p.Owner())
+		}
 	} else {
 		remoteHash = eventContentHash(settled, p.Owner())
 		coreHash = coreContentHash(settled, p.Owner())
 		ownerResp = settled.OwnerResponse
 		attendeeHash = attendeeSetHash(settled.Attendees)
+		if a.Prior.TimeVersion == 0 {
+			if err := checkLocalUnchanged(a); err != nil {
+				return err
+			}
+			return writeRemoteEvent(plan.Dir, a.LocalPath, a.UID, settled, status, p.Owner())
+		}
 	}
 	status.Items[a.UID] = ItemStatus{
+		TimeVersion:   timeVersion,
 		RemoteID:      a.RemoteID,
 		RemoteHash:    remoteHash,
 		CoreHash:      coreHash,
