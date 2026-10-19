@@ -1,8 +1,10 @@
 package mail
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
+	"net/mail"
 	"testing"
 )
 
@@ -35,6 +37,11 @@ func multipartWithAttachments(t *testing.T) []byte {
 
 func TestExtractAttachmentPart(t *testing.T) {
 	raw := multipartWithAttachments(t)
+	msg, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed := NewParser().Parse(msg)
 
 	for _, tc := range []struct {
 		partID    int
@@ -54,6 +61,36 @@ func TestExtractAttachmentPart(t *testing.T) {
 			}
 			if ctype != tc.wantType {
 				t.Errorf("content-type = %q, want %q", ctype, tc.wantType)
+			}
+			if got := parsed.Attachments[tc.partID-1].Size; got != len(tc.wantBytes) {
+				t.Errorf("attachment size = %d, want decoded byte count %d", got, len(tc.wantBytes))
+			}
+		})
+	}
+}
+
+func TestSinglePartAttachmentSizeIsDecoded(t *testing.T) {
+	for _, encoding := range []string{"base64", "quoted-printable", "8bit"} {
+		t.Run(encoding, func(t *testing.T) {
+			want := "caf\xc3\xa9\x00"
+			wire := want
+			if encoding == "base64" {
+				wire = "Y2Fm\r\nw6kA\r\n"
+			} else if encoding == "quoted-printable" {
+				wire = "caf=C3=A9=00"
+			}
+			raw := []byte("Content-Type: application/octet-stream; name=example.bin\r\nContent-Disposition: attachment; filename=example.bin\r\nContent-Transfer-Encoding: " + encoding + "\r\n\r\n" + wire)
+			msg, err := mail.ReadMessage(bytes.NewReader(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed := NewParser().Parse(msg)
+			if len(parsed.Attachments) != 1 || parsed.Attachments[0].Size != len(want) {
+				t.Fatalf("attachment size must count %d decoded bytes: %+v", len(want), parsed.Attachments)
+			}
+			data, _, err := ExtractAttachmentPart(raw, 1)
+			if err != nil || string(data) != want {
+				t.Fatalf("download = %q, %v; want %q", data, err, want)
 			}
 		})
 	}

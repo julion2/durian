@@ -123,9 +123,8 @@ func exerciseLiveMail(t *testing.T, directions []int, html bool) {
 	client := server.Client()
 	client.Timeout = 65 * time.Second
 
-	// The worker has its own 120s Background-based send context and retry loop.
-	// Keep its real durable sender protocol, but additionally bind sends to this
-	// run and permit only ONE sender invocation per account, even on errors.
+	// Keep the worker's real durable sender protocol and cancellation, but
+	// permit only ONE sender invocation per account, even on errors.
 	attempted := map[string]*atomic.Bool{"google-demo": {}, "microsoft-demo": {}}
 	worker := handler.NewOutboxWorker(db, cfg, nil)
 	worker.SetSenderFactory(func(a *config.AccountConfig) (mailsend.Sender, error) {
@@ -321,6 +320,9 @@ func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Cl
 								continue
 							}
 							found++
+							if actual.Size != len(expected.data) {
+								t.Fatal("attachment metadata reports encoded rather than decoded bytes")
+							}
 							data := liveHTTP(t, ctx, client, base, "GET", fmt.Sprintf("/api/v1/messages/%s/attachments/%d", url.PathEscape(msg.ID), actual.PartID), nil)
 							if !bytes.Equal(data, expected.data) {
 								t.Fatal("HTTP attachment bytes differ from independently constructed input")

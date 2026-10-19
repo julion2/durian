@@ -213,7 +213,7 @@ func (p *Parser) extractBody(msg *mail.Message) (string, string, []AttachmentInf
 		attachments = append(attachments, AttachmentInfo{
 			Filename:    name,
 			ContentType: mediaType,
-			Size:        len(body),
+			Size:        len(decodeTransferEncoding(body, transferEncoding)),
 			Disposition: disposition,
 			ContentID:   msg.Header.Get("Content-Id"),
 		})
@@ -276,7 +276,7 @@ func (p *Parser) extractMultipart(r io.Reader, boundary string) (string, string,
 			attachments = append(attachments, AttachmentInfo{
 				Filename:    name,
 				ContentType: mediaType,
-				Size:        len(attBody),
+				Size:        len(decodeTransferEncoding(attBody, transferEncoding)),
 				Disposition: disposition,
 				ContentID:   part.Header.Get("Content-Id"),
 			})

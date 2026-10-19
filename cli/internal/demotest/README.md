@@ -55,13 +55,15 @@ After credential refresh has finished, from the repository root, run **once**:
 
 ```sh
 bazel build //cli/internal/demotest:demotest_live_integration_test
+test_bin=$(bazel cquery //cli/internal/demotest:demotest_live_integration_test --output=files)
 DURIAN_MAIL_LIVE_TEST=1 \
-  ./bazel-bin/cli/internal/demotest/demotest_live_integration_test_/demotest_live_integration_test \
+  "$test_bin" \
   -test.run='^TestLiveMailPublicFlow$' -test.count=1 -test.timeout=6m -test.v
 ```
 
 Running the built binary directly inherits the private environment without
-passing credential values through Bazel test action arguments/cache. Do not use
+passing credential values through Bazel test action arguments/cache. `cquery`
+resolves the Go build-tag transition even after a mixed-target build. Do not use
 test repetition or automatic reruns. A failed/timeout run requires private
 provider inspection before deciding whether a new run is appropriate.
 
@@ -94,7 +96,8 @@ delivery/readback deadline; the second direction never runs after a failure.
 5. Real handler HTTP search → thread → body → attachment readback. The receiving
    row must have the correct account and provider remote reference, not just a
    worker-created local Sent row. Unicode content and envelope are checked;
-   downloaded attachment SHA-256 must equal the independently fixed input hash.
+   metadata sizes must count decoded bytes, and downloaded attachment SHA-256
+   must equal the independently fixed input hash.
 
 Successful messages and any provider drafts left by a failure are **preserved**.
 No remote deletion, reconciliation requeue, invitation, inferred-recipient reply,
