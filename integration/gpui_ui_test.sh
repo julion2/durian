@@ -184,6 +184,25 @@ clear_search() {
   xdotool key --clearmodifiers slash Escape Escape Escape
 }
 
+# The empty-results panel also echoes the full query. Inspect only the input
+# and neighboring controls when checking horizontal scrolling/clipping.
+expect_search_field() {
+  local name="$1" expected="$2" absent="${3:-}"
+  for _ in {1..20}; do
+    screen "$name"
+    convert "$OUT/$name.png" -crop 395x48+248+88 -resize 300% -colorspace Gray -negate "$ROOT/search-field.png"
+    local text
+    text=$(tesseract "$ROOT/search-field.png" stdout --psm 6 2>/dev/null)
+    if grep -Eq "$expected" <<< "$text" && { [[ -z "$absent" ]] || ! grep -Eq "$absent" <<< "$text"; }; then
+      echo "PASS native search field $name"; return
+    fi
+    sleep 0.1
+  done
+  echo "FAIL native search field $name: expected '$expected', absent '$absent'" >&2
+  echo "$text" >&2
+  return 1
+}
+
 # Resolve controls from rendered text rather than assuming dialog coordinates.
 click_word() {
   if [[ "$1" == Undo ]]; then
@@ -310,6 +329,21 @@ expect_inbox_count reopened 0
 search 'subject:missing-fixture'
 expect_screen empty 'No threads match' 'Reply body'
 expect_inbox_count empty 0
+clear_search
+search 'subject:BeginMarkerabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzOverflowTail'
+xdotool key --clearmodifiers slash End
+expect_search_field long-search-end 'OverflowTail' 'BeginMarker'
+expect_search_field long-search-button 'Save view'
+xdotool key --clearmodifiers Home
+# The initial caret can make OCR read "subject" as "bubject". The marker
+# follows that glyph and still distinguishes the beginning from the tail.
+expect_search_field long-search-home 'BeginMarker' 'OverflowTail'
+xdotool key --clearmodifiers End
+xdotool key --clearmodifiers --repeat 100 --delay 5 shift+Left
+expect_search_field long-search-selection 'BeginMarker' 'OverflowTail'
+xdotool key --clearmodifiers BackSpace
+expect_screen long-search-cleared 'Reply body'
+echo 'PASS long search reveals Home/End and selection without covering neighboring controls'
 clear_search
 expect_screen restored 'Reply body'
 
