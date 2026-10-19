@@ -181,6 +181,39 @@ paths:
                 $ref: '#/components/schemas/SettingsResponse'
         '500':
           description: The config could not be loaded
+  /compose-settings:
+    get:
+      summary: Named signatures and per-account defaults from config.pkl
+      description: >-
+        Authenticated like other API routes. Reads the active config on each request
+        and returns only signature content and default names, never account credentials.
+        Account keys are lowercased account names as used by /profiles, not aliases.
+        Content follows the existing config convention: recognizable HTML markup is
+        HTML, otherwise plain text. Clients snapshot selected content into htmlSignature
+        in the encrypted recovery draft; reload must not overwrite existing drafts.
+      responses:
+        '200':
+          description: Current signatures (Cache-Control no-store)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, signatures, account_defaults]
+                properties:
+                  ok:
+                    type: boolean
+                  signatures:
+                    type: object
+                    additionalProperties:
+                      type: string
+                  account_defaults:
+                    type: object
+                    additionalProperties:
+                      type: string
+        '401':
+          description: Bearer authentication required
+        '500':
+          description: The config could not be loaded; details are not returned
   /local-drafts:
     get:
       summary: List all local crash-recovery drafts

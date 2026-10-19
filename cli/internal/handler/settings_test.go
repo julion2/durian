@@ -85,3 +85,49 @@ func TestSettingsHandler_BrokenConfig(t *testing.T) {
 		t.Fatalf("GET /settings with a broken config = %d, want 500", code)
 	}
 }
+
+func TestComposeSettingsHandler(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	h := New(newTestStore(t), nil)
+	h.SetConfigPath(path)
+	for _, tt := range []struct {
+		name, config, response string
+		status                 int
+	}{
+		{
+			"only signatures and account defaults",
+			`{"signatures":{"Office":"<b>Work</b>","Plain":"A & B\n<me@example.com>"},"accounts":[{"name":"Work EU","alias":"short","email":"me@example.com","default_signature":"Office","auth":{"username":"private"}},{"name":"Other","email":"other@example.com"}],"sync":{"tag_sync":{"api_key":"private-key"}}}`,
+			`{"ok":true,"signatures":{"Office":"<b>Work</b>","Plain":"A & B\n<me@example.com>"},"account_defaults":{"work eu":"Office"}}`,
+			http.StatusOK,
+		},
+		{"updated config, no stale values or null maps", `{"accounts":[]}`, `{"ok":true,"signatures":{},"account_defaults":{}}`, http.StatusOK},
+		{"broken config, sanitized error", `{"private":`, "failed to load compose settings\n", http.StatusInternalServerError},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(tt.config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			w := httptest.NewRecorder()
+			newTestRouter(h, nil).ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/compose-settings", nil))
+			if w.Code != tt.status {
+				t.Fatalf("status = %d, want %d: %s", w.Code, tt.status, w.Body.String())
+			}
+			if tt.status != http.StatusOK {
+				if w.Body.String() != tt.response {
+					t.Fatalf("error leaked config details: %s", w.Body.String())
+				}
+				return
+			}
+			var got, want map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal([]byte(tt.response), &want); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) || w.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("response = %v, want %v with no-store", got, want)
+			}
+		})
+	}
+}

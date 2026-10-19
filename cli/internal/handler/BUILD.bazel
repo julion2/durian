@@ -6,6 +6,7 @@ go_library(
         "calendar.go",
         "calendar_sync.go",
         "calendar_write.go",
+        "compose_settings.go",
         "contacts.go",
         "drafts.go",
         "enginewatcher.go",
