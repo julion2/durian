@@ -432,14 +432,21 @@ func (h *Handler) DeleteOutboxHandler(w http.ResponseWriter, r *http.Request) {
 
 // OutboxWorker processes the outbox queue in the background.
 type OutboxWorker struct {
-	store    *store.DB
-	cfg      *config.Config
-	eventHub *EventHub
+	store     *store.DB
+	cfg       *config.Config
+	eventHub  *EventHub
+	newSender func(*config.AccountConfig) (mailsend.Sender, error)
 }
 
 // NewOutboxWorker creates a new outbox background worker.
 func NewOutboxWorker(db *store.DB, cfg *config.Config, hub *EventHub) *OutboxWorker {
 	return &OutboxWorker{store: db, cfg: cfg, eventHub: hub}
+}
+
+// SetSenderFactory overrides sender construction. Call before Start; nil restores
+// sender.For. This seam does not enable any environment-based production bypass.
+func (w *OutboxWorker) SetSenderFactory(factory func(*config.AccountConfig) (mailsend.Sender, error)) {
+	w.newSender = factory
 }
 
 // Start runs the outbox processing loop until ctx is cancelled.
@@ -578,7 +585,11 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 	}
 
 	// Resolve the account's configured SMTP, Graph, Gmail, or JMAP transport.
-	mailSender, err := sender.For(account)
+	factory := w.newSender
+	if factory == nil {
+		factory = sender.For
+	}
+	mailSender, err := factory(account)
 	if err != nil {
 		// Transport setup resolves keychain credentials, so sanitize before the
 		// log sink: never let a raw error from that path reach a logging call.
@@ -595,7 +606,7 @@ func (w *OutboxWorker) sendItem(item *store.OutboxItem) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	slog.Info("Sending outbox item", "module", "OUTBOX", "id", item.ID, "to", draft.To) // encgrep:allow recipient list is intentionally plaintext per ADR-0001 §3 (from/to/cc stay unencrypted for thread routing)
+	slog.Info("Sending outbox item", "module", "OUTBOX", "id", item.ID)
 	send := func() error { return mailSender.Send(ctx, msg) }
 	if durable, ok := mailSender.(mailsend.DurableSender); ok {
 		send = func() error {

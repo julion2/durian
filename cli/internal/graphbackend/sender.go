@@ -43,6 +43,14 @@ func NewSender(account *config.AccountConfig) (*Sender, error) {
 	return &Sender{b: b}, nil
 }
 
+// NewSenderWithBackend shares the backend's explicit token and HTTP policy.
+func NewSenderWithBackend(b *Backend) (*Sender, error) {
+	if b == nil {
+		return nil, errors.New("graph sender requires backend")
+	}
+	return &Sender{b: b}, nil
+}
+
 // graphRecipient is Graph's recipient shape: {emailAddress: {address, name}}.
 type graphRecipient struct {
 	EmailAddress graphEmailAddress `json:"emailAddress"`

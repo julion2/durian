@@ -132,6 +132,20 @@ func New(account *config.AccountConfig) (*Backend, error) {
 	return b, nil
 }
 
+// NewWithToken uses an explicit token source and HTTP client, without credential
+// lookup or persistence. The caller owns the client's transport safety policy.
+func NewWithToken(account *config.AccountConfig, tokenFn func(context.Context) (string, error), client *http.Client) (*Backend, error) {
+	if account == nil || tokenFn == nil || client == nil {
+		return nil, errors.New("graph backend requires account, token source and HTTP client")
+	}
+	b, err := New(account)
+	if err != nil {
+		return nil, err
+	}
+	b.tokenFn, b.httpClient = tokenFn, client
+	return b, nil
+}
+
 // MARK: - Token source
 
 // cachedGraphToken returns the cached Graph access token, minting a fresh one

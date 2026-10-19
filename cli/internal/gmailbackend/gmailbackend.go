@@ -117,6 +117,20 @@ func New(account *config.AccountConfig) (*Backend, error) {
 	return b, nil
 }
 
+// NewWithToken uses an explicit token source and HTTP client, without credential
+// lookup or persistence. The caller owns the client's transport safety policy.
+func NewWithToken(account *config.AccountConfig, tokenFn func(context.Context) (string, error), client *http.Client) (*Backend, error) {
+	if account == nil || tokenFn == nil || client == nil {
+		return nil, errors.New("gmail backend requires account, token source and HTTP client")
+	}
+	b, err := New(account)
+	if err != nil {
+		return nil, err
+	}
+	b.tokenFn, b.httpClient = tokenFn, client
+	return b, nil
+}
+
 // cachedGoogleToken returns the cached Google access token, minting a fresh one
 // via oauth.GetValidToken when none is cached or it is about to expire. The
 // mail.google.com scope the token already carries is accepted by the Gmail API.

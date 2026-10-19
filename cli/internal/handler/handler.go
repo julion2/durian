@@ -73,6 +73,12 @@ func New(db *store.DB, contactsDB *contacts.DB) *Handler {
 	}
 }
 
+// SetBackendFactory overrides backend construction. Call before serving requests;
+// nil restores the normal backendfactory default.
+func (h *Handler) SetBackendFactory(factory func(*config.AccountConfig) (backend.Backend, error)) {
+	h.newBackend = factory
+}
+
 // SetFetcher sets the IMAP attachment fetcher (typically the WatcherManager).
 func (h *Handler) SetFetcher(f AttachmentFetcher) {
 	h.fetcher = f

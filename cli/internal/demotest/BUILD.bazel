@@ -1,0 +1,52 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "demotest",
+    testonly = True,
+    srcs = [
+        "guard.go",
+        "mail.go",
+        "recipients.go",
+    ],
+    importpath = "github.com/julion2/durian/cli/internal/demotest",
+    visibility = ["//cli:__subpackages__"],
+    deps = [
+        "//cli/internal/backend",
+        "//cli/internal/calendartest",
+        "//cli/internal/config",
+        "//cli/internal/gmailbackend",
+        "//cli/internal/graphbackend",
+        "//cli/internal/mailsend",
+    ],
+)
+
+go_test(
+    name = "demotest_test",
+    size = "small",
+    srcs = ["batch_test.go", "mail_test.go"],
+    deps = [
+        ":demotest",
+        "//cli/internal/backend",
+        "//cli/internal/config",
+        "//cli/internal/mailsend",
+    ],
+)
+
+go_test(
+    name = "demotest_live_integration_test",
+    size = "large",
+    srcs = ["live_integration_test.go"],
+    gotags = ["demointegration"],
+    tags = ["manual"],
+    deps = [
+        ":demotest",
+        "//cli/internal/config",
+        "//cli/internal/dbcrypto",
+        "//cli/internal/handler",
+        "//cli/internal/mailsend",
+        "//cli/internal/protocol",
+        "//cli/internal/store",
+        "//cli/internal/syncengine",
+        "@com_github_gorilla_mux//:mux",
+    ],
+)

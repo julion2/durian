@@ -30,6 +30,14 @@ func NewSender(account *config.AccountConfig) (*Sender, error) {
 	return &Sender{b: b}, nil
 }
 
+// NewSenderWithBackend shares the backend's explicit token and HTTP policy.
+func NewSenderWithBackend(b *Backend) (*Sender, error) {
+	if b == nil {
+		return nil, errors.New("gmail sender requires backend")
+	}
+	return &Sender{b: b}, nil
+}
+
 // gmailSendResponse is the messages.send reply (also the shape of a metadata get).
 type gmailSendResponse struct {
 	ID      string `json:"id"`
