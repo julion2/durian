@@ -129,8 +129,10 @@ type CalendarProvider interface {
 	// UpdateEvent updates an existing event per spec, conditional on
 	// spec.ETag (ErrPrecondition on mismatch).
 	UpdateEvent(ctx context.Context, calendarID, eventID string, spec UpdateSpec) error
-	// DeleteEvent deletes an event, conditional on etag when non-empty
-	// (ErrPrecondition on mismatch, ErrNotFound when already gone). With
+	// DeleteEvent checks etag when non-empty (ErrPrecondition on mismatch,
+	// ErrNotFound when already gone). Graph has no atomic conditional delete:
+	// its read-compare-delete preflight still permits a concurrent edit race.
+	// Providers must document weaker guarantees, not imply If-Match support. With
 	// notify the attendees receive the cancellation; see the notification
 	// policy note above.
 	DeleteEvent(ctx context.Context, calendarID, eventID, etag string, notify bool) error

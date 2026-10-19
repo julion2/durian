@@ -93,7 +93,9 @@
 //   - Updates/deletes send the planned etag as the write precondition; an
 //     ErrPrecondition (remote changed since planning) skips that action —
 //     counted in Stats.Skipped — and the next run re-plans from fresh state
-//     instead of clobbering.
+//     instead of clobbering. Graph deletes use a non-atomic read-compare-delete
+//     preflight because the provider ignores If-Match for event DELETE; an
+//     edit during that final round trip remains a provider limitation.
 //   - The same guard runs on the LOCAL side: before overwriting or pruning a
 //     local .ics, Apply re-hashes it and skips when it no longer matches what
 //     Plan read. Plan and Apply are separated by the confirmation prompt and,

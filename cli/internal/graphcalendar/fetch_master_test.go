@@ -2,6 +2,7 @@ package graphcalendar
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 func TestFetchMasterEvents(t *testing.T) {
 	var preferHeaders []string
 	var srv *httptest.Server
+	var masterDetail graphEvent
 
 	masterEvent := func(id, typ string) string {
 		return fmt.Sprintf(`{
@@ -44,7 +46,7 @@ func TestFetchMasterEvents(t *testing.T) {
 		if r.URL.Query().Get("page") == "2" {
 			// Page 2: a seriesMaster with a weekly recurrence, and an
 			// occurrence that must be skipped.
-			fmt.Fprintf(w, `{"value": [
+			body := fmt.Sprintf(`{"value": [
 				{
 					"id": "master1",
 					"iCalUId": "ical-master1",
@@ -74,11 +76,25 @@ func TestFetchMasterEvents(t *testing.T) {
 				},
 				%s
 			]}`, masterEvent("occ1", "occurrence"))
+			var page eventPage
+			if err := json.Unmarshal([]byte(body), &page); err != nil {
+				t.Fatal(err)
+			}
+			masterDetail = page.Value[0]
+			masterDetail.ExceptionOccurrences = []graphEvent{}
+			masterDetail.CancelledOccurrences = []string{}
+			_, _ = w.Write([]byte(body))
 			return
 		}
 		fmt.Fprintf(w, `{"value": [%s], "@odata.nextLink": %q}`,
 			masterEvent("single1", "singleInstance"),
 			srv.URL+"/me/calendars/cal1/events?page=2")
+	})
+	mux.HandleFunc("/me/events/master1", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("$expand") != "exceptionOccurrences" || r.Header.Get("Prefer") != preferMaster {
+			t.Error("missing master expansion or preference")
+		}
+		_ = json.NewEncoder(w).Encode(masterDetail)
 	})
 	srv = httptest.NewServer(mux)
 	defer srv.Close()

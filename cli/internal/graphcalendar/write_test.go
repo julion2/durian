@@ -1,12 +1,93 @@
 package graphcalendar
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/julion2/durian/cli/internal/calendar"
+	"github.com/julion2/durian/cli/internal/calendarsync"
 )
+
+func TestDeleteEventPreconditions(t *testing.T) {
+	for _, tc := range []struct {
+		name, etag, id, key      string
+		readStatus, deleteStatus int
+		wantErr                  error
+		wantDelete               bool
+	}{
+		{"changed remote preserved", "old", "event", "current", 200, 204, calendarsync.ErrPrecondition, false},
+		{"matching deletes", "current", "event", "current", 200, 204, nil, true},
+		{"wrong identity", "current", "other", "current", 200, 204, calendarsync.ErrPrecondition, false},
+		{"missing identity", "current", "", "current", 200, 204, calendarsync.ErrPrecondition, false},
+		{"missing key", "current", "event", "", 200, 204, calendarsync.ErrPrecondition, false},
+		{"read not found", "current", "event", "current", 404, 204, calendarsync.ErrNotFound, false},
+		{"read gone", "current", "event", "current", 410, 204, calendarsync.ErrNotFound, false},
+		{"delete not found", "current", "event", "current", 200, 404, calendarsync.ErrNotFound, true},
+		{"delete gone", "current", "event", "current", 200, 410, calendarsync.ErrNotFound, true},
+		{"delete precondition", "current", "event", "current", 200, 412, calendarsync.ErrPrecondition, true},
+		{"explicit unconditional cleanup", "", "event", "current", 200, 204, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var deleted, deleteCalled atomic.Bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/me/events/event" || r.Header.Get("Prefer") != preferMaster {
+					t.Error("wrong event resource or missing read/write preferences")
+				}
+				switch r.Method {
+				case http.MethodGet:
+					if deleted.Load() {
+						http.NotFound(w, r)
+						return
+					}
+					if r.URL.Query().Get("$select") == "id,changeKey" {
+						if tc.etag == "" {
+							t.Error("unconditional delete unexpectedly read a precondition")
+						}
+						w.WriteHeader(tc.readStatus)
+						_ = json.NewEncoder(w).Encode(map[string]string{"id": tc.id, "changeKey": tc.key})
+						return
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": "event", "subject": "remote edit", "changeKey": "current",
+						"start": graphDateTime{"2026-07-23T10:00:00", "UTC"}, "end": graphDateTime{"2026-07-23T11:00:00", "UTC"}})
+				case http.MethodDelete:
+					deleteCalled.Store(true)
+					if r.Header.Get("If-Match") != tc.etag {
+						t.Error("delete changed the caller's If-Match")
+					}
+					if tc.deleteStatus == http.StatusNoContent {
+						deleted.Store(true) // Model Graph ignoring a stale If-Match.
+					}
+					w.WriteHeader(tc.deleteStatus)
+				default:
+					t.Error("unexpected method")
+				}
+			}))
+			defer srv.Close()
+			c := testClient(srv)
+			err := c.DeleteEvent(context.Background(), "cal", "event", tc.etag, false)
+			if !errors.Is(err, tc.wantErr) || deleteCalled.Load() != tc.wantDelete {
+				t.Fatalf("delete error=%v, sent DELETE=%v; want %v, %v", err, deleteCalled.Load(), tc.wantErr, tc.wantDelete)
+			}
+			if tc.name == "changed remote preserved" {
+				got, err := c.GetEvent(context.Background(), "cal", "event")
+				if err != nil || got.Subject != "remote edit" || got.ETag != "current" {
+					t.Fatalf("remote edit not preserved: %+v / %v", got, err)
+				}
+			}
+			if tc.wantErr == nil {
+				if got, err := c.GetEvent(context.Background(), "cal", "event"); err == nil || got.ID != "" {
+					t.Fatalf("deleted event still readable: %v", err)
+				}
+			}
+		})
+	}
+}
 
 // marshalBody round-trips an EventToGraphBody result through JSON so the
 // assertions see exactly the wire shape Graph would receive.

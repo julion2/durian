@@ -13,9 +13,10 @@
 //
 // Robustness rails baked in here:
 //   - UpdateEvent and DeleteEvent send the engine-planned etag as an If-Match
-//     header; a Graph 412 is wrapped as calendarsync.ErrPrecondition so the
-//     engine skips that action instead of clobbering, and a 404/410 is
-//     wrapped as calendarsync.ErrNotFound so the engine can fold "already
+//     header; a Graph 412 is wrapped as calendarsync.ErrPrecondition. DELETE
+//     also checks the current changeKey first, since Graph has accepted stale
+//     If-Match deletes. This is not an atomic concurrency guarantee. A 404/410
+//     is wrapped as calendarsync.ErrNotFound so the engine can fold "already
 //     gone" into success.
 //   - Attendees are only serialized when the engine explicitly asks for them
 //     (role-gated in the engine: only for meetings the owner organizes) and
@@ -229,9 +230,16 @@ func (c *Client) UpdateEvent(ctx context.Context, calendarID, eventID string, sp
 
 // DeleteEvent DELETEs an event. A 404/410 surfaces as
 // calendarsync.ErrNotFound — the engine folds it into success, since the goal
-// (event absent remotely) is reached either way. etag, when non-empty, is
-// sent as an If-Match header (see UpdateEvent); a 412 surfaces as
-// calendarsync.ErrPrecondition, which the engine skips and re-plans.
+// (event absent remotely) is reached either way. With a non-empty etag, first
+// GET the same immutable identity and changeKey; an incomplete or mismatching
+// result returns calendarsync.ErrPrecondition WITHOUT sending DELETE.
+// If-Match is still sent, but Graph has accepted stale DELETEs and event-delete
+// documents no conditional guarantee:
+// https://learn.microsoft.com/en-us/graph/api/event-delete
+// The GET -> DELETE race remains: an edit after the check can still be lost.
+// This is a best-effort preflight, NOT atomic safety. An empty etag explicitly
+// requests unconditional deletion (also used by owned-ID test cleanup).
+// A Graph 412 surfaces as calendarsync.ErrPrecondition for re-planning.
 // calendarID is unused: Graph event ids are mailbox-global. notify is unused
 // too: Graph decides for itself whether to mail the attendees — deleting a
 // meeting the owner organizes always cancels it for everyone, and there is no
@@ -242,6 +250,17 @@ func (c *Client) DeleteEvent(ctx context.Context, calendarID, eventID, etag stri
 	reqURL := c.baseURL + c.mailboxPath() + "/events/" + url.PathEscape(eventID)
 	headers := map[string]string{"Prefer": preferMaster}
 	if etag != "" {
+		var current struct {
+			ID        string `json:"id"`
+			ChangeKey string `json:"changeKey"`
+		}
+		query := url.Values{"$select": {"id,changeKey"}}
+		if err := c.doJSON(ctx, reqURL+"?"+query.Encode(), headers, &current); err != nil {
+			return fmt.Errorf("failed to check event before delete: %w", classifyWriteError(err))
+		}
+		if current.ID != eventID || current.ID == "" || current.ChangeKey == "" || current.ChangeKey != etag {
+			return fmt.Errorf("event identity or changeKey changed before delete: %w", calendarsync.ErrPrecondition)
+		}
 		headers["If-Match"] = etag
 	}
 

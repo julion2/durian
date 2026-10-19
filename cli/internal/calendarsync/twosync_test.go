@@ -808,6 +808,9 @@ func TestSyncDeleteAfterCreateIsDeleteRemote(t *testing.T) {
 	}
 
 	h.events = []map[string]any{masterEvent("g-new", "remote-uid-1", "My event", "ck-churned")}
+	// The current list and direct read must describe the same remote version.
+	// DELETE now rechecks it rather than trusting Graph to honor If-Match.
+	h.getResponses["g-new"] = h.events[0]
 	if err := os.Remove(h.icsPath("remote-uid-1")); err != nil {
 		t.Fatalf("remove local file: %v", err)
 	}
@@ -827,6 +830,7 @@ func TestSyncDeleteAfterCreateIsDeleteRemote(t *testing.T) {
 func TestSyncDeleteRemote(t *testing.T) {
 	h := newSyncHarness(t)
 	h.events = []map[string]any{masterEvent("g1", "uid-1", "Standup", "ck1")}
+	h.getResponses = map[string]map[string]any{"g1": h.events[0]}
 	h.sync(SyncOptions{})
 
 	if err := os.Remove(h.icsPath("uid-1")); err != nil {
@@ -847,6 +851,7 @@ func TestSyncDeleteRemote(t *testing.T) {
 func TestSyncDeleteRemote404IsSuccess(t *testing.T) {
 	h := newSyncHarness(t)
 	h.events = []map[string]any{masterEvent("g1", "uid-1", "Standup", "ck1")}
+	h.getResponses = map[string]map[string]any{"g1": h.events[0]}
 	h.sync(SyncOptions{})
 
 	if err := os.Remove(h.icsPath("uid-1")); err != nil {
@@ -1701,6 +1706,7 @@ func TestDeleteAsOrganizerCancels(t *testing.T) {
 	h.events = []map[string]any{meetingMaster("g1", "uid-1", "Roadmap", "ck1", true, "organizer",
 		att("Alice", "alice@example.com", "required", "accepted"),
 		att("Bob", "bob@example.com", "optional", "notResponded"))}
+	h.getResponses = map[string]map[string]any{"g1": h.events[0]}
 	h.sync(SyncOptions{})
 	h.organizerMeeting["g1"] = true
 

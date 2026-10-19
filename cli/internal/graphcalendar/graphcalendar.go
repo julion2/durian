@@ -28,7 +28,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
-	"sort"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -541,7 +541,14 @@ type graphEvent struct {
 	OriginalStart         string `json:"originalStart"`
 	OriginalStartTimeZone string `json:"originalStartTimeZone"`
 	OriginalEndTimeZone   string `json:"originalEndTimeZone"`
-	Attendees             []struct {
+	OccurrenceID          string `json:"occurrenceId"`
+	// These collections are selected/expanded on GET master, not /events.
+	ExceptionOccurrences []graphEvent `json:"exceptionOccurrences"`
+	CancelledOccurrences []string     `json:"cancelledOccurrences"`
+	ExceptionsNextLink   string       `json:"exceptionOccurrences@odata.nextLink"`
+	CancelledNextLink    string       `json:"cancelledOccurrences@odata.nextLink"`
+	NextLink             string       `json:"@odata.nextLink"`
+	Attendees            []struct {
 		Type         string              `json:"type"`
 		Status       graphResponseStatus `json:"status"`
 		EmailAddress graphEmailAddress   `json:"emailAddress"`
@@ -696,40 +703,25 @@ func (c *Client) FetchInstances(ctx context.Context, calendarID string, from, to
 // occurrences. The Prefer header (UTC dateTimes, immutable ids) is sent on
 // every page (including @odata.nextLink follow-ups).
 //
-// An "exception" entry is a single occurrence that was changed — moved,
-// renamed, given its own attendees. It is not a separate item to the sync
-// engine but a deviation of its series, so it is folded into the master it
-// names via seriesMasterId, keyed by originalStart. Exceptions are collected
-// across ALL pages first, because /events gives no ordering guarantee that a
-// master precedes its own exceptions.
-//
-// A plain "occurrence" entry stays skipped: it is the rule's own output,
-// already reproduced by the local expansion, and storing it would duplicate
-// every date of every series.
-//
-// KNOWN GAP — cancelled occurrences. Deleting one date of a Graph series
-// removes it from /events entirely rather than leaving a tombstone, so a
-// cancellation cannot be observed on this endpoint and the local calendar
-// keeps rendering that date. Graph exposes the cancelled dates as the series
-// master's cancelledOccurrences collection, but that property is only reliably
-// documented on beta, and requesting an unsupported property in $select fails
-// the whole query with a 400 — which would break every calendar, not just
-// recurring ones. Closing this needs the endpoint verified against the live
-// v1.0 API first. Google has no such gap: it returns cancelled instances as
-// records.
+// /events enumerates masters, NOT their exceptions. Each series is read again
+// with the documented v1.0 exceptionOccurrences expansion and selected
+// cancelledOccurrences (see exceptions.go). Any failed or incomplete read
+// aborts the snapshot: exclusions must never look like remote deletions.
 func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]calendar.Event, error) {
 	headers := map[string]string{"Prefer": preferMaster}
 
 	var events []calendar.Event
-	// byID indexes into events by the Graph master id the exceptions name. It
-	// stores positions, not pointers, so appending cannot leave a stale
-	// reference behind.
-	byID := make(map[string]int)
-	var exceptions []graphEvent
+	byID := make(map[string]graphEvent)
+	seenPages := make(map[string]bool)
 
 	pageURL := fmt.Sprintf("%s%s/calendars/%s/events?$select=%s&$top=100",
 		c.baseURL, c.mailboxPath(), url.PathEscape(calendarID), masterEventSelect)
+	collectionURL := pageURL
 	for pageURL != "" {
+		if seenPages[pageURL] || !sameGraphResource(pageURL, collectionURL) {
+			return nil, fmt.Errorf("invalid master events pagination")
+		}
+		seenPages[pageURL] = true
 		var page eventPage
 		if err := c.doJSON(ctx, pageURL, headers, &page); err != nil {
 			return nil, fmt.Errorf("failed to fetch master events for %s: %w", calendarID, err)
@@ -740,78 +732,41 @@ func (c *Client) FetchMasterEvents(ctx context.Context, calendarID string) ([]ca
 			if _, _, _, err := graphEventZones(ge); err != nil {
 				return nil, fmt.Errorf("failed to read event %s: %w", ge.ID, err)
 			}
-			switch ge.Type {
-			case "singleInstance", "seriesMaster":
-				if ev, ok := eventFromGraph(ge); ok {
-					byID[ge.ID] = len(events)
-					events = append(events, ev)
-				}
-			case "exception":
-				exceptions = append(exceptions, ge)
-			default: // "occurrence" and anything unknown
-				slog.Debug("Skipping non-master event", "module", "GRAPHCAL",
-					"id", ge.ID, "type", ge.Type)
+			if ge.Type == "occurrence" {
+				continue // Rule output, not an independent sync item.
 			}
+			if ge.ID == "" || (ge.Type != "singleInstance" && ge.Type != "seriesMaster") {
+				return nil, fmt.Errorf("unexpected event identity or type in master list")
+			}
+			if previous, exists := byID[ge.ID]; exists {
+				if !reflect.DeepEqual(previous, ge) {
+					return nil, fmt.Errorf("inconsistent duplicate master event")
+				}
+				continue
+			}
+			byID[ge.ID] = ge
+			var ev calendar.Event
+			if ge.Type == "seriesMaster" {
+				var err error
+				ev, err = c.getSeriesMaster(ctx, ge.ID)
+				if err != nil {
+					return nil, fmt.Errorf("failed to enrich series master: %w", err)
+				}
+			} else {
+				var ok bool
+				ev, ok = eventFromGraph(ge)
+				if !ok {
+					return nil, fmt.Errorf("failed to parse master event")
+				}
+			}
+			events = append(events, ev)
 		}
 		pageURL = page.NextLink
 	}
 
-	attachExceptions(events, byID, exceptions)
-
 	slog.Debug("Fetched master events", "module", "GRAPHCAL",
-		"calendar", calendarID, "events", len(events), "exceptions", len(exceptions))
+		"calendar", calendarID, "events", len(events))
 	return events, nil
-}
-
-// attachExceptions folds the collected exception events into their series
-// masters as Overrides, keyed by originalStart and sorted by it — so the .ics
-// bytes, and with them the local file hash the sync engine diffs on, do not
-// depend on the order Graph happened to page them in.
-//
-// An exception whose master is absent is dropped with a warning: its series
-// lives in a calendar the include filter excluded, or was deleted while this
-// fetch was paging. Promoting it to a master of its own would upload a series
-// collapsed to that single occurrence.
-func attachExceptions(events []calendar.Event, byID map[string]int, exceptions []graphEvent) {
-	touched := make(map[int]bool)
-	for _, ge := range exceptions {
-		idx, ok := byID[ge.SeriesMasterID]
-		if !ok {
-			slog.Warn("Dropping series exception without a master", "module", "GRAPHCAL",
-				"id", ge.ID, "master", ge.SeriesMasterID)
-			continue
-		}
-		original, err := parseGraphDateTime(ge.OriginalStart)
-		if err != nil {
-			slog.Warn("Dropping series exception without a usable original start",
-				"module", "GRAPHCAL", "id", ge.ID, "value", ge.OriginalStart, "err", err)
-			continue
-		}
-		ev, ok := eventFromGraph(ge)
-		if !ok {
-			continue
-		}
-		if events[idx].AllDay {
-			zone, _, _, _ := graphEventZones(ge)
-			loc, _ := time.LoadLocation(zone)
-			original = civilDate(original.In(loc))
-		}
-		ev.RecurrenceID = original
-		// An override is a deviation, never a series of its own.
-		ev.Recurrence = nil
-		ev.ExceptionDates = nil
-
-		master := &events[idx]
-		master.Overrides = append(master.Overrides, ev)
-		touched[idx] = true
-	}
-
-	for idx := range touched {
-		master := &events[idx]
-		sort.Slice(master.Overrides, func(i, j int) bool {
-			return master.Overrides[i].RecurrenceID.Before(master.Overrides[j].RecurrenceID)
-		})
-	}
 }
 
 // GetEvent returns one event by its Graph event id, requesting the same field
@@ -831,6 +786,12 @@ func (c *Client) GetEvent(ctx context.Context, calendarID, eventID string) (cale
 	var ge graphEvent
 	if err := c.doJSON(ctx, reqURL, map[string]string{"Prefer": preferMaster}, &ge); err != nil {
 		return calendar.Event{}, fmt.Errorf("failed to get event %s: %w", eventID, err)
+	}
+	if ge.ID != eventID {
+		return calendar.Event{}, fmt.Errorf("event read returned a different identity")
+	}
+	if ge.Type == "seriesMaster" {
+		return c.getSeriesMaster(ctx, eventID)
 	}
 	ev, ok := eventFromGraph(ge)
 	if !ok {

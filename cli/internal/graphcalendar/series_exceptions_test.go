@@ -2,8 +2,10 @@ package graphcalendar
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -11,10 +13,8 @@ import (
 	"github.com/julion2/durian/cli/internal/calendar"
 )
 
-// seriesWithExceptionPage lists the exception BEFORE its master on purpose:
-// /events gives no ordering guarantee, so folding while paging would drop
-// every exception that arrives first. The plain "occurrence" entry must be
-// skipped — it is the rule's own output, already reproduced locally.
+// Fixture components for a master, modified occurrence and ordinary occurrence.
+// Real /events lists the master only; exceptions come from GET master.
 const seriesWithExceptionPage = `{
 	"value": [
 		{
@@ -62,6 +62,13 @@ const seriesWithExceptionPage = `{
 }`
 
 func TestFetchMasterEventsFoldsExceptions(t *testing.T) {
+	var fixture eventPage
+	if err := json.Unmarshal([]byte(seriesWithExceptionPage), &fixture); err != nil {
+		t.Fatal(err)
+	}
+	masterDetail := fixture.Value[2]
+	masterDetail.ExceptionOccurrences = fixture.Value[:1]
+	masterDetail.CancelledOccurrences = []string{"OID.evt-series.2026-08-24"}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/me/calendars/cal1/events", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
@@ -72,7 +79,13 @@ func TestFetchMasterEventsFoldsExceptions(t *testing.T) {
 			t.Errorf("$select = %q, want seriesMasterId and originalStart", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(seriesWithExceptionPage))
+		_ = json.NewEncoder(w).Encode(eventPage{Value: []graphEvent{fixture.Value[2]}})
+	})
+	mux.HandleFunc("/me/events/evt-series", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("$expand") != "" && r.URL.Query().Get("$expand") != "exceptionOccurrences" {
+			t.Error("unexpected expansion")
+		}
+		_ = json.NewEncoder(w).Encode(masterDetail)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -111,11 +124,26 @@ func TestFetchMasterEventsFoldsExceptions(t *testing.T) {
 	if override.Recurrence != nil {
 		t.Error("override carries a recurrence of its own")
 	}
+	if len(master.ExceptionDates) != 1 || master.ExceptionDates[0].Format(time.RFC3339) != "2026-08-24T09:00:00Z" {
+		t.Fatalf("cancellation lost: %v", master.ExceptionDates)
+	}
+	readBack, err := client.GetEvent(context.Background(), "cal1", master.ID)
+	if err != nil || !reflect.DeepEqual(readBack, master) {
+		t.Fatalf("GetEvent differs from snapshot: %+v / %v", readBack, err)
+	}
+	ics, err := calendar.EventToICal(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := calendar.ICalToEvent(ics, "owner@example.com")
+	if err != nil || len(back.Overrides) != 1 || len(back.ExceptionDates) != 1 || !back.Overrides[0].RecurrenceID.Equal(override.RecurrenceID) || !back.ExceptionDates[0].Equal(master.ExceptionDates[0]) {
+		t.Fatalf("ICS lost exclusions: %+v / %v", back, err)
+	}
 }
 
-// An exception whose master is absent has nothing to attach to. Promoting it
-// to a master would upload a series collapsed to that single occurrence.
-func TestFetchMasterEventsDropsOrphanExceptions(t *testing.T) {
+// A surprising orphan is not a safe empty snapshot: do not promote it to an
+// independent event or silently discard a known exclusion.
+func TestFetchMasterEventsRejectsOrphanExceptions(t *testing.T) {
 	const orphanPage = `{
 		"value": [
 			{
@@ -142,11 +170,8 @@ func TestFetchMasterEventsDropsOrphanExceptions(t *testing.T) {
 
 	client := NewWithToken("owner@example.com", srv.URL, "test-token", srv.Client())
 	events, err := client.FetchMasterEvents(context.Background(), "cal1")
-	if err != nil {
-		t.Fatalf("FetchMasterEvents: %v", err)
-	}
-	if len(events) != 0 {
-		t.Errorf("got %d events, want none: %+v", len(events), events)
+	if err == nil || events != nil {
+		t.Errorf("expected snapshot failure, got %+v / %v", events, err)
 	}
 }
 
@@ -199,6 +224,155 @@ func TestParseGraphDateTimeAcceptsBothWireShapes(t *testing.T) {
 			}
 			if !got.Equal(tc.want) {
 				t.Errorf("got %s, want %s", got.UTC(), tc.want)
+			}
+		})
+	}
+}
+
+func exclusionFixture(t *testing.T) graphEvent {
+	t.Helper()
+	var page eventPage
+	if err := json.Unmarshal([]byte(seriesWithExceptionPage), &page); err != nil {
+		t.Fatal(err)
+	}
+	master := page.Value[2]
+	master.ExceptionOccurrences = page.Value[:1]
+	master.CancelledOccurrences = []string{"OID.evt-series.2026-08-24"}
+	return master
+}
+
+// Both read APIs must fail, returning no partial event/snapshot even when an
+// otherwise valid single event preceded the bad series in the collection.
+func TestSeriesExclusionsRejectIncompleteSnapshots(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*graphEvent)
+	}{
+		{"wrong-master-id", func(m *graphEvent) { m.ID = "another-series" }},
+		{"missing-rule", func(m *graphEvent) { m.Recurrence = nil }},
+		{"missing-expanded-exceptions", func(m *graphEvent) { m.ExceptionOccurrences = nil }},
+		{"missing-cancellations", func(m *graphEvent) { m.CancelledOccurrences = nil }},
+		{"missing-original", func(m *graphEvent) { m.ExceptionOccurrences[0].OriginalStart = "" }},
+		{"invalid-original", func(m *graphEvent) { m.ExceptionOccurrences[0].OriginalStart = "2026-08-17T09:00:00" }},
+		{"foreign-exception", func(m *graphEvent) { m.ExceptionOccurrences[0].SeriesMasterID = "other" }},
+		{"unknown-exception-type", func(m *graphEvent) { m.ExceptionOccurrences[0].Type = "occurrence" }},
+		{"bad-exception-time", func(m *graphEvent) { m.ExceptionOccurrences[0].Start.DateTime = "invalid" }},
+		{"bad-exception-zone", func(m *graphEvent) { m.ExceptionOccurrences[0].OriginalStartTimeZone = "custom-zone" }},
+		{"opaque-cancellation", func(m *graphEvent) { m.CancelledOccurrences = []string{"opaque"} }},
+		{"foreign-cancellation", func(m *graphEvent) { m.CancelledOccurrences = []string{"OID.evt-series-other.2026-08-24"} }},
+		{"bad-cancellation-date", func(m *graphEvent) { m.CancelledOccurrences = []string{"OID.evt-series.2026-02-30"} }},
+		{"cancellation-date-suffix", func(m *graphEvent) { m.CancelledOccurrences = []string{"OID.evt-series.2026-08-24.extra"} }},
+		{"overlap", func(m *graphEvent) { m.CancelledOccurrences = []string{"OID.evt-series.2026-08-17"} }},
+		{"disagreeing-identities", func(m *graphEvent) { m.ExceptionOccurrences[0].OccurrenceID = "OID.evt-series.2026-08-18" }},
+		{"foreign-oid-with-valid-original", func(m *graphEvent) { m.ExceptionOccurrences[0].OccurrenceID = "OID.other.2026-08-17" }},
+		{"conflicting-duplicate-id", func(m *graphEvent) {
+			other := m.ExceptionOccurrences[0]
+			other.Subject = "changed"
+			m.ExceptionOccurrences = append(m.ExceptionOccurrences, other)
+		}},
+		{"conflicting-duplicate-original", func(m *graphEvent) {
+			other := m.ExceptionOccurrences[0]
+			other.ID = "another-exception"
+			m.ExceptionOccurrences = append(m.ExceptionOccurrences, other)
+		}},
+		{"foreign-exception-page", func(m *graphEvent) { m.ExceptionsNextLink = "https://example.test/steal" }},
+		{"unknown-cancellation-page", func(m *graphEvent) { m.CancelledNextLink = "https://example.test/steal" }},
+		{"unknown-master-page", func(m *graphEvent) { m.NextLink = "https://example.test/steal" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			detail := exclusionFixture(t)
+			plain := detail
+			single := plain
+			single.ID, single.Type, single.Recurrence = "single", "singleInstance", nil
+			tc.mutate(&detail)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/me/calendars/cal/events" {
+					_ = json.NewEncoder(w).Encode(eventPage{Value: []graphEvent{single, plain}})
+				} else if r.URL.Path == "/me/events/evt-series" {
+					if r.URL.Query().Get("$expand") == "" {
+						_ = json.NewEncoder(w).Encode(plain)
+					} else {
+						_ = json.NewEncoder(w).Encode(detail)
+					}
+				} else {
+					t.Error("followed untrusted or unknown resource")
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			c := testClient(srv)
+			if events, err := c.FetchMasterEvents(context.Background(), "cal"); err == nil || events != nil {
+				t.Fatalf("partial snapshot: %+v / %v", events, err)
+			}
+			if event, err := c.GetEvent(context.Background(), "cal", "evt-series"); err == nil || event.ID != "" {
+				t.Fatalf("partial event: %+v / %v", event, err)
+			}
+		})
+	}
+}
+
+func TestSeriesExclusionsPagingDuplicatesAndOrdering(t *testing.T) {
+	for _, cycle := range []bool{false, true} {
+		t.Run(map[bool]string{false: "complete", true: "cycle"}[cycle], func(t *testing.T) {
+			detail := exclusionFixture(t)
+			first := detail.ExceptionOccurrences[0]
+			second := first
+			second.ID, second.OriginalStart = "second", "2026-08-10T09:00:00Z"
+			// The expanded response supplies one exception, the next page supplies
+			// an earlier exception AND the same first ID again (page overlap).
+			detail.CancelledOccurrences = []string{"OID.evt-series.2026-08-31", "OID.evt-series.2026-08-24", "OID.evt-series.2026-08-24"}
+			var srv *httptest.Server
+			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Prefer") != preferMaster {
+					t.Error("lost read preferences")
+				}
+				switch r.URL.Path {
+				case "/me/calendars/cal/events":
+					page := eventPage{Value: []graphEvent{detail}}
+					if r.URL.Query().Get("page") == "" {
+						page.NextLink = srv.URL + "/me/calendars/cal/events?page=2"
+					}
+					_ = json.NewEncoder(w).Encode(page)
+				case "/me/events/evt-series":
+					out := detail
+					out.ExceptionsNextLink = srv.URL + "/me/events/evt-series/exceptionOccurrences?page=2"
+					_ = json.NewEncoder(w).Encode(out)
+				case "/me/events/evt-series/exceptionOccurrences":
+					page := eventPage{Value: []graphEvent{second, first}}
+					if cycle {
+						page.NextLink = srv.URL + "/me/events/evt-series/exceptionOccurrences?page=2"
+					}
+					_ = json.NewEncoder(w).Encode(page)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			c := testClient(srv)
+			events, err := c.FetchMasterEvents(context.Background(), "cal")
+			if cycle {
+				if err == nil || events != nil {
+					t.Fatal("cyclic page produced a partial snapshot")
+				}
+				return
+			}
+			if err != nil || len(events) != 1 {
+				t.Fatalf("snapshot: %+v / %v", events, err)
+			}
+			got := events[0]
+			if len(got.Overrides) != 2 || got.Overrides[0].ID != "second" || len(got.ExceptionDates) != 2 || got.ExceptionDates[0].Day() != 24 {
+				t.Fatalf("unstable or duplicated exclusions: %+v", got)
+			}
+			// A documented occurrenceId is sufficient when originalStart is
+			// absent; use the original clock, never the moved start.
+			detail.ExceptionOccurrences[0].OriginalStart = ""
+			detail.ExceptionOccurrences[0].OccurrenceID = "OID.evt-series.2026-08-17"
+			// Remove the overlap copy because it still has originalStart and
+			// would correctly count as an inconsistent same-ID response.
+			first = detail.ExceptionOccurrences[0]
+			back, err := c.GetEvent(context.Background(), "cal", "evt-series")
+			if err != nil || !reflect.DeepEqual(back, got) {
+				t.Fatalf("OID read differs: %+v / %v", back, err)
 			}
 		})
 	}
