@@ -299,6 +299,7 @@ impl EventComposer {
             attendees,
             rsvp: editing.as_ref().map_or(Rsvp::Accepted, |e| e.rsvp),
             recurrence: editing.as_ref().and_then(|e| e.recurrence.clone()),
+            occurrence_source: None,
             series: editing.as_ref().and_then(|e| e.series.clone()),
         };
         let id = event.id.clone();

@@ -94,6 +94,8 @@ pub struct Event {
     pub rsvp: Rsvp,
     /// "Every weekday", "Weekly on Tuesday" – display only, occurrences are expanded by the source
     pub recurrence: Option<SharedString>,
+    /// "provider" or "local-estimate" for synced series; absent for local events.
+    pub occurrence_source: Option<SharedString>,
     /// occurrences of one series share this id
     pub series: Option<SharedString>,
 }

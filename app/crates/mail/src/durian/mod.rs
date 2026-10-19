@@ -391,6 +391,7 @@ pub fn calendar_event(account: &SharedString, e: &api::CalendarEvent) -> Option<
         attendees: Vec::new(),
         rsvp,
         recurrence: e.recurring.then(|| "Repeats".into()),
+        occurrence_source: e.occurrence_source.clone().map(Into::into),
         series: e.recurring.then(|| series.into()),
     };
     Some((event, EventRef { account: account.clone(), calendar: e.calendar.clone(), uid: e.uid.clone() }))
@@ -672,6 +673,12 @@ mod tests {
         assert_ne!(ev.id, other_calendar.id, "equal UID/start must not collide across calendars");
         assert_ne!(ev.series, other_account.series);
         assert_ne!(ev.series, other_calendar.series);
+        assert!(ev.occurrence_source.is_none());
+        for source in ["provider", "local-estimate"] {
+            other.occurrence_source = Some(source.into());
+            let (mapped, _) = calendar_event(&"work".into(), &other).unwrap();
+            assert_eq!(mapped.occurrence_source.as_deref(), Some(source));
+        }
         assert!(calendar_event(&"work".into(), &event(r#"{"calendar":"W","uid":"x","start":"garbage","end":"x"}"#)).is_none());
     }
 

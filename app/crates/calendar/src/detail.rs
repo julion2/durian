@@ -175,6 +175,11 @@ pub fn render(schedule: &Entity<Schedule>, event: &Event, selection: &ui::Select
                 .gap(px(6.))
                 .children(calendar.map(|c| chip(theme).child(div().size(px(8.)).rounded_full().bg(color)).child(c.name.clone())))
                 .children(event.recurrence.clone().map(|r| chip(theme).child(r)))
+                .when(event.occurrence_source.as_deref() == Some("local-estimate"), |d| d.child(
+                    chip(theme).id("estimated-occurrence")
+                        .child("Estimated times")
+                        .tooltip(ui::tooltip("Locally expanded series. Sync this calendar to use the provider's times; daylight-saving transitions may differ.")),
+                ))
                 .when(invited && !own, |d| d.child(chip(theme).child(rsvp_label(event.rsvp))))
                 .when(own && invited, |d| d.child(chip(theme).child("Organizer"))),
         )

@@ -256,6 +256,26 @@ expect_screen rsvp-sync-still-pending 'Recover calendar changes'
 jq -se '[.[] | select(.path == "/api/v1/calendars/sync/event")] | length >= 2 and all(.[]; .status == 503 and .scope == {"account":"test","calendar":"Work","uid":"invitation","operation":"rsvp"})' "$ROOT/requests.jsonl"
 echo 'PASS native RSVP rejection and acceptance persist; sync retry is scoped and never replays RSVP'
 
+# Remote series without a current provider snapshot are explicit estimates;
+# an identical local series remains RFC-native. Exercise real Go list/detail
+# responses, including detail hydration which must not erase the source badge.
+for kind in local remote; do
+  path="$ROOT/calendar/local-series.ics"; title=LocalSeries
+  if [[ "$kind" == remote ]]; then path="$ROOT/vdir/test/Work/remote-series.ics"; title=EstimatedSeries; fi
+  printf 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//durian//test//EN\r\nBEGIN:VEVENT\r\nUID:%s-series\r\nSUMMARY:%s\r\nDTSTART;VALUE=DATE:%s\r\nDTEND;VALUE=DATE:%s\r\nRRULE:FREQ=DAILY;COUNT=2\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n' \
+    "$kind" "$title" "$(date +%Y%m%d)" "$(date -d tomorrow +%Y%m%d)" > "$path"
+done
+xdotool key --clearmodifiers Escape ctrl+r
+expect_screen series-loaded 'EstimatedSeries'
+click_word LocalSeries
+expect_screen series-local 'Repeats' 'Estimated times'
+click_word EstimatedSeries
+expect_screen series-estimate 'Estimated times'
+# Let the async detail request complete before checking the warning again.
+sleep 1
+expect_screen series-estimate-hydrated 'Estimated times'
+echo 'PASS native calendar distinguishes remote estimates from local recurrence after detail hydration'
+
 xdotool key --clearmodifiers ctrl+q
 for _ in {1..100}; do ! kill -0 "$APP_PID" 2>/dev/null && break; sleep 0.1; done
 ! kill -0 "$APP_PID" 2>/dev/null

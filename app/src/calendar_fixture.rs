@@ -88,6 +88,7 @@ pub fn load(today: NaiveDate, avatars: &HashMap<String, SharedString>, me: Vec<S
                 attendees: attendees.clone(),
                 rsvp: raw.rsvp.unwrap_or(Rsvp::Accepted),
                 recurrence: raw.recurrence.clone(),
+                occurrence_source: None,
                 series: raw.repeat.is_some().then(|| raw.id.clone()),
             });
         }

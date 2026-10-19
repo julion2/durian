@@ -197,6 +197,7 @@ mod tests {
             attendees,
             rsvp: Rsvp::NeedsAction,
             recurrence: None,
+            occurrence_source: None,
             series: series.then(|| "s".into()),
         }
     }

@@ -289,6 +289,8 @@ pub struct CalendarEvent {
     pub online_meeting_url: Option<String>,
     #[serde(default)]
     pub recurring: bool,
+    #[serde(default)]
+    pub occurrence_source: Option<String>,
     /// detail endpoint only
     #[serde(default)]
     pub organizer: Option<CalendarPerson>,
