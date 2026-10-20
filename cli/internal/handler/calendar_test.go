@@ -731,6 +731,102 @@ func TestCalendarPutUIDIsScopedToCalendar(t *testing.T) {
 	}
 }
 
+func TestCalendarSecondaryOrganizerFromSyncState(t *testing.T) {
+	for _, tc := range []struct {
+		name, mailbox, dir, uid, remoteID string
+		baseline                          calendar.OwnerResp
+		localResponse                     string
+		wantResponse                      string
+		wantReplace                       int
+	}{
+		{"owned secondary", "me@example.com", "Calendar", "evt-secondary", "remote-event", calendar.OwnerRespOrganizer, "", "organizer", http.StatusOK},
+		{"foreign accepted attendee", "me@example.com", "Calendar", "evt-secondary", "remote-event", calendar.OwnerRespAccepted, "accepted", "accepted", http.StatusForbidden},
+		{"pending local RSVP", "me@example.com", "Calendar", "evt-secondary", "remote-event", calendar.OwnerRespTentative, "declined", "declined", http.StatusForbidden},
+		{"wrong mailbox", "other@example.com", "Calendar", "evt-secondary", "remote-event", calendar.OwnerRespOrganizer, "", "", http.StatusConflict},
+		{"missing mailbox", "", "Calendar", "evt-secondary", "remote-event", calendar.OwnerRespOrganizer, "", "", http.StatusForbidden},
+		{"wrong collection", "me@example.com", "Other", "evt-secondary", "remote-event", calendar.OwnerRespOrganizer, "", "", http.StatusForbidden},
+		{"untracked UID", "me@example.com", "Calendar", "other-uid", "remote-event", calendar.OwnerRespOrganizer, "", "", http.StatusForbidden},
+		{"missing remote identity", "me@example.com", "Calendar", "evt-secondary", "", calendar.OwnerRespOrganizer, "", "", http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, calDir := newCalendarHandler(t)
+			event := calendar.Event{
+				ICalUID: "evt-secondary", Subject: "Secondary calendar meeting",
+				Start:     time.Date(2026, 8, 7, 9, 0, 0, 0, time.UTC),
+				End:       time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC),
+				Organizer: &calendar.Person{Email: "secondary@group.calendar.google.com"},
+				Attendees: []calendar.Attendee{{Email: "alice@example.com", Type: "required"}},
+			}
+			if tc.localResponse != "" {
+				event.Attendees = append(event.Attendees, calendar.Attendee{Email: "me@example.com", Type: "required", Response: tc.localResponse})
+			}
+			writeCalendarTestEvent(t, calDir, event)
+			state := &calendarsync.SyncState{Mailbox: tc.mailbox, Calendars: map[string]calendarsync.CalendarStatus{
+				"secondary-calendar": {Name: "Calendar", Dir: tc.dir, Items: map[string]calendarsync.ItemStatus{
+					tc.uid: {RemoteID: tc.remoteID, OwnerResponse: tc.baseline},
+				}},
+			}}
+			if err := calendarsync.NewFileStateStore(filepath.Dir(calDir)).Save(state); err != nil {
+				t.Fatal(err)
+			}
+			icsPath := filepath.Join(calDir, event.ICalUID+".ics")
+			before, err := os.ReadFile(icsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, selector := range []string{"uid", "ref"} {
+				var got struct {
+					Event calendar.CalendarEvent `json:"event"`
+				}
+				code := getJSON(t, r, "/api/v1/calendars/event?account=work&"+selector+"=evt-secondary", &got)
+				if tc.wantReplace == http.StatusConflict {
+					if code != http.StatusConflict {
+						t.Errorf("mismatched mailbox GET = %d", code)
+					}
+					continue
+				}
+				if code != http.StatusOK || got.Event.MyResponse != tc.wantResponse {
+					t.Errorf("GET %s = %d, my_response=%q, want %q", selector, code, got.Event.MyResponse, tc.wantResponse)
+				}
+			}
+			if tc.wantReplace != http.StatusConflict {
+				for _, query := range []string{"from=2026-08-07&to=2026-08-08", "q=Secondary"} {
+					var got struct {
+						Events []calendar.CalendarEvent `json:"events"`
+					}
+					if code := getJSON(t, r, "/api/v1/calendars/events?account=work&"+query, &got); code != http.StatusOK || len(got.Events) != 1 || got.Events[0].MyResponse != tc.wantResponse {
+						t.Errorf("list/search role = %d %+v, want %q", code, got.Events, tc.wantResponse)
+					}
+				}
+			}
+			if tc.wantResponse == "organizer" {
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/calendars/rsvp", strings.NewReader(`{"account":"work","uid":"evt-secondary","response":"accepted"}`)))
+				if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "organizer") {
+					t.Errorf("own RSVP = %d: %s", w.Code, w.Body.String())
+				}
+			}
+			after, err := os.ReadFile(icsPath)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("offline reads/rejected RSVP rewrote ICS: %v", err)
+			}
+			body := `{"account":"work","calendar":"Calendar","uid":"evt-secondary","subject":"Edited","start":"2026-08-07T09:00:00Z","end":"2026-08-07T10:00:00Z","attendees":[],"replace_attendees":true}`
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest("PUT", "/api/v1/calendars/event", strings.NewReader(body)))
+			if w.Code != tc.wantReplace {
+				t.Errorf("empty attendee replacement = %d, want %d: %s", w.Code, tc.wantReplace, w.Body.String())
+			}
+			stored := readCalendarTestEvent(t, calDir, event.ICalUID)
+			if stored.Organizer == nil || stored.Organizer.Email != event.Organizer.Email {
+				t.Error("organizer address changed")
+			}
+			if tc.wantReplace == http.StatusOK && (stored.Subject != "Edited" || len(stored.Attendees) != 0) {
+				t.Errorf("replacement not applied: %+v", stored)
+			}
+		})
+	}
+}
+
 func TestCalendarPutAttendeeEditPreservesOrganizerEntry(t *testing.T) {
 	r, calDir := newCalendarHandler(t)
 	writeCalendarTestEvent(t, calDir, calendar.Event{

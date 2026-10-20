@@ -179,6 +179,7 @@ func (h *Handler) CalendarEventsHandler(w http.ResponseWriter, r *http.Request) 
 			}
 			for _, e := range cal.Events {
 				if calendar.EventMatchesQuery(e, lower) {
+					e = calendarsync.ReadOrganizerRole(cols, cal.Dir, e)
 					dto := calendar.ToCalendarEvent(cal.Name, e, false)
 					dto.Account = cal.Account
 					events = append(events, dto)
@@ -242,6 +243,7 @@ func (s calendarEventSelector) resolve(w http.ResponseWriter, cols []calendar.Co
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	event = calendarsync.ReadOrganizerRole(cols, path, event)
 	return path, event, calName, true
 }
 

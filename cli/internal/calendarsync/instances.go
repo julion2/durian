@@ -275,6 +275,64 @@ func ReadOccurrences(cal calendar.LocalCalendar, from, to time.Time) []calendar.
 		}
 		out = append(out, calendar.ExpandOccurrences(master, from, to)...)
 	}
+	if stateErr == nil {
+		col := calendar.Collection{Dir: cal.Dir, Account: cal.Account, Owner: cal.Owner}
+		for i := range out {
+			out[i] = overlayOrganizerRole(col, state, out[i])
+		}
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Start.Before(out[j].Start) })
 	return out
+}
+
+// ReadOrganizerRole restores provider-confirmed organizer authority for a
+// resolved local event. A secondary calendar's ORGANIZER need not be the
+// account email. Only the saved mailbox/collection/UID binding is trusted;
+// this read never repairs state or rewrites ICS, and is not a sync planner gate.
+// path must name the resolved event file or its exact collection directory.
+func ReadOrganizerRole(cols []calendar.Collection, path string, event calendar.Event) calendar.Event {
+	for _, col := range cols {
+		if filepath.Clean(col.Dir) != filepath.Clean(path) && filepath.Clean(col.Dir) != filepath.Dir(path) {
+			continue
+		}
+		state, err := NewFileStateStore(filepath.Dir(filepath.Clean(col.Dir))).LoadReadOnly()
+		if err == nil {
+			return overlayOrganizerRole(col, state, event)
+		}
+		return event
+	}
+	return event
+}
+
+func overlayOrganizerRole(col calendar.Collection, state *SyncState, event calendar.Event) calendar.Event {
+	if strings.EqualFold(col.Account, "local") || col.Owner == "" || state.Mailbox == "" ||
+		!strings.EqualFold(col.Owner, state.Mailbox) || event.ICalUID == "" {
+		return event
+	}
+	var binding *CalendarStatus
+	for id, status := range state.Calendars {
+		if !boundDir(status.Dir) || status.Dir != filepath.Base(filepath.Clean(col.Dir)) {
+			continue
+		}
+		if binding != nil || id == "" {
+			return event // ambiguous or missing remote collection identity
+		}
+		binding = &status
+	}
+	if binding == nil {
+		return event
+	}
+	item, tracked := binding.Items[event.ICalUID]
+	if !tracked || item.RemoteID == "" || item.OwnerResponse != calendar.OwnerRespOrganizer {
+		return event
+	}
+	event.IsOrganizer = true
+	// Do not replay saved RSVP baselines over local PARTSTAT: those responses
+	// may be pending writes. Only recover the organizer role, not attendee RSVP.
+	switch event.OwnerResponse {
+	case calendar.OwnerRespAccepted, calendar.OwnerRespTentative, calendar.OwnerRespDeclined:
+	default:
+		event.OwnerResponse = calendar.OwnerRespOrganizer
+	}
+	return event
 }

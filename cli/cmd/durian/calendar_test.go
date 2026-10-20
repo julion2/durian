@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -13,6 +16,84 @@ import (
 
 // ParseRSVPVerb/SetOwnerResponse moved to cli/internal/calendar (rsvp_test.go
 // covers them); runCalendarRsvp calls the exported versions.
+
+func TestCalendarCLISecondaryOrganizer(t *testing.T) {
+	previousConfig, previousJSON, previousAccounts := cfg, jsonOutput, calAccounts
+	previousShow, previousSearch, previousRsvp := calShowCalendar, calSearchCalendar, calRsvpCalendar
+	t.Cleanup(func() {
+		cfg, jsonOutput, calAccounts = previousConfig, previousJSON, previousAccounts
+		calShowCalendar, calSearchCalendar, calRsvpCalendar = previousShow, previousSearch, previousRsvp
+	})
+	jsonOutput, calAccounts = true, nil
+	calShowCalendar, calSearchCalendar, calRsvpCalendar = "", "", ""
+	for _, organizer := range []bool{true, false} {
+		t.Run(map[bool]string{true: "secondary organizer", false: "foreign accepted attendee"}[organizer], func(t *testing.T) {
+			base := t.TempDir()
+			cfg = &config.Config{Calendar: config.CalendarConfig{VdirPath: base}, Accounts: []config.AccountConfig{{Name: "Work", Alias: "work", Email: "me@example.com"}}}
+			col := calendar.Collection{Dir: filepath.Join(base, "work", "Secondary"), Account: "work", Owner: "me@example.com"}
+			event := calendar.Event{ICalUID: "secondary-uid", Subject: "Secondary meeting", Start: time.Date(2026, 8, 7, 9, 0, 0, 0, time.UTC), End: time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC), Organizer: &calendar.Person{Email: "secondary@group.calendar.google.com"}}
+			baseline, wantResponse := calendar.OwnerRespOrganizer, "organizer"
+			if !organizer {
+				event.Attendees = []calendar.Attendee{{Email: col.Owner, Type: "required", Response: "accepted"}}
+				baseline, wantResponse = calendar.OwnerRespAccepted, "accepted"
+			}
+			path, err := calendar.WriteEventIn([]calendar.Collection{col}, "Secondary", event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := &calendarsync.SyncState{Mailbox: col.Owner, Calendars: map[string]calendarsync.CalendarStatus{
+				"secondary": {Dir: "Secondary", Items: map[string]calendarsync.ItemStatus{event.ICalUID: {RemoteID: "remote", OwnerResponse: baseline}}},
+			}}
+			if err := calendarsync.NewFileStateStore(filepath.Dir(col.Dir)).Save(state); err != nil {
+				t.Fatal(err)
+			}
+			capture := func(run func() error) []byte {
+				t.Helper()
+				out, err := os.CreateTemp(t.TempDir(), "stdout")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer out.Close()
+				previous := os.Stdout
+				os.Stdout = out
+				defer func() { os.Stdout = previous }()
+				if err := run(); err != nil {
+					t.Fatal(err)
+				}
+				data, err := os.ReadFile(out.Name())
+				if err != nil {
+					t.Fatal(err)
+				}
+				return data
+			}
+			data := capture(func() error { return runCalendarShow(calendarShowCmd, []string{event.ICalUID}) })
+			var detail calendar.CalendarEvent
+			if err := json.Unmarshal(data, &detail); err != nil || detail.MyResponse != wantResponse {
+				t.Errorf("CLI detail = %s, %v; want %q", data, err, wantResponse)
+			}
+			data = capture(func() error { return runCalendarSearch(calendarSearchCmd, []string{"Secondary"}) })
+			var results []calendar.CalendarEvent
+			if err := json.Unmarshal(data, &results); err != nil || len(results) != 1 || results[0].MyResponse != wantResponse {
+				t.Errorf("CLI search = %s, %v; want %q", data, err, wantResponse)
+			}
+			if organizer {
+				if err := runCalendarRsvp(calendarRsvpCmd, []string{"work", event.ICalUID, "accept"}); err == nil || !strings.Contains(err.Error(), "you are the organizer") {
+					t.Errorf("CLI own RSVP error = %v", err)
+				}
+			} else {
+				capture(func() error { return runCalendarRsvp(calendarRsvpCmd, []string{"work", event.ICalUID, "tentative"}) })
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				parsed, err := calendar.ICalToEvent(data, col.Owner)
+				if err != nil || parsed.OwnerResponse != calendar.OwnerRespTentative {
+					t.Errorf("CLI attendee RSVP = %q, %v", parsed.OwnerResponse, err)
+				}
+			}
+		})
+	}
+}
 
 func TestParseHexColor(t *testing.T) {
 	if r, g, b, ok := parseHexColor("#FF8000"); !ok || r != 255 || g != 128 || b != 0 {

@@ -442,6 +442,7 @@ func runCalendarSearch(cmd *cobra.Command, args []string) error {
 		}
 		for _, e := range cal.Events {
 			if calendar.EventMatchesQuery(e, query) {
+				e = calendarsync.ReadOrganizerRole(cols, cal.Dir, e)
 				matches = append(matches, occurrence{cal: cal, event: e})
 			}
 		}
@@ -498,6 +499,7 @@ func runCalendarShow(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	e = calendarsync.ReadOrganizerRole(cols, path, e)
 	account := calendar.CollectionAccountForPath(cols, path)
 	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)

@@ -372,6 +372,104 @@ func TestProviderOccurrenceZeroDurationFoldAndCivilDates(t *testing.T) {
 	}
 }
 
+func TestReadOrganizerRoleBindingAndPendingRSVP(t *testing.T) {
+	for _, tc := range []struct {
+		name, mailbox, dir, uid, remoteID, account, owner, response, stateFile string
+		baseline                                                               calendar.OwnerResp
+		wantOrganizer                                                          bool
+	}{
+		{"secondary organizer", testOwnerEmail, "Secondary", "uid", "remote", "work", testOwnerEmail, "", "valid", calendar.OwnerRespOrganizer, true},
+		{"case insensitive mailbox", "ME@EXAMPLE.COM", "Secondary", "uid", "remote", "work", "me@example.com", "", "valid", calendar.OwnerRespOrganizer, true},
+		{"wrong mailbox", "other@example.com", "Secondary", "uid", "remote", "work", testOwnerEmail, "", "valid", calendar.OwnerRespOrganizer, false},
+		{"missing mailbox", "", "Secondary", "uid", "remote", "work", testOwnerEmail, "", "valid", calendar.OwnerRespOrganizer, false},
+		{"missing owner", testOwnerEmail, "Secondary", "uid", "remote", "work", "", "", "valid", calendar.OwnerRespOrganizer, false},
+		{"wrong collection", testOwnerEmail, "Other", "uid", "remote", "work", testOwnerEmail, "", "valid", calendar.OwnerRespOrganizer, false},
+		{"unsafe collection", testOwnerEmail, "../Secondary", "uid", "remote", "work", testOwnerEmail, "", "valid", calendar.OwnerRespOrganizer, false},
+		{"missing collection", testOwnerEmail, "", "uid", "remote", "work", testOwnerEmail, "", "valid", calendar.OwnerRespOrganizer, false},
+		{"wrong UID", testOwnerEmail, "Secondary", "different", "remote", "work", testOwnerEmail, "", "valid", calendar.OwnerRespOrganizer, false},
+		{"missing remote ID", testOwnerEmail, "Secondary", "uid", "", "work", testOwnerEmail, "", "valid", calendar.OwnerRespOrganizer, false},
+		{"local only", testOwnerEmail, "Secondary", "uid", "remote", "local", testOwnerEmail, "", "valid", calendar.OwnerRespOrganizer, false},
+		{"missing state", testOwnerEmail, "Secondary", "uid", "remote", "work", testOwnerEmail, "", "missing", calendar.OwnerRespOrganizer, false},
+		{"corrupt state", testOwnerEmail, "Secondary", "uid", "remote", "work", testOwnerEmail, "", "corrupt", calendar.OwnerRespOrganizer, false},
+		{"accepted attendee", testOwnerEmail, "Secondary", "uid", "remote", "work", testOwnerEmail, "accepted", "valid", calendar.OwnerRespAccepted, false},
+		{"pending declined", testOwnerEmail, "Secondary", "uid", "remote", "work", testOwnerEmail, "declined", "valid", calendar.OwnerRespAccepted, false},
+		{"pending accepted with organizer baseline", testOwnerEmail, "Secondary", "uid", "remote", "work", testOwnerEmail, "accepted", "valid", calendar.OwnerRespOrganizer, true},
+		{"pending tentative with organizer baseline", testOwnerEmail, "Secondary", "uid", "remote", "work", testOwnerEmail, "tentativelyAccepted", "valid", calendar.OwnerRespOrganizer, true},
+		{"pending declined with organizer baseline", testOwnerEmail, "Secondary", "uid", "remote", "work", testOwnerEmail, "declined", "valid", calendar.OwnerRespOrganizer, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			accountDir := t.TempDir()
+			col := calendar.Collection{Dir: filepath.Join(accountDir, "Secondary"), Account: tc.account, Owner: tc.owner}
+			if err := os.MkdirAll(col.Dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			statePath := filepath.Join(accountDir, ".durian-calsync-state.json")
+			state := &calendarsync.SyncState{Mailbox: tc.mailbox, Calendars: map[string]calendarsync.CalendarStatus{
+				"secondary": {Name: "Renamed calendar", Dir: tc.dir, Items: map[string]calendarsync.ItemStatus{
+					tc.uid: {RemoteID: tc.remoteID, OwnerResponse: tc.baseline},
+				}},
+			}}
+			switch tc.stateFile {
+			case "valid":
+				if err := calendarsync.NewFileStateStore(accountDir).Save(state); err != nil {
+					t.Fatal(err)
+				}
+			case "corrupt":
+				if err := os.WriteFile(statePath, []byte("{broken"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			event := calendar.Event{ICalUID: "uid", Subject: "Secondary", Start: occurrenceTime("2026-08-07T09:00:00Z"), End: occurrenceTime("2026-08-07T10:00:00Z"), Organizer: &calendar.Person{Email: "secondary@group.calendar.google.com"}}
+			if tc.response != "" {
+				event.Attendees = []calendar.Attendee{{Email: tc.owner, Response: tc.response, Type: "required"}}
+			}
+			data, err := calendar.EventToICal(event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(col.Dir, "legacy-name.ics")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := calendar.ICalToEvent(data, col.Owner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := parsed
+			want.IsOrganizer = tc.wantOrganizer
+			if tc.wantOrganizer && tc.response == "" {
+				want.OwnerResponse = calendar.OwnerRespOrganizer
+			}
+			before, _ := os.ReadDir(accountDir)
+			stateBefore, _ := os.ReadFile(statePath)
+			for _, resolvedPath := range []string{path, col.Dir} {
+				got := calendarsync.ReadOrganizerRole([]calendar.Collection{col}, resolvedPath, parsed)
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("role for %q = %+v, want %+v", resolvedPath, got, want)
+				}
+			}
+			outside := calendarsync.ReadOrganizerRole([]calendar.Collection{col}, filepath.Join(accountDir, "Other", "event.ics"), parsed)
+			if !reflect.DeepEqual(outside, parsed) {
+				t.Error("event outside collection was promoted")
+			}
+			cals, err := calendar.ReadCollections([]calendar.Collection{col})
+			if err != nil || len(cals) != 1 {
+				t.Fatalf("read collection: %v, %+v", err, cals)
+			}
+			got := calendarsync.ReadOccurrences(cals[0], event.Start, event.End)
+			if len(got) != 1 || got[0].IsOrganizer != want.IsOrganizer || got[0].OwnerResponse != want.OwnerResponse {
+				t.Errorf("summary role disagrees with detail: %+v, want %+v", got, want)
+			}
+			after, _ := os.ReadDir(accountDir)
+			stateAfter, _ := os.ReadFile(statePath)
+			icsAfter, _ := os.ReadFile(path)
+			if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(stateBefore, stateAfter) || !reflect.DeepEqual(data, icsAfter) {
+				t.Error("offline role reads changed state or ICS")
+			}
+		})
+	}
+}
+
 func TestOccurrenceCacheIsNotSyncState(t *testing.T) {
 	master := gapMaster()
 	p := &occurrenceProvider{fakeProvider: &fakeProvider{events: []Event{master}}}

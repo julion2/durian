@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/julion2/durian/cli/internal/calendar"
+	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
 )
 
@@ -251,6 +252,7 @@ func (h *Handler) CalendarPutEventHandler(w http.ResponseWriter, r *http.Request
 		if refuseReadOnly(w, cols, calName) {
 			return
 		}
+		existing = calendarsync.ReadOrganizerRole(cols, path, existing)
 		merged := existing
 		merged.Subject = ev.Subject
 		merged.Start = ev.Start

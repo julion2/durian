@@ -117,8 +117,9 @@ type Event struct {
 	// Organizer is the meeting organizer; nil for plain appointments.
 	Organizer *Person
 	// IsOrganizer reports whether the account owner organizes this meeting.
-	// Only set on the Graph read path; local files identify the organizer via
-	// Organizer/owner email comparison instead.
+	// Providers set it from their own role metadata. Offline reads can restore
+	// it from mailbox-bound sync state when ORGANIZER is a calendar address
+	// rather than the account email; it is not stored as an ICS self-role flag.
 	IsOrganizer bool
 	// IsCancelled reports whether the meeting has been cancelled remotely.
 	IsCancelled bool

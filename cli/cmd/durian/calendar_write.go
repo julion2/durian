@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/julion2/durian/cli/internal/calendar"
+	"github.com/julion2/durian/cli/internal/calendarsync"
 	"github.com/julion2/durian/cli/internal/config"
 	"github.com/spf13/cobra"
 )
@@ -217,6 +218,7 @@ func runCalendarModify(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("resolve event: %w", err)
 	}
+	event = calendarsync.ReadOrganizerRole(cols, path, event)
 	for _, col := range cols {
 		if col.ReadOnly && strings.EqualFold(calendar.CollectionName(col), calName) {
 			return fmt.Errorf("calendar %q is read-only: %w", calName, calendar.ErrReadOnly)
@@ -383,6 +385,7 @@ func runCalendarRsvp(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	event = calendarsync.ReadOrganizerRole(cols, path, event)
 	owner := calendar.CollectionOwner(cols, calName)
 
 	if isOwnerOrganizer(event, owner) {
@@ -424,7 +427,7 @@ func isOwnerOrganizer(e calendar.Event, owner string) bool {
 	if e.OwnerResponse == calendar.OwnerRespOrganizer {
 		return true
 	}
-	return e.Organizer != nil && owner != "" && strings.EqualFold(e.Organizer.Email, owner)
+	return calendar.OwnerIsOrganizer(e, owner)
 }
 
 func runCalendarDelete(cmd *cobra.Command, args []string) error {
@@ -439,6 +442,7 @@ func runCalendarDelete(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	event = calendarsync.ReadOrganizerRole(cols, path, event)
 
 	if !calDeleteYes {
 		if !canPrompt() {
