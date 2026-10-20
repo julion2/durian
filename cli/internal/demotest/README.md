@@ -24,6 +24,17 @@ delivery difference, not a Durian parser exception. The first readback exposed a
 test-guard bug rejecting Graph's OData folder-delta cursor. After fixing that
 narrow GET path, readback of the **same** message passed without another send.
 
+The additional MIME-edge case (2026-10-20) delivered one Gmail → Outlook blind
+copy through the same outbox/sync/HTTP path. Four attachments survived: UTF-8
+text, nested Shift_JIS `.eml`, a long quoted Unicode filename, and 86,022 bytes
+with binary data after an ASCII prefix. Two initial expectations were wrong:
+RFC 5322 §3.6.3 permits the blind recipient's own Bcc address in its copy;
+Outlook also reserialized the attached email (quoted charset and reordered
+MIME-Version, 238 → 240 bytes). Direct Graph MIME and Python's independent email
+parser confirmed this before changing expectations. The decoded Japanese text
+was unchanged. Readback of the original message then passed, with no resend.
+This two-party test does not prove privacy between multiple blind recipients.
+
 ## Preconditions and commands
 
 Use only the two dedicated, quiescent demo mailboxes. Disable mailbox forwarding
@@ -73,6 +84,11 @@ an already-sent HTML case without enqueueing or sending, set
 that test. The marker is not a credential; it must match the original test case.
 Readback mode refuses a bidirectional run and asserts zero sender invocations.
 
+`TestLiveMIMEEdgesPublicFlow` likewise sends exactly one new message; its
+readback-only mode accepts the marker of a prior MIME-edge run. It characterizes
+the observed Graph `.eml` normalization explicitly rather than normalizing all
+attachments or ignoring byte mismatches.
+
 ## Exercised path and bounds
 
 One modest Unicode subject/body message with a deterministic 51-byte UTF-8
@@ -107,7 +123,7 @@ exits. On uncertainty, use the dedicated mailboxes privately, not an automatic
 resend. Output contains only fixed stage diagnostics and direction numbers;
 production logs are discarded to avoid IDs, subjects, addresses or token leaks.
 
-## Guard extension and deferred capture
+## Guard extension and limited replay
 
 Graph flag synchronization uses `POST /v1.0/$batch`. The only allowed exception
 is 1–20 unique numbered subrequests, all exact `GET
@@ -120,10 +136,15 @@ Opaque Graph cursor reads also permit the provider's exact
 `/me/mailFolders('safe-id')/messages/delta` spelling. This does not allow arbitrary
 OData predicates, alternate users, percent-encoded paths or mutations.
 
-**Mail capture/replay is deferred.** The existing `calendartest.Recorder` is
-calendar-JSON-specific: it cannot preserve MIME faithfully, retains subjects/IDs,
-and has no per-demo-message mailbox-content gate. Wiring it around mailbox
-enumeration could retain unrelated third-party content. This slice therefore
-does not record provider responses. A follow-up needs an explicit mail allowlist,
-strict run-marker/ownership filtering, MIME sanitization and offline replay;
-current offline tests use synthetic transports only.
+`TestReceivedMIMEReplayThroughSyncAndHTTP` replays the redacted Graph `$value`
+response from the MIME-edge case through the real Graph backend, encrypted sync,
+HTTP search/thread/body and attachment downloads, then closes/reopens the store
+and syncs again. The fixture's provenance and redactions are in
+`testdata/README.md`. Reverting multipart attachment sizes to encoded bytes made
+both replay phases fail; restoring decoded sizes passed.
+
+**This is not a complete mail wire recorder.** Provider identity, folder/delta
+JSON and flag envelopes in this replay are synthetic. The existing calendar
+recorder cannot safely wrap arbitrary mail: a general recorder still needs
+strict per-message ownership filtering and MIME-aware redaction before retaining
+any mailbox enumeration or responses. No third-party mail was recorded.

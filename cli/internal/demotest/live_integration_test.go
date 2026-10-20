@@ -43,22 +43,38 @@ const liveAttachment = "Durian LIVE attachment v1\ncafé / 日本語 / 🥭\n"
 // response, attachment metadata, sender serialization or store readback.
 const liveAttachmentSHA256 = "d60a3987e9d99b784cab1225fc9b79d60776a33db312f429e0d6836af5277602"
 
+type liveMailCase int
+
+const (
+	livePlain liveMailCase = iota
+	liveHTML
+	liveMIMEEdges
+)
+
 // TestLiveMailPublicFlow is deliberately absent from normal test builds. It
 // leaves TWO intentional demo mails in the dedicated mailboxes, never deletes
 // existing mail, and never enqueues a replacement after a timeout/error.
 // Run only after the Microsoft credential refresh worker has finished.
 func TestLiveMailPublicFlow(t *testing.T) {
-	exerciseLiveMail(t, []int{0, 1}, false)
+	exerciseLiveMail(t, []int{0, 1}, livePlain)
 }
 
 // One additional, distinct Gmail→Graph message, not a retry of the unresolved
 // Graph→Gmail delivery. Covers HTML, Unicode filenames, empty attachments and
 // a nontrivial binary attachment through the same public outbox/sync path.
 func TestLiveHTMLPublicFlow(t *testing.T) {
-	exerciseLiveMail(t, []int{0}, true)
+	exerciseLiveMail(t, []int{0}, liveHTML)
 }
 
-func exerciseLiveMail(t *testing.T, directions []int, html bool) {
+// Independently authored integration inputs inspired by Thunderbird's
+// test_bcc.js and test_attachment.js contracts, not copied MPL fixtures/code.
+// One new Gmail→Outlook Bcc delivery covers a nested non-UTF-8 email, a long
+// quoted Unicode filename, and binary bytes after a substantial ASCII prefix.
+func TestLiveMIMEEdgesPublicFlow(t *testing.T) {
+	exerciseLiveMail(t, []int{0}, liveMIMEEdges)
+}
+
+func exerciseLiveMail(t *testing.T, directions []int, variant liveMailCase) {
 	t.Helper()
 	if os.Getenv("DURIAN_MAIL_LIVE_TEST") != "1" {
 		t.Skip("requires explicit mail live-test opt-in")
@@ -156,9 +172,13 @@ func exerciseLiveMail(t *testing.T, directions []int, html bool) {
 		}
 		// No subtest: a failure aborts the entire run instead of sending the
 		// other direction after an uncertain outcome.
-		exerciseLiveDirection(t, ctx, client, server.URL, db, mailDemo, from, to, marker, html, resume != "")
+		t.Logf("case %d, run marker %s (readback-only=%v)", variant, marker, resume != "")
+		exerciseLiveDirection(t, ctx, client, server.URL, db, mailDemo, from, to, marker, variant, resume != "")
 		if attempted[from.AccountIdentifier()].Load() != (resume == "") {
 			t.Fatal("public outbox did not invoke the guarded sender")
+		}
+		if t.Failed() {
+			t.FailNow()
 		}
 		t.Logf("direction %d passed (readback-only=%v): provider/sync/search/thread/body/attachment bytes and account ownership", direction+1, resume != "")
 	}
@@ -188,10 +208,11 @@ func (s *singleLiveSend) SendAfterPersist(ctx context.Context, msg *mailsend.Mes
 	return s.sender.SendAfterPersist(ctx, msg, persist)
 }
 
-func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Client, base string, db *store.DB, m *demotest.Mail, from, to *config.AccountConfig, marker string, html, readback bool) {
+func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Client, base string, db *store.DB, m *demotest.Mail, from, to *config.AccountConfig, marker string, variant liveMailCase, readback bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
 	defer cancel()
+	html := variant == liveHTML
 	subject := "Durian Test LIVE café 日本語 🥭 " + marker
 	body := "Bonjour café — 日本語 — 🥭\nBounded two-party mail demo.\n" + marker
 	type attachment struct {
@@ -210,8 +231,26 @@ func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Cl
 			attachment{"empty.txt", "text/plain", []byte{}},
 			attachment{"binary-768k.bin", "application/octet-stream", bytes.Repeat(pattern, 3072)})
 	}
+	if variant == liveMIMEEdges {
+		body = "Bcc: is ordinary body text, not a transport header.\n" + body
+		// Python's independent Shift_JIS codec encodes 会議の資料です as
+		// ie+LY4LMjpGXv4LFgrc=. All nested addresses are synthetic fixtures.
+		nested := "From: Nested Author <author@example.invalid>\r\nTo: Reader <reader@example.invalid>\r\n" +
+			"Subject: Encoded meeting notes\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=Shift_JIS\r\n" +
+			"Content-Transfer-Encoding: base64\r\n\r\nie+LY4LMjpGXv4LFgrc=\r\n"
+		lateBinary := append(bytes.Repeat([]byte("ASCII planning notes\n"), 4096), 0, 255, 128, 1, 2, 3)
+		attachments = append(attachments,
+			attachment{"nested-shift-jis.eml", "message/rfc822", []byte(nested)},
+			attachment{"récapitulatif 日本語; \"budget\" " + strings.Repeat("segment-", 18) + ".bin", "application/octet-stream", []byte{0, 255, 127, 128, 42}},
+			attachment{"ascii-then-binary.bin", "application/octet-stream", lateBinary})
+	}
 	draft := handler.OutboxDraft{IdempotencyKey: marker, From: from.Email, To: []string{to.Email}, Subject: subject, Body: body,
 		IsHTML: html}
+	expectedTo := to.Email
+	if variant == liveMIMEEdges {
+		draft.To, draft.BCC = []string{from.Email}, []string{to.Email}
+		expectedTo = from.Email
+	}
 	for _, a := range attachments {
 		draft.Attachments = append(draft.Attachments, handler.OutboxAttachment{Filename: a.name, MIMEType: a.mime, DataBase64: base64.StdEncoding.EncodeToString(a.data)})
 	}
@@ -221,6 +260,16 @@ func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Cl
 		// attachment API omit empty.txt. Characterize that delivery behavior,
 		// not a Durian parser exception: nonempty filenames/bytes must survive.
 		received = []attachment{attachments[0], attachments[2]}
+	}
+	if variant == liveMIMEEdges {
+		// The real Graph $value response reserializes the attached message:
+		// charset gains quotes (+2 bytes) and MIME-Version moves after CTE.
+		// Confirmed independently with Python's email parser; the nested
+		// decoded text remains 会議の資料です. Other attachments stay exact.
+		received = append([]attachment(nil), attachments...)
+		received[1].data = []byte("From: Nested Author <author@example.invalid>\r\nTo: Reader <reader@example.invalid>\r\n" +
+			"Subject: Encoded meeting notes\r\nContent-Type: text/plain; charset=\"Shift_JIS\"\r\n" +
+			"Content-Transfer-Encoding: base64\r\nMIME-Version: 1.0\r\n\r\nie+LY4LMjpGXv4LFgrc=\r\n")
 	}
 	var enqueued struct {
 		OK bool  `json:"ok"`
@@ -293,8 +342,18 @@ func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Cl
 					}
 					fromAddr, fromErr := mail.ParseAddress(msg.From)
 					toAddrs, toErr := mail.ParseAddressList(msg.To)
-					if fromErr != nil || toErr != nil || fromAddr.Address != from.Email || len(toAddrs) != 1 || toAddrs[0].Address != to.Email {
+					if fromErr != nil || toErr != nil || fromAddr.Address != from.Email || len(toAddrs) != 1 || toAddrs[0].Address != expectedTo {
 						t.Fatal("received envelope or unicode body mismatch")
+					}
+					if variant == liveMIMEEdges && msg.BCC != "" {
+						// RFC 5322 §3.6.3 permits a blind recipient's copy to
+						// retain its own Bcc address. This two-party case cannot
+						// prove privacy between multiple blind recipients.
+						bcc, err := mail.ParseAddressList(msg.BCC)
+						if err != nil || len(bcc) != 1 || bcc[0].Address != to.Email {
+							t.Fatal("received Bcc metadata exposed an unexpected recipient")
+						}
+						t.Log("blind recipient copy contains only its own Bcc address (RFC 5322 §3.6.3)")
 					}
 					var quoted protocol.Response
 					liveJSON(t, ctx, client, base, "GET", "/api/v1/message/body?id="+url.QueryEscape(msg.ID), nil, &quoted)
@@ -321,11 +380,11 @@ func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Cl
 							}
 							found++
 							if actual.Size != len(expected.data) {
-								t.Fatal("attachment metadata reports encoded rather than decoded bytes")
+								t.Errorf("attachment %q metadata size %d differs from submitted %d bytes", expected.name, actual.Size, len(expected.data))
 							}
 							data := liveHTTP(t, ctx, client, base, "GET", fmt.Sprintf("/api/v1/messages/%s/attachments/%d", url.PathEscape(msg.ID), actual.PartID), nil)
 							if !bytes.Equal(data, expected.data) {
-								t.Fatal("HTTP attachment bytes differ from independently constructed input")
+								t.Errorf("attachment %q readback (%d bytes) differs from submitted input", expected.name, len(data))
 							}
 							if expected.mime == "text/plain" && len(expected.data) > 0 {
 								sum := sha256.Sum256(data)
