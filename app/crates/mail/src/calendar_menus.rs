@@ -196,6 +196,7 @@ mod tests {
             description: None,
             attendees,
             rsvp: Rsvp::NeedsAction,
+            is_organizer: false,
             recurrence: None,
             occurrence_source: None,
             series: series.then(|| "s".into()),
@@ -219,12 +220,17 @@ mod tests {
 
         let series = plan(&event(Vec::new(), true), &s, false);
         assert!(series.ends_with(&[Entry::Delete("Delete this event"), Entry::DeleteSeries]));
+
+        let mut secondary = event(vec![person("Secondary", "secondary@group.calendar.google.com", true)], false);
+        secondary.is_organizer = true;
+        assert!(plan(&secondary, &s, false).contains(&Entry::Edit), "explicit organizer authority allows edits without an account-email match");
     }
 
     #[test]
     fn invitations_are_answered_not_edited() {
         let s = schedule();
-        let invite = event(vec![person("Tobias Brandt", "tobias@habric.com", true), person("Julian Schenker", "julian@habric.com", false)], true);
+        let mut invite = event(vec![person("Tobias Brandt", "tobias@habric.com", true), person("Julian Schenker", "julian@habric.com", false)], true);
+        invite.rsvp = Rsvp::Accepted;
         let entries = plan(&invite, &s, true);
         assert_eq!(&entries[..3], &[Entry::Answer("Going", Rsvp::Accepted), Entry::Answer("Maybe", Rsvp::Tentative), Entry::Answer("Not going", Rsvp::Declined)]);
         assert!(entries.contains(&Entry::ShowInvitation) && entries.contains(&Entry::EmailOrganizer("Tobias".into())));

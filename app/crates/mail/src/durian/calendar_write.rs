@@ -265,7 +265,7 @@ impl CalendarWrites {
                     schedule.events.retain(|event| !reference(event).is_ok_and(|at| outcome.removed.contains(&at)));
                     if let Some((account, wire)) = &outcome.event {
                         if let Some((mut event, _)) = calendar_event(account, wire) {
-                            (event.description, event.attendees, event.rsvp) = event_detail(wire, &me, event.rsvp);
+                            (event.description, event.attendees, event.rsvp, event.is_organizer) = event_detail(wire, &me, event.rsvp);
                             saved = event.id.clone();
                             schedule.apply_event(event, cx);
                         }
@@ -314,7 +314,7 @@ impl CalendarWrites {
                     Ok((at, wire)) => {
                         let Some((mut master, _)) = calendar_event(&at.account, &wire) else { return };
                         let schedule = this.schedule.read(cx);
-                        (master.description, master.attendees, master.rsvp) = event_detail(&wire, &schedule.me, master.rsvp);
+                        (master.description, master.attendees, master.rsvp, master.is_organizer) = event_detail(&wire, &schedule.me, master.rsvp);
                         if !schedule.is_own(&master) {
                             cx.emit(WriteEvent::Notice("Only the organizer can edit this meeting.".into()));
                             return;

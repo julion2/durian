@@ -80,8 +80,8 @@ pub enum LiveEvent {
     Downloaded(std::path::PathBuf),
 }
 
-/// An event's detail: description, guests, your answer.
-type Detail = (Option<SharedString>, Vec<Attendee>, Rsvp);
+/// An event's detail: description, guests, your answer, explicit organizer authority.
+type Detail = (Option<SharedString>, Vec<Attendee>, Rsvp, bool);
 
 /// The connect, started before the window exists (`Live::preconnect` at the top of `main`):
 /// window bring-up (~150–450 ms) and the first requests overlap instead of adding up.
@@ -1277,8 +1277,8 @@ impl Live {
             for e in &found {
                 let Some((mut event, at)) = calendar_event(&account, e) else { continue };
                 // guests already known survive the reload
-                if let Some((description, attendees, rsvp)) = self.details.get(&at) {
-                    (event.description, event.attendees, event.rsvp) = (description.clone(), attendees.clone(), *rsvp);
+                if let Some((description, attendees, rsvp, is_organizer)) = self.details.get(&at) {
+                    (event.description, event.attendees, event.rsvp, event.is_organizer) = (description.clone(), attendees.clone(), *rsvp, *is_organizer);
                 }
                 self.refs.insert(event.id.clone(), at);
                 events.push(event);
@@ -1326,10 +1326,10 @@ impl Live {
         };
         let ids: Vec<SharedString> = self.refs.iter().filter(|(_, r)| **r == at).map(|(id, _)| id.clone()).collect();
         let fallback = ids.first().and_then(|id| self.schedule.read(cx).event(id)).map_or(Rsvp::Accepted, |e| e.rsvp);
-        let (description, attendees, rsvp) = event_detail(&detail, &self.me, fallback);
+        let (description, attendees, rsvp, is_organizer) = event_detail(&detail, &self.me, fallback);
         trace::note(&format!("durian: event detail: {} guests, {} occurrences", attendees.len(), ids.len()));
-        self.details.insert(at, (description.clone(), attendees.clone(), rsvp));
-        self.schedule.update(cx, |s, cx| s.fill_detail(&ids, description, attendees, rsvp, cx));
+        self.details.insert(at, (description.clone(), attendees.clone(), rsvp, is_organizer));
+        self.schedule.update(cx, |s, cx| s.fill_detail(&ids, description, attendees, rsvp, is_organizer, cx));
     }
 }
 

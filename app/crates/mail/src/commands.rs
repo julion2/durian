@@ -252,6 +252,7 @@ pub fn event_from(parsed: &calendar::parse::Parsed, calendar: SharedString, mail
         description: None,
         attendees,
         rsvp: Rsvp::Accepted,
+        is_organizer: true,
         recurrence: None,
         occurrence_source: None,
         series: None,

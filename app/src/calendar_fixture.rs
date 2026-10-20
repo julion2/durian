@@ -87,6 +87,7 @@ pub fn load(today: NaiveDate, avatars: &HashMap<String, SharedString>, me: Vec<S
                 description: raw.description.clone(),
                 attendees: attendees.clone(),
                 rsvp: raw.rsvp.unwrap_or(Rsvp::Accepted),
+                is_organizer: false,
                 recurrence: raw.recurrence.clone(),
                 occurrence_source: None,
                 series: raw.repeat.is_some().then(|| raw.id.clone()),

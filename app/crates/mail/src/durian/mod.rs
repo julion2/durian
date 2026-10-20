@@ -390,6 +390,7 @@ pub fn calendar_event(account: &SharedString, e: &api::CalendarEvent) -> Option<
         description: None,
         attendees: Vec::new(),
         rsvp,
+        is_organizer: e.my_response.as_deref() == Some("organizer"),
         recurrence: e.recurring.then(|| "Repeats".into()),
         occurrence_source: e.occurrence_source.clone().map(Into::into),
         series: e.recurring.then(|| series.into()),
@@ -405,7 +406,7 @@ pub fn invitation(account: &SharedString, i: &api::Invitation) -> Option<crate::
     use crate::invite::Kind;
     let (mut event, _) = calendar_event(account, &i.event)?;
     let rsvp = answer(i.event.my_response.as_deref().unwrap_or(""));
-    (event.description, event.attendees, event.rsvp) = event_detail(&i.event, &[], rsvp);
+    (event.description, event.attendees, event.rsvp, event.is_organizer) = event_detail(&i.event, &[], rsvp);
     let kind = match i.method.as_deref() {
         Some("REQUEST") => Kind::Request,
         Some("CANCEL") => Kind::Cancel,
@@ -415,10 +416,10 @@ pub fn invitation(account: &SharedString, i: &api::Invitation) -> Option<crate::
     Some(crate::invite::Invitation { event, kind, occurrence: i.occurrence })
 }
 
-/// The detail's guests (organizer first) and your answer: an organizer you are means it's
-/// yours; otherwise your attendee entry tells; if you're not listed, the summary's answer
-/// (`fallback`) stands.
-pub fn event_detail(e: &api::CalendarEvent, me: &[SharedString], fallback: Rsvp) -> (Option<SharedString>, Vec<Attendee>, Rsvp) {
+/// Description, guests (organizer first), your answer, and explicit provider organizer
+/// authority. Address matching decides the answer, not provider authority; if you're
+/// not listed, the summary's answer (`fallback`) stands.
+pub fn event_detail(e: &api::CalendarEvent, me: &[SharedString], fallback: Rsvp) -> (Option<SharedString>, Vec<Attendee>, Rsvp, bool) {
     let mine = |email: &str| me.iter().any(|m| m.eq_ignore_ascii_case(email));
     let mut attendees: Vec<Attendee> = Vec::new();
     if let Some(o) = e.organizer.as_ref().filter(|o| !o.email.is_empty()) {
@@ -438,7 +439,7 @@ pub fn event_detail(e: &api::CalendarEvent, me: &[SharedString], fallback: Rsvp)
         None => fallback,
     };
     let description = e.description.clone().filter(|d| !d.trim().is_empty()).map(Into::into);
-    (description, attendees, rsvp)
+    (description, attendees, rsvp, e.my_response.as_deref() == Some("organizer"))
 }
 
 #[cfg(test)]
@@ -818,18 +819,63 @@ mod tests {
         let invited = event(r#"{"calendar":"W","uid":"u","start":"2026-10-12","end":"2026-10-13",
             "organizer":{"name":"Mara","email":"mara@x.org"},
             "attendees":[{"name":"Mara","email":"mara@x.org","response":"accepted"},{"name":"","email":"Ada@work.dev","response":"notResponded"}]}"#);
-        let (_, guests, rsvp) = event_detail(&invited, &me, Rsvp::Accepted);
+        let (_, guests, rsvp, is_organizer) = event_detail(&invited, &me, Rsvp::Accepted);
         assert_eq!(guests.len(), 2, "the organizer isn't listed twice");
         assert!(guests[0].organizer && guests[1].name == "Ada@work.dev");
         assert_eq!(rsvp, Rsvp::NeedsAction);
+        assert!(!is_organizer);
 
-        let own = event(r#"{"calendar":"W","uid":"u","start":"2026-10-12","end":"2026-10-13","organizer":{"email":"ada@work.dev"},"attendees":[{"email":"bob@y","response":"tentativelyAccepted"}]}"#);
-        let (_, guests, rsvp) = event_detail(&own, &me, Rsvp::NeedsAction);
+        let own = event(r#"{"calendar":"W","uid":"u","start":"2026-10-12","end":"2026-10-13","all_day":true,"organizer":{"email":"ada@work.dev"},"attendees":[{"email":"bob@y","response":"tentativelyAccepted"}]}"#);
+        let (_, guests, rsvp, _) = event_detail(&own, &me, Rsvp::NeedsAction);
         assert_eq!((rsvp, guests[1].rsvp), (Rsvp::Accepted, Rsvp::Tentative));
 
         let unlisted = event(r#"{"calendar":"W","uid":"u","start":"2026-10-12","end":"2026-10-13","description":"  "}"#);
-        let (description, _, rsvp) = event_detail(&unlisted, &me, Rsvp::Declined);
+        let (description, _, rsvp, _) = event_detail(&unlisted, &me, Rsvp::Declined);
         assert_eq!((description, rsvp), (None, Rsvp::Declined));
+
+        let schedule = calendar::model::Schedule::new(calendar::model::CalendarData {
+            calendars: Vec::new(), events: Vec::new(), me: me.clone(),
+        }, NaiveDate::from_ymd_opt(2026, 10, 12).unwrap());
+        // A provider-owned secondary calendar organizes as its own address, not
+        // the account email. Both master-edit and post-save use this mapping.
+        let secondary = event(r#"{"calendar":"W","uid":"u","start":"2026-10-12","end":"2026-10-13","all_day":true,
+            "my_response":"organizer","organizer":{"name":"Secondary","email":"secondary@group.calendar.google.com"},
+            "attendees":[{"email":"guest@x.org","response":"accepted"}]}"#);
+        let (mut mapped, _) = calendar_event(&"work".into(), &secondary).unwrap();
+        assert!(mapped.is_organizer, "the summary retains the provider role before detail hydration");
+        (mapped.description, mapped.attendees, mapped.rsvp, mapped.is_organizer) = event_detail(&secondary, &me, mapped.rsvp);
+        assert!(schedule.is_own(&mapped), "provider organizer role must authorize editing even with a different organizer email");
+        assert_eq!(mapped.attendees[0].email, "secondary@group.calendar.google.com");
+        assert_eq!(schedule.me, me, "organizer identities must not become account aliases");
+        let seed = crate::event_compose::EventSeed::edit(mapped.clone(), &me);
+        assert_eq!(seed.guests, vec![SharedString::from("guest@x.org")]);
+        let calendars: Vec<calendar::model::CalendarInfo> = serde_json::from_str(r##"[{"id":"work/W","name":"W","account":"work","color":"#123456"}]"##).unwrap();
+        let write = calendar_write::event_write(seed.editing.as_ref().unwrap(), false, &calendars).unwrap();
+        assert_eq!(write.attendees, ["guest@x.org"], "the synthesized organizer row is display-only, not a guest");
+        mapped.attendees.retain(|a| a.organizer);
+        let seed = crate::event_compose::EventSeed::edit(mapped.clone(), &me);
+        assert!(seed.guests.is_empty());
+        assert!(seed.editing.as_ref().unwrap().is_organizer);
+        let write = calendar_write::event_write(seed.editing.as_ref().unwrap(), false, &calendars).unwrap();
+        assert!(write.attendees.is_empty(), "an organizer-only display row must not turn a solo event into an invitation");
+        mapped.rsvp = Rsvp::Declined;
+        assert!(schedule.is_own(&mapped), "organizer authority is independent of the displayed answer");
+
+        let mut accepted = secondary.clone();
+        accepted.my_response = Some("accepted".into());
+        accepted.attendees.push(serde_json::from_str(r#"{"email":"ada@work.dev","response":"accepted"}"#).unwrap());
+        let (mut foreign, _) = calendar_event(&"work".into(), &accepted).unwrap();
+        assert!(!foreign.is_organizer);
+        (foreign.description, foreign.attendees, foreign.rsvp, foreign.is_organizer) = event_detail(&accepted, &me, foreign.rsvp);
+        assert_eq!(foreign.rsvp, Rsvp::Accepted);
+        assert!(!schedule.is_own(&foreign), "accepting a foreign invitation never grants edit authority");
+
+        let (mut fallback, _) = calendar_event(&"work".into(), &own).unwrap();
+        (fallback.description, fallback.attendees, fallback.rsvp, fallback.is_organizer) = event_detail(&own, &me, fallback.rsvp);
+        assert!(!fallback.is_organizer);
+        assert!(schedule.is_own(&fallback), "configured organizer email remains a fallback");
+        fallback.attendees.clear();
+        assert!(schedule.is_own(&fallback), "local/demo events without an organizer remain editable");
     }
 }
 

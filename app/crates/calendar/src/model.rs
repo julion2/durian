@@ -92,6 +92,11 @@ pub struct Event {
     pub attendees: Vec<Attendee>,
     /// the user's own answer
     pub rsvp: Rsvp,
+    /// Explicit organizer authority: the provider's `my_response = organizer`,
+    /// or a locally authored draft. Independent of RSVP and organizer identity:
+    /// a secondary calendar may organize as an address outside `Schedule.me`.
+    /// False means no explicit evidence; the organizer-email fallback still applies.
+    pub is_organizer: bool,
     /// "Every weekday", "Weekly on Tuesday" – display only, occurrences are expanded by the source
     pub recurrence: Option<SharedString>,
     /// "provider" or "local-estimate" for synced series; absent for local events.
@@ -365,20 +370,22 @@ impl Schedule {
         cx.notify();
     }
 
-    /// What only an event's detail carries (guests, organizer, description, your answer), for
+    /// What an event's detail carries (guests, organizer authority, description, your answer), for
     /// every listed occurrence of it. From the data source, so allowed when read-only.
-    pub fn fill_detail(&mut self, ids: &[SharedString], description: Option<SharedString>, attendees: Vec<Attendee>, rsvp: Rsvp, cx: &mut Context<Self>) {
+    pub fn fill_detail(&mut self, ids: &[SharedString], description: Option<SharedString>, attendees: Vec<Attendee>, rsvp: Rsvp, is_organizer: bool, cx: &mut Context<Self>) {
         for event in self.events.iter_mut().filter(|e| ids.contains(&e.id)) {
             event.description = description.clone();
             event.attendees = attendees.clone();
             event.rsvp = rsvp;
+            event.is_organizer = is_organizer;
         }
         cx.notify();
     }
 
-    /// Yours to edit and delete: nobody else organizes it.
+    /// Explicit provider authority wins over address matching. RSVP never grants
+    /// ownership. With no evidence, retain the email/local-demo fallback.
     pub fn is_own(&self, event: &Event) -> bool {
-        event.attendees.iter().find(|a| a.organizer).is_none_or(|o| self.me.iter().any(|m| m.eq_ignore_ascii_case(&o.email)))
+        event.is_organizer || event.attendees.iter().find(|a| a.organizer).is_none_or(|o| self.me.iter().any(|m| m.eq_ignore_ascii_case(&o.email)))
     }
 
     /// Take events out (delete, cancel, remove); returns them for undo.
@@ -437,6 +444,7 @@ impl Schedule {
         copy.series = None;
         copy.recurrence = None;
         copy.rsvp = Rsvp::Accepted;
+        copy.is_organizer = true;
         copy.attendees.clear();
         self.add_event(copy, cx);
     }

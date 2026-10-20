@@ -253,8 +253,14 @@ impl EventComposer {
         let owner_name = owner.map(|a| a.name.clone()).unwrap_or_else(|| mailbox.me.name.clone());
         let guests = self.guests.read(cx).recipients();
         let mut attendees: Vec<Attendee> = Vec::new();
-        if !guests.is_empty() {
+        // Retain the real organizer identity on edit, including a secondary
+        // calendar address. This display row is never serialized as a guest.
+        if let Some(organizer) = self.editing.as_ref().and_then(|e| e.attendees.iter().find(|a| a.organizer)) {
+            attendees.push(organizer.clone());
+        } else if !guests.is_empty() {
             attendees.push(Attendee { name: owner_name, email: owner_email, rsvp: Rsvp::Accepted, organizer: true, avatar: None });
+        }
+        if !guests.is_empty() {
             for guest in guests {
                 let parsed = crate::durian::parse_address(&guest);
                 if !parsed.email.contains('@') {
@@ -298,6 +304,7 @@ impl EventComposer {
             description: (!notes.is_empty()).then(|| notes.into()),
             attendees,
             rsvp: editing.as_ref().map_or(Rsvp::Accepted, |e| e.rsvp),
+            is_organizer: editing.as_ref().is_none_or(|e| e.is_organizer),
             recurrence: editing.as_ref().and_then(|e| e.recurrence.clone()),
             occurrence_source: None,
             series: editing.as_ref().and_then(|e| e.series.clone()),
