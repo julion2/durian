@@ -35,6 +35,15 @@ parser confirmed this before changing expectations. The decoded Japanese text
 was unchanged. Readback of the original message then passed, with no resend.
 This two-party test does not prove privacy between multiple blind recipients.
 
+One distinct Gmail → Outlook iTIP REQUEST then passed the same public path,
+including the HTTP thread's invitation projection, exact attachment bytes,
+organizer/attendee identity and 09:00 Berlin winter time → 08:00 UTC. The received
+MIME contains both an inline calendar alternative and the attached ICS. The
+fixture uses an explicit VTIMEZONE and only the two verified demo addresses.
+Delivery passed in 19.48 seconds; readback of the same message passed in 3.77
+seconds without sending again. This proves invitation delivery/reading, **not**
+provider-calendar RSVP, organizer cancellation or attendee time proposals.
+
 ## Preconditions and commands
 
 Use only the two dedicated, quiescent demo mailboxes. Disable mailbox forwarding
@@ -89,6 +98,10 @@ readback-only mode accepts the marker of a prior MIME-edge run. It characterizes
 the observed Graph `.eml` normalization explicitly rather than normalizing all
 attachments or ignoring byte mismatches.
 
+`TestLiveInvitationPublicFlow` sends one new REQUEST with a calendar attachment;
+it also supports readback-only mode. It is not an organizer calendar-create
+test, and does not grant calendar-API notification/RSVP access to the guards.
+
 ## Exercised path and bounds
 
 One modest Unicode subject/body message with a deterministic 51-byte UTF-8
@@ -116,8 +129,11 @@ delivery/readback deadline; the second direction never runs after a failure.
    must equal the independently fixed input hash.
 
 Successful messages and any provider drafts left by a failure are **preserved**.
-No remote deletion, reconciliation requeue, invitation, inferred-recipient reply,
-or large upload session is enabled. Temporary local state is removed on exit;
+No remote deletion, reconciliation requeue, calendar-API invitation/RSVP,
+inferred-recipient reply, or large upload session is enabled. The iTIP MIME case
+explicitly authors only the two demo addresses as organizer/attendee; the mail
+guard checks transport recipients, not arbitrary embedded calendar recipients.
+Temporary local state is removed on exit;
 there is deliberately no recoverable local key/outbox after the test process
 exits. On uncertainty, use the dedicated mailboxes privately, not an automatic
 resend. Output contains only fixed stage diagnostics and direction numbers;
@@ -143,8 +159,37 @@ and syncs again. The fixture's provenance and redactions are in
 `testdata/README.md`. Reverting multipart attachment sizes to encoded bytes made
 both replay phases fail; restoring decoded sizes passed.
 
+The same replay also covers the received REQUEST, including its inline and
+attached calendar copies, through encrypted sync and HTTP before/after reopening.
+
 **This is not a complete mail wire recorder.** Provider identity, folder/delta
 JSON and flag envelopes in this replay are synthetic. The existing calendar
 recorder cannot safely wrap arbitrary mail: a general recorder still needs
 strict per-message ownership filtering and MIME-aware redaction before retaining
 any mailbox enumeration or responses. No third-party mail was recorded.
+
+## Authored monthly calendar integration
+
+`calendar_live_integration_test` is a separate manual build-tagged target. Build
+it, resolve its binary with `bazel cquery --output=files`, then run exactly
+`-test.run='^TestLiveMonthlyCalendarThroughSync$' -test.v -test.timeout=4m` with
+`DURIAN_CALENDAR_LIVE_TEST=1`, `DURIAN_CALENDAR_PROVIDER=google` or `graph`, and a
+new `DURIAN_CALENDAR_RECORDING` path. Never run independent Microsoft sessions
+concurrently or reuse a recording destination.
+
+The case writes authored ICS into an isolated vdir, runs the real planner and
+provider create, reads actual monthly last-Friday instances, persists/reloads
+sync state twice, and checks the provider-occurrence cache. It deletes only the
+exact created master. The same case replays genuine sanitized responses offline.
+
+The live extension found two silent-loss bugs: neither provider master-create
+uploads detached overrides, and Graph master-create also drops EXDATE. Previously
+the local ICS was replaced by that incomplete read-back. These uploads now fail
+before mutation, preserving authored ICS and the sync baseline. Changed/deleted
+overrides on existing series and changed Graph EXDATE sets are likewise refused;
+ordinary master edits with unchanged downloaded exceptions remain supported.
+This is a data-loss guard, **not implementation of occurrence-edit uploads**.
+Google EXDATE support is unchanged. Final monthly recordings contain 11 Google
+and 29 Graph exchanges, including read-back of rejected uploads and exact-ID
+cleanup. Provider API recurrence-move/cancel tests are separate from this
+authored-ICS path; success of one must not be reported as success of the other.
