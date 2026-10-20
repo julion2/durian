@@ -727,3 +727,68 @@ func TestSeamPlainAppointmentIsSilent(t *testing.T) {
 		t.Error("an attendee-less appointment must never notify")
 	}
 }
+
+func TestSyncPreservesUnsupportedOverrideEdits(t *testing.T) {
+	for _, edit := range []string{"create", "move", "remove", "attendees", "master-only"} {
+		t.Run(edit, func(t *testing.T) {
+			event := remoteEvent("g1", "uid-series", "Monthly review")
+			event.RecurrenceRule = "FREQ=MONTHLY;COUNT=4;BYDAY=FR;BYSETPOS=-1"
+			event.Type = "seriesMaster"
+			event.Start = time.Date(2026, 10, 30, 10, 0, 0, 0, time.UTC)
+			event.End = event.Start.Add(time.Hour)
+			event.Overrides = []Event{{
+				ICalUID: event.ICalUID, Subject: "Review moved to December",
+				RecurrenceID: time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC),
+				Start:        time.Date(2026, 12, 1, 10, 0, 0, 0, time.UTC),
+				End:          time.Date(2026, 12, 1, 11, 0, 0, 0, time.UTC),
+			}}
+			f := &fakeProvider{}
+			dir := t.TempDir()
+			status := CalendarStatus{Items: map[string]ItemStatus{}}
+			if edit != "create" {
+				f.events = []Event{event}
+				if stats := syncFake(t, f, dir, &status); stats != (SyncStats{Downloaded: 1}) {
+					t.Fatalf("seed stats = %+v", stats)
+				}
+			}
+			baseline := status.Items[event.ICalUID]
+			local := event
+			local.Overrides = append([]Event(nil), event.Overrides...)
+			switch edit {
+			case "move":
+				local.Overrides[0].Start = local.Overrides[0].Start.Add(time.Hour)
+				local.Overrides[0].End = local.Overrides[0].End.Add(time.Hour)
+			case "remove":
+				local.Overrides = nil
+			case "attendees":
+				local.Overrides[0].Attendees = []Attendee{{Email: "guest@example.invalid", Type: "required"}}
+			case "master-only":
+				local.Subject = "Renamed monthly review"
+			}
+			path := writeLocalICS(t, dir, local)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := SyncStats{Failed: 1}
+			if edit == "master-only" {
+				want = SyncStats{Uploaded: 1}
+			}
+			if stats := syncFake(t, f, dir, &status); stats != want {
+				t.Fatalf("sync stats = %+v, want %+v", stats, want)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || string(after) != string(before) {
+				t.Fatal("sync must preserve the authored ICS including detached overrides")
+			}
+			if edit != "master-only" {
+				if len(f.createEvents) != 0 || len(f.updateSpecs) != 0 || status.Items[event.ICalUID] != baseline {
+					t.Fatal("unsupported override edit changed remote content or the sync baseline")
+				}
+				if stats := syncFake(t, f, dir, &status); stats != want {
+					t.Fatalf("next sync falsely converged: %+v", stats)
+				}
+			}
+		})
+	}
+}

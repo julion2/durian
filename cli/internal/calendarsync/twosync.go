@@ -1196,8 +1196,7 @@ func coreContentEqual(local, remote Event) bool {
 // plus their own core content, so moving an occurrence to a new time counts as
 // a change while a re-serialization of the same override does not.
 func seriesExceptionsEqual(local, remote Event) bool {
-	if len(local.ExceptionDates) != len(remote.ExceptionDates) ||
-		len(local.Overrides) != len(remote.Overrides) {
+	if len(local.ExceptionDates) != len(remote.ExceptionDates) {
 		return false
 	}
 
@@ -1208,12 +1207,18 @@ func seriesExceptionsEqual(local, remote Event) bool {
 			return false
 		}
 	}
+	return seriesOverridesEqual(local.Overrides, remote.Overrides)
+}
 
-	localOverrides := sortedByRecurrenceID(local.Overrides)
-	remoteOverrides := sortedByRecurrenceID(remote.Overrides)
+func seriesOverridesEqual(local, remote []Event) bool {
+	if len(local) != len(remote) {
+		return false
+	}
+	localOverrides := sortedByRecurrenceID(local)
+	remoteOverrides := sortedByRecurrenceID(remote)
 	for i := range localOverrides {
 		if !localOverrides[i].RecurrenceID.Equal(remoteOverrides[i].RecurrenceID) ||
-			!coreContentEqual(localOverrides[i], remoteOverrides[i]) {
+			!localEventMatchesRemote(localOverrides[i], remoteOverrides[i], "") {
 			return false
 		}
 	}
@@ -1762,6 +1767,11 @@ func notifyAttendees(a Action) bool {
 }
 
 func createFromLocal(ctx context.Context, p CalendarProvider, plan CalendarPlan, a Action, status *CalendarStatus) error {
+	// Provider master creates do not upload detached occurrences. A successful
+	// partial create would rewrite this file from read-back and erase them.
+	if len(a.LocalEvent.Overrides) != 0 {
+		return fmt.Errorf("creating a series with recurrence overrides is not supported; local file kept")
+	}
 	// Role gate: attendees (= invitations) go out only when the owner is the
 	// organizer of this event. A file carrying a foreign ORGANIZER never
 	// invites on that person's behalf.
@@ -1840,6 +1850,12 @@ func createFromLocal(ctx context.Context, p CalendarProvider, plan CalendarPlan,
 // attendees (UpdateSpec.AttendeesOnly), so the provider notifies only the
 // added/removed attendees instead of everyone.
 func patchFromLocal(ctx context.Context, p CalendarProvider, plan CalendarPlan, a Action, status *CalendarStatus) error {
+	// Overrides need separate, conditional occurrence writes, not a master
+	// PATCH. Keep failed edits pending instead of recording false convergence.
+	// Unchanged downloaded overrides must not block ordinary master edits.
+	if !seriesOverridesEqual(a.LocalEvent.Overrides, a.Remote.Overrides) {
+		return fmt.Errorf("uploading changed recurrence overrides is not supported; local file and sync baseline kept")
+	}
 	attendeeBase := a.Prior.AttendeeHash
 	if attendeeBase == "" {
 		// Unknown baseline (pre-Stage-2 status, or a conflict where the
