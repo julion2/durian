@@ -89,6 +89,10 @@ type CreateOptions struct {
 type UpdateSpec struct {
 	// Event is the full desired event content.
 	Event calendar.Event
+	// ExceptionDatesChanged distinguishes an edited exclusion set from unchanged
+	// downloaded cancellations. Providers that cannot upload exclusions must
+	// reject the edit without blocking ordinary master edits of such series.
+	ExceptionDatesChanged bool
 	// IncludeAttendees uploads the attendee list (role-gated by the engine,
 	// see CreateOptions.IncludeAttendees).
 	IncludeAttendees bool

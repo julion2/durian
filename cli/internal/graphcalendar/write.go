@@ -169,6 +169,9 @@ func (c *Client) CreateEvent(ctx context.Context, calendarID string, ev calendar
 	if err := validateWriteEvent(ev); err != nil {
 		return calendar.Event{}, fmt.Errorf("failed to create event in calendar %s: %w", calendarID, err)
 	}
+	if len(ev.ExceptionDates) != 0 {
+		return calendar.Event{}, fmt.Errorf("creating Graph series with EXDATE is not supported; cancel individual occurrences at the provider")
+	}
 	body := EventToGraphBody(ev, opts.IncludeAttendees)
 	if opts.RequestOnlineMeeting {
 		body["isOnlineMeeting"] = true
@@ -203,6 +206,9 @@ func (c *Client) UpdateEvent(ctx context.Context, calendarID, eventID string, sp
 	_ = calendarID
 	if err := validateWriteEvent(spec.Event); err != nil {
 		return fmt.Errorf("failed to update event %s: %w", eventID, err)
+	}
+	if spec.ExceptionDatesChanged {
+		return fmt.Errorf("editing Graph series EXDATE is not supported; local file and sync baseline kept")
 	}
 	var body map[string]any
 	if spec.AttendeesOnly {

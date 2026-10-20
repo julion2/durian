@@ -139,6 +139,24 @@ func exerciseMonthlyCalendarSync(t *testing.T, p calendarsync.CalendarProvider, 
 		RecurrenceID: time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC),
 		Start:        time.Date(2026, 12, 1, 10, 0, 0, 0, time.UTC),
 		End:          time.Date(2026, 12, 1, 11, 0, 0, 0, time.UTC)}}
+	blockedCases := []calendar.Event{blocked}
+	if graph {
+		// Graph also needs per-occurrence cancellations for EXDATE. Its master
+		// body has no exclusion field; Google, unlike Graph, supports EXDATE.
+		exclusion := blocked
+		exclusion.ICalUID = "monthly-exdate@example.invalid"
+		exclusion.Subject = prefix + "cancelled-occurrence"
+		exclusion.Overrides = nil
+		exclusion.ExceptionDates = []time.Time{time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC)}
+		blockedCases = append(blockedCases, exclusion)
+	}
+	for _, blocked := range blockedCases {
+		exerciseRejectedSeries(t, ctx, p, cal, blocked, graph)
+	}
+}
+
+func exerciseRejectedSeries(t *testing.T, ctx context.Context, p calendarsync.CalendarProvider, cal string, blocked calendar.Event, graph bool) {
+	t.Helper()
 	blockedKey := blocked.Subject
 	if graph {
 		blockedKey = calendartest.GraphTransactionID(blocked.Subject)
@@ -156,7 +174,7 @@ func exerciseMonthlyCalendarSync(t *testing.T, p calendarsync.CalendarProvider, 
 		})
 	}
 	if err == nil || blockedID != "" {
-		t.Fatal("authored override must not report success or create a partial remote series")
+		t.Fatal("unsupported series exceptions must not report success or create a partial remote series")
 	}
 	wantICS, err := calendar.EventToICal(blocked)
 	if err != nil {

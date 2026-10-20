@@ -700,6 +700,69 @@ func TestSyncUploadUpdate(t *testing.T) {
 	}
 }
 
+func TestSyncPreservesUnsupportedGraphExclusionEdits(t *testing.T) {
+	for _, edit := range []string{"add", "remove", "master-only"} {
+		t.Run(edit, func(t *testing.T) {
+			h := newSyncHarness(t)
+			master := masterEvent("g1", "uid-series", "Weekly review", "ck1")
+			master["type"] = "seriesMaster"
+			master["recurrence"] = map[string]any{
+				"pattern": map[string]any{"type": "weekly", "interval": 1, "daysOfWeek": []string{"thursday"}},
+				"range":   map[string]any{"type": "numbered", "startDate": "2026-07-23", "numberOfOccurrences": 4, "recurrenceTimeZone": "UTC"},
+			}
+			master["exceptionOccurrences"] = []any{}
+			master["cancelledOccurrences"] = []string{}
+			if edit != "add" {
+				master["cancelledOccurrences"] = []string{"OID.g1.2026-07-30"}
+			}
+			h.events = []map[string]any{master}
+			h.getResponses = map[string]map[string]any{"g1": master}
+			if stats := h.sync(SyncOptions{}); stats != (SyncStats{Downloaded: 1}) {
+				t.Fatalf("seed stats = %+v", stats)
+			}
+			path := h.icsPath("uid-series")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			local, err := ICalToEvent(data, testOwnerEmail)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch edit {
+			case "add":
+				local.ExceptionDates = []time.Time{local.Start.AddDate(0, 0, 7)}
+			case "remove":
+				local.ExceptionDates = nil
+			case "master-only":
+				local.Subject = "Renamed weekly review"
+				h.patchResponses = map[string]map[string]any{"g1": {"id": "g1", "changeKey": "ck2"}}
+			}
+			data, err = EventToICal(local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			baseline := h.status.Items["uid-series"]
+			want := SyncStats{Failed: 1}
+			if edit == "master-only" {
+				want = SyncStats{Uploaded: 1}
+			}
+			if stats := h.sync(SyncOptions{}); stats != want {
+				t.Fatalf("sync stats = %+v, want %+v", stats, want)
+			}
+			if after, err := os.ReadFile(path); err != nil || string(after) != string(data) {
+				t.Fatal("sync changed authored exclusions")
+			}
+			if edit != "master-only" && (h.status.Items["uid-series"] != baseline || h.patchBodies["g1"] != nil) {
+				t.Fatal("unsupported exclusion edit changed remote content or sync baseline")
+			}
+		})
+	}
+}
+
 func TestUploadCreateThenNoop(t *testing.T) {
 	// Graph's changeKey is NOT a stable etag: the POST response, the read-back
 	// GET and the next FetchMasterEvents all report DIFFERENT changeKeys for

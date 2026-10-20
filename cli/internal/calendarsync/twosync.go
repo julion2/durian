@@ -1196,18 +1196,23 @@ func coreContentEqual(local, remote Event) bool {
 // plus their own core content, so moving an occurrence to a new time counts as
 // a change while a re-serialization of the same override does not.
 func seriesExceptionsEqual(local, remote Event) bool {
-	if len(local.ExceptionDates) != len(remote.ExceptionDates) {
+	return exceptionDatesEqual(local.ExceptionDates, remote.ExceptionDates) &&
+		seriesOverridesEqual(local.Overrides, remote.Overrides)
+}
+
+func exceptionDatesEqual(local, remote []time.Time) bool {
+	if len(local) != len(remote) {
 		return false
 	}
 
-	localDates := sortedUnix(local.ExceptionDates)
-	remoteDates := sortedUnix(remote.ExceptionDates)
+	localDates := sortedUnix(local)
+	remoteDates := sortedUnix(remote)
 	for i := range localDates {
 		if localDates[i] != remoteDates[i] {
 			return false
 		}
 	}
-	return seriesOverridesEqual(local.Overrides, remote.Overrides)
+	return true
 }
 
 func seriesOverridesEqual(local, remote []Event) bool {
@@ -1872,11 +1877,12 @@ func patchFromLocal(ctx context.Context, p CalendarProvider, plan CalendarPlan, 
 	}
 	notify := notifyAttendees(a)
 	spec := UpdateSpec{
-		Event:            a.LocalEvent,
-		IncludeAttendees: attendeesChanged,
-		NotifyAttendees:  notify,
-		AttendeesOnly:    attendeesChanged && !coreChanged,
-		ETag:             etag,
+		Event:                 a.LocalEvent,
+		ExceptionDatesChanged: !exceptionDatesEqual(a.LocalEvent.ExceptionDates, a.Remote.ExceptionDates),
+		IncludeAttendees:      attendeesChanged,
+		NotifyAttendees:       notify,
+		AttendeesOnly:         attendeesChanged && !coreChanged,
+		ETag:                  etag,
 	}
 	slog.Info("Updating remote event from local edit", "module", "CALSYNC",
 		"calendar", plan.Calendar.Name, "uid", a.UID, "remoteID", a.RemoteID, "path", a.LocalPath,
