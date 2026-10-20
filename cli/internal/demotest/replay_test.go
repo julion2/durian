@@ -33,7 +33,17 @@ import (
 // encrypted store and HTTP handlers. Only provider transport/identity/cursors
 // are offline substitutes; this does not replace the live delivery test.
 func TestReceivedMIMEReplayThroughSyncAndHTTP(t *testing.T) {
-	compressed, err := os.ReadFile("testdata/graph-mime-edges.eml.gz")
+	t.Run("mime-edges", func(t *testing.T) { exerciseReceivedMIMEReplay(t, false) })
+	t.Run("invitation", func(t *testing.T) { exerciseReceivedMIMEReplay(t, true) })
+}
+
+func exerciseReceivedMIMEReplay(t *testing.T, invitation bool) {
+	t.Helper()
+	fixture, marker := "graph-mime-edges", "durianlive17cece5e7efa721186ad091a091d23180"
+	if invitation {
+		fixture, marker = "graph-invitation", "durianlive58c0998a36c06775da401212a36cd9b30"
+	}
+	compressed, err := os.ReadFile("testdata/" + fixture + ".eml.gz")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +148,6 @@ func TestReceivedMIMEReplayThroughSyncAndHTTP(t *testing.T) {
 				return data
 			}
 			var search, thread, body protocol.Response
-			const marker = "durianlive17cece5e7efa721186ad091a091d23180"
 			get("/api/v1/search?query="+url.QueryEscape("subject:"+marker), &search)
 			if !search.OK || len(search.Results) != 1 {
 				t.Fatal("synced message missing or duplicated")
@@ -150,8 +159,18 @@ func TestReceivedMIMEReplayThroughSyncAndHTTP(t *testing.T) {
 			msg := thread.Thread.Messages[0]
 			get("/api/v1/message/body?id="+url.QueryEscape(msg.ID), &body)
 			if !body.OK || body.MessageBody == nil || !strings.Contains(body.MessageBody.Body, "Bonjour café — 日本語 — 🥭") ||
-				!strings.HasPrefix(msg.Body, "Bcc: is ordinary body text") || msg.BCC != msEmail ||
-				msg.From != googleEmail || msg.To != googleEmail || msg.Account != a.AccountIdentifier() {
+				msg.From != googleEmail || msg.Account != a.AccountIdentifier() {
+				t.Fatal("body or receiving account changed")
+			}
+			if invitation {
+				inv := msg.Invitation
+				if msg.To != msEmail || inv == nil || inv.Method != "REQUEST" || inv.Occurrence ||
+					inv.Event.UID != marker+"@durian.invalid" || inv.Event.Subject != "Durian Test meeting "+marker ||
+					inv.Event.Start.UTC().Format(time.RFC3339) != "2026-11-03T08:00:00Z" || inv.Event.End.UTC().Format(time.RFC3339) != "2026-11-03T09:00:00Z" ||
+					inv.Event.Organizer == nil || inv.Event.Organizer.Email != googleEmail || len(inv.Event.Attendees) != 1 || inv.Event.Attendees[0].Email != msEmail {
+					t.Fatal("received invitation lost method, UID, attendees or Berlin winter time")
+				}
+			} else if !strings.HasPrefix(msg.Body, "Bcc: is ordinary body text") || msg.BCC != msEmail || msg.To != googleEmail {
 				t.Fatal("body, blind-copy identity or receiving account changed")
 			}
 			// Independent Python SHA-256 of the authored data / inspected .eml
@@ -164,6 +183,15 @@ func TestReceivedMIMEReplayThroughSyncAndHTTP(t *testing.T) {
 				"nested-shift-jis.eml":  {240, "da75de9de70221b06424acdd4853bc1aeb73e690353c22dbb7247348153ce5e0"},
 				"ascii-then-binary.bin": {86022, "0a50a17860dcdd3ca4e77ab6211199e01d835ac0b755cb62d43136c855cbcae0"},
 				"récapitulatif 日本語; \"budget\" " + strings.Repeat("segment-", 18) + ".bin": {5, "d935316942792ca4d24d5660b5037ca227f6dcd4e6fcad48996c4f4252ca8fb9"},
+			}
+			if invitation {
+				want = map[string]struct {
+					size int
+					hash string
+				}{
+					"durian-live.txt": {51, "d60a3987e9d99b784cab1225fc9b79d60776a33db312f429e0d6836af5277602"},
+					"invitation.ics":  {841, "dcd184e0d0e756006ab9bdd7de452d06f04d2e3e0a020134828878a99e165b5a"},
+				}
 			}
 			for _, att := range msg.Attachments {
 				expected, ok := want[att.Filename]

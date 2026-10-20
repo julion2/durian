@@ -49,6 +49,7 @@ const (
 	livePlain liveMailCase = iota
 	liveHTML
 	liveMIMEEdges
+	liveInvitation
 )
 
 // TestLiveMailPublicFlow is deliberately absent from normal test builds. It
@@ -72,6 +73,12 @@ func TestLiveHTMLPublicFlow(t *testing.T) {
 // quoted Unicode filename, and binary bytes after a substantial ASCII prefix.
 func TestLiveMIMEEdgesPublicFlow(t *testing.T) {
 	exerciseLiveMail(t, []int{0}, liveMIMEEdges)
+}
+
+// A real iTIP mail, not a parser fixture: both transport recipients and the
+// embedded organizer/attendee are exclusively the two verified demo accounts.
+func TestLiveInvitationPublicFlow(t *testing.T) {
+	exerciseLiveMail(t, []int{0}, liveInvitation)
 }
 
 func exerciseLiveMail(t *testing.T, directions []int, variant liveMailCase) {
@@ -244,6 +251,19 @@ func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Cl
 			attachment{"récapitulatif 日本語; \"budget\" " + strings.Repeat("segment-", 18) + ".bin", "application/octet-stream", []byte{0, 255, 127, 128, 42}},
 			attachment{"ascii-then-binary.bin", "application/octet-stream", lateBinary})
 	}
+	if variant == liveInvitation {
+		ics := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Durian//Live integration//EN\r\nMETHOD:REQUEST\r\n" +
+			"BEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\n" +
+			"BEGIN:STANDARD\r\nDTSTART:20001029T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\n" +
+			"BEGIN:DAYLIGHT\r\nDTSTART:20000326T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n" +
+			"BEGIN:VEVENT\r\nUID:" + marker + "@durian.invalid\r\nDTSTAMP:20261020T120000Z\r\nSEQUENCE:0\r\n" +
+			"DTSTART;TZID=Europe/Berlin:20261103T090000\r\nDTEND;TZID=Europe/Berlin:20261103T100000\r\n" +
+			"SUMMARY:Durian Test meeting " + marker + "\r\n" +
+			"ORGANIZER:mailto:" + from.Email + "\r\n" +
+			"ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:\r\n mailto:" + to.Email + "\r\n" +
+			"END:VEVENT\r\nEND:VCALENDAR\r\n"
+		attachments = append(attachments, attachment{"invitation.ics", "text/calendar; charset=UTF-8; method=REQUEST", []byte(ics)})
+	}
 	draft := handler.OutboxDraft{IdempotencyKey: marker, From: from.Email, To: []string{to.Email}, Subject: subject, Body: body,
 		IsHTML: html}
 	expectedTo := to.Email
@@ -344,6 +364,16 @@ func exerciseLiveDirection(t *testing.T, parent context.Context, client *http.Cl
 					toAddrs, toErr := mail.ParseAddressList(msg.To)
 					if fromErr != nil || toErr != nil || fromAddr.Address != from.Email || len(toAddrs) != 1 || toAddrs[0].Address != expectedTo {
 						t.Fatal("received envelope or unicode body mismatch")
+					}
+					if variant == liveInvitation {
+						inv := msg.Invitation
+						if inv == nil || inv.Method != "REQUEST" || inv.Occurrence || inv.Event.UID != marker+"@durian.invalid" ||
+							inv.Event.Start.UTC().Format(time.RFC3339) != "2026-11-03T08:00:00Z" || inv.Event.End.UTC().Format(time.RFC3339) != "2026-11-03T09:00:00Z" ||
+							inv.Event.Subject != "Durian Test meeting "+marker || inv.Event.Organizer == nil || inv.Event.Organizer.Email != from.Email ||
+							len(inv.Event.Attendees) != 1 || inv.Event.Attendees[0].Email != to.Email {
+							t.Fatal("received invitation lost method, identity, participants or Berlin winter time")
+						}
+						t.Log("received REQUEST projects the exact two-party meeting and 09:00 Berlin as 08:00 UTC")
 					}
 					if variant == liveMIMEEdges && msg.BCC != "" {
 						// RFC 5322 §3.6.3 permits a blind recipient's copy to
